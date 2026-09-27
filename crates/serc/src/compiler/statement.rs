@@ -563,6 +563,8 @@ pub(super) struct ConditionState {
     pub(super) include_scoped_none_condition_owner: bool,
     // The final chained comparison whose fallthrough jump survives small-exit inlining as a NOP.
     pub(super) retained_chained_comparison_exit: Option<TextRange>,
+    // Declaration-only terminal arms retain their comparison cleanup until exit copying.
+    pub(super) empty_terminal_comparison_arms: Vec<TextRange>,
     // A direct conditional-expression assertion outside an iterator loop that begins below the
     // `assert` keyword. CPython retains its first arm's fallthrough jump as a NOP when the
     // assertion exit is inlined; iterator loops instead copy the complete failure block.
@@ -3599,7 +3601,26 @@ impl<'source> Compiler<'source> {
         statement: &ruff_python_ast::StmtIf,
         preserve_protected_folded_nop: bool,
     ) -> Result<(), CompileError> {
-        if self.context.python_version >= crate::PythonVersion::Py313
+        // Removed assertions are represented as empty declarations.
+        let empty_comparison_arms: Vec<_> =
+            std::iter::once((statement.test.as_ref(), statement.body.as_slice()))
+                .chain(statement.elif_else_clauses.iter().filter_map(|clause| {
+                    clause
+                        .test
+                        .as_ref()
+                        .map(|test| (test, clause.body.as_slice()))
+                }))
+                .filter_map(|(test, body)| {
+                    (matches!(test, Expr::Compare(comparison) if comparison.ops.len() > 1)
+                        && !body.is_empty()
+                        && body.iter().all(|statement| {
+                            matches!(statement, Stmt::Global(_) | Stmt::Nonlocal(_))
+                        }))
+                    .then_some(test.range())
+                })
+                .collect();
+        let has_empty_comparison_arm = !empty_comparison_arms.is_empty();
+        let has_optimized_join = self.context.python_version >= crate::PythonVersion::Py313
             && (self.optimized_conditional_join(statement)
                 || (self.context.python_version == crate::PythonVersion::Py313
                     && std::iter::once(statement.body.as_slice())
@@ -3616,7 +3637,8 @@ impl<'source> Compiler<'source> {
                                     Some(super::optimization::OptimizedLocation::Elided)
                                 )
                             })
-                        })))
+                        })));
+        if (has_empty_comparison_arm || has_optimized_join)
             && self.control.loops.contexts.is_empty()
             && !self.has_active_control_flow_region()
             && self.control.withs.active_with_exits.is_empty()
@@ -3629,9 +3651,59 @@ impl<'source> Compiler<'source> {
         {
             // Native copies the shared implicit return after constructing the
             // original conditional and short-circuit joins.
-            self.compile_if(statement)?;
+            if has_empty_comparison_arm
+                && self.context.python_version >= crate::PythonVersion::Py314
+            {
+                let mut empty_comparison_arms = empty_comparison_arms;
+                let mut suites: Vec<_> = std::iter::once(statement.body.as_slice())
+                    .chain(
+                        statement
+                            .elif_else_clauses
+                            .iter()
+                            .map(|clause| clause.body.as_slice()),
+                    )
+                    .collect();
+                while let Some(body) = suites.pop() {
+                    let Some(Stmt::If(tail)) = body.iter().rev().find(|statement| {
+                        !matches!(statement, Stmt::Global(_) | Stmt::Nonlocal(_))
+                    }) else {
+                        continue;
+                    };
+                    for (test, body) in
+                        std::iter::once((Some(tail.test.as_ref()), tail.body.as_slice())).chain(
+                            tail.elif_else_clauses
+                                .iter()
+                                .map(|clause| (clause.test.as_ref(), clause.body.as_slice())),
+                        )
+                    {
+                        if let Some(test) = test
+                            && matches!(test, Expr::Compare(comparison) if comparison.ops.len() > 1)
+                            && !body.is_empty()
+                            && body.iter().all(|statement| {
+                                matches!(statement, Stmt::Global(_) | Stmt::Nonlocal(_))
+                            })
+                        {
+                            empty_comparison_arms.push(test.range());
+                        }
+                        suites.push(body);
+                    }
+                }
+                self.with_control_override(
+                    |control| &mut control.conditions.empty_terminal_comparison_arms,
+                    empty_comparison_arms,
+                    |compiler| compiler.compile_if(statement),
+                )?;
+            } else {
+                self.compile_if(statement)?;
+            }
             self.assembler.set_location(SourceLocation::NONE);
-            return self.emit_deferred_implicit_return();
+            self.emit_deferred_implicit_return()?;
+            if has_empty_comparison_arm
+                && self.context.python_version >= crate::PythonVersion::Py314
+            {
+                self.assembler.allow_last_no_location_block_inlining();
+            }
+            return Ok(());
         }
         if statement.elif_else_clauses.is_empty()
             && matches!(statement.body.last(), Some(Stmt::Expr(expression))
@@ -22157,10 +22229,33 @@ impl<'source> Compiler<'source> {
                             && condition_has_only_runtime_tests(&loop_statement.test)
                             && !expression_contains_chained_comparison(&loop_statement.test)
                             && !suite_contains_loop_break(&loop_statement.body))));
+            // Removed assertions cannot replace a runtime while's unique false-edge
+            // location. Other loop shapes retain their separate exit policies.
+            let loop_exit_tail = normal_exit_suite
+                .iter()
+                .rev()
+                .find(|tail| {
+                    !matches!(tail, Stmt::Global(global)
+                        if global.names.is_empty()
+                            && matches!(self.context.optimized_locations.get(&tail.range()),
+                                Some(super::optimization::OptimizedLocation::Elided)))
+                })
+                .filter(|tail| {
+                    self.context.python_version >= crate::PythonVersion::Py314
+                        && self.control.withs.active_with_exits.is_empty()
+                        && matches!(tail, Stmt::While(loop_statement)
+                            if loop_statement.orelse.is_empty()
+                                && !suite_contains_loop_break(&loop_statement.body)
+                                && early_condition_truthiness(&loop_statement.test).is_none()
+                                && condition_has_only_runtime_tests(&loop_statement.test)
+                                && condition_jump_target_count(&loop_statement.test, false) == 1
+                                && original_condition_has_unique_jump_target(&loop_statement.test, false))
+                })
+                .or_else(|| normal_exit_suite.last());
             let loop_exit_location = statement
                 .orelse
                 .is_empty()
-                .then(|| match statement.body.last()? {
+                .then(|| match loop_exit_tail? {
                     Stmt::While(loop_statement) if is_break_only_loop(loop_statement) => {
                         terminal_while_break_exit_range(loop_statement)
                     }
@@ -23505,7 +23600,7 @@ impl<'source> Compiler<'source> {
                 && !normal_exit_absorbed_by_manager_pop
                 && !statement.is_star
                 && statement.finalbody.is_empty()
-                && matches!(normal_exit_suite.last(), Some(Stmt::While(loop_statement))
+                && matches!(loop_exit_tail, Some(Stmt::While(loop_statement))
                     if loop_statement.orelse.is_empty()
                         && !suite_contains_loop_break(&loop_statement.body)
                         && early_condition_truthiness(&loop_statement.test).is_none()
@@ -27103,14 +27198,20 @@ impl<'source> Compiler<'source> {
             // A following while header leaves that block empty when POP_BLOCK is removed.
             self.assembler.prevent_borrow_reachability(protected_end);
         }
-        // Removed assertions cannot make a structured exit into a linear one:
-        // its original empty block still stops 3.14's borrowing traversal.
-        let effective_body_tail = statement.body.iter().rev().find(|tail| {
-            !matches!(
-                self.context.optimized_locations.get(&tail.range()),
-                Some(super::optimization::OptimizedLocation::Elided)
-            )
-        });
+        // An elided assertion cannot populate a while's empty exit block.
+        // A loop else suite has its own exit and keeps the existing proof.
+        let effective_body_tail = statement
+            .body
+            .iter()
+            .rev()
+            .find(|tail| {
+                !matches!(
+                    self.context.optimized_locations.get(&tail.range()),
+                    Some(super::optimization::OptimizedLocation::Elided)
+                )
+            })
+            .filter(|tail| matches!(tail, Stmt::While(loop_) if loop_.orelse.is_empty()))
+            .or_else(|| statement.body.last());
         let simple_fallthrough_handlers_reach_finally =
             statement.handlers.iter().all(|handler| {
                 handler.as_except_handler().is_some_and(|handler| {

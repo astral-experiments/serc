@@ -134,61 +134,90 @@ fn elided_assertion_after_while_preserves_finally_borrow_boundary() {
 }
 
 #[test]
-fn single_exit_while_keeps_finally_borrowing_after_elided_assertions() {
-    const SOURCE: &str = r"def f(obj, count):
+fn while_else_keeps_finally_borrowing_after_elided_assertions() {
+    for condition in ["condition()", "condition() or count < 3"] {
+        for following in ["", "    return obj\n"] {
+            let source = format!(
+                "def f(obj, count):
     try:
-        while condition() or count < 3:
+        while {condition}:
             action()
+        else:
+            recover()
         assert obj
     except ValueError:
         recover()
     finally:
         obj.close()
-";
-    const COMPARE_LOADS: &str = r"
-import dis, marshal, sys
-def receiver_loads(module):
-    function = next(code for code in module.co_consts
-                    if isinstance(code, type(module)) and code.co_name == 'f')
-    return [instruction.opname for instruction in dis.get_instructions(function)
-            if instruction.argval == 'obj' and instruction.positions.lineno == 9
-            and instruction.opname.startswith('LOAD_FAST')]
-native = receiver_loads(marshal.load(sys.stdin.buffer))
-actual = receiver_loads(marshal.load(sys.stdin.buffer))
-assert native and actual == native, (native, actual)
-";
-    for (index, (version, _, _)) in VERSIONS.into_iter().enumerate() {
-        for level in LEVELS {
-            let native = oracle(SOURCE.as_bytes(), "single_exit_borrow.py", version, level);
-            assert!(native.status.success());
-            let actual = compile_with_options(
-                SOURCE,
-                "single_exit_borrow.py",
-                &CompileOptions {
-                    python_version: version,
-                    optimization_level: level,
-                    ..CompileOptions::default()
-                },
-            )
-            .unwrap()
-            .marshal();
-            let mut child = Command::new(ORACLES[index].get().unwrap())
-                .args(["-I", "-S", "-c", COMPARE_LOADS])
-                .stdin(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap();
-            let mut stdin = child.stdin.take().unwrap();
-            stdin.write_all(&native.stdout).unwrap();
-            stdin.write_all(&actual).unwrap();
-            drop(stdin);
-            let output = child.wait_with_output().unwrap();
-            assert!(
-                output.status.success(),
-                "{version}, {level:?}: {}",
-                String::from_utf8_lossy(&output.stderr)
+{following}"
+            );
+            assert_matches_cpython_versions(
+                &source,
+                "while_else_finally_borrow.py",
+                &LEVELS,
+                &[
+                    PythonVersion::Py313,
+                    PythonVersion::Py314,
+                    PythonVersion::Py315,
+                ],
             );
         }
+    }
+}
+
+#[test]
+fn terminal_chained_comparisons_preserve_empty_branch_exits() {
+    for (index, body) in [
+        "assert value",
+        "global declared",
+        "global declared\n        assert value",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (name, prefix, keyword, suffix) in [
+            ("plain", "", "if", ""),
+            ("else", "", "if", "    else:\n        raise ValueError\n"),
+            (
+                "elif",
+                "    if value is None:\n        raise ValueError\n",
+                "elif",
+                "    else:\n        raise ValueError\n",
+            ),
+        ] {
+            let source = format!(
+                "def f(value):\n{prefix}    {keyword} 0 < value < 3:\n        {body}\n{suffix}"
+            );
+            assert_matches_cpython(
+                &source,
+                &format!("empty_comparison_{name}_{index}.py"),
+                &LEVELS,
+            );
+        }
+    }
+    assert_matches_cpython(
+        "def f(low, value, high, other):
+    if low < value < high:
+        global state
+    else:
+        if low < other < high:
+            global seen
+",
+        "nested_empty_comparison.py",
+        &LEVELS,
+    );
+}
+
+#[test]
+fn elided_assertions_preserve_protected_while_exit_location() {
+    for (case, condition) in ["condition()", "condition() or count < 3"]
+        .into_iter()
+        .enumerate()
+    {
+        let source = format!(
+            "def f(obj, count):\n    try:\n        while {condition}:\n            action()\n        assert obj\n    except ValueError:\n        recover()\n    finally:\n        obj.close()\n"
+        );
+        assert_matches_cpython(&source, &format!("protected_while_exit_{case}.py"), &LEVELS);
     }
 }
 

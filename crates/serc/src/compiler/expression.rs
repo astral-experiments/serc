@@ -9432,7 +9432,12 @@ impl Compiler<'_> {
                 )?;
             }
             self.emit(NOT_TAKEN, 0, 0)?;
-            if self.context.python_version <= PythonVersion::Py313 {
+            let empty_terminal_arm = self
+                .control
+                .conditions
+                .empty_terminal_comparison_arms
+                .contains(&comparison.range);
+            if self.context.python_version <= PythonVersion::Py313 || empty_terminal_arm {
                 self.assembler.set_location(SourceLocation::NONE);
             }
             // Native reserves End here, after operand labels. Its source plan
@@ -9452,16 +9457,19 @@ impl Compiler<'_> {
 
             self.assembler.mark(cleanup);
             self.set_depth(base_depth + 1);
-            if self.context.python_version <= PythonVersion::Py313 {
+            if self.context.python_version <= PythonVersion::Py313 || empty_terminal_arm {
                 self.assembler
                     .set_location(self.source_location(comparison.range));
             }
             self.emit(POP_TOP, 0, -1)?;
             if !jump_on {
-                if self.context.python_version <= PythonVersion::Py313 {
+                if self.context.python_version <= PythonVersion::Py313 || empty_terminal_arm {
                     self.assembler.set_location(SourceLocation::NONE);
                 }
                 let cleanup_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, label)?;
+                if empty_terminal_arm {
+                    self.assembler.defer_jump_removal(cleanup_exit);
+                }
                 if self.control.statements.in_terminal_if_branch_suite
                     && self.control.conditions.retained_chained_comparison_exit
                         == Some(comparison.range)
