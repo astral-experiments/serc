@@ -4382,13 +4382,29 @@ impl<'source> Compiler<'source> {
                     .body
                     .iter()
                     .all(|statement| self.context.is_elided_statement(statement)))
-                || (suite_has_linear_borrow_fallthrough(&statement.body)
+                || ((suite_has_linear_borrow_fallthrough(&statement.body)
+                    || (!self.control.statements.in_match
+                        && statement.body.iter().all(|part| {
+                            self.context.is_elided_statement(part)
+                                || suite_has_linear_borrow_fallthrough(std::slice::from_ref(part))
+                                || matches!(part, Stmt::If(inner)
+                                    if inner.elif_else_clauses.is_empty()
+                                        && early_condition_truthiness(&inner.test).is_none()
+                                        && condition_has_linear_runtime_leaves(&inner.test)
+                                        && !expression_contains_inline_branch(&inner.test)
+                                        && !expression_suspends_current_scope(&inner.test)
+                                        && condition_jump_target_count(&inner.test, false) == 1
+                                        && condition_jump_target_count(&inner.test, true) == 1
+                                        && suite_has_linear_borrow_fallthrough(&inner.body))
+                        })))
                     && matches!(statement.body.last(), Some(Stmt::Expr(expression))
                         if matches!(expression.value.as_ref(), Expr::Call(_))
                             && !expression_contains_inline_branch(&expression.value)
                             && !expression_suspends_current_scope(&expression.value))))
         {
             // The erased else reaches the original unlocated scope footer.
+            // Completed inner conditionals join before the final call, and erased
+            // statements add no edges to that footer.
             // Keep it shared until native repeated predecessor counts decide
             // which exits are copied and whether the original remains alive.
             self.compile_if(statement)?;
@@ -12748,6 +12764,45 @@ impl<'source> Compiler<'source> {
         Ok(())
     }
 
+    /// Certifies ordinary work that cannot introduce a protected loop-exit owner.
+    fn supports_elided_for_join_body(&self, body: &[Stmt]) -> bool {
+        if crate::stack_growth_required() {
+            return crate::grow_stack(|| self.supports_elided_for_join_body(body));
+        }
+        let linear_expression = |expression: &Expr| {
+            !expression_contains_inline_branch(expression)
+                && !expression_suspends_current_scope(expression)
+        };
+        body.iter().all(|statement| {
+            self.context.is_elided_statement(statement)
+                || match statement {
+                    Stmt::If(branch) => {
+                        condition_has_linear_runtime_leaves(&branch.test)
+                            && !expression_suspends_current_scope(&branch.test)
+                            && self.supports_elided_for_join_body(&branch.body)
+                            && branch.elif_else_clauses.iter().all(|clause| {
+                                clause.test.as_ref().is_none_or(|test| {
+                                    condition_has_linear_runtime_leaves(test)
+                                        && !expression_suspends_current_scope(test)
+                                }) && self.supports_elided_for_join_body(&clause.body)
+                            })
+                    }
+                    Stmt::For(loop_statement) => {
+                        !loop_statement.is_async
+                            && loop_statement.orelse.is_empty()
+                            && linear_expression(&loop_statement.iter)
+                            && linear_expression(&loop_statement.target)
+                            && self.supports_elided_for_join_body(&loop_statement.body)
+                    }
+                    Stmt::Break(_) => true,
+                    _ => {
+                        let single = std::slice::from_ref(statement);
+                        suite_has_linear_borrow_fallthrough(single) && !suite_contains_yield(single)
+                    }
+                }
+        })
+    }
+
     fn compile_if(&mut self, statement: &ruff_python_ast::StmtIf) -> Result<(), CompileError> {
         if self.context.python_version == crate::PythonVersion::Py314 {
             // Only names evaluated before any other part of the authored test.
@@ -14826,6 +14881,27 @@ impl<'source> Compiler<'source> {
                                             || is_elided_suite(&clause.body))
                                         && !suite_contains_yield(&clause.body)))
                         });
+                    // An erased suffix emits nothing into a completed For's break-target
+                    // block. Keep the same original join identity as a raw final For.
+                    let elided_for_break_tail = self.can_descend_match_tail_wrappers()
+                        && !self.control.statements.in_match
+                        && !self.control.loops.suite_fallthrough_to_loop_backedge
+                        && body
+                            .last()
+                            .is_some_and(|last| self.context.is_elided_statement(last))
+                        && body
+                            .iter()
+                            .rfind(|part| !self.context.is_elided_statement(part))
+                            .is_some_and(|last| {
+                                matches!(last, Stmt::For(loop_statement)
+                                if !loop_statement.is_async
+                                    && loop_statement.orelse.is_empty()
+                                    && suite_contains_loop_break(&loop_statement.body))
+                            })
+                        && !ruff_python_ast::helpers::any_over_body(body, |expression| {
+                            matches!(expression, Expr::Lambda(_))
+                        })
+                        && self.supports_elided_for_join_body(body);
                     if optimized_empty_both || optimized_nested_else {
                         self.assembler
                             .preserve_redundant_jump_nop_after_threading(branch_exit);
@@ -14874,7 +14950,8 @@ impl<'source> Compiler<'source> {
                         // join before a small return is copied onto the success edge.
                         self.assembler
                             .preserve_empty_join_inlined_jump_nop(branch_exit);
-                    } else if matches!(body.last(), Some(Stmt::For(statement))
+                    } else if elided_for_break_tail
+                        || matches!(body.last(), Some(Stmt::For(statement))
                             if (statement.is_async && statement.orelse.is_empty())
                                 || suite_contains_loop_break(&statement.body))
                         || matches!(body.last(), Some(Stmt::While(statement))
@@ -14886,7 +14963,8 @@ impl<'source> Compiler<'source> {
                         // an else suite would supply its own preceding line instead.
                         // A while loop also has an empty condition-failure block. Its
                         // inlined branch jump has no preceding line event to replace it.
-                        if matches!(body.last(), Some(Stmt::For(loop_statement))
+                        if elided_for_break_tail
+                            || matches!(body.last(), Some(Stmt::For(loop_statement))
                             if !loop_statement.is_async && suite_contains_loop_break(&loop_statement.body))
                         {
                             // The break target is an original empty array even when
