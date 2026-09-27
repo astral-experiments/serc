@@ -8952,7 +8952,12 @@ fn terminal_guard_fallthrough_alias_locations_match_the_graph() {
             first.no_location_policy.preserve_location();
         }
         let mut items = vec![
-            item(RESUME, 0, SourceLocation::new(1, 1, 0, 0), 0),
+            item(
+                RESUME,
+                ResumeLocation::AT_FUNC_START.argument(),
+                SourceLocation::new(1, 1, 0, 0),
+                0,
+            ),
             item(LOAD_FAST, 0, located, 1),
             Item::Instruction(Instruction::new(
                 POP_JUMP_IF_FALSE,

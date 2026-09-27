@@ -4144,6 +4144,7 @@ mod protected_repeated_backedge_tests {
     fn ordinary_await_setup_requires_original_send_fallthrough() {
         use crate::assembler::exception_owners::OrdinaryAwaitEnd;
         use crate::target::opcodes::{CLEANUP_THROW, END_SEND};
+        use crate::target::operands::ResumeLocation;
 
         for case in 0..7 {
             let [
@@ -4185,7 +4186,7 @@ mod protected_repeated_backedge_tests {
                 Item::Label(yielded),
                 Item::Instruction(normal(if case == 4 { NOP } else { YIELD_VALUE }, 1)),
                 Item::Label(yielded_end),
-                Item::Instruction(normal(RESUME, 3)),
+                Item::Instruction(normal(RESUME, ResumeLocation::AFTER_AWAIT.argument())),
                 Item::Instruction(backward(JUMP_BACKWARD_NO_INTERRUPT, send_label)),
                 Item::Label(cleanup),
                 Item::Instruction(cleanup_instruction),
