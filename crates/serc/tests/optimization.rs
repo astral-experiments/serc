@@ -22,6 +22,35 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn discarded_imports_preserve_none_admission_order() {
+    for (index, import) in [
+        "import package",
+        "import package.module as alias",
+        "import package, other",
+        "from package import item",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (scope, prefix, indent) in [
+            ("module", "", ""),
+            ("function", "def f():\n", "    "),
+            ("class", "class Outer:\n", "    "),
+        ] {
+            let source = format!(
+                "{prefix}{indent}if False:\n{indent}    {import}\n\
+                 {indent}class Later:\n{indent}    pass\n"
+            );
+            assert_matches_cpython(
+                &source,
+                &format!("discarded_import_{index}_{scope}.py"),
+                &LEVELS,
+            );
+        }
+    }
+}
+
+#[test]
 fn dotted_import_parser_interning_matches_cpython() {
     for (case, import) in [
         "if False:\n    from SercOuter.SercInner import item\n",

@@ -1555,6 +1555,12 @@ impl Compiler<'_> {
                         if self.legacy_compiler.is_some() && self.register_literals {
                             self.constants.push(Constant::Int(0));
                             self.constants.push(Constant::None);
+                        } else if self.python_version == PythonVersion::Py314
+                            && self.register_literals
+                        {
+                            // Import emits None as its from-list before the unreachable
+                            // branch is removed. A later use keeps that cache position.
+                            self.constants.push(Constant::None);
                         }
                         for alias in &import.names {
                             let imported = alias.name.as_str();
