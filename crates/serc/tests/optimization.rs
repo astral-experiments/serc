@@ -123,6 +123,12 @@ fn assigned_conditional_prefix_preserves_populated_nested_join() {
 }
 
 #[test]
+fn calls_before_return_preserve_erased_loop_tail() {
+    let source = "def f(items, blocked, enabled, work, obj):\n    for item in items:\n        if item not in blocked:\n            if enabled:\n                work()\n                return work()\n            assert item\n    return work()\n";
+    assert_matches_cpython(source, "calls_before_return_loop_tail.py", &LEVELS);
+}
+
+#[test]
 fn completed_prefix_preserves_populated_nested_join() {
     let source = "def f(obj, a, b, c, d, work):\n    if obj is not None:\n        assert obj.ready\n        before = obj\n        if a:\n            first = work()\n        else:\n            first = work()\n        between = obj.ready\n        assert a\n        if b:\n            second = work()\n        chosen = c if d else a\n        assert b\n        after_choice = obj.ready\n        if c:\n            result = None\n        else:\n            result = work()\n    else:\n        assert obj\n    after = obj.after\n    return after\n";
     assert_matches_cpython(source, "completed_prefix_join.py", &LEVELS);

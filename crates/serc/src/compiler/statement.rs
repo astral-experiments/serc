@@ -15483,6 +15483,26 @@ impl<'source> Compiler<'source> {
                         })
                         && (suite_has_linear_borrow_fallthrough(&statement.body)
                             || matches!(statement.body.as_slice(), [Stmt::Return(_) | Stmt::Raise(_)])
+                            // Calls before a return cannot reach the original backedge;
+                            // the conditional's false edge still targets it directly.
+                            || (matches!(self.unit.scope, Scope::Function { .. })
+                                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                                && !self.control.statements.in_match
+                                && self.control.withs.active_with_exits.is_empty()
+                                && self.control.loops.contexts.last().is_some_and(|context| {
+                                    context.iterator_cleanup == IteratorCleanup::Sync
+                                        && !context.has_orelse
+                                        && context.continue_label == restart
+                                })
+                                && matches!(statement.body.split_last(), Some((Stmt::Return(return_), leading))
+                                    if !leading.is_empty()
+                                        && leading.iter().all(|statement| matches!(statement,
+                                            Stmt::Expr(expression) if matches!(expression.value.as_ref(), Expr::Call(_))))
+                                        && suite_has_linear_borrow_fallthrough(leading)
+                                        && return_.value.as_ref().is_none_or(|value| {
+                                            !expression_contains_inline_branch(value)
+                                                && !expression_suspends_current_scope(value)
+                                        })))
                             || (!statement.body.is_empty()
                                 && original_condition_has_unique_jump_target(&statement.test, true)
                                 && statement.body.iter().all(|statement| self.context.is_elided_statement(statement)))))))
