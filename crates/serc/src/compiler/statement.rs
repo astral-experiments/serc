@@ -1601,6 +1601,45 @@ impl<'source> Compiler<'source> {
         self.compile_suite_inner(body, false)
     }
 
+    /// Certifies case exits with flat work and at most one final conditional.
+    fn supports_terminal_match_case(&self, body: &[Stmt]) -> bool {
+        let is_elided = |statement: &Stmt| {
+            matches!(
+                self.context.optimized_locations.get(&statement.range()),
+                Some(super::optimization::OptimizedLocation::Elided)
+            )
+        };
+        let is_flat = |statement: &Stmt| {
+            is_elided(statement)
+                || matches!(
+                    statement,
+                    Stmt::Pass(_) | Stmt::Global(_) | Stmt::Nonlocal(_)
+                )
+                || matches!(statement, Stmt::AnnAssign(assignment)
+                    if assignment.value.is_none()
+                        && matches!(assignment.target.as_ref(), Expr::Name(_)))
+                || (suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement))
+                    && suite_has_nonsuspending_conditional_work(std::slice::from_ref(statement)))
+        };
+        if body.iter().all(is_flat) {
+            return true;
+        }
+        let Some((Stmt::If(conditional), prefix)) =
+            self.terminal_match_case_body(body).split_last()
+        else {
+            return false;
+        };
+        prefix.iter().all(is_flat)
+            && conditional.elif_else_clauses.is_empty()
+            && condition_has_linear_runtime_leaves(&conditional.test)
+            && !expression_suspends_current_scope(&conditional.test)
+            && ((suite_has_linear_borrow_fallthrough(&conditional.body)
+                && suite_has_nonsuspending_conditional_work(&conditional.body))
+                || matches!(conditional.body.as_slice(), [Stmt::Pass(_)])
+                || (conditional.body.iter().all(is_elided)
+                    && condition_jump_target_count(&conditional.test, true) == 1))
+    }
+
     /// Certifies a terminal branch with erased assertions or a linear conditional prefix.
     fn linear_terminal_branch_before_elided(&self, body: &[Stmt]) -> bool {
         let is_elided = |statement: &Stmt| self.context.is_elided_statement(statement);
@@ -1983,24 +2022,41 @@ impl<'source> Compiler<'source> {
             // terminal statement. Keep its comprehension assignment's return span.
             let terminal_comprehension_before_elided = !is_final
                 && final_expression_becomes_return
-                && plain_function_suite
+                && self.supports_elided_terminal_if()
+                && !inherited_statement_has_following
+                && !self
+                    .control
+                    .statements
+                    .context
+                    .propagates_following_to_suites
                 && self.context.python_version >= crate::PythonVersion::Py314
-                && !self.has_active_control_flow_region()
-                && !self.control.in_exception_handler()
-                && self.control.finally.is_inactive_for_return_unwind()
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty()
                 && matches!(statement, Stmt::If(_))
                 && body[index + 1..]
                     .iter()
                     .all(|statement| self.context.is_elided_statement(statement))
                 && matches!(statement, Stmt::If(conditional)
-                if std::iter::once(conditional.body.as_slice())
-                    .chain(conditional.elif_else_clauses.iter().map(|clause| clause.body.as_slice()))
-                    .any(|branch| matches!(branch.last(), Some(Stmt::Assign(assignment))
-                        if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
-                            && matches!(assignment.value.as_ref(), Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_))))
+                if ((plain_function_suite
+                    && std::iter::once(conditional.body.as_slice())
+                        .chain(conditional.elif_else_clauses.iter().map(|clause| clause.body.as_slice()))
+                        .any(|branch| matches!(branch.last(), Some(Stmt::Assign(assignment))
+                            if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                                && matches!(assignment.value.as_ref(), Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_)))))
+                    // Other arms can have distinct shared return donors. Only the
+                    // existing synchronous lowering handles those sibling joins.
+                    || (conditional.elif_else_clauses.is_empty()
+                        && self.terminal_comprehension_assignment(&conditional.body).is_some()))
                     && condition_has_linear_runtime_leaves(&conditional.test)
+                    && !expression_suspends_current_scope(&conditional.test)
                     && conditional.elif_else_clauses.iter().all(|clause| {
-                        clause.test.as_ref().is_none_or(condition_has_linear_runtime_leaves)
+                        clause.test.as_ref().is_none_or(|test| {
+                            condition_has_linear_runtime_leaves(test)
+                                && !expression_suspends_current_scope(test)
+                        })
                     }));
             // A nested conditional before removed assertions can contribute its own
             // return locations to the enclosing terminal branch.
@@ -2113,6 +2169,30 @@ impl<'source> Compiler<'source> {
                 && body[index + 1..]
                     .iter()
                     .all(|statement| self.context.is_elided_statement(statement));
+            // Removed assertions leave this match's cases as the function's terminal exits.
+            let terminal_match_before_elided = self.context.python_version
+                >= crate::PythonVersion::Py314
+                && !is_final
+                && self.supports_elided_terminal_if()
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty()
+                && !inherited_statement_has_following
+                && !self
+                    .control
+                    .statements
+                    .context
+                    .propagates_following_to_suites
+                && matches!(statement, Stmt::Match(statement)
+                    if statement.cases.iter().all(|case| self.supports_terminal_match_case(&case.body)))
+                && body[index + 1..].iter().all(|statement| {
+                    matches!(
+                        self.context.optimized_locations.get(&statement.range()),
+                        Some(super::optimization::OptimizedLocation::Elided)
+                    )
+                });
             // A try with an erased protected body reaches the implicit return directly
             // when only erased assertions follow. Use the existing terminal lowering so
             // its setup NOP can merge with that return instead of retaining an empty join.
@@ -2159,6 +2239,7 @@ impl<'source> Compiler<'source> {
             if (is_final
                 || terminal_if_before_elided
                 || terminal_assignment_before_elided
+                || terminal_match_before_elided
                 || terminal_empty_try_before_elided
                 || terminal_finally_while_before_elided)
                 && final_expression_becomes_return
@@ -4381,6 +4462,7 @@ impl<'source> Compiler<'source> {
                     } else if let Some(statement) = body
                         .last()
                         .filter(|statement| statement_uses_implicit_return_location(statement))
+                        .or_else(|| self.terminal_comprehension_assignment(body))
                     {
                         self.assembler.set_location(
                             self.source_location(implicit_return_range(self, statement)),
@@ -4478,6 +4560,7 @@ impl<'source> Compiler<'source> {
                     } else if let Some(statement) = body
                         .last()
                         .filter(|statement| statement_uses_implicit_return_location(statement))
+                        .or_else(|| self.terminal_comprehension_assignment(body))
                     {
                         self.assembler.set_location(
                             self.source_location(implicit_return_range(self, statement)),
@@ -4505,6 +4588,30 @@ impl<'source> Compiler<'source> {
         }
         self.set_depth(base_depth);
         Ok(())
+    }
+
+    /// Finds the result-store donor hidden by removed comprehension-tail assertions.
+    fn terminal_comprehension_assignment<'a>(&self, body: &'a [Stmt]) -> Option<&'a Stmt> {
+        if self.context.python_version < crate::PythonVersion::Py314
+            || !self.supports_elided_terminal_if()
+            || !self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+        {
+            return None;
+        }
+        body.iter()
+            .rev()
+            .find(|statement| !matches!(
+                self.context.optimized_locations.get(&statement.range()),
+                Some(super::optimization::OptimizedLocation::Elided)
+            ))
+            .filter(|statement| matches!(statement, Stmt::Assign(assignment)
+                if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                    && matches!(assignment.value.as_ref(), Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_))
+                    && !expression_suspends_current_scope(&assignment.value)))
     }
 
     /// Recovers the original return donor hidden by removed branch-tail assertions.
@@ -14459,6 +14566,70 @@ impl<'source> Compiler<'source> {
         .then_some(statement.test.as_ref())
     }
 
+    /// Keeps a raising guard's sole false-edge location after removed assertions.
+    fn elided_raise_try_exit_location(
+        &self,
+        statement: &ruff_python_ast::StmtTry,
+    ) -> Option<SourceLocation> {
+        if self.context.python_version < crate::PythonVersion::Py314
+            || !matches!(self.unit.scope, Scope::Function { .. })
+            || self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) != 0
+            || statement.is_star
+            || !statement.orelse.is_empty()
+            || !statement.finalbody.is_empty()
+            || !self.control.loops.contexts.is_empty()
+            || self.control.loops.suite_fallthrough_to_loop_backedge
+            || !self.control.withs.active_with_exits.is_empty()
+            || !self.control.withs.active_with_region_exclusions.is_empty()
+            || !self.control.exceptions.active_exception_handlers.is_empty()
+            || self.control.exceptions.active_exception_group_handlers != 0
+            || !self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            || !self.control.finally.is_inactive_for_return_unwind()
+        {
+            return None;
+        }
+        let is_elided_assert = |statement: &Stmt| {
+            matches!(statement, Stmt::Global(global) if global.names.is_empty())
+                && matches!(
+                    self.context.optimized_locations.get(&statement.range()),
+                    Some(super::optimization::OptimizedLocation::Elided)
+                )
+        };
+        if !statement.body.last().is_some_and(is_elided_assert) {
+            return None;
+        }
+        let guard_index = statement
+            .body
+            .iter()
+            .rposition(|stmt| !is_elided_assert(stmt))?;
+        let Stmt::If(guard) = &statement.body[guard_index] else {
+            return None;
+        };
+        let [Stmt::Raise(raise)] = guard.body.as_slice() else {
+            return None;
+        };
+        let linear_expression = |value: &Expr| {
+            !expression_contains_inline_branch(value) && !expression_suspends_current_scope(value)
+        };
+        if !guard.elif_else_clauses.is_empty()
+            || !condition_has_linear_runtime_leaves(&guard.test)
+            || expression_suspends_current_scope(&guard.test)
+            || !original_condition_has_unique_jump_target(&guard.test, false)
+            || !raise.exc.as_deref().is_none_or(linear_expression)
+            || !raise.cause.as_deref().is_none_or(linear_expression)
+            || (guard_index > 0
+                && !suite_has_linear_borrow_fallthrough(&statement.body[..guard_index]))
+        {
+            return None;
+        }
+        unique_condition_jump_target(&guard.test, false)
+            .map(|test| self.source_location(test.range()))
+    }
+
     /// Finds the sole false-edge donor for a 3.13 try exit after removed assertions.
     fn legacy_elided_try_guard_return_location(
         &self,
@@ -23157,6 +23328,10 @@ impl<'source> Compiler<'source> {
                 // the break exits the loop and cannot donate its location.
                 self.assembler
                     .set_location(self.source_location(donor.range()));
+            } else if let Some(location) = self.elided_raise_try_exit_location(statement) {
+                // The raising arm cannot reach this exit. Removed assertions leave
+                // the condition's false edge as the original jump's sole donor.
+                self.assembler.set_location(location);
             } else if statement.orelse.is_empty()
                 && let Some(Stmt::If(nested)) = statement.body.last()
                 && let Some(test) = terminating_if_fallthrough_test(nested)

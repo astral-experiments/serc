@@ -438,7 +438,7 @@ impl Compiler<'_> {
     }
 
     /// Exposes a terminal case conditional hidden by optimizer-elided statements.
-    fn terminal_match_case_body<'b>(&self, body: &'b [Stmt]) -> &'b [Stmt] {
+    pub(super) fn terminal_match_case_body<'b>(&self, body: &'b [Stmt]) -> &'b [Stmt] {
         if self.context.python_version < PythonVersion::Py314
             || !matches!(self.unit.scope, Scope::Function { .. })
             || self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) != 0

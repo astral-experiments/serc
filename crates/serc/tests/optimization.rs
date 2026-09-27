@@ -55,6 +55,20 @@ fn elided_non_final_disjunction_keeps_backedge_copy_order() {
 }
 
 #[test]
+fn erased_assertions_preserve_raising_try_guard_exit_locations() {
+    for scope in ["def", "async def"] {
+        for condition in ["flag", "not flag", "flag or other"] {
+            for suffix in ["", "        assert flag\n        assert other, explain()\n"] {
+                let source = format!(
+                    "{scope} f(flag, other):\n    try:\n        if {condition}:\n            raise ValueError(flag) from other\n{suffix}    except Exception:\n        recover()\n    finish()\n"
+                );
+                assert_matches_cpython(&source, "erased_raising_guard_exit.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
 fn nested_assignment_joins_preserve_nops_before_elided_else() {
     for prefix in ["", "        value = 0\n", "        work()\n"] {
         for true_arm in ["assert b", "value = 1"] {
@@ -6612,6 +6626,36 @@ fn elided_assertions_after_terminal_comprehension_branches_match_cpython() {
 }
 
 #[test]
+fn elided_assertions_after_comprehension_branches_keep_store_return_locations() {
+    for prefix in ["", "async "] {
+        for comprehension in [
+            "[item for item in items]",
+            "{item for item in items}",
+            "{item: item for item in items}",
+            "[\n            item\n            for item in items\n        ]",
+        ] {
+            for branch_tail in ["", "        assert result\n"] {
+                let source = format!(
+                    "{prefix}def f(items, flag):\n    if flag:\n        result = {comprehension}\n{branch_tail}    assert flag\n"
+                );
+                assert_matches_cpython(&source, "comprehension_branch_return.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn comprehension_branches_preserve_sibling_return_donors() {
+    for source in [
+        "def f(items, flag, other):\n    if flag:\n        result = [item for item in items]\n        assert result\n    else:\n        if other:\n            if flag:\n                work()\n        assert flag\n    assert flag\n",
+        "async def f(items, flag, other):\n    if flag:\n        result = [item for item in items]\n    else:\n        if other:\n            work()\n        else:\n            more()\n        assert flag\n    assert flag\n",
+        "async def f(items, flag):\n    if flag:\n        result = [item for item in items]\n    else:\n        global token\n    assert flag\n",
+    ] {
+        assert_matches_cpython(source, "comprehension_sibling_return.py", &LEVELS);
+    }
+}
+
+#[test]
 fn elided_assertions_preserve_terminal_branch_comprehension_returns() {
     for source in [
         r"def f(flag, xs):
@@ -7091,6 +7135,82 @@ print(outcome, events)
                 );
             }
         }
+    }
+}
+
+#[test]
+fn terminal_matches_before_erased_assertions_keep_case_returns() {
+    for (case, source) in [
+        "def f(a, b):\n    match a:\n        case 1:\n            if b:\n                action()\n            assert b\n    assert a\n",
+        "async def f(a, b):\n    match a:\n        case 1:\n            if b:\n                action()\n            assert b\n    assert a\n",
+        "async def f(a, b):\n    await action()\n    match a:\n        case 1:\n            if (value := action()):\n                consume(value)\n            assert b\n        case 2:\n            action()\n    assert a\n",
+        "async def f(a, b):\n    match a:\n        case 1:\n            action()\n        case _:\n            if b:\n                action()\n            assert b\n    assert a\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython_versions(
+            source,
+            &format!("terminal_match_before_assertions_{case}.py"),
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
+fn nonlinear_wildcard_match_tails_preserve_false_edge_returns() {
+    for prefix in ["def", "async def"] {
+        for (case, tail) in [
+            "assert b",
+            "global token",
+            "global token\n            assert b",
+            "assert b\n            global token",
+            "value: int",
+            "(value): int",
+            "nonlocal token",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = format!(
+                "{prefix} f(a, b, c):\n    match a:\n        case 1:\n            action()\n        case _:\n            if b:\n                if c:\n                    action()\n                action()\n            {tail}\n    assert a\n"
+            );
+            let source = if tail == "nonlocal token" {
+                format!(
+                    "def outer():\n    token = 0\n    {}",
+                    source.replace('\n', "\n    ")
+                )
+            } else {
+                source
+            };
+            assert_matches_cpython_versions(
+                &source,
+                &format!("nonlinear_wildcard_match_tail_{case}.py"),
+                &LEVELS,
+                &[PythonVersion::Py314, PythonVersion::Py315],
+            );
+        }
+    }
+}
+
+#[test]
+fn nonlinear_match_cases_keep_their_shared_exits() {
+    for (case, source) in [
+        "def f(a, b, c, d, obj, items, cm):\n    match a:\n        case 1:\n            action()\n        case _:\n            if b:\n                if c:\n                    action()\n                action()\n            while b:\n                action()\n            assert b\n    assert a\n",
+        "async def f(a, b, c, d, obj, items, cm):\n    match a:\n        case 1:\n            action()\n        case _:\n            if b:\n                if c:\n                    action()\n                action()\n            while b:\n                action()\n            assert b\n    assert a\n",
+        "async def f(a, b, c, d, obj, items, cm):\n    match a:\n        case 1:\n            if a:\n                value = 1\n            else:\n                if b:\n                    if c:\n                        value = 2\n                    else:\n                        value = 3\n                else:\n                    value = 4\n                assert value\n    assert a\n",
+        "async def f(a, b, c, d, obj, items, cm):\n    match a:\n        case 1:\n            action()\n        case _:\n            if a:\n                value = 1\n            else:\n                if b:\n                    if c:\n                        value = 2\n                    else:\n                        value = 3\n                else:\n                    value = 4\n                assert value\n    assert a\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython_versions(
+            source,
+            &format!("nonlinear_match_case_{case}.py"),
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
     }
 }
 
