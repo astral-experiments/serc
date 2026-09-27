@@ -1439,6 +1439,14 @@ impl Assembler {
         self.original_scope_exit_labels.insert(label);
     }
 
+    /// Certifies the current authored join without introducing a new boundary.
+    pub(crate) fn record_current_original_scope_exit(&mut self) {
+        if let Some(Item::Label(label)) = self.linear_items().last() {
+            let label = *label;
+            self.record_original_scope_exit(label);
+        }
+    }
+
     /// Restores an unlocated Boolean exit while retaining any early-folded location fallback.
     pub(crate) fn prepare_loop_tail_discard(&mut self, preserve_folded_location: bool) {
         let instruction = self.required_last_instruction_mut("preparing a loop-tail discard");

@@ -23,6 +23,50 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn nested_assignment_joins_preserve_nops_before_elided_else() {
+    for prefix in ["", "        value = 0\n", "        work()\n"] {
+        for true_arm in ["assert b", "value = 1"] {
+            for continuation in ["work()", "return value"] {
+                let source = format!(
+                    "def f(a, b):\n    if a:\n{prefix}        if b:\n            {true_arm}\n        else:\n            value = 2\n    else:\n        assert a\n    {continuation}\n"
+                );
+                assert_matches_cpython(&source, "nested_assignment_join.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn elided_else_preserves_the_original_legacy_scope_footer() {
+    for condition in ["b", "b and c", "not (b and c)"] {
+        for body in ["assert b", "obj.action()"] {
+            let source = format!(
+                "def f(a, b, c, obj):\n    if a:\n        assert a\n    if {condition}:\n        {body}\n    else:\n        assert c\n"
+            );
+            assert_matches_cpython(&source, "elided_else_scope_footer.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
+fn terminal_finally_and_loop_preserves_returns_before_removed_assertions() {
+    for (index, source) in [
+        "def f(a, b):\n    try:\n        action()\n    finally:\n        while a and b:\n            action()\n    assert a\n",
+        "def f(a, b, c):\n    try:\n        value = action()\n    finally:\n        while a and b and c:\n            b = step()\n    assert a\n    assert b\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython_versions(
+            source,
+            &format!("finally_and_assert_return_{index}.py"),
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn erased_assertion_gaps_preserve_conditional_join_nops() {
     for gap in [
         "",
@@ -390,6 +434,27 @@ fn with_conditional_exit_before_removed_assertion() {
         assert_matches_cpython(
             &source,
             &format!("with_conditional_exit_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
+fn nested_assignment_exits_survive_removed_assertions() {
+    for (index, source) in [
+        "def f(a,b,c):\n    if a:\n        value=1\n    else:\n        if b:\n            if c:\n                value=2\n            else:\n                value=3\n        else:\n            value=4\n        assert value\n",
+        "def f(a,b,c):\n    if a:\n        value = choose(1)\n        assert value\n    else:\n        value = choose(2)\n        if b:\n            value = choose(3)\n            if a == 1:\n                value = choose(4)\n            elif a == 2:\n                value = choose(5)\n            else:\n                value = choose(6)\n        else:\n            value = choose(7)\n        assert value\n",
+        "def f(a,b,c):\n    value = choose(0)\n    assert value\n    if a:\n        value = 1\n        assert value\n    else:\n        value = 2\n        if b and c:\n            value = 3\n            if a == 1:\n                value = 4\n            elif a == 2:\n                value = 5\n            else:\n                value = 6\n        else:\n            value = 7\n        assert value\n",
+        "def f(a,b,c,obj,items):\n    if a:\n        value=1\n    else:\n        if b:\n            if c: value=2\n            else: value=3\n        else:\n            value=4\n        assert value\n",
+        "def f(a,b,c):\n    if a:\n        value=1\n    else:\n        if b:\n            if c:\n                value=2\n            else:\n                value=3\n        else:\n            value=4\n",
+        "def f(a,b):\n    if a:\n        if b:\n            value=1\n        else:\n            value=2\n    else:\n        value=3\n    assert value\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            source,
+            &format!("nested_assignment_exit_{index}.py"),
             &LEVELS,
         );
     }
@@ -967,15 +1032,12 @@ print(json.dumps(rows))
                 );
                 let mut outputs = Vec::new();
                 for payload in [&native.stdout, &actual] {
-                    let mut child = Command::new(ORACLES[index].get().unwrap())
-                        .args(["-I", "-S", "-B", "-c", TRACE])
-                        .stdin(Stdio::piped())
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped())
-                        .spawn()
-                        .unwrap();
-                    child.stdin.take().unwrap().write_all(payload).unwrap();
-                    let result = child.wait_with_output().unwrap();
+                    let result = run_with_input(
+                        Command::new(ORACLES[index].get().unwrap())
+                            .args(["-I", "-S", "-B", "-c", TRACE])
+                            .stdout(Stdio::piped()),
+                        payload,
+                    );
                     assert!(
                         result.status.success(),
                         "{python_version}, {optimization_level:?}: status {}, {}",
@@ -1165,15 +1227,12 @@ print(json.dumps(rows))
                 );
                 let mut outputs = Vec::new();
                 for payload in [&native.stdout, &actual] {
-                    let mut child = Command::new(ORACLES[index].get().unwrap())
-                        .args(["-I", "-S", "-B", "-c", trace])
-                        .stdin(Stdio::piped())
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped())
-                        .spawn()
-                        .unwrap();
-                    child.stdin.take().unwrap().write_all(payload).unwrap();
-                    let result = child.wait_with_output().unwrap();
+                    let result = run_with_input(
+                        Command::new(ORACLES[index].get().unwrap())
+                            .args(["-I", "-S", "-B", "-c", trace])
+                            .stdout(Stdio::piped()),
+                        payload,
+                    );
                     assert!(
                         result.status.success(),
                         "{python_version}, {optimization_level:?}: status {}, {}",
@@ -1322,15 +1381,12 @@ finally:
         .marshal();
         assert_eq!(actual, native.stdout, "{optimization_level:?}");
         for code in [&native.stdout, &actual] {
-            let mut child = Command::new(ORACLES[1].get().unwrap())
-                .args(["-I", "-S", "-B", "-c", TRACE])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap();
-            child.stdin.take().unwrap().write_all(code).unwrap();
-            let result = child.wait_with_output().unwrap();
+            let result = run_with_input(
+                Command::new(ORACLES[1].get().unwrap())
+                    .args(["-I", "-S", "-B", "-c", TRACE])
+                    .stdout(Stdio::piped()),
+                code,
+            );
             assert!(
                 result.status.success(),
                 "{optimization_level:?}: {}",
@@ -1422,15 +1478,12 @@ if events != ['enter', 'work', 'cleanup', 'exit:None'] or result is not None:
         .marshal();
         assert_eq!(actual, native.stdout, "{optimization_level:?}");
         for code in [&native.stdout, &actual] {
-            let mut child = Command::new(ORACLES[1].get().unwrap())
-                .args(["-I", "-S", "-B", "-c", TRACE])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap();
-            child.stdin.take().unwrap().write_all(code).unwrap();
-            let result = child.wait_with_output().unwrap();
+            let result = run_with_input(
+                Command::new(ORACLES[1].get().unwrap())
+                    .args(["-I", "-S", "-B", "-c", TRACE])
+                    .stdout(Stdio::piped()),
+                code,
+            );
             assert!(
                 result.status.success(),
                 "{optimization_level:?}: {}",
@@ -1529,14 +1582,11 @@ finally:
                 "{python_version}, {optimization_level:?}"
             );
             for code in [&native.stdout, &actual] {
-                let mut child = Command::new(ORACLES[index].get().unwrap())
-                    .args(["-I", "-S", "-B", "-c", TRACE])
-                    .stdin(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .unwrap();
-                child.stdin.take().unwrap().write_all(code).unwrap();
-                let result = child.wait_with_output().unwrap();
+                let result = run_with_input(
+                    Command::new(ORACLES[index].get().unwrap())
+                        .args(["-I", "-S", "-B", "-c", TRACE]),
+                    code,
+                );
                 assert!(
                     result.status.success(),
                     "{python_version}, {optimization_level:?}: {}",
@@ -1644,15 +1694,12 @@ print(json.dumps(rows))
         assert_eq!(actual, native.stdout, "{optimization_level:?}");
         let mut outputs = Vec::new();
         for payload in [&native.stdout, &actual] {
-            let mut child = Command::new(ORACLES[1].get().unwrap())
-                .args(["-I", "-S", "-B", "-c", TRACE])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap();
-            child.stdin.take().unwrap().write_all(payload).unwrap();
-            let result = child.wait_with_output().unwrap();
+            let result = run_with_input(
+                Command::new(ORACLES[1].get().unwrap())
+                    .args(["-I", "-S", "-B", "-c", TRACE])
+                    .stdout(Stdio::piped()),
+                payload,
+            );
             assert!(
                 result.status.success(),
                 "{}",
@@ -1796,15 +1843,12 @@ monitor.free_tool_id(5)
                 "{python_version}, {optimization_level:?}"
             );
             for code in [&native.stdout, &actual] {
-                let mut child = Command::new(ORACLES[index].get().unwrap())
-                    .args(["-I", "-S", "-B", "-c", TRACE])
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .unwrap();
-                child.stdin.take().unwrap().write_all(code).unwrap();
-                let result = child.wait_with_output().unwrap();
+                let result = run_with_input(
+                    Command::new(ORACLES[index].get().unwrap())
+                        .args(["-I", "-S", "-B", "-c", TRACE])
+                        .stdout(Stdio::piped()),
+                    code,
+                );
                 assert!(
                     result.status.success(),
                     "{python_version}, {optimization_level:?}: {}",
@@ -1900,19 +1944,16 @@ monitor.free_tool_id(5)
                     "{optimization_level:?}, {generator}, {has_sibling}"
                 );
                 for code in [&native.stdout, &actual] {
-                    let mut child = Command::new(ORACLES[0].get().unwrap())
-                        .args(["-I", "-S", "-B", "-c", TRACE])
-                        .args([
-                            if generator { "1" } else { "0" },
-                            if has_sibling { "1" } else { "0" },
-                        ])
-                        .stdin(Stdio::piped())
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped())
-                        .spawn()
-                        .unwrap();
-                    child.stdin.take().unwrap().write_all(code).unwrap();
-                    let result = child.wait_with_output().unwrap();
+                    let result = run_with_input(
+                        Command::new(ORACLES[0].get().unwrap())
+                            .args(["-I", "-S", "-B", "-c", TRACE])
+                            .args([
+                                if generator { "1" } else { "0" },
+                                if has_sibling { "1" } else { "0" },
+                            ])
+                            .stdout(Stdio::piped()),
+                        code,
+                    );
                     assert!(
                         result.status.success(),
                         "{optimization_level:?}, {generator}, {has_sibling}: {}",
@@ -2036,15 +2077,12 @@ monitor.free_tool_id(5)
                             continue;
                         }
                         for code in [&native.stdout, &actual] {
-                            let mut child = Command::new(ORACLES[index].get().unwrap())
-                                .args(["-I", "-S", "-B", "-c", TRACE, &marker.to_string()])
-                                .stdin(Stdio::piped())
-                                .stdout(Stdio::piped())
-                                .stderr(Stdio::piped())
-                                .spawn()
-                                .unwrap();
-                            child.stdin.take().unwrap().write_all(code).unwrap();
-                            let result = child.wait_with_output().unwrap();
+                            let result = run_with_input(
+                                Command::new(ORACLES[index].get().unwrap())
+                                    .args(["-I", "-S", "-B", "-c", TRACE, &marker.to_string()])
+                                    .stdout(Stdio::piped()),
+                                code,
+                            );
                             assert!(
                                 result.status.success(),
                                 "{}",
@@ -2225,15 +2263,12 @@ print(json.dumps('ok'))
             .unwrap()
             .marshal();
             for bytes in [&native.stdout[..], &actual] {
-                let mut child = Command::new(ORACLES[index].get().unwrap())
-                    .args(["-I", "-S", "-c", TRACE])
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .unwrap();
-                child.stdin.take().unwrap().write_all(bytes).unwrap();
-                let output = child.wait_with_output().unwrap();
+                let output = run_with_input(
+                    Command::new(ORACLES[index].get().unwrap())
+                        .args(["-I", "-S", "-c", TRACE])
+                        .stdout(Stdio::piped()),
+                    bytes,
+                );
                 assert!(
                     output.status.success(),
                     "{}",
@@ -2372,14 +2407,10 @@ monitor.free_tool_id(5)
         .marshal();
         assert_eq!(actual, native.stdout);
         for payload in [&native.stdout, &actual] {
-            let mut child = Command::new(ORACLES[0].get().unwrap())
-                .args(["-I", "-S", "-B", "-c", TRACE])
-                .stdin(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap();
-            child.stdin.take().unwrap().write_all(payload).unwrap();
-            let result = child.wait_with_output().unwrap();
+            let result = run_with_input(
+                Command::new(ORACLES[0].get().unwrap()).args(["-I", "-S", "-B", "-c", TRACE]),
+                payload,
+            );
             assert!(
                 result.status.success(),
                 "{}",
@@ -2465,14 +2496,10 @@ monitor.free_tool_id(5)
         .marshal();
         assert_eq!(actual, native.stdout);
         for payload in [&native.stdout, &actual] {
-            let mut child = Command::new(ORACLES[0].get().unwrap())
-                .args(["-I", "-S", "-B", "-c", TRACE])
-                .stdin(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap();
-            child.stdin.take().unwrap().write_all(payload).unwrap();
-            let result = child.wait_with_output().unwrap();
+            let result = run_with_input(
+                Command::new(ORACLES[0].get().unwrap()).args(["-I", "-S", "-B", "-c", TRACE]),
+                payload,
+            );
             assert!(
                 result.status.success(),
                 "{}",
@@ -2706,14 +2733,10 @@ if events != ['finish']:
             .marshal();
             assert_eq!(actual, native.stdout);
             for payload in [&native.stdout, &actual] {
-                let mut child = Command::new(ORACLES[index].get().unwrap())
-                    .args(["-I", "-S", "-c", TRACE])
-                    .stdin(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .unwrap();
-                child.stdin.take().unwrap().write_all(payload).unwrap();
-                let result = child.wait_with_output().unwrap();
+                let result = run_with_input(
+                    Command::new(ORACLES[index].get().unwrap()).args(["-I", "-S", "-c", TRACE]),
+                    payload,
+                );
                 assert!(
                     result.status.success(),
                     "{python_version:?} {optimization_level:?}: {}",
@@ -3104,15 +3127,12 @@ print(json.dumps(events))
         .unwrap()
         .marshal();
         let execute = |bytes: &[u8]| {
-            let mut child = Command::new(ORACLES[0].get().unwrap())
-                .args(["-I", "-S", "-c", TRACE])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap();
-            child.stdin.take().unwrap().write_all(bytes).unwrap();
-            child.wait_with_output().unwrap()
+            run_with_input(
+                Command::new(ORACLES[0].get().unwrap())
+                    .args(["-I", "-S", "-c", TRACE])
+                    .stdout(Stdio::piped()),
+                bytes,
+            )
         };
         for result in [execute(&native.stdout), execute(&actual)] {
             assert!(
@@ -3158,6 +3178,84 @@ def f(items):
 ",
     ] {
         assert_matches_cpython(source, "elided_boolean_loop_tail.py", &LEVELS);
+    }
+}
+
+#[test]
+fn non_final_loop_branches_with_elided_else_keep_copied_exits() {
+    for source in [
+        r"
+def f(a,b,c):
+    for x in a:
+        if c:
+            if a and b:
+                assert a
+            else:
+                assert b
+        else:
+            a=b
+",
+        r"
+def f(items,a,b,c,d,obj):
+    for x in items:
+        if c:
+            if a and b:
+                obj.action()
+            else:
+                assert b
+        else:
+            a=d
+",
+        r"
+def f(items,a,b,c,d,obj):
+    for x in items:
+        if c:
+            if a:
+                obj.action()
+            elif a and b:
+                obj.action()
+            else:
+                assert b
+        else:
+            a=d
+",
+        r"
+def f(items,a,b,c,d,obj):
+    while items:
+        if c:
+            if a and b:
+                obj.action()
+            else:
+                assert b
+        else:
+            a=d
+",
+        r"
+def f(a,b,c):
+    for x in a:
+        if c:
+            if a and b:
+                pass
+            else:
+                assert b
+        else:
+            a=b
+",
+        r"
+def f(items,a,b,c,d,obj,cm):
+    for x in items:
+        if c:
+            if a or b:
+                obj.action()
+            else:
+                assert a
+        else:
+            obj.action()
+    else:
+        obj.action()
+",
+    ] {
+        assert_matches_cpython(source, "non_final_elided_loop_else.py", &LEVELS);
     }
 }
 
@@ -3602,15 +3700,12 @@ for name, injected, expected in [
             ("native", native.stdout.as_slice()),
             ("serc", actual.as_slice()),
         ] {
-            let mut child = Command::new(ORACLES[index].get().unwrap())
-                .args(["-I", "-S", "-X", "utf8", "-c", TRACE_JOIN])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap();
-            child.stdin.take().unwrap().write_all(payload).unwrap();
-            let result = child.wait_with_output().unwrap();
+            let result = run_with_input(
+                Command::new(ORACLES[index].get().unwrap())
+                    .args(["-I", "-S", "-X", "utf8", "-c", TRACE_JOIN])
+                    .stdout(Stdio::piped()),
+                payload,
+            );
             assert!(
                 result.status.success(),
                 "{level:?}, {label}: {}",
@@ -3743,16 +3838,13 @@ for prefix, line, argument, expected in cases:
                     .position(|(candidate, _, _)| *candidate == version)
                     .unwrap();
                 for (label, payload) in [("native", &native.stdout), ("serc", &actual)] {
-                    let mut child = Command::new(ORACLES[index].get().unwrap())
-                        .args(["-I", "-S", "-B", "-c", TRACE])
-                        .args(&lines)
-                        .stdin(Stdio::piped())
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped())
-                        .spawn()
-                        .unwrap();
-                    child.stdin.take().unwrap().write_all(payload).unwrap();
-                    let result = child.wait_with_output().unwrap();
+                    let result = run_with_input(
+                        Command::new(ORACLES[index].get().unwrap())
+                            .args(["-I", "-S", "-B", "-c", TRACE])
+                            .args(&lines)
+                            .stdout(Stdio::piped()),
+                        payload,
+                    );
                     assert!(
                         result.status.success(),
                         "{version}, {level:?}, {label}: {}",
@@ -3922,15 +4014,12 @@ if hits != [target] or values != [1] or events != ['enter', 'recover', 'exit:non
                     .position(|(candidate, _, _)| *candidate == version)
                     .unwrap();
                 for (label, bytes) in [("native", &native.stdout), ("serc", &actual)] {
-                    let mut child = Command::new(ORACLES[index].get().unwrap())
-                        .args(["-I", "-S", "-B", "-c", TRACE, target_line, argument])
-                        .stdin(Stdio::piped())
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped())
-                        .spawn()
-                        .unwrap();
-                    child.stdin.take().unwrap().write_all(bytes).unwrap();
-                    let result = child.wait_with_output().unwrap();
+                    let result = run_with_input(
+                        Command::new(ORACLES[index].get().unwrap())
+                            .args(["-I", "-S", "-B", "-c", TRACE, target_line, argument])
+                            .stdout(Stdio::piped()),
+                        bytes,
+                    );
                     assert!(
                         result.status.success(),
                         "{version}, {level:?}, {label}: {}",
@@ -3953,6 +4042,16 @@ import marshal, sys
 code = compile(sys.stdin.buffer.read(), sys.argv[2], 'exec', dont_inherit=True, optimize=int(sys.argv[1]))
 sys.stdout.buffer.write(marshal.dumps(code))
 ";
+
+fn run_with_input(command: &mut Command, input: &[u8]) -> Output {
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    child.wait_with_output().unwrap()
+}
 
 fn oracle(
     source: &[u8],
@@ -5339,14 +5438,11 @@ monitor.free_tool_id(5)
                 .unwrap()
                 .marshal();
                 for code in [&native.stdout, &actual] {
-                    let mut child = Command::new(ORACLES[index].get().unwrap())
-                        .args(["-I", "-S", "-B", "-c", TRACE, mode])
-                        .stdin(Stdio::piped())
-                        .stderr(Stdio::piped())
-                        .spawn()
-                        .unwrap();
-                    child.stdin.take().unwrap().write_all(code).unwrap();
-                    let result = child.wait_with_output().unwrap();
+                    let result = run_with_input(
+                        Command::new(ORACLES[index].get().unwrap())
+                            .args(["-I", "-S", "-B", "-c", TRACE, mode]),
+                        code,
+                    );
                     assert!(
                         result.status.success(),
                         "{python_version}, {optimization_level:?}, {mode}: {}",
@@ -5436,14 +5532,11 @@ monitor.free_tool_id(5)
                 "{python_version}, {optimization_level:?}"
             );
             for code in [&native.stdout, &actual] {
-                let mut child = Command::new(ORACLES[index].get().unwrap())
-                    .args(["-I", "-S", "-B", "-c", TRACE])
-                    .stdin(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .unwrap();
-                child.stdin.take().unwrap().write_all(code).unwrap();
-                let result = child.wait_with_output().unwrap();
+                let result = run_with_input(
+                    Command::new(ORACLES[index].get().unwrap())
+                        .args(["-I", "-S", "-B", "-c", TRACE]),
+                    code,
+                );
                 assert!(
                     result.status.success(),
                     "{python_version}, {optimization_level:?}: {}",
@@ -5792,15 +5885,12 @@ print(json.dumps(events))
             .marshal();
             let mut outputs = Vec::new();
             for payload in [&native.stdout, &actual] {
-                let mut child = Command::new(ORACLES[index].get().unwrap())
-                    .args(["-I", "-S", "-B", "-c", TRACE])
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .unwrap();
-                child.stdin.take().unwrap().write_all(payload).unwrap();
-                let result = child.wait_with_output().unwrap();
+                let result = run_with_input(
+                    Command::new(ORACLES[index].get().unwrap())
+                        .args(["-I", "-S", "-B", "-c", TRACE])
+                        .stdout(Stdio::piped()),
+                    payload,
+                );
                 assert!(
                     result.status.success(),
                     "{}",
@@ -5894,15 +5984,12 @@ print(json.dumps(events))
                     .unwrap()
                     .marshal();
                 let execute = |bytes: &[u8]| {
-                    let mut child = Command::new(ORACLES[index].get().unwrap())
-                        .args(["-I", "-S", "-c", TRACE_BACKEDGE])
-                        .stdin(Stdio::piped())
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped())
-                        .spawn()
-                        .unwrap();
-                    child.stdin.take().unwrap().write_all(bytes).unwrap();
-                    child.wait_with_output().unwrap()
+                    run_with_input(
+                        Command::new(ORACLES[index].get().unwrap())
+                            .args(["-I", "-S", "-c", TRACE_BACKEDGE])
+                            .stdout(Stdio::piped()),
+                        bytes,
+                    )
                 };
                 let expected_run = execute(&native.stdout);
                 let actual_run = execute(&actual);
@@ -6212,16 +6299,13 @@ print(outcome)
                         &b"escaped\n"[..]
                     };
                     for code in [&native.stdout, &actual] {
-                        let mut child = Command::new(ORACLES[index].get().unwrap())
-                            .args(["-I", "-S", "-B", "-c", TRACE_CONDITION])
-                            .arg(condition_line.to_string())
-                            .stdin(Stdio::piped())
-                            .stdout(Stdio::piped())
-                            .stderr(Stdio::piped())
-                            .spawn()
-                            .unwrap();
-                        child.stdin.take().unwrap().write_all(code).unwrap();
-                        let result = child.wait_with_output().unwrap();
+                        let result = run_with_input(
+                            Command::new(ORACLES[index].get().unwrap())
+                                .args(["-I", "-S", "-B", "-c", TRACE_CONDITION])
+                                .arg(condition_line.to_string())
+                                .stdout(Stdio::piped()),
+                            code,
+                        );
                         assert!(
                             result.status.success(),
                             "{}",
@@ -6598,15 +6682,12 @@ finally:
                 ("native", expected.stdout.as_slice()),
                 ("serc", actual.as_slice()),
             ] {
-                let mut child = Command::new(ORACLES[index].get().unwrap())
-                    .args(["-I", "-S", "-X", "utf8", "-c", TRACE_ORACLE])
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .unwrap();
-                child.stdin.take().unwrap().write_all(payload).unwrap();
-                let result = child.wait_with_output().unwrap();
+                let result = run_with_input(
+                    Command::new(ORACLES[index].get().unwrap())
+                        .args(["-I", "-S", "-X", "utf8", "-c", TRACE_ORACLE])
+                        .stdout(Stdio::piped()),
+                    payload,
+                );
                 assert!(
                     result.status.success(),
                     "{version}, {level:?}, {label}: {}",
@@ -6689,15 +6770,12 @@ for value in (False, True):
                 ("native", expected.stdout.as_slice()),
                 ("serc", actual.as_slice()),
             ] {
-                let mut child = Command::new(ORACLES[index].get().unwrap())
-                    .args(["-I", "-S", "-X", "utf8", "-c", TRACE_ORACLE])
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .unwrap();
-                child.stdin.take().unwrap().write_all(payload).unwrap();
-                let result = child.wait_with_output().unwrap();
+                let result = run_with_input(
+                    Command::new(ORACLES[index].get().unwrap())
+                        .args(["-I", "-S", "-X", "utf8", "-c", TRACE_ORACLE])
+                        .stdout(Stdio::piped()),
+                    payload,
+                );
                 assert!(
                     result.status.success(),
                     "{version}, {level:?}, {label}: {}",
@@ -6927,16 +7005,13 @@ print(outcome, events)
             .unwrap()
             .marshal();
             for code in [&native.stdout, &actual] {
-                let mut child = Command::new(ORACLES[2].get().unwrap())
-                    .args(["-I", "-S", "-B", "-c", TRACE_CONDITION])
-                    .arg(line.to_string())
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .unwrap();
-                child.stdin.take().unwrap().write_all(code).unwrap();
-                let result = child.wait_with_output().unwrap();
+                let result = run_with_input(
+                    Command::new(ORACLES[2].get().unwrap())
+                        .args(["-I", "-S", "-B", "-c", TRACE_CONDITION])
+                        .arg(line.to_string())
+                        .stdout(Stdio::piped()),
+                    code,
+                );
                 assert!(
                     result.status.success(),
                     "{}",
@@ -7161,14 +7236,10 @@ assert events == ['caught'], events
             .marshal();
             assert_eq!(actual, native.stdout, "{version} {optimization_level:?}");
             for payload in [&native.stdout, &actual] {
-                let mut child = Command::new(ORACLES[index].get().unwrap())
-                    .args(["-I", "-S", "-c", TRACE])
-                    .stdin(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .unwrap();
-                child.stdin.take().unwrap().write_all(payload).unwrap();
-                let result = child.wait_with_output().unwrap();
+                let result = run_with_input(
+                    Command::new(ORACLES[index].get().unwrap()).args(["-I", "-S", "-c", TRACE]),
+                    payload,
+                );
                 assert!(
                     result.status.success(),
                     "{version} {optimization_level:?}: {}",
@@ -7340,14 +7411,10 @@ for name, expected in [
             .position(|(version, _, _)| *version == PythonVersion::Py314)
             .unwrap();
         for payload in [&native.stdout, &actual] {
-            let mut child = Command::new(ORACLES[index].get().unwrap())
-                .args(["-I", "-S", "-c", TRACE])
-                .stdin(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap();
-            child.stdin.take().unwrap().write_all(payload).unwrap();
-            let result = child.wait_with_output().unwrap();
+            let result = run_with_input(
+                Command::new(ORACLES[index].get().unwrap()).args(["-I", "-S", "-c", TRACE]),
+                payload,
+            );
             assert!(
                 result.status.success(),
                 "{level:?}: {}",
@@ -7482,14 +7549,10 @@ for name, flag, expected in (
                 .position(|(candidate, _, _)| *candidate == version)
                 .unwrap();
             for payload in [&native.stdout, &actual] {
-                let mut child = Command::new(ORACLES[index].get().unwrap())
-                    .args(["-I", "-S", "-c", TRACE])
-                    .stdin(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .unwrap();
-                child.stdin.take().unwrap().write_all(payload).unwrap();
-                let result = child.wait_with_output().unwrap();
+                let result = run_with_input(
+                    Command::new(ORACLES[index].get().unwrap()).args(["-I", "-S", "-c", TRACE]),
+                    payload,
+                );
                 assert!(
                     result.status.success(),
                     "{version:?} {level:?}: {}",
@@ -7615,14 +7678,10 @@ for name, offset, args, expected in [
                 .position(|(target, _, _)| *target == version)
                 .unwrap();
             for payload in [&native.stdout, &actual] {
-                let mut child = Command::new(ORACLES[index].get().unwrap())
-                    .args(["-I", "-S", "-c", TRACE])
-                    .stdin(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .unwrap();
-                child.stdin.take().unwrap().write_all(payload).unwrap();
-                let result = child.wait_with_output().unwrap();
+                let result = run_with_input(
+                    Command::new(ORACLES[index].get().unwrap()).args(["-I", "-S", "-c", TRACE]),
+                    payload,
+                );
                 assert!(
                     result.status.success(),
                     "{version:?} {level:?}: {}",
@@ -7744,14 +7803,10 @@ for target, expected in (
         .marshal();
         assert_eq!(actual, native.stdout);
         for payload in [&native.stdout, &actual] {
-            let mut child = Command::new(ORACLES[2].get().unwrap())
-                .args(["-I", "-S", "-c", TRACE])
-                .stdin(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap();
-            child.stdin.take().unwrap().write_all(payload).unwrap();
-            let result = child.wait_with_output().unwrap();
+            let result = run_with_input(
+                Command::new(ORACLES[2].get().unwrap()).args(["-I", "-S", "-c", TRACE]),
+                payload,
+            );
             assert!(
                 result.status.success(),
                 "{level:?}: {}",
