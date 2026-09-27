@@ -12,7 +12,7 @@ use crate::target::opcodes::{
     CALL, CALL_FUNCTION_EX, CALL_INTRINSIC_1, COMPARE_OP, CONTAINS_OP, COPY, COPY_FREE_VARS, IS_OP,
     JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD, LOAD_CLOSURE, LOAD_CONST, LOAD_FAST,
     LOAD_FAST_LOAD_FAST, LOAD_GLOBAL, MAKE_CELL, NOP, POP_TOP, PUSH_NULL, RERAISE, RESUME,
-    RETURN_CONST, RETURN_GENERATOR, RETURN_VALUE, STORE_FAST, STORE_FAST_LOAD_FAST,
+    RETURN_CONST, RETURN_GENERATOR, RETURN_VALUE, SEND, STORE_FAST, STORE_FAST_LOAD_FAST,
     STORE_FAST_STORE_FAST, TO_BOOL, UNARY_NOT, YIELD_VALUE,
 };
 use crate::target::{is_conditional_jump_for, is_unconditional_jump};
@@ -1754,6 +1754,41 @@ impl OptimizationPipeline {
             // The handler's cleanup SETUP is its first instruction. A body
             // SETUP instead precedes its entry label in the preceding array.
             let owner = if Some(entry) == wrapper || handler_groups.contains(&position) {
+                position
+            } else if self
+                .exception_owner_provenance
+                .ordinary_await_cleanups
+                .iter()
+                .any(|region| region.start == entry && region.target == targets[&entry])
+            {
+                // SEND ends its native array. The following ordinary-await
+                // SETUP starts the fallthrough array, before YIELD_VALUE.
+                let previous = position.checked_sub(1)?;
+                let send = groups[previous]
+                    .iter()
+                    .rev()
+                    .find_map(|block| self.graph[*block].last_instruction())?;
+                let first = groups[position]
+                    .iter()
+                    .flat_map(|block| self.graph[*block].items())
+                    .find_map(|item| match item {
+                        Item::Instruction(instruction) => Some(instruction),
+                        Item::Label(_) => None,
+                    })?;
+                if send.opcode != SEND
+                    || first.opcode != YIELD_VALUE
+                    || !self
+                        .exception_owner_provenance
+                        .ordinary_await_ends
+                        .iter()
+                        .any(|await_end| {
+                            await_end.send == *send
+                                && await_end.cleanup.first() == Some(&Item::Label(targets[&entry]))
+                                && send.operand() == Operand::Forward(await_end.entry)
+                        })
+                {
+                    return None;
+                }
                 position
             } else {
                 let owner = position.checked_sub(1)?;
@@ -4101,6 +4136,110 @@ mod protected_repeated_backedge_tests {
                 ),
                 1 => assert!(found.unwrap().is_empty()),
                 _ => assert!(found.is_none()),
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_await_setup_requires_original_send_fallthrough() {
+        use crate::assembler::exception_owners::OrdinaryAwaitEnd;
+        use crate::target::opcodes::{CLEANUP_THROW, END_SEND};
+
+        for case in 0..7 {
+            let [
+                send_label,
+                yielded,
+                yielded_end,
+                cleanup,
+                end,
+                first,
+                second,
+                backedge,
+                exit,
+            ] = std::array::from_fn(|index| Label::from_u32(u32::try_from(index).unwrap()));
+            let normal = |opcode, value| {
+                Instruction::new(opcode, Operand::Value(value), SourceLocation::NONE, Some(0))
+            };
+            let forward = |opcode, target| {
+                Instruction::new(
+                    opcode,
+                    Operand::Forward(target),
+                    SourceLocation::NONE,
+                    Some(0),
+                )
+            };
+            let backward = |opcode, target| {
+                Instruction::new(
+                    opcode,
+                    Operand::Backward(target),
+                    SourceLocation::NONE,
+                    Some(0),
+                )
+            };
+            let send = forward(SEND, end);
+            let end_send = normal(END_SEND, 0);
+            let cleanup_instruction = normal(CLEANUP_THROW, 0);
+            let mut assembler = Assembler::from_linear_items(vec![
+                Item::Label(send_label),
+                Item::Instruction(send),
+                Item::Label(yielded),
+                Item::Instruction(normal(if case == 4 { NOP } else { YIELD_VALUE }, 1)),
+                Item::Label(yielded_end),
+                Item::Instruction(normal(RESUME, 3)),
+                Item::Instruction(backward(JUMP_BACKWARD_NO_INTERRUPT, send_label)),
+                Item::Label(cleanup),
+                Item::Instruction(cleanup_instruction),
+                Item::Label(end),
+                Item::Instruction(end_send),
+                Item::Label(first),
+                Item::Instruction(forward(POP_JUMP_IF_FALSE, second)),
+                Item::Label(second),
+                Item::Instruction(forward(POP_JUMP_IF_FALSE, exit)),
+                Item::Label(backedge),
+                Item::Instruction(backward(JUMP_BACKWARD, first)),
+                Item::Label(exit),
+                Item::Instruction(normal(RETURN_CONST, 0)),
+            ]);
+            assembler.python_version = PythonVersion::Py312;
+            assembler.next_label = 9;
+            assembler.add_exception_region(yielded, yielded_end, cleanup, 0, false);
+            assembler.record_exception_setup(yielded, false);
+            if case != 1 {
+                assembler.record_legacy_native_setup_target(yielded, cleanup);
+            }
+            if case == 2 {
+                assembler.record_legacy_native_setup_target(yielded, cleanup);
+            }
+            if case != 3 {
+                assembler
+                    .exception_owner_provenance
+                    .ordinary_await_cleanups
+                    .push(assembler.exception_regions[0]);
+            }
+            assembler
+                .exception_owner_provenance
+                .ordinary_await_ends
+                .push(OrdinaryAwaitEnd {
+                    send: if case == 5 { forward(SEND, exit) } else { send },
+                    entry: end,
+                    end_send,
+                    cleanup: vec![
+                        Item::Label(if case == 6 { exit } else { cleanup }),
+                        Item::Instruction(cleanup_instruction),
+                    ],
+                    bridge: None,
+                });
+            let pipeline = assembler.into_optimization_pipeline();
+            let arrays = pipeline.legacy_instruction_arrays();
+            let found = pipeline.legacy_repeated_tails_with_setups(&arrays);
+            if case == 0 {
+                assert!(found.unwrap().iter().any(|(block, _, ordinary, native)| {
+                    *block == pipeline.graph.label_block(backedge).unwrap()
+                        && *ordinary == 1
+                        && *native == 2
+                }));
+            } else {
+                assert!(found.is_none(), "case {case}");
             }
         }
     }

@@ -35567,12 +35567,12 @@ fn with_body_conditional_exit_location(
     if otherwise.test.is_some() {
         return None;
     }
-    let (terminal, fallthrough) = match (
+    let (terminal, fallthrough, fallthrough_truthiness) = match (
         suite_terminates(&statement.body),
         suite_terminates(&otherwise.body),
     ) {
-        (true, false) => (&statement.body, &otherwise.body),
-        (false, true) => (&otherwise.body, &statement.body),
+        (true, false) => (&statement.body, &otherwise.body, false),
+        (false, true) => (&otherwise.body, &statement.body, true),
         _ => return None,
     };
     if !matches!(terminal.last(), Some(Stmt::Return(_) | Stmt::Raise(_))) {
@@ -35613,6 +35613,36 @@ fn with_body_conditional_exit_location(
         if suite_terminates(selected) || !matches!(fallthrough.last(), Some(Stmt::With(_))) {
             return None;
         }
+    }
+    if compiler.context.python_version >= crate::PythonVersion::Py314
+        && matches!(compiler.unit.scope, Scope::Function { .. })
+        && compiler.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+        && compiler.control.loops.contexts.is_empty()
+        && !compiler.control.loops.suite_fallthrough_to_loop_backedge
+        // The current manager has already been popped; at most one outer owner remains.
+        && compiler.control.withs.active_with_exits.len() <= 1
+        && compiler.control.withs.active_with_region_exclusions.len() <= 1
+        && compiler
+            .control
+            .exceptions
+            .active_exception_region_exclusions
+            .is_empty()
+        && !compiler.control.in_exception_handler()
+        && compiler.control.exceptions.active_exception_group_handlers == 0
+        && compiler.control.finally.is_inactive_for_return_unwind()
+        && matches!(terminal.as_slice(), [Stmt::Raise(_)])
+        && !fallthrough.is_empty()
+        && fallthrough
+            .iter()
+            .all(|statement| compiler.context.is_elided_statement(statement))
+        && condition_has_linear_runtime_leaves(&statement.test)
+        && !expression_suspends_current_scope(&statement.test)
+        && original_condition_has_unique_jump_target(&statement.test, fallthrough_truthiness)
+    {
+        // The erased arm's sole original edge donates the test location to the
+        // manager's separate, ownerless POP_BLOCK before normal cleanup calls.
+        return unique_condition_jump_target(&statement.test, fallthrough_truthiness)
+            .map(Ranged::range);
     }
     match fallthrough.last()? {
         statement @ (Stmt::Expr(_) | Stmt::Assign(_) | Stmt::Pass(_)) => {

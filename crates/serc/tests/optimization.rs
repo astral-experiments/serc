@@ -23,6 +23,49 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn ordinary_await_preserves_repeated_condition_backedge_locations() {
+    for (before, inside, after) in [
+        ("    await a\n", "", ""),
+        ("", "        await a\n", ""),
+        ("", "", "    await a\n"),
+        ("    await a\n    await b\n", "", ""),
+    ] {
+        let source = format!(
+            "async def f(items, a, b):\n{before}    for item in items:\n{inside}        if a:\n            assert item\n        if b:\n            assert item\n{after}"
+        );
+        assert_matches_cpython(&source, "ordinary_await_backedge.py", &LEVELS);
+    }
+}
+
+#[test]
+fn sync_manager_preserves_elided_branch_pop_block() {
+    for (manager, indent) in [
+        ("    with cm:\n", "        "),
+        ("    with cm, other:\n", "        "),
+        ("    with cm:\n        with other:\n", "            "),
+    ] {
+        for prefix in [
+            "",
+            "try:\n    work()\nexcept ValueError:\n    recover()\nwork()\n",
+        ] {
+            for (true_arm, false_arm) in [
+                ("assert flag", "raise ValueError"),
+                ("raise ValueError", "assert flag"),
+            ] {
+                let body = format!("{prefix}if flag:\n    {true_arm}\nelse:\n    {false_arm}\n");
+                let mut source = format!("def f(cm, other, flag):\n{manager}");
+                for line in body.lines() {
+                    source.push_str(indent);
+                    source.push_str(line);
+                    source.push('\n');
+                }
+                assert_matches_cpython(&source, "manager_elided_receiver.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
 fn coroutine_manager_preserves_nested_elided_join_nop() {
     for manager in ["with", "async with"] {
         for prefix in ["", "        work()\n", "        await work()\n"] {

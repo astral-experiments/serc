@@ -3215,6 +3215,13 @@ impl Compiler<'_> {
         self.assembler.mark(send);
         self.emit_jump_forward(SEND, end, 0)?;
         self.assembler.record_exception_setup(yielded, false);
+        if get_awaitable_argument == 0
+            && self.unit.flags & CO_COROUTINE != 0
+            && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+        {
+            self.assembler
+                .record_legacy_native_setup_target(yielded, cleanup);
+        }
         self.assembler.mark(yielded);
         self.emit_yield_value(1, 0)?;
         self.assembler.mark(yielded_end);
