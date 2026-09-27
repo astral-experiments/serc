@@ -4048,6 +4048,43 @@ impl<'source> Compiler<'source> {
                     && clause.body.iter().all(|part| self.context.is_elided_statement(part)))
     }
 
+    /// Identifies a terminal nested branch whose assertion arms were erased.
+    fn has_nested_erased_branch_scope_exit(&self, statement: &ruff_python_ast::StmtIf) -> bool {
+        let runtime_name = |expression: &Expr| matches!(expression, Expr::Name(name) if name.id.as_str() != "__debug__");
+        let runtime_atom = |expression: &Expr| {
+            runtime_name(expression)
+                || matches!(expression, Expr::Attribute(attribute) if runtime_name(&attribute.value))
+        };
+        if !runtime_atom(&statement.test)
+            || !(statement.elif_else_clauses.is_empty()
+                || matches!(statement.elif_else_clauses.as_slice(), [clause]
+                    if clause.test.is_none()
+                        && !clause.body.is_empty()
+                        && clause.body.iter().all(|part| self.context.is_elided_statement(part))))
+        {
+            return false;
+        }
+        let [Stmt::If(inner)] = statement.body.as_slice() else {
+            return false;
+        };
+        let inner_test = runtime_atom(&inner.test)
+            || matches!(inner.test.as_ref(), Expr::Call(call)
+                if call.arguments.args.is_empty()
+                    && call.arguments.keywords.is_empty()
+                    && matches!(call.func.as_ref(), Expr::Attribute(attribute)
+                        if runtime_name(&attribute.value)));
+        inner_test
+            && !inner.body.is_empty()
+            && inner
+                .body
+                .iter()
+                .all(|part| self.context.is_elided_statement(part))
+            && matches!(inner.elif_else_clauses.as_slice(), [clause]
+                if clause.test.is_none()
+                    && !clause.body.is_empty()
+                    && clause.body.iter().all(|part| self.context.is_elided_statement(part)))
+    }
+
     /// Identifies a shared scope exit after flat guards and a nested raising branch.
     fn has_nested_raising_if_scope_exit(statement: &ruff_python_ast::StmtIf) -> bool {
         let runtime_name = |expression: &Expr| matches!(expression, Expr::Name(name) if name.id.as_str() != "__debug__");
@@ -4280,7 +4317,16 @@ impl<'source> Compiler<'source> {
                 .body
                 .iter()
                 .rposition(|part| !self.context.is_elided_statement(part))
-            && suite_has_linear_borrow_fallthrough(&statement.body[..=last])
+            // The final call supplies runtime work; erased assertions inside
+            // its linear suite do not introduce a control-flow boundary.
+            && statement.body[..=last].iter().all(|part| {
+                (self.context.is_elided_statement(part)
+                    && matches!(part, Stmt::Global(declaration) if declaration.names.is_empty()))
+                    || matches!(part, Stmt::Pass(_))
+                    || matches!(part, Stmt::Expr(expression)
+                        if !expression_contains_inline_branch(&expression.value))
+                    || suite_has_linear_borrow_fallthrough(std::slice::from_ref(part))
+            })
             && matches!(&statement.body[last], Stmt::Expr(expression)
                 if matches!(expression.value.as_ref(), Expr::Call(_))
                     && !expression_contains_inline_branch(&expression.value)
@@ -4390,7 +4436,9 @@ impl<'source> Compiler<'source> {
             self.compile_if(statement)?;
             if plain_312_scope_exit
                 && (self.has_erased_binary_if_scope_exit(statement)
-                    || Self::has_nested_raising_if_scope_exit(statement))
+                    || Self::has_nested_raising_if_scope_exit(statement)
+                    || (!self.control.statements.in_match
+                        && self.has_nested_erased_branch_scope_exit(statement)))
             {
                 // An earlier erased conditional can count this shared exit twice.
                 // Preserve its original return until native exit copying finishes.
@@ -12573,7 +12621,10 @@ impl<'source> Compiler<'source> {
                 && self.control.exceptions.active_exception_group_handlers == 0
                 && self.control.finally.is_inactive_for_return_unwind()
                 && !self.control.statements.in_match
-                && matches!(statement.test.as_ref(), Expr::BooleanLiteral(value) if !value.value)
+                && (matches!(statement.test.as_ref(), Expr::BooleanLiteral(value) if !value.value)
+                    || matches!(statement.test.as_ref(), Expr::NumberLiteral(number)
+                        if matches!(&number.value, ruff_python_ast::Number::Int(value)
+                            if value.as_u64() == Some(0))))
                 && statement.elif_else_clauses.is_empty()
                 && !statement.body.is_empty()
                 && statement

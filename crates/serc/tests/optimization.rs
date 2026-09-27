@@ -24,7 +24,7 @@ const LEVELS: [OptimizationLevel; 3] = [
 
 #[test]
 fn erased_false_branch_preserves_borrowed_local_loads() {
-    for condition in ["False", "__debug__"] {
+    for condition in ["False", "__debug__", "0", "0x0"] {
         for assertion in ["assert x", "assert x\n            assert y"] {
             let source = format!(
                 "def f(a, b, x, y):\n    if a:\n        if {condition}:\n            {assertion}\n        result = consume(x, y)\n    elif b:\n        result = x\n    else:\n        result = None\n    return result\n"
@@ -170,6 +170,28 @@ fn conditional_prefixes_with_erased_else_preserve_nested_join() {
 }
 
 #[test]
+fn erased_assertions_inside_terminal_call_suite_preserve_footer() {
+    for prefix in [
+        "    if a:\n        assert a\n",
+        "",
+        "    if a:\n        pass\n",
+        "    assert a\n",
+        "    if a:\n        assert a\n    else:\n        assert b\n",
+    ] {
+        for body in [
+            "        assert b\n        finish(obj)\n",
+            "        value = obj.left\n        assert value\n        value = obj.right\n        finish(value)\n",
+            "        pass\n        assert b\n        finish(obj)\n",
+            "        17\n        assert b\n        finish(obj)\n",
+            "        assert a\n        value = obj.left\n        assert value\n        obj.finish(value)\n        assert b\n",
+        ] {
+            let source = format!("def f(a, b, obj, finish):\n{prefix}    if b:\n{body}");
+            assert_matches_cpython(&source, "internal_erased_assert_call.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn elided_condition_before_terminal_for_preserves_legacy_footer_location() {
     for first in ["a", "check(a)"] {
         for second in ["b", "check(b)"] {
@@ -192,6 +214,19 @@ fn live_for_body_preserves_original_footer_location() {
         "def f(obj, items):\n    if obj.active and obj.target is not None:\n        for item in items:\n            item.action()\n",
     ] {
         assert_matches_cpython(source, "live_for_footer.py", &LEVELS);
+    }
+}
+
+#[test]
+fn nested_erased_branch_keeps_original_scope_exit() {
+    for source in [
+        "def f(obj, active, checked):\n    if obj.ready:\n        assert obj.ready\n    prepared = obj.prepare()\n    if obj.active:\n        if obj.check():\n            assert obj.valid\n        else:\n            assert obj.other\n    else:\n        assert obj.active\n",
+        "def f(obj, active, checked):\n    if obj.ready:\n        assert obj.ready\n    prepared = obj.prepare()\n    if active:\n        if obj.check():\n            assert obj.valid\n        else:\n            assert obj.other\n    else:\n        assert obj.active\n",
+        "def f(obj, active, checked):\n    if obj.ready:\n        assert obj.ready\n    prepared = obj.prepare()\n    if obj.active:\n        if obj.checked:\n            assert obj.valid\n        else:\n            assert obj.other\n    else:\n        assert obj.active\n",
+        "def f(obj, active, checked):\n    if obj.ready:\n        assert obj.ready\n    prepared = obj.prepare()\n    if obj.active:\n        if obj.check():\n            assert obj.valid\n        else:\n            assert obj.other\n",
+        "def f(obj, active, checked):\n    prepared = obj.prepare()\n    if obj.active:\n        if obj.check():\n            assert obj.valid\n        else:\n            assert obj.other\n    else:\n        assert obj.active\n",
+    ] {
+        assert_matches_cpython(source, "nested_erased_footer.py", &LEVELS);
     }
 }
 
