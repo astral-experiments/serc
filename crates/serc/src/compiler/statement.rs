@@ -4000,14 +4000,19 @@ impl<'source> Compiler<'source> {
 
     /// Identifies a terminal nested binary branch with two erased assertion arms.
     fn has_erased_binary_if_scope_exit(&self, statement: &ruff_python_ast::StmtIf) -> bool {
+        let identity_operand = |expression: &Expr| {
+            matches!(expression, Expr::Name(_))
+                || matches!(expression, Expr::Attribute(attribute)
+                    if matches!(attribute.value.as_ref(), Expr::Name(_)))
+        };
         let outer_test = match statement.test.as_ref() {
             Expr::Name(_) => true,
             Expr::BoolOp(boolean) if boolean.op == BoolOp::And => {
                 matches!(boolean.values.as_slice(), [Expr::Compare(left), Expr::Compare(right)]
-                    if matches!(left.first_operand(), Expr::Name(_))
+                    if identity_operand(left.first_operand())
                         && matches!(left.ops.as_ref(), [CmpOp::Is])
                         && matches!(left.comparators(), [Expr::NoneLiteral(_)])
-                        && matches!(right.first_operand(), Expr::Name(_))
+                        && identity_operand(right.first_operand())
                         && matches!(right.ops.as_ref(), [CmpOp::IsNot])
                         && matches!(right.comparators(), [Expr::NoneLiteral(_)]))
             }
@@ -4919,6 +4924,7 @@ impl<'source> Compiler<'source> {
     fn elided_branch_return_location(&self, body: &[Stmt]) -> Option<SourceLocation> {
         match self
             .elided_linear_branch_tail(body, true)
+            .or_else(|| self.elided_linear_elif_tail(body))
             .or_else(|| self.elided_returning_while_tail(body))?
         {
             // Each original predecessor donates its span when this footer is copied.
@@ -4928,6 +4934,58 @@ impl<'source> Compiler<'source> {
             }
             _ => None,
         }
+    }
+
+    /// Keeps copied exits of a linear elif chain unlocated after an erased suffix.
+    fn elided_linear_elif_tail<'a>(&self, body: &'a [Stmt]) -> Option<&'a Stmt> {
+        if self.context.python_version < crate::PythonVersion::Py314
+            || !self.supports_elided_terminal_if()
+            || self.unit.flags & CO_COROUTINE != 0
+            || self.has_active_control_flow_region()
+            || self.control.exceptions.active_exception_group_handlers != 0
+            || self.control.statements.in_match
+        {
+            return None;
+        }
+        let end = body
+            .iter()
+            .rposition(|statement| !self.context.is_elided_statement(statement))?;
+        if end + 1 == body.len() {
+            return None;
+        }
+        let linear = |suite: &[Stmt]| {
+            suite_has_linear_borrow_fallthrough(suite) && !suite_contains_yield(suite)
+        };
+        let runtime_test = |test: &Expr| {
+            condition_has_only_runtime_tests(test)
+                && !expression_contains_inline_branch(test)
+                && !expression_suspends_current_scope(test)
+        };
+        let Stmt::If(statement) = &body[end] else {
+            return None;
+        };
+        let (otherwise, elifs) = statement.elif_else_clauses.split_last()?;
+        if !body[..end].iter().all(|part| {
+            self.context.is_elided_statement(part) || linear(std::slice::from_ref(part))
+        }) || !runtime_test(&statement.test)
+            || !linear(&statement.body)
+            || elifs.is_empty()
+            || otherwise.test.is_some()
+            || !elifs.iter().all(|clause| {
+                clause.test.as_ref().is_some_and(runtime_test) && linear(&clause.body)
+            })
+            || !(linear(&otherwise.body)
+                || (!otherwise.body.is_empty()
+                    && otherwise
+                        .body
+                        .iter()
+                        .all(|part| self.context.is_elided_statement(part))))
+        {
+            return None;
+        }
+        // Each arm reaches the original empty join; its own incoming edge must
+        // donate the copied footer's location instead of the final emitted span.
+        Some(&body[end])
     }
 
     /// Finds a returning loop whose sole footer predecessor is its false condition edge.

@@ -23,6 +23,16 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn elif_footer_keeps_each_predecessors_location_after_removed_assertion() {
+    for otherwise in ["assert kind", "value = build()"] {
+        let source = format!(
+            "def f(flag, kind, build):\n    if flag:\n        if kind == 1:\n            value = build()\n        elif kind == 2:\n            value = build()\n        else:\n            {otherwise}\n        assert flag\n"
+        );
+        assert_matches_cpython(&source, "elif_footer.py", &LEVELS);
+    }
+}
+
+#[test]
 fn returning_while_uses_condition_location_after_removed_assertion() {
     for condition in ["value >= 0", "count", "value >= 0 or count"] {
         for prefix in [
@@ -96,6 +106,23 @@ fn erased_nested_binary_if_preserves_legacy_scope_exit() {
         "erased_nested_binary_if_assignment.py",
         &LEVELS,
     );
+}
+
+#[test]
+fn attribute_identity_tests_preserve_legacy_scope_exit() {
+    let erased_prefix =
+        "    if obj.ready:\n        assert left\n        assert right\n        assert obj.valid\n";
+    for (condition, prefix) in [
+        ("left is None and right is not None", erased_prefix),
+        ("obj.left is None and obj.right is not None", erased_prefix),
+        ("left is None and obj.right is not None", erased_prefix),
+        ("obj.left is None and obj.right is not None", ""),
+    ] {
+        let source = format!(
+            "def f(obj, left, right):\n    if obj.stop:\n        return\n    assert obj.valid\n{prefix}    if {condition}:\n        value = not obj.flag\n        if obj.check:\n            assert value\n        else:\n            assert obj.valid\n"
+        );
+        assert_matches_cpython(&source, "attribute_identity_scope_exit.py", &LEVELS);
+    }
 }
 
 #[test]
