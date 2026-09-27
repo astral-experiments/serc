@@ -84,6 +84,30 @@ fn erased_nested_binary_if_preserves_legacy_scope_exit() {
 }
 
 #[test]
+fn erased_linear_prefix_preserves_populated_nested_join() {
+    for prefix in [
+        "        assert obj.ready\n        value = prepare(obj)\n",
+        "        assert obj.ready\n        pass\n        assert obj.valid\n        value = obj\n",
+        "        value = prepare(obj)\n",
+    ] {
+        let source = format!(
+            "def f(obj):\n    if obj is not None:\n{prefix}        if obj.left or obj.right:\n            result = value.left\n        else:\n            result = choose(value)\n            witness = value.right\n    else:\n        assert obj is None\n    witness = obj.after\n"
+        );
+        assert_matches_cpython(&source, "erased_linear_prefix_join.py", &LEVELS);
+    }
+}
+
+#[test]
+fn assigned_conditional_prefix_preserves_populated_nested_join() {
+    for successor in ["    after = obj\n", "    after = obj.after\n"] {
+        let source = format!(
+            "def f(obj, a, b, c, d, work):\n    if obj is not None:\n        if a:\n            first = work()\n        else:\n            first = work()\n        if b:\n            second = work()\n        chosen = c if d else a\n        if c:\n            result = None\n        else:\n            result = work()\n    else:\n        assert obj\n{successor}    return after\n"
+        );
+        assert_matches_cpython(&source, "assigned_conditional_prefix_join.py", &LEVELS);
+    }
+}
+
+#[test]
 fn conditional_prefix_preserves_erased_nested_join() {
     for prefix in [
         "        if b:\n            value = obj.first\n",

@@ -14515,6 +14515,52 @@ impl<'source> Compiler<'source> {
                                 }
                                 has_runtime_work
                             };
+                            // Erased assertions do not create an entry into the nested
+                            // join; the remaining prefix still emits only linear work.
+                            let ordinary_elided_linear_prefix = branch_index == 0
+                                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                                && !self.control.statements.in_match
+                                && !self.has_active_control_flow_region()
+                                && self.control.withs.active_with_exits.is_empty()
+                                && !self.control.loops.suite_fallthrough_to_loop_backedge
+                                && self.control.finally.is_inactive_for_return_unwind()
+                                && leading.iter().any(|statement| {
+                                    matches!(statement, Stmt::Global(global) if global.names.is_empty())
+                                        && self.context.is_elided_statement(statement)
+                                })
+                                && linear_prefix_arm(leading);
+                            // Each prefix conditional and the assigned expression merge
+                            // before the final test, leaving its original join separate.
+                            let ordinary_assigned_conditional_prefix = branch_index == 0
+                                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                                && !self.control.statements.in_match
+                                && !self.has_active_control_flow_region()
+                                && self.control.withs.active_with_exits.is_empty()
+                                && !self.control.loops.suite_fallthrough_to_loop_backedge
+                                && self.control.finally.is_inactive_for_return_unwind()
+                                && matches!(last, Stmt::If(nested)
+                                    if suite_has_linear_borrow_fallthrough(&nested.body)
+                                        && matches!(nested.elif_else_clauses.as_slice(), [clause]
+                                            if clause.test.is_none()
+                                                && suite_has_linear_borrow_fallthrough(&clause.body)))
+                                && matches!(leading, [Stmt::If(first), Stmt::If(second), Stmt::Assign(assignment)]
+                                    if [first, second].into_iter().all(|prefix| {
+                                        condition_has_linear_runtime_leaves(&prefix.test)
+                                            && !expression_suspends_current_scope(&prefix.test)
+                                            && suite_has_linear_borrow_fallthrough(&prefix.body)
+                                            && !suite_contains_yield(&prefix.body)
+                                            && (prefix.elif_else_clauses.is_empty()
+                                                || matches!(prefix.elif_else_clauses.as_slice(), [clause]
+                                                    if clause.test.is_none()
+                                                        && suite_has_linear_borrow_fallthrough(&clause.body)
+                                                        && !suite_contains_yield(&clause.body)))
+                                    })
+                                        && matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                                        && matches!(assignment.value.as_ref(), Expr::If(conditional)
+                                            if [&conditional.test, &conditional.body, &conditional.orelse]
+                                                .into_iter()
+                                                .all(|expression| matches!(expression.as_ref(), Expr::Name(name)
+                                                    if name.id.as_str() != "__debug__"))));
                             // Earlier ordinary conditionals also merge before the final
                             // test; they cannot enter the erased inner join directly.
                             let ordinary_conditional_prefix = branch_index == 0
@@ -14547,6 +14593,8 @@ impl<'source> Compiler<'source> {
                                 });
                             (leading.is_empty()
                                 || suite_has_linear_borrow_fallthrough(leading)
+                                || ordinary_elided_linear_prefix
+                                || ordinary_assigned_conditional_prefix
                                 || ordinary_conditional_prefix)
                                 && matches!(last, Stmt::If(nested)
                                     if condition_has_linear_runtime_leaves(&nested.test)
