@@ -7577,6 +7577,44 @@ impl Compiler<'_> {
             self.pre_register_expression_names(&expression.body)?;
             self.pre_register_expression_names(&expression.orelse)?;
             self.preserve_folded_if_expression_entry(truthiness);
+            if truthiness
+                && self.context.python_version == PythonVersion::Py314
+                && matches!(self.unit.scope, Scope::Function { .. })
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                && self.control.stack.depth == 0
+                && continuation.is_none()
+                && !self.control.statements.in_match
+                && self.control.loops.contexts.is_empty()
+                && !self.control.loops.suite_fallthrough_to_loop_backedge
+                && self.control.generators.generator_region_start.is_none()
+                && self.control.withs.active_with_exits.is_empty()
+                && self.control.withs.active_with_region_exclusions.is_empty()
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty()
+                && !self.control.in_exception_handler()
+                && self.control.exceptions.active_exception_group_handlers == 0
+                && self.control.finally.is_inactive_for_return_unwind()
+                && matches!(expression.body.as_ref(), Expr::Attribute(attribute)
+                    if matches!(attribute.value.as_ref(), Expr::Name(name)
+                        if name.id.as_str() != "__debug__"))
+                && matches!(expression.orelse.as_ref(), Expr::Name(name)
+                    if name.id.as_str() != "__debug__")
+                && self.source_location(expression.test.range()).line
+                    == self.source_location(expression.body.range()).line
+                && self.assembler.at_empty_borrow_block()
+            {
+                // Folding the same-line selector empties its original block. Python 3.14
+                // stops borrow traversal there, before the separate selected value arm.
+                let empty_selector = self.assembler.label();
+                self.assembler.mark(empty_selector);
+                self.assembler.prevent_borrow_reachability(empty_selector);
+                let selected_arm = self.assembler.label();
+                self.assembler.preserve_block_boundary(selected_arm);
+                self.assembler.mark(selected_arm);
+            }
             let selected_entry = self.assembler.label();
             if !truthiness {
                 self.pre_register_discarded_expression(&expression.body, Some(selected_entry))?;

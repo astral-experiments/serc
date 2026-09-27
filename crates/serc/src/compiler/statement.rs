@@ -14721,6 +14721,30 @@ impl<'source> Compiler<'source> {
                             if is_elided_suite(&nested.body)
                                 && matches!(nested.elif_else_clauses.as_slice(), [clause]
                                     if clause.test.is_none() && is_elided_suite(&clause.body)));
+                    // An erased suffix leaves the populated inner If's original join
+                    // unchanged. Only expose that tail to this ordinary certificate;
+                    // the complete body still compiles with its original boundaries.
+                    let nested_else_body = if self.context.python_version
+                        >= crate::PythonVersion::Py314
+                        && branch_index == 0
+                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                        && !self.control.statements.in_match
+                        && !self.has_active_control_flow_region()
+                        && self.control.withs.active_with_exits.is_empty()
+                        && !self.control.loops.suite_fallthrough_to_loop_backedge
+                        && self.control.finally.is_inactive_for_return_unwind()
+                        && matches!(body.split_first(), Some((Stmt::If(nested), suffix))
+                            if !suffix.is_empty()
+                                && suffix.iter().all(|part| self.context.is_elided_statement(part))
+                                && suite_has_linear_borrow_fallthrough(&nested.body)
+                                && matches!(nested.elif_else_clauses.as_slice(), [clause]
+                                    if clause.test.is_none()
+                                        && suite_has_linear_borrow_fallthrough(&clause.body)))
+                    {
+                        &body[..1]
+                    } else {
+                        body
+                    };
                     let optimized_nested_else = self.context.python_version
                         >= crate::PythonVersion::Py314
                         // Ruff flattens elif clauses, but each one owns a nested If
@@ -14752,7 +14776,7 @@ impl<'source> Compiler<'source> {
                         // A linear prefix cannot enter the nested conditional's
                         // original end block. Each inner arm may emit work or vanish
                         // independently; its false fallthrough still donates the line.
-                        && body.split_last().is_some_and(|(last, leading)| {
+                        && nested_else_body.split_last().is_some_and(|(last, leading)| {
                             let linear_prefix_arm = |arm: &[Stmt]| {
                                 let mut has_runtime_work = false;
                                 for statement in arm {

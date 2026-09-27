@@ -23,6 +23,22 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn folded_true_value_selector_preserves_empty_borrow_entry() {
+    for source in [
+        "def probe(marker, low, high, bound, choice, flag, left, right, obj, make):\n    if marker is not None:\n        if low >= bound:\n            scratch = left\n        else:\n            scratch = right\n        if low != high:\n            scratch = right\n        value = obj.payload if __debug__ else right\n        if flag:\n            result = None\n        else:\n            result = make()\n    else:\n        assert marker\n    return marker\n",
+        "def probe(marker, low, high, bound, choice, flag, left, right, obj, make):\n    if marker is not None:\n        if low >= bound:\n            scratch = left\n        else:\n            scratch = right\n        if low != high:\n            scratch = right\n        value = obj.payload if True else right\n        if flag:\n            result = None\n        else:\n            result = make()\n    else:\n        assert marker\n    return marker\n",
+    ] {
+        assert_matches_cpython(source, "folded_true_value_selector.py", &LEVELS);
+    }
+}
+
+#[test]
+fn elided_suffix_preserves_populated_nested_if_join() {
+    let source = "def f(outer, inner, value, obj):\n    if outer is None:\n        if inner:\n            result = 1\n        else:\n            result = value + 1\n        assert inner\n    else:\n        assert outer\n    after = obj.attribute\n    return after\n";
+    assert_matches_cpython(source, "nested_if_suffix.py", &LEVELS);
+}
+
+#[test]
 fn elided_else_after_completed_work_preserves_legacy_footer_location() {
     for source in [
         "def f(flag, enabled, count, inner, obj):\n    if not flag:\n        assert flag\n        assert count\n    if enabled and count > 0:\n        assert enabled\n        value = obj.make()\n        use(value)\n        if inner:\n            use(value)\n            use(value)\n        value = 1.0\n        assert value\n        other = 2.0\n        use(other)\n    else:\n        assert count\n",
