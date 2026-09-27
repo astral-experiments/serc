@@ -23,6 +23,38 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn coroutine_manager_preserves_nested_elided_join_nop() {
+    for manager in ["with", "async with"] {
+        for prefix in ["", "        work()\n", "        await work()\n"] {
+            for continuation in ["", "        work()\n"] {
+                let source = format!(
+                    "async def f(cm, a, b):\n    {manager} cm:\n{prefix}        if a:\n            if b:\n                assert b\n            else:\n                assert a\n        else:\n            assert a\n{continuation}"
+                );
+                assert_matches_cpython(&source, "coroutine_manager_nested_join.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn elided_non_final_disjunction_keeps_backedge_copy_order() {
+    for (case, source) in [
+        "def f(items, flag, a, b):\n    for item in items:\n        if flag:\n            if a or b:\n                assert item\n        else:\n            work(item)\n",
+        "def f(items, flag, a, b, c):\n    for item in items:\n        if flag:\n            if a or b or c:\n                assert item\n        else:\n            pass\n",
+        "def f(items, flag, a, b):\n    for outer in items:\n        for item in items:\n            if flag:\n                if a == 1 or check(b):\n                    assert item\n            else:\n                work(item)\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            source,
+            &format!("elided_non_final_disjunction_{case}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn nested_assignment_joins_preserve_nops_before_elided_else() {
     for prefix in ["", "        value = 0\n", "        work()\n"] {
         for true_arm in ["assert b", "value = 1"] {
@@ -63,6 +95,21 @@ fn terminal_finally_and_loop_preserves_returns_before_removed_assertions() {
             &LEVELS,
             &[PythonVersion::Py314, PythonVersion::Py315],
         );
+    }
+}
+
+#[test]
+fn terminating_if_before_erased_assertions_preserves_the_legacy_footer() {
+    for body in [
+        "return None",
+        "return obj",
+        "raise ValueError",
+        "value = obj.attr\n        return value",
+    ] {
+        let source = format!(
+            "def f(a, b, obj):\n    if a:\n        assert a\n    if b:\n        {body}\n    assert b\n"
+        );
+        assert_matches_cpython(&source, "terminating_if_erased_footer.py", &LEVELS);
     }
 }
 
@@ -113,6 +160,27 @@ fn manager_setups_preserve_repeated_legacy_empty_branch_locations() {
         assert_matches_cpython(
             source,
             &format!("manager_repeated_empty_branch_{case}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
+fn direct_finally_async_for_keeps_exit_before_erased_assertions() {
+    for (index, source) in [
+        "async def f(items, obj):\n    try:\n        async for item in items:\n            pass\n        assert items\n    finally:\n        obj.finish()\n",
+        "async def f(items, obj):\n    try:\n        async for item in items:\n            obj.accept(item)\n        assert items\n    finally:\n        await obj.finish()\n",
+        "async def f(items, obj):\n    try:\n        token = prepare()\n        obj.begin()\n        items = adapt(items)\n        async for item in items:\n            pass\n        assert items\n    finally:\n        obj.finish()\n",
+        "async def f(items, obj):\n    try:\n        async for item in items:\n            pass\n    finally:\n        obj.finish()\n",
+        "async def f(items, obj):\n    try:\n        async for item in adapt(\n            items\n        ):\n            pass\n        assert items\n    finally:\n        obj.finish()\n",
+        "async def f(items, obj):\n    try:\n        async for item in items:\n            pass\n        assert items\n        async for again in items:\n            obj.accept(again)\n        assert items\n    finally:\n        obj.finish()\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            source,
+            &format!("direct_finally_async_for_exit_{index}.py"),
             &LEVELS,
         );
     }

@@ -86,6 +86,8 @@ struct AsyncForEndPopOrigin {
 #[derive(Debug)]
 struct AsyncForEndPopRecorder {
     scope_depths: (usize, usize, usize, usize, usize, usize),
+    // Only a live linear finalizer certifies a preceding erased-assertion tail.
+    allows_elided_assert_suffix: bool,
     origin: Option<AsyncForEndPopOrigin>,
 }
 
@@ -101,9 +103,10 @@ impl AsyncForEndPopRecorder {
         )
     }
 
-    fn new(control: &ControlFlowState<'_>) -> Self {
+    fn new(control: &ControlFlowState<'_>, allows_elided_assert_suffix: bool) -> Self {
         Self {
             scope_depths: Self::scope_depths(control),
+            allows_elided_assert_suffix,
             origin: None,
         }
     }
@@ -1600,12 +1603,7 @@ impl<'source> Compiler<'source> {
 
     /// Certifies a terminal branch with erased assertions or a linear conditional prefix.
     fn linear_terminal_branch_before_elided(&self, body: &[Stmt]) -> bool {
-        let is_elided = |statement: &Stmt| {
-            matches!(
-                self.context.optimized_locations.get(&statement.range()),
-                Some(super::optimization::OptimizedLocation::Elided)
-            )
-        };
+        let is_elided = |statement: &Stmt| self.context.is_elided_statement(statement);
         let Some(end) = body.iter().rposition(|statement| !is_elided(statement)) else {
             return false;
         };
@@ -1637,12 +1635,9 @@ impl<'source> Compiler<'source> {
     fn protected_terminal_if_before_elided(&self, statement: &Stmt, following: &[Stmt]) -> bool {
         matches!(statement, Stmt::If(_))
             && !following.is_empty()
-            && following.iter().all(|statement| {
-                matches!(
-                    self.context.optimized_locations.get(&statement.range()),
-                    Some(super::optimization::OptimizedLocation::Elided)
-                )
-            })
+            && following
+                .iter()
+                .all(|statement| self.context.is_elided_statement(statement))
             && matches!(statement, Stmt::If(conditional)
                 if early_condition_truthiness(&conditional.test).is_none()
                     || (early_condition_truthiness(&conditional.test) == Some(true)
@@ -1671,12 +1666,7 @@ impl<'source> Compiler<'source> {
 
     /// Certifies ordinary coroutine work ending after its conditional prefixes.
     fn coroutine_branch_has_linear_tail(&self, body: &[Stmt]) -> bool {
-        let is_elided = |statement: &Stmt| {
-            matches!(
-                self.context.optimized_locations.get(&statement.range()),
-                Some(super::optimization::OptimizedLocation::Elided)
-            )
-        };
+        let is_elided = |statement: &Stmt| self.context.is_elided_statement(statement);
         let linear = |statement: &Stmt| {
             let single = std::slice::from_ref(statement);
             suite_has_nonsuspending_conditional_work(single)
@@ -1708,12 +1698,7 @@ impl<'source> Compiler<'source> {
         let Stmt::If(conditional) = statement else {
             return false;
         };
-        let is_elided = |statement: &Stmt| {
-            matches!(
-                self.context.optimized_locations.get(&statement.range()),
-                Some(super::optimization::OptimizedLocation::Elided)
-            )
-        };
+        let is_elided = |statement: &Stmt| self.context.is_elided_statement(statement);
         conditional.elif_else_clauses.is_empty()
             && condition_has_linear_runtime_leaves(&conditional.test)
             && !expression_suspends_current_scope(&conditional.test)
@@ -1971,17 +1956,29 @@ impl<'source> Compiler<'source> {
             let is_final = index + 1 == body.len();
             // In 3.12 an assertion removed by optimization does not postpone the
             // enclosing branch's implicit return or its separate conditional exits.
+            // A direct terminating arm at scope end also keeps its original false
+            // footer when only erased assertions follow the conditional.
             let terminal_before_elided_assertions = self.context.python_version
                 == crate::PythonVersion::Py312
                 && !is_final
-                && self.control.statements.terminal_if_branch_has_siblings
+                && (self.control.statements.terminal_if_branch_has_siblings
+                    || (plain_function_suite
+                        && !self.control.statements.in_terminal_if_branch_suite
+                        && self.supports_elided_terminal_if()
+                        && !self.has_active_control_flow_region()
+                        && matches!(statement, Stmt::If(conditional)
+                        if conditional.elif_else_clauses.is_empty()
+                            && condition_has_linear_runtime_leaves(&conditional.test)
+                            && !expression_suspends_current_scope(&conditional.test)
+                            && conditional.body.split_last().is_some_and(|(tail, prefix)| {
+                                matches!(tail, Stmt::Return(_) | Stmt::Raise(_))
+                                    && (prefix.is_empty()
+                                        || suite_has_linear_borrow_fallthrough(prefix))
+                            }))))
                 && matches!(statement, Stmt::If(_))
-                && body[index + 1..].iter().all(|statement| {
-                    matches!(
-                        self.context.optimized_locations.get(&statement.range()),
-                        Some(super::optimization::OptimizedLocation::Elided)
-                    )
-                });
+                && body[index + 1..]
+                    .iter()
+                    .all(|statement| self.context.is_elided_statement(statement));
             // Removing trailing assertions makes this conditional the function's
             // terminal statement. Keep its comprehension assignment's return span.
             let terminal_comprehension_before_elided = !is_final
@@ -1992,12 +1989,9 @@ impl<'source> Compiler<'source> {
                 && !self.control.in_exception_handler()
                 && self.control.finally.is_inactive_for_return_unwind()
                 && matches!(statement, Stmt::If(_))
-                && body[index + 1..].iter().all(|statement| {
-                    matches!(
-                        self.context.optimized_locations.get(&statement.range()),
-                        Some(super::optimization::OptimizedLocation::Elided)
-                    )
-                })
+                && body[index + 1..]
+                    .iter()
+                    .all(|statement| self.context.is_elided_statement(statement))
                 && matches!(statement, Stmt::If(conditional)
                 if std::iter::once(conditional.body.as_slice())
                     .chain(conditional.elif_else_clauses.iter().map(|clause| clause.body.as_slice()))
@@ -2019,12 +2013,9 @@ impl<'source> Compiler<'source> {
                 && !self.control.in_exception_handler()
                 && self.control.finally.is_inactive_for_return_unwind()
                 && matches!(statement, Stmt::If(_))
-                && body[index + 1..].iter().all(|statement| {
-                    matches!(
-                        self.context.optimized_locations.get(&statement.range()),
-                        Some(super::optimization::OptimizedLocation::Elided)
-                    )
-                })
+                && body[index + 1..]
+                    .iter()
+                    .all(|statement| self.context.is_elided_statement(statement))
                 && matches!(statement, Stmt::If(conditional)
                     if (self.context.python_version >= crate::PythonVersion::Py314
                             && nested_terminal_assignment_branches(conditional))
@@ -2032,10 +2023,7 @@ impl<'source> Compiler<'source> {
                         || matches!(conditional.elif_else_clauses.as_slice(), [clause]
                             if clause.test.is_none()
                                 && !clause.body.is_empty()
-                                && clause.body.iter().all(|statement| matches!(
-                                    self.context.optimized_locations.get(&statement.range()),
-                                    Some(super::optimization::OptimizedLocation::Elided)
-                                ))))
+                                && clause.body.iter().all(|statement| self.context.is_elided_statement(statement))))
                         && condition_has_linear_runtime_leaves(&conditional.test)
                         && !expression_suspends_current_scope(&conditional.test)
                         && (suite_has_linear_borrow_fallthrough(&conditional.body)
@@ -2051,10 +2039,7 @@ impl<'source> Compiler<'source> {
                                     && !expression_suspends_current_scope(&nested.test)
                                     && matches!(nested.body.as_slice(), [Stmt::Pass(_)]))
                             || (!conditional.body.is_empty()
-                                && conditional.body.iter().all(|statement| matches!(
-                                    self.context.optimized_locations.get(&statement.range()),
-                                    Some(super::optimization::OptimizedLocation::Elided)
-                                ))))
+                                && conditional.body.iter().all(|statement| self.context.is_elided_statement(statement))))
                         && !suite_contains_yield(&conditional.body)));
             let coroutine_if_before_elided = final_expression_becomes_return
                 && self.context.python_version >= crate::PythonVersion::Py313
@@ -2125,12 +2110,9 @@ impl<'source> Compiler<'source> {
                                 && !expression_suspends_current_scope(&expression.test)
                                 && !expression_suspends_current_scope(&expression.body)
                                 && !expression_suspends_current_scope(&expression.orelse)))
-                && body[index + 1..].iter().all(|statement| {
-                    matches!(
-                        self.context.optimized_locations.get(&statement.range()),
-                        Some(super::optimization::OptimizedLocation::Elided)
-                    )
-                });
+                && body[index + 1..]
+                    .iter()
+                    .all(|statement| self.context.is_elided_statement(statement));
             // A try with an erased protected body reaches the implicit return directly
             // when only erased assertions follow. Use the existing terminal lowering so
             // its setup NOP can merge with that return instead of retaining an empty join.
@@ -2145,16 +2127,10 @@ impl<'source> Compiler<'source> {
                 if !statement.is_star
                     && statement.orelse.is_empty()
                     && statement.finalbody.is_empty()
-                    && statement.body.iter().all(|statement| matches!(
-                        self.context.optimized_locations.get(&statement.range()),
-                        Some(super::optimization::OptimizedLocation::Elided)
-                    )))
-                && body[index + 1..].iter().all(|statement| {
-                    matches!(
-                        self.context.optimized_locations.get(&statement.range()),
-                        Some(super::optimization::OptimizedLocation::Elided)
-                    )
-                });
+                    && statement.body.iter().all(|statement| self.context.is_elided_statement(statement)))
+                && body[index + 1..]
+                    .iter()
+                    .all(|statement| self.context.is_elided_statement(statement));
             // Each false edge of a terminal finally loop supplies its own return
             // location. Erased assertions after the try do not share those exits.
             let terminal_finally_while_before_elided = self.context.python_version
@@ -2177,12 +2153,9 @@ impl<'source> Compiler<'source> {
                                 && condition_has_linear_runtime_leaves(&loop_statement.test)
                                 && !expression_suspends_current_scope(&loop_statement.test)
                                 && suite_has_linear_borrow_fallthrough(&loop_statement.body)))
-                && body[index + 1..].iter().all(|statement| {
-                    matches!(
-                        self.context.optimized_locations.get(&statement.range()),
-                        Some(super::optimization::OptimizedLocation::Elided)
-                    )
-                });
+                && body[index + 1..]
+                    .iter()
+                    .all(|statement| self.context.is_elided_statement(statement));
             if (is_final
                 || terminal_if_before_elided
                 || terminal_assignment_before_elided
@@ -2438,17 +2411,11 @@ impl<'source> Compiler<'source> {
                         && !expression_suspends_current_scope(&previous.test)
                         && !previous.body.is_empty()
                         && (simple_assertion_suite(&previous.body)
-                            || previous.body.iter().all(|stmt| matches!(
-                            self.context.optimized_locations.get(&stmt.range()),
-                            Some(super::optimization::OptimizedLocation::Elided)
-                        )))
+                            || previous.body.iter().all(|stmt| self.context.is_elided_statement(stmt)))
                         && matches!(previous.elif_else_clauses.as_slice(), [clause]
                             if clause.test.is_none() && !clause.body.is_empty()
                                 && (simple_assertion_suite(&clause.body)
-                                    || clause.body.iter().all(|stmt| matches!(
-                                    self.context.optimized_locations.get(&stmt.range()),
-                                    Some(super::optimization::OptimizedLocation::Elided)
-                                ))))
+                                    || clause.body.iter().all(|stmt| self.context.is_elided_statement(stmt))))
                 );
             // Removed assertions leave the direct manager-tail Pass outside its protected region.
             let optimized_sync_with_pass_tail = self.context.python_version
@@ -2458,10 +2425,7 @@ impl<'source> Compiler<'source> {
                 && index + 1 < body.len()
                 && body[index + 1..].iter().all(|statement| {
                     matches!(statement, Stmt::Global(global) if global.names.is_empty())
-                        && matches!(
-                            self.context.optimized_locations.get(&statement.range()),
-                            Some(super::optimization::OptimizedLocation::Elided)
-                        )
+                        && self.context.is_elided_statement(statement)
                 });
             let constant_pass_location = match statement {
                 Stmt::Pass(statement) => Some(self.source_location(statement.range)),
@@ -2795,11 +2759,58 @@ impl<'source> Compiler<'source> {
                         })
                     && body[index + 1..].iter().all(|statement| {
                         matches!(statement, Stmt::Global(global) if global.names.is_empty())
-                            && matches!(
-                                self.context.optimized_locations.get(&statement.range()),
-                                Some(super::optimization::OptimizedLocation::Elided)
-                            )
+                            && self.context.is_elided_statement(statement)
                     });
+                // A direct handler-free try/finally body has the same original
+                // POP_BLOCK after a terminal async-for and erased assertions. The
+                // existing recorder must belong to this exact shallow owner.
+                let protected_async_for_elided_assert_suffix =
+                    protected_async_for_elided_assert_suffix
+                        || (self.context.python_version >= crate::PythonVersion::Py314
+                            && !is_final
+                            && matches!(statement, Stmt::For(statement) if statement.is_async)
+                            && matches!(self.unit.scope, Scope::Function { .. })
+                            && self.unit.flags
+                                & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                                == CO_COROUTINE
+                            && self.control.loops.contexts.is_empty()
+                            && self.control.withs.active_with_exits.is_empty()
+                            && self.control.withs.active_with_region_exclusions.is_empty()
+                            && self
+                                .control
+                                .exceptions
+                                .active_exception_region_exclusions
+                                .len()
+                                == 1
+                            && self.control.exceptions.active_exception_handlers.is_empty()
+                            && self.control.exceptions.active_exception_group_handlers == 0
+                            && !self.control.in_exception_handler()
+                            && self.control.finally.active_finally_try_bodies == 1
+                            && self.control.finally.active_normal_finally_bodies == 0
+                            && self.control.finally.active_copied_finally_bodies == 0
+                            && self.control.finally.active_finally_end_blocks == 0
+                            && matches!(self.control.finally.async_for_end_pop_recorders.as_slice(), [recorder]
+                                if recorder.allows_elided_assert_suffix
+                                    && recorder.scope_depths == AsyncForEndPopRecorder::scope_depths(&self.control))
+                            && self
+                                .control
+                                .exceptions
+                                .direct_try_body_statements
+                                .contains(&statement.range())
+                            && self
+                                .control
+                                .exceptions
+                                .direct_try_body_statements
+                                .last()
+                                .copied()
+                                == body.last().map(Ranged::range)
+                            && body[index + 1..].iter().all(|statement| {
+                                matches!(statement, Stmt::Global(global) if global.names.is_empty())
+                                    && matches!(
+                                        self.context.optimized_locations.get(&statement.range()),
+                                        Some(super::optimization::OptimizedLocation::Elided)
+                                    )
+                            }));
                 let emit_protected_async_for_end_nop = (is_final
                     || protected_async_for_elided_assert_suffix)
                     && matches!(statement, Stmt::For(statement) if statement.is_async)
@@ -3055,10 +3066,7 @@ impl<'source> Compiler<'source> {
                 let elided_join_successor = if matches!(statement, Stmt::If(_)) {
                     body[index + 1..].iter().find(|next| {
                         !matches!(next, Stmt::Global(global) if global.names.is_empty())
-                            || !matches!(
-                                self.context.optimized_locations.get(&next.range()),
-                                Some(super::optimization::OptimizedLocation::Elided)
-                            )
+                            || !self.context.is_elided_statement(next)
                     })
                 } else {
                     None
@@ -3247,12 +3255,7 @@ impl<'source> Compiler<'source> {
         let terminal_assignment = body
             .iter()
             .rev()
-            .find(|statement| {
-                !matches!(
-                    self.context.optimized_locations.get(&statement.range()),
-                    Some(super::optimization::OptimizedLocation::Elided)
-                )
-            })
+            .find(|statement| !self.context.is_elided_statement(statement))
             .is_some_and(|statement| {
                 // Earlier name-store arms can still copy their short exit tail
                 // through the enclosing conditional's intervening jump.
@@ -3769,10 +3772,7 @@ impl<'source> Compiler<'source> {
     fn terminal_for_break_exit_inherits_predecessor(&self, body: &[Stmt]) -> bool {
         let end = body.iter().rposition(|statement| {
             !matches!(statement, Stmt::Global(global) if global.names.is_empty())
-                || !matches!(
-                    self.context.optimized_locations.get(&statement.range()),
-                    Some(super::optimization::OptimizedLocation::Elided)
-                )
+                || !self.context.is_elided_statement(statement)
         });
         terminal_for_break_exit_inherits_predecessor(&body[..end.map_or(0, |index| index + 1)])
     }
@@ -3915,12 +3915,8 @@ impl<'source> Compiler<'source> {
                                 .map(|clause| clause.body.as_slice()),
                         )
                         .any(|body| {
-                            body.last().is_some_and(|last| {
-                                matches!(
-                                    self.context.optimized_locations.get(&last.range()),
-                                    Some(super::optimization::OptimizedLocation::Elided)
-                                )
-                            })
+                            body.last()
+                                .is_some_and(|last| self.context.is_elided_statement(last))
                         })));
         if (has_empty_comparison_arm || has_optimized_join)
             && self.control.loops.contexts.is_empty()
@@ -4051,17 +4047,12 @@ impl<'source> Compiler<'source> {
             && matches!(statement.elif_else_clauses.as_slice(), [clause]
             if clause.test.is_none()
                 && !clause.body.is_empty()
-                && clause.body.iter().all(|statement| matches!(
-                    self.context.optimized_locations.get(&statement.range()),
-                    Some(super::optimization::OptimizedLocation::Elided)
-                )))
+                && clause.body.iter().all(|statement| self.context.is_elided_statement(statement)))
             && ((!statement.body.is_empty()
-                && statement.body.iter().all(|statement| {
-                    matches!(
-                        self.context.optimized_locations.get(&statement.range()),
-                        Some(super::optimization::OptimizedLocation::Elided)
-                    )
-                }))
+                && statement
+                    .body
+                    .iter()
+                    .all(|statement| self.context.is_elided_statement(statement)))
                 || (suite_has_linear_borrow_fallthrough(&statement.body)
                     && matches!(statement.body.last(), Some(Stmt::Expr(expression))
                         if matches!(expression.value.as_ref(), Expr::Call(_))
@@ -4090,10 +4081,7 @@ impl<'source> Compiler<'source> {
                             && (matches!(body.last(), Some(Stmt::Try(_) | Stmt::If(_) | Stmt::Match(_) | Stmt::For(_)))
                                 || (plain_312_scope_exit
                                     && matches!(body.iter().rev().find(|statement| {
-                                        !matches!(
-                                            self.context.optimized_locations.get(&statement.range()),
-                                            Some(super::optimization::OptimizedLocation::Elided)
-                                        )
+                                        !self.context.is_elided_statement(statement)
                                     }), Some(Stmt::If(_))))
                                 || matches!(body.last(), Some(Stmt::Expr(expression))
                                     if matches!(expression.value.as_ref(), Expr::Await(_)))
@@ -4229,10 +4217,7 @@ impl<'source> Compiler<'source> {
                     || matches!(
                         body.iter().rev().find(|statement| {
                             !(matches!(statement, Stmt::Global(global) if global.names.is_empty())
-                                && matches!(
-                                    self.context.optimized_locations.get(&statement.range()),
-                                    Some(super::optimization::OptimizedLocation::Elided)
-                                ))
+                                && self.context.is_elided_statement(statement))
                         }),
                         Some(Stmt::Assign(assignment))
                             if matches!(assignment.value.as_ref(),
@@ -4549,12 +4534,9 @@ impl<'source> Compiler<'source> {
         {
             return None;
         }
-        let end = body.iter().rposition(|statement| {
-            !matches!(
-                self.context.optimized_locations.get(&statement.range()),
-                Some(super::optimization::OptimizedLocation::Elided)
-            )
-        })?;
+        let end = body
+            .iter()
+            .rposition(|statement| !self.context.is_elided_statement(statement))?;
         if end + 1 == body.len() {
             return None;
         }
@@ -13640,18 +13622,13 @@ impl<'source> Compiler<'source> {
                                 statement.elif_else_clauses.split_last()?;
                             if final_clause.test.is_some()
                                 || final_clause.body.is_empty()
-                                || !final_clause.body.iter().any(|stmt| {
-                                    matches!(
-                                        self.context.optimized_locations.get(&stmt.range()),
-                                        Some(super::optimization::OptimizedLocation::Elided)
-                                    )
-                                })
+                                || !final_clause
+                                    .body
+                                    .iter()
+                                    .any(|stmt| self.context.is_elided_statement(stmt))
                                 || !final_clause.body.iter().all(|stmt| {
                                     matches!(stmt, Stmt::Global(_) | Stmt::Nonlocal(_))
-                                        || matches!(
-                                            self.context.optimized_locations.get(&stmt.range()),
-                                            Some(super::optimization::OptimizedLocation::Elided)
-                                        )
+                                        || self.context.is_elided_statement(stmt)
                                 })
                                 || earlier.iter().any(|clause| {
                                     clause.test.as_ref().is_none_or(|test| {
@@ -13927,12 +13904,9 @@ impl<'source> Compiler<'source> {
                         && matches!(body.last(), Some(Stmt::Assert(_)));
                     let is_elided_suite = |body: &[Stmt]| {
                         !body.is_empty()
-                            && body.iter().all(|stmt| {
-                                matches!(
-                                    self.context.optimized_locations.get(&stmt.range()),
-                                    Some(super::optimization::OptimizedLocation::Elided)
-                                )
-                            })
+                            && body
+                                .iter()
+                                .all(|stmt| self.context.is_elided_statement(stmt))
                     };
                     // The erased true arm retains its own original array. A live
                     // successor or an inner synchronous manager keeps the common
@@ -14007,14 +13981,32 @@ impl<'source> Compiler<'source> {
                         && matches!(statement.elif_else_clauses.last(), Some(clause)
                             if clause.test.is_none()
                                 && is_elided_suite(&clause.body));
+                    // A coroutine's single manager keeps this nested all-elided
+                    // join inside the same protected body. Its original end array
+                    // still receives the inner false edge's line after exit copying.
+                    let single_manager_elided_nested_join = self.unit.flags
+                        & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                        == CO_COROUTINE
+                        && self.control.withs.active_with_exits.len() == 1
+                        && self.control.withs.active_with_region_exclusions.len() == 1
+                        && self
+                            .control
+                            .exceptions
+                            .active_exception_region_exclusions
+                            .is_empty()
+                        && matches!(body, [Stmt::If(nested)]
+                            if is_elided_suite(&nested.body)
+                                && matches!(nested.elif_else_clauses.as_slice(), [clause]
+                                    if clause.test.is_none() && is_elided_suite(&clause.body)));
                     let optimized_nested_else = self.context.python_version
                         >= crate::PythonVersion::Py314
                         && branch_index == 0
                         && matches!(self.unit.scope, Scope::Function { .. })
-                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                        && ((self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                             == 0
+                            && !self.has_active_control_flow_region())
+                            || single_manager_elided_nested_join)
                         && self.control.loops.contexts.is_empty()
-                        && !self.has_active_control_flow_region()
                         && !self.control.in_exception_handler()
                         && self.control.exceptions.active_exception_group_handlers == 0
                         && self.control.finally.active_finally_try_bodies == 0
@@ -14449,12 +14441,7 @@ impl<'source> Compiler<'source> {
         {
             return None;
         }
-        let is_elided = |statement: &Stmt| {
-            matches!(
-                self.context.optimized_locations.get(&statement.range()),
-                Some(super::optimization::OptimizedLocation::Elided)
-            )
-        };
+        let is_elided = |statement: &Stmt| self.context.is_elided_statement(statement);
         if !body.last().is_some_and(is_elided) {
             return None;
         }
@@ -14498,12 +14485,7 @@ impl<'source> Compiler<'source> {
         {
             return None;
         }
-        let is_elided = |statement: &Stmt| {
-            matches!(
-                self.context.optimized_locations.get(&statement.range()),
-                Some(super::optimization::OptimizedLocation::Elided)
-            )
-        };
+        let is_elided = |statement: &Stmt| self.context.is_elided_statement(statement);
         if !statement.body.last().is_some_and(is_elided) {
             return None;
         }
@@ -14748,17 +14730,11 @@ impl<'source> Compiler<'source> {
         if self.context.python_version >= crate::PythonVersion::Py314
             && let Some(end) = body.iter().rposition(|statement| {
                 !matches!(statement, Stmt::Global(_) | Stmt::Nonlocal(_))
-                    && !matches!(
-                        self.context.optimized_locations.get(&statement.range()),
-                        Some(super::optimization::OptimizedLocation::Elided)
-                    )
+                    && !self.context.is_elided_statement(statement)
             })
-            && body[end + 1..].iter().any(|statement| {
-                matches!(
-                    self.context.optimized_locations.get(&statement.range()),
-                    Some(super::optimization::OptimizedLocation::Elided)
-                )
-            })
+            && body[end + 1..]
+                .iter()
+                .any(|statement| self.context.is_elided_statement(statement))
             && matches!(&body[end], Stmt::If(statement)
             if statement.elif_else_clauses.is_empty()
                 && condition_has_only_runtime_tests(&statement.test)
@@ -14767,10 +14743,7 @@ impl<'source> Compiler<'source> {
                     || (!self.has_active_control_flow_region()
                         && !self.control.in_exception_handler()
                         && self.control.finally.is_inactive_for_return_unwind()
-                        && body[end + 1..].iter().all(|suffix| matches!(
-                            self.context.optimized_locations.get(&suffix.range()),
-                            Some(super::optimization::OptimizedLocation::Elided)
-                        ))
+                        && body[end + 1..].iter().all(|suffix| self.context.is_elided_statement(suffix))
                         && condition_has_linear_runtime_leaves(&statement.test)
                         && !suite_contains_yield(&statement.body)
                         && statement.body.iter().all(|statement| {
@@ -14781,10 +14754,7 @@ impl<'source> Compiler<'source> {
                             || matches!(statement.body.as_slice(), [Stmt::Return(_) | Stmt::Raise(_)])
                             || (!statement.body.is_empty()
                                 && original_condition_has_unique_jump_target(&statement.test, true)
-                                && statement.body.iter().all(|statement| matches!(
-                                    self.context.optimized_locations.get(&statement.range()),
-                                    Some(super::optimization::OptimizedLocation::Elided)
-                                )))))))
+                                && statement.body.iter().all(|statement| self.context.is_elided_statement(statement)))))))
         {
             // Native emits no instructions for the optimized suffix, leaving the
             // conditional as the original loop-tail statement. A direct return or
@@ -16974,10 +16944,7 @@ impl<'source> Compiler<'source> {
         let elided_else = matches!(statement.elif_else_clauses.last(), Some(clause)
         if clause.test.is_none()
             && !clause.body.is_empty()
-            && clause.body.iter().all(|statement| matches!(
-                self.context.optimized_locations.get(&statement.range()),
-                Some(super::optimization::OptimizedLocation::Elided)
-            )));
+            && clause.body.iter().all(|statement| self.context.is_elided_statement(statement)));
         // A removed else in a non-final arm leaves an unlocated exit that native
         // copies onto each runtime edge. For-loop else and nonlinear condition joins
         // keep their existing lowering because they have separate continuations.
@@ -17061,10 +17028,7 @@ impl<'source> Compiler<'source> {
                                     && !expression_suspends_current_scope(test)
                                     && condition_jump_target_count(test, true) == 1
                             }) && !clause.body.is_empty()
-                                && clause.body.iter().all(|statement| matches!(
-                                    self.context.optimized_locations.get(&statement.range()),
-                                    Some(super::optimization::OptimizedLocation::Elided)
-                                ))
+                                && clause.body.iter().all(|statement| self.context.is_elided_statement(statement))
                         })))
                     && (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                         || (self.unit.flags & CO_COROUTINE != 0
@@ -17075,10 +17039,7 @@ impl<'source> Compiler<'source> {
                             })))
                     && self.control.in_loop_tail_without_nested_cleanup()
                     && !statement.body.is_empty()
-                    && statement.body.iter().all(|statement| matches!(
-                        self.context.optimized_locations.get(&statement.range()),
-                        Some(super::optimization::OptimizedLocation::Elided)
-                    ))))
+                    && statement.body.iter().all(|statement| self.context.is_elided_statement(statement))))
             && !self.control.in_exception_handler()
             && (self.control.exceptions.active_exception_region_exclusions.is_empty()
                 && self.control.finally.active_finally_try_bodies == 0
@@ -17140,6 +17101,42 @@ impl<'source> Compiler<'source> {
                     || copied_for_else_branch_exit)
                 && (!self.has_active_control_flow_region()
                     || condition_has_only_runtime_tests(&statement.test));
+            if copied_loop_branch_exit
+                && self.context.python_version >= crate::PythonVersion::Py314
+                && !try_body_normal_exit
+                && statement.elif_else_clauses.is_empty()
+                && matches!(self.unit.scope, Scope::Function { .. })
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                && !self.has_active_control_flow_region()
+                && !self.control.in_exception_handler()
+                && self.control.finally.is_inactive_for_return_unwind()
+                && self.control.loops.contexts.last().is_some_and(|context| {
+                    context.iterator_cleanup == IteratorCleanup::Sync && !context.has_orelse
+                })
+                && condition_has_linear_runtime_leaves(&statement.test)
+                && condition_has_only_runtime_tests(&statement.test)
+                && !expression_suspends_current_scope(&statement.test)
+                && condition_jump_target_count(&statement.test, true) > 1
+                && condition_jump_target_count(&statement.test, false) == 1
+                && !statement.body.is_empty()
+                && statement.body.iter().all(|statement| {
+                    matches!(
+                        self.context.optimized_locations.get(&statement.range()),
+                        Some(super::optimization::OptimizedLocation::Elided)
+                    )
+                })
+            {
+                // Removed arms share the enclosing branch's original exit. Keep it
+                // unlocated until all incoming edges receive their backedge copies.
+                let exit = self.assembler.label();
+                self.compile_jump_if(&statement.test, false, exit)?;
+                self.assembler.mark(exit);
+                self.set_depth(base_depth);
+                self.assembler.set_location(SourceLocation::NONE);
+                let backedge = self.emit_loop_tail_backedge(restart, false)?;
+                self.assembler.mark_as_artificial_eval_break(backedge);
+                return Ok(LoopBackedge::Emitted);
+            }
             // CPython keeps a non-final branch's nested condition body before the fallback
             // backedge even when that body exits the enclosing loop or function.
             if copied_loop_branch_exit
@@ -18012,18 +18009,12 @@ impl<'source> Compiler<'source> {
                     && !self.has_active_control_flow_region()
                     && !self.control.in_exception_handler()
                     && self.control.finally.is_inactive_for_return_unwind()
-                    && body.last().is_some_and(|statement| {
-                        matches!(
-                            self.context.optimized_locations.get(&statement.range()),
-                            Some(super::optimization::OptimizedLocation::Elided)
-                        )
-                    })
-                    && let Some(index) = body.iter().rposition(|statement| {
-                        !matches!(
-                            self.context.optimized_locations.get(&statement.range()),
-                            Some(super::optimization::OptimizedLocation::Elided)
-                        )
-                    })
+                    && body
+                        .last()
+                        .is_some_and(|statement| self.context.is_elided_statement(statement))
+                    && let Some(index) = body
+                        .iter()
+                        .rposition(|statement| !self.context.is_elided_statement(statement))
                     && let Stmt::While(inner) = &body[index]
                     && condition_has_linear_runtime_leaves(&inner.test)
                     && !expression_suspends_current_scope(&inner.test)
@@ -18913,10 +18904,7 @@ impl<'source> Compiler<'source> {
                 // empty original successor still stops 3.14's borrow traversal.
                 while let Some((last, leading)) = borrow_body.split_last()
                     && matches!(last, Stmt::Global(declaration) if declaration.names.is_empty())
-                    && matches!(
-                        self.context.optimized_locations.get(&last.range()),
-                        Some(super::optimization::OptimizedLocation::Elided)
-                    )
+                    && self.context.is_elided_statement(last)
                 {
                     borrow_body = leading;
                 }
@@ -19463,12 +19451,9 @@ impl<'source> Compiler<'source> {
     fn optimized_conditional_join(&self, branch: &ruff_python_ast::StmtIf) -> bool {
         let is_elided = |body: &[Stmt]| {
             !body.is_empty()
-                && body.iter().all(|stmt| {
-                    matches!(
-                        self.context.optimized_locations.get(&stmt.range()),
-                        Some(super::optimization::OptimizedLocation::Elided),
-                    )
-                })
+                && body
+                    .iter()
+                    .all(|stmt| self.context.is_elided_statement(stmt))
         };
         let linear = |body: &[Stmt]| {
             is_elided(body)
@@ -19526,10 +19511,8 @@ impl<'source> Compiler<'source> {
                 return None;
             };
             if !prefix.iter().all(|statement| {
-                matches!(
-                    self.context.optimized_locations.get(&statement.range()),
-                    Some(super::optimization::OptimizedLocation::Elided)
-                ) || suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement))
+                self.context.is_elided_statement(statement)
+                    || suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement))
             }) {
                 return None;
             }
@@ -21621,12 +21604,11 @@ impl<'source> Compiler<'source> {
             && statement.finalbody.is_empty()
             && self.control.finally.active_finally_try_bodies == 0
         {
-            let effective_tail = statement.body.iter().rev().find(|tail| {
-                !matches!(
-                    self.context.optimized_locations.get(&tail.range()),
-                    Some(super::optimization::OptimizedLocation::Elided)
-                )
-            });
+            let effective_tail = statement
+                .body
+                .iter()
+                .rev()
+                .find(|tail| !self.context.is_elided_statement(tail));
             let has_elided_suffix =
                 effective_tail.map(Ranged::range) != statement.body.last().map(Ranged::range);
             effective_tail.and_then(|tail| match tail {
@@ -22909,8 +22891,7 @@ impl<'source> Compiler<'source> {
                 .find(|tail| {
                     !matches!(tail, Stmt::Global(global)
                         if global.names.is_empty()
-                            && matches!(self.context.optimized_locations.get(&tail.range()),
-                                Some(super::optimization::OptimizedLocation::Elided)))
+                            && self.context.is_elided_statement(tail))
                 })
                 .filter(|tail| {
                     self.context.python_version >= crate::PythonVersion::Py314
@@ -23267,12 +23248,10 @@ impl<'source> Compiler<'source> {
                 && let [clause] = branch.elif_else_clauses.as_slice()
                 && clause.test.is_none()
                 && !clause.body.is_empty()
-                && clause.body.iter().all(|statement| {
-                    matches!(
-                        self.context.optimized_locations.get(&statement.range()),
-                        Some(super::optimization::OptimizedLocation::Elided)
-                    )
-                })
+                && clause
+                    .body
+                    .iter()
+                    .all(|statement| self.context.is_elided_statement(statement))
                 && let Some(donor) = unique_condition_jump_target(&branch.test, false)
             {
                 // Exit copying bypasses this original join from the populated arm.
@@ -25605,17 +25584,12 @@ impl<'source> Compiler<'source> {
                 >= crate::PythonVersion::Py314
                 && handler.name.is_some()
                 && terminal
-                && handler.body.last().is_some_and(|statement| {
-                    matches!(
-                        self.context.optimized_locations.get(&statement.range()),
-                        Some(super::optimization::OptimizedLocation::Elided)
-                    )
-                })
+                && handler
+                    .body
+                    .last()
+                    .is_some_and(|statement| self.context.is_elided_statement(statement))
                 && matches!(handler.body.iter().rev().find(|statement| {
-                    !matches!(
-                        self.context.optimized_locations.get(&statement.range()),
-                        Some(super::optimization::OptimizedLocation::Elided)
-                    )
+                    !self.context.is_elided_statement(statement)
                 }), Some(Stmt::For(tail))
                     if !tail.is_async
                         && tail.orelse.is_empty()
@@ -27922,12 +27896,7 @@ impl<'source> Compiler<'source> {
             .body
             .iter()
             .rev()
-            .find(|tail| {
-                !matches!(
-                    self.context.optimized_locations.get(&tail.range()),
-                    Some(super::optimization::OptimizedLocation::Elided)
-                )
-            })
+            .find(|tail| !self.context.is_elided_statement(tail))
             .filter(|tail| match tail {
                 Stmt::While(loop_) => loop_.orelse.is_empty(),
                 // Without another arm, the body's fallthrough and false edge
@@ -30413,7 +30382,24 @@ impl<'source> Compiler<'source> {
                             .set_location(compiler.source_location(pass.range));
                         compiler.emit(NOP, 0, 0)?;
                     }
-                    let recorder = AsyncForEndPopRecorder::new(&compiler.control);
+                    let live_linear_finalizer = !statement.finalbody.is_empty()
+                        && statement.finalbody.iter().all(|statement| {
+                            matches!(statement, Stmt::Expr(expression)
+                            if match expression.value.as_ref() {
+                                call @ Expr::Call(_) => {
+                                    !expression_contains_inline_branch(call)
+                                        && !expression_suspends_current_scope(call)
+                                }
+                                Expr::Await(awaited) => {
+                                    matches!(awaited.value.as_ref(), Expr::Call(_))
+                                        && !expression_contains_inline_branch(&awaited.value)
+                                        && !expression_suspends_current_scope(&awaited.value)
+                                }
+                                _ => false,
+                            })
+                        });
+                    let recorder =
+                        AsyncForEndPopRecorder::new(&compiler.control, live_linear_finalizer);
                     let ((), recorder) = compiler.with_control_stack(
                         |control| &mut control.finally.async_for_end_pop_recorders,
                         recorder,
@@ -30841,10 +30827,7 @@ impl<'source> Compiler<'source> {
                 .rev()
                 .find(|statement| {
                     !matches!(statement, Stmt::Global(_) | Stmt::Nonlocal(_))
-                        && !matches!(
-                            self.context.optimized_locations.get(&statement.range()),
-                            Some(super::optimization::OptimizedLocation::Elided)
-                        )
+                        && !self.context.is_elided_statement(statement)
                 })
                 .is_some_and(|last| match last {
                     Stmt::Expr(expression) => {
@@ -32642,10 +32625,7 @@ impl<'source> Compiler<'source> {
                     .iter()
                     .rposition(|statement| {
                         !matches!(statement, Stmt::Global(global) if global.names.is_empty())
-                            || !matches!(
-                                self.context.optimized_locations.get(&statement.range()),
-                                Some(super::optimization::OptimizedLocation::Elided)
-                            )
+                            || !self.context.is_elided_statement(statement)
                     })
                     .map_or(0, |index| index + 1);
                 &body[..end]

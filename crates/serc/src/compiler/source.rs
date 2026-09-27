@@ -359,6 +359,14 @@ impl<'source> CompilationContext<'source> {
         }
     }
 
+    /// Returns whether optimization recorded this statement as elided.
+    pub(super) fn is_elided_statement(&self, statement: &Stmt) -> bool {
+        matches!(
+            self.optimized_locations.get(&statement.range()),
+            Some(super::optimization::OptimizedLocation::Elided)
+        )
+    }
+
     /// Preserve symbol-table and suspension facts established before assertion removal.
     pub(super) fn preserve_unoptimized_scopes(&mut self, body: &Suite) {
         struct GeneratorCollector {
