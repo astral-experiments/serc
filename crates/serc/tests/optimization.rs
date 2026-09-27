@@ -242,6 +242,16 @@ fn live_for_body_preserves_original_footer_location() {
 }
 
 #[test]
+fn attribute_iterator_preserves_original_footer_location() {
+    for prefix in ["    if obj.ready:\n        assert obj.ready\n", ""] {
+        let source = format!(
+            "def f(obj):\n{prefix}    if obj.active and obj.target is not None:\n        for item in obj.items:\n            item.action()\n"
+        );
+        assert_matches_cpython(&source, "attribute_iterator_footer.py", &LEVELS);
+    }
+}
+
+#[test]
 fn nested_erased_branch_keeps_original_scope_exit() {
     for source in [
         "def f(obj, active, checked):\n    if obj.ready:\n        assert obj.ready\n    prepared = obj.prepare()\n    if obj.active:\n        if obj.check():\n            assert obj.valid\n        else:\n            assert obj.other\n    else:\n        assert obj.active\n",
