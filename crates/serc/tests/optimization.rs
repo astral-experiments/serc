@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
@@ -20,6 +21,25 @@ const LEVELS: [OptimizationLevel; 3] = [
     OptimizationLevel::One,
     OptimizationLevel::Two,
 ];
+
+#[test]
+fn empty_try_before_removed_assertions_preserves_implicit_return() {
+    for (case, source) in [
+        "def f(flag):\n    try:\n        assert flag\n    except AssertionError:\n        pass\n    assert flag\n",
+        "def f(flag):\n    try:\n        assert flag\n        assert flag, describe()\n    except AssertionError as error:\n        pass\n    assert flag\n    assert flag\n",
+        "def f(flag):\n    \"description\"\n    action()\n    try: assert flag\n    except: pass\n    assert flag; assert flag\n",
+        "def f(flag):\n    try:\n        assert flag\n    except AssertionError:\n        recover()\n    assert flag\n",
+        "def f(flag):\n    try:\n        assert flag\n    except AssertionError:\n        return 1\n    assert flag\n",
+        "def f(flag):\n    try:\n        assert flag\n    except AssertionError:\n        pass\n    assert flag\n    action()\n",
+        "def f(flag):\n    try:\n        assert flag\n        pass\n    except AssertionError:\n        pass\n    assert flag\n",
+        "def f(flag):\n    try:\n        assert flag\n    except AssertionError:\n        pass\n    assert flag\n    pass\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(source, &format!("empty_try_assert_tail_{case}.py"), &LEVELS);
+    }
+}
 
 #[test]
 fn with_conditional_exit_before_removed_assertion() {
@@ -45,6 +65,24 @@ fn with_conditional_exit_before_removed_assertion() {
             &source,
             &format!("with_conditional_exit_{index}.py"),
             &LEVELS,
+        );
+    }
+}
+
+#[test]
+fn nested_authored_pass_preserves_returns_before_removed_assertions() {
+    for (index, source) in [
+        "def f(a, b, c):\n    if a:\n        if b:\n            if c:\n                pass\n        assert a\n",
+        "def f(a, b, c):\n    if a:\n        pass\n    else:\n        if b:\n            if c:\n                pass\n        assert a\n        assert b\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython_versions(
+            source,
+            &format!("nested_authored_pass_return_{index}.py"),
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
         );
     }
 }
@@ -112,6 +150,36 @@ fn elided_assertions_preserve_conditional_assignment_return_boundary() {
     .enumerate()
     {
         assert_matches_cpython(source, &format!("conditional_assignment_assert_{case}.py"), &LEVELS);
+    }
+}
+
+#[test]
+fn elided_assertions_preserve_unpacking_return_locations() {
+    for locals in [0, 16] {
+        for targets in [
+            "first, second",
+            "first, second, third",
+            "first, second, third, fourth",
+        ] {
+            for brackets in [false, true] {
+                let mut source = String::from("def f(obj):\n");
+                for index in 0..locals {
+                    writeln!(source, "    temporary_{index} = {index}").unwrap();
+                }
+                let values = targets
+                    .split(", ")
+                    .map(|name| format!("obj.{name}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let target = if brackets {
+                    format!("[{targets}]")
+                } else {
+                    targets.to_owned()
+                };
+                writeln!(source, "    {target} = {values}\n    assert first").unwrap();
+                assert_matches_cpython(&source, "unpacking_before_assert.py", &LEVELS);
+            }
+        }
     }
 }
 
@@ -2463,6 +2531,36 @@ fn nested_pass_before_elided_assert_preserves_return_locations() {
 }
 
 #[test]
+fn elided_assertions_preserve_terminal_branch_return_locations() {
+    for (index, source) in [
+        "def f(first, second, obj):\n    if first:\n        if second:\n            value = obj.first\n        else:\n            value = obj.second\n        assert value\n",
+        "def f(first, second):\n    if first:\n        while second:\n            second = step()\n        assert second\n",
+        "def f(first, second, obj):\n    if first:\n        work()\n    else:\n        if second:\n            value = obj.first\n        else:\n            value = obj.second\n        assert value\n",
+        "def f(first, second):\n    if first:\n        work()\n    else:\n        while second:\n            second = step()\n        assert second\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython_versions(
+            source,
+            &format!("terminal_branch_return_{index}.py"),
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
+fn elided_assertions_preserve_nested_assignment_join_nop() {
+    assert_matches_cpython_versions(
+        "def f(flag, item):\n    if flag:\n        if item is None:\n            value = 1.0\n        else:\n            value = convert(item)\n        assert value\n    else:\n        value = 2.0\n    return value\n",
+        "nested_assignment_join.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn nested_terminal_if_before_elided_assert_matches_cpython() {
     for source in [
         "def f(a,b):\n if a:\n  if b:\n   x = 1\n  assert a\n",
@@ -2661,6 +2759,39 @@ print(json.dumps(events))
 }
 
 #[test]
+fn elided_boolean_loop_tail_after_prefix_or_nested_condition() {
+    for source in [
+        r"
+def f(items):
+    for item in items:
+        first, second = item
+        if first == 1 or second == 2:
+            assert first
+",
+        r"
+def f(items):
+    assert items
+    values = prepare(items)
+    for item in values:
+        first, second = item, item
+        assert first
+        if first == 1 or second == 2:
+            assert second
+",
+        r"
+def f(items):
+    for item in items:
+        if condition(item):
+            if item is not None:
+                if item in (1, 2) or item in (3, 4):
+                    assert item
+",
+    ] {
+        assert_matches_cpython(source, "elided_boolean_loop_tail.py", &LEVELS);
+    }
+}
+
+#[test]
 fn loop_tail_elided_else_matches_cpython() {
     for source in [
         r"
@@ -2739,6 +2870,18 @@ fn elided_loop_arms_inside_managers_match_cpython() {
 "
             );
             assert_matches_cpython(&source, "elided_manager_loop.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
+fn coroutine_elided_loop_arms_inside_managers_match_cpython() {
+    for manager in ["with cm", "async with cm"] {
+        for condition in ["item == 1", "first or second"] {
+            let source = format!(
+                "async def f(cm, items, first, second):\n    {manager}:\n        for item in items:\n            if {condition}:\n                assert item\n            else:\n                assert items\n"
+            );
+            assert_matches_cpython(&source, "coroutine_elided_manager_loop.py", &LEVELS);
         }
     }
 }
@@ -2842,6 +2985,18 @@ fn elided_if_else_preserves_conditional_join() {
 }
 
 #[test]
+fn elided_elif_else_preserves_conditional_join() {
+    for source in [
+        "def f(first, second):\n if first:\n  assert first\n elif second:\n  assert second\n else:\n  assert first\n action()\n",
+        "def f(first, second):\n if first:\n  assert first\n elif first or second:\n  assert second\n else:\n  assert first\n action()\n",
+        "def f(first, second):\n if first:\n  assert first\n elif second:\n  assert second\n else:\n  assert first\n return 1\n",
+        "def f(first, second):\n if first:\n  assert first\n elif second:\n  assert second\n action()\n",
+    ] {
+        assert_matches_cpython(source, "sub/elided_elif_else.py", &LEVELS);
+    }
+}
+
+#[test]
 fn protected_elided_if_else_preserves_conditional_join() {
     for source in [
         "def f(a):\n try:\n  if a:\n   assert a\n  else:\n   assert not a\n  work(a)\n except ValueError:\n  recover()\n",
@@ -2861,6 +3016,9 @@ fn protected_elided_if_else_preserves_conditional_join() {
 #[test]
 fn elided_outer_else_preserves_nested_conditional_join() {
     for source in [
+        "def f(a,b):\n if a:\n  if b:\n   assert a\n  else:\n   assert b\n else:\n  assert a\n work()\n",
+        "def f(a,b):\n if a:\n  if b:\n   assert a\n  else:\n   assert b\n else:\n  assert a\n return 1\n",
+        "def f(a,b):\n if a:\n  if b:\n   assert a\n  else:\n   assert b\n work()\n",
         "def f(a,b):\n if a:\n  if b:\n   x = 1\n  else:\n   x = 2\n else:\n  assert a\n work(x)\n",
         "def f(a,b):\n if a and b:\n  if not b:\n   x = 1\n  else:\n   x = 2\n else:\n  assert a\n work(x)\n",
         "def f(a,b):\n if a:\n  if b:\n   work(1)\n  else:\n   work(2)\n else:\n  assert a\n finish()\n",

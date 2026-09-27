@@ -929,8 +929,8 @@ impl<'source> Compiler<'source> {
         self.compile_scope_suite(body, add_implicit_return, has_docstring)?;
         let add_implicit_return =
             add_implicit_return && !self.control.statements.emitted_fallthrough_return;
-        // Elided statements must not hide the comprehension assignment that
-        // owns the implicit-return location.
+        // Elided statements must not hide the assignment that owns the implicit
+        // return's location before static store reordering and fusion.
         let terminal_statement = body.last();
         let is_elided_statement = |statement: &Stmt| {
             matches!(statement, Stmt::Global(global) if global.names.is_empty())
@@ -945,15 +945,7 @@ impl<'source> Compiler<'source> {
             body.iter()
                 .rev()
                 .find(|statement| !is_elided_statement(statement))
-                .filter(|statement| {
-                    let Stmt::Assign(assignment) = statement else {
-                        return false;
-                    };
-                    matches!(
-                        assignment.value.as_ref(),
-                        Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_)
-                    )
-                })
+                .filter(|statement| matches!(statement, Stmt::Assign(_)))
                 .or(terminal_statement)
         } else {
             terminal_statement

@@ -1883,6 +1883,14 @@ impl<'source> Compiler<'source> {
                         && !expression_suspends_current_scope(&conditional.test)
                         && (suite_has_linear_borrow_fallthrough(&conditional.body)
                             || matches!(conditional.body.as_slice(), [Stmt::Pass(_)])
+                            // The nested pass keeps its original NOP until after
+                            // exit copying. Both conditions need separate returns
+                            // before the removed assertion's empty join disappears.
+                            || matches!(conditional.body.as_slice(), [Stmt::If(nested)]
+                                if nested.elif_else_clauses.is_empty()
+                                    && condition_has_linear_runtime_leaves(&nested.test)
+                                    && !expression_suspends_current_scope(&nested.test)
+                                    && matches!(nested.body.as_slice(), [Stmt::Pass(_)]))
                             || (!conditional.body.is_empty()
                                 && conditional.body.iter().all(|statement| matches!(
                                     self.context.optimized_locations.get(&statement.range()),
@@ -1932,7 +1940,34 @@ impl<'source> Compiler<'source> {
                         Some(super::optimization::OptimizedLocation::Elided)
                     )
                 });
-            if (is_final || terminal_if_before_elided || terminal_assignment_before_elided)
+            // A try with an erased protected body reaches the implicit return directly
+            // when only erased assertions follow. Use the existing terminal lowering so
+            // its setup NOP can merge with that return instead of retaining an empty join.
+            let terminal_empty_try_before_elided = self.context.python_version
+                >= crate::PythonVersion::Py314
+                && !is_final
+                && plain_function_suite
+                && !self.has_active_control_flow_region()
+                && !self.control.in_exception_handler()
+                && self.control.finally.is_inactive_for_return_unwind()
+                && matches!(statement, Stmt::Try(statement)
+                if !statement.is_star
+                    && statement.orelse.is_empty()
+                    && statement.finalbody.is_empty()
+                    && statement.body.iter().all(|statement| matches!(
+                        self.context.optimized_locations.get(&statement.range()),
+                        Some(super::optimization::OptimizedLocation::Elided)
+                    )))
+                && body[index + 1..].iter().all(|statement| {
+                    matches!(
+                        self.context.optimized_locations.get(&statement.range()),
+                        Some(super::optimization::OptimizedLocation::Elided)
+                    )
+                });
+            if (is_final
+                || terminal_if_before_elided
+                || terminal_assignment_before_elided
+                || terminal_empty_try_before_elided)
                 && final_expression_becomes_return
             {
                 match statement {
@@ -4024,6 +4059,8 @@ impl<'source> Compiler<'source> {
                         // Resolve the return after 3.12's static swaps, even when an
                         // elided assertion follows the comprehension assignment.
                         self.assembler.set_location(SourceLocation::NONE);
+                    } else if let Some(location) = self.elided_branch_return_location(body) {
+                        self.assembler.set_location(location);
                     } else if suite_has_shared_terminal_condition_exit(body)
                         || (self.assembler.at_original_match_join()
                             && self.assembler.at_original_unconditional_join())
@@ -4119,6 +4156,8 @@ impl<'source> Compiler<'source> {
                         // Resolve the return after 3.12's static swaps, even when an
                         // elided assertion follows the comprehension assignment.
                         self.assembler.set_location(SourceLocation::NONE);
+                    } else if let Some(location) = self.elided_branch_return_location(body) {
+                        self.assembler.set_location(location);
                     } else if suite_has_shared_terminal_condition_exit(body)
                         || (self.assembler.at_original_match_join()
                             && self.assembler.at_original_unconditional_join())
@@ -4159,6 +4198,71 @@ impl<'source> Compiler<'source> {
         }
         self.set_depth(base_depth);
         Ok(())
+    }
+
+    /// Recovers the original return donor hidden by removed branch-tail assertions.
+    fn elided_branch_return_location(&self, body: &[Stmt]) -> Option<SourceLocation> {
+        match self.elided_linear_branch_tail(body)? {
+            // Each original predecessor donates its span when this footer is copied.
+            Stmt::If(_) => Some(SourceLocation::NONE),
+            Stmt::While(statement) => {
+                Some(self.source_location(while_condition_exit_range(&statement.test)))
+            }
+            _ => None,
+        }
+    }
+
+    /// Finds a linear conditional or loop exit hidden by removed branch-tail assertions.
+    fn elided_linear_branch_tail<'a>(&self, body: &'a [Stmt]) -> Option<&'a Stmt> {
+        if self.context.python_version < crate::PythonVersion::Py314
+            || !matches!(self.unit.scope, Scope::Function { .. })
+            || self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) != 0
+            || !self.control.loops.contexts.is_empty()
+            || self.control.loops.suite_fallthrough_to_loop_backedge
+            || !self.control.withs.active_with_exits.is_empty()
+            || self.has_active_control_flow_region()
+            || self.control.in_exception_handler()
+            || self.control.exceptions.active_exception_group_handlers != 0
+            || !self.control.finally.is_inactive_for_return_unwind()
+        {
+            return None;
+        }
+        let end = body.iter().rposition(|statement| {
+            !matches!(
+                self.context.optimized_locations.get(&statement.range()),
+                Some(super::optimization::OptimizedLocation::Elided)
+            )
+        })?;
+        if end + 1 == body.len() {
+            return None;
+        }
+        match &body[end] {
+            Stmt::If(statement)
+                if condition_has_linear_runtime_leaves(&statement.test)
+                    && !expression_suspends_current_scope(&statement.test)
+                    && suite_has_linear_borrow_fallthrough(&statement.body)
+                    && !suite_contains_yield(&statement.body)
+                    && matches!(statement.elif_else_clauses.as_slice(), [clause]
+                        if clause.test.is_none()
+                            && suite_has_linear_borrow_fallthrough(&clause.body)
+                            && !suite_contains_yield(&clause.body)) =>
+            {
+                // Both live arms still reach the nested conditional's original join.
+                Some(&body[end])
+            }
+            Stmt::While(statement)
+                if statement.orelse.is_empty()
+                    && condition_has_linear_runtime_leaves(&statement.test)
+                    && !expression_suspends_current_scope(&statement.test)
+                    && original_condition_has_unique_jump_target(&statement.test, false)
+                    && suite_has_linear_borrow_fallthrough(&statement.body)
+                    && !suite_contains_yield(&statement.body) =>
+            {
+                // The condition's sole false edge owns the empty loop exit.
+                Some(&body[end])
+            }
+            _ => None,
+        }
     }
 
     fn compile_terminal_if_branch_suite(
@@ -13494,9 +13598,18 @@ impl<'source> Compiler<'source> {
                                 .inherited_followed_by_small_return
                             && !self.has_active_control_flow_region()))
                         && matches!(body.last(), Some(Stmt::Assert(_)));
+                    let is_elided_suite = |body: &[Stmt]| {
+                        !body.is_empty()
+                            && body.iter().all(|stmt| {
+                                matches!(
+                                    self.context.optimized_locations.get(&stmt.range()),
+                                    Some(super::optimization::OptimizedLocation::Elided)
+                                )
+                            })
+                    };
                     let optimized_empty_both = self.context.python_version
                         >= crate::PythonVersion::Py314
-                        && branch_index == 0
+                        && branch_index + 2 == branch_count
                         && (!self.has_active_control_flow_region()
                             || (self.unit.flags
                                 & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
@@ -13540,20 +13653,10 @@ impl<'source> Compiler<'source> {
                         && original_condition_has_unique_jump_target(test, true)
                         && condition_has_linear_runtime_leaves(test)
                         && !expression_suspends_current_scope(test)
-                        && !body.is_empty()
-                        && body.iter().all(|stmt| {
-                            matches!(
-                                self.context.optimized_locations.get(&stmt.range()),
-                                Some(super::optimization::OptimizedLocation::Elided)
-                            )
-                        })
-                        && matches!(statement.elif_else_clauses.as_slice(), [clause]
+                        && is_elided_suite(body)
+                        && matches!(statement.elif_else_clauses.last(), Some(clause)
                             if clause.test.is_none()
-                                && !clause.body.is_empty()
-                                && clause.body.iter().all(|stmt| matches!(
-                                    self.context.optimized_locations.get(&stmt.range()),
-                                    Some(super::optimization::OptimizedLocation::Elided)
-                                )));
+                                && is_elided_suite(&clause.body));
                     let optimized_nested_else = self.context.python_version
                         >= crate::PythonVersion::Py314
                         && branch_index == 0
@@ -13573,21 +13676,19 @@ impl<'source> Compiler<'source> {
                         && original_condition_has_unique_jump_target(test, true)
                         && matches!(statement.elif_else_clauses.as_slice(), [clause]
                         if clause.test.is_none()
-                            && !clause.body.is_empty()
-                            && clause.body.iter().all(|stmt| matches!(
-                                self.context.optimized_locations.get(&stmt.range()),
-                                Some(super::optimization::OptimizedLocation::Elided)
-                            )))
+                            && is_elided_suite(&clause.body))
                         && matches!(body, [Stmt::If(nested)]
                             if condition_has_linear_runtime_leaves(&nested.test)
                                 && !expression_suspends_current_scope(&nested.test)
                                 && original_condition_has_unique_jump_target(&nested.test, true)
                                 && original_condition_has_unique_jump_target(&nested.test, false)
-                                && suite_has_linear_borrow_fallthrough(&nested.body)
                                 && !suite_contains_yield(&nested.body)
                                 && matches!(nested.elif_else_clauses.as_slice(), [clause]
                                     if clause.test.is_none()
-                                        && suite_has_linear_borrow_fallthrough(&clause.body)
+                                        && ((suite_has_linear_borrow_fallthrough(&nested.body)
+                                            && suite_has_linear_borrow_fallthrough(&clause.body))
+                                            || (is_elided_suite(&nested.body)
+                                                && is_elided_suite(&clause.body)))
                                         && !suite_contains_yield(&clause.body)));
                     if optimized_empty_both || optimized_nested_else {
                         self.assembler
@@ -13760,7 +13861,11 @@ impl<'source> Compiler<'source> {
                         // An unguarded wildcard falls through to the match's empty join.
                         // Keep that block's line event when a small outer exit replaces it.
                         self.assembler.preserve_direct_inlined_jump_nop(branch_exit);
-                    } else if let Some(Stmt::If(nested)) = body.last() {
+                    } else if let Some(Stmt::If(nested)) = body
+                        .last()
+                        .filter(|statement| matches!(statement, Stmt::If(_)))
+                        .or_else(|| self.elided_linear_branch_tail(body))
+                    {
                         // CPython emits this jump in the nested if's empty join block. When
                         // small-exit inlining replaces it with a NOP, no preceding instruction
                         // in that block can make the NOP redundant.
@@ -16505,7 +16610,13 @@ impl<'source> Compiler<'source> {
                 // Elided arms share the original loop backedge even inside a
                 // manager. Its threaded false edge gets fresh, ownerless slots.
                 || (statement.elif_else_clauses.len() == 1
-                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    && (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                        || (self.unit.flags & CO_COROUTINE != 0
+                            && condition_has_linear_runtime_leaves(&statement.test)
+                            && !expression_suspends_current_scope(&statement.test)
+                            && self.control.loops.contexts.last().is_some_and(|context| {
+                                context.iterator_cleanup == IteratorCleanup::Sync
+                            })))
                     && self.control.in_loop_tail_without_nested_cleanup()
                     && !statement.body.is_empty()
                     && statement.body.iter().all(|statement| matches!(
@@ -18912,11 +19023,32 @@ impl<'source> Compiler<'source> {
         {
             return None;
         }
-        let [Stmt::If(branch)] = statement.body.as_slice() else {
-            return None;
-        };
-        self.optimized_conditional_join(branch)
-            .then_some(branch.range)
+        let mut body = statement.body.as_slice();
+        loop {
+            let (Stmt::If(branch), prefix) = body.split_last()? else {
+                return None;
+            };
+            if !prefix.iter().all(|statement| {
+                matches!(
+                    self.context.optimized_locations.get(&statement.range()),
+                    Some(super::optimization::OptimizedLocation::Elided)
+                ) || suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement))
+            }) {
+                return None;
+            }
+            if self.optimized_conditional_join(branch) {
+                return Some(branch.range);
+            }
+            // Linear prefixes and enclosing one-arm conditions leave the same
+            // empty join before the original, unlocated iterator backedge.
+            if !branch.elif_else_clauses.is_empty()
+                || !condition_has_linear_runtime_leaves(&branch.test)
+                || expression_suspends_current_scope(&branch.test)
+            {
+                return None;
+            }
+            body = &branch.body;
+        }
     }
 
     fn compile_for(&mut self, statement: &ruff_python_ast::StmtFor) -> Result<(), CompileError> {
