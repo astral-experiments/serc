@@ -2883,6 +2883,56 @@ impl OptimizationPipeline {
             return omitted_markers;
         }
 
+        if self.python_version >= crate::PythonVersion::Py314 {
+            for pair in order.windows(2) {
+                let [current, next] = *pair else {
+                    unreachable!()
+                };
+                if temperatures[current.index()] != COLD_BLOCK
+                    || temperatures[next.index()] != WARM_BLOCK
+                {
+                    continue;
+                }
+                let mut instructions =
+                    graph[current]
+                        .items()
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .filter_map(|(offset, item)| match item {
+                            Item::Instruction(instruction) => Some((offset, instruction)),
+                            Item::Label(_) => None,
+                        });
+                let Some((offset, jump)) = instructions.next() else {
+                    continue;
+                };
+                let Some((_, previous)) = instructions.next() else {
+                    continue;
+                };
+                if jump.opcode == JUMP_FORWARD
+                    && matches!(jump.operand(), Operand::Forward(target)
+                        if graph.label_block(target) == Some(next))
+                    && *jump
+                        == Instruction::new(
+                            JUMP_FORWARD,
+                            jump.operand(),
+                            jump.location,
+                            jump.depth_after(),
+                        )
+                    && jump.location.line == previous.location.line
+                    && graph[next].items().iter().find_map(|item| match item {
+                        Item::Instruction(instruction) => Some(instruction.location.line >= 0),
+                        Item::Label(_) => None,
+                    }) == Some(true)
+                {
+                    // Exit copying can leave a deferred adjacent branch jump here.
+                    // CPython removes it before cold relocation creates an ownerless
+                    // bridge with the final instruction's post-SWAP location.
+                    graph.remove_item(ItemPosition::new(current, offset));
+                }
+            }
+        }
+
         let explicit_jumps = (0..order.len().saturating_sub(1))
             .filter(|position| {
                 temperatures[order[*position].index()] == COLD_BLOCK

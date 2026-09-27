@@ -2193,6 +2193,19 @@ impl<'source> Compiler<'source> {
                                     Some(super::optimization::OptimizedLocation::Elided)
                                 ))))
                 );
+            // Removed assertions leave the direct manager-tail Pass outside its protected region.
+            let optimized_sync_with_pass_tail = self.context.python_version
+                >= crate::PythonVersion::Py314
+                && direct_sync_manager_body
+                && matches!(statement, Stmt::Pass(_))
+                && index + 1 < body.len()
+                && body[index + 1..].iter().all(|statement| {
+                    matches!(statement, Stmt::Global(global) if global.names.is_empty())
+                        && matches!(
+                            self.context.optimized_locations.get(&statement.range()),
+                            Some(super::optimization::OptimizedLocation::Elided)
+                        )
+                });
             let constant_pass_location = match statement {
                 Stmt::Pass(statement) => Some(self.source_location(statement.range)),
                 _ => None,
@@ -2227,6 +2240,7 @@ impl<'source> Compiler<'source> {
                     || self.control.finally.active_finally_end_blocks > 0
                     || protected_async_with_pass
                     || protected_sync_with_join_pass
+                    || optimized_sync_with_pass_tail
                     || (self.context.python_version >= crate::PythonVersion::Py314
                         && split_pass_finally_prefix)
                     || (self.control.statements.retained_branch_pass == Some(statement.range)
@@ -2276,12 +2290,12 @@ impl<'source> Compiler<'source> {
                     .set_location(self.source_location(statement.range));
                 // A pass stays in its authored block, including before an implicit return.
                 // Context-manager exits retain the existing marker boundaries.
-                let direct_manager_pass_tail = self.context.python_version
-                    >= crate::PythonVersion::Py314
-                    && direct_manager_pass_suite
-                    && body[index + 1..]
-                        .iter()
-                        .all(|statement| matches!(statement, Stmt::Global(_) | Stmt::Nonlocal(_)));
+                let direct_manager_pass_tail = optimized_sync_with_pass_tail
+                    || (self.context.python_version >= crate::PythonVersion::Py314
+                        && direct_manager_pass_suite
+                        && body[index + 1..].iter().all(|statement| {
+                            matches!(statement, Stmt::Global(_) | Stmt::Nonlocal(_))
+                        }));
                 let noop_start = ((is_final || direct_manager_pass_tail)
                     && !protected_async_with_pass
                     && !self.control.withs.active_with_region_exclusions.is_empty())
@@ -2947,8 +2961,27 @@ impl<'source> Compiler<'source> {
         has_later_arm: bool,
     ) {
         let legacy = self.context.python_version <= crate::PythonVersion::Py313;
+        // Removing trailing assertions does not merge an assignment's original
+        // join with the enclosing conditional's return block.
+        let terminal_assignment = body
+            .iter()
+            .rev()
+            .find(|statement| {
+                !matches!(
+                    self.context.optimized_locations.get(&statement.range()),
+                    Some(super::optimization::OptimizedLocation::Elided)
+                )
+            })
+            .is_some_and(|statement| {
+                // Earlier name-store arms can still copy their short exit tail
+                // through the enclosing conditional's intervening jump.
+                matches!(statement, Stmt::Assign(assignment)
+                    if !has_later_arm
+                        || !matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                        || body.last().map(Ranged::range) == Some(assignment.range))
+            });
         let needs_boundary = legacy
-            || matches!(body.last(), Some(Stmt::Assign(_)))
+            || terminal_assignment
             // Nonfinal deletion arms have an authored end jump. A one-slot Name
             // delete plus that replaced jump and the return can still fit a copy.
             || (!has_later_arm && matches!(body.last(), Some(Stmt::Delete(_))))
@@ -3451,6 +3484,18 @@ impl<'source> Compiler<'source> {
         Ok(())
     }
 
+    /// Keep removed assertions from replacing a loop break's return location.
+    fn terminal_for_break_exit_inherits_predecessor(&self, body: &[Stmt]) -> bool {
+        let end = body.iter().rposition(|statement| {
+            !matches!(statement, Stmt::Global(global) if global.names.is_empty())
+                || !matches!(
+                    self.context.optimized_locations.get(&statement.range()),
+                    Some(super::optimization::OptimizedLocation::Elided)
+                )
+        });
+        terminal_for_break_exit_inherits_predecessor(&body[..end.map_or(0, |index| index + 1)])
+    }
+
     /// Leaves a while-else footer unlocated until its original predecessors receive copies.
     fn terminal_while_else_break_exit_inherits_predecessor(&self, body: &[Stmt]) -> bool {
         if !matches!(self.unit.scope, Scope::Function { .. })
@@ -3924,7 +3969,7 @@ impl<'source> Compiler<'source> {
                         self.assembler.set_location(
                             self.source_location(implicit_return_range(self, statement)),
                         );
-                    } else if terminal_for_break_exit_inherits_predecessor(body)
+                    } else if self.terminal_for_break_exit_inherits_predecessor(body)
                         || self.terminal_while_else_break_exit_inherits_predecessor(body)
                     {
                         self.assembler.set_location(SourceLocation::NONE);
@@ -3974,7 +4019,16 @@ impl<'source> Compiler<'source> {
                             true,
                             |compiler| {
                                 compiler.with_fallthrough_tracking(|compiler| {
-                                    compiler.compile_terminal_if_branch_suite(body, true, true)
+                                    compiler.with_control_override(
+                                        |control| {
+                                            &mut control.statements.in_terminal_if_branch_suite
+                                        },
+                                        true,
+                                        |compiler| {
+                                            compiler
+                                                .compile_terminal_if_branch_suite(body, true, true)
+                                        },
+                                    )
                                 })
                             },
                         )
@@ -4010,7 +4064,7 @@ impl<'source> Compiler<'source> {
                         self.assembler.set_location(
                             self.source_location(implicit_return_range(self, statement)),
                         );
-                    } else if terminal_for_break_exit_inherits_predecessor(body)
+                    } else if self.terminal_for_break_exit_inherits_predecessor(body)
                         || self.terminal_while_else_break_exit_inherits_predecessor(body)
                     {
                         self.assembler.set_location(SourceLocation::NONE);
@@ -14129,6 +14183,7 @@ impl<'source> Compiler<'source> {
                                 if !matches!(expression.value.as_ref(), Expr::Call(_)))
                         })
                         && (suite_has_linear_borrow_fallthrough(&statement.body)
+                            || matches!(statement.body.as_slice(), [Stmt::Return(_) | Stmt::Raise(_)])
                             || (!statement.body.is_empty()
                                 && original_condition_has_unique_jump_target(&statement.test, true)
                                 && statement.body.iter().all(|statement| matches!(
@@ -14137,7 +14192,8 @@ impl<'source> Compiler<'source> {
                                 )))))))
         {
             // Native emits no instructions for the optimized suffix, leaving the
-            // conditional as the original loop-tail statement.
+            // conditional as the original loop-tail statement. A direct return or
+            // raise leaves only its false edge to supply the backedge's location.
             let tail = self.compile_loop_tail_suite_inner(
                 &body[..=end],
                 restart,
@@ -16356,7 +16412,17 @@ impl<'source> Compiler<'source> {
                     && self.assembler.instruction_count() == context.body_start
             });
         let optimized_empty_else = eligible_else
-            && self.control.withs.active_with_region_exclusions.is_empty()
+            && (self.control.withs.active_with_region_exclusions.is_empty()
+                // Elided arms share the original loop backedge even inside a
+                // manager. Its threaded false edge gets fresh, ownerless slots.
+                || (statement.elif_else_clauses.len() == 1
+                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    && self.control.in_loop_tail_without_nested_cleanup()
+                    && !statement.body.is_empty()
+                    && statement.body.iter().all(|statement| matches!(
+                        self.context.optimized_locations.get(&statement.range()),
+                        Some(super::optimization::OptimizedLocation::Elided)
+                    ))))
             && !self.control.in_exception_handler()
             && (self.control.exceptions.active_exception_region_exclusions.is_empty()
                 && self.control.finally.active_finally_try_bodies == 0
@@ -24734,6 +24800,30 @@ impl<'source> Compiler<'source> {
             let handler_has_named_while_break_join = handler.name.is_some()
                 && matches!(handler.body.last(), Some(Stmt::While(tail)) if tail.orelse.is_empty())
                 && self.assembler.defer_original_while_break_cleanup_edges();
+            // Removed assertions do not separate a for-loop's authored break from
+            // its artificial name cleanup. Preserve that original unlocated join
+            // so exit copying gives break and exhaustion their own cleanup spans.
+            let handler_has_elided_for_break_cleanup = self.context.python_version
+                >= crate::PythonVersion::Py314
+                && handler.name.is_some()
+                && terminal
+                && handler.body.last().is_some_and(|statement| {
+                    matches!(
+                        self.context.optimized_locations.get(&statement.range()),
+                        Some(super::optimization::OptimizedLocation::Elided)
+                    )
+                })
+                && matches!(handler.body.iter().rev().find(|statement| {
+                    !matches!(
+                        self.context.optimized_locations.get(&statement.range()),
+                        Some(super::optimization::OptimizedLocation::Elided)
+                    )
+                }), Some(Stmt::For(tail))
+                    if !tail.is_async
+                        && tail.orelse.is_empty()
+                        && suite_contains_loop_break(&tail.body)
+                        && !suite_contains_loop_break_with_finally(&tail.body))
+                && self.assembler.at_original_authored_break_join();
             // The false operands alone enter this original cleanup. Its normal
             // finalizer suffix reaches the loop eval check; the exceptional copy
             // reaches RERAISE. Keep the omitted POP_BLOCK and later copied jumps
@@ -24758,6 +24848,7 @@ impl<'source> Compiler<'source> {
                             if raised.exc.is_none() && raised.cause.is_none()))
                 && self.assembler.at_original_jump_only_conditional_join();
             let handler_ends_with_inlineable_cleanup = handler_ends_with_preordered_cleanup
+                || handler_has_elided_for_break_cleanup
                 || handler_has_finalizer_false_join
                 || handler_has_guarded_finally_cleanup
                 || coroutine_guarded_finally_cleanup
@@ -27012,6 +27103,14 @@ impl<'source> Compiler<'source> {
             // A following while header leaves that block empty when POP_BLOCK is removed.
             self.assembler.prevent_borrow_reachability(protected_end);
         }
+        // Removed assertions cannot make a structured exit into a linear one:
+        // its original empty block still stops 3.14's borrowing traversal.
+        let effective_body_tail = statement.body.iter().rev().find(|tail| {
+            !matches!(
+                self.context.optimized_locations.get(&tail.range()),
+                Some(super::optimization::OptimizedLocation::Elided)
+            )
+        });
         let simple_fallthrough_handlers_reach_finally =
             statement.handlers.iter().all(|handler| {
                 handler.as_except_handler().is_some_and(|handler| {
@@ -27035,7 +27134,7 @@ impl<'source> Compiler<'source> {
                 })
             }) && matches!(statement.finalbody.as_slice(), [Stmt::Expr(_)])
                 && !matches!(
-                    statement.body.last(),
+                    effective_body_tail,
                     Some(Stmt::If(_) | Stmt::Try(_) | Stmt::While(_) | Stmt::With(_))
                 );
         // One plain outer finalizer does not change the guarded break's normal
@@ -27118,10 +27217,10 @@ impl<'source> Compiler<'source> {
             // after the protected body, including a terminal manager or join.
             // Keep the existing structured-else routes and their empty-exit vetoes.
             && (!matches!(
-                statement.body.last(),
+                effective_body_tail,
                 Some(Stmt::If(_) | Stmt::Try(_) | Stmt::While(_) | Stmt::With(_))
             ) || suite_has_linear_borrow_fallthrough(&statement.orelse));
-        // A single runtime test without an else suite leaves a located normal-exit
+        // A runtime while with one false edge and no else suite leaves a located normal-exit
         // jump, retained as a NOP after cold handlers move. Linear cleanup or a
         // certified runtime condition keeps its entry nonempty. Branching tests
         // and else suites can erase that jump's location; other structured cleanup
@@ -27206,10 +27305,15 @@ impl<'source> Compiler<'source> {
                                             || matches!(handler.body.as_slice(), [Stmt::Pass(_)]))
                                 }))
                             && suite_has_linear_borrow_fallthrough(tail))))
-            && matches!(statement.body.last(), Some(Stmt::While(loop_statement))
-                if loop_statement.orelse.is_empty()
-                    && self.context.fold_constant(&loop_statement.test).is_none()
-                    && !expression_contains_inline_branch(&loop_statement.test));
+            && matches!(effective_body_tail, Some(Stmt::While(loop_statement))
+            if loop_statement.orelse.is_empty()
+                && self.context.fold_constant(&loop_statement.test).is_none()
+                && (!expression_contains_inline_branch(&loop_statement.test)
+                    || (condition_has_linear_runtime_leaves(&loop_statement.test)
+                        && original_condition_has_unique_jump_target(
+                            &loop_statement.test,
+                            false,
+                        ))));
         // A runtime while's sole false edge retains the located normal-exit NOP
         // before this manager-protected cleanup. A named recovery's bare return
         // has its own copied finalizer and cannot empty that normal source array.
@@ -31696,9 +31800,9 @@ impl<'source> Compiler<'source> {
         if remaining.is_empty() {
             let body_start = self.assembler.instruction_count();
             let body_previous_location = self.assembler.last_instruction_location();
-            // Assertions removed by optimization do not separate a try/finally
+            // Assertions removed by optimization do not separate a terminal statement
             // from the manager's normal exit in CPython's instruction graph.
-            let terminal_try_body = if self.context.python_version >= crate::PythonVersion::Py314 {
+            let terminal_body = if self.context.python_version >= crate::PythonVersion::Py314 {
                 let end = body
                     .iter()
                     .rposition(|statement| {
@@ -31714,13 +31818,13 @@ impl<'source> Compiler<'source> {
                 body
             };
             let terminal_if = matches!(
-                body.last(),
+                terminal_body.last(),
                 Some(Stmt::If(statement))
                     if statement.elif_else_clauses.is_empty()
                         && suite_terminates(&statement.body)
             );
             let terminal_branching = matches!(
-                body.last(),
+                terminal_body.last(),
                 Some(Stmt::If(statement))
                     if statement
                         .elif_else_clauses
@@ -31745,7 +31849,7 @@ impl<'source> Compiler<'source> {
                                 .all(|body| matches!(body, [Stmt::Assign(_)])))
             );
             if terminal_if || terminal_branching {
-                let (last, leading) = body.split_last().expect("with body has a final if");
+                let (last, leading) = terminal_body.split_last().expect("with body has a final if");
                 let Stmt::If(statement) = last else {
                     unreachable!("terminal with condition must be an if statement");
                 };
@@ -31820,10 +31924,16 @@ impl<'source> Compiler<'source> {
                         )
                     },
                 )?;
-            } else if let Some((last @ Stmt::Try(statement), leading)) = terminal_try_body.split_last()
-                // Splitting an earlier authored statement into a separate suite can
-                // change its retained exception slot. Keep that existing path intact.
-                && (terminal_try_body.len() == body.len() || leading.is_empty())
+                self.compile_suite(&body[terminal_body.len()..])?;
+            } else if let Some((last @ Stmt::Try(statement), leading)) = terminal_body.split_last()
+                // A prefix ending in an authored marker keeps its original array.
+                // Emitted linear work can precede the extracted try directly.
+                && (terminal_body.len() == body.len()
+                    || leading.is_empty()
+                    || (suite_has_linear_borrow_fallthrough(leading)
+                        && leading.last().is_some_and(|statement| {
+                            suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement))
+                        })))
                 // A loop-else cleanup jumps past the conditional's original false join.
                 // That located join keeps the with owner; it is not the manager POP_BLOCK.
                 && !matches!(statement.finalbody.last(), Some(Stmt::If(tail))
@@ -31923,8 +32033,8 @@ impl<'source> Compiler<'source> {
                 } else if let Some((location, entry)) = manager_pop {
                     body_noop = Some(WithBodyExitNoop::RetainedManagerPopBlock(location, entry));
                 }
-                if terminal_try_body.len() < body.len() {
-                    self.compile_suite(&body[terminal_try_body.len()..])?;
+                if terminal_body.len() < body.len() {
+                    self.compile_suite(&body[terminal_body.len()..])?;
                 }
             } else if !matches!(body, [Stmt::Pass(_)]) {
                 // Keep direct pass-only bodies on the with compiler's fallback path. CPython
@@ -31995,7 +32105,7 @@ impl<'source> Compiler<'source> {
             {
                 body_noop = Some(WithBodyExitNoop::Located(statement.range()));
             } else if terminal_if
-                && let Some(Stmt::If(statement)) = body.last()
+                && let Some(Stmt::If(statement)) = terminal_body.last()
                 // A folded infinite loop still has an original normal false exit.
                 && suite_terminates_before_constant_folding(&statement.body)
                 && condition_jump_target_count(&statement.test, false) == 1
@@ -32006,7 +32116,7 @@ impl<'source> Compiler<'source> {
                     &statement.test,
                 )));
             } else if terminal_branching
-                && let Some(Stmt::If(statement)) = body.last()
+                && let Some(Stmt::If(statement)) = terminal_body.last()
                 && let Some(test) = terminating_if_fallthrough_test(statement)
                 && condition_has_only_runtime_tests(&statement.test)
                 && statement.elif_else_clauses.iter().all(|clause| {

@@ -22,6 +22,177 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn with_conditional_exit_before_removed_assertion() {
+    for (index, body) in [
+        "if flag:\n    return 1\nassert flag\n",
+        "if flag:\n    raise ValueError\nassert flag\n",
+        "if flag is None:\n    return 1\nassert flag\nassert other\n",
+        "if flag:\n    return 1\nelif other:\n    return 2\nassert flag\n",
+        "if flag:\n    return 1\nelse:\n    return 2\nassert flag\n",
+        "work()\nif flag:\n    return 1\nassert flag\n",
+        "if flag:\n    work()\nassert flag\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut source = String::from("def f(cm, flag, other, work):\n    with cm:\n");
+        for line in body.lines() {
+            source.push_str("        ");
+            source.push_str(line);
+            source.push('\n');
+        }
+        assert_matches_cpython(
+            &source,
+            &format!("with_conditional_exit_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
+fn terminal_else_preserves_nested_conditional_exits_before_removed_assertions() {
+    for (index, leaf) in ["assert marker", "pass", "marker = first"]
+        .into_iter()
+        .enumerate()
+    {
+        let source = format!(
+            "def f(first, second):
+    marker = setup()
+    if first is None:
+        assert marker
+    else:
+        if second is None:
+            {leaf}
+        assert marker
+"
+        );
+        assert_matches_cpython(&source, &format!("terminal_else_{index}.py"), &LEVELS);
+    }
+}
+
+#[test]
+fn terminal_else_preserves_literal_location_after_manager() {
+    assert_matches_cpython(
+        "if flag:
+    pass
+else:
+    with manager:
+        consume()
+    0
+",
+        "terminal_else_literal.py",
+        &LEVELS,
+    );
+}
+
+#[test]
+fn elided_assertions_preserve_terminal_loop_break_locations() {
+    for (case, source) in [
+        "def f(flag, items):\n    if flag:\n        for item in items:\n            if item:\n                break\n        assert flag\n",
+        "def f(flag, items):\n    if flag:\n        action()\n    else:\n        for item in items:\n            if item:\n                break\n        assert flag\n        assert items\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(source, &format!("terminal_loop_break_{case}.py"), &LEVELS);
+    }
+}
+
+#[test]
+fn elided_assertions_preserve_conditional_assignment_return_boundary() {
+    for (case, source) in [
+        "def f(flag, value):\n    if value is not None:\n        result = 1 if flag else 2\n        assert result\n",
+        "def f(flag, value):\n    if value is None:\n        consume()\n    else:\n        result = 1 if flag else 2\n        assert result\n        assert flag\n",
+        "def f(obj, flag, value):\n    if value is not None:\n        obj.result = 1 if flag else 2\n        assert obj.result\n    else:\n        obj.result = None\n",
+        "def f(obj, flag, value):\n    if value is not None:\n        obj[0] = 1 if flag else 2\n        assert flag\n",
+        "def f(flag, value):\n    if value is None:\n        consume()\n    elif flag:\n        result = 1 if value else 2\n        assert result\n    else:\n        done()\n",
+        "def f(flag):\n    result = 1 if flag else 2\n    assert result\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(source, &format!("conditional_assignment_assert_{case}.py"), &LEVELS);
+    }
+}
+
+#[test]
+fn elided_assertion_after_while_preserves_finally_borrow_boundary() {
+    assert_matches_cpython(
+        r"def f(obj, count):
+    try:
+        while condition() and count < 3:
+            action()
+        assert obj
+    except ValueError:
+        recover()
+    finally:
+        obj.close()
+",
+        "while_finally_borrow.py",
+        &LEVELS,
+    );
+}
+
+#[test]
+fn single_exit_while_keeps_finally_borrowing_after_elided_assertions() {
+    const SOURCE: &str = r"def f(obj, count):
+    try:
+        while condition() or count < 3:
+            action()
+        assert obj
+    except ValueError:
+        recover()
+    finally:
+        obj.close()
+";
+    const COMPARE_LOADS: &str = r"
+import dis, marshal, sys
+def receiver_loads(module):
+    function = next(code for code in module.co_consts
+                    if isinstance(code, type(module)) and code.co_name == 'f')
+    return [instruction.opname for instruction in dis.get_instructions(function)
+            if instruction.argval == 'obj' and instruction.positions.lineno == 9
+            and instruction.opname.startswith('LOAD_FAST')]
+native = receiver_loads(marshal.load(sys.stdin.buffer))
+actual = receiver_loads(marshal.load(sys.stdin.buffer))
+assert native and actual == native, (native, actual)
+";
+    for (index, (version, _, _)) in VERSIONS.into_iter().enumerate() {
+        for level in LEVELS {
+            let native = oracle(SOURCE.as_bytes(), "single_exit_borrow.py", version, level);
+            assert!(native.status.success());
+            let actual = compile_with_options(
+                SOURCE,
+                "single_exit_borrow.py",
+                &CompileOptions {
+                    python_version: version,
+                    optimization_level: level,
+                    ..CompileOptions::default()
+                },
+            )
+            .unwrap()
+            .marshal();
+            let mut child = Command::new(ORACLES[index].get().unwrap())
+                .args(["-I", "-S", "-c", COMPARE_LOADS])
+                .stdin(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut stdin = child.stdin.take().unwrap();
+            stdin.write_all(&native.stdout).unwrap();
+            stdin.write_all(&actual).unwrap();
+            drop(stdin);
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{version}, {level:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}
+
+#[test]
 fn discarded_imports_preserve_none_admission_order() {
     for (index, import) in [
         "import package",
@@ -109,6 +280,35 @@ fn discarded_star_imports_match_cpython() {
     .enumerate()
     {
         assert_matches_cpython(source, &format!("star_import_{case}.py"), &LEVELS);
+    }
+}
+
+#[test]
+fn named_handler_loop_cleanup_after_elided_assertions_matches_cpython() {
+    for (index, suffix) in [
+        "assert error\n",
+        "assert error\n        assert items\n",
+        "pass\n        assert error\n",
+        "assert error\n        pass\n",
+        "pass\n",
+        "",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for definition in ["def", "async def"] {
+            let source = format!(
+                "{definition} f(items):
+    try:
+        action()
+    except ValueError as error:
+        for item in items:
+            if item:
+                break
+        {suffix}"
+            );
+            assert_matches_cpython(&source, &format!("named_handler_loop_{index}.py"), &LEVELS);
+        }
     }
 }
 
@@ -2255,6 +2455,31 @@ fn nested_loop_if_before_elided_assert_matches_cpython() {
 }
 
 #[test]
+fn terminating_loop_branch_before_elided_assert_matches_cpython() {
+    for terminal in [
+        "raise ValueError()",
+        "raise ValueError() from flag",
+        "return item",
+        "return",
+        "return item or flag",
+        "return item if flag else items",
+    ] {
+        for otherwise in ["", "        else:\n            assert items\n"] {
+            let source = format!(
+                "def f(items, flag):
+    for item in items:
+        if flag:
+            if item is None:
+                {terminal}
+            assert item
+{otherwise}"
+            );
+            assert_matches_cpython(&source, "terminating_elided_loop_branch.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn terminal_if_before_elided_assert_matches_cpython_312() {
     for source in [
         "def f(x):\n if x:\n  with context():\n   call()\n else:\n  if x:\n   assert x\n  assert x\n",
@@ -2424,6 +2649,37 @@ def f(xs):
 ",
     ] {
         assert_matches_cpython(source, "elided_loop_else.py", &LEVELS);
+    }
+}
+
+#[test]
+fn elided_loop_arms_inside_managers_match_cpython() {
+    for test in [
+        "item",
+        "item == 1",
+        "item is None",
+        "item and flag",
+        "item or flag",
+    ] {
+        for prefix in [
+            "",
+            "            first = setup()\n            second = setup()\n",
+        ] {
+            let source = format!(
+                "def f(manager, items, flag):
+    with manager:
+        with manager:
+{prefix}            for item in items:
+                if {test}:
+                    assert flag
+                    assert item
+                else:
+                    assert flag
+                    assert item
+"
+            );
+            assert_matches_cpython(&source, "elided_manager_loop.py", &LEVELS);
+        }
     }
 }
 
@@ -4848,6 +5104,18 @@ fn elided_assertion_with_nested_finally_matches_cpython() {
 }
 
 #[test]
+fn optimized_manager_tail_after_runtime_work_matches_cpython() {
+    for source in [
+        "def f(cm):\n    with cm:\n        try:\n            action()\n        finally:\n            cleanup()\n        pass\n        assert value\n",
+        "def f(cm):\n    with cm:\n        token = action()\n        try:\n            action()\n        finally:\n            cleanup()\n        assert token\n",
+        "def f(cm):\n    with cm:\n        action()\n        try:\n            action()\n        finally:\n            cleanup()\n        assert value\n",
+        "def f(cm):\n    with cm:\n        token = action()\n        pass\n        assert token\n",
+    ] {
+        assert_matches_cpython(source, "manager_runtime_tail.py", &LEVELS);
+    }
+}
+
+#[test]
 fn elided_assertion_after_manager_finally_matches_cpython() {
     for source in [
         "def f(cm, x):\n    with cm:\n        try:\n            work()\n        finally:\n            cleanup()\n        assert x\n",
@@ -5120,6 +5388,24 @@ fn optimized_match_guards_preserve_default_locations() {
 "#,
     ] {
         assert_matches_cpython(source, "match_guard_control.py", &LEVELS);
+    }
+}
+
+#[test]
+fn elided_else_preserves_async_comprehension_exit() {
+    for comprehension in [
+        "[item async for item in items]",
+        "{item async for item in items}",
+        "{item: item async for item in items}",
+    ] {
+        for otherwise in ["assert flag", "value = items"] {
+            for continuation in ["return await consume(value)", "return value"] {
+                let source = format!(
+                    "async def f(flag, items):\n    if flag:\n        value = {comprehension}\n    else:\n        {otherwise}\n    {continuation}\n"
+                );
+                assert_matches_cpython(&source, "async_comprehension_exit.py", &LEVELS);
+            }
+        }
     }
 }
 
