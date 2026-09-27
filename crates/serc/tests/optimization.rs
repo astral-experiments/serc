@@ -53,6 +53,23 @@ fn elided_assertion_footer_inherits_live_branch_location() {
 }
 
 #[test]
+fn elided_call_suffix_preserves_legacy_footer_location() {
+    for (first, second) in [("a", "b"), ("a is not None", "b is not None")] {
+        for call in ["action(obj)", "obj.update(b)"] {
+            for suffix in [
+                "        assert obj\n",
+                "        assert obj\n        assert b\n",
+            ] {
+                let source = format!(
+                    "def f(a, b, obj):\n    if {first}:\n        assert a\n    if {second}:\n        value = factory(b)\n        {call}\n{suffix}"
+                );
+                assert_matches_cpython(&source, "elided_call_suffix.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
 fn ordinary_await_preserves_repeated_condition_backedge_locations() {
     for (before, inside, after) in [
         ("    await a\n", "", ""),

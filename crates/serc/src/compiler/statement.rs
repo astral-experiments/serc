@@ -4094,8 +4094,12 @@ impl<'source> Compiler<'source> {
         if self.context.python_version == crate::PythonVersion::Py312
             && matches!(self.unit.scope, Scope::Function { .. })
             && statement.elif_else_clauses.is_empty()
-            && suite_has_linear_borrow_fallthrough(&statement.body)
-            && matches!(statement.body.last(), Some(Stmt::Expr(expression))
+            && let Some(last) = statement
+                .body
+                .iter()
+                .rposition(|part| !self.context.is_elided_statement(part))
+            && suite_has_linear_borrow_fallthrough(&statement.body[..=last])
+            && matches!(&statement.body[last], Stmt::Expr(expression)
                 if matches!(expression.value.as_ref(), Expr::Call(_))
                     && !expression_contains_inline_branch(&expression.value)
                     && !expression_suspends_current_scope(&expression.value))
