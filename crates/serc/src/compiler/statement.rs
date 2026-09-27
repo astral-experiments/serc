@@ -23081,6 +23081,37 @@ impl<'source> Compiler<'source> {
                 // POP_BLOCK/JUMP pair and supplies its fallthrough location.
                 self.assembler
                     .set_location(self.source_location(pass.range));
+            } else if self.context.python_version >= crate::PythonVersion::Py314
+                && !statement.is_star
+                && statement.orelse.is_empty()
+                && statement.finalbody.is_empty()
+                && matches!(self.unit.scope, Scope::Function { .. })
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                && self.control.loops.contexts.is_empty()
+                && self.control.withs.active_with_exits.is_empty()
+                && !self.has_active_control_flow_region()
+                && !self.control.in_exception_handler()
+                && self.control.finally.is_inactive_for_return_unwind()
+                && let Some(Stmt::If(branch)) = statement.body.last()
+                && condition_has_only_runtime_tests(&branch.test)
+                && !expression_suspends_current_scope(&branch.test)
+                && original_condition_has_unique_jump_target(&branch.test, false)
+                && suite_has_linear_borrow_fallthrough(&branch.body)
+                && let [clause] = branch.elif_else_clauses.as_slice()
+                && clause.test.is_none()
+                && !clause.body.is_empty()
+                && clause.body.iter().all(|statement| {
+                    matches!(
+                        self.context.optimized_locations.get(&statement.range()),
+                        Some(super::optimization::OptimizedLocation::Elided)
+                    )
+                })
+                && let Some(donor) = unique_condition_jump_target(&branch.test, false)
+            {
+                // Exit copying bypasses this original join from the populated arm.
+                // Its erased else leaves only the condition's false edge as a donor.
+                self.assembler
+                    .set_location(self.source_location(donor.range()));
             } else if let Some(location) = self.assembler.last_instruction_location() {
                 self.assembler.set_location(location);
             }

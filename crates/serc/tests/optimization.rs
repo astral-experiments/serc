@@ -23,6 +23,25 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn erased_try_else_keeps_condition_location_on_retained_exit() {
+    for (case, source) in [
+        "def f(obj, flag):\n    try:\n        if flag:\n            obj.action()\n        else:\n            assert flag\n    except ValueError:\n        return False\n    if flag:\n        assert obj\n    return True\n",
+        "def f(a,b,obj,cm,items):\n    try:\n        if not a:\n            obj.action()\n        else:\n            assert a\n    except ValueError:\n        return False\n    if a:\n        assert obj\n    return True\n",
+        "def f(a,b,obj,cm,items):\n    try:\n        if a or b:\n            obj.action()\n        else:\n            assert a\n    except ValueError:\n        return False\n    if a:\n        assert obj\n    return True\n",
+        "def f(a,b,obj,cm,items):\n    try:\n        if a == b:\n            value = obj.value\n        else:\n            assert a\n    except ValueError:\n        return False\n    if a:\n        assert obj\n    return True\n",
+        "def f(a,b,obj,cm,items):\n    try:\n        action()\n        if a:\n            obj.action()\n        else:\n            assert a\n    except ValueError:\n        return False\n    if a:\n        assert obj\n    return True\n",
+        "def f(a,b,obj,cm,items):\n    try:\n        if a:\n            obj.action()\n        else:\n            assert a\n    except ValueError as exc:\n        recover(exc)\n    if a:\n        assert obj\n    return True\n",
+        "def f(a,b,obj,cm,items):\n    try:\n        if a:\n            obj.action()\n        else:\n            assert a\n    except ValueError:\n        return False\n    action()\n    return obj\n",
+        "def f(a,b,obj,cm,items):\n    try:\n        if a:\n            obj.action()\n        else:\n            assert a, describe()\n    except ValueError:\n        return False\n    if a:\n        assert obj\n    return True\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(source, &format!("erased_try_else_exit_{case}.py"), &LEVELS);
+    }
+}
+
+#[test]
 fn legacy_coroutine_conditional_work_keeps_returns_before_erased_assertions() {
     for (case, source) in [
         "async def f(a, b, items):\n    if a:\n        if b:\n            value = [x for x in items]\n        assert a\n",
