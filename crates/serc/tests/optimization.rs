@@ -70,6 +70,56 @@ fn elided_call_suffix_preserves_legacy_footer_location() {
 }
 
 #[test]
+fn erased_async_for_assertions_preserve_continue_tail() {
+    for prefix in ["", "        total += 1\n"] {
+        for work in ["", "            skipped += 1\n"] {
+            for suffix in ["", "        assert item\n        assert total\n"] {
+                let source = format!(
+                    "async def f(items):\n    total = 0\n    skipped = 0\n    async for item in items:\n{prefix}        if item is None:\n{work}            continue\n{suffix}"
+                );
+                assert_matches_cpython(&source, "async_for_continue_tail.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn elided_assertions_preserve_terminal_call_join_boundaries() {
+    for call in [
+        "sink(x if flag else y)",
+        "sink.call(x, y, x if flag else y)",
+    ] {
+        for suffix in ["        assert x\n", "        assert x\n        assert y\n"] {
+            for tail in [
+                "",
+                "    else:\n        sink(x)\n",
+                "    elif flag:\n        sink(x if tag else y)\n        assert y\n    else:\n        sink(y)\n",
+            ] {
+                let source = format!(
+                    "def f(tag, sink, x, y, flag):\n    if tag:\n        {call}\n{suffix}{tail}"
+                );
+                assert_matches_cpython(&source, "elided_assertion_call_join.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn final_elif_preserves_nested_assignment_join() {
+    for prefix in [
+        "    if a == 1:\n        value = obj.first\n",
+        "    if a == 0:\n        return obj.first\n    elif a == 1:\n        value = obj.first\n",
+    ] {
+        for condition in ["b", "b and c", "b or c"] {
+            let source = format!(
+                "def f(a, b, c, obj):\n{prefix}    elif a == 2:\n        if {condition}:\n            value = obj.left\n        else:\n            value = obj.right\n    else:\n        assert a\n    action()\n"
+            );
+            assert_matches_cpython(&source, "final_elif_nested_join.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn ordinary_await_preserves_repeated_condition_backedge_locations() {
     for (before, inside, after) in [
         ("    await a\n", "", ""),

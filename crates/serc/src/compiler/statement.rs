@@ -3356,8 +3356,33 @@ impl<'source> Compiler<'source> {
                         || !matches!(assignment.targets.as_slice(), [Expr::Name(_)])
                         || body.last().map(Ranged::range) == Some(assignment.range))
             });
+        let elided_terminal_call = self.context.python_version >= crate::PythonVersion::Py314
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.control.loops.contexts.is_empty()
+            && !self.control.loops.suite_fallthrough_to_loop_backedge
+            && self.control.withs.active_with_exits.is_empty()
+            && !self.has_active_control_flow_region()
+            && !self.control.in_exception_handler()
+            && self.control.exceptions.active_exception_group_handlers == 0
+            && self.control.finally.is_inactive_for_return_unwind()
+            && !self.control.statements.in_match
+            && body
+                .last()
+                .is_some_and(|statement| self.context.is_elided_statement(statement))
+            && body
+                .iter()
+                .rev()
+                .find(|statement| !self.context.is_elided_statement(statement))
+                .is_some_and(|statement| {
+                    matches!(statement, Stmt::Expr(expression)
+                        if matches!(expression.value.as_ref(), Expr::Call(_))
+                            && !expression_suspends_current_scope(&expression.value))
+                });
         let needs_boundary = legacy
             || terminal_assignment
+            // Erased assertions do not join a call's original block to the return.
+            || elided_terminal_call
             // Nonfinal deletion arms have an authored end jump. A one-slot Name
             // delete plus that replaced jump and the return can still fit a copy.
             || (!has_later_arm && matches!(body.last(), Some(Stmt::Delete(_))))
@@ -14190,7 +14215,14 @@ impl<'source> Compiler<'source> {
                                     if clause.test.is_none() && is_elided_suite(&clause.body)));
                     let optimized_nested_else = self.context.python_version
                         >= crate::PythonVersion::Py314
-                        && branch_index == 0
+                        // Ruff flattens elif clauses, but each one owns a nested If
+                        // in CPython. Earlier arms cannot enter this final arm's join.
+                        && (branch_index == 0
+                            || (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                                && !self.control.statements.in_match
+                                && self.control.withs.active_with_exits.is_empty()
+                                && !self.control.loops.suite_fallthrough_to_loop_backedge
+                                && self.control.finally.is_inactive_for_return_unwind()))
                         && matches!(self.unit.scope, Scope::Function { .. })
                         && ((self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                             == 0
@@ -14206,7 +14238,7 @@ impl<'source> Compiler<'source> {
                         && condition_has_linear_runtime_leaves(test)
                         && !expression_suspends_current_scope(test)
                         && original_condition_has_unique_jump_target(test, true)
-                        && matches!(statement.elif_else_clauses.as_slice(), [clause]
+                        && matches!(statement.elif_else_clauses.get(branch_index..), Some([clause])
                         if clause.test.is_none()
                             && is_elided_suite(&clause.body))
                         // A linear prefix cannot enter the nested conditional's
@@ -20052,6 +20084,70 @@ impl<'source> Compiler<'source> {
         Ok(())
     }
 
+    /// Finds an erased suffix after a conditional continue in an ordinary coroutine.
+    fn async_for_elided_continue_tail(
+        &self,
+        statement: &ruff_python_ast::StmtFor,
+    ) -> Option<usize> {
+        if self.context.python_version < crate::PythonVersion::Py314
+            || self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) != CO_COROUTINE
+            || !self.control.loops.contexts.is_empty()
+            || !self.control.withs.active_with_exits.is_empty()
+            || !self.control.withs.active_with_region_exclusions.is_empty()
+            || !self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            || self.control.in_exception_handler()
+            || !self.control.finally.is_inactive_for_return_unwind()
+            || !statement.orelse.is_empty()
+            || expression_contains_inline_branch(&statement.iter)
+            || expression_contains_inline_branch(&statement.target)
+            || expression_suspends_current_scope(&statement.iter)
+            || expression_suspends_current_scope(&statement.target)
+        {
+            return None;
+        }
+        let end = statement
+            .body
+            .iter()
+            .rposition(|part| !self.context.is_elided_statement(part))?;
+        let suffix = &statement.body[end + 1..];
+        if suffix.is_empty()
+            || !suffix.iter().all(|part| {
+                matches!(part, Stmt::Global(global) if global.names.is_empty())
+                    && self.context.is_elided_statement(part)
+            })
+        {
+            return None;
+        }
+        let Stmt::If(branch) = &statement.body[end] else {
+            return None;
+        };
+        let [Stmt::AugAssign(work), Stmt::Continue(_)] = branch.body.as_slice() else {
+            return None;
+        };
+        let prefix = &statement.body[..end];
+        if !branch.elif_else_clauses.is_empty()
+            || !matches!(branch.test.as_ref(), Expr::Compare(comparison)
+                if matches!(comparison.ops.as_ref(), [CmpOp::Is])
+                    && matches!(comparison.comparators(), [Expr::NoneLiteral(_)]))
+            || !condition_has_linear_runtime_leaves(&branch.test)
+            || expression_suspends_current_scope(&branch.test)
+            || expression_contains_inline_branch(&work.target)
+            || expression_contains_inline_branch(&work.value)
+            || expression_suspends_current_scope(&work.target)
+            || expression_suspends_current_scope(&work.value)
+            || !(prefix.is_empty()
+                || (suite_has_linear_borrow_fallthrough(prefix)
+                    && suite_has_nonsuspending_conditional_work(prefix)))
+        {
+            return None;
+        }
+        Some(end + 1)
+    }
+
     fn compile_async_for(
         &mut self,
         statement: &ruff_python_ast::StmtFor,
@@ -20166,11 +20262,24 @@ impl<'source> Compiler<'source> {
         context.has_orelse = !statement.orelse.is_empty();
         let body_start = self.assembler.instruction_count();
         let first_iterator_loop_assertion = first_iterator_loop_assertion(&statement.body);
+        let effective_tail = self.async_for_elided_continue_tail(statement);
         let tail_jumps = self.with_loop_context(context, |compiler| {
             compiler.with_control_override(
                 |control| &mut control.loops.first_iterator_loop_assertion,
                 first_iterator_loop_assertion,
-                |compiler| compiler.compile_loop_tail_suite(&statement.body, start, true),
+                |compiler| {
+                    // Erased assertions leave the conditional's false edge at the
+                    // loop header. Keep the existing tail's jump and owner handling.
+                    let body = effective_tail
+                        .map_or(statement.body.as_slice(), |end| &statement.body[..end]);
+                    let tail = compiler.compile_loop_tail_suite(body, start, true)?;
+                    if let Some(end) = effective_tail {
+                        let location = compiler.assembler.location();
+                        compiler.compile_suite(&statement.body[end..])?;
+                        compiler.assembler.set_location(location);
+                    }
+                    Ok(tail)
+                },
             )
         })?;
         if tail_jumps == LoopBackedge::Required && !suite_terminates(&statement.body) {
