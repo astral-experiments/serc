@@ -184,6 +184,18 @@ fn elided_condition_before_terminal_for_preserves_legacy_footer_location() {
 }
 
 #[test]
+fn live_for_body_preserves_original_footer_location() {
+    for source in [
+        "def f(obj, items):\n    if obj.ready:\n        assert obj.ready\n    if obj.active and obj.target is not None:\n        for item in items:\n            item.action()\n",
+        "def f(obj, items):\n    if obj.ready:\n        assert obj.ready\n    if obj.active and obj.target is not None:\n        for item in items:\n            assert item\n",
+        "def f(obj, items):\n    if obj.ready:\n        assert obj.ready\n    if obj.active:\n        for item in items:\n            item.action()\n",
+        "def f(obj, items):\n    if obj.active and obj.target is not None:\n        for item in items:\n            item.action()\n",
+    ] {
+        assert_matches_cpython(source, "live_for_footer.py", &LEVELS);
+    }
+}
+
+#[test]
 fn elided_assertion_footer_inherits_live_branch_location() {
     for exit in ["raise ValueError", "return", "return b"] {
         for suffix in [

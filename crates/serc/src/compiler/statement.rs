@@ -4401,7 +4401,6 @@ impl<'source> Compiler<'source> {
                 && early_condition_truthiness(&statement.test).is_none()
                 && condition_has_linear_runtime_leaves(&statement.test)
                 && !expression_suspends_current_scope(&statement.test)
-                && condition_jump_target_count(&statement.test, false) == 1
                 && condition_jump_target_count(&statement.test, true) == 1
                 && let Some((Stmt::For(iterator), prefix)) = statement.body.split_last()
                 && !iterator.is_async
@@ -4410,9 +4409,27 @@ impl<'source> Compiler<'source> {
                 && matches!(iterator.iter.as_ref(), Expr::Name(_))
                 && prefix.iter().all(|part| self.context.is_elided_statement(part))
                 && !iterator.body.is_empty()
-                && iterator.body.iter().all(|part| self.context.is_elided_statement(part))
+                && ((condition_jump_target_count(&statement.test, false) == 1
+                    && iterator.body.iter().all(|part| self.context.is_elided_statement(part)))
+                    || (!self.control.statements.in_match
+                        && (condition_jump_target_count(&statement.test, false) == 1
+                            || matches!(statement.test.as_ref(), Expr::BoolOp(boolean)
+                                if boolean.op == BoolOp::And
+                                    && boolean.values.len() == 2
+                                    && boolean.values.iter().all(|leaf| {
+                                        condition_jump_target_count(leaf, false) == 1
+                                            && condition_jump_target_count(leaf, true) == 1
+                                    })))
+                        && (iterator.body.iter().all(|part| self.context.is_elided_statement(part))
+                            || matches!(iterator.body.as_slice(), [Stmt::Expr(expression)]
+                                if matches!(expression.value.as_ref(), Expr::Call(call)
+                                    if call.arguments.args.is_empty()
+                                        && call.arguments.keywords.is_empty()
+                                        && matches!(call.func.as_ref(), Expr::Attribute(attribute)
+                                            if matches!(attribute.value.as_ref(), Expr::Name(_))))))))
             {
                 // An earlier erased conditional can count this original footer twice.
+                // A linear call body and two simple AND leaves retain the same exit.
                 // Its iterator exhaustion stays unlocated until the native line pass.
                 self.assembler.record_current_original_scope_exit();
             }
