@@ -5028,6 +5028,12 @@ impl<'source> Compiler<'source> {
             return None;
         };
         let (otherwise, elifs) = statement.elif_else_clauses.split_last()?;
+        let erased_else = !elifs.is_empty()
+            && !otherwise.body.is_empty()
+            && otherwise
+                .body
+                .iter()
+                .all(|part| self.context.is_elided_statement(part));
         if !body[..end].iter().all(|part| {
             self.context.is_elided_statement(part) || linear(std::slice::from_ref(part))
         }) || !runtime_test(&statement.test)
@@ -5036,13 +5042,7 @@ impl<'source> Compiler<'source> {
             || !elifs.iter().all(|clause| {
                 clause.test.as_ref().is_some_and(runtime_test) && live_arm(&clause.body)
             })
-            || !(live_arm(&otherwise.body)
-                || (!elifs.is_empty()
-                    && !otherwise.body.is_empty()
-                    && otherwise
-                        .body
-                        .iter()
-                        .all(|part| self.context.is_elided_statement(part))))
+            || !(live_arm(&otherwise.body) || erased_else)
         {
             return None;
         }
