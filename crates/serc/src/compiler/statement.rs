@@ -14882,7 +14882,8 @@ impl<'source> Compiler<'source> {
                                         && !suite_contains_yield(&clause.body)))
                         });
                     // An erased suffix emits nothing into a completed For's break-target
-                    // block. Keep the same original join identity as a raw final For.
+                    // block. Incoming breaks thread past its exit before the surviving
+                    // natural-exhaustion edge supplies the line for its late NOP.
                     let elided_for_break_tail = self.can_descend_match_tail_wrappers()
                         && !self.control.statements.in_match
                         && !self.control.loops.suite_fallthrough_to_loop_backedge
@@ -14950,8 +14951,10 @@ impl<'source> Compiler<'source> {
                         // join before a small return is copied onto the success edge.
                         self.assembler
                             .preserve_empty_join_inlined_jump_nop(branch_exit);
-                    } else if elided_for_break_tail
-                        || matches!(body.last(), Some(Stmt::For(statement))
+                    } else if elided_for_break_tail {
+                        self.assembler
+                            .preserve_redundant_jump_nop_after_threading(branch_exit);
+                    } else if matches!(body.last(), Some(Stmt::For(statement))
                             if (statement.is_async && statement.orelse.is_empty())
                                 || suite_contains_loop_break(&statement.body))
                         || matches!(body.last(), Some(Stmt::While(statement))
@@ -14963,8 +14966,7 @@ impl<'source> Compiler<'source> {
                         // an else suite would supply its own preceding line instead.
                         // A while loop also has an empty condition-failure block. Its
                         // inlined branch jump has no preceding line event to replace it.
-                        if elided_for_break_tail
-                            || matches!(body.last(), Some(Stmt::For(loop_statement))
+                        if matches!(body.last(), Some(Stmt::For(loop_statement))
                             if !loop_statement.is_async && suite_contains_loop_break(&loop_statement.body))
                         {
                             // The break target is an original empty array even when
