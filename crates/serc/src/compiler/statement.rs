@@ -653,6 +653,8 @@ pub(super) struct GeneratorState {
 #[derive(Debug, Default)]
 pub(super) struct StatementState {
     pub(super) context: StatementContext,
+    // Match-owned exits need their own return-donor certificate.
+    pub(super) in_match: bool,
     // This exact match ends a case whose success jump skips a later case or default.
     pub(super) match_tail_before_case_exit: Option<TextRange>,
     // This trailing while shares its empty exit with an enclosing conditional's false edge.
@@ -4200,6 +4202,26 @@ impl<'source> Compiler<'source> {
             // native exit duplication assigns each predecessor its own return. In 3.13
             // this happens before folding; 3.12 duplicates exits after CFG optimization.
             self.compile_if(statement)?;
+            if plain_312_scope_exit
+                && statement.elif_else_clauses.is_empty()
+                && early_condition_truthiness(&statement.test).is_none()
+                && condition_has_linear_runtime_leaves(&statement.test)
+                && !expression_suspends_current_scope(&statement.test)
+                && condition_jump_target_count(&statement.test, false) == 1
+                && condition_jump_target_count(&statement.test, true) == 1
+                && let Some((Stmt::For(iterator), prefix)) = statement.body.split_last()
+                && !iterator.is_async
+                && iterator.orelse.is_empty()
+                && matches!(iterator.target.as_ref(), Expr::Name(_))
+                && matches!(iterator.iter.as_ref(), Expr::Name(_))
+                && prefix.iter().all(|part| self.context.is_elided_statement(part))
+                && !iterator.body.is_empty()
+                && iterator.body.iter().all(|part| self.context.is_elided_statement(part))
+            {
+                // An earlier erased conditional can count this original footer twice.
+                // Its iterator exhaustion stays unlocated until the native line pass.
+                self.assembler.record_current_original_scope_exit();
+            }
             self.assembler.set_location(SourceLocation::NONE);
             return self.emit_deferred_implicit_return();
         }
@@ -4625,7 +4647,7 @@ impl<'source> Compiler<'source> {
 
     /// Recovers the original return donor hidden by removed branch-tail assertions.
     fn elided_branch_return_location(&self, body: &[Stmt]) -> Option<SourceLocation> {
-        match self.elided_linear_branch_tail(body)? {
+        match self.elided_linear_branch_tail(body, true)? {
             // Each original predecessor donates its span when this footer is copied.
             Stmt::If(_) => Some(SourceLocation::NONE),
             Stmt::While(statement) => {
@@ -4636,7 +4658,11 @@ impl<'source> Compiler<'source> {
     }
 
     /// Finds a linear conditional or loop exit hidden by removed branch-tail assertions.
-    fn elided_linear_branch_tail<'a>(&self, body: &'a [Stmt]) -> Option<&'a Stmt> {
+    fn elided_linear_branch_tail<'a>(
+        &self,
+        body: &'a [Stmt],
+        allow_terminating_else: bool,
+    ) -> Option<&'a Stmt> {
         if self.context.python_version < crate::PythonVersion::Py314
             || !matches!(self.unit.scope, Scope::Function { .. })
             || self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) != 0
@@ -4656,6 +4682,20 @@ impl<'source> Compiler<'source> {
         if end + 1 == body.len() {
             return None;
         }
+        let direct_exit = |body: &[Stmt]| {
+            let linear = |value: &Expr| {
+                !expression_contains_inline_branch(value)
+                    && !expression_suspends_current_scope(value)
+            };
+            match body {
+                [Stmt::Return(statement)] => statement.value.as_deref().is_none_or(linear),
+                [Stmt::Raise(statement)] => {
+                    statement.exc.as_deref().is_none_or(linear)
+                        && statement.cause.as_deref().is_none_or(linear)
+                }
+                _ => false,
+            }
+        };
         match &body[end] {
             Stmt::If(statement)
                 if condition_has_linear_runtime_leaves(&statement.test)
@@ -4664,10 +4704,14 @@ impl<'source> Compiler<'source> {
                     && !suite_contains_yield(&statement.body)
                     && matches!(statement.elif_else_clauses.as_slice(), [clause]
                         if clause.test.is_none()
-                            && suite_has_linear_borrow_fallthrough(&clause.body)
-                            && !suite_contains_yield(&clause.body)) =>
+                            && ((suite_has_linear_borrow_fallthrough(&clause.body)
+                                && !suite_contains_yield(&clause.body))
+                                || (allow_terminating_else
+                                    && !self.control.statements.in_match
+                                    && direct_exit(&clause.body)))) =>
             {
-                // Both live arms still reach the nested conditional's original join.
+                // Only live predecessors can donate a return location. Join-NOP
+                // preservation still requires both arms to reach this original join.
                 Some(&body[end])
             }
             Stmt::While(statement)
@@ -14169,11 +14213,17 @@ impl<'source> Compiler<'source> {
                                 && matches!(last, Stmt::If(nested)
                                     if condition_has_linear_runtime_leaves(&nested.test)
                                 && !expression_suspends_current_scope(&nested.test)
-                                && original_condition_has_unique_jump_target(&nested.test, true)
-                                && original_condition_has_unique_jump_target(&nested.test, false)
                                 && !suite_contains_yield(&nested.body)
                                 && matches!(nested.elif_else_clauses.as_slice(), [clause]
                                     if clause.test.is_none()
+                                        // Shared condition targets enter the populated arms,
+                                        // not the empty end block receiving the outer exit.
+                                        && ((original_condition_has_unique_jump_target(&nested.test, true)
+                                            && original_condition_has_unique_jump_target(&nested.test, false))
+                                            || (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                                                && !self.has_active_control_flow_region()
+                                                && suite_has_linear_borrow_fallthrough(&nested.body)
+                                                && suite_has_linear_borrow_fallthrough(&clause.body)))
                                         && (suite_has_linear_borrow_fallthrough(&nested.body)
                                             || is_elided_suite(&nested.body))
                                         && (suite_has_linear_borrow_fallthrough(&clause.body)
@@ -14354,7 +14404,7 @@ impl<'source> Compiler<'source> {
                     } else if let Some(Stmt::If(nested)) = body
                         .last()
                         .filter(|statement| matches!(statement, Stmt::If(_)))
-                        .or_else(|| self.elided_linear_branch_tail(body))
+                        .or_else(|| self.elided_linear_branch_tail(body, false))
                     {
                         // CPython emits this jump in the nested if's empty join block. When
                         // small-exit inlining replaces it with a NOP, no preceding instruction
@@ -19735,6 +19785,14 @@ impl<'source> Compiler<'source> {
             if !prefix.iter().all(|statement| {
                 self.context.is_elided_statement(statement)
                     || suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement))
+                    // A conditional continue targets the iterator head separately;
+                    // its false edge leaves this tail's original empty join intact.
+                    || matches!(statement, Stmt::If(guard)
+                        if guard.elif_else_clauses.is_empty()
+                            && matches!(guard.body.as_slice(), [Stmt::Continue(_)])
+                            && condition_has_only_runtime_tests(&guard.test)
+                            && condition_has_linear_runtime_leaves(&guard.test)
+                            && !expression_suspends_current_scope(&guard.test))
             }) {
                 return None;
             }

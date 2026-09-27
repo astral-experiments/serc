@@ -567,6 +567,19 @@ impl Compiler<'_> {
         statement: &ruff_python_ast::StmtMatch,
         terminal: bool,
     ) -> Result<(), CompileError> {
+        self.with_control_override(
+            |control| &mut control.statements.in_match,
+            true,
+            |compiler| compiler.compile_match_with_context(statement, terminal),
+        )
+    }
+
+    /// Lowers the match while preserving its enclosing exit-owner context.
+    fn compile_match_with_context(
+        &mut self,
+        statement: &ruff_python_ast::StmtMatch,
+        terminal: bool,
+    ) -> Result<(), CompileError> {
         let base_depth = self.control.stack.depth;
         let match_has_following = !terminal && self.control.statements.context.has_following;
         if self.context.python_version >= PythonVersion::Py314

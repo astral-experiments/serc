@@ -23,6 +23,36 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn elided_condition_before_terminal_for_preserves_legacy_footer_location() {
+    for first in ["a", "check(a)"] {
+        for second in ["b", "check(b)"] {
+            for loop_prefix in ["", "        assert a\n"] {
+                let source = format!(
+                    "def f(a, b, items):\n    assert a\n    if {first}:\n        assert a\n    if {second}:\n{loop_prefix}        for item in items:\n            assert item\n"
+                );
+                assert_matches_cpython(&source, "elided_condition_loop_footer.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn elided_assertion_footer_inherits_live_branch_location() {
+    for exit in ["raise ValueError", "return", "return b"] {
+        for suffix in [
+            "",
+            "        assert a\n",
+            "        assert a\n        assert b\n",
+        ] {
+            let source = format!(
+                "def f(a, b):\n    if a:\n        if b:\n            value = action()\n        else:\n            {exit}\n{suffix}    else:\n        raise RuntimeError\n"
+            );
+            assert_matches_cpython(&source, "elided_assertion_footer.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn ordinary_await_preserves_repeated_condition_backedge_locations() {
     for (before, inside, after) in [
         ("    await a\n", "", ""),
@@ -126,6 +156,18 @@ fn erased_assertions_preserve_raising_try_guard_exit_locations() {
                 );
                 assert_matches_cpython(&source, "erased_raising_guard_exit.py", &LEVELS);
             }
+        }
+    }
+}
+
+#[test]
+fn nested_boolean_assignment_joins_preserve_nops_before_elided_else() {
+    for condition in ["b or c", "b and c", "(b or c) and d", "not (b and c)"] {
+        for continuation in ["work(value)", "return value"] {
+            let source = format!(
+                "def f(a, b, c, d):\n    if a:\n        if {condition}:\n            value = 1\n        else:\n            value = 2\n    else:\n        assert a\n    {continuation}\n"
+            );
+            assert_matches_cpython(&source, "nested_boolean_assignment_join.py", &LEVELS);
         }
     }
 }
@@ -3322,6 +3364,33 @@ def f(items):
 ",
     ] {
         assert_matches_cpython(source, "elided_boolean_loop_tail.py", &LEVELS);
+    }
+}
+
+#[test]
+fn elided_boolean_loop_tail_after_continue_guard() {
+    for source in [
+        r"
+def f(items, a, b, c, d):
+    for item in items:
+        if item <= 0:
+            continue
+        if a != b or c != d:
+            assert item
+",
+        r"
+def f(groups, a, b, c, d):
+    for items in groups:
+        for item in items:
+            if item is None:
+                continue
+            value = transform(item)
+            if a != b or c != d:
+                assert value
+        action()
+",
+    ] {
+        assert_matches_cpython(source, "elided_loop_tail_continue.py", &LEVELS);
     }
 }
 
