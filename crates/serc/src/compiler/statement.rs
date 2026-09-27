@@ -4453,10 +4453,10 @@ impl<'source> Compiler<'source> {
                 && let Some((Stmt::For(iterator), prefix)) = statement.body.split_last()
                 && !iterator.is_async
                 && iterator.orelse.is_empty()
-                && matches!(iterator.target.as_ref(), Expr::Name(_))
                 && prefix.iter().all(|part| self.context.is_elided_statement(part))
                 && !iterator.body.is_empty()
-                && ((matches!(iterator.iter.as_ref(), Expr::Name(_))
+                && ((matches!(iterator.target.as_ref(), Expr::Name(_))
+                    && matches!(iterator.iter.as_ref(), Expr::Name(_))
                     && condition_jump_target_count(&statement.test, false) == 1
                     && iterator.body.iter().all(|part| self.context.is_elided_statement(part)))
                     || (!self.control.statements.in_match
@@ -4468,21 +4468,27 @@ impl<'source> Compiler<'source> {
                                         condition_jump_target_count(leaf, false) == 1
                                             && condition_jump_target_count(leaf, true) == 1
                                     })))
-                        && ((matches!(iterator.iter.as_ref(), Expr::Name(_))
-                            && iterator.body.iter().all(|part| self.context.is_elided_statement(part)))
-                            || ((matches!(iterator.iter.as_ref(), Expr::Name(_))
-                                || matches!(iterator.iter.as_ref(), Expr::Attribute(attribute)
-                                    if matches!(attribute.value.as_ref(), Expr::Name(_))))
-                                && matches!(iterator.body.as_slice(), [Stmt::Expr(expression)]
+                        && (matches!(iterator.target.as_ref(), Expr::Name(_))
+                            || matches!(iterator.target.as_ref(), Expr::Tuple(tuple)
+                                if tuple.elts.iter().all(|element| matches!(element, Expr::Name(_)))))
+                        && (matches!(iterator.iter.as_ref(), Expr::Name(_))
+                            || matches!(iterator.iter.as_ref(), Expr::Attribute(attribute)
+                                if matches!(attribute.value.as_ref(), Expr::Name(_)))
+                            || matches!(iterator.iter.as_ref(), Expr::Call(call)
+                                if matches!(call.func.as_ref(), Expr::Name(_))))
+                        && !expression_contains_inline_branch(&iterator.iter)
+                        && !expression_suspends_current_scope(&iterator.iter)
+                        && (iterator.body.iter().all(|part| self.context.is_elided_statement(part))
+                            || matches!(iterator.body.as_slice(), [Stmt::Expr(expression)]
                                 if matches!(expression.value.as_ref(), Expr::Call(call)
-                                    if call.arguments.args.is_empty()
-                                        && call.arguments.keywords.is_empty()
+                                    if !expression_contains_inline_branch(&expression.value)
+                                        && !expression_suspends_current_scope(&expression.value)
                                         && matches!(call.func.as_ref(), Expr::Attribute(attribute)
-                                            if matches!(attribute.value.as_ref(), Expr::Name(_)))))))))
+                                            if matches!(attribute.value.as_ref(), Expr::Name(_))))))))
             {
                 // An earlier erased conditional can count this original footer twice.
                 // A linear call body and two simple AND leaves retain the same exit.
-                // Loading an attribute iterator leaves those predecessor edges intact.
+                // Linear iterator calls, unpacking, and call arguments leave those edges intact.
                 // Its iterator exhaustion stays unlocated until the native line pass.
                 self.assembler.record_current_original_scope_exit();
             }
@@ -14548,7 +14554,17 @@ impl<'source> Compiler<'source> {
                                         && matches!(nested.elif_else_clauses.as_slice(), [clause]
                                             if clause.test.is_none()
                                                 && suite_has_linear_borrow_fallthrough(&clause.body)))
-                                && matches!(leading, [Stmt::If(first), Stmt::If(second), Stmt::Assign(assignment)]
+                                && {
+                                    // Straight-line work adds no entry into the final join.
+                                    let mut branches = leading.iter().filter(|statement| {
+                                        let statement = *statement;
+                                        !(matches!(statement, Stmt::Pass(_))
+                                            || (matches!(statement, Stmt::Global(global) if global.names.is_empty())
+                                                && self.context.is_elided_statement(statement))
+                                            || suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement)))
+                                    });
+                                    matches!((branches.next(), branches.next(), branches.next(), branches.next()),
+                                        (Some(Stmt::If(first)), Some(Stmt::If(second)), Some(Stmt::Assign(assignment)), None)
                                     if [first, second].into_iter().all(|prefix| {
                                         condition_has_linear_runtime_leaves(&prefix.test)
                                             && !expression_suspends_current_scope(&prefix.test)
@@ -14565,7 +14581,8 @@ impl<'source> Compiler<'source> {
                                             if [&conditional.test, &conditional.body, &conditional.orelse]
                                                 .into_iter()
                                                 .all(|expression| matches!(expression.as_ref(), Expr::Name(name)
-                                                    if name.id.as_str() != "__debug__"))));
+                                                    if name.id.as_str() != "__debug__"))))
+                                };
                             // Earlier ordinary conditionals also merge before the final
                             // test; they cannot enter the erased inner join directly.
                             let ordinary_conditional_prefix = branch_index == 0

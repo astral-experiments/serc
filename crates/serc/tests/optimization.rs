@@ -108,6 +108,12 @@ fn assigned_conditional_prefix_preserves_populated_nested_join() {
 }
 
 #[test]
+fn completed_prefix_preserves_populated_nested_join() {
+    let source = "def f(obj, a, b, c, d, work):\n    if obj is not None:\n        assert obj.ready\n        before = obj\n        if a:\n            first = work()\n        else:\n            first = work()\n        between = obj.ready\n        assert a\n        if b:\n            second = work()\n        chosen = c if d else a\n        assert b\n        after_choice = obj.ready\n        if c:\n            result = None\n        else:\n            result = work()\n    else:\n        assert obj\n    after = obj.after\n    return after\n";
+    assert_matches_cpython(source, "completed_prefix_join.py", &LEVELS);
+}
+
+#[test]
 fn conditional_prefix_preserves_erased_nested_join() {
     for prefix in [
         "        if b:\n            value = obj.first\n",
@@ -248,6 +254,48 @@ fn attribute_iterator_preserves_original_footer_location() {
             "def f(obj):\n{prefix}    if obj.active and obj.target is not None:\n        for item in obj.items:\n            item.action()\n"
         );
         assert_matches_cpython(&source, "attribute_iterator_footer.py", &LEVELS);
+    }
+}
+
+#[test]
+fn linear_for_method_arguments_preserve_original_footer_location() {
+    for arguments in [
+        "argument",
+        "argument, other",
+        "argument.value",
+        "produce(argument)",
+        "argument=argument",
+        "*argument",
+        "__debug__",
+    ] {
+        let source = format!(
+            "def f(obj, argument, other):\n    if obj.ready:\n        assert obj.ready\n    if obj.active and obj.target is not None:\n        for item in obj.items:\n            item.action({arguments})\n"
+        );
+        assert_matches_cpython(&source, "linear_for_method_arguments.py", &LEVELS);
+    }
+}
+
+#[test]
+fn linear_for_unpacking_preserves_original_footer_location() {
+    for (target, iterator, body) in [
+        ("item", "make_items(items, argument)", "assert argument"),
+        ("item, other", "items", "assert argument"),
+        (
+            "item, other",
+            "make_items(items, argument=argument)",
+            "assert argument",
+        ),
+        ("()", "make_items(items, argument)", "assert argument"),
+        (
+            "item, other",
+            "make_items(items, argument.extra)",
+            "item.action(argument)",
+        ),
+    ] {
+        let source = format!(
+            "def f(obj, items, argument):\n    if obj.ready:\n        assert obj.ready\n    if obj.active and obj.target is not None:\n        for {target} in {iterator}:\n            {body}\n"
+        );
+        assert_matches_cpython(&source, "linear_for_unpacking.py", &LEVELS);
     }
 }
 
