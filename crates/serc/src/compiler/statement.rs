@@ -34296,11 +34296,13 @@ impl<'source> Compiler<'source> {
             } else if let Some((last @ Stmt::Try(statement), leading)) = terminal_body.split_last()
                 // A prefix ending in an authored marker keeps its original array.
                 // Emitted linear work can precede the extracted try directly.
+                // Erased statements do not change that final array.
                 && (terminal_body.len() == body.len()
                     || leading.is_empty()
                     || ((suite_has_linear_borrow_fallthrough(leading)
                         || leading.iter().all(|prefix| {
                             matches!(prefix, Stmt::Pass(_))
+                                || self.context.is_elided_statement(prefix)
                                 || suite_has_linear_borrow_fallthrough(std::slice::from_ref(prefix))
                                 // Imports and completed managers can precede the linear
                                 // work that repopulates the prefix's final array.
@@ -34322,9 +34324,13 @@ impl<'source> Compiler<'source> {
                                             && definition.parameters.iter_non_variadic_params()
                                                 .all(|parameter| parameter.default.is_none())))
                         }))
-                        && leading.last().is_some_and(|statement| {
-                            suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement))
-                        })))
+                        && leading
+                            .iter()
+                            .rev()
+                            .find(|prefix| !self.context.is_elided_statement(prefix))
+                            .is_some_and(|statement| {
+                                suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement))
+                            })))
                 // A loop-else cleanup jumps past the conditional's original false join.
                 // That located join keeps the with owner; it is not the manager POP_BLOCK.
                 && !matches!(statement.finalbody.last(), Some(Stmt::If(tail))

@@ -7317,6 +7317,41 @@ fn elided_assertion_after_manager_finally_matches_cpython() {
 }
 
 #[test]
+fn elided_prefix_preserves_finally_manager_exit() {
+    let source = "def run(worker):\n    with outer():\n        with inner():\n            item = worker.read()\n            assert item\n            pending = worker.start()\n            try:\n                consume(pending)\n            finally:\n                worker.finish()\n            assert item\n";
+    let without_prefix_assert = source.replacen("            assert item\n", "", 1);
+    for (index, source) in [
+        source.to_owned(),
+        without_prefix_assert.clone(),
+        source.replacen("            assert item\n", "            pass\n", 1),
+        source.replacen(
+            "            assert item\n",
+            "            inspect(item)\n",
+            1,
+        ),
+        without_prefix_assert.replace(
+            "            pending = worker.start()\n",
+            "            pending = worker.start()\n            assert item\n",
+        ),
+        source.replacen(
+            "            assert item\n",
+            "            assert item\n            assert worker\n",
+            1,
+        ),
+        format!("{source}            inspect(item)\n"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            &source,
+            &format!("elided_prefix_finally_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn completed_prefix_preserves_finally_manager_exit() {
     for function in ["def", "async def"] {
         for prefix in [
