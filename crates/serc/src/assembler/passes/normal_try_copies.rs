@@ -1748,7 +1748,9 @@ impl OptimizationPipeline {
                     let setup = instructions[previous];
                     setup.opcode == NOP
                         && setup.location.line >= 0
-                        && setup.depth_after() == jump.depth_after()
+                        && setup
+                            .depth_after()
+                            .is_some_and(|depth| jump.depth_after() == Some(depth))
                         && setup.jump_policy.preserves_explicit_nop()
                         && setup.exception_policy() == super::super::ExceptionPolicy::EXCLUDE_ALWAYS
                         && setup.pre_fold_extra_instructions() == 0
@@ -4329,7 +4331,7 @@ impl OptimizationPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::assembler::{Assembler, ExceptionRegionPriority, UnoptimizedCode};
+    use crate::assembler::{Assembler, ExceptionPolicy, ExceptionRegionPriority, UnoptimizedCode};
     use crate::target::opcodes::{LOAD_CONST, POP_EXCEPT, POP_TOP, RETURN_VALUE};
 
     fn item(opcode: crate::target::Opcode, operand: Operand, line: i32) -> Item {
@@ -4565,6 +4567,79 @@ mod tests {
             owners_at(&pipeline, *marker_block, *marker_ordinal),
             [Label::from_u32(7), Label::from_u32(8), Label::from_u32(9)]
         );
+    }
+
+    #[test]
+    fn empty_setup_owner_restoration_requires_known_matching_depths() {
+        for (setup_depth, jump_depth) in [
+            (Some(2), Some(2)),
+            (Some(2), Some(3)),
+            (Some(2), None),
+            (None, Some(2)),
+            (None, None),
+        ] {
+            let [entry, start, end, target, handler] = [0, 1, 2, 3, 4].map(Label::from_u32);
+            let location = SourceLocation::new(5, 8, 4, 12);
+            let mut setup = Instruction::new(NOP, Operand::Value(0), location, setup_depth);
+            setup.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
+            setup.jump_policy.preserve_explicit_nop();
+            let mut jump = Instruction::new(
+                JUMP_FORWARD,
+                Operand::Forward(target),
+                SourceLocation::NONE,
+                jump_depth,
+            );
+            jump.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
+            jump.jump_policy.retain_nop_for_direct_target();
+            let mut items = vec![
+                Item::Label(entry),
+                Item::Instruction(setup),
+                Item::Label(start),
+                Item::Instruction(jump),
+                Item::Label(end),
+                Item::Label(target),
+            ];
+            items.extend((0..5).map(|_| item(LOAD_CONST, Operand::Value(0), 9)));
+            items.extend([
+                item(RETURN_VALUE, Operand::Value(0), 9),
+                Item::Label(handler),
+                item(RETURN_VALUE, Operand::Value(0), 10),
+            ]);
+            let mut assembler = Assembler {
+                code: UnoptimizedCode::Linear(items),
+                next_label: 5,
+                python_version: crate::PythonVersion::Py314,
+                ..Assembler::default()
+            };
+            assembler.record_normal_try_exit(start, target, None);
+            let mut pipeline = assembler.into_optimization_pipeline();
+            let provenance = &mut pipeline.exception_owner_provenance;
+            provenance.ordinary_try_setups.insert(start, handler);
+            provenance.setups.push((start, Some(location)));
+            provenance
+                .normal_try_jump_owners
+                .insert((start, end), vec![region(start, end, handler, false)]);
+            let original = pipeline.graph.copy_items();
+            pipeline.restore_empty_try_jump_owners();
+            let block = pipeline.graph.label_block(start).unwrap();
+            if setup_depth == Some(2) && jump_depth == Some(2) {
+                assert_eq!(owners_at(&pipeline, block, 0), [handler]);
+                assert_eq!(
+                    pipeline.graph[block]
+                        .last_instruction()
+                        .unwrap()
+                        .exception_policy(),
+                    ExceptionPolicy::default()
+                );
+            } else {
+                assert_eq!(
+                    pipeline.graph.copy_items(),
+                    original,
+                    "{setup_depth:?}, {jump_depth:?}"
+                );
+                assert!(pipeline.exception_regions.is_empty());
+            }
+        }
     }
 
     #[test]
