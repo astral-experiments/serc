@@ -40502,6 +40502,14 @@ fn finally_loop_leaves_empty_borrow_exit(statement: &Stmt) -> bool {
 // A final nested `try`, or a fallthrough `if` without an `else`, leaves CPython's normal
 // try-exit block empty after redundant jumps are removed.
 fn suite_ends_in_empty_try_exit_block(body: &[Stmt], loop_tail: bool) -> bool {
+    // Erased assertions emit no record after the effective tail. They cannot
+    // populate the original join that stops CPython's borrowed-load traversal.
+    let Some(last) = body.iter().rposition(
+        |statement| !matches!(statement, Stmt::Global(global) if global.names.is_empty()),
+    ) else {
+        return false;
+    };
+    let body = &body[..=last];
     match body.last() {
         Some(Stmt::Try(tail)) if try_ends_with_named_handler_ifexp_name_assignment(tail) => true,
         Some(Stmt::Try(tail))

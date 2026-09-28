@@ -120,6 +120,23 @@ fn conditional_call_preserves_erased_else_try_exit() {
 }
 
 #[test]
+fn erased_assertion_preserves_try_exit_borrow_boundary() {
+    for definition in ["def", "async def"] {
+        for suffix in ["assert value.kind == 'item'", "pass", "check(value)"] {
+            let source = format!(
+                "{definition} collect(items):\n    result = []\n    for entry in items:\n        try:\n            value = entry.read().value\n            if value.kind == 'group':\n                assert len(value.parts) == 1\n                value = value.parts[0]\n            {suffix}\n        except Error as error:\n            report(error)\n            value = fallback()\n        result.append(value)\n    return result\n"
+            );
+            assert_matches_cpython(&source, "erased_try_exit_assertion.py", &LEVELS);
+        }
+    }
+    assert_matches_cpython(
+        "def collect(items):\n    result = []\n    for entry in items:\n        try:\n            value = entry.read()\n            while value.ready and value.active:\n                value = step(value)\n            assert value\n        except Error:\n            value = fallback()\n        result.append(value)\n    return result\n",
+        "erased_while_try_exit_assertion.py",
+        &LEVELS,
+    );
+}
+
+#[test]
 fn elided_assertion_after_nested_iterator_preserves_condition_backedges() {
     for suffix in ["assert item", "pass", "after()"] {
         let source = format!(
