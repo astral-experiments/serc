@@ -23,6 +23,41 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn erased_nested_arms_keep_the_enclosing_iterator_exit() {
+    let source = r"def process(items, flags, kinds, width):
+    with manager() as owner, manager(), manager(), manager(), manager(), manager():
+        for entry in items:
+            if flags & kinds.first:
+                assert entry.left is not None
+                assert entry.width == width
+                if len(entry.left.shape) > 3:
+                    assert entry.left.shape[1] == width
+                    assert entry.right.shape[1] == width
+            else:
+                assert entry.left is None
+            assert entry.valid
+            if flags & kinds.second:
+                assert entry.left is not None
+                assert entry.width == width
+                if len(entry.right.shape) > 3:
+                    assert entry.left.shape[1] == width
+                    assert entry.right.shape[1] == width
+            else:
+                assert entry.right is None
+        result = transform(items)
+";
+    for source in [
+        source.to_owned(),
+        source.replace(
+            "with manager() as owner, manager(), manager(), manager(), manager(), manager():",
+            "with manager():",
+        ),
+    ] {
+        assert_matches_cpython(&source, "erased_nested_iterator_arm.py", &LEVELS);
+    }
+}
+
+#[test]
 fn nested_erased_joins_inherit_conditional_successors() {
     let source = r"def process(items, count, flags, kinds, enabled, limit):
     with manager() as owner, manager():

@@ -19227,6 +19227,14 @@ impl<'source> Compiler<'source> {
                                     && matches!(branch.elif_else_clauses.as_slice(), [otherwise]
                                         if otherwise.test.is_none()
                                             && self.coroutine_branch_has_linear_tail(&otherwise.body)))
+                            // An erased one-sided arm still evaluates its condition,
+                            // then both edges reach the enclosing iterator unchanged.
+                            || matches!(statement, Stmt::If(branch)
+                                if branch.elif_else_clauses.is_empty()
+                                    && !branch.body.is_empty()
+                                    && branch.body.iter().all(|part| self.context.is_elided_statement(part))
+                                    && condition_has_linear_runtime_leaves(&branch.test)
+                                    && !expression_suspends_current_scope(&branch.test))
                     })));
         let protected_loop_else = protected_iterator_work_else || protected_direct_loop_else;
         // The erased else threads directly to the while backedge. Completed
