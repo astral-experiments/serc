@@ -23,6 +23,41 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn async_manager_preserves_conditional_join_before_outer_finalizer() {
+    let source = r"async def f(manager, stream, enabled, expected):
+    with manager:
+        try:
+            async with stream:
+                result = await receive()
+                if enabled and transform(result).value == expected:
+                    assert result.valid
+                else:
+                    assert not result.valid
+                data = (await receive()).read()
+                consume(data)
+                for item in data:
+                    consume(item)
+        finally:
+            try:
+                if stream is not None:
+                    await cleanup(stream)
+            finally:
+                await finish()
+";
+    for source in [
+        source.to_owned(),
+        source.replace("    with manager:", "    async with manager:"),
+        source.replace("            async with stream:", "            async with stream, other:"),
+        source.replace(
+            "        finally:\n            try:\n                if stream is not None:\n                    await cleanup(stream)\n            finally:\n                await finish()",
+            "        finally:\n            await finish()",
+        ),
+    ] {
+        assert_matches_cpython(&source, "async_manager_finally_join.py", &LEVELS);
+    }
+}
+
+#[test]
 fn populated_elif_chains_preserve_conditional_loop_join() {
     let source = r#"def collect(groups, first, second):
     for group in groups:

@@ -15282,11 +15282,49 @@ impl<'source> Compiler<'source> {
                                             .active_exception_region_exclusions
                                             .len()
                             });
+                    // Live work keeps this join inside the async manager. The sole
+                    // enclosing finalizer starts before that manager and runs only
+                    // after its exit, so it adds no predecessor to the empty arm.
+                    let managed_finally_coroutine_join = matches!(
+                        self.unit.scope,
+                        Scope::Function { .. }
+                    ) && self.unit.flags
+                        & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                        == CO_COROUTINE
+                        && self.control.generators.generator_region_start.is_some()
+                        && self.control.loops.contexts.is_empty()
+                        && self
+                            .control
+                            .statements
+                            .context
+                            .elided_join_has_live_successor
+                        && self.control.finally.active_finally_try_bodies == 1
+                        && self
+                            .control
+                            .exceptions
+                            .active_exception_region_exclusions
+                            .len()
+                            == 1
+                        && self.control.withs.active_with_exits.len()
+                            == self.control.withs.active_with_region_exclusions.len()
+                        && matches!(finalizers.as_slice(), [finalizer]
+                                if finalizer.exception_region_depth == 0
+                                    && finalizer.enclosing_finally_try_depth == 0
+                                    && finalizer.with_depth < self.control.withs.active_with_exits.len())
+                        && self
+                            .control
+                            .withs
+                            .active_with_exits
+                            .last()
+                            .is_some_and(|manager| {
+                                manager.is_async && manager.exception_region_depth == 1
+                            });
                     let optimized_empty_both = self.context.python_version
                         >= crate::PythonVersion::Py314
                         && branch_index + 2 == branch_count
                         && (!self.has_active_control_flow_region()
                             || direct_finally_body_join
+                            || managed_finally_coroutine_join
                             || (self.unit.flags
                                 & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                                 == 0
@@ -15322,7 +15360,8 @@ impl<'source> Compiler<'source> {
                         && self.control.exceptions.active_exception_group_handlers == 0
                         && (self.control.finally.active_finally_try_bodies == 0
                             || direct_finally_body_join
-                            || enclosing_finally_loop_join)
+                            || enclosing_finally_loop_join
+                            || managed_finally_coroutine_join)
                         && self.control.finally.active_normal_finally_bodies == 0
                         && self.control.finally.active_copied_finally_bodies == 0
                         && self.control.finally.active_finally_end_blocks == 0
