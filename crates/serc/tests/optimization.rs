@@ -1379,6 +1379,24 @@ fn coroutine_call_footer_preserves_original_location() {
 }
 
 #[test]
+fn coroutine_erased_else_preserves_shared_return_locations() {
+    let source = "async def f(manager, worker, first, second, items):\n    with manager:\n        await worker()\n    values = {item: item for item in items}\n    item = values[0]\n    if first:\n        assert item\n    if second:\n        assert item\n        value = values[1]\n        assert value\n    else:\n        assert item\n";
+    for source in [
+        source.to_owned(),
+        source.replace(
+            "    with manager:\n        await worker()\n    values = {item: item for item in items}\n",
+            "    values = items\n",
+        ),
+        source.replace("value = values[1]", "value = worker()"),
+        source.replace("    else:\n        assert item", "    else:\n        pass"),
+        source.replace("    else:\n        assert item", "    else:\n        worker()"),
+        format!("{source}    worker()\n"),
+    ] {
+        assert_matches_cpython(&source, "coroutine_erased_else_footer.py", &LEVELS);
+    }
+}
+
+#[test]
 fn erased_assertions_inside_terminal_call_suite_preserve_footer() {
     for prefix in [
         "    if a:\n        assert a\n",

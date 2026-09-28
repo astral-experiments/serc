@@ -4469,18 +4469,40 @@ impl<'source> Compiler<'source> {
             && self.supports_elided_terminal_if()
             && self.unit.flags & CO_COROUTINE == 0
             && !self.has_active_control_flow_region();
-        if plain_312_scope_exit
+        let coroutine_312_linear_branch = self.context.python_version
+            == crate::PythonVersion::Py312
+            && self.supports_elided_terminal_if()
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && !self.control.statements.in_match
+            && condition_jump_target_count(&statement.test, false) == 1
+            && condition_jump_target_count(&statement.test, true) == 1
+            && statement
+                .body
+                .iter()
+                .any(|part| !self.context.is_elided_statement(part))
+            && statement.body.iter().all(|part| {
+                self.context.is_elided_statement(part)
+                    || (suite_has_linear_borrow_fallthrough(std::slice::from_ref(part))
+                        && suite_has_nonsuspending_conditional_work(std::slice::from_ref(part)))
+            });
+        if (plain_312_scope_exit || coroutine_312_linear_branch)
             && condition_has_linear_runtime_leaves(&statement.test)
             && !expression_suspends_current_scope(&statement.test)
             && matches!(statement.elif_else_clauses.as_slice(), [clause]
             if clause.test.is_none()
                 && !clause.body.is_empty()
                 && clause.body.iter().all(|statement| self.context.is_elided_statement(statement)))
-            && ((!statement.body.is_empty()
-                && statement
-                    .body
-                    .iter()
-                    .all(|statement| self.context.is_elided_statement(statement)))
+            && (coroutine_312_linear_branch
+                || (!statement.body.is_empty()
+                    && statement
+                        .body
+                        .iter()
+                        .all(|statement| self.context.is_elided_statement(statement)))
                 || ((suite_has_linear_borrow_fallthrough(&statement.body)
                     || (!self.control.statements.in_match
                         && statement.body.iter().all(|part| {
@@ -4504,6 +4526,7 @@ impl<'source> Compiler<'source> {
             // The erased else reaches the original unlocated scope footer.
             // Completed inner conditionals join before the final call, and erased
             // statements add no edges to that footer.
+            // A coroutine's StopIteration wrapper adds no normal exit predecessor.
             // Keep it shared until native repeated predecessor counts decide
             // which exits are copied and whether the original remains alive.
             self.compile_if(statement)?;
