@@ -23,6 +23,22 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn elided_handler_assertion_preserves_while_break_cleanup() {
+    for suffix in ["assert found", "pass", "after()"] {
+        let source = format!(
+            "async def f(worker):\n    try:\n        await worker.run()\n    except Error as error:\n        found = False\n        while error.cause:\n            if \"marker\" in str(error):\n                found = True\n                break\n            error = error.cause\n        {suffix}\n"
+        );
+        assert_matches_cpython(&source, "handler_while_break_cleanup.py", &LEVELS);
+    }
+    for definition in ["def", "async def"] {
+        let source = format!(
+            "{definition} f(worker):\n    try:\n        worker.run()\n    except Error as error:\n        cursor = error\n        found = False\n        while cursor.cause:\n            if \"marker\" in cursor.payload.data.decode():\n                found = True\n                break\n            cursor = cursor.cause\n        assert found\n"
+        );
+        assert_matches_cpython(&source, "handler_cursor_break_cleanup.py", &LEVELS);
+    }
+}
+
+#[test]
 fn elided_assertion_after_nested_iterator_preserves_condition_backedges() {
     for suffix in ["assert item", "pass", "after()"] {
         let source = format!(

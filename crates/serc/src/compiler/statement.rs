@@ -26901,7 +26901,10 @@ impl<'source> Compiler<'source> {
                 && terminal
                 && self.assembler.at_original_jump_only_conditional_join();
             let handler_has_named_while_break_join = handler.name.is_some()
-                && matches!(handler.body.last(), Some(Stmt::While(tail)) if tail.orelse.is_empty())
+                // Removed assertions leave the loop's original cleanup predecessors intact.
+                && matches!(handler.body.iter().rev().find(|part| {
+                    !self.context.is_elided_statement(part)
+                }), Some(Stmt::While(tail)) if tail.orelse.is_empty())
                 && self.assembler.defer_original_while_break_cleanup_edges();
             // Removed assertions do not separate a for-loop's authored break from
             // its artificial name cleanup. Preserve that original unlocated join
