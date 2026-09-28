@@ -2008,12 +2008,58 @@ impl OptimizationPipeline {
                     start <= end && !(start..end).contains(&block_positions[&block])
                 })
             };
+            // An erased branch can retain its repeated incoming count inside a
+            // manager too. Its redundant jump must stay within every original
+            // region and reach a located runtime record, not a cleanup boundary.
+            let forward_join_keeps_owners = || {
+                let Operand::Forward(target) = instruction.operand() else {
+                    return false;
+                };
+                let Some(target_block) = self.graph.label_block(target) else {
+                    return false;
+                };
+                if label_group(target) != Some(index + 1)
+                    || instruction.exception_policy() != super::super::ExceptionPolicy::default()
+                    || !self.graph[target_block]
+                        .items()
+                        .iter()
+                        .find_map(|item| match item {
+                            Item::Instruction(instruction) => Some(instruction),
+                            Item::Label(_) => None,
+                        })
+                        .is_some_and(|next| {
+                            next.location.line >= 0
+                                && next.opcode != NOP
+                                && next.exception_policy()
+                                    == super::super::ExceptionPolicy::default()
+                                && !next.fusion_policy.is_converted_pop_block()
+                        })
+                {
+                    return false;
+                }
+                let source = block_positions[&block];
+                let target = block_positions[&target_block];
+                self.exception_regions.iter().all(|region| {
+                    let position = |label| {
+                        self.graph
+                            .label_block(label)
+                            .and_then(|block| block_positions.get(&block).copied())
+                    };
+                    let (Some(start), Some(end)) = (position(region.start), position(region.end))
+                    else {
+                        return false;
+                    };
+                    start <= end && (start..end).contains(&source) == (start..end).contains(&target)
+                })
+            };
             if instructions.next().is_none()
                 && (matches!(
                     instruction.opcode,
                     JUMP_BACKWARD | JUMP_BACKWARD_NO_INTERRUPT
                 ) || (instruction.opcode == JUMP_FORWARD
-                    && (wrapper.is_none() || has_only_scope_owner()))
+                    && (wrapper.is_none()
+                        || has_only_scope_owner()
+                        || forward_join_keeps_owners()))
                     || (instruction.opcode == RETURN_CONST
                         && original_scope_exit
                         && (wrapper.is_none() || has_only_scope_owner())))
@@ -4257,7 +4303,7 @@ mod protected_repeated_backedge_tests {
 
         for (forward, case) in [false, true]
             .into_iter()
-            .flat_map(|forward| (0..8).map(move |case| (forward, case)))
+            .flat_map(|forward| (0..12).map(move |case| (forward, case)))
         {
             let [
                 wrapper,
@@ -4331,6 +4377,19 @@ mod protected_repeated_backedge_tests {
             }
             let mut pipeline = assembler.into_optimization_pipeline();
             let arrays = pipeline.legacy_instruction_arrays();
+            if case >= 8 {
+                let continuation_block = pipeline.graph.label_block(continuation).unwrap();
+                let next = pipeline
+                    .graph
+                    .instructions_mut(continuation_block)
+                    .next()
+                    .unwrap();
+                next.location = SourceLocation::new(10, 10, 4, 12);
+                if case == 11 {
+                    next.set_exception_policy(super::super::super::ExceptionPolicy::EXCLUDE_ALWAYS);
+                }
+                pipeline.exception_regions[0].end = stop;
+            }
             match case {
                 1 => pipeline.exception_regions[0].end = footer,
                 2 => pipeline.exception_regions[0].end = stop,
@@ -4347,6 +4406,14 @@ mod protected_repeated_backedge_tests {
                     .exception_owner_provenance
                     .legacy_native_setup_targets
                     .clear(),
+                9 => pipeline.exception_regions[0].end = continuation,
+                10 => pipeline
+                    .exception_regions
+                    .push(crate::assembler::ExceptionRegion {
+                        start: continuation,
+                        end: stop,
+                        ..pipeline.exception_regions[0]
+                    }),
                 _ => {}
             }
             let found = pipeline.legacy_repeated_tails_with_setups(&arrays);
@@ -4357,7 +4424,7 @@ mod protected_repeated_backedge_tests {
             });
             assert_eq!(
                 retained,
-                case <= 1 || (forward && case == 6),
+                case <= 1 || (forward && matches!(case, 6 | 8)),
                 "forward {forward}, case {case}"
             );
         }

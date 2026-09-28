@@ -8434,6 +8434,26 @@ fn empty_try_before_finalizer_work_keeps_normal_exit_owner() {
 }
 
 #[test]
+fn protected_erased_conditionals_preserve_repeated_join_predecessors() {
+    let source = "async def f(manager, earlier, value, items):\n    async with manager:\n        await prepare()\n        if earlier:\n            assert ready()\n        if value is not None:\n            assert ready()\n        else:\n            assert other()\n        for item in items:\n            await consume(item)\n";
+    for (index, source) in [
+        source.to_owned(),
+        source.replace("async with manager:", "with manager:"),
+        source.replace("            assert ready()", "            prepare()"),
+        source.replace("        if earlier:\n            assert ready()\n", ""),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            &source,
+            &format!("protected_erased_join_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn erased_conditionals_preserve_repeated_join_predecessors_in_suspended_scopes() {
     let source = "async def f(flag, items):\n    await prepare()\n    if other:\n        assert ready()\n    if flag:\n        assert ready()\n    else:\n        assert other()\n    value = consume(items)\n    for item in items:\n        assert item\n";
     for (index, source) in [
