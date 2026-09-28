@@ -5216,6 +5216,39 @@ fn terminating_if_before_elided_assert_preserves_branch_location() {
 }
 
 #[test]
+fn folded_match_guard_preserves_original_nop() {
+    let source = r#"class Example:
+    @property
+    def case(self):
+        match self.state.data.kind:
+            case Kind.FIRST if True:
+                assert isinstance(self.state.data, First)
+            case Kind.SECOND:
+                work(self.state.data)
+            case Kind.THIRD:
+                work(self.state.data)
+            case _:
+                raise AssertionError(f"unknown: {self.state.data.kind}")
+        return self.state.data
+"#;
+    for source in [
+        source.to_owned(),
+        source.replace("return self.state.data", "return (self, value)"),
+        source.replace("return self.state.data", "return self.state.data.payload"),
+        source.replace(
+            "return self.state.data",
+            "return (\n            self.state.data\n        )",
+        ),
+        source.replace("if True:", "if (\n                True\n            ):"),
+        source.replace("if True:", "if valid(self):"),
+        source.replace("assert isinstance(self.state.data, First)", "pass"),
+        source.replace("work(self.state.data)", "assert self.state.data"),
+    ] {
+        assert_matches_cpython(&source, "folded_match_guard.py", &LEVELS);
+    }
+}
+
+#[test]
 fn erased_match_cases_inherit_copied_return_locations() {
     let source = r#"class Example:
     @property

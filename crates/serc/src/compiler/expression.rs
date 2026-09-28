@@ -852,12 +852,24 @@ impl Compiler<'_> {
                 }
             }
             if !guard_always_false {
-                // A class or OR case with an erased body keeps its copied-subject
-                // pop and success exit unlocated in a plain function.
+                // An erased class/OR case keeps its subject pop unlocated. A refutable
+                // folded true guard before a small copied return does likewise, so its
+                // original NOP survives before the pop through line compaction.
                 let elided_case_body = self.context.python_version >= PythonVersion::Py314
                     && copied_subject
-                    && matches!(case.pattern, Pattern::MatchClass(_) | Pattern::MatchOr(_))
-                    && case.guard.is_none()
+                    && ((case.guard.is_none()
+                        && matches!(case.pattern, Pattern::MatchClass(_) | Pattern::MatchOr(_)))
+                        || (match_has_following
+                            && !irrefutable_true_guard
+                            && !self.control.in_loop()
+                            && self
+                                .control
+                                .statements
+                                .context
+                                .followed_by_small_match_return
+                            && case.guard.as_ref().is_some_and(|guard| {
+                                early_condition_truthiness(guard) == Some(true)
+                            })))
                     && matches!(self.unit.scope, Scope::Function { .. })
                     && (!terminal
                         || self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)

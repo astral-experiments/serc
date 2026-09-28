@@ -742,6 +742,9 @@ pub(super) struct StatementContext {
     // Two direct name loads, BUILD_TUPLE, and RETURN_VALUE fill CPython's four-slot
     // copy budget before superinstruction fusion. A copied jump NOP exceeds it.
     pub(super) match_successor_fills_small_exit_copy_budget: bool,
+    // Whether a direct return fits four original records, including any return-line NOP.
+    // This is measured before tuple folding or superinstruction fusion.
+    pub(super) followed_by_small_match_return: bool,
     // Whether that successor exits the function by returning or raising. CPython copies these
     // exit blocks before removing assertion-branch jumps, including jumps from later clauses.
     followed_by_return_or_raise: bool,
@@ -3048,6 +3051,30 @@ impl<'source> Compiler<'source> {
                             if tuple.elts.len() == 2
                                 && tuple.elts.iter().all(|value| matches!(value, Expr::Name(_))))
                 );
+                let followed_by_small_match_return = matches!(
+                    (statement, body.get(index + 1)),
+                    (Stmt::Match(_), Some(Stmt::Return(returned)))
+                        if returned.value.as_deref().is_none_or(|value| {
+                            let records = match value {
+                                Expr::Name(_) => 2,
+                                Expr::Attribute(attribute) => match attribute.value.as_ref() {
+                                    Expr::Name(_) => 3,
+                                    Expr::Attribute(inner) if matches!(inner.value.as_ref(), Expr::Name(_)) => 4,
+                                    _ => return false,
+                                },
+                                Expr::Tuple(tuple) if tuple.elts.len() <= 2
+                                    && tuple.elts.iter().all(|element| {
+                                        matches!(element, Expr::Name(_)) || is_literal_constant(element)
+                                    }) => tuple.elts.len() + 2,
+                                // Constants retain their original value-line NOP before loading.
+                                _ if is_literal_constant(value) => 3,
+                                _ => return false,
+                            };
+                            let return_line_nop = self.line_number(u32::from(returned.start()))
+                                != self.line_number(u32::from(value.start()));
+                            records + usize::from(return_line_nop) <= 4
+                        })
+                );
                 let followed_by_return_or_raise =
                     matches!(body.get(index + 1), Some(Stmt::Return(_) | Stmt::Raise(_)));
                 let followed_by_try = matches!(body.get(index + 1), Some(Stmt::Try(_)));
@@ -3299,6 +3326,7 @@ impl<'source> Compiler<'source> {
                     followed_by_global_attribute_return,
                     followed_by_tuple_return,
                     match_successor_fills_small_exit_copy_budget,
+                    followed_by_small_match_return,
                     followed_by_return_or_raise,
                     followed_by_try,
                     branch_join_successor: preceded_by_branch_join.then_some(statement.range()),
