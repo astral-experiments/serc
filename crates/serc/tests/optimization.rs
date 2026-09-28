@@ -7472,6 +7472,23 @@ print(outcome)
 }
 
 #[test]
+fn discarded_async_yield_preserves_comprehension_exception_owners() {
+    for prefix in [
+        "    assert value\n    assert obj\n",
+        "",
+        "    pass\n",
+        "    consume(value)\n",
+        "    yield value\n",
+        "    await later()\n",
+    ] {
+        let source = format!(
+            "async def f(obj, value):\n    value = {{**{{key: 0 for key in obj}}, \"a\": 0, \"b\": 0}}\n    yield value\n{prefix}    try:\n        if obj.flag:\n            consume(value)\n        yield value\n        await later()\n    except Exception:\n        handle()\n"
+        );
+        assert_matches_cpython(&source, "discarded_async_yield.py", &LEVELS);
+    }
+}
+
+#[test]
 fn comprehension_collection_continuations_preserve_exception_owners() {
     for expression in [
         "[x, *[k for k in xs], x]",

@@ -2418,8 +2418,8 @@ impl ExceptionOwnerProvenance {
             CALL_KW, CONTAINS_OP, DICT_UPDATE, FORMAT_SIMPLE, GET_ITER, IMPORT_FROM, IMPORT_NAME,
             LIST_APPEND, LIST_EXTEND, LOAD_ATTR, LOAD_CONST, LOAD_DEREF, LOAD_FAST, LOAD_GLOBAL,
             LOAD_NAME, LOAD_SMALL_INT, MAKE_FUNCTION, POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE,
-            PUSH_NULL, SET_FUNCTION_ATTRIBUTE, STORE_DEREF, STORE_FAST, STORE_NAME, TO_BOOL,
-            UNPACK_SEQUENCE,
+            PUSH_NULL, RESUME, SET_FUNCTION_ATTRIBUTE, STORE_DEREF, STORE_FAST, STORE_NAME,
+            TO_BOOL, UNPACK_SEQUENCE, YIELD_VALUE,
         };
         use crate::target::operands::UnaryIntrinsic;
 
@@ -2649,6 +2649,39 @@ impl ExceptionOwnerProvenance {
         } else {
             self.original_uniform_fold_positions(&instructions.iter().collect::<Vec<_>>())
         };
+        // A discarded async yield retains all four records in the original array.
+        // Resume changes only its exception-depth bit, without creating a vacancy.
+        let yield_members = instructions
+            .windows(4)
+            .enumerate()
+            .filter_map(|(start, parts)| {
+                let [wrap, yielded, resume, discard] = parts else {
+                    unreachable!();
+                };
+                (comprehension_restore_count > 0
+                    && start > comprehension_restore_count
+                    && wrap.opcode == CALL_INTRINSIC_1
+                    && wrap.operand() == Operand::Value(UnaryIntrinsic::ASYNC_GEN_WRAP.argument())
+                    && yielded.opcode == YIELD_VALUE
+                    && yielded.operand() == Operand::Value(0)
+                    && resume.opcode == RESUME
+                    && matches!(resume.operand(), Operand::Value(1 | 5))
+                    && discard.opcode == POP_TOP
+                    && discard.operand() == Operand::Value(0)
+                    && instruction_item_positions[start + 3]
+                        == instruction_item_positions[start] + 3
+                    && parts.iter().all(|part| part.location == wrap.location)
+                    && wrap.depth_after().is_some()
+                    && yielded.depth_after() == wrap.depth_after()
+                    && resume.depth_after() == wrap.depth_after()
+                    && wrap
+                        .depth_after()
+                        .and_then(|depth| depth.checked_sub(1))
+                        .is_some_and(|depth| discard.depth_after() == Some(depth)))
+                .then_some(start..start + 4)
+            })
+            .flatten()
+            .collect::<FxHashSet<_>>();
         let mut setup_count = 0;
         let mut folded_slots = 0usize;
         let mut membership_folds = 0;
@@ -2912,6 +2945,11 @@ impl ExceptionOwnerProvenance {
                     if before.checked_sub(1) != Some(after) || after < depth {
                         return false;
                     }
+                    expanded_collection = true;
+                }
+                CALL_INTRINSIC_1 | YIELD_VALUE | RESUME | POP_TOP
+                    if yield_members.contains(&index) =>
+                {
                     expanded_collection = true;
                 }
                 CALL_INTRINSIC_1 => {
@@ -15639,6 +15677,109 @@ mod tests {
                 provenance.uncompacted_prefix(&candidate, &all, &OnceCell::new(), 1, false),
                 gap.is_none(),
                 "gap: {gap:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn comprehension_async_yield_requires_an_intact_discard_sequence() {
+        use super::{ExceptionOwnerProvenance, OnceCell};
+        use crate::assembler::{Instruction, Item, Label, Operand, SourceLocation};
+        use crate::target::opcodes::{
+            CALL_INTRINSIC_1, LOAD_FAST, NOT_TAKEN, POP_JUMP_IF_FALSE, POP_TOP, RESUME, STORE_FAST,
+            SWAP, TO_BOOL, YIELD_VALUE,
+        };
+        use crate::target::operands::UnaryIntrinsic;
+
+        let entry = Label::from_u32(0);
+        let exit = Label::from_u32(1);
+        let make = |opcode, operand, depth| {
+            Item::Instruction(Instruction::new(
+                opcode,
+                operand,
+                SourceLocation::new(3, 3, 0, 4),
+                depth,
+            ))
+        };
+        for case in [
+            "intact",
+            "resume in handler",
+            "wrong intrinsic",
+            "yield from",
+            "resume after await",
+            "stored result",
+            "different location",
+            "unknown depth",
+            "changed depth",
+            "depth underflow",
+            "interior label",
+            "following label",
+        ] {
+            let mut prefix = vec![
+                Item::Label(entry),
+                make(SWAP, Operand::Value(2), Some(2)),
+                make(STORE_FAST, Operand::Value(0), Some(1)),
+                make(LOAD_FAST, Operand::Value(20), Some(2)),
+                make(
+                    CALL_INTRINSIC_1,
+                    Operand::Value(UnaryIntrinsic::ASYNC_GEN_WRAP.argument()),
+                    Some(2),
+                ),
+                make(YIELD_VALUE, Operand::Value(0), Some(2)),
+                make(RESUME, Operand::Value(1), Some(2)),
+                make(POP_TOP, Operand::Value(0), Some(1)),
+                make(LOAD_FAST, Operand::Value(20), Some(2)),
+                make(TO_BOOL, Operand::Value(0), Some(2)),
+                make(POP_JUMP_IF_FALSE, Operand::Forward(exit), Some(1)),
+                make(NOT_TAKEN, Operand::Value(0), Some(1)),
+            ];
+            match case {
+                "intact" => {}
+                "resume in handler" => prefix[6] = make(RESUME, Operand::Value(5), Some(2)),
+                "wrong intrinsic" => {
+                    prefix[4] = make(
+                        CALL_INTRINSIC_1,
+                        Operand::Value(UnaryIntrinsic::LIST_TO_TUPLE.argument()),
+                        Some(2),
+                    )
+                }
+                "yield from" => prefix[5] = make(YIELD_VALUE, Operand::Value(1), Some(2)),
+                "resume after await" => prefix[6] = make(RESUME, Operand::Value(3), Some(2)),
+                "stored result" => prefix[7] = make(STORE_FAST, Operand::Value(20), Some(1)),
+                "different location" => {
+                    let Item::Instruction(resume) = &mut prefix[6] else {
+                        unreachable!()
+                    };
+                    resume.location = SourceLocation::new(4, 4, 0, 4);
+                }
+                "unknown depth" => prefix[7] = make(POP_TOP, Operand::Value(0), None),
+                "changed depth" => prefix[6] = make(RESUME, Operand::Value(1), Some(3)),
+                "depth underflow" => {
+                    prefix[4] = make(
+                        CALL_INTRINSIC_1,
+                        Operand::Value(UnaryIntrinsic::ASYNC_GEN_WRAP.argument()),
+                        Some(0),
+                    );
+                    prefix[5] = make(YIELD_VALUE, Operand::Value(0), Some(0));
+                    prefix[6] = make(RESUME, Operand::Value(1), Some(0));
+                    prefix[7] = make(POP_TOP, Operand::Value(0), None);
+                }
+                "interior label" => prefix.insert(6, Item::Label(Label::from_u32(2))),
+                "following label" => prefix.insert(8, Item::Label(Label::from_u32(2))),
+                _ => unreachable!(),
+            }
+            let mut all = prefix.clone();
+            all.push(Item::Label(exit));
+            assert_eq!(
+                ExceptionOwnerProvenance::default().uncompacted_prefix(
+                    &prefix,
+                    &all,
+                    &OnceCell::new(),
+                    1,
+                    false,
+                ),
+                matches!(case, "intact" | "resume in handler"),
+                "{case}",
             );
         }
     }
