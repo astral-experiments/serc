@@ -34230,6 +34230,20 @@ impl<'source> Compiler<'source> {
         let expression_suspends_current_scope = |expression: &Expr| {
             module_can_suspend && super::expression::expression_suspends_current_scope(expression)
         };
+        // The assignment store follows the comprehension's local restoration,
+        // populating its normal completion array before the next protected body.
+        let completed_comprehension_store = |statement: &Stmt| {
+            matches!(statement, Stmt::Assign(assignment)
+                if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                    && matches!(assignment.value.as_ref(), Expr::ListComp(comprehension)
+                        if !expression_contains_inline_branch(&comprehension.elt)
+                            && !expression_suspends_current_scope(&assignment.value)
+                            && matches!(comprehension.generators.as_slice(), [iterator]
+                                if !iterator.is_async
+                                    && iterator.ifs.is_empty()
+                                    && matches!(iterator.target, Expr::Name(_))
+                                    && !expression_contains_inline_branch(&iterator.iter))))
+        };
         let mut body_noop = None;
         if remaining.is_empty() {
             let body_start = self.assembler.instruction_count();
@@ -34411,17 +34425,7 @@ impl<'source> Compiler<'source> {
                                                 && suite_has_linear_borrow_fallthrough(&loop_statement.body)
                                                 && !suite_contains_yield(&loop_statement.body)
                                         }
-                                        Stmt::Assign(assignment) => {
-                                            matches!(assignment.targets.as_slice(), [Expr::Name(_)])
-                                                && matches!(assignment.value.as_ref(), Expr::ListComp(comprehension)
-                                                    if !expression_contains_inline_branch(&comprehension.elt)
-                                                        && !expression_suspends_current_scope(&assignment.value)
-                                                        && matches!(comprehension.generators.as_slice(), [iterator]
-                                                            if !iterator.is_async
-                                                                && iterator.ifs.is_empty()
-                                                                && matches!(iterator.target, Expr::Name(_))
-                                                                && !expression_contains_inline_branch(&iterator.iter)))
-                                        }
+                                        Stmt::Assign(_) => completed_comprehension_store(prefix),
                                         _ => false,
                                     })
                         }))
@@ -34431,6 +34435,10 @@ impl<'source> Compiler<'source> {
                             .find(|prefix| !self.context.is_elided_statement(prefix))
                             .is_some_and(|statement| {
                                 suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement))
+                                    || (self.context.python_version >= crate::PythonVersion::Py314
+                                        && matches!(self.unit.scope, Scope::Function { .. })
+                                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                                        && completed_comprehension_store(statement))
                             })))
                 // A loop-else cleanup jumps past the conditional's original false join.
                 // That located join keeps the with owner; it is not the manager POP_BLOCK.

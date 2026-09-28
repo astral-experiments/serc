@@ -313,6 +313,16 @@ fn erased_assertions_preserve_manager_while_exit() {
 }
 
 #[test]
+fn comprehension_assignment_prefix_preserves_finalizer_manager_exit() {
+    for suffix in ["assert valid(values)", "pass", "check(values)"] {
+        let source = format!(
+            "def f(manager, items):\n    with manager:\n        values = [work(item) for item in items]\n        try:\n            assert ready()\n            wait()\n        finally:\n            finish()\n        {suffix}\n"
+        );
+        assert_matches_cpython(&source, "comprehension_prefix_finalizer.py", &LEVELS);
+    }
+}
+
+#[test]
 fn completed_finalizer_prefix_preserves_manager_exit() {
     for suffix in ["assert done(second)", "pass", "check(second)"] {
         let source = format!(
