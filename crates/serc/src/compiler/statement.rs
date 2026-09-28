@@ -4487,10 +4487,7 @@ impl<'source> Compiler<'source> {
             && !self.control.statements.in_match
             && condition_jump_target_count(&statement.test, false) == 1
             && condition_jump_target_count(&statement.test, true) == 1
-            && statement
-                .body
-                .iter()
-                .any(|part| !self.context.is_elided_statement(part))
+            && !statement.body.is_empty()
             && statement.body.iter().all(|part| {
                 self.context.is_elided_statement(part)
                     || (suite_has_linear_borrow_fallthrough(std::slice::from_ref(part))

@@ -1573,6 +1573,29 @@ fn async_manager_setups_preserve_repeated_loop_backedges() {
 }
 
 #[test]
+fn coroutine_erased_branches_preserve_shared_return_locations() {
+    let definition = "    def choose(value):\n        if value:\n            return first\n        return False\n";
+    let source = format!(
+        "async def f(work, first, second):\n{definition}    await work(choose)\n    value = await work()\n    assert value\n    if first is not None:\n        assert value\n    if second:\n        assert value\n    else:\n        assert value\n"
+    );
+    for source in [
+        source.clone(),
+        source
+            .replace(definition, "")
+            .replace("work(choose)", "work(first)"),
+        source.replace("await ", ""),
+        source.replace("    if first is not None:\n        assert value\n", ""),
+        source.replace(
+            "    else:\n        assert value\n",
+            "    else:\n        pass\n",
+        ),
+        source.replace("    if second:", "    if not second:"),
+    ] {
+        assert_matches_cpython(&source, "coroutine_erased_branches_footer.py", &LEVELS);
+    }
+}
+
+#[test]
 fn coroutine_erased_else_preserves_shared_return_locations() {
     let source = "async def f(manager, worker, first, second, items):\n    with manager:\n        await worker()\n    values = {item: item for item in items}\n    item = values[0]\n    if first:\n        assert item\n    if second:\n        assert item\n        value = values[1]\n        assert value\n    else:\n        assert item\n";
     for source in [
