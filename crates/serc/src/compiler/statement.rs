@@ -4582,12 +4582,23 @@ impl<'source> Compiler<'source> {
             // A runtime while's two false edges retain their unlocated shared exit until
             // native exit duplication assigns each predecessor its own return. In 3.13
             // this happens before folding; 3.12 duplicates exits after CFG optimization.
+            let nonbreaking_while_arm = statement.elif_else_clauses.is_empty()
+                && early_condition_truthiness(&statement.test).is_none()
+                && condition_has_linear_runtime_leaves(&statement.test)
+                && !expression_suspends_current_scope(&statement.test)
+                && condition_jump_target_count(&statement.test, false) == 1
+                && condition_jump_target_count(&statement.test, true) == 1
+                && matches!(statement.body.as_slice(), [Stmt::While(loop_statement)]
+                    if early_condition_truthiness(&loop_statement.test) == Some(true)
+                        && loop_statement.orelse.is_empty()
+                        && !suite_contains_loop_break(&loop_statement.body));
             self.compile_if(statement)?;
             if plain_312_scope_exit
                 && (self.has_erased_binary_if_scope_exit(statement)
                     || Self::has_nested_raising_if_scope_exit(statement)
                     || (!self.control.statements.in_match
-                        && (self.has_nested_erased_branch_scope_exit(statement)
+                        && (nonbreaking_while_arm
+                            || self.has_nested_erased_branch_scope_exit(statement)
                             || (matches!(statement.test.as_ref(), Expr::Name(name) if name.id != "__debug__")
                                 && statement.elif_else_clauses.is_empty()
                                 && matches!(statement.body.as_slice(), [Stmt::If(inner)]

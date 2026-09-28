@@ -1447,6 +1447,26 @@ fn completed_branch_work_preserves_original_call_footer() {
 }
 
 #[test]
+fn conditional_infinite_loop_preserves_shared_scope_return() {
+    let source = "def f(state, work):\n    if state.check:\n        assert state.valid\n    work()\n    if not state.check:\n        while True:\n            try:\n                value = work()\n            except ValueError as error:\n                report(error)\n            if not state.repeat:\n                return value.result\n";
+    for source in [
+        source.to_owned(),
+        source.replace("    if state.check:\n        assert state.valid\n", ""),
+        source.replace("while True:", "while state.running:"),
+        source
+            .replace("except ValueError as error:", "except ValueError:")
+            .replace("report(error)", "report()"),
+        format!("{source}    work()\n"),
+        source.replace(
+            "        while True:\n",
+            "        while True:\n            for item in work():\n                break\n",
+        ),
+    ] {
+        assert_matches_cpython(&source, "conditional_infinite_loop_footer.py", &LEVELS);
+    }
+}
+
+#[test]
 fn module_terminal_calls_preserve_shared_return_locations() {
     let source = "if __name__ == \"__main__\":\n    if not wants_help():\n        assert ready()\n    launch(\n        value=config,\n    )\n";
     for source in [
