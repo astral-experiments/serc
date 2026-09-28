@@ -166,8 +166,33 @@ fn erased_false_branch_preserves_borrowed_local_loads() {
 
 #[test]
 fn genuine_pass_preserves_conditional_expression_join() {
-    let source = "def f(a, b, x, y):\n    if a:\n        x if b else y\n        pass\n";
-    assert_matches_cpython(source, "case.py", &LEVELS);
+    for (index, expression) in [
+        "x if b else y",
+        "left(x) if b else y",
+        "x if b else right(y)",
+        "left(x) if b else right(y)",
+        "obj.left if b else obj.right",
+        "obj.left(x) if b else obj.right(y)",
+        "x[0] if b else y[0]",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let source = format!(
+            "def f(a, b, x, y, left, right, obj):\n    if a:\n        {expression}\n        pass\n"
+        );
+        assert_matches_cpython(
+            &source,
+            &format!("conditional_expression_pass_{index}.py"),
+            &LEVELS,
+        );
+    }
+    for suffix in ["", "        assert a\n", "        pass\n    after()\n"] {
+        let source = format!(
+            "def f(a, b, left, right):\n    if a:\n        left() if b else right()\n{suffix}"
+        );
+        assert_matches_cpython(&source, "conditional_expression_pass_boundary.py", &LEVELS);
+    }
 }
 
 #[test]

@@ -4326,8 +4326,9 @@ impl<'source> Compiler<'source> {
             && !self.context.is_elided_statement(pass)
             && matches!(expression.value.as_ref(), Expr::If(conditional)
                 if runtime_name(&conditional.test)
-                    && runtime_name(&conditional.body)
-                    && runtime_name(&conditional.orelse))
+                    && !expression_contains_inline_branch(&conditional.body)
+                    && !expression_contains_inline_branch(&conditional.orelse)
+                    && !expression_suspends_current_scope(&expression.value))
         {
             // The Pass donates its location before its NOP is removed. Keep the
             // expression's discard separate from the enclosing If's footer.
