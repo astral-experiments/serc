@@ -4152,7 +4152,14 @@ impl<'source> Compiler<'source> {
             runtime_name(expression)
                 || matches!(expression, Expr::Attribute(attribute) if runtime_name(&attribute.value))
         };
-        if !runtime_atom(&statement.test)
+        let runtime_test = |expression: &Expr| {
+            runtime_atom(expression)
+                || matches!(expression, Expr::Compare(comparison)
+                    if runtime_atom(comparison.first_operand())
+                        && matches!(comparison.ops.as_ref(), [CmpOp::Is | CmpOp::IsNot])
+                        && matches!(comparison.comparators(), [Expr::NoneLiteral(_)]))
+        };
+        if !runtime_test(&statement.test)
             || !(statement.elif_else_clauses.is_empty()
                 || matches!(statement.elif_else_clauses.as_slice(), [clause]
                     if clause.test.is_none()
@@ -4161,10 +4168,17 @@ impl<'source> Compiler<'source> {
         {
             return false;
         }
-        let [Stmt::If(inner)] = statement.body.as_slice() else {
+        let Some(end) = statement
+            .body
+            .iter()
+            .rposition(|part| !self.context.is_elided_statement(part))
+        else {
             return false;
         };
-        let inner_test = runtime_atom(&inner.test)
+        let [Stmt::If(inner)] = &statement.body[..=end] else {
+            return false;
+        };
+        let inner_test = runtime_test(&inner.test)
             || matches!(inner.test.as_ref(), Expr::Call(call)
                 if call.arguments.args.is_empty()
                     && call.arguments.keywords.is_empty()
@@ -4507,8 +4521,7 @@ impl<'source> Compiler<'source> {
             && self.supports_elided_terminal_if()
             && self.unit.flags & CO_COROUTINE == 0
             && !self.has_active_control_flow_region();
-        let coroutine_312_linear_branch = self.context.python_version
-            == crate::PythonVersion::Py312
+        let coroutine_312_scope_exit = self.context.python_version == crate::PythonVersion::Py312
             && self.supports_elided_terminal_if()
             && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
             && self
@@ -4516,7 +4529,8 @@ impl<'source> Compiler<'source> {
                 .exceptions
                 .active_exception_region_exclusions
                 .is_empty()
-            && !self.control.statements.in_match
+            && !self.control.statements.in_match;
+        let coroutine_312_linear_branch = coroutine_312_scope_exit
             && condition_jump_target_count(&statement.test, false) == 1
             && condition_jump_target_count(&statement.test, true) == 1
             && !statement.body.is_empty()
@@ -4569,8 +4583,11 @@ impl<'source> Compiler<'source> {
             self.assembler.set_location(SourceLocation::NONE);
             return self.emit_deferred_implicit_return();
         }
+        let nested_312_scope_exit = (plain_312_scope_exit || coroutine_312_scope_exit)
+            && !self.control.statements.in_match
+            && self.has_nested_erased_branch_scope_exit(statement);
         if self.context.python_version <= crate::PythonVersion::Py313
-            && std::iter::once(statement.body.as_slice())
+            && (nested_312_scope_exit || std::iter::once(statement.body.as_slice())
                 .chain(
                     statement
                         .elif_else_clauses
@@ -4599,7 +4616,7 @@ impl<'source> Compiler<'source> {
                                     }
                                     _ => false,
                                 })))
-                })
+                }))
         {
             // Keep each compound arm's original jump to the shared footer. 3.12
             // visits exit blocks in source order, so nested recovery exits cannot
@@ -4622,12 +4639,11 @@ impl<'source> Compiler<'source> {
                         && loop_statement.orelse.is_empty()
                         && !suite_contains_loop_break(&loop_statement.body));
             self.compile_if(statement)?;
-            if plain_312_scope_exit
+            if nested_312_scope_exit || (plain_312_scope_exit
                 && (self.has_erased_binary_if_scope_exit(statement)
                     || Self::has_nested_raising_if_scope_exit(statement)
                     || (!self.control.statements.in_match
                         && (nonbreaking_while_arm
-                            || self.has_nested_erased_branch_scope_exit(statement)
                             || (matches!(statement.test.as_ref(), Expr::Name(name) if name.id != "__debug__")
                                 && statement.elif_else_clauses.is_empty()
                                 && matches!(statement.body.as_slice(), [Stmt::If(inner)]
@@ -4637,7 +4653,7 @@ impl<'source> Compiler<'source> {
                                             if return_statement.value.as_deref().is_some_and(|value| {
                                                 value.is_literal_expr()
                                                     || matches!(value, Expr::Name(name) if name.id != "__debug__")
-                                            })))))))
+                                            }))))))))
             {
                 // An earlier erased conditional can count this shared exit twice.
                 // Preserve its original return until native exit copying finishes.

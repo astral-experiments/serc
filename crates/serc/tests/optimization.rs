@@ -8539,6 +8539,36 @@ fn empty_try_before_finalizer_work_keeps_normal_exit_owner() {
 }
 
 #[test]
+fn nested_erased_conditions_preserve_original_function_return() {
+    let source = "async def f(state):\n    result = await prepare()\n    if state.previous is not None:\n        assert result\n    if state.outer is not None:\n        if state.inner is None:\n            assert result\n        else:\n            assert state.inner\n        assert result\n";
+    for (index, source) in [
+        source.to_owned(),
+        source
+            .replace("async def", "def")
+            .replace("await prepare()", "prepare()"),
+        source.replace(
+            "    if state.previous is not None:\n        assert result\n",
+            "",
+        ),
+        source.replace("state.outer is not None", "state.outer is None"),
+        source.replace("state.inner is None", "state.inner is not None"),
+        format!("{source}    else:\n        assert result\n"),
+        source
+            .replace("\n    ", "\n        ")
+            .replacen('\n', "\n    with manager:\n", 1),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            &source,
+            &format!("nested_erased_return_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn erased_suffix_preserves_original_function_return() {
     let source = "async def f(first, second):\n    await prepare()\n    if second:\n        assert second\n    if first and not second:\n        assert first\n    else:\n        assert second\n    assert first\n";
     for (index, source) in [
