@@ -721,6 +721,8 @@ pub(super) struct StatementContext {
     followed_by_name_assignment_or_deletion: bool,
     // Whether an elided conditional join reaches a call, linear store, or name delete.
     elided_join_has_live_successor: bool,
+    // A synchronous manager starts live work before entering its own protected body.
+    elided_join_has_manager_successor: bool,
     // Two tuple elements, BUILD_TUPLE, POP_BLOCK, and RETURN exceed the four-record
     // exit-copy budget before folding or fusion in a direct try body.
     elided_join_has_large_tuple_return: bool,
@@ -3315,6 +3317,12 @@ impl<'source> Compiler<'source> {
                                     && tuple.elts.iter().all(|element| !matches!(element, Expr::Starred(_)))
                                     && !expression_contains_inline_branch(value)
                                     && !expression_suspends_current_scope(value))),
+                    elided_join_has_manager_successor: matches!(elided_join_successor,
+                    Some(Stmt::With(manager)) if !manager.is_async
+                        && manager.items.iter().all(|item| {
+                            !expression_contains_inline_branch(&item.context_expr)
+                                && !expression_suspends_current_scope(&item.context_expr)
+                        })),
                     elided_join_has_conditional_successor: matches!(elided_join_successor,
                         Some(Stmt::If(branch)) if condition_has_linear_runtime_leaves(&branch.test)
                             && !expression_suspends_current_scope(&branch.test))
@@ -15379,6 +15387,39 @@ impl<'source> Compiler<'source> {
                     } else {
                         body
                     };
+                    // The direct try body owns this join until the following work.
+                    // Its finalizer and a following manager start separate arrays;
+                    // the generator wrapper likewise adds no normal predecessor.
+                    let direct_finally_nested_join = self.control.loops.contexts.is_empty()
+                        && self.control.withs.active_with_exits.is_empty()
+                        && self.control.withs.active_with_region_exclusions.is_empty()
+                        && self.control.finally.active_finally_try_bodies == 1
+                        && self
+                            .control
+                            .exceptions
+                            .active_exception_region_exclusions
+                            .len()
+                            == 1
+                        && self
+                            .control
+                            .exceptions
+                            .direct_try_body_statements
+                            .contains(&statement.range)
+                        && (self
+                            .control
+                            .statements
+                            .context
+                            .elided_join_has_live_successor
+                            || self
+                                .control
+                                .statements
+                                .context
+                                .elided_join_has_manager_successor)
+                        && matches!(finalizers.as_slice(), [finalizer]
+                            if finalizer.exception_region_depth == 0
+                                && finalizer.enclosing_finally_try_depth == 0
+                                && finalizer.with_depth == 0
+                                && finalizer.loop_depth == 0);
                     let optimized_nested_else = self.context.python_version
                         >= crate::PythonVersion::Py314
                         // Ruff flattens elif clauses, but each one owns a nested If
@@ -15393,13 +15434,15 @@ impl<'source> Compiler<'source> {
                         && ((self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                             == 0
                             && !self.has_active_control_flow_region())
-                            || coroutine_elided_nested_join)
+                            || coroutine_elided_nested_join
+                            || direct_finally_nested_join)
                         && (self.control.loops.contexts.is_empty()
                             || async_iterator_forward_join
                             || ordinary_loop_forward_join)
                         && !self.control.in_exception_handler()
                         && self.control.exceptions.active_exception_group_handlers == 0
-                        && self.control.finally.active_finally_try_bodies == 0
+                        && (self.control.finally.active_finally_try_bodies == 0
+                            || direct_finally_nested_join)
                         && self.control.finally.active_normal_finally_bodies == 0
                         && self.control.finally.active_copied_finally_bodies == 0
                         && self.control.finally.active_finally_end_blocks == 0

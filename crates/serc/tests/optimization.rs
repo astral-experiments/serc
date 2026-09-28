@@ -75,6 +75,42 @@ fn populated_elif_chains_preserve_conditional_loop_join() {
 }
 
 #[test]
+fn protected_nested_joins_keep_their_finally_owner() {
+    let source = r"async def collect(items, enabled):
+    try:
+        if enabled:
+            if ready():
+                values = {entry.key: entry for entry in items}
+            else:
+                report('missing')
+        else:
+            assert valid()
+        with manager() as stream:
+            consume(stream)
+        yield values
+    finally:
+        await cleanup()
+";
+    for source in [
+        source.to_owned(),
+        source.replace("yield values", "await process(values)"),
+        source
+            .replace("async def", "def")
+            .replace("await cleanup()", "cleanup()"),
+        source
+            .replace("async def", "def")
+            .replace("yield values", "consume(values)")
+            .replace("await cleanup()", "cleanup()"),
+        source.replace(
+            "        with manager() as stream:\n            consume(stream)",
+            "        consume(values)",
+        ),
+    ] {
+        assert_matches_cpython(&source, "protected_nested_join.py", &LEVELS);
+    }
+}
+
+#[test]
 fn erased_elif_chains_preserve_live_loop_join() {
     let source = r"def collect(items, kinds, enabled):
     for value in items:
