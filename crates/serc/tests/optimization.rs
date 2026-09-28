@@ -917,6 +917,28 @@ fn elided_assertion_footer_inherits_live_branch_location() {
 }
 
 #[test]
+fn erased_assertion_after_terminating_guard_preserves_footer_location() {
+    for source in [
+        "def f(value, items, obj, flag):\n    if value is None:\n        return value\n    else:\n        if items is not None:\n            for item in items:\n                if item in value:\n                    return value\n            raise ValueError(value)\n        assert False\n",
+        "def f(value, items, obj, flag):\n    if value is None:\n        return value\n    else:\n        if items is not None:\n            for item in items:\n                if item in value:\n                    return value\n            return value\n        assert False\n",
+        "def f(value, items, obj, flag):\n    if value is None:\n        return value\n    else:\n        if items is not None:\n            obj.work()\n            raise ValueError(value)\n        assert False\n",
+        "def f(value, items, obj, flag):\n    if value is None:\n        return value\n    else:\n        if items is not None:\n            raise ValueError(value)\n        assert False\n",
+        "def f(value, items, obj, flag):\n    if value is None:\n        return value\n    else:\n        if items is not None:\n            if flag:\n                obj.work()\n            raise ValueError(value)\n        assert False\n",
+        "def f(value, items, obj, flag):\n    if value is None:\n        return value\n    else:\n        if items is not None:\n            try:\n                obj.work()\n            except ValueError:\n                obj.recover()\n            raise ValueError(value)\n        assert False\n",
+        "def f(value, items, obj, flag):\n    if value is None:\n        return value\n    else:\n        if items is not None:\n            with obj:\n                obj.work()\n            raise ValueError(value)\n        assert False\n",
+        "def f(value, items, obj, flag):\n    if value is None:\n        return value\n    else:\n        if items is not None:\n            match flag:\n                case 0:\n                    obj.work()\n                case _:\n                    obj.other()\n            raise ValueError(value)\n        assert False\n",
+        "def f(value, items, obj, flag):\n    if value is None:\n        return value\n    else:\n        if items is not None:\n            for item in items:\n                if item in value:\n                    return value\n            raise ValueError(value)\n",
+        "def f(value, items, obj, flag):\n    if value is None:\n        return value\n    else:\n        if items is not None:\n            for item in items:\n                if item in value:\n                    return value\n            raise ValueError(value)\n    assert False\n",
+        "def f(value, items, obj, flag):\n    if value is None:\n        return value\n    else:\n        if items is not None:\n            for item in items:\n                if item in value:\n                    return value\n            raise ValueError(value)\n        pass\n",
+        "def f(value, items, obj, flag):\n    if value is None:\n        return value\n    else:\n        if items is not None:\n            for item in items:\n                if item in value:\n                    return value\n            raise ValueError(value)\n        obj.after()\n        assert False\n",
+        "def f(value, items, obj, flag):\n    if value is None:\n        return value\n    else:\n        if items is not None or flag:\n            for item in items:\n                if item in value:\n                    return value\n            raise ValueError(value)\n        assert False\n",
+        "def f(value, items, obj, flag):\n    if value is None:\n        return value\n    else:\n        if items is not None:\n            for item in items:\n                if item in value:\n                    return value\n            raise ValueError(value)\n        assert False\n    yield value\n",
+    ] {
+        assert_matches_cpython(source, "erased_assertion_terminating_guard.py", &LEVELS);
+    }
+}
+
+#[test]
 fn elided_call_suffix_preserves_legacy_footer_location() {
     for (first, second) in [("a", "b"), ("a is not None", "b is not None")] {
         for call in ["action(obj)", "obj.update(b)"] {

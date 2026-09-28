@@ -5132,6 +5132,9 @@ impl<'source> Compiler<'source> {
 
     /// Recovers the original return donor hidden by removed branch-tail assertions.
     fn elided_branch_return_location(&self, body: &[Stmt]) -> Option<SourceLocation> {
+        if let Some(test) = self.elided_terminating_if_fallthrough(body) {
+            return Some(self.source_location(condition_fallthrough_range(test)));
+        }
         match self
             .elided_linear_branch_tail(body, true)
             .or_else(|| self.elided_fallthrough_if_tail(body))
@@ -15541,10 +15544,8 @@ impl<'source> Compiler<'source> {
             return None;
         };
         (statement.elif_else_clauses.is_empty()
-            && matches!(
-                statement.body.as_slice(),
-                [Stmt::Return(_) | Stmt::Raise(_)]
-            )
+            // Completed work before this exit cannot reach the shared footer.
+            && matches!(statement.body.last(), Some(Stmt::Return(_) | Stmt::Raise(_)))
             && condition_has_linear_runtime_leaves(&statement.test)
             && !expression_suspends_current_scope(&statement.test)
             && original_condition_has_unique_jump_target(&statement.test, false))
