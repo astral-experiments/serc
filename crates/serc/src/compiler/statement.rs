@@ -15061,23 +15061,23 @@ impl<'source> Compiler<'source> {
                     // An erased suffix leaves the populated inner If's original join
                     // unchanged. Only expose that tail to this ordinary certificate;
                     // the complete body still compiles with its original boundaries.
-                    let nested_else_body = if coroutine_elided_nested_join {
-                        effective_nested_else_body
-                    } else if self.context.python_version >= crate::PythonVersion::Py314
-                        && branch_index == 0
-                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
-                        && !self.control.statements.in_match
-                        && !self.has_active_control_flow_region()
-                        && self.control.withs.active_with_exits.is_empty()
-                        && !self.control.loops.suite_fallthrough_to_loop_backedge
-                        && self.control.finally.is_inactive_for_return_unwind()
-                        && effective_nested_else_body.len() < body.len()
-                        && matches!(effective_nested_else_body.split_last(), Some((Stmt::If(nested), leading))
+                    let nested_else_body = if coroutine_elided_nested_join
+                        || (self.context.python_version >= crate::PythonVersion::Py314
+                            && branch_index == 0
+                            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                                == 0
+                            && !self.control.statements.in_match
+                            && !self.has_active_control_flow_region()
+                            && self.control.withs.active_with_exits.is_empty()
+                            && !self.control.loops.suite_fallthrough_to_loop_backedge
+                            && self.control.finally.is_inactive_for_return_unwind()
+                            && effective_nested_else_body.len() < body.len()
+                            && matches!(effective_nested_else_body.split_last(), Some((Stmt::If(nested), leading))
                             if (leading.is_empty() || suite_has_linear_borrow_fallthrough(leading))
                                 && suite_has_linear_borrow_fallthrough(&nested.body)
                                 && matches!(nested.elif_else_clauses.as_slice(), [clause]
                                     if clause.test.is_none()
-                                        && suite_has_linear_borrow_fallthrough(&clause.body)))
+                                        && suite_has_linear_borrow_fallthrough(&clause.body))))
                     {
                         effective_nested_else_body
                     } else {
