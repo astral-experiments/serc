@@ -4181,6 +4181,8 @@ mod protected_repeated_backedge_tests {
 
     #[test]
     fn coroutine_footer_requires_completed_explicit_regions() {
+        use crate::target::operands::{ResumeLocation, UnaryIntrinsic};
+
         for case in 0..8 {
             let [wrapper, body, handler, first, second, call, footer, stop] =
                 std::array::from_fn(|index| Label::from_u32(u32::try_from(index).unwrap()));
@@ -4204,7 +4206,7 @@ mod protected_repeated_backedge_tests {
                 Item::Instruction(normal(RETURN_GENERATOR, 0)),
                 Item::Instruction(normal(POP_TOP, 0)),
                 Item::Label(wrapper),
-                Item::Instruction(normal(RESUME, 0)),
+                Item::Instruction(normal(RESUME, ResumeLocation::AT_FUNC_START.argument())),
                 Item::Label(body),
                 Item::Instruction(normal(NOP, 0)),
                 Item::Instruction(jump(JUMP_FORWARD, first)),
@@ -4220,7 +4222,10 @@ mod protected_repeated_backedge_tests {
                 Item::Label(footer),
                 Item::Instruction(normal(RETURN_CONST, 0)),
                 Item::Label(stop),
-                Item::Instruction(normal(CALL_INTRINSIC_1, 3)),
+                Item::Instruction(normal(
+                    CALL_INTRINSIC_1,
+                    UnaryIntrinsic::STOPITERATION_ERROR.argument(),
+                )),
                 Item::Instruction(normal(RERAISE, 1)),
             ]);
             assembler.python_version = PythonVersion::Py312;
