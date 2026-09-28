@@ -18359,6 +18359,13 @@ impl<'source> Compiler<'source> {
                     && statement.body.iter().all(|statement| {
                         self.context.is_elided_statement(statement)
                             || suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement))
+                            || matches!(statement, Stmt::If(branch)
+                                if branch.elif_else_clauses.last().is_some_and(|clause| clause.test.is_none())
+                                    && suite_has_linear_borrow_fallthrough(&branch.body)
+                                    && branch.elif_else_clauses.iter().all(|clause| {
+                                        suite_has_linear_borrow_fallthrough(&clause.body)
+                                    })
+                                    && suite_has_nonsuspending_conditional_work(std::slice::from_ref(statement)))
                     })));
         // The erased else threads directly to the while backedge. Completed
         // managers inside an arm do not change that target; normalizing the

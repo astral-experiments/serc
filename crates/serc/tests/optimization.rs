@@ -33,6 +33,18 @@ fn compacted_branch_pass_preserves_return_copy_location() {
 }
 
 #[test]
+fn protected_iterator_preserves_completed_conditional_backedges() {
+    for definition in ["def", "async def"] {
+        for managers in ["manager", "manager, other, third"] {
+            let source = format!(
+                "{definition} f(manager, other, third, values, active):\n    with {managers}:\n        for value in values:\n            if skip(value):\n                continue\n            item = value.load()\n            if active:\n                assert item\n                if item.kind == 1:\n                    expected = {{1: 2}}\n                else:\n                    expected = {{1: 3}}\n                assert expected\n            else:\n                assert item\n"
+            );
+            assert_matches_cpython(&source, "protected_nested_conditional.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn async_iterator_preserves_erased_branch_backedges() {
     for manager in ["with", "async with"] {
         for iterator in ["for", "async for"] {
