@@ -4406,14 +4406,20 @@ impl<'source> Compiler<'source> {
             && condition_jump_target_count(&statement.test, true) == 1
             && !expression_suspends_current_scope(&statement.test)
             && self.control.loops.contexts.is_empty()
-            && !self.has_active_control_flow_region()
+            && self.control.withs.active_with_region_exclusions.is_empty()
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
             && !self.control.in_exception_handler()
             && self.control.finally.is_inactive_for_return_unwind()
-            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
         {
             // Keep the shared, unlocated footer until 3.12 counts predecessors.
             // An earlier empty conditional can queue this condition twice, so
             // its call arm cannot always donate a location to the original exit.
+            // A coroutine's StopIteration wrapper adds no normal exit predecessor.
             self.compile_if(statement)?;
             self.assembler.record_current_original_scope_exit();
             self.assembler.set_location(SourceLocation::NONE);

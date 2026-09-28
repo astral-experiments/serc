@@ -1110,6 +1110,22 @@ fn completed_branch_work_preserves_original_call_footer() {
 }
 
 #[test]
+fn coroutine_call_footer_preserves_original_location() {
+    for prefix in [
+        "",
+        "    await prepare()\n",
+        "    items = [item.value for item in obj]\n",
+    ] {
+        for prior in ["", "    if value in {1, 2}:\n        assert obj\n"] {
+            let source = format!(
+                "async def f(value, obj):\n{prefix}{prior}    if value == 3:\n        assert obj\n        obj.work()\n"
+            );
+            assert_matches_cpython(&source, "coroutine_call_footer.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn erased_assertions_inside_terminal_call_suite_preserve_footer() {
     for prefix in [
         "    if a:\n        assert a\n",

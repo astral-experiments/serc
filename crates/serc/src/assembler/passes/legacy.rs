@@ -1885,6 +1885,13 @@ impl OptimizationPipeline {
             }
         }
 
+        let block_positions = self
+            .graph
+            .order()
+            .iter()
+            .enumerate()
+            .map(|(index, &block)| (block, index))
+            .collect::<FxHashMap<_, _>>();
         let mut tails = Vec::new();
         for (index, fragments) in groups.iter().enumerate() {
             if !repeated_successors[index] {
@@ -1910,8 +1917,26 @@ impl OptimizationPipeline {
                         if self.original_scope_exit_labels.contains(label))
                 })
             });
-            // A certified coroutine footer can retain its count under the sole
-            // implicit wrapper, whose prologue and SETUP target were checked above.
+            // Earlier completed SETUPs do not own this footer. Reject any
+            // surviving explicit region that still covers it; the implicit
+            // wrapper's prologue and SETUP target were checked above.
+            let has_only_scope_owner = || {
+                self.exception_regions.iter().all(|region| {
+                    if region.is_scope_fallback {
+                        return true;
+                    }
+                    let position = |label| {
+                        self.graph
+                            .label_block(label)
+                            .and_then(|block| block_positions.get(&block).copied())
+                    };
+                    let (Some(start), Some(end)) = (position(region.start), position(region.end))
+                    else {
+                        return false;
+                    };
+                    start <= end && !(start..end).contains(&block_positions[&block])
+                })
+            };
             if instructions.next().is_none()
                 && (matches!(
                     instruction.opcode,
@@ -1919,7 +1944,7 @@ impl OptimizationPipeline {
                 ) || (wrapper.is_none() && instruction.opcode == JUMP_FORWARD)
                     || (instruction.opcode == RETURN_CONST
                         && original_scope_exit
-                        && (wrapper.is_none() || setups.len() == 1)))
+                        && (wrapper.is_none() || has_only_scope_owner())))
                 && instruction.location == SourceLocation::NONE
             {
                 let mut expected = *instruction;
@@ -4151,6 +4176,91 @@ mod protected_repeated_backedge_tests {
                 1 => assert!(found.unwrap().is_empty()),
                 _ => assert!(found.is_none()),
             }
+        }
+    }
+
+    #[test]
+    fn coroutine_footer_requires_completed_explicit_regions() {
+        for case in 0..8 {
+            let [wrapper, body, handler, first, second, call, footer, stop] =
+                std::array::from_fn(|index| Label::from_u32(u32::try_from(index).unwrap()));
+            let normal = |opcode, argument| {
+                Instruction::new(
+                    opcode,
+                    Operand::Value(argument),
+                    SourceLocation::NONE,
+                    Some(0),
+                )
+            };
+            let jump = |opcode, target| {
+                Instruction::new(
+                    opcode,
+                    Operand::Forward(target),
+                    SourceLocation::NONE,
+                    Some(0),
+                )
+            };
+            let mut assembler = Assembler::from_linear_items(vec![
+                Item::Instruction(normal(RETURN_GENERATOR, 0)),
+                Item::Instruction(normal(POP_TOP, 0)),
+                Item::Label(wrapper),
+                Item::Instruction(normal(RESUME, 0)),
+                Item::Label(body),
+                Item::Instruction(normal(NOP, 0)),
+                Item::Instruction(jump(JUMP_FORWARD, first)),
+                Item::Label(handler),
+                Item::Instruction(normal(RERAISE, 0)),
+                Item::Label(first),
+                Item::Instruction(jump(POP_JUMP_IF_FALSE, second)),
+                Item::Label(second),
+                Item::Instruction(jump(POP_JUMP_IF_FALSE, footer)),
+                Item::Label(call),
+                Item::Instruction(normal(CALL, 0)),
+                Item::Instruction(normal(POP_TOP, 0)),
+                Item::Label(footer),
+                Item::Instruction(normal(RETURN_CONST, 0)),
+                Item::Label(stop),
+                Item::Instruction(normal(CALL_INTRINSIC_1, 3)),
+                Item::Instruction(normal(RERAISE, 1)),
+            ]);
+            assembler.python_version = PythonVersion::Py312;
+            assembler.next_label = 8;
+            assembler.add_exception_region(body, handler, handler, 0, false);
+            assembler.add_stopiteration_exception_region_with_depth(wrapper, stop, stop, 0);
+            assembler.record_exception_setup(body, false);
+            assembler.record_legacy_native_setup_target(body, handler);
+            assembler.record_exception_setup(wrapper, false);
+            assembler.record_legacy_native_setup_target(wrapper, stop);
+            if case != 6 {
+                assembler.record_original_scope_exit(footer);
+            }
+            let mut pipeline = assembler.into_optimization_pipeline();
+            let arrays = pipeline.legacy_instruction_arrays();
+            match case {
+                1 => pipeline.exception_regions[0].end = footer,
+                2 => pipeline.exception_regions[0].end = stop,
+                3 => {
+                    pipeline.exception_regions[0].start = footer;
+                    pipeline.exception_regions[0].end = stop;
+                }
+                4 => pipeline.exception_regions[0].end = Label::from_u32(99),
+                5 => {
+                    pipeline.exception_regions[0].start = stop;
+                    pipeline.exception_regions[0].end = first;
+                }
+                7 => pipeline
+                    .exception_owner_provenance
+                    .legacy_native_setup_targets
+                    .clear(),
+                _ => {}
+            }
+            let found = pipeline.legacy_repeated_tails_with_setups(&arrays);
+            let retained = found.is_some_and(|tails| {
+                tails.iter().any(|(block, _, ordinary, native)| {
+                    Some(*block) == pipeline.graph.label_block(footer) && native > ordinary
+                })
+            });
+            assert_eq!(retained, case <= 1, "case {case}");
         }
     }
 

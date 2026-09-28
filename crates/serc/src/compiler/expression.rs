@@ -4652,7 +4652,7 @@ impl Compiler<'_> {
             self.assembler
                 .record_exception_setup(protected_start, false);
             if matches!(self.unit.scope, Scope::Function { .. })
-                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
                 && generators.iter().all(|generator| !generator.is_async)
             {
                 // Native's inlined-comprehension SETUP targets this restore
