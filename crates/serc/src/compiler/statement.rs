@@ -18201,7 +18201,12 @@ impl<'source> Compiler<'source> {
                 .is_some_and(|context| context.iterator_cleanup == IteratorCleanup::Sync)
             && condition_has_linear_runtime_leaves(&statement.test)
             && !expression_suspends_current_scope(&statement.test)
-            && suite_has_linear_borrow_fallthrough(&statement.body);
+            && (suite_has_linear_borrow_fallthrough(&statement.body)
+                || (!statement.body.is_empty()
+                    && statement
+                        .body
+                        .iter()
+                        .all(|statement| self.context.is_elided_statement(statement))));
         let optimized_empty_else = eligible_else
             && (self.control.withs.active_with_region_exclusions.is_empty()
                 || protected_iterator_loop_else

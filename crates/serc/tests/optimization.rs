@@ -54,6 +54,22 @@ fn elided_assertion_after_nested_iterator_preserves_condition_backedges() {
 }
 
 #[test]
+fn erased_protected_loop_arms_preserve_condition_polarity() {
+    for condition in ["check(item)", "not check(item)"] {
+        for body in [
+            "assert item",
+            "assert item\n                assert item.flag",
+            "consume(item)",
+        ] {
+            let source = format!(
+                "def f(items):\n    try:\n        for item in items:\n            if {condition}:\n                {body}\n            else:\n                assert item\n        return True\n    except Exception:\n        return False\n"
+            );
+            assert_matches_cpython(&source, "erased_protected_loop_arms.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn erased_match_cases_preserve_loop_backedges() {
     for body in [
         "assert item",
