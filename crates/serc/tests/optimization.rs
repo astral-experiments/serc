@@ -12144,3 +12144,40 @@ fn protected_iterator_erased_inner_arm_preserves_backward_condition() {
         &LEVELS,
     );
 }
+
+#[test]
+fn erased_iterator_arms_stay_inside_enclosing_except_and_finally() {
+    let source = r"def normalize(groups, enabled):
+    for group in groups:
+        try:
+            for value in group:
+                item = prepare(value)
+                consume(item)
+                if enabled:
+                    assert item
+                else:
+                    assert group
+            consume(group)
+        except LookupError:
+            recover()
+        finally:
+            cleanup(group)
+";
+    for (index, source) in [
+        source.to_owned(),
+        source.replace("        except LookupError:\n            recover()\n", ""),
+        source.replace(
+            "item = prepare(value)",
+            "item = prepare(value) if enabled else fallback(value)",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            &source,
+            &format!("protected_erased_iterator_arms_{index}.py"),
+            &LEVELS,
+        );
+    }
+}

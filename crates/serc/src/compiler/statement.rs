@@ -18987,15 +18987,23 @@ impl<'source> Compiler<'source> {
         // A finally entered before this synchronous iterator is not unwound by
         // its backedge. The saved protected-loop depth distinguishes that owner
         // from a try/finally entered inside the iteration.
+        // Fully erased arms also share that backedge under an enclosing except
+        // owner. The loop-tail guard below requires every owner to predate the
+        // iterator, so normalizing the edge cannot cross an intervening cleanup.
+        let erased_final_body = !final_body.is_empty()
+            && final_body
+                .iter()
+                .all(|statement| self.context.is_elided_statement(statement));
         let iterator_inside_finally = matches!(self.unit.scope, Scope::Function { .. })
             && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
             && self.control.finally.active_finally_try_bodies == 1
-            && self
-                .control
-                .exceptions
-                .active_exception_region_exclusions
-                .len()
-                == 1
+            && (erased_final_body
+                || self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .len()
+                    == 1)
             && self
                 .control
                 .finally
@@ -19011,7 +19019,7 @@ impl<'source> Compiler<'source> {
             })
             && condition_has_linear_runtime_leaves(final_test)
             && condition_jump_target_count(final_test, false) == 1
-            && suite_has_linear_borrow_fallthrough(final_body);
+            && (erased_final_body || suite_has_linear_borrow_fallthrough(final_body));
         // With no intervening cleanup, the removed else reaches the iterator
         // directly. Native normalizes that backward condition into fresh slots.
         // A comparison chain keeps its own operand cleanup before the same exit.
