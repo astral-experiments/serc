@@ -10957,3 +10957,40 @@ fn nested_leaf_returns_preserve_repeated_scope_footer() {
         assert_matches_cpython(source, &format!("nested_leaf_footer_{case}.py"), &LEVELS);
     }
 }
+
+#[test]
+fn normal_finalizer_none_marker_reuses_original_local_load_owner() {
+    let source = r"async def f(outer, inner):
+    async with outer:
+        resource = None
+        try:
+            resource = await setup()
+            await prepare(resource)
+            async with inner:
+                value = None
+                pending = await begin()
+                try:
+                    await work()
+                    response = await read()
+                    value = consume(response)
+                finally:
+                    remaining = await finish(pending)
+            assert value is not None
+            check(remaining, value)
+            assert response
+        finally:
+            if resource is not None:
+                try:
+                    await cleanup(resource)
+                except Error:
+                    report()
+";
+    for (index, source) in [
+        source.to_owned(),
+        source.replace("            check(remaining, value)\n", ""),
+        source.replace("            assert value is not None\n", "").replace("            assert response\n", ""),
+        source.replace("                try:\n                    await cleanup(resource)\n                except Error:\n                    report()\n", "                await cleanup(resource)\n"),
+    ].into_iter().enumerate() {
+        assert_matches_cpython(&source, &format!("normal_finalizer_local_load_owner_{index}.py"), &LEVELS);
+    }
+}

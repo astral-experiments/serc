@@ -9322,9 +9322,18 @@ impl LayoutAssembler {
                                     Some((instruction_index + 1, Some(region)));
                                 continue;
                             }
+                            // Earlier compaction can move the append into the captured
+                            // local load itself. Its original slot has the same owner as
+                            // the comparison, provided the original array epoch is known.
+                            let original_load_slot = tail
+                                .early_removals
+                                .checked_sub(comparison_removals)
+                                .and_then(|removed| load_index.checked_add(removed));
                             if paired
                                 || copied.is_some()
-                                || tail.early_removals != 3 + usize::from(removed_pop)
+                                || (tail.early_removals != 3 + usize::from(removed_pop)
+                                    && !(pop_slot_epoch_known
+                                        && original_load_slot == Some(instruction_index + 1)))
                             {
                                 continue;
                             }
