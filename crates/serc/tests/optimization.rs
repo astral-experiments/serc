@@ -90,6 +90,36 @@ fn erased_conditional_preserves_join_before_async_manager_exit() {
 }
 
 #[test]
+fn conditional_call_preserves_erased_else_try_exit() {
+    for (index, (call, otherwise)) in [
+        ("consume(item if enabled else values)", "assert item"),
+        (
+            "consume(\n                    value=item if enabled else values,\n                )",
+            "assert item",
+        ),
+        ("(consume if enabled else report)(item)", "assert item"),
+        (
+            "if enabled:\n                    prepare(item)\n                else:\n                    prepare(values)\n                consume(item if enabled else values)",
+            "assert item",
+        ),
+        ("consume(item) if enabled else consume(values)", "assert item"),
+        ("consume(item if enabled else values)", "consume(item)"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let source = format!(
+            "def validate(values, enabled):\n    item = values[0]\n    try:\n        if enabled:\n            if valid(item):\n                {call}\n            else:\n                {otherwise}\n    except Exception:\n        return False\n    if 'payload' in item:\n        assert item.payload\n    return True\n"
+        );
+        assert_matches_cpython(
+            &source,
+            &format!("conditional_call_try_exit_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn elided_assertion_after_nested_iterator_preserves_condition_backedges() {
     for suffix in ["assert item", "pass", "after()"] {
         let source = format!(
