@@ -15548,6 +15548,20 @@ impl<'source> Compiler<'source> {
                                             || suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement)),
                                     }
                                 });
+                            // Ruff flattens elif clauses. Each erased clause still has
+                            // a distinct original IfEnd, whose final false edge donates
+                            // the location when the enclosing exit becomes a NOP.
+                            let erased_elif_chain = matches!(last, Stmt::If(nested)
+                                if nested.elif_else_clauses.len() > 1
+                                    && is_elided_suite(&nested.body)
+                                    && nested.elif_else_clauses.last().is_some_and(|clause| clause.test.is_none())
+                                    && nested.elif_else_clauses.iter().all(|clause| is_elided_suite(&clause.body))
+                                    && std::iter::once(nested.test.as_ref())
+                                        .chain(nested.elif_else_clauses.iter().filter_map(|clause| clause.test.as_ref()))
+                                        .all(|test| condition_has_linear_runtime_leaves(test)
+                                            && !expression_suspends_current_scope(test)
+                                            && original_condition_has_unique_jump_target(test, true)
+                                            && original_condition_has_unique_jump_target(test, false)));
                             (leading.is_empty()
                                 || coroutine_elided_nested_join
                                 || populated_arm(leading)
@@ -15560,7 +15574,7 @@ impl<'source> Compiler<'source> {
                                     if condition_has_completed_call_leaves(&nested.test, self.context.python_version)
                                 && !expression_suspends_current_scope(&nested.test)
                                 && !suite_contains_yield(&nested.body)
-                                && matches!(nested.elif_else_clauses.as_slice(), [clause]
+                                && (erased_elif_chain || matches!(nested.elif_else_clauses.as_slice(), [clause]
                                     if clause.test.is_none()
                                         // Shared condition targets enter the populated arms,
                                         // not the empty end block receiving the outer exit.
@@ -15574,7 +15588,7 @@ impl<'source> Compiler<'source> {
                                             || is_elided_suite(&nested.body))
                                         && (populated_arm(&clause.body)
                                             || is_elided_suite(&clause.body))
-                                        && !suite_contains_yield(&clause.body)))
+                                        && !suite_contains_yield(&clause.body))))
                         });
                     // An erased suffix leaves the completed For's break target empty.
                     // An erased outer else also makes its exit jump redundant. Incoming

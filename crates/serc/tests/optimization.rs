@@ -23,6 +23,38 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn erased_elif_chains_preserve_live_loop_join() {
+    let source = r"def collect(items, kinds, enabled):
+    for value in items:
+        if enabled:
+            if value.kind == kinds.first:
+                assert value.valid
+            elif value.kind == kinds.second:
+                assert value.valid
+            elif value.kind == kinds.third:
+                assert value.valid
+            else:
+                assert False
+        else:
+            assert value.kind in kinds.allowed
+        consume(value)
+    finish()
+";
+    for source in [
+        source.to_owned(),
+        source.replace("for value in items:", "while ready(items):"),
+        source.replace(
+            "    finish()",
+            "    else:\n        completed()\n    finish()",
+        ),
+        source.replace("        consume(value)", "        output = value"),
+        source.replace("        consume(value)", "        assert value.valid"),
+    ] {
+        assert_matches_cpython(&source, "erased_chain_loop_join.py", &LEVELS);
+    }
+}
+
+#[test]
 fn enclosing_finalizer_preserves_live_loop_join() {
     let source = r"def process(items, owner):
     try:
