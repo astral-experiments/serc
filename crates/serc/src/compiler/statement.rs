@@ -25033,6 +25033,32 @@ impl<'source> Compiler<'source> {
                 // The raising arm cannot reach this exit. Removed assertions leave
                 // the condition's false edge as the original jump's sole donor.
                 self.assembler.set_location(location);
+            } else if self.context.python_version >= crate::PythonVersion::Py314
+                && matches!(self.unit.scope, Scope::Function { .. })
+                && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+                && !statement.is_star
+                && statement.orelse.is_empty()
+                && statement.finalbody.is_empty()
+                && self.control.exceptions.active_exception_handlers.is_empty()
+                && self.control.exceptions.active_exception_group_handlers == 0
+                && self.control.finally.is_inactive_for_return_unwind()
+                // The current try's collector was popped before normal-exit
+                // emission. Its surrounding cleanup depths must match the loop.
+                && self.control.in_loop_tail_without_nested_cleanup()
+                && statement.body.last().is_some_and(|tail| self.context.is_elided_statement(tail))
+                && let Some(Stmt::If(guard)) = normal_exit_join_suite.last()
+                && guard.elif_else_clauses.is_empty()
+                && matches!(guard.body.as_slice(), [Stmt::Break(_)])
+                && condition_has_linear_runtime_leaves(&guard.test)
+                && !expression_suspends_current_scope(&guard.test)
+                && original_condition_has_unique_jump_target(&guard.test, false)
+                && let Some(donor) = unique_condition_jump_target(&guard.test, false)
+            {
+                // The break unwinds this try and leaves the loop. Only the
+                // condition's false edge reaches its normal POP_BLOCK and exit;
+                // erased assertions cannot donate the preceding break's span.
+                self.assembler
+                    .set_location(self.source_location(donor.range()));
             } else if statement.orelse.is_empty()
                 && let Some(Stmt::If(nested)) = statement.body.last()
                 && let Some(test) = terminating_if_fallthrough_test(nested)

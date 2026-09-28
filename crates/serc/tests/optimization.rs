@@ -2829,6 +2829,21 @@ fn erased_assertion_preserves_conditional_break_backedge_donor() {
 }
 
 #[test]
+fn erased_assertion_preserves_try_break_exit_donor() {
+    let source = "async def f(manager):\n    async with manager:\n        while True:\n            try:\n                await work()\n                value = await read()\n                state = value[\"state\"]\n                if state in (\"ready\", \"failed\"):\n                    break\n                assert state in (\"waiting\", \"busy\")\n            except Error:\n                recover()\n        await finish()\n    return True\n";
+    for source in [
+        source.to_owned(),
+        source.replace(
+            "                assert state in (\"waiting\", \"busy\")\n",
+            "",
+        ),
+        source.replace("                recover()", "                pass"),
+    ] {
+        assert_matches_cpython(&source, "try_break_exit_donor.py", &LEVELS);
+    }
+}
+
+#[test]
 fn elided_assertions_preserve_terminal_loop_break_locations() {
     for (case, source) in [
         "def f(flag, items):\n    if flag:\n        for item in items:\n            if item:\n                break\n        assert flag\n",
