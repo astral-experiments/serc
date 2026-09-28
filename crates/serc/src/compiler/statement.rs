@@ -15136,6 +15136,7 @@ impl<'source> Compiler<'source> {
                         });
                     // The same protected body owns the nested all-elided join.
                     // Its original end array receives the inner false edge's line.
+                    // Enclosing managers do not change that innermost owner.
                     let effective_nested_else_body = &body[..body
                         .iter()
                         .rposition(|part| !self.context.is_elided_statement(part))
@@ -15143,8 +15144,9 @@ impl<'source> Compiler<'source> {
                     let coroutine_elided_nested_join = self.unit.flags
                         & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                         == CO_COROUTINE
-                        && ((self.control.withs.active_with_exits.len() == 1
-                            && self.control.withs.active_with_region_exclusions.len() == 1)
+                        && ((!self.control.withs.active_with_exits.is_empty()
+                            && self.control.withs.active_with_exits.len()
+                                == self.control.withs.active_with_region_exclusions.len())
                             || async_iterator_forward_join)
                         && self
                             .control

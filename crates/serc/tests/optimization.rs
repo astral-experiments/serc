@@ -23,6 +23,16 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn nested_erased_conditions_preserve_manager_join() {
+    for managers in ["first(), second()", "first(), second(), third()"] {
+        let source = format!(
+            "async def f(flag, other):\n    with {managers}:\n        result = await work()\n        if flag:\n            assert result\n            if other:\n                assert result\n            else:\n                assert other\n        else:\n            assert flag\n"
+        );
+        assert_matches_cpython(&source, "manager_join.py", &LEVELS);
+    }
+}
+
+#[test]
 fn erased_else_preserves_outer_iterator_after_inner_for() {
     for prefix in ["", "                assert item\n"] {
         let source = format!(
