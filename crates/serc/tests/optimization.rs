@@ -257,6 +257,21 @@ fn erased_assertions_preserve_manager_while_exit() {
 }
 
 #[test]
+fn completed_iterator_prefix_preserves_finalizer_manager_exit() {
+    for prefix in [
+        "        for item in items:\n            begin(item)\n        value = []\n",
+        "        items = [make(item) for item in items]\n        for item in items:\n            begin(item)\n        value = []\n",
+    ] {
+        for suffix in ["assert valid(items)", "pass", "check(items)"] {
+            let source = format!(
+                "def f(manager, items):\n    with manager:\n{prefix}        try:\n            for item in items:\n                work(item)\n        except Error as error:\n            raise Failure() from error\n        finally:\n            for item in items:\n                finish(item)\n            for item in items:\n                if active(item):\n                    stop(item)\n                    finish(item)\n        {suffix}\n    after()\n"
+            );
+            assert_matches_cpython(&source, "iterator_prefix_finalizer.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn elided_conditional_preserves_jump_before_finalizer() {
     for body in ["assert value.ready", "pass", "record(value)"] {
         let source = format!(

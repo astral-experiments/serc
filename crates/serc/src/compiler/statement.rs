@@ -34320,6 +34320,35 @@ impl<'source> Compiler<'source> {
                                             && definition.decorator_list.is_empty()
                                             && definition.parameters.iter_non_variadic_params()
                                                 .all(|parameter| parameter.default.is_none())))
+                                // Completed iterators cannot enter the later try or its
+                                // cleanup. The live prefix tail required below repopulates
+                                // the original array after their exhaustion joins.
+                                || (self.context.python_version >= crate::PythonVersion::Py314
+                                    && matches!(self.unit.scope, Scope::Function { .. })
+                                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                                    && match prefix {
+                                        Stmt::For(loop_statement) => {
+                                            !loop_statement.is_async
+                                                && loop_statement.orelse.is_empty()
+                                                && matches!(loop_statement.target.as_ref(), Expr::Name(_))
+                                                && !expression_contains_inline_branch(&loop_statement.iter)
+                                                && !expression_suspends_current_scope(&loop_statement.iter)
+                                                && suite_has_linear_borrow_fallthrough(&loop_statement.body)
+                                                && !suite_contains_yield(&loop_statement.body)
+                                        }
+                                        Stmt::Assign(assignment) => {
+                                            matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                                                && matches!(assignment.value.as_ref(), Expr::ListComp(comprehension)
+                                                    if !expression_contains_inline_branch(&comprehension.elt)
+                                                        && !expression_suspends_current_scope(&assignment.value)
+                                                        && matches!(comprehension.generators.as_slice(), [iterator]
+                                                            if !iterator.is_async
+                                                                && iterator.ifs.is_empty()
+                                                                && matches!(iterator.target, Expr::Name(_))
+                                                                && !expression_contains_inline_branch(&iterator.iter)))
+                                        }
+                                        _ => false,
+                                    })
                         }))
                         && leading
                             .iter()
