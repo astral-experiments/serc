@@ -15469,13 +15469,23 @@ impl<'source> Compiler<'source> {
                                     if clause.test.is_none()
                                         && suite_has_linear_borrow_fallthrough(&clause.body)
                                         && suite_has_nonsuspending_conditional_work(&clause.body)));
-                    let coroutine_elided_nested_join = self.unit.flags
+                    let matching_manager_region = !self.control.withs.active_with_exits.is_empty()
+                        && self.control.withs.active_with_exits.len()
+                            == self.control.withs.active_with_region_exclusions.len();
+                    // Ordinary loops retain this manager owner before live work or
+                    // another test. Their saved cleanup depths must still match.
+                    let protected_elided_nested_join = ((self.unit.flags
                         & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                         == CO_COROUTINE
-                        && ((!self.control.withs.active_with_exits.is_empty()
-                            && self.control.withs.active_with_exits.len()
-                                == self.control.withs.active_with_region_exclusions.len())
-                            || async_iterator_forward_join)
+                        && (matching_manager_region || async_iterator_forward_join))
+                        || (ordinary_loop_forward_join
+                            && matching_manager_region
+                            && self
+                                .control
+                                .withs
+                                .active_with_exits
+                                .iter()
+                                .all(|manager| !manager.is_async)))
                         && self
                             .control
                             .exceptions
@@ -15492,7 +15502,7 @@ impl<'source> Compiler<'source> {
                     // An erased suffix leaves the populated inner If's original join
                     // unchanged. Only expose that tail to this ordinary certificate;
                     // the complete body still compiles with its original boundaries.
-                    let nested_else_body = if coroutine_elided_nested_join
+                    let nested_else_body = if protected_elided_nested_join
                         || coroutine_populated_nested_join
                         || (self.context.python_version >= crate::PythonVersion::Py314
                             && branch_index == 0
@@ -15562,7 +15572,7 @@ impl<'source> Compiler<'source> {
                         && ((self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                             == 0
                             && !self.has_active_control_flow_region())
-                            || coroutine_elided_nested_join
+                            || protected_elided_nested_join
                             || direct_finally_nested_join
                             || coroutine_populated_nested_join)
                         && (self.control.loops.contexts.is_empty()
@@ -15805,7 +15815,7 @@ impl<'source> Compiler<'source> {
                                             && original_condition_has_unique_jump_target(test, false)));
                             (leading.is_empty()
                                 || is_elided_suite(leading)
-                                || coroutine_elided_nested_join
+                                || protected_elided_nested_join
                                 || coroutine_populated_nested_join
                                 || populated_arm(leading)
                                 || ordinary_elided_linear_prefix
