@@ -9213,14 +9213,14 @@ fn comprehension_branches_preserve_sibling_return_donors() {
 
 #[test]
 fn suspended_comprehension_siblings_preserve_return_locations() {
-    let source = r#"async def collect(flag, items):
+    let source = r"async def collect(flag, items):
     if flag:
         with manager():
             result = [item async for item in items]
     else:
         result = [item async for item in items]
     assert result
-"#;
+";
     for source in [
         source.to_owned(),
         source.replace(
