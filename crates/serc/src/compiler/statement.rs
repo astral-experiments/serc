@@ -15601,10 +15601,12 @@ impl<'source> Compiler<'source> {
                                     })
                                         && matches!(assignment.targets.as_slice(), [Expr::Name(_)])
                                         && matches!(assignment.value.as_ref(), Expr::If(conditional)
-                                            if [&conditional.test, &conditional.body, &conditional.orelse]
+                                            if condition_has_linear_runtime_leaves(&conditional.test)
+                                                && !expression_suspends_current_scope(&conditional.test)
+                                                && [&conditional.body, &conditional.orelse]
                                                 .into_iter()
-                                                .all(|expression| matches!(expression.as_ref(), Expr::Name(name)
-                                                    if name.id.as_str() != "__debug__"))))
+                                                .all(|expression| !expression_contains_inline_branch(expression)
+                                                    && !expression_suspends_current_scope(expression))))
                                 };
                             // Earlier ordinary conditionals merge before the final test
                             // or return from the function. Neither path can enter the

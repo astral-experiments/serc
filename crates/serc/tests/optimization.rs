@@ -1805,6 +1805,41 @@ fn erased_linear_prefix_preserves_populated_nested_join() {
 }
 
 #[test]
+fn assigned_call_conditional_prefix_preserves_populated_join() {
+    let source = r"def choose(owner, incoming, first):
+    if incoming is not None:
+        active = owner.enabled()
+        assert incoming.valid
+        if first:
+            value = incoming.prepare(first)
+        else:
+            value = incoming.prepare(0)
+        if value.kind != owner.kind:
+            value = value.convert(owner.kind)
+        options = configure(callback=lambda: None)
+        args = pack(value, options) if owner.recompute or active else None
+        if active:
+            result = None
+        else:
+            result = emit(value, args)
+    else:
+        assert first
+    consume(result)
+";
+    for source in [
+        source.to_owned(),
+        source.replace("owner.recompute or active", "owner.recompute and active"),
+        source.replace("owner.recompute or active", "not owner.ready()"),
+        source.replace(
+            "pack(value, options) if owner.recompute or active else None",
+            "value.left if owner.recompute else value.right",
+        ),
+    ] {
+        assert_matches_cpython(&source, "assigned_call_conditional_prefix.py", &LEVELS);
+    }
+}
+
+#[test]
 fn assigned_conditional_prefix_preserves_populated_nested_join() {
     for successor in ["    after = obj\n", "    after = obj.after\n"] {
         let source = format!(
