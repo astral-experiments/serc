@@ -74,6 +74,22 @@ fn erased_nested_else_preserves_try_exit_borrow_boundary() {
 }
 
 #[test]
+fn erased_conditional_preserves_join_before_async_manager_exit() {
+    for body in ["assert flag", "pass"] {
+        let source = format!(
+            "async def f(manager, outer, inner, stop, flag, work):\n    with manager:\n        while not stop:\n            async with outer:\n                async with inner:\n                    if not flag:\n                        {body}\n                    else:\n                        {body}\n            await work()\n"
+        );
+        assert_matches_cpython(&source, "async_manager_conditional_join.py", &LEVELS);
+    }
+    for source in [
+        "async def f(inner, stop, flag, work):\n    while not stop:\n        async with inner:\n            if not flag:\n                assert flag\n            else:\n                assert flag\n        await work()\n",
+        "async def f(outer, inner, flag, work):\n    async with outer:\n        async with inner:\n            if not flag:\n                assert flag\n            else:\n                assert flag\n    await work()\n",
+    ] {
+        assert_matches_cpython(source, "async_manager_loop_boundary.py", &LEVELS);
+    }
+}
+
+#[test]
 fn elided_assertion_after_nested_iterator_preserves_condition_backedges() {
     for suffix in ["assert item", "pass", "after()"] {
         let source = format!(

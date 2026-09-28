@@ -14771,7 +14771,7 @@ impl<'source> Compiler<'source> {
                                 .all(|stmt| self.context.is_elided_statement(stmt))
                     };
                     // The erased true arm retains its own original array. A live
-                    // successor or an inner synchronous manager keeps the common
+                    // successor or an inner manager's exit keeps the common
                     // end block from becoming a copied, unlocated loop backedge.
                     // A lexical successor alone is insufficient: it may also vanish.
                     let elided_join_has_forward_continuation = self
@@ -14813,12 +14813,6 @@ impl<'source> Compiler<'source> {
                                     ))
                                 || self.control.loops.contexts.last().is_some_and(|context| {
                                     context.with_depth < self.control.withs.active_with_exits.len()
-                                        && self
-                                            .control
-                                            .withs
-                                            .active_with_exits
-                                            .last()
-                                            .is_some_and(|manager| !manager.is_async)
                                 })));
                     let optimized_empty_both = self.context.python_version
                         >= crate::PythonVersion::Py314
