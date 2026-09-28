@@ -180,6 +180,16 @@ fn elided_else_after_completed_work_preserves_legacy_footer_location() {
 }
 
 #[test]
+fn erased_else_after_breaking_for_preserves_branch_join() {
+    for tail in ["finish()", "value = None", "return None"] {
+        let source = format!(
+            "def f(flag, items):\n    if flag:\n        for item in items:\n            if item:\n                break\n    else:\n        assert flag\n    {tail}\n"
+        );
+        assert_matches_cpython(&source, "breaking_for_erased_else.py", &LEVELS);
+    }
+}
+
+#[test]
 fn erased_suffix_after_breaking_for_preserves_branch_join() {
     for source in [
         "def example(items, candidates, size, mode, obj, ready, alternate, use):\n    if size > 0:\n        before = prepare()\n        if ready:\n            use(before)\n        middle = prepare()\n        if alternate:\n            use(middle)\n        if mode == 0:\n            total = 0\n            for item in items:\n                if item == mode:\n                    total = 0\n                    total += item\n            assert total\n            picked = 0\n            for candidate in candidates:\n                assert candidate\n                if candidate == mode:\n                    picked = candidate.value\n                    picked += total\n                    if picked == mode:\n                        break\n            assert picked\n        else:\n            assert size\n        result = finish(obj)\n        use(result)\n",

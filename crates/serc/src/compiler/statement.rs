@@ -15086,15 +15086,22 @@ impl<'source> Compiler<'source> {
                                             || is_elided_suite(&clause.body))
                                         && !suite_contains_yield(&clause.body)))
                         });
-                    // An erased suffix emits nothing into a completed For's break-target
-                    // block. Incoming breaks thread past its exit before the surviving
-                    // natural-exhaustion edge supplies the line for its late NOP.
+                    // An erased suffix leaves the completed For's break target empty.
+                    // An erased outer else also makes its exit jump redundant. Incoming
+                    // breaks thread past it before the surviving natural-exhaustion edge
+                    // supplies the line for its late NOP.
                     let elided_for_break_tail = self.can_descend_match_tail_wrappers()
                         && !self.control.statements.in_match
                         && !self.control.loops.suite_fallthrough_to_loop_backedge
-                        && body
+                        && (body
                             .last()
                             .is_some_and(|last| self.context.is_elided_statement(last))
+                            || (branch_index == 0
+                                && condition_has_linear_runtime_leaves(test)
+                                && !expression_suspends_current_scope(test)
+                                && original_condition_has_unique_jump_target(test, true)
+                                && matches!(statement.elif_else_clauses.as_slice(), [clause]
+                                    if clause.test.is_none() && is_elided_suite(&clause.body))))
                         && body
                             .iter()
                             .rfind(|part| !self.context.is_elided_statement(part))
