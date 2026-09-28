@@ -23,6 +23,40 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn annotated_comprehension_preserves_implicit_return_location() {
+    let source = "async def collect(items, fields):\n    await prepare()\n    result: list[tuple] = [\n        tuple(item for field in fields)\n        for item in items\n    ]\n    assert result\n";
+    for (index, source) in [
+        source.to_owned(),
+        source.replace("    assert result\n", ""),
+        source
+            .replace("async def", "def")
+            .replace("    await prepare()\n", ""),
+        source
+            .replace("result: list[tuple] = [", "result: set[tuple] = {")
+            .replace("    ]\n", "    }\n"),
+        source
+            .replace("result: list[tuple] = [", "result: dict[object, tuple] = {")
+            .replace(
+                "        tuple(item for field in fields)",
+                "        item: tuple(item for field in fields)",
+            )
+            .replace("    ]\n", "    }\n"),
+        source.replace("result: list[tuple]", "result"),
+        source.replace("    assert result\n", "    consume(result)\n"),
+        source.replace("tuple(item for field in fields)", "item"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            &source,
+            &format!("annotated_comprehension_return_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn compacted_branch_pass_preserves_return_copy_location() {
     for definition in ["def", "async def"] {
         let source = format!(

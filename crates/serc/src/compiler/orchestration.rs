@@ -939,28 +939,48 @@ impl<'source> Compiler<'source> {
                     Some(super::optimization::OptimizedLocation::Elided)
                 )
         };
+        let annotated_comprehension_store = |statement: &Stmt| {
+            if self.context.python_version >= PythonVersion::Py314
+                && let Stmt::AnnAssign(assignment) = statement
+                && matches!(assignment.target.as_ref(), Expr::Name(_))
+                && matches!(
+                    assignment.value.as_deref(),
+                    Some(Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_))
+                )
+            {
+                // Function-local annotations emit no code after the result store.
+                // Its span remains the return donor when comprehension restores move.
+                Some(assignment.target.range())
+            } else {
+                None
+            }
+        };
         let return_location_statement = if self.context.python_version >= PythonVersion::Py314
             && terminal_statement.is_some_and(is_elided_statement)
         {
             body.iter()
                 .rev()
                 .find(|statement| !is_elided_statement(statement))
-                .filter(|statement| matches!(statement, Stmt::Assign(_)))
+                .filter(|statement| {
+                    matches!(statement, Stmt::Assign(_))
+                        || annotated_comprehension_store(statement).is_some()
+                })
                 .or(terminal_statement)
         } else {
             terminal_statement
         };
-        if add_implicit_return
-            && let Some(statement) = return_location_statement.filter(|statement| {
+        let return_range = return_location_statement.and_then(|statement| {
+            annotated_comprehension_store(statement).or_else(|| {
                 terminal_statement_uses_implicit_return_location(
                     statement,
                     self.context.python_version,
                     false,
                 )
+                .then(|| implicit_return_range(&self, statement))
             })
-        {
-            self.assembler
-                .set_location(self.source_location(implicit_return_range(&self, statement)));
+        });
+        if add_implicit_return && let Some(range) = return_range {
+            self.assembler.set_location(self.source_location(range));
         } else if self.assembler.instruction_count() > body_start {
             self.assembler.set_location(SourceLocation::NONE);
         } else if let Some(statement @ Stmt::Pass(_)) = body.last() {
