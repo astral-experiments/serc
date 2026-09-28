@@ -15741,7 +15741,7 @@ mod tests {
                         CALL_INTRINSIC_1,
                         Operand::Value(UnaryIntrinsic::LIST_TO_TUPLE.argument()),
                         Some(2),
-                    )
+                    );
                 }
                 "yield from" => prefix[5] = make(YIELD_VALUE, Operand::Value(1), Some(2)),
                 "resume after await" => prefix[6] = make(RESUME, Operand::Value(3), Some(2)),
