@@ -732,6 +732,35 @@ fn unpacked_store_preserves_loop_backedge_location() {
 }
 
 #[test]
+fn erased_finally_branch_preserves_conditional_continuation() {
+    let source = "def configure(kind, ready):\n    try:\n        if kind == 'first':\n            assert ready\n        elif kind == 'second':\n            assert kind\n        else:\n            assert False\n        if ready and available():\n            consume(kind)\n    finally:\n        finish()\n";
+    for (index, source) in [
+        source.to_owned(),
+        source.replace(
+            "        elif kind == 'second':\n            assert kind\n",
+            "",
+        ),
+        source.replace(
+            "        if ready and available():\n            consume(kind)",
+            "        consume(kind)",
+        ),
+        source.replace(
+            "        if ready and available():",
+            "        assert ready\n        if ready and available():",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            &source,
+            &format!("erased_finally_continuation_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn erased_assertion_preserves_legacy_loop_return_copies() {
     let source = "def f(worker):\n    if not worker.ready:\n        value = worker.read()\n        while value not in [\"a\", \"b\"]:\n            value = worker.read()\n        assert value == \"a\"\n";
     for (index, source) in [

@@ -15183,17 +15183,20 @@ impl<'source> Compiler<'source> {
                                 )
                             })
                             == Some(&statement.range))
-                            || (self
+                            || ((self
                                 .control
                                 .statements
                                 .context
                                 .elided_join_has_live_successor
+                                // A following runtime test also begins with a located
+                                // instruction before any cleanup in its branches.
+                                || self.control.statements.context.elided_join_has_conditional_successor)
                                 && self
                                     .control
                                     .exceptions
                                     .direct_try_body_statements
                                     .contains(&statement.range)))
-                        && matches!(statement.elif_else_clauses.as_slice(), [clause]
+                        && matches!(statement.elif_else_clauses.get(branch_index..), Some([clause])
                             if clause.test.is_none())
                         && (finalizers.len() == 1 || nested_finally_contexts)
                         && finalizers
