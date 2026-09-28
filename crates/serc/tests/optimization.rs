@@ -1515,6 +1515,47 @@ fn completed_generator_call_preserves_nested_branch_join() {
 }
 
 #[test]
+fn generator_call_stores_preserve_populated_nested_join() {
+    let source = r"def choose(result, items):
+    if result is None:
+        flag = any(check(item) for item in items)
+        if flag:
+            assert all(check(item) for item in items)
+            selected = next(item for item in items if check(item))
+            result = build(selected)
+        else:
+            result = fallback(items)
+    else:
+        assert valid(result)
+    consume(result)
+    return result
+";
+    let ordinary_prefix = source.replace("any(check(item) for item in items)", "check(items)");
+    let without_assertion = |source: &str| {
+        source.replace(
+            "            assert all(check(item) for item in items)\n",
+            "",
+        )
+    };
+    let linear_selection = |source: &str| {
+        source.replace(
+            "next(item for item in items if check(item))",
+            "select(items)",
+        )
+    };
+    for source in [
+        source.to_owned(),
+        linear_selection(&without_assertion(source)),
+        without_assertion(&ordinary_prefix),
+        linear_selection(&ordinary_prefix),
+        linear_selection(&without_assertion(&ordinary_prefix)),
+        source.replace("        assert valid(result)", "        consume(result)"),
+    ] {
+        assert_matches_cpython(&source, "generator_call_store_join.py", &LEVELS);
+    }
+}
+
+#[test]
 fn completed_comprehension_preserves_nested_branch_join() {
     let source = "def collect(options, values):\n    result = options.values\n    if result is None:\n        if values is not None:\n            result = [item.value for item in values]\n        else:\n            result = make_values()\n    else:\n        assert result\n    output = []\n    for item in result:\n        output.append(item)\n    return output\n";
     for source in [

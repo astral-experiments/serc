@@ -15290,6 +15290,21 @@ impl<'source> Compiler<'source> {
                                         && matches!(assignment.value.as_ref(), Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_))
                                         && !expression_suspends_current_scope(&assignment.value))
                             };
+                            // Specialized paths merge before the store. Ordinary calls
+                            // create the generator in a separate scope; only its first
+                            // iterable and the callable are evaluated here.
+                            let completed_generator_call = |statement: &Stmt| {
+                                matches!(statement, Stmt::Assign(assignment)
+                                    if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                                        && !expression_suspends_current_scope(&assignment.value)
+                                        && matches!(assignment.value.as_ref(), Expr::Call(call)
+                                            if optimized_generator_callable_for_target(call, self.context.python_version).is_some()
+                                                || (call.arguments.keywords.is_empty()
+                                                    && !expression_contains_inline_branch(&call.func)
+                                                    && matches!(call.arguments.args.as_ref(), [Expr::Generator(generator)]
+                                                        if generator.generators.first().is_some_and(|outermost|
+                                                            !expression_contains_inline_branch(&outermost.iter))))))
+                            };
                             // Continues return to this loop's header. Only normal
                             // exhaustion reaches the enclosing conditional's join.
                             let completed_for = |statement: &Stmt| {
@@ -15320,16 +15335,15 @@ impl<'source> Compiler<'source> {
                                         // Comprehensions likewise finish before their store.
                                         (suite_has_linear_borrow_fallthrough(std::slice::from_ref(tail))
                                             || completed_comprehension(tail)
+                                            || completed_generator_call(tail)
                                             || completed_for(tail))
                                             && prefix.iter().all(|part| {
                                                 matches!(part, Stmt::Pass(_))
+                                                    || (matches!(part, Stmt::Global(global) if global.names.is_empty())
+                                                        && self.context.is_elided_statement(part))
                                                     || suite_has_linear_borrow_fallthrough(std::slice::from_ref(part))
                                                     || completed_comprehension(part)
-                                                    || matches!(part, Stmt::Assign(assignment)
-                                                        if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
-                                                            && matches!(assignment.value.as_ref(), Expr::Call(call)
-                                                                if optimized_generator_callable_for_target(call, self.context.python_version).is_some())
-                                                            && !expression_suspends_current_scope(&assignment.value))
+                                                    || completed_generator_call(part)
                                             })
                                     })
                             };
