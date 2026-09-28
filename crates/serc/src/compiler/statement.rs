@@ -34087,7 +34087,19 @@ impl<'source> Compiler<'source> {
                 // Emitted linear work can precede the extracted try directly.
                 && (terminal_body.len() == body.len()
                     || leading.is_empty()
-                    || (suite_has_linear_borrow_fallthrough(leading)
+                    || ((suite_has_linear_borrow_fallthrough(leading)
+                        || leading.iter().all(|prefix| {
+                            matches!(prefix, Stmt::Pass(_))
+                                || suite_has_linear_borrow_fallthrough(std::slice::from_ref(prefix))
+                                // Plain definitions emit linear function creation here. Modern
+                                // annotations and child bodies compile in independent scopes.
+                                || (self.context.python_version >= crate::PythonVersion::Py314
+                                    && matches!(prefix, Stmt::FunctionDef(definition)
+                                        if definition.type_params.is_none()
+                                            && definition.decorator_list.is_empty()
+                                            && definition.parameters.iter_non_variadic_params()
+                                                .all(|parameter| parameter.default.is_none())))
+                        }))
                         && leading.last().is_some_and(|statement| {
                             suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement))
                         })))

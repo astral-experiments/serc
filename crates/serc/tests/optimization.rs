@@ -6765,6 +6765,25 @@ fn elided_assertion_after_manager_finally_matches_cpython() {
 }
 
 #[test]
+fn nested_definition_before_finally_preserves_manager_exit() {
+    for definition in [
+        "async def child():\n            yield flag",
+        "async def child(*, item: Item) -> Items[Item]:\n            yield flag",
+        "def child():\n            return flag",
+    ] {
+        let source = format!(
+            "async def f(manager, task, flag):\n    with manager:\n        {definition}\n        configure(child)\n        try:\n            assert flag\n        finally:\n            release()\n            result = await task\n        assert result\n"
+        );
+        assert_matches_cpython(&source, "nested_definition_finally_exit.py", &LEVELS);
+    }
+    assert_matches_cpython(
+        "async def f(manager, task, flag):\n    with manager:\n        'marker'\n        configure(flag)\n        try:\n            assert flag\n        finally:\n            release()\n            result = await task\n        assert result\n",
+        "literal_prefix_finally_exit.py",
+        &LEVELS,
+    );
+}
+
+#[test]
 fn elided_assertion_after_manager_finally_preserves_preceding_pass_owner() {
     const SOURCE: &str = "def f(cm, x):\n    with cm:\n        pass\n        try:\n            work()\n        finally:\n            cleanup()\n        assert x\n";
     const TRACE: &str = r"
