@@ -12098,3 +12098,49 @@ fn managed_coroutine_iterator_preserves_forward_conditional_join() {
         &LEVELS,
     );
 }
+
+#[test]
+fn protected_iterator_erased_inner_arm_preserves_backward_condition() {
+    assert_matches_cpython(
+        r"def f(manager, items, kind, cached, transform, dispatch):
+    with manager:
+        for item in items:
+            if kind == 0:
+                dispatch(item)
+            elif kind == 1 or kind == 2:
+                item['tag'] = 'value'
+                if cached(item):
+                    assert item
+                else:
+                    if transform(item):
+                        item['value'] = transform(item)
+                    item['value'] = dispatch[0](item)
+            else:
+                assert item
+        dispatch(items)
+",
+        "primary.py",
+        &LEVELS,
+    );
+    assert_matches_cpython(
+        r"async def f(manager, items, kind, cached, transform, dispatch):
+    with manager:
+        for item in items:
+            if kind == 0:
+                dispatch(item)
+            elif kind == 1 or kind == 2:
+                item['tag'] = 'value'
+                if cached(item):
+                    assert item
+                else:
+                    if transform(item):
+                        item['value'] = transform(item)
+                    item['value'] = dispatch[0](item)
+            else:
+                assert item
+        dispatch(items)
+",
+        "coroutine.py",
+        &LEVELS,
+    );
+}

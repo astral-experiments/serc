@@ -19062,6 +19062,18 @@ impl<'source> Compiler<'source> {
                                         suite_has_linear_borrow_fallthrough(&clause.body)
                                     })
                                     && suite_has_nonsuspending_conditional_work(std::slice::from_ref(statement)))
+                            // An erased true arm and a completed linear false arm
+                            // also rejoin this iterator without entering cleanup.
+                            || matches!(statement, Stmt::If(branch)
+                                if !branch.body.is_empty()
+                                    && branch.body.iter().all(|part| self.context.is_elided_statement(part))
+                                    && condition_has_linear_runtime_leaves(&branch.test)
+                                    && !expression_suspends_current_scope(&branch.test)
+                                    && condition_jump_target_count(&branch.test, true) == 1
+                                    && condition_jump_target_count(&branch.test, false) == 1
+                                    && matches!(branch.elif_else_clauses.as_slice(), [otherwise]
+                                        if otherwise.test.is_none()
+                                            && self.coroutine_branch_has_linear_tail(&otherwise.body)))
                     })));
         let protected_loop_else = protected_iterator_work_else || protected_direct_loop_else;
         // The erased else threads directly to the while backedge. Completed
