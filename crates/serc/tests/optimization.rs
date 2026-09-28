@@ -8418,6 +8418,24 @@ fn comprehension_branches_preserve_sibling_return_donors() {
 }
 
 #[test]
+fn coroutine_comprehension_siblings_preserve_return_locations() {
+    let source = "async def collect(flag, items, fields):\n    await prepare()\n    if flag:\n        with manager():\n            result = [tuple(item for field in fields) for item in items]\n    else:\n        result = [\n            tuple(item for field in fields)\n            for item in items\n        ]\n    assert result\n";
+    for source in [
+        source.to_owned(),
+        source.replace("tuple(item for field in fields)", "item"),
+        source.replace(
+            "with manager():",
+            "with manager() as active, second_manager() as other:",
+        ),
+        source.replace("    assert result\n", "    consume(result)\n"),
+        "async def collect(flag, items):\n    await prepare()\n    if flag:\n        work()\n    else:\n        result = [item for item in items]\n    assert flag\n".to_owned(),
+        "async def collect(flag, other, items):\n    await prepare()\n    if flag:\n        result = [item for item in items]\n    elif other:\n        result = {item for item in items}\n    else:\n        result = {item: item for item in items}\n    assert result\n".to_owned(),
+    ] {
+        assert_matches_cpython(&source, "coroutine_comprehension_siblings.py", &LEVELS);
+    }
+}
+
+#[test]
 fn elided_assertions_preserve_terminal_branch_comprehension_returns() {
     for source in [
         r"def f(flag, xs):

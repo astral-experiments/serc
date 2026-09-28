@@ -1758,6 +1758,32 @@ impl<'source> Compiler<'source> {
             })
     }
 
+    /// Checks that each coroutine arm has an independent ordinary return donor.
+    fn coroutine_branches_have_linear_return_donors(
+        &self,
+        conditional: &ruff_python_ast::StmtIf,
+    ) -> bool {
+        std::iter::once(conditional.body.as_slice())
+            .chain(
+                conditional
+                    .elif_else_clauses
+                    .iter()
+                    .map(|clause| clause.body.as_slice()),
+            )
+            .all(|branch| {
+                self.coroutine_branch_has_linear_tail(branch)
+                    || matches!(branch, [Stmt::With(manager)]
+                        if !manager.is_async
+                            && manager.items.iter().all(|item| {
+                                !expression_suspends_current_scope(&item.context_expr)
+                                    && item.optional_vars.as_ref().is_none_or(|target| {
+                                        !expression_suspends_current_scope(target)
+                                    })
+                            })
+                            && self.coroutine_branch_has_linear_tail(&manager.body))
+            })
+    }
+
     /// Certifies target-supported, nonsuspending exits before erased assertions.
     fn terminal_if_before_elided(&self, statement: &Stmt, following: &[Stmt]) -> bool {
         let Stmt::If(conditional) = statement else {
@@ -2072,14 +2098,16 @@ impl<'source> Compiler<'source> {
                     .iter()
                     .all(|statement| self.context.is_elided_statement(statement))
                 && matches!(statement, Stmt::If(conditional)
-                if ((plain_function_suite
+                if (((plain_function_suite
+                    || (self.unit.flags & CO_COROUTINE != 0
+                        && self.coroutine_branches_have_linear_return_donors(conditional)))
                     && std::iter::once(conditional.body.as_slice())
                         .chain(conditional.elif_else_clauses.iter().map(|clause| clause.body.as_slice()))
                         .any(|branch| matches!(branch.last(), Some(Stmt::Assign(assignment))
                             if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
                                 && matches!(assignment.value.as_ref(), Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_)))))
-                    // Other arms can have distinct shared return donors. Only the
-                    // existing synchronous lowering handles those sibling joins.
+                    // Nested joins and empty sibling arms can share return donors;
+                    // coroutine copying requires an independent donor in every arm.
                     || (conditional.elif_else_clauses.is_empty()
                         && self.terminal_comprehension_assignment(&conditional.body).is_some()))
                     && condition_has_linear_runtime_leaves(&conditional.test)
