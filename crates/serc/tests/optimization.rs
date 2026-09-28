@@ -1899,10 +1899,30 @@ fn empty_try_before_removed_assertions_preserves_implicit_return() {
 }
 
 #[test]
-fn elided_terminal_or_preserves_shared_return_order() {
-    for test in ["a or b", "a == 1 or b == 2", "a or b or c"] {
-        let source = format!("def f(a, b, c):\n    if {test}:\n        assert a\n");
-        assert_matches_cpython(&source, "elided_terminal_or.py", &LEVELS);
+fn elided_terminal_boolean_preserves_shared_return_order() {
+    for test in [
+        "a or b",
+        "a == 1 or b == 2",
+        "a or b or c",
+        "a and b",
+        "a and (b or c)",
+        "not a and (b or c)",
+        "(a or b) and (c or d)",
+        "not a and (not b or c)",
+        "not a.ready and (b() or c.ready)",
+    ] {
+        let source = format!("def f(a, b, c, d):\n    if {test}:\n        assert a\n");
+        assert_matches_cpython(&source, "elided_terminal_boolean.py", &LEVELS);
+    }
+    for (body, suffix) in [
+        ("pass", ""),
+        ("consume(a)", ""),
+        ("assert a\n        consume(a)", ""),
+        ("assert a", "    consume(a)\n"),
+    ] {
+        let source =
+            format!("def f(a, b, c):\n    if not a and (b or c):\n        {body}\n{suffix}");
+        assert_matches_cpython(&source, "terminal_boolean_live_body.py", &LEVELS);
     }
 }
 

@@ -4211,11 +4211,10 @@ impl<'source> Compiler<'source> {
                 .collect();
         let has_empty_comparison_arm = !empty_comparison_arms.is_empty();
         // 3.12 inserts each copied exit after the original shared footer. Eager
-        // per-arm returns change that order when an OR body is entirely elided.
+        // per-arm returns change that order when a Boolean body is entirely elided.
         let has_optimized_join = (self.context.python_version >= crate::PythonVersion::Py313
             || (statement.elif_else_clauses.is_empty()
-                && matches!(statement.test.as_ref(), Expr::BoolOp(boolean)
-                    if boolean.op == BoolOp::Or)))
+                && matches!(statement.test.as_ref(), Expr::BoolOp(_))))
             && (self.optimized_conditional_join(statement)
                 || (self.context.python_version == crate::PythonVersion::Py313
                     && std::iter::once(statement.body.as_slice())
