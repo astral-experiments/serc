@@ -6501,14 +6501,21 @@ impl Compiler<'_> {
                 )?;
                 self.assembler.mark(next);
             }
-            return self.compile_comprehension_filter(
+            let empty_folded_tail = comprehension_filter_truthiness(last) == Some(true)
+                && self.assembler.at_empty_borrow_block();
+            self.compile_comprehension_filter(
                 last,
                 element_location,
                 accepted,
                 restart,
                 include_with_region_exclusion,
                 include_protected_region_exclusion,
-            );
+            )?;
+            if empty_folded_tail {
+                // Removing the final folded operand empties its original fallthrough block.
+                self.assembler.mark_last_nop_borrow_barrier_if_removed();
+            }
+            return Ok(());
         }
         if let Expr::BoolOp(boolean) = condition
             && boolean.op == BoolOp::Or

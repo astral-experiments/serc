@@ -38,6 +38,21 @@ fn elided_finally_assertion_preserves_exceptional_exit_locations() {
 }
 
 #[test]
+fn folded_comprehension_and_tail_preserves_borrow_boundary() {
+    for (index, source) in [
+        "def collect(mapping, items):\n    result = [item for item in items if mapping.get(item) and not __debug__]\n    return result\n",
+        "def collect(mapping, items):\n    result = [item for item in items if mapping.get(item) and True]\n    return result\n",
+        "def collect(mapping, items):\n    result = [item for item in items if mapping.get(item)]\n    return result\n",
+        "def collect(mapping, items):\n    result = [\n        item for item in items\n        if mapping.get(item)\n        and True\n    ]\n    return result\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(source, &format!("folded_comprehension_and_tail_{index}.py"), &LEVELS);
+    }
+}
+
+#[test]
 fn conditional_assignment_preserves_original_statement_joins() {
     for source in [
         r"def example(flag, choice, build):
