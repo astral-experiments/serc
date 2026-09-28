@@ -1710,24 +1710,49 @@ impl OptimizationPipeline {
                             else {
                                 return false;
                             };
+                            // Lowering can compact an emitted Pass into this jump.
+                            // Its original slot and unique source record certify the
+                            // same head as an omitted Pass, before CFG optimization.
+                            let pass = Instruction::new(
+                                NOP,
+                                Operand::Value(0),
+                                instruction.location,
+                                Some(depth),
+                            );
+                            let emitted_pass = instruction.pre_fold_extra_instructions() == 1
+                                && self
+                                    .exception_owner_provenance
+                                    .original_pass_nops
+                                    .iter()
+                                    .filter(|original| **original == pass)
+                                    .count()
+                                    == 1;
                             if *tail != instruction
                                 || !labels.iter().any(|item| matches!(item, Item::Label(entry)
                                     if self.exception_owner_provenance.source_boundaries.contains(entry)
                                         && self.exception_owner_provenance.block_boundaries.contains(entry)))
                                 || !labels.iter().all(|item| matches!(item, Item::Label(entry)
                                     if self.original_nop_targets.contains(entry)
-                                        && self.exception_owner_provenance.omitted_nop_counts.get(entry) == Some(&1)
-                                        && self.exception_owner_provenance.omitted_nop_locations.get(entry) == Some(&instruction.location)))
+                                        && (if emitted_pass {
+                                            !self.exception_owner_provenance.omitted_nop_counts.contains_key(entry)
+                                                && !self.exception_owner_provenance.omitted_nop_locations.contains_key(entry)
+                                        } else {
+                                            self.exception_owner_provenance.omitted_nop_counts.get(entry) == Some(&1)
+                                                && self.exception_owner_provenance.omitted_nop_locations.get(entry) == Some(&instruction.location)
+                                        })))
                             {
                                 return false;
                             }
-                            instruction
-                                == Instruction::new(
-                                    JUMP_FORWARD,
-                                    Operand::Forward(target),
-                                    instruction.location,
-                                    Some(depth),
-                                )
+                            let mut original = Instruction::new(
+                                JUMP_FORWARD,
+                                Operand::Forward(target),
+                                instruction.location,
+                                Some(depth),
+                            );
+                            if emitted_pass {
+                                original.add_pre_fold_extra_instructions(1);
+                            }
+                            instruction == original
                         })();
                         // A jump retained as a source-position NOP remains a CFG boundary.
                         if instruction.jump_policy.allows_threading_target()

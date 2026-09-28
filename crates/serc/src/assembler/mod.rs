@@ -1538,7 +1538,7 @@ impl Assembler {
 
     /// Records an authored Pass NOP before the graph can rewrite or copy it.
     pub(crate) fn record_original_pass_nop(&mut self) {
-        if self.python_version == crate::PythonVersion::Py314 {
+        if self.python_version >= crate::PythonVersion::Py314 {
             let instruction = *self.required_last_instruction_mut("recording an authored Pass");
             debug_assert_eq!(instruction.opcode, NOP);
             self.exception_owner_provenance

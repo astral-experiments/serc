@@ -23,6 +23,16 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn compacted_branch_pass_preserves_return_copy_location() {
+    for definition in ["def", "async def"] {
+        let source = format!(
+            "{definition} f(kind, left, right, flag):\n    if kind == left:\n        result = left\n        assert flag\n        pass\n    elif kind == right:\n        result = right\n        if flag:\n            assert kind\n        else:\n            assert kind\n        pass\n    else:\n        raise ValueError(\"kind\")\n    assert result\n"
+        );
+        assert_matches_cpython(&source, "compacted_branch_pass.py", &LEVELS);
+    }
+}
+
+#[test]
 fn async_iterator_preserves_erased_branch_backedges() {
     for manager in ["with", "async with"] {
         for iterator in ["for", "async for"] {
