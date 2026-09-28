@@ -14977,6 +14977,21 @@ impl<'source> Compiler<'source> {
                                                         .len()
                                         },
                                     ))
+                                // A coroutine's implicit owner also keeps a following
+                                // runtime test ahead of the synchronous iterator backedge.
+                                || (self.control.statements.context.elided_join_has_conditional_successor
+                                    && self.unit.flags
+                                        & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                                        == CO_COROUTINE
+                                    && self.control.generators.generator_region_start.is_some()
+                                    && self.control.withs.active_with_exits.is_empty()
+                                    && self.control.withs.active_with_region_exclusions.is_empty()
+                                    && self.control.exceptions.active_exception_region_exclusions.is_empty()
+                                    && self.control.loops.contexts.last().is_some_and(|context| {
+                                        context.iterator_cleanup == IteratorCleanup::Sync
+                                            && context.with_depth == 0
+                                            && context.exception_region_depth == 0
+                                    }))
                                 || self.control.loops.contexts.last().is_some_and(|context| {
                                     context.with_depth < self.control.withs.active_with_exits.len()
                                 })));

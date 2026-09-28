@@ -2064,6 +2064,16 @@ fn erased_match_case_suffix_preserves_join_before_successor() {
 }
 
 #[test]
+fn coroutine_sequential_conditions_preserve_erased_joins() {
+    for next_test in ["second", "second and third", "second or third"] {
+        let source = format!(
+            "async def f(items, first, second, third):\n    await prepare()\n    for item in items:\n        if first:\n            assert item\n        else:\n            assert items\n        if {next_test}:\n            assert item\n        else:\n            assert items\n"
+        );
+        assert_matches_cpython(&source, "coroutine_sequential_joins.py", &LEVELS);
+    }
+}
+
+#[test]
 fn coroutine_loop_store_preserves_elided_join_nop() {
     for target in ["item.state", "item.parent.state", "item[0]"] {
         let source = format!(
