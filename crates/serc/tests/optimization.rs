@@ -140,6 +140,55 @@ fn erased_suffix_preserves_with_pop_block() {
 }
 
 #[test]
+fn erased_handler_assertions_preserve_manager_pop_block() {
+    const SOURCE: &str = "def f(manager, factory):\n    with manager():\n        obj = factory()\n        try:\n            obj.run()\n            raise ValueError(\"failed\")\n        except Error as exc:\n            text = str(exc)\n            assert \"bad\" in text\n        assert obj.ready\n    finish()\n";
+    for (index, assignment) in [
+        "text = str(exc)",
+        "obj.text = str(exc)",
+        "text, other = unpack(exc)",
+        "text, *other = unpack(exc)",
+        "text = obj.text = str(exc)",
+        "(obj\n             .text) = str(exc)",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let source = SOURCE.replace("text = str(exc)", assignment);
+        assert_matches_cpython(
+            &source,
+            &format!("erased_handler_store_{index}.py"),
+            &LEVELS,
+        );
+        let source = source
+            .replace("            assert \"bad\" in text\n", "")
+            .replace("        assert obj.ready\n", "");
+        assert_matches_cpython(&source, &format!("live_handler_store_{index}.py"), &LEVELS);
+    }
+    for (index, source) in [
+        SOURCE.replace("        assert obj.ready\n", ""),
+        SOURCE.replace("            assert \"bad\" in text\n", ""),
+        SOURCE
+            .replace("except Error as exc:", "except Error:")
+            .replace("str(exc)", "str(obj)"),
+        SOURCE.replace("text = str(exc)", "consume(exc)"),
+        SOURCE.replace(
+            "        assert obj.ready\n",
+            "        assert obj.ready\n        obj.finish()\n",
+        ),
+        SOURCE.replace("            raise ValueError(\"failed\")\n", ""),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            &source,
+            &format!("handler_manager_boundary_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn erased_assertions_preserve_manager_while_exit() {
     let source = "def f(manager, worker):\n    with manager:\n        while len(worker.items) != 1:\n            worker.advance()\n        assert len(worker.items) == 1\n";
     let repeated = source.replace(

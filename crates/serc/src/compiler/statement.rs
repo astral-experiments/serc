@@ -34699,7 +34699,7 @@ impl<'source> Compiler<'source> {
         let body_noop = body_noop.or_else(|| {
             remaining
                 .is_empty()
-                .then(|| with_body_handler_exit_location(body))
+                .then(|| with_body_handler_exit_location(self, body))
                 .flatten()
                 .map(WithBodyExitNoop::LocatedConvertedPopBlock)
                 .or_else(|| {
@@ -36757,8 +36757,15 @@ fn with_body_ends_in_terminal_try(body: &[Stmt]) -> bool {
 // predecessor. If a direct return, raise, or break terminates the try body and the only normal predecessor
 // instead comes from an exception handler, CPython propagates that handler's fallthrough location
 // onto the marker.
-fn with_body_handler_exit_location(body: &[Stmt]) -> Option<TextRange> {
-    let Some(Stmt::Try(statement)) = body.last() else {
+fn with_body_handler_exit_location(compiler: &Compiler<'_>, body: &[Stmt]) -> Option<TextRange> {
+    // Removed assertions leave the handler's last live statement adjacent to its
+    // cleanup, and the try's normal join adjacent to the manager's POP_BLOCK.
+    let is_live = |statement: &Stmt| {
+        !(compiler.context.python_version >= crate::PythonVersion::Py314
+            && matches!(statement, Stmt::Global(global) if global.names.is_empty())
+            && compiler.context.is_elided_statement(statement))
+    };
+    let Some(Stmt::Try(statement)) = body.iter().rev().find(|statement| is_live(statement)) else {
         return None;
     };
     if statement.is_star
@@ -36782,16 +36789,18 @@ fn with_body_handler_exit_location(body: &[Stmt]) -> Option<TextRange> {
         return None;
     }
 
-    match handler.body.last()? {
+    match handler
+        .body
+        .iter()
+        .rev()
+        .find(|statement| is_live(statement))?
+    {
         Stmt::Assert(statement) => Some(statement.test.range()),
         Stmt::If(statement) => {
             terminating_if_fallthrough_test(statement).map(synthetic_condition_exit_range)
         }
         // The final store locates the handler's artificial cleanup and the manager exit.
-        Stmt::Assign(assignment) => Some(match assignment.targets.as_slice() {
-            [Expr::Name(target)] => target.range,
-            _ => assignment.range,
-        }),
+        statement @ Stmt::Assign(_) => Some(implicit_return_range(compiler, statement)),
         statement @ (Stmt::Expr(_) | Stmt::Pass(_)) => Some(statement.range()),
         _ => None,
     }
