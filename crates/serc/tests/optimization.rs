@@ -23,6 +23,19 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn chained_condition_loop_exit_preserves_iterator_location() {
+    for source in [
+        "def f(a, b, items):\n    assert a\n    if check(a):\n        assert b\n    if a < b < items:\n        assert a\n        for item in items:\n            assert item\n",
+        "def f(a, b, items):\n    if a < b < items:\n        for item in items:\n            consume(item)\n",
+        "def f(a, b, items):\n    if a < b:\n        for item in items:\n            consume(item)\n",
+        "def f(a, b, items):\n    if a < b < items:\n        for item in items:\n            consume(item)\n        after()\n",
+        "def f(a, b, items):\n    if a < b < items:\n        for item in items:\n            consume(item)\n    after()\n",
+    ] {
+        assert_matches_cpython(source, "chained_condition_loop_exit.py", &LEVELS);
+    }
+}
+
+#[test]
 fn elided_finally_assertion_preserves_exceptional_exit_locations() {
     for tail in ["assert flag", "pass", "after()"] {
         let source = format!(
