@@ -18547,11 +18547,17 @@ impl<'source> Compiler<'source> {
         let protected_loop_else = protected_iterator_work_else || protected_direct_loop_else;
         // The erased else threads directly to the while backedge. Completed
         // managers inside an arm do not change that target; normalizing the
-        // backward condition creates fresh slots outside the enclosing owner.
+        // backward condition creates fresh slots outside the enclosing manager
+        // or try owner. Erased prefixes add no instruction slots to those arms.
         let protected_while_loop_else = eligible_else
             && matches!(self.unit.scope, Scope::Function { .. })
             && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
-            && self.control.in_synchronous_with()
+            && (self.control.in_synchronous_with()
+                || !self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty())
             && self.control.in_loop_tail_without_nested_cleanup()
             && self.control.loops.contexts.last().is_some_and(|context| {
                 context.iterator_cleanup == IteratorCleanup::None
@@ -18571,7 +18577,12 @@ impl<'source> Compiler<'source> {
                         && body.last().is_some_and(|last| {
                             suite_has_linear_borrow_fallthrough(std::slice::from_ref(last))
                         })
-                        && suite_has_completed_manager_loop_work(body)
+                        && body.iter().all(|statement| {
+                            self.context.is_elided_statement(statement)
+                                || suite_has_completed_manager_loop_work(std::slice::from_ref(
+                                    statement,
+                                ))
+                        })
                 });
         let optimized_empty_else = eligible_else
             && (self.control.withs.active_with_region_exclusions.is_empty()
@@ -18610,6 +18621,7 @@ impl<'source> Compiler<'source> {
             && (self.control.exceptions.active_exception_region_exclusions.is_empty()
                 && self.control.finally.active_finally_try_bodies == 0
                 || protected_finally_loop_else
+                || protected_while_loop_else
                 || protected_loop_else)
             && self.control.exceptions.active_exception_group_handlers == 0
             && self.control.finally.active_normal_finally_bodies == 0

@@ -36,6 +36,16 @@ fn erased_else_preserves_populated_iterator_elif() {
 }
 
 #[test]
+fn erased_else_preserves_try_while_work() {
+    for prefix in ["", "                assert flag\n"] {
+        let source = format!(
+            "def f(flag):\n    try:\n        while True:\n            if first(flag):\n                emit(flag)\n            elif second(flag):\n{prefix}                result = transform(flag)\n                emit(result)\n            else:\n                assert False\n    except ValueError:\n        pass\n"
+        );
+        assert_matches_cpython(&source, "try_while_work.py", &LEVELS);
+    }
+}
+
+#[test]
 fn erased_else_preserves_protected_pass_backedge() {
     for definition in ["def", "async def"] {
         for loop_header in ["while True", "for value in flag"] {
