@@ -15101,16 +15101,25 @@ impl<'source> Compiler<'source> {
                         // original end block. Each inner arm may emit work or vanish
                         // independently; its false fallthrough still donates the line.
                         && nested_else_body.split_last().is_some_and(|(last, leading)| {
+                            let completed_comprehension = |statement: &Stmt| {
+                                matches!(statement, Stmt::Assign(assignment)
+                                    if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                                        && matches!(assignment.value.as_ref(), Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_))
+                                        && !expression_suspends_current_scope(&assignment.value))
+                            };
                             let populated_arm = |arm: &[Stmt]| {
                                 suite_has_linear_borrow_fallthrough(arm)
                                     || arm.split_last().is_some_and(|(tail, prefix)| {
                                         // The optimized and fallback call paths join before
                                         // this assignment and the arm's later linear tail.
                                         // Neither can enter the separate nested IfEnd.
-                                        suite_has_linear_borrow_fallthrough(std::slice::from_ref(tail))
+                                        // Comprehensions likewise finish before their store.
+                                        (suite_has_linear_borrow_fallthrough(std::slice::from_ref(tail))
+                                            || completed_comprehension(tail))
                                             && prefix.iter().all(|part| {
                                                 matches!(part, Stmt::Pass(_))
                                                     || suite_has_linear_borrow_fallthrough(std::slice::from_ref(part))
+                                                    || completed_comprehension(part)
                                                     || matches!(part, Stmt::Assign(assignment)
                                                         if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
                                                             && matches!(assignment.value.as_ref(), Expr::Call(call)

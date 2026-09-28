@@ -1159,6 +1159,42 @@ fn completed_generator_call_preserves_nested_branch_join() {
 }
 
 #[test]
+fn completed_comprehension_preserves_nested_branch_join() {
+    let source = "def collect(options, values):\n    result = options.values\n    if result is None:\n        if values is not None:\n            result = [item.value for item in values]\n        else:\n            result = make_values()\n    else:\n        assert result\n    output = []\n    for item in result:\n        output.append(item)\n    return output\n";
+    for source in [
+        source.to_owned(),
+        source.replace(
+            "[item.value for item in values]",
+            "[key for key, item in values.items() if item.enabled]",
+        ),
+        source.replace(
+            "[item.value for item in values]",
+            "{item.value for item in values}",
+        ),
+        source.replace(
+            "[item.value for item in values]",
+            "{item.key: item.value for item in values}",
+        ),
+        source.replace(
+            "[item.value for item in values]",
+            "[(item, other) for item in values if item for other in values if other]",
+        ),
+        source.replace(
+            "[item.value for item in values]",
+            "[tuple(item for other in values) for item in values]",
+        ),
+        source.replace(
+            "            result = [item.value for item in values]",
+            "            prepared = [item.value for item in values]\n            result = finish(prepared)",
+        ),
+        source.replace("        assert result", "        consume(result)"),
+        source[..source.find("    output = []").unwrap()].to_owned(),
+    ] {
+        assert_matches_cpython(&source, "completed_comprehension_join.py", &LEVELS);
+    }
+}
+
+#[test]
 fn conditional_prefixes_with_erased_else_preserve_nested_join() {
     for prefix in [
         "        if b:\n            value = obj.first\n        if c:\n            value = obj.second\n",
