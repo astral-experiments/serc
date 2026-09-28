@@ -23,6 +23,25 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn erased_assertion_preserves_legacy_loop_return_copies() {
+    let source = "def f(worker):\n    if not worker.ready:\n        value = worker.read()\n        while value not in [\"a\", \"b\"]:\n            value = worker.read()\n        assert value == \"a\"\n";
+    for (index, source) in [
+        source.to_owned(),
+        source.replace(
+            "    if not worker.ready:\n",
+            "    if worker.invalid:\n        raise ValueError(\"invalid\")\n    if not worker.ready:\n",
+        ),
+        source.replace("        assert value == \"a\"\n", "        pass\n"),
+        format!("{source}        worker.finish()\n"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(&source, &format!("legacy_loop_return_{index}.py"), &LEVELS);
+    }
+}
+
+#[test]
 fn erased_loop_branch_before_condition_keeps_protected_join() {
     for condition in ["first", "first and third", "first or third", "not first"] {
         for gap in ["", "                assert third\n"] {

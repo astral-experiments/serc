@@ -4466,7 +4466,7 @@ impl<'source> Compiler<'source> {
                                 || (plain_312_scope_exit
                                     && matches!(body.iter().rev().find(|statement| {
                                         !self.context.is_elided_statement(statement)
-                                    }), Some(Stmt::If(_))))
+                                    }), Some(Stmt::If(_) | Stmt::While(_))))
                                 || matches!(body.last(), Some(Stmt::Expr(expression))
                                     if matches!(expression.value.as_ref(), Expr::Await(_)))
                                 || suite_has_cold_only_terminal_if_continuation(body)
