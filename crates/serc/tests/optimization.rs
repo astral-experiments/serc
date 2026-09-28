@@ -11414,3 +11414,100 @@ fn erased_conditional_join_precedes_named_awaitable_finalizer() {
         );
     }
 }
+
+#[test]
+fn erased_else_preserves_nested_join_before_iterator_work() {
+    assert_matches_cpython(
+        r"def f(items, flag, mode, values):
+    for item in items:
+        if mode:
+            if flag:
+                result = 0
+                for value in values:
+                    result += consume(value)
+            else:
+                result = consume(item)
+        else:
+            assert False
+        consume(result)
+",
+        "nested_iterator",
+        &LEVELS,
+    );
+    assert_matches_cpython(
+        r"def f(items, retries, mode, flag, values):
+    for item in items:
+        for retry in retries:
+            if mode == 0:
+                if flag:
+                    result = 0
+                    for value in values:
+                        result += consume(value)
+                    log(result)
+                else:
+                    result = consume(item)
+            elif mode == 1:
+                if flag:
+                    assert False
+                else:
+                    result = 0
+                    for value in values:
+                        if skip(value):
+                            continue
+                        result += consume(value)
+                    log(result)
+            elif mode == 2:
+                if flag:
+                    result = 0
+                    for value in values:
+                        result += consume(value)
+                else:
+                    result = consume(item)
+            else:
+                assert False
+            consume(result)
+            if done(result):
+                break
+            log(result)
+        else:
+            log(item)
+        finish(item)
+    return result
+",
+        "elif_chain",
+        &LEVELS,
+    );
+    assert_matches_cpython(
+        r"def f(items, flag, mode, values):
+    for item in items:
+        if mode:
+            if flag:
+                result = consume(item)
+            else:
+                result = consume(item)
+        else:
+            assert False
+        consume(result)
+",
+        "flat_arms",
+        &LEVELS,
+    );
+    assert_matches_cpython(
+        r"def f(items, flag, mode, values):
+    for outer in items:
+        for item in items:
+            if mode:
+                if flag:
+                    result = 0
+                    for value in values:
+                        result += consume(value)
+                else:
+                    result = consume(item)
+            else:
+                assert False
+            consume(result)
+",
+        "outer_iterator",
+        &LEVELS,
+    );
+}

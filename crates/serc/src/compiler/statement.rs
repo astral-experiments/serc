@@ -15253,6 +15253,31 @@ impl<'source> Compiler<'source> {
                                 && context.with_depth == 0
                                 && context.exception_region_depth == 0
                         });
+                    // Live work keeps the join ahead of an ordinary loop's backedge.
+                    // No manager, exception, or finally-end boundary changes its owner.
+                    let ordinary_loop_forward_join = self.unit.flags
+                        & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                        == 0
+                        && self
+                            .control
+                            .statements
+                            .context
+                            .elided_join_has_live_successor
+                        && !self.control.loops.suite_fallthrough_to_loop_backedge
+                        && self.control.loops.contexts.last().is_some_and(|context| {
+                            matches!(
+                                context.iterator_cleanup,
+                                IteratorCleanup::None | IteratorCleanup::Sync
+                            ) && context.with_depth == self.control.withs.active_with_exits.len()
+                                && context.exception_region_depth
+                                    == self
+                                        .control
+                                        .exceptions
+                                        .active_exception_region_exclusions
+                                        .len()
+                                && context.finally_end_depth
+                                    == self.control.finally.active_finally_end_blocks
+                        });
                     // The same protected body owns the nested all-elided join.
                     // Its original end array receives the inner false edge's line.
                     // Enclosing managers do not change that innermost owner.
@@ -15320,7 +15345,9 @@ impl<'source> Compiler<'source> {
                             == 0
                             && !self.has_active_control_flow_region())
                             || coroutine_elided_nested_join)
-                        && (self.control.loops.contexts.is_empty() || async_iterator_forward_join)
+                        && (self.control.loops.contexts.is_empty()
+                            || async_iterator_forward_join
+                            || ordinary_loop_forward_join)
                         && !self.control.in_exception_handler()
                         && self.control.exceptions.active_exception_group_handlers == 0
                         && self.control.finally.active_finally_try_bodies == 0
