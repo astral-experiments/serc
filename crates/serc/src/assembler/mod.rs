@@ -15773,6 +15773,44 @@ impl Assembler {
         }
     }
 
+    /// Records protocol-await labels without treating the await as ordinary source work.
+    pub(crate) fn record_legacy_protocol_await_setup(
+        &mut self,
+        yielded: Label,
+        yielded_end: Label,
+        cleanup: Label,
+        send: Label,
+        exit: Label,
+    ) {
+        if self.python_version == crate::PythonVersion::Py312 {
+            let mut regions = self
+                .exception_regions
+                .iter()
+                .filter(|region| region.start == yielded && region.target == cleanup);
+            let Some(region) = regions.next() else {
+                return;
+            };
+            if regions.next().is_some()
+                || region.end != yielded_end
+                || region.is_scope_fallback
+                || region.preserve_lasti
+                || !matches!(region.priority, ExceptionRegionPriority::OriginalRange(start, end)
+                    if start == yielded && end == yielded_end)
+            {
+                return;
+            }
+            self.exception_owner_provenance
+                .legacy_protocol_await_setups
+                .push(exception_owners::LegacyProtocolAwaitSetup {
+                    yielded,
+                    yielded_end,
+                    cleanup,
+                    send,
+                    exit,
+                });
+        }
+    }
+
     /// Retains the authored handler identity of an ordinary try's original SETUP.
     pub(crate) fn record_ordinary_try_exception_setup(
         &mut self,

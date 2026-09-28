@@ -23,6 +23,16 @@ thread_local! {
     static VERIFY_COMPLETE_OWNER_REPLAY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Original labels for a Python 3.12 async-manager protocol await.
+#[derive(Debug)]
+pub(super) struct LegacyProtocolAwaitSetup {
+    pub(super) yielded: Label,
+    pub(super) yielded_end: Label,
+    pub(super) cleanup: Label,
+    pub(super) send: Label,
+    pub(super) exit: Label,
+}
+
 /// Original CFG facts that cannot be recovered from split exception ranges or optimized jumps.
 #[derive(Debug, Default)]
 pub(super) struct ExceptionOwnerProvenance {
@@ -35,6 +45,8 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) setups: Vec<(Label, Option<SourceLocation>)>,
     // Original 3.12 SETUP entries and targets, captured before region splitting.
     pub(super) legacy_native_setup_targets: Vec<(Label, Label)>,
+    // Protocol awaits do not participate in ordinary-await owner propagation.
+    pub(super) legacy_protocol_await_setups: Vec<LegacyProtocolAwaitSetup>,
     // Authored ordinary-try SETUP and its original handler, independently of split ranges.
     pub(super) ordinary_try_setups: FxHashMap<Label, Label>,
     // Authored name-clearing exception handlers, independent of overlapping outer regions.

@@ -9,11 +9,11 @@ use super::super::{
     block_jump_target,
 };
 use crate::target::opcodes::{
-    CALL, CALL_FUNCTION_EX, CALL_INTRINSIC_1, COMPARE_OP, CONTAINS_OP, COPY, COPY_FREE_VARS, IS_OP,
-    JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD, LOAD_CLOSURE, LOAD_CONST, LOAD_FAST,
-    LOAD_FAST_LOAD_FAST, LOAD_GLOBAL, MAKE_CELL, NOP, POP_TOP, PUSH_NULL, RERAISE, RESUME,
-    RETURN_CONST, RETURN_GENERATOR, RETURN_VALUE, SEND, STORE_FAST, STORE_FAST_LOAD_FAST,
-    STORE_FAST_STORE_FAST, TO_BOOL, UNARY_NOT, YIELD_VALUE,
+    CALL, CALL_FUNCTION_EX, CALL_INTRINSIC_1, CLEANUP_THROW, COMPARE_OP, CONTAINS_OP, COPY,
+    COPY_FREE_VARS, END_SEND, IS_OP, JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD,
+    LOAD_CLOSURE, LOAD_CONST, LOAD_FAST, LOAD_FAST_LOAD_FAST, LOAD_GLOBAL, MAKE_CELL, NOP, POP_TOP,
+    PUSH_NULL, RERAISE, RESUME, RETURN_CONST, RETURN_GENERATOR, RETURN_VALUE, SEND, STORE_FAST,
+    STORE_FAST_LOAD_FAST, STORE_FAST_STORE_FAST, TO_BOOL, UNARY_NOT, YIELD_VALUE,
 };
 use crate::target::{is_conditional_jump_for, is_unconditional_jump};
 use crate::{CompileError, PythonVersion};
@@ -1786,6 +1786,75 @@ impl OptimizationPipeline {
                                 && await_end.cleanup.first() == Some(&Item::Label(targets[&entry]))
                                 && send.operand() == Operand::Forward(await_end.entry)
                         })
+                {
+                    return None;
+                }
+                position
+            } else if let Some(origin) = self
+                .exception_owner_provenance
+                .legacy_protocol_await_setups
+                .iter()
+                .find(|origin| origin.yielded == entry)
+            {
+                // ADD_YIELD_FROM uses the same virtual SETUP for manager protocol
+                // awaits, but these must not acquire ordinary-await owner facts.
+                let previous = position.checked_sub(1)?;
+                let cleanup_group = label_group(origin.cleanup)?;
+                let exit_group = label_group(origin.exit)?;
+                let instructions = |index: usize| {
+                    groups[index]
+                        .iter()
+                        .flat_map(|block| self.graph[*block].items())
+                        .filter_map(|item| match item {
+                            Item::Instruction(instruction) => Some(instruction),
+                            Item::Label(_) => None,
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let body = instructions(position);
+                let mut regions = self
+                    .exception_regions
+                    .iter()
+                    .filter(|region| region.start == entry && region.target == origin.cleanup);
+                let region = regions.next()?;
+                if regions.next().is_some()
+                    || region.is_scope_fallback
+                    || region.preserve_lasti
+                    || region.end != origin.yielded_end
+                    || self.graph.label_block(region.end).and_then(|block| {
+                        self.graph[block]
+                            .items()
+                            .iter()
+                            .find_map(|item| match item {
+                                Item::Instruction(instruction) => Some(instruction),
+                                Item::Label(_) => None,
+                            })
+                    }) != body.get(1).copied()
+                    || self
+                        .exception_owner_provenance
+                        .legacy_protocol_await_setups
+                        .iter()
+                        .filter(|candidate| candidate.yielded == entry)
+                        .count()
+                        != 1
+                    || origin.cleanup != targets[&entry]
+                    || label_group(origin.send) != Some(previous)
+                    || cleanup_group != position + 1
+                    || exit_group != cleanup_group + 1
+                    || !instructions(previous).last().is_some_and(|send| {
+                        send.opcode == SEND && send.operand() == Operand::Forward(origin.exit)
+                    })
+                    || !matches!(body.as_slice(), [yielded, resume, back]
+                        if yielded.opcode == YIELD_VALUE
+                            && resume.opcode == RESUME
+                            && resume.operand() == Operand::Value(3)
+                            && back.opcode == JUMP_BACKWARD_NO_INTERRUPT
+                            && back.operand() == Operand::Backward(origin.send))
+                    || !matches!(instructions(cleanup_group).as_slice(), [cleanup]
+                        if cleanup.opcode == CLEANUP_THROW && cleanup.operand() == Operand::Value(0))
+                    || !instructions(exit_group).first().is_some_and(|end| {
+                        end.opcode == END_SEND && end.operand() == Operand::Value(0)
+                    })
                 {
                     return None;
                 }
@@ -4270,12 +4339,15 @@ mod protected_repeated_backedge_tests {
     }
 
     #[test]
-    fn ordinary_await_setup_requires_original_send_fallthrough() {
+    fn await_setup_requires_original_send_fallthrough() {
         use crate::assembler::exception_owners::OrdinaryAwaitEnd;
         use crate::target::opcodes::{CLEANUP_THROW, END_SEND};
         use crate::target::operands::ResumeLocation;
 
-        for case in 0..7 {
+        for (protocol, case) in (0..7)
+            .map(|case| (false, case))
+            .chain((0..12).map(|case| (true, case)))
+        {
             let [
                 send_label,
                 yielded,
@@ -4308,14 +4380,21 @@ mod protected_repeated_backedge_tests {
             };
             let send = forward(SEND, end);
             let end_send = normal(END_SEND, 0);
-            let cleanup_instruction = normal(CLEANUP_THROW, 0);
+            let cleanup_instruction = normal(if case == 9 { NOP } else { CLEANUP_THROW }, 0);
             let mut assembler = Assembler::from_linear_items(vec![
                 Item::Label(send_label),
                 Item::Instruction(send),
                 Item::Label(yielded),
                 Item::Instruction(normal(if case == 4 { NOP } else { YIELD_VALUE }, 1)),
                 Item::Label(yielded_end),
-                Item::Instruction(normal(RESUME, ResumeLocation::AFTER_AWAIT.argument())),
+                Item::Instruction(normal(
+                    RESUME,
+                    if case == 10 {
+                        2
+                    } else {
+                        ResumeLocation::AFTER_AWAIT.argument()
+                    },
+                )),
                 Item::Instruction(backward(JUMP_BACKWARD_NO_INTERRUPT, send_label)),
                 Item::Label(cleanup),
                 Item::Instruction(cleanup_instruction),
@@ -4340,25 +4419,49 @@ mod protected_repeated_backedge_tests {
             if case == 2 {
                 assembler.record_legacy_native_setup_target(yielded, cleanup);
             }
-            if case != 3 {
+            if protocol {
+                if case != 3 {
+                    assembler.record_legacy_protocol_await_setup(
+                        yielded,
+                        if case == 7 { end } else { yielded_end },
+                        if case == 6 { exit } else { cleanup },
+                        send_label,
+                        if case == 5 { exit } else { end },
+                    );
+                }
+                if case == 8 {
+                    assembler.exception_regions[0].preserve_lasti = true;
+                }
+                if case == 11 {
+                    assembler.record_legacy_protocol_await_setup(
+                        yielded,
+                        yielded_end,
+                        cleanup,
+                        send_label,
+                        end,
+                    );
+                }
+            } else {
+                if case != 3 {
+                    assembler
+                        .exception_owner_provenance
+                        .ordinary_await_cleanups
+                        .push(assembler.exception_regions[0]);
+                }
                 assembler
                     .exception_owner_provenance
-                    .ordinary_await_cleanups
-                    .push(assembler.exception_regions[0]);
+                    .ordinary_await_ends
+                    .push(OrdinaryAwaitEnd {
+                        send: if case == 5 { forward(SEND, exit) } else { send },
+                        entry: end,
+                        end_send,
+                        cleanup: vec![
+                            Item::Label(if case == 6 { exit } else { cleanup }),
+                            Item::Instruction(cleanup_instruction),
+                        ],
+                        bridge: None,
+                    });
             }
-            assembler
-                .exception_owner_provenance
-                .ordinary_await_ends
-                .push(OrdinaryAwaitEnd {
-                    send: if case == 5 { forward(SEND, exit) } else { send },
-                    entry: end,
-                    end_send,
-                    cleanup: vec![
-                        Item::Label(if case == 6 { exit } else { cleanup }),
-                        Item::Instruction(cleanup_instruction),
-                    ],
-                    bridge: None,
-                });
             let pipeline = assembler.into_optimization_pipeline();
             let arrays = pipeline.legacy_instruction_arrays();
             let found = pipeline.legacy_repeated_tails_with_setups(&arrays);
@@ -4369,7 +4472,7 @@ mod protected_repeated_backedge_tests {
                         && *native == 2
                 }));
             } else {
-                assert!(found.is_none(), "case {case}");
+                assert!(found.is_none(), "protocol {protocol}, case {case}");
             }
         }
     }

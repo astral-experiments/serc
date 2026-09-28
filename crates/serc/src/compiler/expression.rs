@@ -3253,8 +3253,7 @@ impl Compiler<'_> {
         self.assembler.mark(send);
         self.emit_jump_forward(SEND, end, 0)?;
         self.assembler.record_exception_setup(yielded, false);
-        if get_awaitable_argument == 0
-            && self.unit.flags & CO_COROUTINE != 0
+        if self.unit.flags & CO_COROUTINE != 0
             && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
         {
             self.assembler
@@ -3274,6 +3273,17 @@ impl Compiler<'_> {
             (base_depth + 2 + self.iterator_extra_slots()).cast_unsigned(),
             false,
         );
+        if matches!(get_awaitable_argument, 1 | 2)
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+        {
+            self.assembler.record_legacy_protocol_await_setup(
+                yielded,
+                yielded_end,
+                cleanup,
+                send,
+                end,
+            );
+        }
         self.assembler.set_location(cleanup_location);
         self.set_depth(base_depth + 3 + self.iterator_extra_slots());
         self.emit(CLEANUP_THROW, 0, -1)?;

@@ -1430,6 +1430,27 @@ fn coroutine_call_footer_preserves_original_location() {
 }
 
 #[test]
+fn async_manager_setups_preserve_repeated_loop_backedges() {
+    let prefix = "    async with manager:\n        value = await worker()\n";
+    let source = format!(
+        "async def f(manager, worker, items):\n{prefix}    for item in items:\n        assert item\n        if item.kind == 1:\n            assert value\n        if item.kind == 0:\n            assert value\n"
+    );
+    for source in [
+        source.clone(),
+        source.replace(prefix, "    async with manager:\n        async with manager:\n            value = await worker()\n"),
+        source.replace("    for item", "        for item")
+            .replace("        assert item", "            assert item")
+            .replace("        if item", "            if item")
+            .replace("            assert value", "                assert value"),
+        format!("{source}        worker()\n"),
+        format!("{source}    worker()\n"),
+        format!("async def f(manager, worker, first, second):\n{prefix}    if first:\n        assert second\n    if second:\n        worker()\n"),
+    ] {
+        assert_matches_cpython(&source, "async_manager_loop_backedge.py", &LEVELS);
+    }
+}
+
+#[test]
 fn coroutine_erased_else_preserves_shared_return_locations() {
     let source = "async def f(manager, worker, first, second, items):\n    with manager:\n        await worker()\n    values = {item: item for item in items}\n    item = values[0]\n    if first:\n        assert item\n    if second:\n        assert item\n        value = values[1]\n        assert value\n    else:\n        assert item\n";
     for source in [
