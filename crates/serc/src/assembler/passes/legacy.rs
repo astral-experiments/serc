@@ -1988,9 +1988,9 @@ impl OptimizationPipeline {
                         if self.original_scope_exit_labels.contains(label))
                 })
             });
-            // Earlier completed SETUPs do not own this footer. Reject any
-            // surviving explicit region that still covers it; the implicit
-            // wrapper's prologue and SETUP target were checked above.
+            // Completed SETUPs and the implicit wrapper leave a forward join or
+            // scope footer's repeated count unchanged. Reject surviving explicit
+            // owners; the wrapper's prologue and SETUP target were checked above.
             let has_only_scope_owner = || {
                 self.exception_regions.iter().all(|region| {
                     if region.is_scope_fallback {
@@ -2012,7 +2012,8 @@ impl OptimizationPipeline {
                 && (matches!(
                     instruction.opcode,
                     JUMP_BACKWARD | JUMP_BACKWARD_NO_INTERRUPT
-                ) || (wrapper.is_none() && instruction.opcode == JUMP_FORWARD)
+                ) || (instruction.opcode == JUMP_FORWARD
+                    && (wrapper.is_none() || has_only_scope_owner()))
                     || (instruction.opcode == RETURN_CONST
                         && original_scope_exit
                         && (wrapper.is_none() || has_only_scope_owner())))
@@ -4251,12 +4252,24 @@ mod protected_repeated_backedge_tests {
     }
 
     #[test]
-    fn coroutine_footer_requires_completed_explicit_regions() {
+    fn scope_wrapper_tails_require_completed_explicit_regions() {
         use crate::target::operands::{ResumeLocation, UnaryIntrinsic};
 
-        for case in 0..8 {
-            let [wrapper, body, handler, first, second, call, footer, stop] =
-                std::array::from_fn(|index| Label::from_u32(u32::try_from(index).unwrap()));
+        for (forward, case) in [false, true]
+            .into_iter()
+            .flat_map(|forward| (0..8).map(move |case| (forward, case)))
+        {
+            let [
+                wrapper,
+                body,
+                handler,
+                first,
+                second,
+                call,
+                footer,
+                continuation,
+                stop,
+            ] = std::array::from_fn(|index| Label::from_u32(u32::try_from(index).unwrap()));
             let normal = |opcode, argument| {
                 Instruction::new(
                     opcode,
@@ -4291,6 +4304,12 @@ mod protected_repeated_backedge_tests {
                 Item::Instruction(normal(CALL, 0)),
                 Item::Instruction(normal(POP_TOP, 0)),
                 Item::Label(footer),
+                Item::Instruction(if forward {
+                    jump(JUMP_FORWARD, continuation)
+                } else {
+                    normal(RETURN_CONST, 0)
+                }),
+                Item::Label(continuation),
                 Item::Instruction(normal(RETURN_CONST, 0)),
                 Item::Label(stop),
                 Item::Instruction(normal(
@@ -4300,7 +4319,7 @@ mod protected_repeated_backedge_tests {
                 Item::Instruction(normal(RERAISE, 1)),
             ]);
             assembler.python_version = PythonVersion::Py312;
-            assembler.next_label = 8;
+            assembler.next_label = 9;
             assembler.add_exception_region(body, handler, handler, 0, false);
             assembler.add_stopiteration_exception_region_with_depth(wrapper, stop, stop, 0);
             assembler.record_exception_setup(body, false);
@@ -4336,7 +4355,11 @@ mod protected_repeated_backedge_tests {
                     Some(*block) == pipeline.graph.label_block(footer) && native > ordinary
                 })
             });
-            assert_eq!(retained, case <= 1, "case {case}");
+            assert_eq!(
+                retained,
+                case <= 1 || (forward && case == 6),
+                "forward {forward}, case {case}"
+            );
         }
     }
 

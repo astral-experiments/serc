@@ -8359,6 +8359,31 @@ fn empty_try_before_finalizer_work_keeps_normal_exit_owner() {
 }
 
 #[test]
+fn erased_conditionals_preserve_repeated_join_predecessors_in_suspended_scopes() {
+    let source = "async def f(flag, items):\n    await prepare()\n    if other:\n        assert ready()\n    if flag:\n        assert ready()\n    else:\n        assert other()\n    value = consume(items)\n    for item in items:\n        assert item\n";
+    for (index, source) in [
+        source.to_owned(),
+        source.replace("    await prepare()\n", ""),
+        source
+            .replace("async def", "def")
+            .replace("    await prepare()\n", ""),
+        source
+            .replace("async def", "def")
+            .replace("    await prepare()", "    yield prepare()"),
+        source.replace("        assert other()", "        consume(items)"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            &source,
+            &format!("erased_condition_join_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn empty_try_before_manager_cleanup_keeps_its_exit_unowned() {
     let source = "def f(manager):\n    try:\n        prepare()\n        with manager as resource:\n            resource.first()\n            resource.second()\n            try:\n                assert resource.check()\n            except Error:\n                pass\n        after()\n    finally:\n        finish()\n";
     for (index, source) in [
