@@ -22511,6 +22511,19 @@ impl<'source> Compiler<'source> {
         } else {
             statement.orelse.as_slice()
         };
+        // Removed assertions leave the preceding conditional as the normal
+        // body's original join. Use the same tail for sharing, locations, and retention.
+        let normal_exit_join_suite = if self.context.python_version >= crate::PythonVersion::Py314
+            && statement.orelse.is_empty()
+        {
+            let end = normal_exit_suite
+                .iter()
+                .rposition(|statement| !self.context.is_elided_statement(statement))
+                .map_or(0, |index| index + 1);
+            &normal_exit_suite[..end]
+        } else {
+            normal_exit_suite
+        };
         let guarded_raise_finally_test = (!statement.is_star
             && statement.finalbody.is_empty()
             && matches!(self.unit.scope, Scope::Function { .. })
@@ -24364,7 +24377,7 @@ impl<'source> Compiler<'source> {
                             && (borrow_exit_has_source_successor
                                 || self.control.statements.context.inherited_has_following)))
                     && matches!(
-                        normal_exit_suite.last(),
+                        normal_exit_join_suite.last(),
                         Some(Stmt::If(branch))
                             if matches!(
                                 nested_if_exit_location(branch, true),
@@ -24477,7 +24490,7 @@ impl<'source> Compiler<'source> {
                         && matches!(nested.body.as_slice(), [Stmt::If(_)]))
                     && direct_try_body_exit_location(&statement.body).is_none();
             let direct_exit_location = (!unlocated_conditional_exit)
-                .then(|| direct_try_body_exit_location(normal_exit_suite))
+                .then(|| direct_try_body_exit_location(normal_exit_join_suite))
                 .flatten()
                 .or_else(|| {
                     // Earlier arms copy the following name return before line resolution.
@@ -25963,7 +25976,7 @@ impl<'source> Compiler<'source> {
             // only a located normal join retains its converted jump as a NOP.
             if statement.orelse.is_empty()
                 && !shared_conditional_exit
-                && suite_ends_in_retained_try_body_exit_join(&statement.body)
+                && suite_ends_in_retained_try_body_exit_join(normal_exit_join_suite)
             {
                 self.assembler
                     .preserve_redundant_jump_nop_after_threading(normal_exit);

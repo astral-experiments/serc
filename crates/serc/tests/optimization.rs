@@ -1761,6 +1761,23 @@ fn elided_terminal_or_preserves_shared_return_order() {
 }
 
 #[test]
+fn erased_assertions_preserve_try_body_joins_and_false_edge_locations() {
+    for function in ["def", "async def"] {
+        for alternate in [
+            "chosen = converted",
+            "if value:\n                return converted",
+            "if value:\n                raise Problem(value)",
+            "if value:\n                chosen = converted\n            else:\n                chosen = value",
+        ] {
+            let source = format!(
+                "{function} f(value):\n    try:\n        converted = convert(value)\n        if predicate(converted):\n            chosen = converted[0]\n        else:\n            {alternate}\n        assert chosen\n    except Exception as error:\n        raise Problem(value) from error\n    consume(chosen)\n"
+            );
+            assert_matches_cpython(&source, "erased_try_body_join.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn elided_try_guards_keep_python313_false_edge_return_locations() {
     for (index, source) in [
         "def f(a):\n    try:\n        if a:\n            return\n        assert False\n    except:\n        pass\n",
