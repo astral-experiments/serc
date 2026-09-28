@@ -15665,12 +15665,14 @@ impl<'source> Compiler<'source> {
             .map(|test| self.source_location(test.range()))
     }
 
-    /// Finds the sole false-edge donor for a 3.13 try exit after removed assertions.
-    fn legacy_elided_try_guard_return_location(
+    /// Finds the sole false-edge donor for a try exit after removed assertions.
+    fn elided_try_guard_return_location(
         &self,
         statement: &ruff_python_ast::StmtTry,
     ) -> Option<SourceLocation> {
-        if self.context.python_version != crate::PythonVersion::Py313
+        if !(self.context.python_version == crate::PythonVersion::Py313
+            || (self.context.python_version >= crate::PythonVersion::Py314
+                && self.unit.flags & CO_COROUTINE != 0))
             || !matches!(self.unit.scope, Scope::Function { .. })
             || self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) != 0
             || statement.is_star
@@ -24086,10 +24088,10 @@ impl<'source> Compiler<'source> {
                 self.assembler.set_location(
                     self.source_location(while_condition_exit_range(&loop_statement.test)),
                 );
-            } else if let Some(location) = self.legacy_elided_try_guard_return_location(statement) {
-                // 3.13 propagates the sole false edge's span into the unlocated
-                // normal exit before RETURN_CONST folding. The terminating arm
-                // cannot donate its physically preceding return or raise span.
+            } else if let Some(location) = self.elided_try_guard_return_location(statement) {
+                // The unlocated normal exit inherits the sole false edge's span.
+                // The terminating arm cannot donate its physically preceding
+                // return or raise span.
                 self.assembler.set_location(location);
             } else if let Some(location) = self.assembler.last_instruction_location() {
                 self.assembler.set_location(location);

@@ -1689,6 +1689,31 @@ fn elided_try_guards_keep_python313_false_edge_return_locations() {
 }
 
 #[test]
+fn elided_coroutine_try_guards_preserve_false_edge_return_locations() {
+    const SOURCE: &str = "async def f(a, b, obj):\n    try:\n        if a is not None:\n            return await obj.first(a)\n        elif b is not None:\n            value = await obj.second(b)\n            obj.check(value)\n            return obj.wrap(value)\n        assert a or b\n    except Error as exc:\n        raise ValueError from exc\n    except Exception as exc:\n        obj.log(exc)\n        raise ValueError from exc\n";
+    for (index, source) in [
+        SOURCE.to_owned(),
+        SOURCE.replace("await ", ""),
+        SOURCE.replace("return obj.wrap(value)", "raise ValueError(value)"),
+        SOURCE
+            .replace("return await obj.first(a)", "raise ValueError(a)")
+            .replace("return obj.wrap(value)", "raise TypeError(value)"),
+        SOURCE.replace("    try:\n", "    try:\n        if obj.ready:\n            obj.prepare()\n"),
+        SOURCE.replace("        assert a or b\n", "        assert a or b\n        assert obj\n"),
+        "async def f(a, obj):\n    try:\n        if a is not None:\n            return await obj.first(a)\n        assert a\n    except Error:\n        raise\n".to_owned(),
+        SOURCE.replace("        assert a or b\n", ""),
+        SOURCE.replace("        assert a or b\n", "        assert a or b\n        obj.finish()\n"),
+        SOURCE.replace("        assert a or b\n", "        else:\n            return None\n        assert a or b\n"),
+        SOURCE.replace("async def", "def").replace("await ", ""),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(&source, &format!("elided_coroutine_try_guard_{index}.py"), &LEVELS);
+    }
+}
+
+#[test]
 fn elided_protected_elif_preserves_loop_condition_owner() {
     for (function, manager) in [
         ("def", "with"),
