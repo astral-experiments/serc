@@ -34324,13 +34324,22 @@ impl<'source> Compiler<'source> {
                                             && definition.decorator_list.is_empty()
                                             && definition.parameters.iter_non_variadic_params()
                                                 .all(|parameter| parameter.default.is_none())))
-                                // Completed iterators cannot enter the later try or its
-                                // cleanup. The live prefix tail required below repopulates
-                                // the original array after their exhaustion joins.
+                                // Completed cleanups and iterators cannot enter the later
+                                // try or its cleanup. The live prefix tail required below
+                                // repopulates the original array after their joins.
                                 || (self.context.python_version >= crate::PythonVersion::Py314
                                     && matches!(self.unit.scope, Scope::Function { .. })
                                     && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                                     && match prefix {
+                                        Stmt::Try(completed) => {
+                                            !completed.is_star
+                                                && completed.handlers.is_empty()
+                                                && completed.orelse.is_empty()
+                                                && suite_has_linear_borrow_fallthrough(&completed.body)
+                                                && suite_has_nonsuspending_conditional_work(&completed.body)
+                                                && suite_has_linear_borrow_fallthrough(&completed.finalbody)
+                                                && suite_has_nonsuspending_conditional_work(&completed.finalbody)
+                                        }
                                         Stmt::For(loop_statement) => {
                                             !loop_statement.is_async
                                                 && loop_statement.orelse.is_empty()

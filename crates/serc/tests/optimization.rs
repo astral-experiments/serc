@@ -267,6 +267,16 @@ fn erased_assertions_preserve_manager_while_exit() {
 }
 
 #[test]
+fn completed_finalizer_prefix_preserves_manager_exit() {
+    for suffix in ["assert done(second)", "pass", "check(second)"] {
+        let source = format!(
+            "def f(first, second):\n    with first, second:\n        value = acquire(first)\n        try:\n            other = acquire(second)\n        finally:\n            release(first)\n        assert value\n        assert other\n        value = acquire(second)\n        try:\n            assert value\n        finally:\n            release(second)\n        {suffix}\n"
+        );
+        assert_matches_cpython(&source, "completed_finalizer_prefix.py", &LEVELS);
+    }
+}
+
+#[test]
 fn completed_iterator_prefix_preserves_finalizer_manager_exit() {
     for prefix in [
         "        for item in items:\n            begin(item)\n        value = []\n",
