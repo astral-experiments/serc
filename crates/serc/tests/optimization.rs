@@ -59,6 +59,7 @@ fn folded_true_value_selector_preserves_empty_borrow_entry() {
     for source in [
         "def probe(marker, low, high, bound, choice, flag, left, right, obj, make):\n    if marker is not None:\n        if low >= bound:\n            scratch = left\n        else:\n            scratch = right\n        if low != high:\n            scratch = right\n        value = obj.payload if __debug__ else right\n        if flag:\n            result = None\n        else:\n            result = make()\n    else:\n        assert marker\n    return marker\n",
         "def probe(marker, low, high, bound, choice, flag, left, right, obj, make):\n    if marker is not None:\n        if low >= bound:\n            scratch = left\n        else:\n            scratch = right\n        if low != high:\n            scratch = right\n        value = obj.payload if True else right\n        if flag:\n            result = None\n        else:\n            result = make()\n    else:\n        assert marker\n    return marker\n",
+        "def probe(marker, low, high, bound, choice, flag, left, right, obj, make):\n    if marker is not None:\n        if low >= bound:\n            scratch = left\n        else:\n            scratch = right\n        if low != high:\n            scratch = right\n        value = obj.child.payload if __debug__ else right\n        if flag:\n            result = None\n        else:\n            result = make()\n    else:\n        assert marker\n    return marker\n",
     ] {
         assert_matches_cpython(source, "folded_true_value_selector.py", &LEVELS);
     }

@@ -7599,7 +7599,10 @@ impl Compiler<'_> {
                 && self.control.finally.is_inactive_for_return_unwind()
                 && matches!(expression.body.as_ref(), Expr::Attribute(attribute)
                     if matches!(attribute.value.as_ref(), Expr::Name(name)
-                        if name.id.as_str() != "__debug__"))
+                        if name.id.as_str() != "__debug__")
+                        || matches!(attribute.value.as_ref(), Expr::Attribute(receiver)
+                            if matches!(receiver.value.as_ref(), Expr::Name(name)
+                                if name.id.as_str() != "__debug__")))
                 && matches!(expression.orelse.as_ref(), Expr::Name(name)
                     if name.id.as_str() != "__debug__")
                 && self.source_location(expression.test.range()).line
