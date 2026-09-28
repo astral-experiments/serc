@@ -15,6 +15,7 @@ use crate::target::opcodes::{
     PUSH_NULL, RERAISE, RESUME, RETURN_CONST, RETURN_GENERATOR, RETURN_VALUE, SEND, STORE_FAST,
     STORE_FAST_LOAD_FAST, STORE_FAST_STORE_FAST, TO_BOOL, UNARY_NOT, YIELD_VALUE,
 };
+use crate::target::operands::ResumeLocation;
 use crate::target::{is_conditional_jump_for, is_unconditional_jump};
 use crate::{CompileError, PythonVersion};
 
@@ -1847,7 +1848,7 @@ impl OptimizationPipeline {
                     || !matches!(body.as_slice(), [yielded, resume, back]
                         if yielded.opcode == YIELD_VALUE
                             && resume.opcode == RESUME
-                            && resume.operand() == Operand::Value(3)
+                            && resume.operand() == Operand::Value(ResumeLocation::AFTER_AWAIT.argument())
                             && back.opcode == JUMP_BACKWARD_NO_INTERRUPT
                             && back.operand() == Operand::Backward(origin.send))
                     || !matches!(instructions(cleanup_group).as_slice(), [cleanup]
@@ -4390,7 +4391,7 @@ mod protected_repeated_backedge_tests {
                 Item::Instruction(normal(
                     RESUME,
                     if case == 10 {
-                        2
+                        ResumeLocation::AFTER_YIELD_FROM.argument()
                     } else {
                         ResumeLocation::AFTER_AWAIT.argument()
                     },
