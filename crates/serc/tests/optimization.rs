@@ -9238,6 +9238,41 @@ fn comprehension_branches_preserve_sibling_return_donors() {
 }
 
 #[test]
+fn short_circuit_prefix_preserves_nested_return_donors() {
+    let source = r"def validate(kind):
+    if kind == 1:
+        enabled = ready() and first() in (1, 2)
+        assert enabled
+        active = ready()
+        if active:
+            left = first()
+            right = second()
+            assert left
+            assert right
+        else:
+            assert enabled
+            left = first() if ready() else 1
+        assert left
+    else:
+        raise ValueError(kind)
+";
+    for source in [
+        source.to_owned(),
+        source.replace(
+            "ready() and first() in (1, 2)",
+            "ready() or first() in (1, 2)",
+        ),
+        source.replace(
+            "ready() and first() in (1, 2)",
+            "(ready() or other()) and first() in (1, 2)",
+        ),
+        source.replace("ready() and first() in (1, 2)", "ready()"),
+    ] {
+        assert_matches_cpython(&source, "short_circuit_prefix_return.py", &LEVELS);
+    }
+}
+
+#[test]
 fn suspended_comprehension_siblings_preserve_return_locations() {
     let source = r"async def collect(flag, items):
     if flag:

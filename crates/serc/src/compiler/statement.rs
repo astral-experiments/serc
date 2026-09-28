@@ -5364,7 +5364,14 @@ impl<'source> Compiler<'source> {
                 .iter()
                 .all(|part| self.context.is_elided_statement(part));
         if !body[..end].iter().all(|part| {
-            self.context.is_elided_statement(part) || linear(std::slice::from_ref(part))
+            self.context.is_elided_statement(part)
+                || linear(std::slice::from_ref(part))
+                // The result store joins all short-circuit paths before the final if.
+                || matches!(part, Stmt::Assign(assignment)
+                    if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                        && matches!(assignment.value.as_ref(), Expr::BoolOp(_))
+                        && condition_has_linear_runtime_leaves(&assignment.value)
+                        && !expression_suspends_current_scope(&assignment.value))
         }) || !runtime_test(&statement.test)
             || !live_arm(&statement.body)
             || otherwise.test.is_some()
