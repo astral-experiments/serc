@@ -55,6 +55,27 @@ fn erased_match_cases_preserve_loop_backedges() {
 }
 
 #[test]
+fn elided_async_loop_branches_keep_augmented_assignment_join() {
+    for (index, (function, loop_kind, successor)) in [
+        ("async def", "async for", "count += 1"),
+        ("async def", "async for", "count = count + 1"),
+        ("def", "for", "count += 1"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let source = format!(
+            "{function} count_events(items):\n    count = 0\n    {loop_kind} item in items:\n        if count == 0:\n            assert item\n        elif count == 1:\n            assert item\n        else:\n            assert item\n        {successor}\n    assert count == 3\n"
+        );
+        assert_matches_cpython(
+            &source,
+            &format!("elided_async_loop_join_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn chained_condition_loop_exit_preserves_iterator_location() {
     for source in [
         "def f(a, b, items):\n    assert a\n    if check(a):\n        assert b\n    if a < b < items:\n        assert a\n        for item in items:\n            assert item\n",

@@ -3201,6 +3201,8 @@ impl<'source> Compiler<'source> {
                         || matches!(elided_join_successor,
                             Some(Stmt::Assign(assignment)) if matches!(assignment.targets.as_slice(), [Expr::Name(_)]))
                         || matches!(elided_join_successor,
+                            Some(Stmt::AugAssign(assignment)) if matches!(assignment.target.as_ref(), Expr::Name(_)))
+                        || matches!(elided_join_successor,
                             Some(Stmt::Delete(deletion)) if matches!(deletion.targets.as_slice(), [Expr::Name(_)])),
                     elided_join_has_conditional_successor: matches!(elided_join_successor,
                         Some(Stmt::If(branch)) if condition_has_linear_runtime_leaves(&branch.test)
