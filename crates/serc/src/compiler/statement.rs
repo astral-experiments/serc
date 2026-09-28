@@ -4416,7 +4416,7 @@ impl<'source> Compiler<'source> {
             return self.emit_deferred_implicit_return();
         }
         if self.context.python_version == crate::PythonVersion::Py312
-            && matches!(self.unit.scope, Scope::Function { .. })
+            && matches!(self.unit.scope, Scope::Module | Scope::Function { .. })
             && statement.elif_else_clauses.is_empty()
             && let Some(last) = statement
                 .body

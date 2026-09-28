@@ -1255,6 +1255,22 @@ fn completed_branch_work_preserves_original_call_footer() {
 }
 
 #[test]
+fn module_terminal_calls_preserve_shared_return_locations() {
+    let source = "if __name__ == \"__main__\":\n    if not wants_help():\n        assert ready()\n    launch(\n        value=config,\n    )\n";
+    for source in [
+        source.to_owned(),
+        source.replace("launch(", "worker.launch("),
+        source.replace("assert ready()", "pass"),
+        format!("{source}consume(config)\n"),
+        format!(
+            "\"description\"\nfrom __future__ import annotations\nimport library\ndef prepare(value: int) -> None:\n    consume(value)\n\n{source}"
+        ),
+    ] {
+        assert_matches_cpython(&source, "module_call_footer.py", &LEVELS);
+    }
+}
+
+#[test]
 fn coroutine_call_footer_preserves_original_location() {
     for prefix in [
         "",
