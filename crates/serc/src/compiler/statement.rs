@@ -37229,9 +37229,27 @@ fn with_body_conditional_exit_location(
         return unique_condition_jump_target(&statement.test, fallthrough_truthiness)
             .map(Ranged::range);
     }
-    match fallthrough.last()? {
+    // Removed assertions add no instruction between this arm's last operation
+    // and the manager's POP_BLOCK, so they cannot replace its location donor.
+    let fallthrough_tail = if compiler.context.python_version >= crate::PythonVersion::Py314 {
+        fallthrough
+            .iter()
+            .rfind(|statement| !compiler.context.is_elided_statement(statement))
+    } else {
+        fallthrough.last()
+    };
+    match fallthrough_tail? {
         statement @ (Stmt::Expr(_) | Stmt::Assign(_) | Stmt::Pass(_)) => {
             Some(implicit_return_range(compiler, statement))
+        }
+        Stmt::AnnAssign(assignment)
+            if compiler.context.python_version >= crate::PythonVersion::Py314
+                && matches!(compiler.unit.scope, Scope::Function { .. })
+                && assignment.value.is_some()
+                && matches!(assignment.target.as_ref(), Expr::Name(_)) =>
+        {
+            // Function-local annotations emit no runtime work after the store.
+            Some(assignment.target.range())
         }
         Stmt::Delete(deletion) => deletion
             .targets

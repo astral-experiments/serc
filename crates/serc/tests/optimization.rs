@@ -348,6 +348,18 @@ fn erased_assertions_preserve_manager_while_exit() {
 }
 
 #[test]
+fn elided_assertion_preserves_conditional_manager_store_location() {
+    for assignment in ["value: object = await work()", "value = await work()"] {
+        for suffix in ["assert valid(value)", "pass", "check(value)"] {
+            let source = format!(
+                "async def f(manager, flag):\n    with manager:\n        if flag:\n            {assignment}\n            return\n        else:\n            {assignment}\n            {suffix}\n    after()\n"
+            );
+            assert_matches_cpython(&source, "conditional_manager_store.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn comprehension_assignment_prefix_preserves_finalizer_manager_exit() {
     for suffix in ["assert valid(values)", "pass", "check(values)"] {
         let source = format!(
