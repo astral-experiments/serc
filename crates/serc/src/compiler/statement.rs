@@ -37192,7 +37192,13 @@ fn with_body_has_terminal_manager_suppression(body: &[Stmt]) -> bool {
 // When a final structured statement leaves one normal predecessor, location propagation makes
 // that NOP observable before the manager's normal exit.
 fn with_body_ends_in_retained_pop_block(body: &[Stmt], direct_body: bool) -> bool {
-    match body.last() {
+    // Removed assertions emit nothing between the compound statement's exit and
+    // the manager's POP_BLOCK. Keep that original predecessor visible.
+    let last = body
+        .iter()
+        .rev()
+        .find(|statement| !matches!(statement, Stmt::Global(global) if global.names.is_empty()));
+    match last {
         Some(Stmt::For(statement)) => {
             suite_terminates(&statement.orelse)
                 && suite_contains_loop_break(&statement.body)

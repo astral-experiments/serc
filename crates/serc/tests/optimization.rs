@@ -23,6 +23,26 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn erased_suffix_preserves_with_pop_block() {
+    let source = "def check(manager):\n    with manager:\n        try:\n            action()\n        except OSError as error:\n            assert error\n        else:\n            raise AssertionError()\n        assert manager\n        assert manager\n";
+    for (index, source) in [
+        source.to_owned(),
+        source.replace("        assert manager\n", ""),
+        source.replace("        assert manager\n        assert manager\n", "        finish()\n"),
+        source.replace("            assert error\n", "            pass\n"),
+        source.replace("except OSError as error:", "except OSError:").replace("            assert error\n", "            assert manager\n"),
+        "def check(manager, items):\n    with manager:\n        for item in items:\n            if item:\n                break\n        else:\n            raise ValueError()\n        assert items\n".to_owned(),
+        "def check(manager, ready):\n    with manager:\n        while ready():\n            if stop():\n                break\n        else:\n            raise ValueError()\n        assert ready\n".to_owned(),
+        "def check(first, second):\n    with first:\n        with second:\n            raise ValueError()\n        assert first\n".to_owned(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(&source, &format!("erased_with_tail_{index}.py"), &LEVELS);
+    }
+}
+
+#[test]
 fn erased_assertions_preserve_manager_while_exit() {
     let source = "def f(manager, worker):\n    with manager:\n        while len(worker.items) != 1:\n            worker.advance()\n        assert len(worker.items) == 1\n";
     let repeated = source.replace(
