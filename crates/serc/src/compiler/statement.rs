@@ -14952,14 +14952,36 @@ impl<'source> Compiler<'source> {
                         && matches!(statement.elif_else_clauses.last(), Some(clause)
                             if clause.test.is_none()
                                 && is_elided_suite(&clause.body));
-                    // A coroutine's single manager keeps this nested all-elided
-                    // join inside the same protected body. Its original end array
-                    // still receives the inner false edge's line after exit copying.
-                    let single_manager_elided_nested_join = self.unit.flags
+                    // Async-for closes its __anext__ handler before entering the body.
+                    // A live successor keeps this join ahead of the iterator backedge.
+                    let async_iterator_forward_join = self.unit.flags
                         & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                         == CO_COROUTINE
-                        && self.control.withs.active_with_exits.len() == 1
-                        && self.control.withs.active_with_region_exclusions.len() == 1
+                        && self.control.withs.active_with_exits.is_empty()
+                        && self.control.withs.active_with_region_exclusions.is_empty()
+                        && self
+                            .control
+                            .exceptions
+                            .active_exception_region_exclusions
+                            .is_empty()
+                        && self
+                            .control
+                            .statements
+                            .context
+                            .elided_join_has_live_successor
+                        && self.control.loops.contexts.last().is_some_and(|context| {
+                            context.iterator_cleanup == IteratorCleanup::Async
+                                && context.with_depth == 0
+                                && context.exception_region_depth == 0
+                        });
+                    // The same protected body owns the nested all-elided join.
+                    // Its original end array receives the inner false edge's line.
+                    let coroutine_elided_nested_join = self.unit.flags
+                        & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                        == CO_COROUTINE
+                        && ((self.control.withs.active_with_exits.len() == 1
+                            && self.control.withs.active_with_region_exclusions.len() == 1)
+                            || async_iterator_forward_join)
                         && self
                             .control
                             .exceptions
@@ -15007,8 +15029,8 @@ impl<'source> Compiler<'source> {
                         && ((self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                             == 0
                             && !self.has_active_control_flow_region())
-                            || single_manager_elided_nested_join)
-                        && self.control.loops.contexts.is_empty()
+                            || coroutine_elided_nested_join)
+                        && (self.control.loops.contexts.is_empty() || async_iterator_forward_join)
                         && !self.control.in_exception_handler()
                         && self.control.exceptions.active_exception_group_handlers == 0
                         && self.control.finally.active_finally_try_bodies == 0

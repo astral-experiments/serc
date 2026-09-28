@@ -23,6 +23,18 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn erased_nested_branches_preserve_async_iterator_join() {
+    let source = "async def f(values, flag):\n    items = []\n    async for value in values:\n        if not items:\n            if flag:\n                assert value\n            else:\n                assert value\n        else:\n            assert value\n        items.append(value)\n";
+    for suffix in ["", "    result = tuple(items)\n    assert result\n"] {
+        assert_matches_cpython(
+            &format!("{source}{suffix}"),
+            "async_iterator_elided_join.py",
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn erased_coroutine_comparison_arms_preserve_shared_cleanup() {
     for prefix in ["", "    await worker()\n"] {
         let source = format!(
