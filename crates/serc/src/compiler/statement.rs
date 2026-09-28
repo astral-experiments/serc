@@ -730,6 +730,8 @@ pub(super) struct StatementContext {
     elided_join_has_large_tuple_return: bool,
     // Whether an elided join reaches another runtime conditional after erased asserts.
     elided_join_has_conditional_successor: bool,
+    // A synchronous iterator evaluates its header before entering a new loop.
+    elided_join_has_iterator_successor: bool,
     // Whether the next statement is a direct if with a name test.
     followed_by_direct_name_if: bool,
     // Whether that successor is a direct loop break.
@@ -3390,6 +3392,11 @@ impl<'source> Compiler<'source> {
                             && self.control.statements.context.same_region_continuation
                                 == Some(statement.range())
                             && self.control.statements.context.elided_join_has_conditional_successor),
+                    elided_join_has_iterator_successor: matches!(elided_join_successor,
+                        Some(Stmt::For(iterator)) if !iterator.is_async
+                            && [&iterator.iter, &iterator.target].into_iter().all(|expression|
+                                !expression_contains_inline_branch(expression)
+                                    && !expression_suspends_current_scope(expression))),
                     followed_by_direct_name_if: matches!(body.get(index + 1),
                         Some(Stmt::If(branch)) if matches!(branch.test.as_ref(), Expr::Name(name) if name.id.as_str() != "__debug__")
                             && branch.elif_else_clauses.is_empty()),
@@ -15113,10 +15120,11 @@ impl<'source> Compiler<'source> {
                                                         .len()
                                         },
                                     ))
-                                // A following runtime test stays ahead of the coroutine's
-                                // synchronous backedge. Managers entered before the loop
-                                // keep that forward join under the same cleanup owner.
-                                || (self.control.statements.context.elided_join_has_conditional_successor
+                                // A following runtime test or iterator header stays ahead
+                                // of the coroutine's synchronous backedge. Managers entered
+                                // before the loop keep the join under the same cleanup owner.
+                                || ((self.control.statements.context.elided_join_has_conditional_successor
+                                    || self.control.statements.context.elided_join_has_iterator_successor)
                                     && self.unit.flags
                                         & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                                         == CO_COROUTINE

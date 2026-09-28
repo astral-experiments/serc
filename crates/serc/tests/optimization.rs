@@ -12400,6 +12400,29 @@ fn managed_coroutine_erased_shared_arm_preserves_copied_loop_exits() {
 }
 
 #[test]
+fn coroutine_erased_join_before_nested_iterator() {
+    let source = r"async def f(items, later):
+    with manager():
+        await prepare()
+        for item in items:
+            if item.ready:
+                assert item.valid
+            else:
+                assert item.other
+            for entry in later:
+                consume(entry)
+";
+    for source in [
+        source.to_owned(),
+        source.replace("in later:", "in source.items:"),
+        source.replace("in later:", "in entries():"),
+        source.replace("with manager():", "with manager(), manager():"),
+    ] {
+        assert_matches_cpython(&source, "coroutine_iterator_successor.py", &LEVELS);
+    }
+}
+
+#[test]
 fn protected_iterator_tail_accepts_completed_conditional_work() {
     let source = r"async def f(items, outer, manager, config, key, legacy):
     async with outer:
