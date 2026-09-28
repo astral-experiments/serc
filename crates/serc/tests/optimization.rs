@@ -23,6 +23,58 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn populated_elif_chains_preserve_conditional_loop_join() {
+    let source = r#"def collect(groups, first, second):
+    for group in groups:
+        for batch in group:
+            for item in batch:
+                if item.kind == 1:
+                    if first:
+                        value = f"first_{item.part}"
+                    else:
+                        value = "first"
+                elif item.kind == 2:
+                    assert first
+                    if second:
+                        value = f"second_{item.part}"
+                    elif first:
+                        value = f"second_{item.other}"
+                    else:
+                        value = "second"
+                else:
+                    assert False
+                if item.ready:
+                    emit(value)
+"#;
+    for source in [
+        source.to_owned(),
+        source.replace("                    assert first\n", ""),
+        source.replace(
+            "                if item.ready:\n                    emit(value)",
+            "                emit(value)",
+        ),
+        source.replace(
+            "                    elif first:\n                        value = f\"second_{item.other}\"\n",
+            "",
+        ),
+        source.replace(
+            "                    else:\n                        value = \"second\"",
+            "                    elif item.valid:\n                        value = \"third\"\n                    else:\n                        value = \"second\"",
+        ),
+        source.replace(
+            "                        value = f\"second_{item.other}\"",
+            "                        assert first",
+        ),
+        source.replace(
+            "                        value = f\"second_{item.other}\"",
+            "                        value = [part for part in item.parts]",
+        ),
+    ] {
+        assert_matches_cpython(&source, "populated_chain_loop_join.py", &LEVELS);
+    }
+}
+
+#[test]
 fn erased_elif_chains_preserve_live_loop_join() {
     let source = r"def collect(items, kinds, enabled):
     for value in items:

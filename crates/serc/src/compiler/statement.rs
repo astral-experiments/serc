@@ -15286,11 +15286,16 @@ impl<'source> Compiler<'source> {
                     let ordinary_loop_forward_join = self.unit.flags
                         & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                         == 0
-                        && self
+                        && (self
                             .control
                             .statements
                             .context
                             .elided_join_has_live_successor
+                            || self
+                                .control
+                                .statements
+                                .context
+                                .elided_join_has_conditional_successor)
                         && !self.control.loops.suite_fallthrough_to_loop_backedge
                         && self.control.loops.contexts.last().is_some_and(|context| {
                             matches!(
@@ -15576,14 +15581,18 @@ impl<'source> Compiler<'source> {
                                             || suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement)),
                                     }
                                 });
-                            // Ruff flattens elif clauses. Each erased clause still has
-                            // a distinct original IfEnd, whose final false edge donates
-                            // the location when the enclosing exit becomes a NOP.
-                            let erased_elif_chain = matches!(last, Stmt::If(nested)
+                            // Ruff flattens elif clauses. Each clause still has a distinct
+                            // original IfEnd; linear work completes before entering it.
+                            // The final false edge donates the enclosing exit's NOP line.
+                            let linear_elif_chain = matches!(last, Stmt::If(nested)
                                 if nested.elif_else_clauses.len() > 1
-                                    && is_elided_suite(&nested.body)
                                     && nested.elif_else_clauses.last().is_some_and(|clause| clause.test.is_none())
-                                    && nested.elif_else_clauses.iter().all(|clause| is_elided_suite(&clause.body))
+                                    && std::iter::once(nested.body.as_slice())
+                                        .chain(nested.elif_else_clauses.iter().map(|clause| clause.body.as_slice()))
+                                        .all(|arm| is_elided_suite(arm)
+                                            || (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                                                && populated_arm(arm)
+                                                && !suite_contains_yield(arm)))
                                     && std::iter::once(nested.test.as_ref())
                                         .chain(nested.elif_else_clauses.iter().filter_map(|clause| clause.test.as_ref()))
                                         .all(|test| condition_has_linear_runtime_leaves(test)
@@ -15591,6 +15600,7 @@ impl<'source> Compiler<'source> {
                                             && original_condition_has_unique_jump_target(test, true)
                                             && original_condition_has_unique_jump_target(test, false)));
                             (leading.is_empty()
+                                || is_elided_suite(leading)
                                 || coroutine_elided_nested_join
                                 || populated_arm(leading)
                                 || ordinary_elided_linear_prefix
@@ -15602,7 +15612,7 @@ impl<'source> Compiler<'source> {
                                     if condition_has_completed_call_leaves(&nested.test, self.context.python_version)
                                 && !expression_suspends_current_scope(&nested.test)
                                 && !suite_contains_yield(&nested.body)
-                                && (erased_elif_chain || matches!(nested.elif_else_clauses.as_slice(), [clause]
+                                && (linear_elif_chain || matches!(nested.elif_else_clauses.as_slice(), [clause]
                                     if clause.test.is_none()
                                         // Shared condition targets enter the populated arms,
                                         // not the empty end block receiving the outer exit.
