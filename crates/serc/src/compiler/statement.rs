@@ -25670,6 +25670,13 @@ impl<'source> Compiler<'source> {
                                             })
                                         })
                                             && (suite_has_linear_borrow_fallthrough(&nested.body)
+                                                || (nested.body.iter().any(|part| {
+                                                    suite_has_linear_borrow_fallthrough(std::slice::from_ref(part))
+                                                }) && nested.body.iter().all(|part| {
+                                                    self.context.is_elided_statement(part)
+                                                        || matches!(part, Stmt::Pass(_))
+                                                        || suite_has_linear_borrow_fallthrough(std::slice::from_ref(part))
+                                                }))
                                                 || matches!(nested.body.as_slice(), [Stmt::Assert(assertion), rest @ ..]
                                                     if assertion.msg.is_none()
                                                         && assertion_has_only_runtime_tests(&assertion.test)
@@ -25694,6 +25701,7 @@ impl<'source> Compiler<'source> {
                 // outer POP_BLOCK; it cannot populate that unlocated false-edge array.
                 // An assertion followed by linear work still completes before that
                 // join; its raising arm cannot populate the pass-only recovery's exit.
+                // Erased assertions add no records to that linear path or its join.
                 // Keep the separate pass-only rule for retained conditional return exits.
                 // A terminal guarded break also leaves an empty loop/try join. Its
                 // false edges do not independently enter the loop's live continuation:

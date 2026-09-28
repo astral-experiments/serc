@@ -595,6 +595,22 @@ fn elided_handler_assertion_preserves_while_break_cleanup() {
 }
 
 #[test]
+fn erased_assertions_preserve_nested_recovery_borrow_boundary() {
+    for definition in ["def", "async def"] {
+        for body in [
+            "                assert obj.state is None\n                obj.state = {}\n",
+            "                obj.state = {}\n                assert obj.state is None\n",
+            "                obj.state = {}\n",
+        ] {
+            let source = format!(
+                "{definition} f(obj, flag):\n    try:\n        if flag and ready(obj):\n            assert obj.ready\n            try:\n{body}            except Exception:\n                pass\n    except Exception:\n        return None\n    use(obj)\n    use(obj)\n"
+            );
+            assert_matches_cpython(&source, "nested_recovery_borrow.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn erased_nested_else_preserves_try_exit_borrow_boundary() {
     let source = "def validate(values, enabled):\n    item = values[0]\n    try:\n        if enabled:\n            if valid(item):\n                consume(item)\n            else:\n                assert item\n    except Exception:\n        return False\n    if 'payload' in item:\n        assert item.payload\n    return True\n";
     let preceding_branch = source.replace(
