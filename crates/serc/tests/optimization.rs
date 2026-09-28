@@ -631,6 +631,33 @@ fn erased_condition_before_nested_raise_preserves_scope_exit() {
 }
 
 #[test]
+fn completed_generator_call_preserves_nested_branch_join() {
+    for source in [
+        "def f(value, obj, items):\n    if value is None:\n        if obj.flag:\n            values = tuple(item.value for item in items)\n            value = obj.make(values)\n        else:\n            obj.check()\n            value = obj.build()\n    else:\n        assert value == obj.other\n    value = obj.finish(value)\n    return obj.wrap(value)\n",
+        "def f(value, obj, items):\n    if value is None:\n        if obj.flag:\n            values = all(item.value for item in items)\n            value = obj.make(values)\n        else:\n            obj.check()\n            value = obj.build()\n    else:\n        assert value == obj.other\n    value = obj.finish(value)\n    return obj.wrap(value)\n",
+        "def f(value, obj, items):\n    if value is None:\n        if obj.flag:\n            values = any(item.value for item in items)\n            value = obj.make(values)\n        else:\n            obj.check()\n            value = obj.build()\n    else:\n        assert value == obj.other\n    value = obj.finish(value)\n    return obj.wrap(value)\n",
+        "def f(value, obj, items):\n    if value is None:\n        if obj.flag:\n            value = obj.make()\n        else:\n            values = tuple(item.value for item in items)\n            value = obj.make(values)\n    else:\n        assert value == obj.other\n    value = obj.finish(value)\n    return obj.wrap(value)\n",
+        "def f(value, obj, items):\n    if value is None:\n        if obj.flag:\n            values = tuple(item.value for item in items)\n            value = obj.make(values)\n        else:\n            values = tuple(item.value for item in items)\n            value = obj.make(values)\n    else:\n        assert value == obj.other\n    value = obj.finish(value)\n    return obj.wrap(value)\n",
+        "def f(value, obj, items):\n    if value is None:\n        if obj.flag:\n            value = obj.make()\n        else:\n            obj.check()\n            value = obj.build()\n    else:\n        assert value == obj.other\n    value = obj.finish(value)\n    return obj.wrap(value)\n",
+        "def f(value, obj, items):\n    if value is None:\n        if obj.flag:\n            values = tuple(item.value for item in items)\n            value = obj.make(values)\n        else:\n            obj.check()\n            value = obj.build()\n    else:\n        obj.check(value)\n    value = obj.finish(value)\n    return obj.wrap(value)\n",
+        "def f(value, obj, items):\n    if value is None:\n        if obj.flag:\n            values = tuple(item.value for item in items)\n            value = obj.make(values)\n        else:\n            obj.check()\n            value = obj.build()\n        obj.after()\n    else:\n        assert value == obj.other\n    value = obj.finish(value)\n    return obj.wrap(value)\n",
+    ] {
+        assert_matches_cpython(source, "completed_generator_call_join.py", &LEVELS);
+    }
+    for source in [
+        "def f(value, obj, items):\n    if value is None:\n        if obj.flag:\n            values = list(item.value for item in items)\n            value = obj.make(values)\n        else:\n            obj.check()\n            value = obj.build()\n    else:\n        assert value == obj.other\n    value = obj.finish(value)\n    return obj.wrap(value)\n",
+        "def f(value, obj, items):\n    if value is None:\n        if obj.flag:\n            values = set(item.value for item in items)\n            value = obj.make(values)\n        else:\n            obj.check()\n            value = obj.build()\n    else:\n        assert value == obj.other\n    value = obj.finish(value)\n    return obj.wrap(value)\n",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "completed_collection_call_join.py",
+            &LEVELS,
+            &[PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn conditional_prefixes_with_erased_else_preserve_nested_join() {
     for prefix in [
         "        if b:\n            value = obj.first\n        if c:\n            value = obj.second\n",

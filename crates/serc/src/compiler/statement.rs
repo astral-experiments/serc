@@ -14936,6 +14936,24 @@ impl<'source> Compiler<'source> {
                         // original end block. Each inner arm may emit work or vanish
                         // independently; its false fallthrough still donates the line.
                         && nested_else_body.split_last().is_some_and(|(last, leading)| {
+                            let populated_arm = |arm: &[Stmt]| {
+                                suite_has_linear_borrow_fallthrough(arm)
+                                    || arm.split_last().is_some_and(|(tail, prefix)| {
+                                        // The optimized and fallback call paths join before
+                                        // this assignment and the arm's later linear tail.
+                                        // Neither can enter the separate nested IfEnd.
+                                        suite_has_linear_borrow_fallthrough(std::slice::from_ref(tail))
+                                            && prefix.iter().all(|part| {
+                                                matches!(part, Stmt::Pass(_))
+                                                    || suite_has_linear_borrow_fallthrough(std::slice::from_ref(part))
+                                                    || matches!(part, Stmt::Assign(assignment)
+                                                        if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                                                            && matches!(assignment.value.as_ref(), Expr::Call(call)
+                                                                if optimized_generator_callable_for_target(call, self.context.python_version).is_some())
+                                                            && !expression_suspends_current_scope(&assignment.value))
+                                            })
+                                    })
+                            };
                             let linear_prefix_arm = |arm: &[Stmt]| {
                                 let mut has_runtime_work = false;
                                 for statement in arm {
@@ -15072,11 +15090,11 @@ impl<'source> Compiler<'source> {
                                             && original_condition_has_unique_jump_target(&nested.test, false))
                                             || (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                                                 && !self.has_active_control_flow_region()
-                                                && suite_has_linear_borrow_fallthrough(&nested.body)
-                                                && suite_has_linear_borrow_fallthrough(&clause.body)))
-                                        && (suite_has_linear_borrow_fallthrough(&nested.body)
+                                                && populated_arm(&nested.body)
+                                                && populated_arm(&clause.body)))
+                                        && (populated_arm(&nested.body)
                                             || is_elided_suite(&nested.body))
-                                        && (suite_has_linear_borrow_fallthrough(&clause.body)
+                                        && (populated_arm(&clause.body)
                                             || is_elided_suite(&clause.body))
                                         && !suite_contains_yield(&clause.body)))
                         });
