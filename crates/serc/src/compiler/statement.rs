@@ -4039,11 +4039,11 @@ impl<'source> Compiler<'source> {
         let linear_prefix = match prefix {
             [] => true,
             [Stmt::Assign(assignment)] => {
-                matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                matches!(assignment.targets.as_slice(), [target] if identity_operand(target))
                     && matches!(assignment.value.as_ref(), Expr::UnaryOp(unary)
                         if unary.op == UnaryOp::Not
                             && matches!(unary.operand.as_ref(), Expr::Attribute(attribute)
-                                if matches!(attribute.value.as_ref(), Expr::Name(_))))
+                                if identity_operand(&attribute.value)))
             }
             _ => false,
         };

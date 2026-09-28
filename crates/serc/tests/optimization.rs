@@ -493,6 +493,16 @@ fn attribute_identity_tests_preserve_legacy_scope_exit() {
         );
         assert_matches_cpython(&source, "attribute_identity_scope_exit.py", &LEVELS);
     }
+    for assignment in [
+        "obj.value = not obj.flag",
+        "value = not obj.part.flag",
+        "obj.value = not obj.part.flag",
+    ] {
+        let source = format!(
+            "def f(obj, left, right):\n    if obj.stop:\n        return\n{erased_prefix}    if obj.left is None and obj.right is not None:\n        {assignment}\n        if obj.check:\n            assert obj.valid\n        else:\n            assert obj.check\n"
+        );
+        assert_matches_cpython(&source, "attribute_assignment_scope_exit.py", &LEVELS);
+    }
 }
 
 #[test]
