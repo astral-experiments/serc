@@ -35,6 +35,27 @@ fn async_iterator_preserves_erased_branch_backedges() {
 }
 
 #[test]
+fn async_iterator_chained_condition_preserves_erased_else_backedge() {
+    for iterator in ["for", "async for"] {
+        for condition in [
+            "previous == item.value == None",
+            "previous is item.value is None",
+            "0 < item.value < 3",
+            "previous == item.value == None and ready(item)",
+            "previous == item.value == None or ready(item)",
+            "not (previous == item.value == None)",
+            "previous == await read(item) == None",
+            "previous == (item.value if ready(item) else fallback()) == None",
+        ] {
+            let source = format!(
+                "async def collect(manager, items):\n    async with manager:\n        with subscribe():\n            previous = None\n            {iterator} item in items:\n                if valid(item) and item.kind == 'entry':\n                    if {condition}:\n                        assert item.value is not None\n                        previous = item.value\n                    else:\n                        assert item.value == previous\n            assert previous is not None\n"
+            );
+            assert_matches_cpython(&source, "iterator_chained_erased_else.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn async_iterator_erased_suffix_preserves_inner_manager_exit() {
     for outer in ["async with manager:", "try:"] {
         let handler = if outer == "try:" {

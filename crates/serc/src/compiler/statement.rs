@@ -18312,6 +18312,7 @@ impl<'source> Compiler<'source> {
             });
         // With no intervening cleanup, the removed else reaches the iterator
         // directly. Native normalizes that backward condition into fresh slots.
+        // A comparison chain keeps its own operand cleanup before the same exit.
         let protected_iterator_loop_else = eligible_else
             && statement.elif_else_clauses.len() == 1
             && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
@@ -18323,8 +18324,7 @@ impl<'source> Compiler<'source> {
                 .contexts
                 .last()
                 .is_some_and(|context| context.iterator_cleanup != IteratorCleanup::None)
-            && condition_has_linear_runtime_leaves(&statement.test)
-            && !expression_suspends_current_scope(&statement.test)
+            && condition_has_runtime_iterator_leaves(&statement.test)
             && (suite_has_linear_borrow_fallthrough(&statement.body)
                 || (!statement.body.is_empty()
                     && statement.body.iter().all(|statement| {
@@ -18402,9 +18402,10 @@ impl<'source> Compiler<'source> {
             && self.control.finally.active_copied_finally_bodies == 0
             && self.control.finally.active_finally_end_blocks == 0
             && self.control.finally.active_overriding_finally_returns == 0
-            // A suspended scope's final chained condition can own a cleanup
-            // backedge inside its implicit exception wrapper.
+            // Outside a direct iterator exit, a suspended scope's final chained
+            // condition can own a backedge inside its implicit exception wrapper.
             && (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                || protected_iterator_loop_else
                 || (!expression_contains_chained_comparison(&statement.test)
                     && statement.elif_else_clauses.iter().all(|clause| {
                         clause.test.as_ref().is_none_or(|test| {
@@ -41390,6 +41391,29 @@ fn condition_has_linear_runtime_leaves(expression: &Expr) -> bool {
         _ => {
             condition_has_only_runtime_tests(expression)
                 && !expression_contains_inline_branch(expression)
+        }
+    }
+}
+
+/// Certify iterator-tail conditions with linear tests or complete comparison chains.
+fn condition_has_runtime_iterator_leaves(expression: &Expr) -> bool {
+    if crate::stack_growth_required() {
+        return crate::grow_stack(|| condition_has_runtime_iterator_leaves(expression));
+    }
+    match expression {
+        Expr::BoolOp(boolean) => boolean
+            .values
+            .iter()
+            .all(condition_has_runtime_iterator_leaves),
+        Expr::UnaryOp(unary) if unary.op == UnaryOp::Not => {
+            condition_has_runtime_iterator_leaves(&unary.operand)
+        }
+        Expr::Compare(comparison) if comparison.ops.len() > 1 => {
+            condition_has_only_runtime_tests(expression)
+        }
+        _ => {
+            condition_has_linear_runtime_leaves(expression)
+                && !expression_suspends_current_scope(expression)
         }
     }
 }
