@@ -15231,6 +15231,7 @@ impl<'source> Compiler<'source> {
                                         Stmt::If(prefix) => condition_has_linear_runtime_leaves(&prefix.test)
                                             && !expression_suspends_current_scope(&prefix.test)
                                             && (linear_prefix_arm(&prefix.body)
+                                                || is_elided_suite(&prefix.body)
                                                 || returning_prefix_arm(&prefix.body))
                                             && !suite_contains_yield(&prefix.body)
                                             && (prefix.elif_else_clauses.is_empty()
@@ -15244,6 +15245,7 @@ impl<'source> Compiler<'source> {
                                                         && !suite_contains_yield(&clause.body))),
                                         _ => (matches!(statement, Stmt::Global(global) if global.names.is_empty())
                                             && self.context.is_elided_statement(statement))
+                                            || completed_comprehension(statement)
                                             || suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement)),
                                     }
                                 });

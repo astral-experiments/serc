@@ -1120,6 +1120,37 @@ fn conditional_prefix_preserves_erased_nested_join() {
 }
 
 #[test]
+fn comprehension_and_erased_prefixes_preserve_nested_join() {
+    let source = "def collect(kind, items, score, count):\n    if kind == 'selected':\n        assert items\n        values = [item.strip().lower() for item in items]\n        assert values\n        if score < 0:\n            assert values\n        else:\n            assert not values\n        if count > 0:\n            assert values\n        else:\n            assert not values\n        if 'key' in values:\n            assert score\n        else:\n            assert count\n    else:\n        assert not items\n    return {'kind': kind, 'items': items, 'score': score, 'count': count}\n";
+    for source in [
+        source.to_owned(),
+        source.replace(
+            "[item.strip().lower() for item in items]",
+            "{item.strip().lower() for item in items}",
+        ),
+        source.replace(
+            "[item.strip().lower() for item in items]",
+            "{item: item.strip().lower() for item in items}",
+        ),
+        source.replace(
+            "[item.strip().lower() for item in items]",
+            "[tuple(item for other in items) for item in items]",
+        ),
+        source.replace("[item.strip().lower() for item in items]", "items"),
+        source.replace(
+            "{'kind': kind, 'items': items, 'score': score, 'count': count}",
+            "{'items': items}",
+        ),
+        source.replace(
+            "    else:\n        assert not items",
+            "    else:\n        consume(items)",
+        ),
+    ] {
+        assert_matches_cpython(&source, "comprehension_erased_prefixes.py", &LEVELS);
+    }
+}
+
+#[test]
 fn erased_prefix_preserves_constructed_raise_return_copies() {
     const SOURCE: &str = "def f(obj):\n    if obj.count is not None:\n        assert obj.ready\n    if check(obj.child):\n        if obj.count is not None:\n            raise ValueError(\"count\")\n        values = obj.child.values\n        if any(value % obj.scale for value in values):\n            raise ValueError(\"scale\")\n        if any(value < obj.lower for value in values):\n            raise ValueError(\"lower\")\n        if obj.upper is not None and any(value > obj.upper for value in values):\n            raise ValueError(\"upper\")\n";
     let prefix = "    if obj.count is not None:\n        assert obj.ready\n";
