@@ -8211,6 +8211,36 @@ fn empty_try_before_finalizer_work_keeps_normal_exit_owner() {
 }
 
 #[test]
+fn empty_try_before_manager_cleanup_keeps_its_exit_unowned() {
+    let source = "def f(manager):\n    try:\n        prepare()\n        with manager as resource:\n            resource.first()\n            resource.second()\n            try:\n                assert resource.check()\n            except Error:\n                pass\n        after()\n    finally:\n        finish()\n";
+    for (index, source) in [
+        source.to_owned(),
+        source.replace(
+            "                assert resource.check()",
+            "                pass",
+        ),
+        source.replace(
+            "                assert resource.check()",
+            "                resource.check()",
+        ),
+        source.replace("        after()\n", ""),
+        source.replace(
+            "                pass\n",
+            "                pass\n            resource.third()\n",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            &source,
+            &format!("empty_try_manager_cleanup_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn optimized_empty_try_loop_keeps_enclosing_exception_owner() {
     const TRACE_BACKEDGE: &str = r"
 import dis, json, marshal, sys

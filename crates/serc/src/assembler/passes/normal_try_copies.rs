@@ -1,3 +1,5 @@
+use std::cmp::Reverse;
+
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::super::block_graph::{BasicBlockId, ItemPosition};
@@ -9,6 +11,56 @@ use super::super::{
 };
 use super::normal_try_copy_plan::{OriginalNode, OriginalTail, PrefixSlot, plan_normal_try_copies};
 use crate::target::opcodes::{JUMP_BACKWARD, JUMP_FORWARD, NOP, POP_EXCEPT};
+
+/// Checks that clearing a jump's exclusion cannot select a different existing owner.
+fn restored_empty_try_owner_is_unshadowed(
+    owners: &[ExceptionRegion],
+    regions: &[ExceptionRegion],
+    offsets: &FxHashMap<Label, usize>,
+    position: usize,
+) -> bool {
+    let priority = |region: &ExceptionRegion| match region.priority {
+        ExceptionRegionPriority::Resolved { start, end } if start < end => {
+            Some((region.is_scope_fallback, Reverse(start), end))
+        }
+        _ => None,
+    };
+    let mut winner = None;
+    for owner in owners {
+        let Some(key) = priority(owner) else {
+            return false;
+        };
+        if winner.as_ref().is_none_or(|(best, _)| key < *best) {
+            winner = Some((key, owner));
+        }
+    }
+    let Some((owner_priority, owner)) = winner else {
+        return false;
+    };
+    for region in regions {
+        let Some((&start, &end)) = offsets.get(&region.start).zip(offsets.get(&region.end)) else {
+            return false;
+        };
+        if start > end {
+            return false;
+        }
+        if start <= position && position < end {
+            let Some(key) = priority(region) else {
+                return false;
+            };
+            // Existing regions precede restored owners, so they win priority ties.
+            if key < owner_priority
+                || (key == owner_priority
+                    && (region.target != owner.target
+                        || region.depth != owner.depth
+                        || region.preserve_lasti != owner.preserve_lasti))
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
 
 /// Recognizes two intact, located slots of an explicit local return.
 pub(super) fn original_local_return(items: &[Item]) -> bool {
@@ -1742,8 +1794,15 @@ impl OptimizationPipeline {
                     })
                 });
             // Removed assertions can leave the normal jump unlocated until its
-            // intact SETUP donates a line. That does not erase the jump's owner.
+            // intact SETUP donates a line. Clearing its exclusion must not activate
+            // an inner region that shadows the recorded original owner.
             let empty_setup_donor = self.python_version >= crate::PythonVersion::Py314
+                && restored_empty_try_owner_is_unshadowed(
+                    owners,
+                    &self.exception_regions,
+                    &offsets,
+                    start_offset,
+                )
                 && start_offset.checked_sub(1).is_some_and(|previous| {
                     let setup = instructions[previous];
                     setup.opcode == NOP
@@ -4570,6 +4629,120 @@ mod tests {
     }
 
     #[test]
+    fn empty_setup_owner_restoration_preserves_original_priority() {
+        let [start, end, handler, other, middle, missing] = [0, 1, 2, 3, 4, 5].map(Label::from_u32);
+        let offsets = FxHashMap::from_iter([(start, 0), (middle, 1), (end, 2)]);
+        let owner = ExceptionRegion {
+            priority: ExceptionRegionPriority::Resolved { start: 10, end: 20 },
+            ..region(start, end, handler, false)
+        };
+        let enclosing = ExceptionRegion {
+            priority: ExceptionRegionPriority::Resolved { start: 5, end: 25 },
+            ..owner
+        };
+        let inner = ExceptionRegion {
+            priority: ExceptionRegionPriority::Resolved { start: 11, end: 19 },
+            ..owner
+        };
+        let different = ExceptionRegion {
+            target: other,
+            ..owner
+        };
+        for (name, live, expected) in [
+            ("same owner", owner, true),
+            (
+                "same owner fragment",
+                ExceptionRegion {
+                    start: middle,
+                    ..owner
+                },
+                true,
+            ),
+            ("enclosing owner", enclosing, true),
+            (
+                "fallback owner",
+                ExceptionRegion {
+                    is_scope_fallback: true,
+                    ..inner
+                },
+                true,
+            ),
+            ("inner owner at same depth", inner, false),
+            (
+                "inner owner ends at jump",
+                ExceptionRegion {
+                    end: middle,
+                    ..inner
+                },
+                true,
+            ),
+            ("equal priority other target", different, false),
+            (
+                "equal priority other depth",
+                ExceptionRegion {
+                    depth: owner.depth + 1,
+                    ..owner
+                },
+                false,
+            ),
+            (
+                "equal priority other lasti",
+                ExceptionRegion {
+                    preserve_lasti: !owner.preserve_lasti,
+                    ..owner
+                },
+                false,
+            ),
+            (
+                "unknown physical end",
+                ExceptionRegion {
+                    end: missing,
+                    ..owner
+                },
+                false,
+            ),
+            (
+                "reversed physical range",
+                ExceptionRegion {
+                    start: end,
+                    end: start,
+                    ..owner
+                },
+                false,
+            ),
+            (
+                "unresolved priority",
+                region(start, end, handler, false),
+                false,
+            ),
+        ] {
+            assert_eq!(
+                restored_empty_try_owner_is_unshadowed(&[owner], &[live], &offsets, 1),
+                expected,
+                "{name}",
+            );
+        }
+        assert!(restored_empty_try_owner_is_unshadowed(
+            &[owner, different],
+            &[owner],
+            &offsets,
+            1,
+        ));
+        assert!(!restored_empty_try_owner_is_unshadowed(
+            &[different, owner],
+            &[owner],
+            &offsets,
+            1,
+        ));
+        assert!(!restored_empty_try_owner_is_unshadowed(
+            &[region(start, end, handler, false)],
+            &[],
+            &offsets,
+            1,
+        ));
+    }
+
+    #[test]
     fn empty_setup_owner_restoration_requires_known_matching_depths() {
         for (setup_depth, jump_depth) in [
             (Some(2), Some(2)),
@@ -4616,9 +4789,11 @@ mod tests {
             let provenance = &mut pipeline.exception_owner_provenance;
             provenance.ordinary_try_setups.insert(start, handler);
             provenance.setups.push((start, Some(location)));
+            let mut owner = region(start, end, handler, false);
+            owner.priority = ExceptionRegionPriority::Resolved { start: 0, end: 10 };
             provenance
                 .normal_try_jump_owners
-                .insert((start, end), vec![region(start, end, handler, false)]);
+                .insert((start, end), vec![owner]);
             let original = pipeline.graph.copy_items();
             pipeline.restore_empty_try_jump_owners();
             let block = pipeline.graph.label_block(start).unwrap();
