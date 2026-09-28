@@ -15160,6 +15160,27 @@ impl<'source> Compiler<'source> {
                                         && matches!(assignment.value.as_ref(), Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_))
                                         && !expression_suspends_current_scope(&assignment.value))
                             };
+                            // Continues return to this loop's header. Only normal
+                            // exhaustion reaches the enclosing conditional's join.
+                            let completed_for = |statement: &Stmt| {
+                                matches!(statement, Stmt::For(iterator)
+                                    if !iterator.is_async
+                                        && iterator.orelse.is_empty()
+                                        && [&iterator.iter, &iterator.target].into_iter().all(|expression| {
+                                            !expression_contains_inline_branch(expression)
+                                                && !expression_suspends_current_scope(expression)
+                                        })
+                                        && iterator.body.iter().all(|part| {
+                                            let single = std::slice::from_ref(part);
+                                            (suite_has_linear_borrow_fallthrough(single)
+                                                && suite_has_nonsuspending_conditional_work(single))
+                                                || matches!(part, Stmt::If(guard)
+                                                    if guard.elif_else_clauses.is_empty()
+                                                        && condition_has_linear_runtime_leaves(&guard.test)
+                                                        && !expression_suspends_current_scope(&guard.test)
+                                                        && matches!(guard.body.as_slice(), [Stmt::Continue(_)]))
+                                        }))
+                            };
                             let populated_arm = |arm: &[Stmt]| {
                                 suite_has_linear_borrow_fallthrough(arm)
                                     || arm.split_last().is_some_and(|(tail, prefix)| {
@@ -15168,7 +15189,8 @@ impl<'source> Compiler<'source> {
                                         // Neither can enter the separate nested IfEnd.
                                         // Comprehensions likewise finish before their store.
                                         (suite_has_linear_borrow_fallthrough(std::slice::from_ref(tail))
-                                            || completed_comprehension(tail))
+                                            || completed_comprehension(tail)
+                                            || completed_for(tail))
                                             && prefix.iter().all(|part| {
                                                 matches!(part, Stmt::Pass(_))
                                                     || suite_has_linear_borrow_fallthrough(std::slice::from_ref(part))
@@ -15304,16 +15326,14 @@ impl<'source> Compiler<'source> {
                                 });
                             (leading.is_empty()
                                 || coroutine_elided_nested_join
-                                || suite_has_linear_borrow_fallthrough(leading)
+                                || populated_arm(leading)
                                 || ordinary_elided_linear_prefix
                                 || ordinary_assigned_conditional_prefix
                                 || ordinary_conditional_prefix)
                                 && matches!(last, Stmt::If(nested)
                                     // Specialized generator-call paths merge before
                                     // the condition branches into either populated arm.
-                                    if (condition_has_linear_runtime_leaves(&nested.test)
-                                        || matches!(nested.test.as_ref(), Expr::Call(call)
-                                            if optimized_generator_callable_for_target(call, self.context.python_version).is_some()))
+                                    if condition_has_completed_call_leaves(&nested.test, self.context.python_version)
                                 && !expression_suspends_current_scope(&nested.test)
                                 && !suite_contains_yield(&nested.body)
                                 && matches!(nested.elif_else_clauses.as_slice(), [clause]
@@ -41649,6 +41669,26 @@ fn condition_has_linear_runtime_leaves(expression: &Expr) -> bool {
             condition_has_only_runtime_tests(expression)
                 && !expression_contains_inline_branch(expression)
         }
+    }
+}
+
+/// Certifies tests whose specialized and fallback call paths merge before branching.
+fn condition_has_completed_call_leaves(expression: &Expr, version: crate::PythonVersion) -> bool {
+    if crate::stack_growth_required() {
+        return crate::grow_stack(|| condition_has_completed_call_leaves(expression, version));
+    }
+    match expression {
+        Expr::BoolOp(boolean) => boolean
+            .values
+            .iter()
+            .all(|value| condition_has_completed_call_leaves(value, version)),
+        Expr::UnaryOp(unary) if unary.op == UnaryOp::Not => {
+            condition_has_completed_call_leaves(&unary.operand, version)
+        }
+        Expr::Call(call) if optimized_generator_callable_for_target(call, version).is_some() => {
+            true
+        }
+        _ => condition_has_linear_runtime_leaves(expression),
     }
 }
 

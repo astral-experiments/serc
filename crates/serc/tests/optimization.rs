@@ -1324,6 +1324,45 @@ fn completed_comprehension_preserves_nested_branch_join() {
 }
 
 #[test]
+fn completed_loop_preserves_nested_branch_join() {
+    let source = r#"def render(outputs, allowed):
+    if outputs is None:
+        prefix = "empty"
+    elif isinstance(outputs, tuple):
+        prefix = f"{outputs!r}"
+    elif isinstance(outputs, dict):
+        values = [value for value in outputs.values() if ready(value)]
+        if values and all(value in allowed for value in values):
+            prefix = f"{outputs!r}"
+        else:
+            token = make()
+            prefix = f"{show(token)} = call"
+            for name, value in outputs.items():
+                if not ready(value):
+                    continue
+                register(value, f"{show(token)}[{show(name)}]")
+    else:
+        assert False
+    consume(prefix, outputs, allowed)
+    return prefix
+"#;
+    for source in [
+        source.to_owned(),
+        source.replace("values and all", "values or all"),
+        source.replace(
+            "if values and all(value in allowed for value in values):",
+            "if not (values and all(value in allowed for value in values)):",
+        ),
+        source.replace(
+            "                if not ready(value):\n                    continue\n",
+            "",
+        ),
+    ] {
+        assert_matches_cpython(&source, "completed_loop_join.py", &LEVELS);
+    }
+}
+
+#[test]
 fn conditional_prefixes_with_erased_else_preserve_nested_join() {
     for prefix in [
         "        if b:\n            value = obj.first\n        if c:\n            value = obj.second\n",
