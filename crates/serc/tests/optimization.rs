@@ -59,6 +59,28 @@ fn erased_loop_branch_before_condition_keeps_protected_join() {
 }
 
 #[test]
+fn erased_try_else_preserves_manager_borrow_boundary() {
+    let source = "async def run():\n    try:\n        async with manager() as resource:\n            await resource.first()\n    except RuntimeError as error:\n        assert error\n    else:\n        assert False\n    async with manager() as resource:\n        await resource.second()\n";
+    for (index, source) in [
+        source.to_owned(),
+        source.replace("    else:\n        assert False\n", ""),
+        source.replace("        assert False\n", "        pass\n"),
+        source.replace("        assert False\n", "        finish()\n"),
+        source.replace("        async with manager()", "        with manager()"),
+        source.replace(
+            "        assert False\n",
+            "        assert False\n    finally:\n        finish()\n",
+        ),
+        "async def run():\n    async with manager() as resource:\n        pass\n    try:\n        await resource.first()\n    except ValueError:\n        pass\n    else:\n        assert False\n    configure()\n    async with manager() as resource:\n        await resource.second()\n".to_owned(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(&source, &format!("erased_manager_try_else_{index}.py"), &LEVELS);
+    }
+}
+
+#[test]
 fn erased_suffix_preserves_with_pop_block() {
     let source = "def check(manager):\n    with manager:\n        try:\n            action()\n        except OSError as error:\n            assert error\n        else:\n            raise AssertionError()\n        assert manager\n        assert manager\n";
     for (index, source) in [

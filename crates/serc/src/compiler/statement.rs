@@ -22889,9 +22889,12 @@ impl<'source> Compiler<'source> {
             && nested_try_has_populated_for_break_entry(statement);
         // CPython can leave an empty physical block after a final with or nested try. Borrowed-
         // load traversal stops there, so a following suite cannot reach this try join through
-        // that normal-exit edge.
+        // that normal-exit edge. An erased else emits no record to populate that block.
         if (borrow_exit_has_successor
-            && statement.orelse.is_empty()
+            && statement
+                .orelse
+                .iter()
+                .all(|statement| self.context.is_elided_statement(statement))
             && matches!(statement.body.last(), Some(Stmt::With(_))))
             || (borrow_exit_has_successor
                 && matches!(normal_exit_suite.last(), Some(Stmt::Try(_)))
