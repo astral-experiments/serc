@@ -25063,18 +25063,31 @@ impl<'source> Compiler<'source> {
                 && condition_has_only_runtime_tests(&branch.test)
                 && !expression_suspends_current_scope(&branch.test)
                 && original_condition_has_unique_jump_target(&branch.test, false)
-                && suite_has_linear_borrow_fallthrough(&branch.body)
-                && let [clause] = branch.elif_else_clauses.as_slice()
+                && suite_has_populated_try_exit(&branch.body)
+                && let Some((clause, earlier)) = branch.elif_else_clauses.split_last()
                 && clause.test.is_none()
                 && !clause.body.is_empty()
                 && clause
                     .body
                     .iter()
                     .all(|statement| self.context.is_elided_statement(statement))
-                && let Some(donor) = unique_condition_jump_target(&branch.test, false)
+                && earlier.iter().all(|clause| {
+                    clause.test.as_ref().is_some_and(|test| {
+                        condition_has_only_runtime_tests(test)
+                            && !expression_suspends_current_scope(test)
+                            && original_condition_has_unique_jump_target(test, false)
+                    }) && suite_has_populated_try_exit(&clause.body)
+                })
+                && let Some(donor) = unique_condition_jump_target(
+                    earlier
+                        .last()
+                        .and_then(|clause| clause.test.as_ref())
+                        .unwrap_or(&branch.test),
+                    false,
+                )
             {
-                // Exit copying bypasses this original join from the populated arm.
-                // Its erased else leaves only the condition's false edge as a donor.
+                // Exit copying bypasses this original join from every populated arm.
+                // The erased else leaves only the final condition's false edge as a donor.
                 self.assembler
                     .set_location(self.source_location(donor.range()));
             } else if let Some(location) = self.assembler.last_instruction_location() {
@@ -39144,6 +39157,21 @@ pub(super) fn suite_has_linear_borrow_fallthrough(body: &[Stmt]) -> bool {
         has_runtime_work |= has_work;
     }
     has_runtime_work
+}
+
+/// Recognizes a populated try exit after linear work or a completed comprehension store.
+fn suite_has_populated_try_exit(body: &[Stmt]) -> bool {
+    suite_has_linear_borrow_fallthrough(body)
+        || matches!(body, [Stmt::Assign(assignment)]
+            if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                && matches!(assignment.value.as_ref(), Expr::ListComp(comprehension)
+                    if !expression_contains_inline_branch(&comprehension.elt)
+                        && !expression_suspends_current_scope(&assignment.value)
+                        && matches!(comprehension.generators.as_slice(), [iterator]
+                            if !iterator.is_async
+                                && iterator.ifs.is_empty()
+                                && matches!(iterator.target, Expr::Name(_))
+                                && !expression_contains_inline_branch(&iterator.iter))))
 }
 
 /// Certifies work that returns to its original owner after nested managers and loops.

@@ -2186,6 +2186,22 @@ fn direct_finally_async_for_keeps_exit_before_erased_assertions() {
 }
 
 #[test]
+fn erased_else_preserves_final_elif_try_exit_locations() {
+    for condition in [
+        "second(value)",
+        "not second(value)",
+        "all(valid(item) for item in items)",
+    ] {
+        for value in ["transform(items)", "[transform(item) for item in items]"] {
+            let source = format!(
+                "def f(items, value):\n    try:\n        if first(value):\n            result = transform(items)\n        elif {condition}:\n            result = {value}\n        else:\n            assert valid(value)\n    except ValueError as error:\n        raise TypeError(value) from error\n    consume(result)\n    return result\n"
+            );
+            assert_matches_cpython(&source, "erased_elif_try_exit.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn erased_try_else_keeps_condition_location_on_retained_exit() {
     for (case, source) in [
         "def f(obj, flag):\n    try:\n        if flag:\n            obj.action()\n        else:\n            assert flag\n    except ValueError:\n        return False\n    if flag:\n        assert obj\n    return True\n",
