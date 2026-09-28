@@ -18313,9 +18313,38 @@ impl<'source> Compiler<'source> {
                         .body
                         .iter()
                         .all(|statement| self.context.is_elided_statement(statement))));
+        // The erased else threads directly to the while backedge. Completed
+        // managers inside an arm do not change that target; normalizing the
+        // backward condition creates fresh slots outside the enclosing owner.
+        let protected_while_loop_else = eligible_else
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.control.in_synchronous_with()
+            && self.control.in_loop_tail_without_nested_cleanup()
+            && self.control.loops.contexts.last().is_some_and(|context| {
+                context.iterator_cleanup == IteratorCleanup::None
+                    && context.continue_label == restart
+            })
+            && std::iter::once((statement.test.as_ref(), statement.body.as_slice()))
+                .chain(statement.elif_else_clauses.iter().filter_map(|clause| {
+                    clause
+                        .test
+                        .as_ref()
+                        .map(|test| (test, clause.body.as_slice()))
+                }))
+                .all(|(test, body)| {
+                    condition_has_linear_runtime_leaves(test)
+                        && !expression_suspends_current_scope(test)
+                        && condition_jump_target_count(test, true) == 1
+                        && body.last().is_some_and(|last| {
+                            suite_has_linear_borrow_fallthrough(std::slice::from_ref(last))
+                        })
+                        && suite_has_completed_manager_loop_work(body)
+                });
         let optimized_empty_else = eligible_else
             && (self.control.withs.active_with_region_exclusions.is_empty()
                 || protected_iterator_loop_else
+                || protected_while_loop_else
                 // Elided arms share the original loop backedge even inside a
                 // manager. Its threaded false edge gets fresh, ownerless slots.
                 || ((statement.elif_else_clauses.len() == 1
@@ -38654,6 +38683,34 @@ pub(super) fn suite_has_linear_borrow_fallthrough(body: &[Stmt]) -> bool {
         has_runtime_work |= has_work;
     }
     has_runtime_work
+}
+
+/// Certifies work that returns to its original owner after nested managers and loops.
+fn suite_has_completed_manager_loop_work(body: &[Stmt]) -> bool {
+    if crate::stack_growth_required() {
+        return crate::grow_stack(|| suite_has_completed_manager_loop_work(body));
+    }
+    body.iter().all(|statement| match statement {
+        Stmt::With(manager) => {
+            !manager.is_async
+                && manager.items.iter().all(|item| {
+                    !expression_contains_inline_branch(&item.context_expr)
+                        && !expression_suspends_current_scope(&item.context_expr)
+                        && item.optional_vars.as_ref().is_none_or(|target| {
+                            !expression_contains_inline_branch(target)
+                                && !expression_suspends_current_scope(target)
+                        })
+                })
+                && suite_has_completed_manager_loop_work(&manager.body)
+        }
+        Stmt::While(loop_statement) => {
+            loop_statement.orelse.is_empty()
+                && condition_has_linear_runtime_leaves(&loop_statement.test)
+                && !expression_suspends_current_scope(&loop_statement.test)
+                && suite_has_completed_manager_loop_work(&loop_statement.body)
+        }
+        _ => suite_has_nonsuspending_conditional_work(std::slice::from_ref(statement)),
+    })
 }
 
 /// Certifies a populated named-handler exit into guarded, named linear recovery.

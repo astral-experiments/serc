@@ -297,6 +297,27 @@ fn elided_assertion_after_nested_iterator_preserves_condition_backedges() {
 }
 
 #[test]
+fn erased_while_else_normalizes_protected_backedges() {
+    let source = "def process(state):\n    with guard():\n        while True:\n            value = receive()\n            if value == \"start\":\n                work()\n            elif value == \"stop\":\n                other()\n            else:\n                assert False, value\n";
+    for (index, source) in [
+        source.to_owned(),
+        source.replace("while True:", "while state.ready:"),
+        source.replace("                assert False, value", "                pass"),
+        source.replace("                assert False, value", "                recover(value)"),
+        source.replace("            else:\n                assert False, value\n", ""),
+        source.replace(
+            "                other()",
+            "                with state.lock:\n                    state.ready = True\n                    state.lock.notify()\n                    while state.ready:\n                        state.lock.wait()\n                publish(None)",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(&source, &format!("protected_while_backedge_{index}.py"), &LEVELS);
+    }
+}
+
+#[test]
 fn erased_protected_loop_arms_preserve_condition_polarity() {
     for condition in ["check(item)", "not check(item)"] {
         for body in [
