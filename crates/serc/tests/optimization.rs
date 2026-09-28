@@ -12448,3 +12448,40 @@ fn erased_match_case_threads_through_enclosing_branch() {
         }
     }
 }
+
+#[test]
+fn terminal_nested_erased_if_keeps_finalizer_join() {
+    let source = r"async def f(first, second):
+    try:
+        if first:
+            consume(first)
+            assert first
+        else:
+            consume(second)
+            assert second
+            if second:
+                assert first
+            else:
+                assert second
+    finally:
+        cleanup()
+";
+    for (index, source) in [
+        source.to_owned(),
+        source.replace("async def", "def"),
+        source.replace("    finally:", "            assert first\n    finally:"),
+        source.replace(
+            "            if second:",
+            "            if first:\n                consume(first)\n            elif second:",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            &source,
+            &format!("terminal_nested_finalizer_join_{index}.py"),
+            &LEVELS,
+        );
+    }
+}

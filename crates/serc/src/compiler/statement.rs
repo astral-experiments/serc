@@ -691,6 +691,8 @@ pub(super) struct StatementContext {
     // This exact statement reaches a source successor without crossing a compound
     // statement's cleanup. Only conditional arms inherit that continuation.
     same_region_continuation: Option<TextRange>,
+    // This exact conditional finishes a direct try-body tail through conditional arms.
+    direct_try_tail_continuation: Option<TextRange>,
     // Whether an enclosing statement has a sibling successor after its nested suite.
     pub(super) inherited_has_following: bool,
     // Whether that inherited continuation is a small name or literal return.
@@ -3324,6 +3326,12 @@ impl<'source> Compiler<'source> {
                         Stmt::If(_) | Stmt::With(_)
                     ),
                     same_region_continuation,
+                    direct_try_tail_continuation: self
+                        .control
+                        .statements
+                        .context
+                        .direct_try_tail_continuation
+                        .filter(|range| *range == statement.range()),
                     has_following: !is_final,
                     followed_by_implicit_return: is_final
                         && final_expression_becomes_return
@@ -15245,6 +15253,8 @@ impl<'source> Compiler<'source> {
                                 )
                             })
                             == Some(&statement.range))
+                            || self.control.statements.context.direct_try_tail_continuation
+                                == Some(statement.range)
                             || ((self
                                 .control
                                 .statements
@@ -16237,6 +16247,42 @@ impl<'source> Compiler<'source> {
         } else {
             None
         };
+        // A terminal conditional arm reaches the same try-body POP_BLOCK as its
+        // enclosing conditional. Carry that fact only along exact conditional tails;
+        // unrelated suites and cleanup statements must not inherit it.
+        let direct_try_tail_continuation =
+            (self.control.statements.context.direct_try_tail_continuation == Some(statement.range)
+                || self
+                    .control
+                    .exceptions
+                    .direct_try_body_statements
+                    .iter()
+                    .rfind(|range| {
+                        !matches!(
+                            self.context.optimized_locations.get(range),
+                            Some(super::optimization::OptimizedLocation::Elided)
+                        )
+                    })
+                    == Some(&statement.range))
+            .then(|| {
+                let end = body
+                    .iter()
+                    .rposition(|part| !self.context.is_elided_statement(part))?;
+                let Stmt::If(tail) = &body[end] else {
+                    return None;
+                };
+                body[..end]
+                    .iter()
+                    .all(|part| {
+                        self.context.is_elided_statement(part)
+                            || (suite_has_linear_borrow_fallthrough(std::slice::from_ref(part))
+                                && suite_has_nonsuspending_conditional_work(std::slice::from_ref(
+                                    part,
+                                )))
+                    })
+                    .then_some(tail.range)
+            })
+            .flatten();
         // This branch's sole iterator still reaches the separately compiled source
         // successor. Carry that exact continuation to the iterator's break policy.
         let prefix_end = self.control.loops.split_loop_tail_prefix_end;
@@ -16263,7 +16309,18 @@ impl<'source> Compiler<'source> {
                                 compiler.with_control_override(
                                     |control| &mut control.statements.while_before_conditional_join,
                                     while_before_conditional_join,
-                                    |compiler| compiler.compile_suite(body),
+                                    |compiler| {
+                                        compiler.with_control_override(
+                                            |control| {
+                                                &mut control
+                                                    .statements
+                                                    .context
+                                                    .direct_try_tail_continuation
+                                            },
+                                            direct_try_tail_continuation,
+                                            |compiler| compiler.compile_suite(body),
+                                        )
+                                    },
                                 )
                             },
                         )
