@@ -18382,16 +18382,19 @@ impl<'source> Compiler<'source> {
                     && context.finally_end_depth == self.control.finally.active_finally_end_blocks
                     && self.assembler.instruction_count() == context.body_start
             });
-        // A direct Continue in the final tested arm reaches the same iterator,
+        // A final Pass or iterator Continue reaches the same loop backedge,
         // including inside an enclosing try/finally. Earlier elif arms cannot
         // enter its erased false edge, so that edge still normalizes independently.
-        let protected_iterator_continue_else = eligible_else
+        // Comparison chains retain a separate jump to the Pass backedge.
+        let protected_direct_loop_else = eligible_else
             && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
             && self.control.in_loop_tail_without_nested_cleanup()
-            && self.control.loops.contexts.last().is_some_and(|context| {
-                context.iterator_cleanup != IteratorCleanup::None
-                    && context.continue_label == restart
-            })
+            && self
+                .control
+                .loops
+                .contexts
+                .last()
+                .is_some_and(|context| context.continue_label == restart)
             && statement
                 .elif_else_clauses
                 .iter()
@@ -18406,7 +18409,12 @@ impl<'source> Compiler<'source> {
                 .is_some_and(|(test, body)| {
                     condition_has_runtime_iterator_leaves(test)
                         && !expression_suspends_current_scope(test)
-                        && matches!(body, [Stmt::Continue(_)])
+                        && ((matches!(body, [Stmt::Pass(_)])
+                            && condition_has_linear_runtime_leaves(test))
+                            || (matches!(body, [Stmt::Continue(_)])
+                                && self.control.loops.contexts.last().is_some_and(|context| {
+                                    context.iterator_cleanup != IteratorCleanup::None
+                                })))
                 });
         // With no intervening cleanup, the removed else reaches the iterator
         // directly. Native normalizes that backward condition into fresh slots.
@@ -18436,8 +18444,7 @@ impl<'source> Compiler<'source> {
                                     })
                                     && suite_has_nonsuspending_conditional_work(std::slice::from_ref(statement)))
                     })));
-        let protected_iterator_loop_else =
-            protected_iterator_work_else || protected_iterator_continue_else;
+        let protected_loop_else = protected_iterator_work_else || protected_direct_loop_else;
         // The erased else threads directly to the while backedge. Completed
         // managers inside an arm do not change that target; normalizing the
         // backward condition creates fresh slots outside the enclosing owner.
@@ -18468,7 +18475,7 @@ impl<'source> Compiler<'source> {
                 });
         let optimized_empty_else = eligible_else
             && (self.control.withs.active_with_region_exclusions.is_empty()
-                || protected_iterator_loop_else
+                || protected_loop_else
                 || protected_while_loop_else
                 // Elided arms share the original loop backedge even inside a
                 // manager. Its threaded false edge gets fresh, ownerless slots.
@@ -18503,16 +18510,16 @@ impl<'source> Compiler<'source> {
             && (self.control.exceptions.active_exception_region_exclusions.is_empty()
                 && self.control.finally.active_finally_try_bodies == 0
                 || protected_finally_loop_else
-                || protected_iterator_loop_else)
+                || protected_loop_else)
             && self.control.exceptions.active_exception_group_handlers == 0
             && self.control.finally.active_normal_finally_bodies == 0
             && self.control.finally.active_copied_finally_bodies == 0
             && self.control.finally.active_finally_end_blocks == 0
             && self.control.finally.active_overriding_finally_returns == 0
-            // Outside a direct iterator exit, a suspended scope's final chained
+            // Outside a direct loop exit, a suspended scope's final chained
             // condition can own a backedge inside its implicit exception wrapper.
             && (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
-                || protected_iterator_loop_else
+                || protected_loop_else
                 || (!expression_contains_chained_comparison(&statement.test)
                     && statement.elif_else_clauses.iter().all(|clause| {
                         clause.test.as_ref().is_none_or(|test| {

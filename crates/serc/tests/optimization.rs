@@ -23,6 +23,18 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn erased_else_preserves_protected_pass_backedge() {
+    for definition in ["def", "async def"] {
+        for loop_header in ["while True", "for value in flag"] {
+            let source = format!(
+                "{definition} f(flag):\n    try:\n        {loop_header}:\n            if flag == 1:\n                pass\n            else:\n                assert False\n    finally:\n        print(flag)\n"
+            );
+            assert_matches_cpython(&source, "protected_pass_backedge.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn erased_else_preserves_protected_iterator_continue() {
     for body in [
         "            if value == 1:\n                continue\n            else:\n                assert False\n",
