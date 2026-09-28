@@ -7154,6 +7154,12 @@ fn empty_try_in_conditional_finally_compacts_setup_before_exit() {
 }
 
 #[test]
+fn empty_try_before_finalizer_work_keeps_normal_exit_owner() {
+    const SOURCE: &str = "async def f(manager, items, work, flag):\n    async with manager:\n        for item in items:\n            try:\n                await work(item)\n            finally:\n                if flag:\n                    value = work()\n                    count = value / 2\n                    try:\n                        assert count == item\n                    except AssertionError:\n                        pass\n                    work(count)\n";
+    assert_matches_cpython(SOURCE, "empty_try_finally_work.py", &LEVELS[1..]);
+}
+
+#[test]
 fn optimized_empty_try_loop_keeps_enclosing_exception_owner() {
     const TRACE_BACKEDGE: &str = r"
 import dis, json, marshal, sys

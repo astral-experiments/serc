@@ -1741,7 +1741,31 @@ impl OptimizationPipeline {
                                 })
                     })
                 });
-            if jump.location.line < 0 && !shared_reraise {
+            // Removed assertions can leave the normal jump unlocated until its
+            // intact SETUP donates a line. That does not erase the jump's owner.
+            let empty_setup_donor = self.python_version >= crate::PythonVersion::Py314
+                && start_offset.checked_sub(1).is_some_and(|previous| {
+                    let setup = instructions[previous];
+                    setup.opcode == NOP
+                        && setup.location.line >= 0
+                        && setup.depth_after() == jump.depth_after()
+                        && setup.jump_policy.preserves_explicit_nop()
+                        && setup.exception_policy() == super::super::ExceptionPolicy::EXCLUDE_ALWAYS
+                        && setup.pre_fold_extra_instructions() == 0
+                        && setup.local_policy.hidden_exception_owner_slots() == 0
+                        && offsets.iter().any(|(label, offset)| {
+                            *offset == start_offset
+                                && self
+                                    .exception_owner_provenance
+                                    .ordinary_try_setups
+                                    .contains_key(label)
+                                && self
+                                    .exception_owner_provenance
+                                    .setups
+                                    .contains(&(*label, Some(setup.location)))
+                        })
+                });
+            if jump.location.line < 0 && !shared_reraise && !empty_setup_donor {
                 continue;
             }
             // A wholly unlocated handler cleanup is copied before its final jump
