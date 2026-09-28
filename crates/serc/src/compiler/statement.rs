@@ -14866,10 +14866,43 @@ impl<'source> Compiler<'source> {
                                 || self.control.loops.contexts.last().is_some_and(|context| {
                                     context.with_depth < self.control.withs.active_with_exits.len()
                                 })));
+                    // The direct try-body join precedes POP_BLOCK and a separate,
+                    // live finalizer array. Its empty true-arm jump still receives
+                    // the condition's line before redundant-jump removal.
+                    let direct_finally_body_join = matches!(
+                        self.unit.scope,
+                        Scope::Function { .. }
+                    ) && self.unit.flags
+                        & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                        == 0
+                        && self.control.loops.contexts.is_empty()
+                        && self.control.withs.active_with_exits.is_empty()
+                        && self.control.withs.active_with_region_exclusions.is_empty()
+                        && self
+                            .control
+                            .exceptions
+                            .active_exception_region_exclusions
+                            .len()
+                            == 1
+                        && self.control.finally.active_finally_try_bodies == 1
+                        && !self.control.statements.context.has_following
+                        && self.control.exceptions.direct_try_body_statements.last()
+                            == Some(&statement.range)
+                        && matches!(statement.elif_else_clauses.as_slice(), [clause]
+                            if clause.test.is_none())
+                        && matches!(self.control.finally.active_return_finally_contexts.as_slice(), [finalizer]
+                        if !finalizer.body.is_empty()
+                            && finalizer.body.iter().all(|part| {
+                                matches!(part, Stmt::Expr(expression)
+                                    if matches!(expression.value.as_ref(), Expr::Call(_))
+                                        && !expression_contains_inline_branch(&expression.value)
+                                        && !expression_suspends_current_scope(&expression.value))
+                            }));
                     let optimized_empty_both = self.context.python_version
                         >= crate::PythonVersion::Py314
                         && branch_index + 2 == branch_count
                         && (!self.has_active_control_flow_region()
+                            || direct_finally_body_join
                             || (self.unit.flags
                                 & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                                 == 0
@@ -14902,7 +14935,8 @@ impl<'source> Compiler<'source> {
                                     || !self.control.exceptions.active_exception_region_exclusions.is_empty())))
                         && !self.control.in_exception_handler()
                         && self.control.exceptions.active_exception_group_handlers == 0
-                        && self.control.finally.active_finally_try_bodies == 0
+                        && (self.control.finally.active_finally_try_bodies == 0
+                            || direct_finally_body_join)
                         && self.control.finally.active_normal_finally_bodies == 0
                         && self.control.finally.active_copied_finally_bodies == 0
                         && self.control.finally.active_finally_end_blocks == 0

@@ -148,6 +148,16 @@ fn erased_assertions_preserve_manager_while_exit() {
 }
 
 #[test]
+fn elided_conditional_preserves_jump_before_finalizer() {
+    for body in ["assert value.ready", "pass", "record(value)"] {
+        let source = format!(
+            "def f(flag):\n    try:\n        value = work()\n        assert value\n        if flag:\n            {body}\n        else:\n            assert value.done\n    finally:\n        cleanup()\n        finish()\n"
+        );
+        assert_matches_cpython(&source, "conditional_before_finalizer.py", &LEVELS);
+    }
+}
+
+#[test]
 fn elided_handler_assertion_preserves_conditional_cleanup() {
     for suffix in ["assert value in str(error)", "pass", "after()"] {
         let source = format!(
