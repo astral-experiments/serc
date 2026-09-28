@@ -268,6 +268,12 @@ fn genuine_pass_preserves_conditional_expression_join() {
         "obj.left if b else obj.right",
         "obj.left(x) if b else obj.right(y)",
         "x[0] if b else y[0]",
+        "x if b else 1",
+        "1 if b else x",
+        "1 if b else 2",
+        "x if b else 1 + 2",
+        "'value' if b else x",
+        "x if b else None",
     ]
     .into_iter()
     .enumerate()
@@ -281,10 +287,14 @@ fn genuine_pass_preserves_conditional_expression_join() {
             &LEVELS,
         );
     }
-    for suffix in ["", "        assert a\n", "        pass\n    after()\n"] {
-        let source = format!(
-            "def f(a, b, left, right):\n    if a:\n        left() if b else right()\n{suffix}"
-        );
+    for (expression, suffix) in [
+        ("left() if b else right()", ""),
+        ("left() if b else right()", "        assert a\n"),
+        ("left() if b else right()", "        pass\n    after()\n"),
+        ("x if b else 1", "        pass\n    after()\n"),
+    ] {
+        let source =
+            format!("def f(a, b, x, left, right):\n    if a:\n        {expression}\n{suffix}");
         assert_matches_cpython(&source, "conditional_expression_pass_boundary.py", &LEVELS);
     }
 }

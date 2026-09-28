@@ -4308,8 +4308,7 @@ impl<'source> Compiler<'source> {
         };
         let runtime_name =
             |value: &Expr| matches!(value, Expr::Name(name) if name.id.as_str() != "__debug__");
-        let conditional_expression_tail = if self.context.python_version
-            >= crate::PythonVersion::Py314
+        let pass_expression_tail = if self.context.python_version >= crate::PythonVersion::Py314
             && matches!(self.unit.scope, Scope::Function { .. })
             && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
             && self.control.loops.contexts.is_empty()
@@ -4334,18 +4333,20 @@ impl<'source> Compiler<'source> {
             // expression's discard separate from the enclosing If's footer.
             Some(tail)
         } else {
-            conditional_expression_tail
+            None
         };
+        let conditional_expression_tail = pass_expression_tail.or(conditional_expression_tail);
         if statement.elif_else_clauses.is_empty()
             && matches!(conditional_expression_tail, Some(Stmt::Expr(expression))
                 if matches!(expression.value.as_ref(), Expr::If(conditional)
                     if early_condition_truthiness(&conditional.test).is_none()
-                        && fold_constant(&conditional.body).is_none()
-                        && fold_constant(&conditional.orelse).is_none()))
+                        && (pass_expression_tail.is_some()
+                            || (fold_constant(&conditional.body).is_none()
+                                && fold_constant(&conditional.orelse).is_none()))))
         {
-            // Runtime arms retain their shared discard before falling through the
-            // enclosing if's separate footer. Keep that non-exiting original array
-            // through small-exit copying instead of distributing the return into it.
+            // Retain the shared discard before the enclosing if's separate footer. Keep
+            // that non-exiting original array through small-exit copying instead of
+            // distributing the return into it.
             self.compile_if(statement)?;
             self.assembler.set_location(SourceLocation::NONE);
             return self.emit_deferred_implicit_return();
