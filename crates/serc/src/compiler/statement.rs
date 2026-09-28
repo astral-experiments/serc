@@ -15021,7 +15021,7 @@ impl<'source> Compiler<'source> {
                         });
                     // The same protected body owns the nested all-elided join.
                     // Its original end array receives the inner false edge's line.
-                    let coroutine_nested_else_body = &body[..body
+                    let effective_nested_else_body = &body[..body
                         .iter()
                         .rposition(|part| !self.context.is_elided_statement(part))
                         .map_or(0, |index| index + 1)];
@@ -15036,7 +15036,7 @@ impl<'source> Compiler<'source> {
                             .exceptions
                             .active_exception_region_exclusions
                             .is_empty()
-                        && matches!(coroutine_nested_else_body.split_last(), Some((Stmt::If(nested), leading))
+                        && matches!(effective_nested_else_body.split_last(), Some((Stmt::If(nested), leading))
                             if leading.iter().all(|part| {
                                 self.context.is_elided_statement(part)
                                     || suite_has_linear_borrow_fallthrough(std::slice::from_ref(part))
@@ -15048,7 +15048,7 @@ impl<'source> Compiler<'source> {
                     // unchanged. Only expose that tail to this ordinary certificate;
                     // the complete body still compiles with its original boundaries.
                     let nested_else_body = if coroutine_elided_nested_join {
-                        coroutine_nested_else_body
+                        effective_nested_else_body
                     } else if self.context.python_version >= crate::PythonVersion::Py314
                         && branch_index == 0
                         && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
@@ -15057,15 +15057,15 @@ impl<'source> Compiler<'source> {
                         && self.control.withs.active_with_exits.is_empty()
                         && !self.control.loops.suite_fallthrough_to_loop_backedge
                         && self.control.finally.is_inactive_for_return_unwind()
-                        && matches!(body.split_first(), Some((Stmt::If(nested), suffix))
-                            if !suffix.is_empty()
-                                && suffix.iter().all(|part| self.context.is_elided_statement(part))
+                        && effective_nested_else_body.len() < body.len()
+                        && matches!(effective_nested_else_body.split_last(), Some((Stmt::If(nested), leading))
+                            if (leading.is_empty() || suite_has_linear_borrow_fallthrough(leading))
                                 && suite_has_linear_borrow_fallthrough(&nested.body)
                                 && matches!(nested.elif_else_clauses.as_slice(), [clause]
                                     if clause.test.is_none()
                                         && suite_has_linear_borrow_fallthrough(&clause.body)))
                     {
-                        &body[..1]
+                        effective_nested_else_body
                     } else {
                         body
                     };
@@ -15254,7 +15254,11 @@ impl<'source> Compiler<'source> {
                                 || ordinary_assigned_conditional_prefix
                                 || ordinary_conditional_prefix)
                                 && matches!(last, Stmt::If(nested)
-                                    if condition_has_linear_runtime_leaves(&nested.test)
+                                    // Specialized generator-call paths merge before
+                                    // the condition branches into either populated arm.
+                                    if (condition_has_linear_runtime_leaves(&nested.test)
+                                        || matches!(nested.test.as_ref(), Expr::Call(call)
+                                            if optimized_generator_callable_for_target(call, self.context.python_version).is_some()))
                                 && !expression_suspends_current_scope(&nested.test)
                                 && !suite_contains_yield(&nested.body)
                                 && matches!(nested.elif_else_clauses.as_slice(), [clause]

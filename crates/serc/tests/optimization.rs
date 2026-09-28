@@ -787,6 +787,29 @@ fn elided_suffix_preserves_populated_nested_if_join() {
 }
 
 #[test]
+fn linear_prefix_and_elided_suffix_preserve_nested_if_join() {
+    let source = "def update(state):\n    if state.ready():\n        item = state.next()\n        if available(item):\n            apply(item)\n        else:\n            discard(item)\n        assert state.valid()\n    else:\n        assert state.valid()\n    result = state.finish()\n    assert result\n";
+    for source in [
+        source.to_owned(),
+        source.replace(
+            "available(item)",
+            "all(value == 1 for value in item.values())",
+        ),
+        source.replace("available(item)", "any(value for value in item.values())"),
+        source.replace("available(item)", "tuple(value for value in item.values())"),
+        source.replace("        item = state.next()", "        state.prepare()"),
+        source.replace(
+            "        item = state.next()",
+            "        state.prepare()\n        item = state.next()\n        other = item.value",
+        ),
+        source.replace("        item = state.next()\n", ""),
+        source.replacen("        assert state.valid()", "        consume(item)", 1),
+    ] {
+        assert_matches_cpython(&source, "prefixed_nested_if_suffix.py", &LEVELS);
+    }
+}
+
+#[test]
 fn elided_else_after_completed_work_preserves_legacy_footer_location() {
     for source in [
         "def f(flag, enabled, count, inner, obj):\n    if not flag:\n        assert flag\n        assert count\n    if enabled and count > 0:\n        assert enabled\n        value = obj.make()\n        use(value)\n        if inner:\n            use(value)\n            use(value)\n        value = 1.0\n        assert value\n        other = 2.0\n        use(other)\n    else:\n        assert count\n",
