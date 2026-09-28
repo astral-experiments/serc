@@ -19861,22 +19861,18 @@ impl<'source> Compiler<'source> {
                     && condition_has_only_runtime_tests(&statement.test)
                     && condition_has_linear_runtime_leaves(&statement.test)
                     && !expression_suspends_current_scope(&statement.test)
-                    && !statement.body.is_empty()
-                    && statement
-                        .body
+                    // Sibling arms cannot enter this condition's empty true target.
+                    // Their live work does not populate its shared backedge array.
+                    && !body.is_empty()
+                    && body
                         .iter()
                         .all(|statement| self.context.is_elided_statement(statement))
                     && statement.elif_else_clauses.iter().all(|clause| {
-                        !clause.body.is_empty()
-                            && clause
-                                .body
-                                .iter()
-                                .all(|statement| self.context.is_elided_statement(statement))
-                            && clause.test.as_ref().is_none_or(|test| {
-                                condition_has_only_runtime_tests(test)
-                                    && condition_has_linear_runtime_leaves(test)
-                                    && !expression_suspends_current_scope(test)
-                            })
+                        clause.test.as_ref().is_none_or(|test| {
+                            condition_has_only_runtime_tests(test)
+                                && condition_has_linear_runtime_leaves(test)
+                                && !expression_suspends_current_scope(test)
+                        })
                     });
                 let linear_exit_body = |body: &[Stmt]| {
                     if self.unit.flags & CO_COROUTINE == 0 {

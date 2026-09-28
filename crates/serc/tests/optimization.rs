@@ -11780,3 +11780,63 @@ fn erased_else_preserves_nested_join_before_iterator_work() {
         &LEVELS,
     );
 }
+
+#[test]
+fn erased_loop_arm_keeps_copied_backedges_with_live_siblings() {
+    assert_matches_cpython(
+        r#"def f(items, active, output):
+    for item in items:
+        if item.startswith("start"):
+            output.append(item)
+        elif item == "skip":
+            continue
+        elif ("a" in item and "b" in item) or item.startswith("c") or item.strip().startswith("d") or "e" in item:
+            assert active
+        elif item == "work":
+            output.append(item)
+        elif "x" in item or "y" in item or "z" in item:
+            assert active
+        else:
+            report(item)
+    return output
+"#,
+        "mixed_arms.py",
+        &LEVELS,
+    );
+    assert_matches_cpython(
+        r"def f(items, left, right, value):
+    for item in items:
+        if left or right:
+            assert value
+        else:
+            consume(item)
+",
+        "single_erased_arm.py",
+        &LEVELS,
+    );
+    assert_matches_cpython(
+        r"def f(items, left, right, value):
+    for item in items:
+        if left or right:
+            assert value
+        else:
+            return item
+",
+        "sibling_return.py",
+        &LEVELS,
+    );
+    assert_matches_cpython(
+        r"def f(items, left, right, value):
+    for item in items:
+        if left or right:
+            assert value
+        else:
+            try:
+                consume(item)
+            except Problem:
+                recover(item)
+",
+        "sibling_recovery.py",
+        &LEVELS,
+    );
+}
