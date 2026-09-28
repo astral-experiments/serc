@@ -14910,10 +14910,10 @@ impl<'source> Compiler<'source> {
                     let direct_finally_body_join = matches!(
                         self.unit.scope,
                         Scope::Function { .. }
-                    ) && self.unit.flags
-                        & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                        == 0
-                        && self.control.loops.contexts.is_empty()
+                    ) && matches!(
+                        self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR),
+                        0 | CO_COROUTINE
+                    ) && self.control.loops.contexts.is_empty()
                         && self.control.withs.active_with_exits.is_empty()
                         && self.control.withs.active_with_region_exclusions.is_empty()
                         && self
@@ -14941,10 +14941,24 @@ impl<'source> Compiler<'source> {
                         && matches!(self.control.finally.active_return_finally_contexts.as_slice(), [finalizer]
                         if !finalizer.body.is_empty()
                             && finalizer.body.iter().all(|part| {
-                                matches!(part, Stmt::Expr(expression)
-                                    if matches!(expression.value.as_ref(), Expr::Call(_))
-                                        && !expression_contains_inline_branch(&expression.value)
-                                        && !expression_suspends_current_scope(&expression.value))
+                                let Stmt::Expr(expression) = part else {
+                                    return false;
+                                };
+                                let call = match expression.value.as_ref() {
+                                    Expr::Await(await_expression)
+                                        if self.unit.flags
+                                            & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                                            == CO_COROUTINE =>
+                                    {
+                                        // Await's send loop starts after the normal
+                                        // finalizer entry and adds no join predecessor.
+                                        await_expression.value.as_ref()
+                                    }
+                                    expression => expression,
+                                };
+                                matches!(call, Expr::Call(_))
+                                    && !expression_contains_inline_branch(call)
+                                    && !expression_suspends_current_scope(call)
                             }));
                     let optimized_empty_both = self.context.python_version
                         >= crate::PythonVersion::Py314

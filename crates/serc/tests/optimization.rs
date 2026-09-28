@@ -437,6 +437,18 @@ fn elided_conditional_preserves_jump_before_finalizer() {
 }
 
 #[test]
+fn elided_conditional_preserves_jump_before_coroutine_finalizer() {
+    for cleanup in ["cleanup()", "await cleanup()"] {
+        for body in ["assert value.ready", "pass", "record(value)"] {
+            let source = format!(
+                "async def f(flag):\n    try:\n        value = await work()\n        if flag:\n            {body}\n        else:\n            assert value.done\n    finally:\n        {cleanup}\n"
+            );
+            assert_matches_cpython(&source, "conditional_coroutine_finalizer.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn elided_handler_assertion_preserves_conditional_cleanup() {
     for suffix in ["assert value in str(error)", "pass", "after()"] {
         let source = format!(
