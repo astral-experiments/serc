@@ -14943,8 +14943,18 @@ impl<'source> Compiler<'source> {
                         self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR),
                         0 | CO_COROUTINE
                     ) && self.control.loops.contexts.is_empty()
-                        && self.control.withs.active_with_exits.is_empty()
-                        && self.control.withs.active_with_region_exclusions.is_empty()
+                        && ((self.control.withs.active_with_exits.is_empty()
+                            && self.control.withs.active_with_region_exclusions.is_empty())
+                            // Managers entered before this try add no predecessor to
+                            // its conditional join or its normal finalizer entry.
+                            || (self.unit.flags
+                                & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                                == 0
+                                && self.control.withs.active_with_exits.len()
+                                    == self.control.withs.active_with_region_exclusions.len()
+                                && self.control.withs.active_with_exits.iter().all(|manager| {
+                                    !manager.is_async && manager.exception_region_depth == 0
+                                })))
                         && self
                             .control
                             .exceptions

@@ -449,6 +449,18 @@ fn elided_conditional_preserves_jump_before_coroutine_finalizer() {
 }
 
 #[test]
+fn elided_conditional_preserves_jump_before_managed_finalizer() {
+    for managers in ["manager", "manager, other"] {
+        for body in ["assert value.ready", "pass", "record(value)"] {
+            let source = format!(
+                "def f(manager, other, flag):\n    with {managers}:\n        value: object = setup()\n        try:\n            work(value)\n            if flag is None:\n                {body}\n            else:\n                assert value.done\n        finally:\n            cleanup(value)\n"
+            );
+            assert_matches_cpython(&source, "conditional_managed_finalizer.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn elided_handler_assertion_preserves_conditional_cleanup() {
     for suffix in ["assert value in str(error)", "pass", "after()"] {
         let source = format!(
