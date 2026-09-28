@@ -23,6 +23,33 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn async_iterator_preserves_erased_branch_backedges() {
+    for manager in ["with", "async with"] {
+        for iterator in ["for", "async for"] {
+            let source = format!(
+                "async def collect(manager, items):\n    {manager} manager:\n        with subscribe():\n            previous = None\n            {iterator} item in items:\n                if valid(item) and item.kind == 'entry':\n                    if previous is None:\n                        assert item.value is not None\n                        previous = item.value\n                        assert previous\n                    else:\n                        assert item.value == previous\n            assert previous is not None\n"
+            );
+            assert_matches_cpython(&source, "protected_iterator_erased_branches.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
+fn async_iterator_erased_suffix_preserves_inner_manager_exit() {
+    for outer in ["async with manager:", "try:"] {
+        let handler = if outer == "try:" {
+            "    except Error:\n        recover()\n"
+        } else {
+            ""
+        };
+        let source = format!(
+            "async def collect(manager, items):\n    {outer}\n        with subscribe():\n            async for item in items:\n                consume(item)\n            assert items\n{handler}"
+        );
+        assert_matches_cpython(&source, "async_iterator_inner_manager_exit.py", &LEVELS);
+    }
+}
+
+#[test]
 fn erased_nested_branches_preserve_async_iterator_join() {
     let source = "async def f(values, flag):\n    items = []\n    async for value in values:\n        if not items:\n            if flag:\n                assert value\n            else:\n                assert value\n        else:\n            assert value\n        items.append(value)\n";
     for suffix in ["", "    result = tuple(items)\n    assert result\n"] {

@@ -2842,27 +2842,17 @@ impl<'source> Compiler<'source> {
                                     == context.exception_region_depth
                         });
                 // Erased assertions still leave the manager's original POP_BLOCK
-                // after END_ASYNC_FOR, including in nested synchronous 3.15 managers.
+                // after END_ASYNC_FOR. An outer async manager does not change
+                // the innermost synchronous manager's original exit.
                 let protected_async_for_elided_assert_suffix = (self.context.python_version
                     == crate::PythonVersion::Py314
                     || (self.context.python_version == crate::PythonVersion::Py315
-                        && self
-                            .control
-                            .withs
-                            .active_with_exits
-                            .iter()
-                            .all(|context| !context.is_async)
                         && self.control.exceptions.active_exception_group_handlers == 0))
                     && !is_final
                     && matches!(statement, Stmt::For(statement) if statement.is_async)
                     && matches!(self.unit.scope, Scope::Function { .. })
                     && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
                     && self.control.loops.contexts.is_empty()
-                    && self
-                        .control
-                        .exceptions
-                        .active_exception_region_exclusions
-                        .is_empty()
                     && !self.control.in_exception_handler()
                     && self.control.finally.is_inactive_for_return_unwind()
                     && self
@@ -2872,6 +2862,12 @@ impl<'source> Compiler<'source> {
                         .last()
                         .is_some_and(|context| {
                             !context.is_async
+                                && context.exception_region_depth
+                                    == self
+                                        .control
+                                        .exceptions
+                                        .active_exception_region_exclusions
+                                        .len()
                                 && context.terminal_statement_range
                                     == body.last().map(Ranged::range)
                         })
@@ -18326,15 +18322,15 @@ impl<'source> Compiler<'source> {
                 .loops
                 .contexts
                 .last()
-                .is_some_and(|context| context.iterator_cleanup == IteratorCleanup::Sync)
+                .is_some_and(|context| context.iterator_cleanup != IteratorCleanup::None)
             && condition_has_linear_runtime_leaves(&statement.test)
             && !expression_suspends_current_scope(&statement.test)
             && (suite_has_linear_borrow_fallthrough(&statement.body)
                 || (!statement.body.is_empty()
-                    && statement
-                        .body
-                        .iter()
-                        .all(|statement| self.context.is_elided_statement(statement))));
+                    && statement.body.iter().all(|statement| {
+                        self.context.is_elided_statement(statement)
+                            || suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement))
+                    })));
         // The erased else threads directly to the while backedge. Completed
         // managers inside an arm do not change that target; normalizing the
         // backward condition creates fresh slots outside the enclosing owner.
