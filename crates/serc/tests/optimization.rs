@@ -461,6 +461,23 @@ fn elided_conditional_preserves_jump_before_managed_finalizer() {
 }
 
 #[test]
+fn elided_conditional_preserves_jump_before_guarded_finalizer() {
+    for asynchronous in [false, true] {
+        for body in ["assert valid()", "pass", "record()"] {
+            let source = format!(
+                "async def f(flag, resource):\n    try:\n        await work()\n        if flag:\n            {body}\n        else:\n            assert ready()\n    finally:\n        if resource is not None:\n            resource.close()\n            await finish(resource)\n"
+            );
+            let source = if asynchronous {
+                source
+            } else {
+                source.replace("async def", "def").replace("await ", "")
+            };
+            assert_matches_cpython(&source, "conditional_guarded_finalizer.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn elided_handler_assertion_preserves_conditional_cleanup() {
     for suffix in ["assert value in str(error)", "pass", "after()"] {
         let source = format!(

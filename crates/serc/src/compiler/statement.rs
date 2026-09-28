@@ -14933,6 +14933,26 @@ impl<'source> Compiler<'source> {
                                 || self.control.loops.contexts.last().is_some_and(|context| {
                                     context.with_depth < self.control.withs.active_with_exits.len()
                                 })));
+                    let linear_finalizer_call = |part: &Stmt| {
+                        let Stmt::Expr(expression) = part else {
+                            return false;
+                        };
+                        let call = match expression.value.as_ref() {
+                            Expr::Await(await_expression)
+                                if self.unit.flags
+                                    & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                                    == CO_COROUTINE =>
+                            {
+                                // Await's send loop starts after the normal
+                                // finalizer entry and adds no join predecessor.
+                                await_expression.value.as_ref()
+                            }
+                            expression => expression,
+                        };
+                        matches!(call, Expr::Call(_))
+                            && !expression_contains_inline_branch(call)
+                            && !expression_suspends_current_scope(call)
+                    };
                     // A direct try-body join precedes live work or POP_BLOCK and
                     // a separate finalizer array. Its empty true-arm jump receives
                     // the condition's line before redundant-jump removal.
@@ -14978,27 +14998,17 @@ impl<'source> Compiler<'source> {
                         && matches!(statement.elif_else_clauses.as_slice(), [clause]
                             if clause.test.is_none())
                         && matches!(self.control.finally.active_return_finally_contexts.as_slice(), [finalizer]
-                        if !finalizer.body.is_empty()
-                            && finalizer.body.iter().all(|part| {
-                                let Stmt::Expr(expression) = part else {
-                                    return false;
-                                };
-                                let call = match expression.value.as_ref() {
-                                    Expr::Await(await_expression)
-                                        if self.unit.flags
-                                            & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                                            == CO_COROUTINE =>
-                                    {
-                                        // Await's send loop starts after the normal
-                                        // finalizer entry and adds no join predecessor.
-                                        await_expression.value.as_ref()
-                                    }
-                                    expression => expression,
-                                };
-                                matches!(call, Expr::Call(_))
-                                    && !expression_contains_inline_branch(call)
-                                    && !expression_suspends_current_scope(call)
-                            }));
+                        if (!finalizer.body.is_empty()
+                            && finalizer.body.iter().all(linear_finalizer_call))
+                            // A runtime guard also keeps the finalizer entry located;
+                            // its arm and exit cannot add a predecessor to the try join.
+                            || matches!(finalizer.body, [Stmt::If(guard)]
+                                if guard.elif_else_clauses.is_empty()
+                                    && condition_has_only_runtime_tests(&guard.test)
+                                    && !expression_contains_inline_branch(&guard.test)
+                                    && !expression_suspends_current_scope(&guard.test)
+                                    && !guard.body.is_empty()
+                                    && guard.body.iter().all(linear_finalizer_call)));
                     let optimized_empty_both = self.context.python_version
                         >= crate::PythonVersion::Py314
                         && branch_index + 2 == branch_count
