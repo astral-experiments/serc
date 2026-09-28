@@ -40660,6 +40660,19 @@ fn guarded_iterator_recovery_leaves_empty_try_exit(statement: &ruff_python_ast::
 fn statement_threads_through_empty_join(statement: &Stmt) -> bool {
     match statement {
         Stmt::Try(_) | Stmt::With(_) => true,
+        // With a linear true arm and an erased else, the jump reaches the next
+        // nonempty block. CPython removes it before borrowed-load traversal, so
+        // it cannot provide a route around the enclosing empty join.
+        Stmt::If(statement)
+            if suite_has_linear_borrow_fallthrough(&statement.body)
+                && matches!(statement.elif_else_clauses.as_slice(), [otherwise]
+                if otherwise.test.is_none()
+                    && otherwise.body.iter().all(|statement| {
+                        matches!(statement, Stmt::Global(global) if global.names.is_empty())
+                    })) =>
+        {
+            false
+        }
         Stmt::If(statement) => {
             !statement.elif_else_clauses.is_empty()
                 && std::iter::once(statement.body.as_slice())

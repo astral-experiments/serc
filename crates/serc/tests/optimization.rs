@@ -39,6 +39,41 @@ fn elided_handler_assertion_preserves_while_break_cleanup() {
 }
 
 #[test]
+fn erased_nested_else_preserves_try_exit_borrow_boundary() {
+    let source = "def validate(values, enabled):\n    item = values[0]\n    try:\n        if enabled:\n            if valid(item):\n                consume(item)\n            else:\n                assert item\n    except Exception:\n        return False\n    if 'payload' in item:\n        assert item.payload\n    return True\n";
+    let preceding_branch = source.replace(
+        "    try:\n",
+        "    try:\n        prepare(item)\n        if valid(item):\n            consume(item)\n        else:\n            assert item\n",
+    );
+    for (index, source) in [
+        source.to_owned(),
+        preceding_branch.replace(
+            "    except Exception:\n",
+            "    except Exception as error:\n        report(error)\n",
+        ),
+        source.replace("                assert item\n", "                consume(item)\n"),
+        source.replace("                assert item\n", "                pass\n"),
+        source.replace(
+            "            else:\n",
+            "            elif alternate(item):\n                consume(item)\n            else:\n",
+        ),
+        source.replace(
+            "        if enabled:\n            if valid(item):\n                consume(item)\n            else:\n                assert item\n",
+            "        if valid(item):\n            consume(item)\n        else:\n            assert item\n",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            &source,
+            &format!("nested_erased_else_try_exit_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn elided_assertion_after_nested_iterator_preserves_condition_backedges() {
     for suffix in ["assert item", "pass", "after()"] {
         let source = format!(
