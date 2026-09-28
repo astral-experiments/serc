@@ -1850,6 +1850,45 @@ fn erased_linear_prefix_preserves_populated_nested_join() {
 }
 
 #[test]
+fn raising_arm_preserves_nested_erased_else_join() {
+    let source = r#"def configure(enabled, path, options, config):
+    if enabled:
+        assert path is None
+    else:
+        if path is None:
+            if options.family is None:
+                raise ValueError("missing")
+            else:
+                assert options.name is not None
+                assert config is None
+                item = lookup(options.family)
+                path = item.path
+                config = item.config
+                if item.layout is not None:
+                    options.first = item.layout.first
+                    options.second = item.layout.second
+                else:
+                    assert options.valid
+        else:
+            assert options.family is None
+    result = work(config)
+    try:
+        finish(result)
+    except Error:
+        raise
+    return result
+"#;
+    for source in [
+        source.to_owned(),
+        source.replace("raise ValueError(\"missing\")", "raise error"),
+        source.replace("raise ValueError(\"missing\")", "raise error from cause"),
+        source.replace("if item.layout is not None:", "if item.ready():"),
+    ] {
+        assert_matches_cpython(&source, "raising_arm_nested_join.py", &LEVELS);
+    }
+}
+
+#[test]
 fn assigned_call_conditional_prefix_preserves_populated_join() {
     let source = r"def choose(owner, incoming, first):
     if incoming is not None:

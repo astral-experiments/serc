@@ -14715,6 +14715,9 @@ impl<'source> Compiler<'source> {
                     let direct_try_body_exit = direct_try_body_exit
                         || self.control.exceptions.ownerless_handler_assignment_branch
                             == Some(statement.range);
+                    let raising_else_join = (branch_index == 0)
+                        .then(|| self.raising_nested_else_join(statement, body))
+                        .flatten();
                     // An enclosing suite or a split loop tail can supply this branch's
                     // shared continuation. Keep early marker locations for copied exits;
                     // only a surviving shared jump retains the empty join's missing location.
@@ -14886,6 +14889,9 @@ impl<'source> Compiler<'source> {
                             self.source_location(while_condition_exit_range(&while_statement.test))
                         };
                         self.assembler.set_location(location);
+                    } else if let Some(test) = raising_else_join {
+                        self.assembler
+                            .set_location(self.source_location(condition_fallthrough_range(test)));
                     } else if let Some(test) = self.elided_terminating_if_fallthrough(body) {
                         self.assembler
                             .set_location(self.source_location(condition_fallthrough_range(test)));
@@ -15856,7 +15862,8 @@ impl<'source> Compiler<'source> {
                             matches!(expression, Expr::Lambda(_))
                         })
                         && self.supports_elided_for_join_body(body);
-                    if optimized_empty_both || optimized_nested_else {
+                    if optimized_empty_both || optimized_nested_else || raising_else_join.is_some()
+                    {
                         self.assembler
                             .preserve_redundant_jump_nop_after_threading(branch_exit);
                     } else if declaration_only_body {
@@ -16247,6 +16254,80 @@ impl<'source> Compiler<'source> {
                 )
             },
         )
+    }
+
+    /// Finds the sole false-edge donor after a raising arm and an erased nested else.
+    fn raising_nested_else_join<'a>(
+        &self,
+        statement: &ruff_python_ast::StmtIf,
+        body: &'a [Stmt],
+    ) -> Option<&'a Expr> {
+        if self.context.python_version < crate::PythonVersion::Py314
+            || !matches!(self.unit.scope, Scope::Function { .. })
+            || self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) != 0
+            || self.control.statements.in_match
+            || !self.control.loops.contexts.is_empty()
+            || self.control.loops.suite_fallthrough_to_loop_backedge
+            || !self.control.withs.active_with_exits.is_empty()
+            || self.has_active_control_flow_region()
+            || self.control.in_exception_handler()
+            || self.control.exceptions.active_exception_group_handlers != 0
+            || !self.control.finally.is_inactive_for_return_unwind()
+        {
+            return None;
+        }
+        let elided = |body: &[Stmt]| {
+            !body.is_empty()
+                && body
+                    .iter()
+                    .all(|part| self.context.is_elided_statement(part))
+        };
+        let linear_prefix = |body: &[Stmt]| {
+            body.iter().all(|part| {
+                self.context.is_elided_statement(part)
+                    || matches!(part, Stmt::Pass(_))
+                    || (suite_has_linear_borrow_fallthrough(std::slice::from_ref(part))
+                        && suite_has_nonsuspending_conditional_work(std::slice::from_ref(part)))
+            })
+        };
+        let runtime_test = |test: &Expr| {
+            condition_has_linear_runtime_leaves(test)
+                && !expression_suspends_current_scope(test)
+                && original_condition_has_unique_jump_target(test, true)
+                && original_condition_has_unique_jump_target(test, false)
+        };
+        let (Stmt::If(raising), leading) = body.split_last()? else {
+            return None;
+        };
+        let [Stmt::Raise(raised)] = raising.body.as_slice() else {
+            return None;
+        };
+        let [continuing] = raising.elif_else_clauses.as_slice() else {
+            return None;
+        };
+        let (Stmt::If(tail), prefix) = continuing.body.split_last()? else {
+            return None;
+        };
+        // RAISE_VARARGS removes the true arm's normal predecessor. Linear work
+        // in the other arm finishes before its final conditional, whose erased
+        // false arm donates the outer exit's line before it becomes a NOP.
+        (runtime_test(&statement.test)
+            && matches!(statement.elif_else_clauses.as_slice(), [clause]
+                if clause.test.is_none() && elided(&clause.body))
+            && linear_prefix(leading)
+            && runtime_test(&raising.test)
+            && raised.exc.iter().chain(&raised.cause).all(|value| {
+                !expression_contains_inline_branch(value)
+                    && !expression_suspends_current_scope(value)
+            })
+            && continuing.test.is_none()
+            && linear_prefix(prefix)
+            && runtime_test(&tail.test)
+            && suite_has_linear_borrow_fallthrough(&tail.body)
+            && suite_has_nonsuspending_conditional_work(&tail.body)
+            && matches!(tail.elif_else_clauses.as_slice(), [clause]
+                if clause.test.is_none() && elided(&clause.body)))
+        .then_some(tail.test.as_ref())
     }
 
     fn elided_terminating_if_fallthrough<'a>(&self, body: &'a [Stmt]) -> Option<&'a Expr> {
