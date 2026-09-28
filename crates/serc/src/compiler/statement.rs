@@ -4642,6 +4642,119 @@ impl<'source> Compiler<'source> {
             return Ok(());
         }
 
+        if self.context.python_version >= crate::PythonVersion::Py313
+            && self.supports_elided_terminal_if()
+            && self.unit.flags & CO_COROUTINE == 0
+            && !self.has_active_control_flow_region()
+            && self.control.exceptions.active_exception_group_handlers == 0
+            && !self.control.statements.in_match
+            && let [Stmt::If(nested), suffix @ ..] = statement.body.as_slice()
+            && let [nested_else] = nested.elif_else_clauses.as_slice()
+            && nested_else.test.is_none()
+            && let [outer_else] = statement.elif_else_clauses.as_slice()
+            && outer_else.test.is_none()
+            && let [Stmt::Return(returned)] = outer_else.body.as_slice()
+            && let Some(return_value) = returned.value.as_deref()
+        {
+            let modern_shared_tail = if self.context.python_version >= crate::PythonVersion::Py314
+                && !suffix.is_empty()
+                && suffix
+                    .iter()
+                    .all(|part| self.context.is_elided_statement(part))
+            {
+                let flat = |value: &Expr| {
+                    !expression_contains_inline_branch(value)
+                        && !expression_suspends_current_scope(value)
+                        && !ruff_python_ast::helpers::any_over_expr(value, |value| {
+                            matches!(value, Expr::Lambda(_))
+                        })
+                };
+                let runtime_test =
+                    |value: &Expr| condition_has_only_runtime_tests(value) && flat(value);
+                let mut work = nested
+                    .body
+                    .iter()
+                    .filter(|part| !self.context.is_elided_statement(part));
+                let mut has_else_work = false;
+                if let Some(Stmt::Assign(assignment)) = work.next()
+                    && work.next().is_none()
+                    && let Expr::If(value) = assignment.value.as_ref()
+                {
+                    runtime_test(&statement.test)
+                        && runtime_test(&nested.test)
+                        && matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                        && runtime_test(&value.test)
+                        && flat(&value.body)
+                        && flat(&value.orelse)
+                        && fold_constant(&value.body).is_none()
+                        && fold_constant(&value.orelse).is_none()
+                        && nested_else.body.iter().all(|part| {
+                            if self.context.is_elided_statement(part) {
+                                return true;
+                            }
+                            let live =
+                                suite_has_linear_borrow_fallthrough(std::slice::from_ref(part));
+                            has_else_work |= live;
+                            live
+                        })
+                        && has_else_work
+                        && !suite_contains_yield(&nested_else.body)
+                        && !ruff_python_ast::helpers::any_over_body(&nested_else.body, |value| {
+                            matches!(value, Expr::Lambda(_))
+                        })
+                        && flat(return_value)
+                        && fold_constant(return_value).is_none()
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            let legacy_pass_tail = if self.context.python_version == crate::PythonVersion::Py313
+                && matches!(suffix, [part @ Stmt::Pass(_)] if !self.context.is_elided_statement(part))
+            {
+                let runtime_name = |value: &Expr| matches!(value, Expr::Name(name) if name.id.as_str() != "__debug__");
+                let name_call = |value: &Expr| {
+                    matches!(value, Expr::Call(call)
+                    if runtime_name(&call.func) && call.arguments.is_empty())
+                };
+                let assertion = |part: &Stmt| {
+                    self.context.is_elided_statement(part)
+                        || matches!(part, Stmt::Assert(assertion)
+                            if assertion.msg.is_none() && runtime_name(&assertion.test))
+                };
+                if let [Stmt::Assign(assignment), asserted] = nested.body.as_slice()
+                    && let Expr::If(value) = assignment.value.as_ref()
+                    && let [else_asserted, Stmt::Assign(else_assignment)] =
+                        nested_else.body.as_slice()
+                {
+                    runtime_name(&statement.test)
+                        && runtime_name(&nested.test)
+                        && assertion(asserted)
+                        && matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                        && runtime_name(&value.test)
+                        && name_call(&value.body)
+                        && runtime_name(&value.orelse)
+                        && assertion(else_asserted)
+                        && matches!(else_assignment.targets.as_slice(), [Expr::Name(_)])
+                        && name_call(&else_assignment.value)
+                        && name_call(return_value)
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if modern_shared_tail || legacy_pass_tail {
+                // Preserve both original statement jumps before native exit copying.
+                // Modern targets need both NOP slots to keep the expression tail above
+                // the four-slot limit; Python 3.13 needs the outer jump to copy through Pass.
+                self.compile_if(statement)?;
+                self.assembler.set_location(SourceLocation::NONE);
+                return self.emit_deferred_implicit_return();
+            }
+        }
+
         let base_depth = self.control.stack.depth;
         let mut branches: Vec<(Option<&Expr>, &[Stmt])> =
             vec![(Some(&statement.test), statement.body.as_slice())];

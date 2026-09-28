@@ -23,6 +23,38 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn conditional_assignment_preserves_original_statement_joins() {
+    for source in [
+        r"def example(flag, choice, build):
+    if flag:
+        if choice:
+            value = build() if flag else choice
+            assert value
+        else:
+            assert choice
+            value = build()
+        assert flag
+    else:
+        return build()
+",
+        r"def example(flag, choice, build):
+    if flag:
+        if choice:
+            value = build() if flag else choice
+            assert value
+        else:
+            assert choice
+            value = build()
+        pass
+    else:
+        return build()
+",
+    ] {
+        assert_matches_cpython(source, "conditional_assignment_statement_joins.py", &LEVELS);
+    }
+}
+
+#[test]
 fn folded_true_value_selector_preserves_empty_borrow_entry() {
     for source in [
         "def probe(marker, low, high, bound, choice, flag, left, right, obj, make):\n    if marker is not None:\n        if low >= bound:\n            scratch = left\n        else:\n            scratch = right\n        if low != high:\n            scratch = right\n        value = obj.payload if __debug__ else right\n        if flag:\n            result = None\n        else:\n            result = make()\n    else:\n        assert marker\n    return marker\n",
