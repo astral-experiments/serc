@@ -19147,6 +19147,12 @@ impl<'source> Compiler<'source> {
         // A conditional call argument rejoins before the call's discarded result,
         // so its internal branches also stay separate from the erased false edge.
         // An inner if without else completes either edge before the same backedge.
+        let completed_work_at_restart = self
+            .control
+            .loops
+            .contexts
+            .last()
+            .is_some_and(|context| context.continue_label == restart);
         let protected_iterator_work_else = eligible_else
             && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
             && self.control.in_loop_tail_without_nested_cleanup()
@@ -19163,6 +19169,29 @@ impl<'source> Compiler<'source> {
                     && final_body.iter().all(|statement| {
                         self.context.is_elided_statement(statement)
                             || suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement))
+                            // Both value arms merge before the name store, independently
+                            // of the enclosing condition's erased false edge.
+                            || (completed_work_at_restart && matches!(statement, Stmt::Assign(assignment)
+                                if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                                    && matches!(assignment.value.as_ref(), Expr::If(value)
+                                        if condition_has_linear_runtime_leaves(&value.test)
+                                            && !expression_suspends_current_scope(&value.test)
+                                            && [&value.body, &value.orelse].into_iter().all(|value|
+                                                !expression_contains_inline_branch(value)
+                                                    && !expression_suspends_current_scope(value)))))
+                            // Erased arms keep their condition but add no work or
+                            // cleanup before reaching the same iterator backedge.
+                            || (completed_work_at_restart && matches!(statement, Stmt::If(branch)
+                                if condition_has_linear_runtime_leaves(&branch.test)
+                                    && !expression_suspends_current_scope(&branch.test)
+                                    && original_condition_has_unique_jump_target(&branch.test, true)
+                                    && original_condition_has_unique_jump_target(&branch.test, false)
+                                    && !branch.body.is_empty()
+                                    && branch.body.iter().all(|part| self.context.is_elided_statement(part))
+                                    && matches!(branch.elif_else_clauses.as_slice(), [clause]
+                                        if clause.test.is_none()
+                                            && !clause.body.is_empty()
+                                            && clause.body.iter().all(|part| self.context.is_elided_statement(part)))))
                             || matches!(statement, Stmt::Expr(expression)
                                 if cleanup_conditional_argument_has_eager_call_prefix(&expression.value))
                             || matches!(statement, Stmt::For(inner)

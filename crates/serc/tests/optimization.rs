@@ -12363,3 +12363,35 @@ fn managed_coroutine_erased_shared_arm_preserves_copied_loop_exits() {
         assert_matches_cpython(&source, "managed_coroutine_shared_loop_exit.py", &LEVELS);
     }
 }
+
+#[test]
+fn protected_iterator_tail_accepts_completed_conditional_work() {
+    let source = r"async def f(items, outer, manager, config, key, legacy):
+    async with outer:
+        with manager:
+            for item in items:
+                if item.kind:
+                    consume(item)
+                else:
+                    value = item.value
+                    if config is not None and key in config:
+                        start = 1 if item.first else 6
+                        if legacy:
+                            assert value == start
+                        else:
+                            assert value != start
+                    else:
+                        assert value
+";
+    for source in [
+        source.to_owned(),
+        source.replace("1 if item.first else 6", "first if item.first else second"),
+        source.replace(
+            "1 if item.first else 6",
+            "left() if item.first else right()",
+        ),
+        source.replace("if legacy:", "if item.legacy:"),
+    ] {
+        assert_matches_cpython(&source, "protected_iterator_completed_work.py", &LEVELS);
+    }
+}
