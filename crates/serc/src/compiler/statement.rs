@@ -14958,6 +14958,17 @@ impl<'source> Compiler<'source> {
                                 }
                                 has_runtime_work
                             };
+                            let returning_prefix_arm = |arm: &[Stmt]| {
+                                let Some((Stmt::Return(exit), leading)) = arm.split_last() else {
+                                    return false;
+                                };
+                                (leading.is_empty() || linear_prefix_arm(leading))
+                                    && !suite_contains_yield(leading)
+                                    && exit.value.as_ref().is_none_or(|value| {
+                                        !expression_contains_inline_branch(value)
+                                            && !expression_suspends_current_scope(value)
+                                    })
+                            };
                             // Erased assertions do not create an entry into the nested
                             // join; the remaining prefix still emits only linear work.
                             let ordinary_elided_linear_prefix = branch_index == 0
@@ -15015,8 +15026,9 @@ impl<'source> Compiler<'source> {
                                                 .all(|expression| matches!(expression.as_ref(), Expr::Name(name)
                                                     if name.id.as_str() != "__debug__"))))
                                 };
-                            // Earlier ordinary conditionals also merge before the final
-                            // test; they cannot enter the erased inner join directly.
+                            // Earlier ordinary conditionals merge before the final test
+                            // or return from the function. Neither path can enter the
+                            // erased inner join directly.
                             let ordinary_conditional_prefix = branch_index == 0
                                 && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                                 && !self.control.statements.in_match
@@ -15032,13 +15044,17 @@ impl<'source> Compiler<'source> {
                                     match statement {
                                         Stmt::If(prefix) => condition_has_linear_runtime_leaves(&prefix.test)
                                             && !expression_suspends_current_scope(&prefix.test)
-                                            && linear_prefix_arm(&prefix.body)
+                                            && (linear_prefix_arm(&prefix.body)
+                                                || returning_prefix_arm(&prefix.body))
                                             && !suite_contains_yield(&prefix.body)
                                             && (prefix.elif_else_clauses.is_empty()
                                                 || matches!(prefix.elif_else_clauses.as_slice(), [clause]
                                                     if clause.test.is_none()
                                                         && (linear_prefix_arm(&clause.body)
-                                                            || is_elided_suite(&clause.body))
+                                                            || is_elided_suite(&clause.body)
+                                                            || returning_prefix_arm(&clause.body))
+                                                        && !(returning_prefix_arm(&prefix.body)
+                                                            && returning_prefix_arm(&clause.body))
                                                         && !suite_contains_yield(&clause.body))),
                                         _ => (matches!(statement, Stmt::Global(global) if global.names.is_empty())
                                             && self.context.is_elided_statement(statement))

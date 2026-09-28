@@ -407,6 +407,10 @@ fn conditional_prefix_preserves_erased_nested_join() {
         "        if b:\n            value = obj.first\n",
         "        if b:\n            value = obj.first\n        else:\n            value = obj.second\n",
         "        if b:\n            value = obj.first\n            assert b\n        else:\n            value = obj.second\n            assert c\n",
+        "        if b:\n            return obj.first\n",
+        "        if b:\n            value = obj.first\n        else:\n            return obj.second\n",
+        "        if b:\n            value = obj.first\n            return value\n",
+        "        if b:\n            return obj.first\n        else:\n            value = obj.second\n",
     ] {
         let source = format!(
             "def f(a, b, c, obj):\n    if a:\n{prefix}        if c:\n            assert c\n        else:\n            assert b\n    else:\n        assert a\n    action()\n"
