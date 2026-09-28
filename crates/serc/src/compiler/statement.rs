@@ -4560,7 +4560,7 @@ impl<'source> Compiler<'source> {
                             || matches!(iterator.iter.as_ref(), Expr::Attribute(attribute)
                                 if matches!(attribute.value.as_ref(), Expr::Name(_)))
                             || matches!(iterator.iter.as_ref(), Expr::Call(call)
-                                if matches!(call.func.as_ref(), Expr::Name(_))))
+                                if matches!(call.func.as_ref(), Expr::Name(_) | Expr::Attribute(_))))
                         && !expression_contains_inline_branch(&iterator.iter)
                         && !expression_suspends_current_scope(&iterator.iter)
                         && (iterator.body.iter().all(|part| self.context.is_elided_statement(part))

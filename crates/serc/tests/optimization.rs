@@ -550,6 +550,24 @@ fn attribute_iterator_preserves_original_footer_location() {
 }
 
 #[test]
+fn method_iterator_preserves_original_footer_location() {
+    for (target, iterator, following) in [
+        ("item", "obj.items()", ""),
+        ("key, item", "obj.values.items()", ""),
+        ("key, item", "obj.values.items(argument)", ""),
+        ("key, item", "items(argument)", ""),
+        ("key, item", "values", ""),
+        ("key, item", "obj.values", ""),
+        ("key, item", "obj.values.items()", "    finish()\n"),
+    ] {
+        let source = format!(
+            "def f(obj, items, values, argument):\n    if obj.optional is not None:\n        assert obj\n    if obj.values:\n        for {target} in {iterator}:\n            assert item\n{following}"
+        );
+        assert_matches_cpython(&source, "method_iterator_footer.py", &LEVELS);
+    }
+}
+
+#[test]
 fn linear_for_method_arguments_preserve_original_footer_location() {
     for arguments in [
         "argument",
