@@ -8460,6 +8460,29 @@ fn empty_try_before_finalizer_work_keeps_normal_exit_owner() {
 }
 
 #[test]
+fn erased_suffix_preserves_original_function_return() {
+    let source = "async def f(first, second):\n    await prepare()\n    if second:\n        assert second\n    if first and not second:\n        assert first\n    else:\n        assert second\n    assert first\n";
+    for (index, source) in [
+        source.to_owned(),
+        source
+            .replace("async def", "def")
+            .replace("await prepare()", "prepare()"),
+        source.replace("    if second:\n        assert second\n", ""),
+        "async def f(first, second):\n    await prepare()\n    if second:\n        assert second\n    while first:\n        assert second\n    assert second\n".to_owned(),
+        "async def f(first, second):\n    await prepare()\n    if second:\n        assert second\n    while first:\n        if second:\n            break\n        work()\n    assert second\n".to_owned(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            &source,
+            &format!("erased_suffix_return_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn protected_erased_conditionals_preserve_repeated_join_predecessors() {
     let source = "async def f(manager, earlier, value, items):\n    async with manager:\n        await prepare()\n        if earlier:\n            assert ready()\n        if value is not None:\n            assert ready()\n        else:\n            assert other()\n        for item in items:\n            await consume(item)\n";
     for (index, source) in [

@@ -31,6 +31,7 @@ use crate::{CompileError, PythonVersion};
 
 use super::constant::{DeferredConstantTarget, OutputState, fold_constant, literal_constant};
 use super::definition::clean_doc;
+use super::expression::early_condition_truthiness;
 use super::scope::{
     LoweringFunctionPlan, NameId, NameInterner, NameSet, ScopeId,
     collect_conditional_simple_annotations, collect_simple_annotations, has_annotations,
@@ -994,6 +995,24 @@ impl<'source> Compiler<'source> {
             || (self.context.python_version == PythonVersion::Py312
                 && self.control.generators.generator_region_start.is_some()
                 && !self.control.statements.emitted_fallthrough_return);
+        if self.context.python_version == PythonVersion::Py312
+            && add_implicit_return
+            && self.assembler.location() == SourceLocation::NONE
+            && terminal_statement.is_some_and(is_elided_statement)
+            && let Some(Stmt::If(conditional)) = body
+                .iter()
+                .rev()
+                .find(|statement| !is_elided_statement(statement))
+            && early_condition_truthiness(&conditional.test).is_none()
+            && conditional.body.iter().all(is_elided_statement)
+            && matches!(conditional.elif_else_clauses.as_slice(), [clause]
+                if clause.test.is_none() && clause.body.iter().all(is_elided_statement))
+        {
+            // General If lowering leaves its original end label here when both
+            // arms and the suffix are erased. Keep that shared footer until
+            // native repeated predecessor counts decide which returns survive.
+            self.assembler.record_current_original_scope_exit();
+        }
         self.finish_inner(add_implicit_return)
     }
 
