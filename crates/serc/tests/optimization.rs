@@ -1907,6 +1907,26 @@ fn elided_assertions_preserve_terminal_loop_break_locations() {
 }
 
 #[test]
+fn elided_assertions_preserve_linear_assignment_return_boundary() {
+    let source = "def check(first, second):\n    if first:\n        if second:\n            left()\n        else:\n            right()\n        value = \"text\"\n        assert value\n    else:\n        other()\n";
+    for (index, source) in [
+        source.to_owned(),
+        source.replace("value = \"text\"", "value = second"),
+        source.replace("value = \"text\"", "value = choose()"),
+        source.replace("value = \"text\"", "value = \"left\" if second else \"right\""),
+        source.replace("value = \"text\"", "value = first or second"),
+        source.replace("        assert value\n", ""),
+        source.replace("        assert value\n", "        return\n"),
+        "def check(first, second):\n    if first:\n        other()\n    else:\n        if second:\n            left()\n        else:\n            right()\n        value = \"text\"\n        assert value\n".to_owned(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(&source, &format!("linear_assignment_assert_{index}.py"), &LEVELS);
+    }
+}
+
+#[test]
 fn elided_assertions_preserve_conditional_assignment_return_boundary() {
     for (case, source) in [
         "def f(flag, value):\n    if value is not None:\n        result = 1 if flag else 2\n        assert result\n",

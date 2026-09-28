@@ -3382,11 +3382,14 @@ impl<'source> Compiler<'source> {
             .rev()
             .find(|statement| !self.context.is_elided_statement(statement))
             .is_some_and(|statement| {
-                // Earlier name-store arms can still copy their short exit tail
-                // through the enclosing conditional's intervening jump.
+                // A conditional value can leave only STORE_FAST before the outer jump,
+                // so its copied return still fits four slots. A linear value needs a
+                // load as well; the replaced jump NOP pushes that exit over the limit.
                 matches!(statement, Stmt::Assign(assignment)
                     if !has_later_arm
                         || !matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                        || (!expression_contains_inline_branch(&assignment.value)
+                            && !expression_suspends_current_scope(&assignment.value))
                         || body.last().map(Ranged::range) == Some(assignment.range))
             });
         let elided_terminal_call = self.context.python_version >= crate::PythonVersion::Py314
