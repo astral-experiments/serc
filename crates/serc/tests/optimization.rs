@@ -23,6 +23,35 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn nested_erased_joins_inherit_conditional_successors() {
+    let source = r"def process(items, count, flags, kinds, enabled, limit):
+    with manager() as owner, manager():
+        for index, entry in enumerate(items):
+            if count > 0 and flags & kinds.first and enabled:
+                if index == limit:
+                    assert entry.left is not None
+                    assert entry.width == count
+                else:
+                    assert entry.left is None
+            assert entry.valid
+            if count > 0 and flags & kinds.second:
+                assert entry.right is not None
+            else:
+                assert entry.right is None
+";
+    for source in [
+        source.to_owned(),
+        source.replace("with manager() as owner, manager():", "with manager():"),
+        source.replace(
+            "for index, entry in enumerate(items):",
+            "while ready(items):\n            index, entry = next(items)",
+        ),
+    ] {
+        assert_matches_cpython(&source, "nested_conditional_successor.py", &LEVELS);
+    }
+}
+
+#[test]
 fn nested_erased_loop_joins_keep_the_manager_owner() {
     let source = r"def process(items, count, flags, kinds, enabled):
     with manager() as first, manager() as second, manager():

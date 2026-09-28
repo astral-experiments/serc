@@ -3374,7 +3374,14 @@ impl<'source> Compiler<'source> {
                         Some(Stmt::If(branch)) if condition_has_linear_runtime_leaves(&branch.test)
                             && !expression_suspends_current_scope(&branch.test))
                         || self.control.loops.split_loop_tail_conditional_predecessor
-                            == Some(statement.range()),
+                            == Some(statement.range())
+                        // A final nested If reaches the same following test without
+                        // crossing cleanup, just as it reaches a live successor.
+                        || (matches!(statement, Stmt::If(_))
+                            && elided_join_successor.is_none()
+                            && self.control.statements.context.same_region_continuation
+                                == Some(statement.range())
+                            && self.control.statements.context.elided_join_has_conditional_successor),
                     followed_by_direct_name_if: matches!(body.get(index + 1),
                         Some(Stmt::If(branch)) if matches!(branch.test.as_ref(), Expr::Name(name) if name.id.as_str() != "__debug__")
                             && branch.elif_else_clauses.is_empty()),
