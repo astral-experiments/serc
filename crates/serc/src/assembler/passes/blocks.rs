@@ -5671,6 +5671,15 @@ impl OptimizationPipeline {
                     .iter()
                     .rev()
                     .find_map(|item| match item {
+                        Item::Instruction(instruction)
+                            if instruction.fusion_policy.location_from_next()
+                                && instruction.location == SourceLocation::NONE
+                                && instruction.no_location_policy.preserves_location() =>
+                        {
+                            // An explicitly unlocated NEXT_LOCATION pop stops the earlier
+                            // pattern from donating to an erased body's copied loop exit.
+                            Some(SourceLocation::NONE)
+                        }
                         Item::Instruction(instruction) if instruction.location.line >= 0 => {
                             Some(instruction.location)
                         }

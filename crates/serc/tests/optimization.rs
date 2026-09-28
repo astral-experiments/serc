@@ -817,6 +817,34 @@ fn erased_match_capture_body_drops_redundant_success_nop() {
 }
 
 #[test]
+fn erased_match_cases_keep_unlocated_loop_exits() {
+    let source = r"def f(items):
+    for item in items:
+        match item:
+            case First() | Second():
+                item.value = 1
+            case Third():
+                assert item.value is not None
+            case Fourth():
+                pass
+            case _:
+                raise ValueError(item)
+";
+    for source in [
+        source.to_owned(),
+        source.replace("Third()", "Third() | Fifth()"),
+        source.replace("Third()", "Third(value)"),
+        source.replace("Third()", "3"),
+        source.replace("Third():", "Third() if valid(item):"),
+        source.replace("assert item.value is not None", "pass"),
+        source.replace("assert item.value is not None", "work(item)"),
+        format!("{source}        after(item)\n"),
+    ] {
+        assert_matches_cpython(&source, "erased_match_loop_exit.py", &LEVELS);
+    }
+}
+
+#[test]
 fn erased_match_cases_preserve_loop_backedges() {
     for body in [
         "assert item",
