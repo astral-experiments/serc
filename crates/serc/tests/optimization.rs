@@ -2704,6 +2704,50 @@ else:
 }
 
 #[test]
+fn erased_assertion_preserves_conditional_break_backedge_donor() {
+    let source = r#"def select(groups, expected):
+    for group in groups:
+        valid = True
+        for field in group:
+            if field.kind == "main":
+                value = decode(field)
+                if value != expected:
+                    report(value)
+                    valid = False
+                    break
+                assert value
+            elif field.kind == "extra":
+                if ready(field) and valid and expected:
+                    details = decode(field)
+                    if details not in known:
+                        known[details] = {}
+                    value = known[details]
+        if valid:
+            yield group
+"#;
+    for source in [
+        source.to_owned(),
+        source.replace("yield group", "consume(group)"),
+        source.replace("                assert value\n", ""),
+        source.replace(
+            "if value != expected:",
+            "if value != expected or invalid(field):",
+        ),
+        source.replace(
+            "if value != expected:",
+            "if (\n                    value\n                    != expected\n                ):",
+        ),
+        source.replace(
+            "                    report(value)\n                    valid = False\n",
+            "",
+        ),
+        source.replace("assert value", "consume(value)"),
+    ] {
+        assert_matches_cpython(&source, "conditional_break_backedge_donor.py", &LEVELS);
+    }
+}
+
+#[test]
 fn elided_assertions_preserve_terminal_loop_break_locations() {
     for (case, source) in [
         "def f(flag, items):\n    if flag:\n        for item in items:\n            if item:\n                break\n        assert flag\n",

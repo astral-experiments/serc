@@ -19717,6 +19717,29 @@ impl<'source> Compiler<'source> {
                     // Optimized-away assertions leave the nested loop's false edge
                     // as the donor for this branch's enclosing backedge.
                     self.assembler.set_location(self.source_location(range));
+                } else if self.context.python_version >= crate::PythonVersion::Py314
+                    && !try_body_normal_exit
+                    && self.control.in_loop_tail_without_nested_cleanup()
+                    && body
+                        .last()
+                        .is_some_and(|part| self.context.is_elided_statement(part))
+                    && let Some(Stmt::If(guard)) = body
+                        .iter()
+                        .rev()
+                        .find(|part| !self.context.is_elided_statement(part))
+                    && guard.elif_else_clauses.is_empty()
+                    && condition_has_linear_runtime_leaves(&guard.test)
+                    && !expression_suspends_current_scope(&guard.test)
+                    && original_condition_has_unique_jump_target(&guard.test, false)
+                    && matches!(guard.body.split_last(), Some((Stmt::Break(_), prefix))
+                        if (prefix.is_empty() || suite_has_linear_borrow_fallthrough(prefix))
+                            && suite_has_nonsuspending_conditional_work(prefix))
+                {
+                    // The break cannot reach this backedge. Erased assertions leave
+                    // the guard's unique false edge as its original location donor.
+                    self.assembler.set_location(
+                        self.source_location(condition_fallthrough_range(&guard.test)),
+                    );
                 } else if let Some(location) = self.assembler.last_instruction_location() {
                     self.assembler.set_location(location);
                 } else if let Some(statement) = body.last() {
