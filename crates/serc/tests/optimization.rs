@@ -12254,3 +12254,58 @@ fn erased_iterator_arms_stay_inside_enclosing_except_and_finally() {
         );
     }
 }
+
+#[test]
+fn erased_assert_suffix_preserves_pass_iterator_exits() {
+    assert_matches_cpython(
+        r"async def f(items, flag):
+    for item in items:
+        assert item
+        if flag:
+            if item is None:
+                pass
+            assert item is not None
+        else:
+            if item is not None:
+                pass
+            assert item is None
+    consume(items)
+",
+        "primary.py",
+        &LEVELS,
+    );
+    assert_matches_cpython(
+        r"def f(items, flag):
+    for item in items:
+        assert item
+        if flag:
+            if item is None:
+                pass
+            assert item is not None
+        else:
+            if item is not None:
+                pass
+            assert item is None
+    consume(items)
+",
+        "ordinary.py",
+        &LEVELS,
+    );
+    assert_matches_cpython(
+        r"async def f(items, flag):
+    async for item in items:
+        assert item
+        if flag:
+            if item is None:
+                pass
+            assert item is not None
+        else:
+            if item is not None:
+                pass
+            assert item is None
+    consume(items)
+",
+        "async_iterator.py",
+        &LEVELS,
+    );
+}

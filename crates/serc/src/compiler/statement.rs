@@ -16720,6 +16720,24 @@ impl<'source> Compiler<'source> {
                 && condition_has_only_runtime_tests(&statement.test)
                 && !expression_suspends_current_scope(&statement.test)
                 && (matches!(statement.body.as_slice(), [Stmt::Continue(_)])
+                    // A Pass before an erased suffix still reaches the original
+                    // iterator directly, in either arm of an enclosing condition.
+                    || (matches!(statement.body.as_slice(), [Stmt::Pass(_)])
+                        && matches!(self.unit.scope, Scope::Function { .. })
+                        && !mode.try_body_normal_exit
+                        && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+                        && !self.control.in_exception_handler()
+                        && self.control.finally.is_inactive_for_return_unwind()
+                        && self.control.finally.active_finally_try_bodies == 0
+                        && self.control.in_loop_tail_without_nested_cleanup()
+                        && self.control.loops.contexts.last().is_some_and(|context| {
+                            context.iterator_cleanup != IteratorCleanup::None
+                                && context.continue_label == restart
+                        })
+                        && condition_has_linear_runtime_leaves(&statement.test)
+                        && original_condition_has_unique_jump_target(&statement.test, true)
+                        && original_condition_has_unique_jump_target(&statement.test, false)
+                        && body[end + 1..].iter().all(|suffix| self.context.is_elided_statement(suffix)))
                     // A non-final iterator arm keeps both inner exits even when
                     // its erased suffix sits under the surrounding loop owner.
                     || (mode.non_final_branch
