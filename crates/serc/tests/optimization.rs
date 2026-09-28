@@ -38,6 +38,16 @@ fn elided_finally_assertion_preserves_exceptional_exit_locations() {
 }
 
 #[test]
+fn folded_negated_comprehension_filter_preserves_operand_location() {
+    for condition in ["not __debug__", "not True", "not False", "False"] {
+        let source = format!(
+            "def collect(mapping, items):\n    result = [\n        item for item in items\n        if mapping.get(item)\n        and {condition}\n    ]\n    return result\n"
+        );
+        assert_matches_cpython(&source, "folded_negated_comprehension_filter.py", &LEVELS);
+    }
+}
+
+#[test]
 fn folded_comprehension_and_tail_preserves_borrow_boundary() {
     for (index, source) in [
         "def collect(mapping, items):\n    result = [item for item in items if mapping.get(item) and not __debug__]\n    return result\n",

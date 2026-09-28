@@ -6453,7 +6453,8 @@ impl Compiler<'_> {
         }
         if comprehension_filter_truthiness(condition) == Some(false) {
             self.record_folded_value(condition)?;
-            let condition_location = self.source_location(condition.range());
+            let condition_location =
+                self.source_location(synthetic_condition_exit_range(condition));
             if condition_location.line != element_location.line {
                 self.assembler.set_location(condition_location);
                 self.emit(NOP, 0, 0)?;
