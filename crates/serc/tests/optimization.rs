@@ -817,6 +817,21 @@ fn elided_assertion_after_nested_iterator_preserves_condition_backedges() {
 }
 
 #[test]
+fn coroutine_erased_while_else_normalizes_protected_backedges() {
+    let source = "async def f(receive, process):\n    try:\n        while True:\n            value = receive()\n            if isinstance(value, (list, tuple)):\n                first, second, third = value\n                assert third is not None\n                await process(first=first, second=second, third=third)\n            else:\n                assert False, value\n    except ValueError:\n        report()\n";
+    for source in [
+        source.to_owned(),
+        source.replace("while True:", "while receive.enabled:"),
+        source.replace("first, second, third = value", "third = value"),
+        source.replace("await process(", "result = await process("),
+        source.replace("await ", ""),
+        source.replace("assert False, value", "pass"),
+    ] {
+        assert_matches_cpython(&source, "coroutine_protected_while_else.py", &LEVELS);
+    }
+}
+
+#[test]
 fn erased_while_else_normalizes_protected_backedges() {
     let source = "def process(state):\n    with guard():\n        while True:\n            value = receive()\n            if value == \"start\":\n                work()\n            elif value == \"stop\":\n                other()\n            else:\n                assert False, value\n";
     for (index, source) in [

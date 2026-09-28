@@ -18792,7 +18792,7 @@ impl<'source> Compiler<'source> {
         // or try owner. Erased prefixes add no instruction slots to those arms.
         let protected_while_loop_else = eligible_else
             && matches!(self.unit.scope, Scope::Function { .. })
-            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
             && (self.control.in_synchronous_with()
                 || !self
                     .control
@@ -18823,6 +18823,10 @@ impl<'source> Compiler<'source> {
                                 || suite_has_completed_manager_loop_work(std::slice::from_ref(
                                     statement,
                                 ))
+                                || (self.unit.flags & CO_COROUTINE != 0
+                                    && suite_has_linear_borrow_fallthrough(std::slice::from_ref(
+                                        statement,
+                                    )))
                         })
                 });
         let optimized_empty_else = eligible_else
