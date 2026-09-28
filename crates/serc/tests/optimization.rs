@@ -942,6 +942,37 @@ fn conditional_prefix_preserves_erased_nested_join() {
 }
 
 #[test]
+fn erased_prefix_preserves_constructed_raise_return_copies() {
+    const SOURCE: &str = "def f(obj):\n    if obj.count is not None:\n        assert obj.ready\n    if check(obj.child):\n        if obj.count is not None:\n            raise ValueError(\"count\")\n        values = obj.child.values\n        if any(value % obj.scale for value in values):\n            raise ValueError(\"scale\")\n        if any(value < obj.lower for value in values):\n            raise ValueError(\"lower\")\n        if obj.upper is not None and any(value > obj.upper for value in values):\n            raise ValueError(\"upper\")\n";
+    let prefix = "    if obj.count is not None:\n        assert obj.ready\n";
+    let mut method = "class C:\n".to_owned();
+    for line in SOURCE.lines() {
+        writeln!(method, "    {line}").unwrap();
+    }
+    for (index, source) in [
+        SOURCE.to_owned(),
+        SOURCE
+            .replace("any(value % obj.scale for value in values)", "check(values)")
+            .replace("any(value < obj.lower for value in values)", "check(values)")
+            .replace("any(value > obj.upper for value in values)", "check(values)"),
+        SOURCE.replace("check(obj.child)", "check(obj.child, obj.count, ready=True)"),
+        SOURCE.replace("value > obj.upper for value in values", "(value if value else obj.upper) > obj.upper for value in values if value and obj.ready"),
+        SOURCE.replace(prefix, ""),
+        SOURCE.replace("        assert obj.ready\n", "        pass\n"),
+        SOURCE.replace("        assert obj.ready\n", "        obj.prepare()\n"),
+        format!("{SOURCE}    finish()\n"),
+        "def f(a, b, c):\n    if a:\n        assert a\n    if b:\n        if c:\n            raise ValueError(\"bad\")\n".to_owned(),
+        "def f(obj):\n    if obj.ready:\n        assert obj.ready\n    if obj.open:\n        if obj.bad:\n            raise obj.error\n".to_owned(),
+        method,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(&source, &format!("constructed_raise_scope_exit_{index}.py"), &LEVELS);
+    }
+}
+
+#[test]
 fn erased_condition_before_nested_raise_preserves_scope_exit() {
     for prefix in [
         "    if a:\n        assert a\n",

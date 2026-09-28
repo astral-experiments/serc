@@ -4119,26 +4119,34 @@ impl<'source> Compiler<'source> {
     /// Identifies a shared scope exit after flat guards and a nested raising branch.
     fn has_nested_raising_if_scope_exit(statement: &ruff_python_ast::StmtIf) -> bool {
         let runtime_name = |expression: &Expr| matches!(expression, Expr::Name(name) if name.id.as_str() != "__debug__");
-        let name_call = |expression: &Expr| {
-            matches!(expression, Expr::Call(call)
-                if runtime_name(&call.func)
-                    && matches!(call.arguments.args.as_ref(), [argument] if runtime_name(argument))
-                    && call.arguments.keywords.is_empty())
+        let runtime_test = |expression: &Expr| {
+            // A lazy generator runs only its first iterable in this scope.
+            // Its element and filter branches cannot reach the scope footer.
+            let generator_call = matches!(expression, Expr::Call(call)
+            if runtime_name(&call.func)
+                && call.arguments.keywords.is_empty()
+                && matches!(call.arguments.args.as_ref(), [Expr::Generator(generator)]
+                    if generator.generators.iter().all(|generator| !generator.is_async)
+                        && generator.generators.first().is_some_and(|first| {
+                            !expression_contains_inline_branch(&first.iter)
+                                && !expression_suspends_current_scope(&first.iter)
+                        })));
+            (condition_has_linear_runtime_leaves(expression) || generator_call)
+                && condition_jump_target_count(expression, false) == 1
+                && condition_jump_target_count(expression, true) == 1
+                && !expression_suspends_current_scope(expression)
         };
-        let not_none = |expression: &Expr| {
-            matches!(expression, Expr::Compare(comparison)
-                if runtime_name(comparison.first_operand())
-                    && matches!(comparison.ops.as_ref(), [CmpOp::IsNot])
-                    && matches!(comparison.comparators(), [Expr::NoneLiteral(_)]))
-        };
-        let raises_name = |body: &[Stmt]| {
+        let raises = |body: &[Stmt]| {
             matches!(body, [Stmt::Raise(raised)]
-                if raised.exc.as_deref().is_some_and(runtime_name)
+                if raised.exc.as_deref().is_some_and(|expression| {
+                    !expression_contains_inline_branch(expression)
+                        && !expression_suspends_current_scope(expression)
+                })
                     && raised.cause.is_none())
         };
         if !statement.elif_else_clauses.is_empty()
             || early_condition_truthiness(&statement.test).is_some()
-            || !(runtime_name(&statement.test) || name_call(&statement.test))
+            || !runtime_test(&statement.test)
         {
             return false;
         }
@@ -4146,19 +4154,16 @@ impl<'source> Compiler<'source> {
             return false;
         };
         let inner_test = match inner.test.as_ref() {
-            Expr::Name(_) => runtime_name(&inner.test),
             Expr::BoolOp(boolean) if boolean.op == BoolOp::And => {
                 matches!(boolean.values.as_slice(), [left, right]
-                    if runtime_name(left) && runtime_name(right))
-                    || matches!(boolean.values.as_slice(), [left, right]
-                        if not_none(left) && name_call(right))
+                    if runtime_test(left) && runtime_test(right))
             }
-            _ => false,
+            _ => runtime_test(&inner.test),
         };
         if !inner_test
             || early_condition_truthiness(&inner.test).is_some()
             || !inner.elif_else_clauses.is_empty()
-            || !raises_name(&inner.body)
+            || !raises(&inner.body)
         {
             return false;
         }
@@ -4167,16 +4172,15 @@ impl<'source> Compiler<'source> {
             Stmt::If(guard) => {
                 guard.elif_else_clauses.is_empty()
                     && early_condition_truthiness(&guard.test).is_none()
-                    && (runtime_name(&guard.test)
-                        || not_none(&guard.test)
-                        || name_call(&guard.test))
-                    && raises_name(&guard.body)
+                    && runtime_test(&guard.test)
+                    && raises(&guard.body)
             }
             Stmt::Assign(assignment) if !has_assignment => {
                 has_assignment = true;
                 matches!(assignment.targets.as_slice(), [target] if runtime_name(target))
                     && matches!(assignment.value.as_ref(), Expr::Attribute(attribute)
-                        if runtime_name(&attribute.value))
+                        if !expression_contains_inline_branch(&attribute.value)
+                            && !expression_suspends_current_scope(&attribute.value))
             }
             _ => false,
         })
