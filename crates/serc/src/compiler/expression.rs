@@ -6038,23 +6038,14 @@ impl Compiler<'_> {
                 )?;
                 self.assembler.mark(next);
             }
-            let empty_folded_tail = jump_constant_truthiness(last)
-                .is_some_and(|truthiness| truthiness != negated)
-                && self.assembler.at_empty_borrow_block();
-            self.compile_filter_condition(
+            return self.compile_filter_condition(
                 last,
                 element_location,
                 (accepted, restart),
                 include_comprehension_cleanup,
                 include_protected_region_exclusion,
                 negated,
-            )?;
-            if empty_folded_tail {
-                // The last Boolean operand has its own original fallthrough block.
-                // Removing its folded condition stops borrowing through that block.
-                self.assembler.mark_last_nop_borrow_barrier_if_removed();
-            }
-            return Ok(());
+            );
         }
         if let Expr::BoolOp(boolean) = condition
             && (boolean.op == BoolOp::And) == negated
@@ -6101,10 +6092,14 @@ impl Compiler<'_> {
             self.record_folded_value(operand)?;
             let operand_location = self.source_location(operand.range());
             if truthiness != negated {
+                let empty_folded_block = self.assembler.at_empty_borrow_block();
                 self.assembler
                     .record_exception_owner_block_boundary(accepted);
                 self.assembler.set_location(operand_location);
                 self.emit(NOP, 0, 0)?;
+                if empty_folded_block {
+                    self.assembler.mark_last_nop_borrow_barrier_if_removed();
+                }
             } else {
                 if operand_location.line != element_location.line {
                     self.assembler.set_location(operand_location);
@@ -6469,6 +6464,7 @@ impl Compiler<'_> {
             return Ok(());
         }
         if comprehension_filter_truthiness(condition) == Some(true) {
+            let empty_folded_block = self.assembler.at_empty_borrow_block();
             // The removed filter jump still separates the original instruction arrays.
             self.assembler
                 .record_exception_owner_block_boundary(accepted);
@@ -6479,6 +6475,10 @@ impl Compiler<'_> {
                 self.assembler
                     .set_location(self.source_location(condition.range()));
                 self.emit(NOP, 0, 0)?;
+            }
+            if empty_folded_block {
+                // Removing a folded operand can empty any original filter block.
+                self.assembler.mark_last_nop_borrow_barrier_if_removed();
             }
             return Ok(());
         }
@@ -6502,21 +6502,14 @@ impl Compiler<'_> {
                 )?;
                 self.assembler.mark(next);
             }
-            let empty_folded_tail = comprehension_filter_truthiness(last) == Some(true)
-                && self.assembler.at_empty_borrow_block();
-            self.compile_comprehension_filter(
+            return self.compile_comprehension_filter(
                 last,
                 element_location,
                 accepted,
                 restart,
                 include_with_region_exclusion,
                 include_protected_region_exclusion,
-            )?;
-            if empty_folded_tail {
-                // Removing the final folded operand empties its original fallthrough block.
-                self.assembler.mark_last_nop_borrow_barrier_if_removed();
-            }
-            return Ok(());
+            );
         }
         if let Expr::BoolOp(boolean) = condition
             && boolean.op == BoolOp::Or
