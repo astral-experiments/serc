@@ -1453,7 +1453,12 @@ mod tests {
                 None,
                 false,
             );
-            assert_eq!(without_dump.kind, OutcomeKind::ByteMismatch);
+            assert_eq!(
+                without_dump.kind,
+                OutcomeKind::ByteMismatch,
+                "source_bytes={source_bytes}; first compare: {}",
+                without_dump.detail
+            );
             assert!(without_dump.mismatch_bytes.is_none());
             let mut outcome = super::compare(
                 &path,
@@ -1464,7 +1469,12 @@ mod tests {
                 None,
                 true,
             );
-            assert_eq!(outcome.kind, OutcomeKind::ByteMismatch);
+            assert_eq!(
+                outcome.kind,
+                OutcomeKind::ByteMismatch,
+                "source_bytes={source_bytes}; retained compare: {}",
+                outcome.detail
+            );
             fs::write(&oracle, "#!/bin/sh\nprintf 'other oracle bytes'\n").unwrap();
             let mut second_outcome = super::compare(
                 &second_path,
@@ -1475,7 +1485,12 @@ mod tests {
                 None,
                 true,
             );
-            assert_eq!(second_outcome.kind, OutcomeKind::ByteMismatch);
+            assert_eq!(
+                second_outcome.kind,
+                OutcomeKind::ByteMismatch,
+                "source_bytes={source_bytes}; second compare: {}",
+                second_outcome.detail
+            );
 
             let dump = directory
                 .path()
