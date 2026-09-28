@@ -99,6 +99,16 @@ fn erased_assertions_preserve_manager_while_exit() {
 }
 
 #[test]
+fn elided_handler_assertion_preserves_conditional_cleanup() {
+    for suffix in ["assert value in str(error)", "pass", "after()"] {
+        let source = format!(
+            "async def f(manager, other, value):\n    async with manager:\n        try:\n            async with await other():\n                work()\n        except Error as error:\n            if value in str(error):\n                recover()\n            {suffix}\n"
+        );
+        assert_matches_cpython(&source, "handler_conditional_cleanup.py", &LEVELS);
+    }
+}
+
+#[test]
 fn elided_handler_assertion_preserves_while_break_cleanup() {
     for suffix in ["assert found", "pass", "after()"] {
         let source = format!(

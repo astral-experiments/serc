@@ -27387,8 +27387,12 @@ impl<'source> Compiler<'source> {
             // A normal continuation can outlive the currently lowered suite. It still
             // shares this cleanup's condition and body exits. A surrounding cleanup beyond
             // a loop backedge is different: each copied backedge keeps its predecessor span.
+            // Elided assertions add no instruction between the conditional join
+            // and its artificial cleanup, so they cannot supply its location.
             let handler_ends_with_unlocated_if_cleanup = matches!(
-                handler.body.last(),
+                handler.body.iter().rev().find(|statement| {
+                    !self.context.is_elided_statement(statement)
+                }),
                 Some(Stmt::If(tail))
                     if loop_tail.is_none()
                         && early_condition_truthiness(&tail.test) != Some(true)
