@@ -14859,7 +14859,7 @@ impl<'source> Compiler<'source> {
                     // successor or an inner manager's exit keeps the common
                     // end block from becoming a copied, unlocated loop backedge.
                     // A lexical successor alone is insufficient: it may also vanish.
-                    // A following conditional stays in the iterator's original
+                    // A following conditional stays in the loop's original
                     // protected region even when a try encloses the manager.
                     let elided_join_has_forward_continuation = self
                         .control
@@ -14888,9 +14888,11 @@ impl<'source> Compiler<'source> {
                                         .is_empty()
                                     && self.control.loops.contexts.last().is_some_and(
                                         |context| {
-                                            context.iterator_cleanup == IteratorCleanup::Sync
-                                                && context.with_depth
-                                                    == self.control.withs.active_with_exits.len()
+                                            matches!(
+                                                context.iterator_cleanup,
+                                                IteratorCleanup::None | IteratorCleanup::Sync
+                                            ) && context.with_depth
+                                                == self.control.withs.active_with_exits.len()
                                                 && context.exception_region_depth
                                                     == self
                                                         .control

@@ -23,6 +23,16 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn erased_branches_preserve_protected_while_join() {
+    for loop_test in ["True", "flag", "flag != stop"] {
+        let source = format!(
+            "def f(manager, flag, stop):\n    with manager:\n        while {loop_test}:\n            if flag:\n                assert flag\n            else:\n                assert stop\n            if stop:\n                break\n            else:\n                print(flag)\n"
+        );
+        assert_matches_cpython(&source, "protected_while_join.py", &LEVELS);
+    }
+}
+
+#[test]
 fn annotated_comprehension_preserves_implicit_return_location() {
     let source = "async def collect(items, fields):\n    await prepare()\n    result: list[tuple] = [\n        tuple(item for field in fields)\n        for item in items\n    ]\n    assert result\n";
     for (index, source) in [
