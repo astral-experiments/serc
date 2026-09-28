@@ -15345,6 +15345,36 @@ impl<'source> Compiler<'source> {
                         .iter()
                         .rposition(|part| !self.context.is_elided_statement(part))
                         .map_or(0, |index| index + 1)];
+                    // A coroutine's implicit exception wrapper does not enter the
+                    // populated inner If's empty end array. With only linear,
+                    // nonsuspending work, its false arm remains the sole donor
+                    // after the other arm threads past the erased outer else.
+                    let coroutine_populated_nested_join = self.unit.flags
+                        & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                        == CO_COROUTINE
+                        && branch_index == 0
+                        && !self.control.statements.in_match
+                        && self.control.loops.contexts.is_empty()
+                        && self.control.withs.active_with_exits.is_empty()
+                        && self.control.withs.active_with_region_exclusions.is_empty()
+                        && self
+                            .control
+                            .exceptions
+                            .active_exception_region_exclusions
+                            .is_empty()
+                        && self.control.finally.is_inactive_for_return_unwind()
+                        && matches!(effective_nested_else_body.split_last(), Some((Stmt::If(nested), leading))
+                            if leading.iter().all(|part| {
+                                self.context.is_elided_statement(part)
+                                    || (suite_has_linear_borrow_fallthrough(std::slice::from_ref(part))
+                                        && suite_has_nonsuspending_conditional_work(std::slice::from_ref(part)))
+                            })
+                                && suite_has_linear_borrow_fallthrough(&nested.body)
+                                && suite_has_nonsuspending_conditional_work(&nested.body)
+                                && matches!(nested.elif_else_clauses.as_slice(), [clause]
+                                    if clause.test.is_none()
+                                        && suite_has_linear_borrow_fallthrough(&clause.body)
+                                        && suite_has_nonsuspending_conditional_work(&clause.body)));
                     let coroutine_elided_nested_join = self.unit.flags
                         & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                         == CO_COROUTINE
@@ -15369,6 +15399,7 @@ impl<'source> Compiler<'source> {
                     // unchanged. Only expose that tail to this ordinary certificate;
                     // the complete body still compiles with its original boundaries.
                     let nested_else_body = if coroutine_elided_nested_join
+                        || coroutine_populated_nested_join
                         || (self.context.python_version >= crate::PythonVersion::Py314
                             && branch_index == 0
                             && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
@@ -15438,7 +15469,8 @@ impl<'source> Compiler<'source> {
                             == 0
                             && !self.has_active_control_flow_region())
                             || coroutine_elided_nested_join
-                            || direct_finally_nested_join)
+                            || direct_finally_nested_join
+                            || coroutine_populated_nested_join)
                         && (self.control.loops.contexts.is_empty()
                             || async_iterator_forward_join
                             || ordinary_loop_forward_join)
@@ -15666,6 +15698,7 @@ impl<'source> Compiler<'source> {
                             (leading.is_empty()
                                 || is_elided_suite(leading)
                                 || coroutine_elided_nested_join
+                                || coroutine_populated_nested_join
                                 || populated_arm(leading)
                                 || ordinary_elided_linear_prefix
                                 || ordinary_assigned_conditional_prefix

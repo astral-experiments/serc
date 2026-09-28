@@ -761,6 +761,16 @@ fn erased_finally_branch_preserves_conditional_continuation() {
 }
 
 #[test]
+fn coroutine_populated_nested_branch_preserves_erased_join() {
+    for condition in ["isinstance(item, dict)", "accept(item)"] {
+        let source = format!(
+            "async def normalize(record):\n    await prepare()\n    if record.values is not None:\n        assert record.values\n        item = record.values[0]\n        if {condition}:\n            label = item.get(\"label\")\n        else:\n            label = getattr(item, \"label\", None)\n        assert label\n    else:\n        assert record.values is None\n    await finish()\n"
+        );
+        assert_matches_cpython(&source, "coroutine_populated_nested_join.py", &LEVELS);
+    }
+}
+
+#[test]
 fn erased_assertion_preserves_legacy_loop_return_copies() {
     let source = "def f(worker):\n    if not worker.ready:\n        value = worker.read()\n        while value not in [\"a\", \"b\"]:\n            value = worker.read()\n        assert value == \"a\"\n";
     for (index, source) in [
