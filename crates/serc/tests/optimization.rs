@@ -555,6 +555,24 @@ fn conditional_prefixes_with_erased_else_preserve_nested_join() {
 }
 
 #[test]
+fn completed_branch_work_preserves_original_call_footer() {
+    for source in [
+        "def f(a, b, c, obj, items):\n    if a:\n        assert a\n    if b:\n        if c:\n            obj.work()\n        obj.finish()\n",
+        "def f(a, b, c, obj, items):\n    if a:\n        assert a\n    if b:\n        with obj:\n            obj.work()\n        obj.finish()\n",
+        "def f(a, b, c, obj, items):\n    if a:\n        assert a\n    if b:\n        with obj:\n            with obj.other:\n                obj.work()\n        obj.finish()\n",
+        "def f(a, b, c, obj, items):\n    if a:\n        assert a\n    if b:\n        for item in items:\n            if item:\n                continue\n            obj.work(item)\n        obj.finish()\n",
+        "def f(a, b, c, obj, items):\n    if a:\n        assert a\n    if b:\n        obj.work([item for item in items])\n        obj.finish()\n",
+        "def f(a, b, c, obj, items):\n    if a:\n        assert a\n    if b:\n        with obj:\n            with obj.other:\n                for item in items:\n                    if item:\n                        continue\n                    obj.work(item)\n        obj.work([item for item in items])\n        obj.finish()\n",
+        "def f(a, b, c, obj, items):\n    if b:\n        with obj:\n            obj.work()\n        obj.finish()\n",
+        "def f(a, b, c, obj, items):\n    if a:\n        pass\n    if b:\n        with obj:\n            obj.work()\n        obj.finish()\n",
+        "def f(a, b, c, obj, items):\n    if a:\n        assert a\n    if b:\n        with obj:\n            obj.work()\n        obj.finish()\n    obj.after()\n",
+        "def f(a, b, c, obj, items):\n    with obj:\n        if a:\n            assert a\n        if b:\n            if c:\n                obj.work()\n            obj.finish()\n",
+    ] {
+        assert_matches_cpython(source, "completed_branch_call_footer.py", &LEVELS);
+    }
+}
+
+#[test]
 fn erased_assertions_inside_terminal_call_suite_preserve_footer() {
     for prefix in [
         "    if a:\n        assert a\n",

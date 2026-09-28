@@ -1902,16 +1902,27 @@ impl OptimizationPipeline {
             let Some((block, instruction)) = instructions.next() else {
                 continue;
             };
+            // Completed SETUP regions do not own a later original scope footer.
+            // Its repeated count still prevents the final call's line donation.
+            let original_scope_exit = fragments.iter().any(|block| {
+                self.graph[*block].items().iter().any(|item| {
+                    matches!(item, Item::Label(label)
+                        if self.original_scope_exit_labels.contains(label))
+                })
+            });
             if instructions.next().is_none()
                 && (matches!(
                     instruction.opcode,
                     JUMP_BACKWARD | JUMP_BACKWARD_NO_INTERRUPT
-                ) || (instruction.opcode == JUMP_FORWARD && wrapper.is_none()))
+                ) || (wrapper.is_none()
+                    && (instruction.opcode == JUMP_FORWARD
+                        || (instruction.opcode == RETURN_CONST && original_scope_exit))))
                 && instruction.location == SourceLocation::NONE
             {
                 let mut expected = *instruction;
-                let counts = if instruction.opcode == JUMP_FORWARD {
-                    if let Operand::Forward(target) = instruction.operand()
+                let counts = if matches!(instruction.opcode, JUMP_FORWARD | RETURN_CONST) {
+                    if instruction.opcode == JUMP_FORWARD
+                        && let Operand::Forward(target) = instruction.operand()
                         && label_group(target) == Some(index + 1)
                     {
                         // Native removes this jump after reachability. Its exact

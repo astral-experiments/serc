@@ -4360,16 +4360,8 @@ impl<'source> Compiler<'source> {
                 .body
                 .iter()
                 .rposition(|part| !self.context.is_elided_statement(part))
-            // The final call supplies runtime work; erased assertions inside
-            // its linear suite do not introduce a control-flow boundary.
-            && statement.body[..=last].iter().all(|part| {
-                (self.context.is_elided_statement(part)
-                    && matches!(part, Stmt::Global(declaration) if declaration.names.is_empty()))
-                    || matches!(part, Stmt::Pass(_))
-                    || matches!(part, Stmt::Expr(expression)
-                        if !expression_contains_inline_branch(&expression.value))
-                    || suite_has_linear_borrow_fallthrough(std::slice::from_ref(part))
-            })
+            // The final call finishes before the shared footer, including after
+            // completed conditionals, loops, or managers in the same branch.
             && matches!(&statement.body[last], Stmt::Expr(expression)
                 if matches!(expression.value.as_ref(), Expr::Call(_))
                     && !expression_contains_inline_branch(&expression.value)
@@ -4388,6 +4380,7 @@ impl<'source> Compiler<'source> {
             // An earlier empty conditional can queue this condition twice, so
             // its call arm cannot always donate a location to the original exit.
             self.compile_if(statement)?;
+            self.assembler.record_current_original_scope_exit();
             self.assembler.set_location(SourceLocation::NONE);
             return self.emit_deferred_implicit_return();
         }
