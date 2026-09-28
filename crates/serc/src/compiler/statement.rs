@@ -2272,7 +2272,8 @@ impl<'source> Compiler<'source> {
                     .iter()
                     .all(|statement| self.context.is_elided_statement(statement));
             // Each false edge of a terminal finally loop supplies its own return
-            // location. Erased assertions after the try do not share those exits.
+            // location. Linear cleanup before the loop and erased assertions after
+            // the try body or the try itself do not share those exits.
             let terminal_finally_while_before_elided = self.context.python_version
                 >= crate::PythonVersion::Py314
                 && !is_final
@@ -2282,17 +2283,22 @@ impl<'source> Compiler<'source> {
                 && !self.control.in_exception_handler()
                 && self.control.finally.is_inactive_for_return_unwind()
                 && matches!(statement, Stmt::Try(statement)
-                    if !statement.is_star
-                        && statement.handlers.is_empty()
-                        && statement.orelse.is_empty()
-                        && suite_has_linear_borrow_fallthrough(&statement.body)
-                        && matches!(statement.finalbody.as_slice(), [Stmt::While(loop_statement)]
-                            if loop_statement.orelse.is_empty()
-                                && matches!(loop_statement.test.as_ref(), Expr::BoolOp(boolean)
-                                    if boolean.op == BoolOp::And && boolean.values.len() > 1)
-                                && condition_has_linear_runtime_leaves(&loop_statement.test)
-                                && !expression_suspends_current_scope(&loop_statement.test)
-                                && suite_has_linear_borrow_fallthrough(&loop_statement.body)))
+                if !statement.is_star
+                    && statement.handlers.is_empty()
+                    && statement.orelse.is_empty()
+                    && statement.body.iter()
+                        .rposition(|statement| !self.context.is_elided_statement(statement))
+                        .is_some_and(|last| suite_has_linear_borrow_fallthrough(&statement.body[..=last]))
+                    && statement.finalbody.split_last().is_some_and(|(tail, prefix)| {
+                        (prefix.is_empty() || suite_has_linear_borrow_fallthrough(prefix))
+                            && matches!(tail, Stmt::While(loop_statement)
+                        if loop_statement.orelse.is_empty()
+                            && matches!(loop_statement.test.as_ref(), Expr::BoolOp(boolean)
+                                if boolean.op == BoolOp::And && boolean.values.len() > 1)
+                            && condition_has_linear_runtime_leaves(&loop_statement.test)
+                            && !expression_suspends_current_scope(&loop_statement.test)
+                            && suite_has_linear_borrow_fallthrough(&loop_statement.body))
+                    }))
                 && body[index + 1..]
                     .iter()
                     .all(|statement| self.context.is_elided_statement(statement));

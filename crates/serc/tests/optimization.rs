@@ -1840,6 +1840,33 @@ fn terminal_finally_and_loop_preserves_returns_before_removed_assertions() {
 }
 
 #[test]
+fn terminal_finally_loop_after_linear_cleanup_preserves_returns() {
+    let source = "def f(state):\n    try:\n        value = work()\n        assert value\n    finally:\n        state.close()\n        deadline = clock() + 2\n        while state.active and clock() < deadline:\n            pause()\n    assert not state.active\n";
+    for (index, source) in [
+        source.to_owned(),
+        source.replace("        assert value\n", ""),
+        source.replace(
+            "        state.close()\n        deadline = clock() + 2\n",
+            "",
+        ),
+        source.replace("    assert not state.active\n", "    consume(state)\n"),
+        source.replace(
+            "            pause()\n",
+            "            pause()\n        finish()\n",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            &source,
+            &format!("finally_loop_cleanup_return_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn terminating_if_before_erased_assertions_preserves_the_legacy_footer() {
     for body in [
         "return None",
