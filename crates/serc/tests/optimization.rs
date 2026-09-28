@@ -43,6 +43,22 @@ fn nested_erased_conditions_preserve_manager_join() {
 }
 
 #[test]
+fn erased_iterator_else_preserves_conditional_call_argument_join() {
+    for definition in ["def", "async def"] {
+        for call in [
+            "receiver.send(value=item, option=factory() if factory else None)",
+            "consume(item, factory() if factory else None)",
+            "receiver.send(value=item, option=factory())",
+        ] {
+            let source = format!(
+                "{definition} f(manager, items, receiver, factory):\n    with manager:\n        for item in items:\n            if check(item):\n                consume(item)\n            elif receiver is not None:\n                assert item\n                {call}\n            else:\n                assert factory\n"
+            );
+            assert_matches_cpython(&source, "conditional_argument_iterator.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn erased_inner_iterator_body_preserves_outer_condition_backedge() {
     for definition in ["def", "async def"] {
         for body in ["assert value", "pass", "emit(value)"] {

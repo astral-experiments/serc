@@ -18610,6 +18610,8 @@ impl<'source> Compiler<'source> {
         // A completed inner for owns its iterator cleanup only on the true edge;
         // the erased false edge still reaches the outer iterator directly.
         // An erased or pass-only body still completes that iterator cleanup.
+        // A conditional call argument rejoins before the call's discarded result,
+        // so its internal branches also stay separate from the erased false edge.
         let protected_iterator_work_else = eligible_else
             && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
             && self.control.in_loop_tail_without_nested_cleanup()
@@ -18626,6 +18628,8 @@ impl<'source> Compiler<'source> {
                     && final_body.iter().all(|statement| {
                         self.context.is_elided_statement(statement)
                             || suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement))
+                            || matches!(statement, Stmt::Expr(expression)
+                                if cleanup_conditional_argument_has_eager_call_prefix(&expression.value))
                             || matches!(statement, Stmt::For(inner)
                                 if !inner.is_async
                                     && inner.orelse.is_empty()
