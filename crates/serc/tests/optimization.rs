@@ -23,6 +23,23 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn erased_loop_branch_before_condition_keeps_protected_join() {
+    for condition in ["first", "first and third", "first or third", "not first"] {
+        for gap in ["", "                assert third\n"] {
+            let source = format!(
+                "def f(manager, items, first, second, third):\n    try:\n        with manager:\n            for item in items:\n                if {condition}:\n                    assert first\n                else:\n                    assert second\n{gap}                if second:\n                    assert second\n                else:\n                    assert first\n    except Exception:\n        recover()\n"
+            );
+            assert_matches_cpython(&source, "erased_loop_condition_join.py", &LEVELS);
+        }
+    }
+    assert_matches_cpython(
+        "def f(manager, items, first, second):\n    with manager:\n        try:\n            for item in items:\n                if first:\n                    assert first\n                else:\n                    assert second\n                if second:\n                    assert second\n                else:\n                    assert first\n        except Exception:\n            recover()\n",
+        "erased_loop_condition_inner_try.py",
+        &LEVELS,
+    );
+}
+
+#[test]
 fn erased_suffix_preserves_with_pop_block() {
     let source = "def check(manager):\n    with manager:\n        try:\n            action()\n        except OSError as error:\n            assert error\n        else:\n            raise AssertionError()\n        assert manager\n        assert manager\n";
     for (index, source) in [
