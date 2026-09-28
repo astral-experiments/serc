@@ -15672,17 +15672,18 @@ impl<'source> Compiler<'source> {
                 .expect("retained try-body if exit requires an active try")
                 .push((exit_start, exit_end));
         }
-        if self
-            .control
-            .exceptions
-            .active_exception_handlers
-            .last()
-            .is_some_and(|handler| {
-                handler.name.is_none() && handler.trailing_statement == Some(statement.range)
-            })
+        if self.control.in_loop()
+            || self
+                .control
+                .exceptions
+                .active_exception_handlers
+                .last()
+                .is_some_and(|handler| {
+                    handler.name.is_none() && handler.trailing_statement == Some(statement.range)
+                })
         {
-            // The final comprehension falls through to the handler's source-less cleanup.
-            // Preserve its result-store donor before static SWAP elimination moves it.
+            // A final comprehension can fall through to an unlocated loop exit or
+            // handler cleanup. Preserve its store donor before static SWAP reordering.
             self.assembler.record_comprehension_assignment_exit(end);
         }
         self.assembler.record_exception_owner_block_boundary(end);

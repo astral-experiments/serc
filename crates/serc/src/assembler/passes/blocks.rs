@@ -1759,7 +1759,7 @@ fn comprehension_assignment_exit_location(
         }
         _ => return None,
     };
-    if jump.opcode != JUMP_FORWARD || jump.location.line >= 0 {
+    if !matches!(jump.opcode, JUMP_FORWARD | JUMP_BACKWARD) || jump.location.line >= 0 {
         return None;
     }
     let (entries, instructions) = target[..entry_len].iter().find_map(|item| match item {

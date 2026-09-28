@@ -8739,6 +8739,22 @@ fn elided_assertions_after_terminal_comprehension_branches_match_cpython() {
 }
 
 #[test]
+fn comprehension_branches_preserve_backedge_store_locations() {
+    let source = "def check_groups(groups, flag):\n    for group in groups:\n        if flag:\n            selected = [item for item in group if ready(item)]\n            assert selected\n        else:\n            selected = [item for item in group if item.active]\n            assert selected\n        assert len(selected) == 1\n";
+    for source in [
+        source.to_owned(),
+        source.replace("[item for item in group if item.active]", "[\n                item\n                for item in group\n                if item.active\n            ]"),
+        source.replace("[item for item in group if ready(item)]", "{item for item in group if ready(item)}").replace("[item for item in group if item.active]", "{item for item in group if item.active}"),
+        source.replace("[item for item in group if ready(item)]", "{item: item for item in group if ready(item)}").replace("[item for item in group if item.active]", "{item: item for item in group if item.active}"),
+        source.replace("selected =", "item ="),
+        source.replace("selected =", "flag.selected ="),
+        source.replace("        assert len(selected) == 1", "        consume(selected)"),
+    ] {
+        assert_matches_cpython(&source, "comprehension_backedge_store.py", &LEVELS);
+    }
+}
+
+#[test]
 fn elided_assertions_after_comprehension_branches_keep_store_return_locations() {
     for prefix in ["", "async "] {
         for comprehension in [
