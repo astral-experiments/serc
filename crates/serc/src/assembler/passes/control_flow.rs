@@ -6156,6 +6156,22 @@ impl OptimizationPipeline {
                             .with_context_locations
                             .contains(&instruction.location)))
                 && (!instruction.jump_policy.preserves_explicit_nop()
+                    // Keep empty SETUPs through reachability, then compact their NOP
+                    // once the threaded exit carries the same source location.
+                    || (self.python_version >= crate::PythonVersion::Py314
+                        && setup_nop
+                        && instruction.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
+                        && following_labels.iter().any(|label| {
+                            setup_locations.get(label) == Some(&instruction.location)
+                                && self.exception_owner_provenance
+                                    .ordinary_try_setups
+                                    .contains_key(label)
+                        })
+                        && next.is_some_and(|next| {
+                            next.location == instruction.location
+                                && (is_unconditional_jump(next.opcode)
+                                    || next.opcode == RERAISE)
+                        }))
                     || (original_manager_pops.contains(&position)
                         && (instruction.location.line < 0
                             || next.is_some_and(|next| {

@@ -1626,8 +1626,8 @@ impl OptimizationPipeline {
         graph.label_block(target)
     }
 
-    /// Restores original empty-try owners before a live prefix or its cleanup copy.
-    fn restore_uncopied_empty_try_jump_owners(&mut self) {
+    /// Restores original empty-try owners before a live prefix or shared finalizer exit.
+    fn restore_empty_try_jump_owners(&mut self) {
         let graph = &self.graph;
         if !self
             .exception_owner_provenance
@@ -1682,7 +1682,6 @@ impl OptimizationPipeline {
                 || head.is_empty()
                 || head.iter().any(|item| !matches!(item, Item::Label(_)))
                 || jump.opcode != JUMP_FORWARD
-                || jump.location.line < 0
                 || jump.exception_policy() != super::super::ExceptionPolicy::EXCLUDE_ALWAYS
                 || jump.pre_fold_extra_instructions() != 0
                 || jump.local_policy.hidden_exception_owner_slots() != 0
@@ -1707,6 +1706,44 @@ impl OptimizationPipeline {
             let Some(mut target_block) = graph.label_block(target) else {
                 continue;
             };
+            // A shared finalizer RERAISE has the same enclosing owner as the
+            // original empty-body exit. Keep that owner available to exit copying.
+            let mut target_instructions =
+                graph[target_block]
+                    .items()
+                    .iter()
+                    .filter_map(|item| match item {
+                        Item::Instruction(instruction) => Some(instruction),
+                        Item::Label(_) => None,
+                    });
+            let shared_reraise = self.python_version >= crate::PythonVersion::Py314
+                && target_instructions.next().is_some_and(|instruction| {
+                    instruction.opcode == crate::target::opcodes::RERAISE
+                        && instruction.operand() == Operand::Value(0)
+                        && instruction.location == SourceLocation::NONE
+                        && instruction.exception_policy()
+                            == super::super::ExceptionPolicy::default()
+                        && instruction.pre_fold_extra_instructions() == 0
+                        && instruction.local_policy.hidden_exception_owner_slots() == 0
+                })
+                && target_instructions.next().is_none()
+                && owners.iter().all(|owner| {
+                    self.exception_regions.iter().any(|region| {
+                        region.target == owner.target
+                            && region.depth == owner.depth
+                            && region.preserve_lasti == owner.preserve_lasti
+                            && offsets
+                                .get(&region.start)
+                                .zip(offsets.get(&region.end))
+                                .zip(offsets.get(&target))
+                                .is_some_and(|((start, end), target)| {
+                                    start <= target && target < end
+                                })
+                    })
+                });
+            if jump.location.line < 0 && !shared_reraise {
+                continue;
+            }
             // A wholly unlocated handler cleanup is copied before its final jump
             // reaches the same large runtime prefix. Preserve the original source
             // owners until the ordinary copier transports the cleanup's owners.
@@ -1753,7 +1790,7 @@ impl OptimizationPipeline {
             }
             // CPython copies at most four original exit records; a located runtime
             // prefix also excludes unlocated-exit copying and jump-to-jump threading.
-            if prefix == 5 {
+            if prefix == 5 || shared_reraise {
                 selected.push((
                     start_offset,
                     start.as_u32(),
@@ -2055,7 +2092,7 @@ impl OptimizationPipeline {
             return;
         }
         self.prepare_unlocated_normal_try_discards();
-        self.restore_uncopied_empty_try_jump_owners();
+        self.restore_empty_try_jump_owners();
         let mut selected = Vec::new();
         for &(entry, target) in &self.exception_owner_provenance.normal_try_exits {
             let (Some(block), Some(target_block)) = (

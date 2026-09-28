@@ -7145,6 +7145,15 @@ print(json.dumps(events))
 }
 
 #[test]
+fn empty_try_in_conditional_finally_compacts_setup_before_exit() {
+    const SOURCE: &str = "async def f(manager, items, work, flag):\n    async with manager:\n        for item in items:\n            try:\n                await work(item)\n            finally:\n                if flag:\n                    value = work()\n                    count = value / 2\n                    try:\n                        assert count == item\n                    except AssertionError:\n                        pass\n";
+    for body in ["assert count == item", "pass", "work(count)"] {
+        let source = SOURCE.replace("assert count == item", body);
+        assert_matches_cpython(&source, "empty_try_finally_exit.py", &LEVELS);
+    }
+}
+
+#[test]
 fn optimized_empty_try_loop_keeps_enclosing_exception_owner() {
     const TRACE_BACKEDGE: &str = r"
 import dis, json, marshal, sys
