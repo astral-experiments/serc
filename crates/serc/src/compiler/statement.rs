@@ -14964,6 +14964,54 @@ impl<'source> Compiler<'source> {
                             && !expression_contains_inline_branch(call)
                             && !expression_suspends_current_scope(call)
                     };
+                    let finalizer_has_located_entry = |body: &[Stmt]| {
+                        (!body.is_empty() && body.iter().all(linear_finalizer_call))
+                            // A runtime guard keeps the entry located; following calls
+                            // add no predecessor to the protected conditional join.
+                            || body.split_first().is_some_and(|(first, tail)| {
+                                matches!(first, Stmt::If(guard)
+                                    if guard.elif_else_clauses.is_empty()
+                                        && condition_has_only_runtime_tests(&guard.test)
+                                        && !expression_contains_inline_branch(&guard.test)
+                                        && !expression_suspends_current_scope(&guard.test)
+                                        && !guard.body.is_empty()
+                                        && guard.body.iter().all(linear_finalizer_call))
+                                    && tail.iter().all(linear_finalizer_call)
+                            })
+                    };
+                    let finalizers = &self.control.finally.active_return_finally_contexts;
+                    // Consecutive protected finally frames leave the innermost try
+                    // as the join owner. Their outer cleanups run only after it exits.
+                    let nested_finally_contexts = self.unit.flags
+                        & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                        == 0
+                        && finalizers.len() > 1
+                        && finalizers.len() == self.control.finally.active_finally_try_bodies
+                        && finalizers.len()
+                            == self
+                                .control
+                                .exceptions
+                                .active_exception_region_exclusions
+                                .len()
+                        && finalizers.iter().enumerate().all(|(depth, finalizer)| {
+                            finalizer.exception_region_depth == depth
+                                && finalizer.enclosing_finally_try_depth == depth
+                                && finalizer.with_depth
+                                    == self
+                                        .control
+                                        .withs
+                                        .active_with_exits
+                                        .iter()
+                                        .filter(|manager| manager.exception_region_depth <= depth)
+                                        .count()
+                        })
+                        && finalizers.split_last().is_some_and(|(inner, outer)| {
+                            inner.with_depth == self.control.withs.active_with_exits.len()
+                                && outer.iter().all(|finalizer| {
+                                    !finalizer.body.is_empty()
+                                        && finalizer.body.iter().all(linear_finalizer_call)
+                                })
+                        });
                     // A direct try-body join precedes live work or POP_BLOCK and
                     // a separate finalizer array. Its empty true-arm jump receives
                     // the condition's line before redundant-jump removal.
@@ -14984,15 +15032,19 @@ impl<'source> Compiler<'source> {
                                 && self.control.withs.active_with_exits.len()
                                     == self.control.withs.active_with_region_exclusions.len()
                                 && self.control.withs.active_with_exits.iter().all(|manager| {
-                                    !manager.is_async && manager.exception_region_depth == 0
+                                    !manager.is_async
+                                        && (manager.exception_region_depth == 0
+                                            || (nested_finally_contexts
+                                                && manager.exception_region_depth < finalizers.len()))
                                 })))
-                        && self
+                        && ((self
                             .control
                             .exceptions
                             .active_exception_region_exclusions
                             .len()
                             == 1
-                        && self.control.finally.active_finally_try_bodies == 1
+                            && self.control.finally.active_finally_try_bodies == 1)
+                            || nested_finally_contexts)
                         && ((!self.control.statements.context.has_following
                             && self.control.exceptions.direct_try_body_statements.last()
                                 == Some(&statement.range))
@@ -15008,18 +15060,10 @@ impl<'source> Compiler<'source> {
                                     .contains(&statement.range)))
                         && matches!(statement.elif_else_clauses.as_slice(), [clause]
                             if clause.test.is_none())
-                        && matches!(self.control.finally.active_return_finally_contexts.as_slice(), [finalizer]
-                        if (!finalizer.body.is_empty()
-                            && finalizer.body.iter().all(linear_finalizer_call))
-                            // A runtime guard also keeps the finalizer entry located;
-                            // its arm and exit cannot add a predecessor to the try join.
-                            || matches!(finalizer.body, [Stmt::If(guard)]
-                                if guard.elif_else_clauses.is_empty()
-                                    && condition_has_only_runtime_tests(&guard.test)
-                                    && !expression_contains_inline_branch(&guard.test)
-                                    && !expression_suspends_current_scope(&guard.test)
-                                    && !guard.body.is_empty()
-                                    && guard.body.iter().all(linear_finalizer_call)));
+                        && (finalizers.len() == 1 || nested_finally_contexts)
+                        && finalizers
+                            .last()
+                            .is_some_and(|finalizer| finalizer_has_located_entry(finalizer.body));
                     let optimized_empty_both = self.context.python_version
                         >= crate::PythonVersion::Py314
                         && branch_index + 2 == branch_count

@@ -532,6 +532,18 @@ fn elided_conditional_preserves_jump_before_guarded_finalizer() {
 }
 
 #[test]
+fn elided_conditional_preserves_jump_before_nested_finalizers() {
+    for managers in ["manager", "manager, other"] {
+        for body in ["assert valid()", "pass", "record()"] {
+            let source = format!(
+                "def f(manager, other, flag, resource):\n    try:\n        with {managers}:\n            begin()\n            try:\n                work()\n                if flag:\n                    {body}\n                else:\n                    assert ready()\n            finally:\n                if resource is not None:\n                    resource.close()\n                finish()\n    finally:\n        cleanup()\n"
+            );
+            assert_matches_cpython(&source, "conditional_nested_finalizers.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn elided_handler_assertion_preserves_conditional_cleanup() {
     for suffix in ["assert value in str(error)", "pass", "after()"] {
         let source = format!(
