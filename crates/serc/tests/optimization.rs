@@ -63,6 +63,20 @@ fn folded_comprehension_and_tail_preserves_borrow_boundary() {
 }
 
 #[test]
+fn finally_declarations_preserve_exceptional_exit_locations() {
+    assert_matches_cpython(
+        "def f(manager, flag):\n    with manager:\n        try:\n            work()\n        finally:\n            if flag:\n                cleanup()\n            global marker\n",
+        "finally_global_declaration.py",
+        &LEVELS,
+    );
+    assert_matches_cpython(
+        "def outer():\n    marker = None\n    def f(manager, flag):\n        with manager:\n            try:\n                work()\n            finally:\n                if flag:\n                    cleanup()\n                nonlocal marker\n    return f\n",
+        "finally_nonlocal_declaration.py",
+        &LEVELS,
+    );
+}
+
+#[test]
 fn conditional_assignment_preserves_original_statement_joins() {
     for source in [
         r"def example(flag, choice, build):
