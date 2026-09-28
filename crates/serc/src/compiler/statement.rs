@@ -4811,6 +4811,23 @@ impl<'source> Compiler<'source> {
             }
         }
 
+        let nonsuspending_coroutine_raise = self.unit.flags & CO_COROUTINE != 0
+            && self.supports_elided_terminal_if()
+            && self.control.generators.coroutine_suspension_epoch == 0
+            && !self.control.generators.emitted_yield_value
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && !self.control.statements.in_match
+            && matches!(statement.test.as_ref(), Expr::Compare(comparison)
+                if matches!(comparison.first_operand(), Expr::Name(_))
+                    && matches!(comparison.ops.as_ref(), [CmpOp::IsNot])
+                    && matches!(comparison.comparators(), [Expr::NoneLiteral(_)]))
+            && matches!(statement.body.as_slice(), [Stmt::Raise(raised)]
+                if matches!(raised.exc.as_deref(), Some(Expr::Name(_)))
+                    && raised.cause.is_none());
         let base_depth = self.control.stack.depth;
         let mut branches: Vec<(Option<&Expr>, &[Stmt])> =
             vec![(Some(&statement.test), statement.body.as_slice())];
@@ -4847,7 +4864,9 @@ impl<'source> Compiler<'source> {
                         super::legacy_native_labels::NativeRole::IfEnd(statement.range),
                         next,
                     );
-                    if plain_312_scope_exit && suite_terminates(body) {
+                    if (plain_312_scope_exit || nonsuspending_coroutine_raise)
+                        && suite_terminates(body)
+                    {
                         // No implicit return is distributed into a terminating
                         // authored arm. This false edge still names the original
                         // scope footer, even when reachability visits it twice.

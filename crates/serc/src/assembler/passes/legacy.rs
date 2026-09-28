@@ -1910,13 +1910,16 @@ impl OptimizationPipeline {
                         if self.original_scope_exit_labels.contains(label))
                 })
             });
+            // A certified coroutine footer can retain its count under the sole
+            // implicit wrapper, whose prologue and SETUP target were checked above.
             if instructions.next().is_none()
                 && (matches!(
                     instruction.opcode,
                     JUMP_BACKWARD | JUMP_BACKWARD_NO_INTERRUPT
-                ) || (wrapper.is_none()
-                    && (instruction.opcode == JUMP_FORWARD
-                        || (instruction.opcode == RETURN_CONST && original_scope_exit))))
+                ) || (wrapper.is_none() && instruction.opcode == JUMP_FORWARD)
+                    || (instruction.opcode == RETURN_CONST
+                        && original_scope_exit
+                        && (wrapper.is_none() || setups.len() == 1)))
                 && instruction.location == SourceLocation::NONE
             {
                 let mut expected = *instruction;

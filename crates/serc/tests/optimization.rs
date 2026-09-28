@@ -305,6 +305,25 @@ fn chained_condition_loop_exit_preserves_iterator_location() {
 }
 
 #[test]
+fn coroutine_raise_preserves_repeated_scope_footer() {
+    for prefix in [
+        "    if expected is not None:\n        assert value == expected\n",
+        "    if expected is not None:\n        pass\n",
+        "",
+    ] {
+        let source = format!(
+            "async def f(expected, error, calls, value):\n{prefix}    calls.append(value)\n    if error is not None:\n        raise error\n"
+        );
+        assert_matches_cpython(&source, "coroutine_raise_footer.py", &LEVELS);
+    }
+    assert_matches_cpython(
+        "def outer(expected, error, calls):\n    async def f(value):\n        if expected is not None:\n            assert value == expected\n        calls.append(value)\n        if error is not None:\n            raise error\n    return f\n",
+        "coroutine_closure_raise_footer.py",
+        &LEVELS,
+    );
+}
+
+#[test]
 fn elided_finally_assertion_preserves_exceptional_exit_locations() {
     for tail in ["assert flag", "pass", "after()"] {
         let source = format!(
