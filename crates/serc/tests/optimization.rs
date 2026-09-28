@@ -9503,6 +9503,18 @@ fn completed_managers_preserve_coroutine_match_returns() {
 }
 
 #[test]
+fn nested_match_arms_preserve_tuple_return_copy_budget() {
+    for otherwise in ["assert False", "pass", "result = [7]; tag = 'seven'"] {
+        for returned in ["result, tag", "result", "result, tag, kind"] {
+            let source = format!(
+                "def f(kind, first, second):\n    tag = 'unset'\n    match kind:\n        case None:\n            if first:\n                if second:\n                    result = [1]\n                    tag = 'one'\n                elif first:\n                    result = [2]\n                    tag = 'two'\n                else:\n                    result = [3]\n                    tag = 'three'\n            elif second:\n                result = [4]\n                tag = 'four'\n            else:\n                result = [5]\n                tag = 'five'\n        case 'other':\n            result = [6]\n            tag = 'six'\n        case _:\n            {otherwise}\n    return {returned}\n"
+            );
+            assert_matches_cpython(&source, "nested_match_return_budget.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn coroutine_match_cases_preserve_nested_condition_return_donors() {
     for prefix in [
         "",

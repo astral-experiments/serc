@@ -130,6 +130,8 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) original_comparison_fallthroughs: Vec<(Label, Label, [Instruction; 6])>,
     // Source-authored match ends establish original arrays independently of case exits.
     pub(super) original_match_join_boundaries: FxHashSet<Label>,
+    // Original leaf-block entry and exit, case-success join, and following return array.
+    pub(super) nested_match_exit_copy_origins: Vec<(Label, Instruction, Label, Label)>,
     // Exact post-threading head and original fallthrough donor of a shared case return.
     pub(super) shared_match_return_donors: FxHashMap<Label, (Instruction, Instruction)>,
     // Authored normal exits and their immediate, fully emitted restore records.

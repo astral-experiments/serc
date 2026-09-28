@@ -1168,6 +1168,19 @@ impl Compiler<'_> {
                             )?;
                         self.assembler
                             .record_original_match_success(success_exit, original_empty_join);
+                        if original_unlocated_head
+                            && self.can_descend_match_tail_wrappers()
+                            && self
+                                .control
+                                .statements
+                                .context
+                                .match_successor_fills_small_exit_copy_budget
+                            && matches!(case.body.last(), Some(Stmt::If(tail))
+                                if match_case_has_nested_jump_predecessor(tail, true))
+                        {
+                            self.assembler
+                                .preserve_nested_match_exit_copy_budget(success_exit);
+                        }
                         if original_unlocated_head {
                             self.assembler.mark_as_artificial_eval_break(success_exit);
                             if let Some(Stmt::If(tail)) = case.body.last()

@@ -2859,6 +2859,93 @@ impl OptimizationPipeline {
             &self.graph,
             &mut self.borrow_authored_finally_break_origins,
         );
+        // CPython copies unlocated joins in source order before jump threading.
+        // The case-success array grows to NOP plus four return records before a
+        // nested predecessor revisits it. Keep that predecessor on this original
+        // copy; threading it to the uncopied return would incorrectly make it small.
+        let invalid_match_copy_joins = self
+            .exception_owner_provenance
+            .nested_match_exit_copy_origins
+            .iter()
+            .filter_map(|&(entry, source, join, _)| {
+                (!graph.label_block(entry).is_some_and(|block| {
+                    matches!(graph[block].items().last(), Some(Item::Instruction(jump)) if *jump == source)
+                        && graph[block].items().iter()
+                            .take_while(|item| matches!(item, Item::Label(_)))
+                            .any(|item| *item == Item::Label(entry))
+                }))
+                .then_some(join)
+            })
+            .collect::<FxHashSet<_>>();
+        let nested_match_copy_targets = self
+            .exception_owner_provenance
+            .nested_match_exit_copy_origins
+            .iter()
+            .filter_map(|&(entry, source, join, exit)| {
+                if invalid_match_copy_joins.contains(&join) {
+                    return None;
+                }
+                let records = |label| -> Option<Vec<Instruction>> {
+                    Some(
+                        graph[graph.label_block(label)?]
+                            .items()
+                            .iter()
+                            .filter_map(|item| match item {
+                                Item::Instruction(record) => Some(*record),
+                                Item::Label(_) => None,
+                            })
+                            .collect(),
+                    )
+                };
+                let source_block = graph.label_block(entry)?;
+                if !matches!(graph[source_block].items().last(), Some(Item::Instruction(jump)) if *jump == source)
+                {
+                    return None;
+                }
+                let source_index = label_offsets.get(entry)?
+                    + graph[source_block]
+                        .items()
+                        .iter()
+                        .filter(|item| matches!(item, Item::Instruction(_)))
+                        .count()
+                        .checked_sub(1)?;
+                if instruction_positions.get(source_index)
+                    != Some(&(source_block, graph[source_block].items().len().checked_sub(1)?))
+                {
+                    return None;
+                }
+                let join_records = records(join)?;
+                let [jump] = join_records.as_slice() else {
+                    return None;
+                };
+                let exit_records = records(exit)?;
+                let [first, second, tuple, ret] = exit_records.as_slice() else {
+                    return None;
+                };
+                let name_load = |record: &Instruction| {
+                    matches!(
+                        record.opcode,
+                        crate::target::opcodes::LOAD_FAST
+                            | crate::target::opcodes::LOAD_DEREF
+                            | crate::target::opcodes::LOAD_GLOBAL
+                    ) && (record.opcode != crate::target::opcodes::LOAD_GLOBAL
+                        || matches!(record.operand(), Operand::Value(argument) if argument & 1 == 0))
+                };
+                (jump.opcode == JUMP_FORWARD
+                    && jump.operand() == Operand::Forward(exit)
+                    && jump.jump_policy.is_original_match_success()
+                    && name_load(first)
+                    && name_load(second)
+                    && tuple.opcode == crate::target::opcodes::BUILD_TUPLE
+                    && tuple.operand() == Operand::Value(2)
+                    && ret.opcode == RETURN_VALUE
+                    && exit_records.iter().all(|record| {
+                        record.pre_fold_extra_instructions() == 0
+                            && record.local_policy.hidden_exception_owner_slots() == 0
+                    }))
+                .then_some((source_index, join))
+            })
+            .collect::<FxHashMap<_, _>>();
         // Build this lazily for a match-success jump that needs it. A removed
         // original NOP can be recorded under any co-located label alias.
         let mut original_nop_offsets = None;
@@ -2895,6 +2982,10 @@ impl OptimizationPipeline {
             };
             let original_target = target;
             let original_jump = *instruction;
+            let nested_match_copy_target = nested_match_copy_targets.get(&source_index).copied();
+            if nested_match_copy_target.is_some() {
+                instruction.jump_policy.prevent_small_exit_inlining();
+            }
             let nested_join_origins = nested_join_sources.get(&source_index);
             let mut nested_join_target_is_clean = true;
             let authored_break_copy_nop = instruction.fusion_policy.is_authored_break()
@@ -2920,6 +3011,9 @@ impl OptimizationPipeline {
             let mut threaded_jump_count = 0_u8;
             let mut crosses_normal_try_exit = false;
             for _ in 0..jump_target_count {
+                if nested_match_copy_target == Some(target) {
+                    break;
+                }
                 let Some((
                     next_operand,
                     next_opcode,
