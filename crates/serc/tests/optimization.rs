@@ -1451,6 +1451,22 @@ fn erased_match_case_suffix_preserves_join_before_successor() {
 }
 
 #[test]
+fn coroutine_linear_prefix_preserves_nested_elided_join_nop() {
+    for manager in ["with", "async with"] {
+        for prefix in [
+            "value = current.state.value",
+            "current.value = result",
+            "value = await read(current)",
+        ] {
+            let source = format!(
+                "async def inspect(manager, enabled, kind, flag):\n    {manager} manager as current:\n        result = await current.read()\n        if enabled and kind == 'ready':\n            assert result\n            {prefix}\n            if flag:\n                assert result\n            else:\n                assert not result\n            assert result\n        else:\n            assert not result\n"
+            );
+            assert_matches_cpython(&source, "coroutine_prefix_nested_join.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn coroutine_manager_preserves_nested_elided_join_nop() {
     for manager in ["with", "async with"] {
         for prefix in ["", "        work()\n", "        await work()\n"] {

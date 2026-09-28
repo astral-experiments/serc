@@ -14982,6 +14982,10 @@ impl<'source> Compiler<'source> {
                         });
                     // The same protected body owns the nested all-elided join.
                     // Its original end array receives the inner false edge's line.
+                    let coroutine_nested_else_body = &body[..body
+                        .iter()
+                        .rposition(|part| !self.context.is_elided_statement(part))
+                        .map_or(0, |index| index + 1)];
                     let coroutine_elided_nested_join = self.unit.flags
                         & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                         == CO_COROUTINE
@@ -14993,15 +14997,20 @@ impl<'source> Compiler<'source> {
                             .exceptions
                             .active_exception_region_exclusions
                             .is_empty()
-                        && matches!(body, [Stmt::If(nested)]
-                            if is_elided_suite(&nested.body)
+                        && matches!(coroutine_nested_else_body.split_last(), Some((Stmt::If(nested), leading))
+                            if leading.iter().all(|part| {
+                                self.context.is_elided_statement(part)
+                                    || suite_has_linear_borrow_fallthrough(std::slice::from_ref(part))
+                            })
+                                && is_elided_suite(&nested.body)
                                 && matches!(nested.elif_else_clauses.as_slice(), [clause]
                                     if clause.test.is_none() && is_elided_suite(&clause.body)));
                     // An erased suffix leaves the populated inner If's original join
                     // unchanged. Only expose that tail to this ordinary certificate;
                     // the complete body still compiles with its original boundaries.
-                    let nested_else_body = if self.context.python_version
-                        >= crate::PythonVersion::Py314
+                    let nested_else_body = if coroutine_elided_nested_join {
+                        coroutine_nested_else_body
+                    } else if self.context.python_version >= crate::PythonVersion::Py314
                         && branch_index == 0
                         && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                         && !self.control.statements.in_match
@@ -15191,6 +15200,7 @@ impl<'source> Compiler<'source> {
                                     }
                                 });
                             (leading.is_empty()
+                                || coroutine_elided_nested_join
                                 || suite_has_linear_borrow_fallthrough(leading)
                                 || ordinary_elided_linear_prefix
                                 || ordinary_assigned_conditional_prefix
