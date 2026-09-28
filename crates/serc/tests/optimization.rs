@@ -43,6 +43,23 @@ fn nested_erased_conditions_preserve_manager_join() {
 }
 
 #[test]
+fn erased_iterator_else_preserves_optional_inner_branch() {
+    for definition in ["def", "async def"] {
+        for body in [
+            "                if magnitude(item) / scale(item) > limit:\n                    output.emit(item)\n",
+            "                if item:\n                    output.emit(item)\n",
+            "                if item:\n                    output.emit(item)\n                assert item\n",
+            "                if item:\n                    output.emit(item)\n                else:\n                    consume(item)\n",
+        ] {
+            let source = format!(
+                "{definition} f(manager, items, output, limit):\n    with manager:\n        for item in items:\n            if first(item):\n                consume(item)\n            elif accepts(item):\n                assert item\n{body}            else:\n                assert False\n"
+            );
+            assert_matches_cpython(&source, "optional_inner_branch.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn erased_iterator_else_preserves_conditional_call_argument_join() {
     for definition in ["def", "async def"] {
         for call in [

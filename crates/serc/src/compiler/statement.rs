@@ -16314,6 +16314,19 @@ impl<'source> Compiler<'source> {
                 && condition_has_only_runtime_tests(&statement.test)
                 && !expression_suspends_current_scope(&statement.test)
                 && (matches!(statement.body.as_slice(), [Stmt::Continue(_)])
+                    // A non-final iterator arm keeps both inner exits even when
+                    // its erased suffix sits under the surrounding loop owner.
+                    || (mode.non_final_branch
+                        && !mode.try_body_normal_exit
+                        && self.has_active_control_flow_region()
+                        && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+                        && self.control.in_loop_tail_without_nested_cleanup()
+                        && self.control.in_iterator_loop()
+                        && self.control.finally.active_finally_try_bodies == 0
+                        && body[end + 1..].iter().all(|suffix| self.context.is_elided_statement(suffix))
+                        && condition_has_linear_runtime_leaves(&statement.test)
+                        && suite_has_linear_borrow_fallthrough(&statement.body)
+                        && suite_has_nonsuspending_conditional_work(&statement.body))
                     || (!self.has_active_control_flow_region()
                         && !self.control.in_exception_handler()
                         && self.control.finally.is_inactive_for_return_unwind()
@@ -18692,6 +18705,7 @@ impl<'source> Compiler<'source> {
         // An erased or pass-only body still completes that iterator cleanup.
         // A conditional call argument rejoins before the call's discarded result,
         // so its internal branches also stay separate from the erased false edge.
+        // An inner if without else completes either edge before the same backedge.
         let protected_iterator_work_else = eligible_else
             && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
             && self.control.in_loop_tail_without_nested_cleanup()
@@ -18724,7 +18738,8 @@ impl<'source> Compiler<'source> {
                                                 || matches!(part, Stmt::Pass(_))
                                         })))
                             || matches!(statement, Stmt::If(branch)
-                                if branch.elif_else_clauses.last().is_some_and(|clause| clause.test.is_none())
+                                if (branch.elif_else_clauses.is_empty()
+                                    || branch.elif_else_clauses.last().is_some_and(|clause| clause.test.is_none()))
                                     && suite_has_linear_borrow_fallthrough(&branch.body)
                                     && branch.elif_else_clauses.iter().all(|clause| {
                                         suite_has_linear_borrow_fallthrough(&clause.body)
