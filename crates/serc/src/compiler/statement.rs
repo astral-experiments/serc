@@ -26470,6 +26470,8 @@ impl<'source> Compiler<'source> {
             }
             if handler.name.is_some() {
                 self.assembler.record_exception_setup(body_start, false);
+                self.assembler
+                    .record_legacy_native_setup_target(body_start, name_cleanup);
             } else {
                 // An unnamed handler continues after POP_TOP without another SETUP.
                 self.assembler

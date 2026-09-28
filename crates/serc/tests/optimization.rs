@@ -3967,6 +3967,33 @@ fn preceding_exception_setups_preserve_optimized_backedge_locations() {
 }
 
 #[test]
+fn named_handler_setups_preserve_optimized_backedge_locations() {
+    let source = "def f(items, first, second):\n    for item in items:\n        try:\n            work(item)\n        except ValueError as error:\n            recover(error)\n        if first:\n            assert item\n        if second:\n            assert item\n    return finish()\n";
+    for source in [
+        source.to_owned(),
+        source.replace(
+            "            recover(error)",
+            "            try:\n                recover(error)\n            except TypeError as other:\n                consume(other)",
+        ),
+        source.replace(
+            "        if first:",
+            "        except TypeError as other:\n            recover(other)\n        if first:",
+        ),
+        source.replace(
+            "        if first:",
+            "        try:\n            value = convert(item)\n        except TypeError as other:\n            value = str(other)\n        if first:",
+        ),
+        source.replace("    return finish()", "        pass\n    return finish()"),
+        source.replace(
+            "    return finish()",
+            "        consume(item)\n    return finish()",
+        ),
+    ] {
+        assert_matches_cpython(&source, "named_handler_backedge.py", &LEVELS);
+    }
+}
+
+#[test]
 fn preceding_exception_setup_does_not_own_later_backedge() {
     const SOURCE: &str = "def f(xs, work, handler):\n    try:\n        work()\n    except ValueError:\n        handler()\n    for x in xs:\n        if x:\n            assert False\n        if x:\n            assert False\n";
     const TRACE: &str = r"
