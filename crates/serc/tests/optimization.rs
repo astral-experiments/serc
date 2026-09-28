@@ -23,6 +23,16 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn nested_erased_condition_keeps_live_loop_successor() {
+    for successor in ["emit(item)", "result = transform(item)"] {
+        let source = format!(
+            "def f(items, flag):\n    with manager():\n        for item in items:\n            if flag:\n                if item.ready:\n                    assert item\n                else:\n                    assert flag\n            {successor}\n"
+        );
+        assert_matches_cpython(&source, "live_loop_successor.py", &LEVELS);
+    }
+}
+
+#[test]
 fn nested_erased_conditions_preserve_manager_join() {
     for managers in ["first(), second()", "first(), second(), third()"] {
         let source = format!(

@@ -3253,7 +3253,14 @@ impl<'source> Compiler<'source> {
                         || matches!(elided_join_successor,
                             Some(Stmt::AugAssign(assignment)) if matches!(assignment.target.as_ref(), Expr::Name(_)))
                         || matches!(elided_join_successor,
-                            Some(Stmt::Delete(deletion)) if matches!(deletion.targets.as_slice(), [Expr::Name(_)])),
+                            Some(Stmt::Delete(deletion)) if matches!(deletion.targets.as_slice(), [Expr::Name(_)]))
+                        // A final nested condition reaches the enclosing condition's
+                        // live successor without crossing a cleanup or loop backedge.
+                        || (matches!(statement, Stmt::If(_))
+                            && elided_join_successor.is_none()
+                            && self.control.statements.context.same_region_continuation
+                                == Some(statement.range())
+                            && self.control.statements.context.elided_join_has_live_successor),
                     elided_join_has_conditional_successor: matches!(elided_join_successor,
                         Some(Stmt::If(branch)) if condition_has_linear_runtime_leaves(&branch.test)
                             && !expression_suspends_current_scope(&branch.test))
