@@ -11950,3 +11950,79 @@ fn erased_loop_arm_keeps_copied_backedges_with_live_siblings() {
         &LEVELS,
     );
 }
+
+#[test]
+fn managed_coroutine_iterator_preserves_forward_conditional_join() {
+    assert_matches_cpython(
+        r"async def f(items, boundary, first, second):
+    with first, second:
+        for item in items:
+            values = await receive(item)
+            value = values[0]
+            if item >= boundary:
+                assert value.valid
+            else:
+                assert not value.valid
+            if item <= boundary:
+                assert value.ready
+            else:
+                assert value.other
+",
+        "two_managers.py",
+        &LEVELS,
+    );
+    assert_matches_cpython(
+        r"async def f(items, boundary, first, second):
+    with first:
+        for item in items:
+            values = await receive(item)
+            value = values[0]
+            if item >= boundary:
+                assert value.valid
+            else:
+                assert not value.valid
+            if item <= boundary:
+                assert value.ready
+            else:
+                assert value.other
+",
+        "single_manager.py",
+        &LEVELS,
+    );
+    assert_matches_cpython(
+        r"async def f(items, boundary, first, second):
+    for outer in items:
+        with first, second:
+            for item in items:
+                values = await receive(item)
+                value = values[0]
+                if item >= boundary:
+                    assert value.valid
+                else:
+                    assert not value.valid
+                if item <= boundary:
+                    assert value.ready
+                else:
+                    assert value.other
+",
+        "nested_loop.py",
+        &LEVELS,
+    );
+    assert_matches_cpython(
+        r"async def f(items):
+    count = 0
+    skipped = 0
+    async for item in items:
+        count += 1
+        if item is None:
+            skipped += 1
+            continue
+        assert item.valid
+        assert item.ready
+    ratio = count / skipped
+    assert ratio
+",
+        "historical_async_for_continue.py",
+        &LEVELS,
+    );
+}
