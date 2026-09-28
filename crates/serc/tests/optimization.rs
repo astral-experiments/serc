@@ -730,6 +730,24 @@ fn erased_protected_loop_arms_preserve_condition_polarity() {
 }
 
 #[test]
+fn erased_match_capture_body_drops_redundant_success_nop() {
+    let source = "def f(items):\n    result = {}\n    for key, value in items:\n        match value:\n            case First(value=a):\n                output = transform(a)\n            case Second(value=b):\n                output = transform(b)\n            case other:\n                assert False, other\n        result[key] = consume(output)\n    return result\n";
+    for source in [
+        source.to_string(),
+        source.replace("assert False, other", "pass"),
+        source.replace("assert False, other", "output = transform(other)"),
+        source.replace(
+            "assert False, other",
+            "assert other\n                assert valid(other)",
+        ),
+        source.replace("case other:", "case other if check(other):"),
+        source.replace("    result = {}", "    global other\n    result = {}"),
+    ] {
+        assert_matches_cpython(&source, "erased_match_capture.py", &LEVELS);
+    }
+}
+
+#[test]
 fn erased_match_cases_preserve_loop_backedges() {
     for body in [
         "assert item",

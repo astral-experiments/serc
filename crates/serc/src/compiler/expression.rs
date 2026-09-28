@@ -1235,10 +1235,29 @@ impl Compiler<'_> {
                                 self.context.python_version,
                             )
                             .is_some();
+                        // An erased final capture body leaves its unlocated success jump
+                        // directly after the capture store. That store already supplies
+                        // the pattern line when the jump to the live successor is removed.
+                        let erased_capture_fallthrough = self.context.python_version
+                            >= PythonVersion::Py314
+                            && match_has_following
+                            && !copied_subject
+                            && !has_default
+                            && case.guard.is_none()
+                            && matches!(&case.pattern, Pattern::MatchAs(pattern)
+                                if pattern.pattern.is_none() && pattern.name.is_some())
+                            && !case.body.is_empty()
+                            && case
+                                .body
+                                .iter()
+                                .all(|statement| self.context.is_elided_statement(statement));
                         let previous_instruction_covers_branch = context.fail_pop.is_empty()
                             && !subject_pop_is_optimized_away
                             && body_previous_location.is_some_and(|location| {
                                 location.line == self.assembler.location().line
+                                    || (erased_capture_fallthrough
+                                        && location.line
+                                            == self.source_location(case.pattern.range()).line)
                             });
                         if irrefutable_true_guard {
                             self.assembler.preserve_inlined_jump_nop(success_exit);
