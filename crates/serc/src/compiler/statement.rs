@@ -34048,7 +34048,7 @@ impl<'source> Compiler<'source> {
                                     && !compiler.context.is_elided_statement(statement)
                             });
                         if (compiler.context.python_version == crate::PythonVersion::Py312
-                            && statement.finalbody.last().is_some_and(|statement| {
+                            && effective_tail.is_some_and(|statement| {
                                 matches!(statement, Stmt::Assign(_))
                                     || matches!(statement, Stmt::AnnAssign(assignment) if assignment.value.is_some())
                             }))

@@ -722,6 +722,25 @@ fn elided_finally_assertion_preserves_exceptional_exit_locations() {
 }
 
 #[test]
+fn elided_finally_assertion_preserves_assignment_exit_locations() {
+    let source = "def f(items):\n    try:\n        yield\n    finally:\n        values = {\n            key: value\n            for key, value in items\n        }\n        assert values\n";
+    for source in [
+        source.to_owned(),
+        source.replace("values =", "values: dict ="),
+        source.replace("yield", "work()"),
+        source
+            .replace("def f(", "async def f(")
+            .replace("yield", "await work()"),
+        source.replace("        assert values\n", ""),
+        format!("{source}        pass\n"),
+        format!("{source}        work()\n"),
+        format!("{source}        global flag\n"),
+    ] {
+        assert_matches_cpython(&source, "finally_assignment_assertion_tail.py", &LEVELS);
+    }
+}
+
+#[test]
 fn folded_comprehension_filter_chains_preserve_borrow_boundaries() {
     for (index, filter) in [
         "not __debug__ and mapping.get(item) and item",
