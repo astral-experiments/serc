@@ -18576,6 +18576,7 @@ impl<'source> Compiler<'source> {
         // earlier populated arms have their own exits to the iterator.
         // A completed inner for owns its iterator cleanup only on the true edge;
         // the erased false edge still reaches the outer iterator directly.
+        // An erased or pass-only body still completes that iterator cleanup.
         let protected_iterator_work_else = eligible_else
             && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
             && self.control.in_loop_tail_without_nested_cleanup()
@@ -18599,8 +18600,12 @@ impl<'source> Compiler<'source> {
                                     && !expression_contains_inline_branch(&inner.target)
                                     && !expression_suspends_current_scope(&inner.iter)
                                     && !expression_suspends_current_scope(&inner.target)
-                                    && suite_has_linear_borrow_fallthrough(&inner.body)
-                                    && suite_has_nonsuspending_conditional_work(&inner.body))
+                                    && ((suite_has_linear_borrow_fallthrough(&inner.body)
+                                        && suite_has_nonsuspending_conditional_work(&inner.body))
+                                        || inner.body.iter().all(|part| {
+                                            self.context.is_elided_statement(part)
+                                                || matches!(part, Stmt::Pass(_))
+                                        })))
                             || matches!(statement, Stmt::If(branch)
                                 if branch.elif_else_clauses.last().is_some_and(|clause| clause.test.is_none())
                                     && suite_has_linear_borrow_fallthrough(&branch.body)

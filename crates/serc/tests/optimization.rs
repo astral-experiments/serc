@@ -33,6 +33,18 @@ fn nested_erased_conditions_preserve_manager_join() {
 }
 
 #[test]
+fn erased_inner_iterator_body_preserves_outer_condition_backedge() {
+    for definition in ["def", "async def"] {
+        for body in ["assert value", "pass", "emit(value)"] {
+            let source = format!(
+                "{definition} f(manager, groups):\n    with manager:\n        for group in groups:\n            prepare(group)\n            for item in group:\n                if valid(item):\n                    for value in values(item):\n                        {body}\n                else:\n                    assert item\n            finish(group)\n"
+            );
+            assert_matches_cpython(&source, "erased_inner_iterator.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn erased_else_preserves_outer_iterator_after_inner_for() {
     for prefix in ["", "                assert item\n"] {
         let source = format!(
