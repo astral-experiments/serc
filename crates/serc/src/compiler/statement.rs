@@ -2827,11 +2827,16 @@ impl<'source> Compiler<'source> {
                                     == context.exception_region_depth
                         });
                 // Erased assertions still leave the manager's original POP_BLOCK
-                // after END_ASYNC_FOR, including in a shallow 3.15 manager body.
+                // after END_ASYNC_FOR, including in nested synchronous 3.15 managers.
                 let protected_async_for_elided_assert_suffix = (self.context.python_version
                     == crate::PythonVersion::Py314
                     || (self.context.python_version == crate::PythonVersion::Py315
-                        && self.control.withs.active_with_exits.len() == 1
+                        && self
+                            .control
+                            .withs
+                            .active_with_exits
+                            .iter()
+                            .all(|context| !context.is_async)
                         && self.control.exceptions.active_exception_group_handlers == 0))
                     && !is_final
                     && matches!(statement, Stmt::For(statement) if statement.is_async)

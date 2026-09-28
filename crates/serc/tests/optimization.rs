@@ -8840,6 +8840,16 @@ fn optimized_assertions_after_shallow_async_for_keep_manager_exit_location() {
 }
 
 #[test]
+fn optimized_assertions_after_nested_async_for_keep_manager_exit_location() {
+    for source in [
+        "async def f(outer, inner, items):\n    with outer:\n        with inner:\n            results: list[Item] = []\n            async for item in items():\n                results.append(item)\n            assert len(results) == 1\n            assert results[0].value\n",
+        "async def f(first, second, third, items):\n    with first, second:\n        with third:\n            async for item in items:\n                work(item)\n            assert items\n",
+    ] {
+        assert_matches_cpython(source, "nested_async_for_manager_exit.py", &LEVELS);
+    }
+}
+
+#[test]
 fn optimized_assertions_after_async_for_preserve_manager_exit_marker() {
     const SOURCE: &str = "async def f(xs,a,b,c):\n    with a:\n        u = 1\n        async for x in xs:\n            pass\n        assert xs\n";
     const TRACE: &str = r"
