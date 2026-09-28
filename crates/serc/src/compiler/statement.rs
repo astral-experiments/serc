@@ -18245,7 +18245,7 @@ impl<'source> Compiler<'source> {
         // directly. Native normalizes that backward condition into fresh slots.
         let protected_iterator_loop_else = eligible_else
             && statement.elif_else_clauses.len() == 1
-            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
             && self.control.in_loop_tail_without_nested_cleanup()
             && self.control.finally.active_finally_try_bodies == 0
             && self

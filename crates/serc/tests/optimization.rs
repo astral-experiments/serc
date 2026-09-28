@@ -23,6 +23,23 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn coroutine_protected_iterator_preserves_erased_else_backedge() {
+    for manager in ["with", "async with"] {
+        for body in ["previous = value", "consume(value)", "await consume(value)"] {
+            let source = format!(
+                "async def collect(manager, items):\n    {manager} manager:\n        previous = None\n        for item in items:\n            value = item.value\n            assert value\n            if previous is None:\n                {body}\n            else:\n                assert previous is value\n"
+            );
+            assert_matches_cpython(&source, "coroutine_protected_iterator_else.py", &LEVELS);
+        }
+    }
+    assert_matches_cpython(
+        "async def collect(manager, items):\n    with manager:\n        previous = None\n        for item in items:\n            async def prepare():\n                async with open_stream(item) as stream:\n                    async for packet in stream:\n                        pass\n            with capture():\n                await prepare()\n            value = item.value\n            if previous is None:\n                previous = value\n            else:\n                assert previous is value\n",
+        "coroutine_nested_definition_iterator_else.py",
+        &LEVELS,
+    );
+}
+
+#[test]
 fn erased_assertion_preserves_legacy_loop_return_copies() {
     let source = "def f(worker):\n    if not worker.ready:\n        value = worker.read()\n        while value not in [\"a\", \"b\"]:\n            value = worker.read()\n        assert value == \"a\"\n";
     for (index, source) in [
