@@ -15011,7 +15011,7 @@ impl<'source> Compiler<'source> {
                                 || self.control.loops.contexts.last().is_some_and(|context| {
                                     context.with_depth < self.control.withs.active_with_exits.len()
                                 })));
-                    let linear_finalizer_call = |part: &Stmt| {
+                    let linear_finalizer_entry = |part: &Stmt| {
                         let Stmt::Expr(expression) = part else {
                             return false;
                         };
@@ -15023,6 +15023,11 @@ impl<'source> Compiler<'source> {
                             {
                                 // Await's send loop starts after the normal
                                 // finalizer entry and adds no join predecessor.
+                                // Loading a named awaitable is also a located,
+                                // linear entry before the send loop begins.
+                                if matches!(await_expression.value.as_ref(), Expr::Name(_)) {
+                                    return true;
+                                }
                                 await_expression.value.as_ref()
                             }
                             expression => expression,
@@ -15032,8 +15037,8 @@ impl<'source> Compiler<'source> {
                             && !expression_suspends_current_scope(call)
                     };
                     let finalizer_has_located_entry = |body: &[Stmt]| {
-                        (!body.is_empty() && body.iter().all(linear_finalizer_call))
-                            // A runtime guard keeps the entry located; following calls
+                        (!body.is_empty() && body.iter().all(linear_finalizer_entry))
+                            // A runtime guard keeps the entry located; following expressions
                             // add no predecessor to the protected conditional join.
                             || body.split_first().is_some_and(|(first, tail)| {
                                 matches!(first, Stmt::If(guard)
@@ -15042,8 +15047,8 @@ impl<'source> Compiler<'source> {
                                         && !expression_contains_inline_branch(&guard.test)
                                         && !expression_suspends_current_scope(&guard.test)
                                         && !guard.body.is_empty()
-                                        && guard.body.iter().all(linear_finalizer_call))
-                                    && tail.iter().all(linear_finalizer_call)
+                                        && guard.body.iter().all(linear_finalizer_entry))
+                                    && tail.iter().all(linear_finalizer_entry)
                             })
                     };
                     let finalizers = &self.control.finally.active_return_finally_contexts;
@@ -15076,7 +15081,7 @@ impl<'source> Compiler<'source> {
                             inner.with_depth == self.control.withs.active_with_exits.len()
                                 && outer.iter().all(|finalizer| {
                                     !finalizer.body.is_empty()
-                                        && finalizer.body.iter().all(linear_finalizer_call)
+                                        && finalizer.body.iter().all(linear_finalizer_entry)
                                 })
                         });
                     // A direct try-body join precedes live work or POP_BLOCK and

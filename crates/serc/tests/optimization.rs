@@ -11259,3 +11259,40 @@ fn erased_iterator_else_stays_inside_enclosing_finally() {
         );
     }
 }
+
+#[test]
+fn erased_conditional_join_precedes_named_awaitable_finalizer() {
+    let source = r"async def f(resource, cleanup):
+    try:
+        await work(resource)
+        if resource.expected is not None:
+            assert resource.value is not None
+            assert resource.expected in resource.value
+        else:
+            assert resource.value is None
+    finally:
+        await cleanup
+";
+    for (index, source) in [
+        source.to_owned(),
+        source.replace("f(resource, cleanup)", "f(resource)"),
+        source.replacen(
+            "    try:\n",
+            "    def capture():\n        return cleanup\n    try:\n",
+            1,
+        ),
+        source.replace(
+            "        await cleanup\n",
+            "        if resource:\n            await cleanup\n        await another\n",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            &source,
+            &format!("named_awaitable_finalizer_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
