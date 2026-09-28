@@ -18520,6 +18520,8 @@ impl<'source> Compiler<'source> {
         // A comparison chain keeps its own operand cleanup before the same exit.
         // In an elif chain only the final tested arm reaches this erased else;
         // earlier populated arms have their own exits to the iterator.
+        // A completed inner for owns its iterator cleanup only on the true edge;
+        // the erased false edge still reaches the outer iterator directly.
         let protected_iterator_work_else = eligible_else
             && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
             && self.control.in_loop_tail_without_nested_cleanup()
@@ -18536,6 +18538,15 @@ impl<'source> Compiler<'source> {
                     && final_body.iter().all(|statement| {
                         self.context.is_elided_statement(statement)
                             || suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement))
+                            || matches!(statement, Stmt::For(inner)
+                                if !inner.is_async
+                                    && inner.orelse.is_empty()
+                                    && !expression_contains_inline_branch(&inner.iter)
+                                    && !expression_contains_inline_branch(&inner.target)
+                                    && !expression_suspends_current_scope(&inner.iter)
+                                    && !expression_suspends_current_scope(&inner.target)
+                                    && suite_has_linear_borrow_fallthrough(&inner.body)
+                                    && suite_has_nonsuspending_conditional_work(&inner.body))
                             || matches!(statement, Stmt::If(branch)
                                 if branch.elif_else_clauses.last().is_some_and(|clause| clause.test.is_none())
                                     && suite_has_linear_borrow_fallthrough(&branch.body)

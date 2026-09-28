@@ -23,6 +23,16 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn erased_else_preserves_outer_iterator_after_inner_for() {
+    for prefix in ["", "                assert item\n"] {
+        let source = format!(
+            "def f(items):\n    try:\n        for item in items:\n            if first(item):\n                emit(item)\n            elif second(item) and ready(item):\n{prefix}                for value in values(item):\n                    emit(value)\n            else:\n                assert False\n    except ValueError:\n        raise\n"
+        );
+        assert_matches_cpython(&source, "outer_iterator.py", &LEVELS);
+    }
+}
+
+#[test]
 fn erased_else_preserves_populated_iterator_elif() {
     for body in [
         "                emit(value)\n",
