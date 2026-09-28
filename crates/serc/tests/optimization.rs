@@ -38,6 +38,23 @@ fn elided_assertion_after_nested_iterator_preserves_condition_backedges() {
 }
 
 #[test]
+fn erased_match_cases_preserve_loop_backedges() {
+    for body in [
+        "assert item",
+        "pass",
+        "consume(item)",
+        "assert item\n                consume(item)",
+    ] {
+        for suffix in ["", "        after()\n"] {
+            let source = format!(
+                "def f(items):\n    for item in items:\n        match item:\n            case 1:\n                {body}\n            case 2:\n                {body}\n            case _:\n                assert False\n{suffix}"
+            );
+            assert_matches_cpython(&source, "erased_match_loop_backedges.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn chained_condition_loop_exit_preserves_iterator_location() {
     for source in [
         "def f(a, b, items):\n    assert a\n    if check(a):\n        assert b\n    if a < b < items:\n        assert a\n        for item in items:\n            assert item\n",

@@ -1222,11 +1222,15 @@ impl Compiler<'_> {
                         } else if self.assembler.instruction_count() == body_start + 1
                             && !previous_instruction_covers_branch
                             && !matches!(self.unit.scope, Scope::Class { .. })
-                            // A pass success with original failure cleanup still owns a JUMP.
-                            // At a loop tail it must thread to the backedge; retaining its
-                            // removed-jump NOP would leave a forward bridge.
+                            // A pass or erased body still owns its case-success JUMP.
+                            // With original failure cleanup at a loop tail, it must thread
+                            // to the backedge instead of retaining a removed-jump NOP.
                             && !(case.guard.is_none()
-                                && matches!(case.body.as_slice(), [Stmt::Pass(_)])
+                                && (matches!(case.body.as_slice(), [Stmt::Pass(_)])
+                                    || case
+                                        .body
+                                        .iter()
+                                        .all(|statement| self.context.is_elided_statement(statement)))
                                 && self.control.falls_through_to_loop_backedge()
                                 && ((has_default
                                     && matches!(case.pattern, Pattern::MatchValue(_)))
