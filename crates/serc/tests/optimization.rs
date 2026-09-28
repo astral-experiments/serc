@@ -23,6 +23,19 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn erased_else_preserves_populated_iterator_elif() {
+    for body in [
+        "                emit(value)\n",
+        "                if flag:\n                    result = left(value)\n                else:\n                    result = right(value)\n                emit(result)\n",
+    ] {
+        let source = format!(
+            "def f(manager, values, flag):\n    with manager:\n        for value in values:\n            if first(value):\n                emit(value)\n                if flag:\n                    emit(value)\n            elif second(value):\n{body}            else:\n                assert False\n"
+        );
+        assert_matches_cpython(&source, "populated_iterator_elif.py", &LEVELS);
+    }
+}
+
+#[test]
 fn erased_else_preserves_protected_pass_backedge() {
     for definition in ["def", "async def"] {
         for loop_header in ["while True", "for value in flag"] {

@@ -18471,45 +18471,45 @@ impl<'source> Compiler<'source> {
                     && context.finally_end_depth == self.control.finally.active_finally_end_blocks
                     && self.assembler.instruction_count() == context.body_start
             });
+        let (final_test, final_body) = statement
+            .elif_else_clauses
+            .iter()
+            .rev()
+            .find_map(|clause| {
+                clause
+                    .test
+                    .as_ref()
+                    .map(|test| (test, clause.body.as_slice()))
+            })
+            .unwrap_or((statement.test.as_ref(), statement.body.as_slice()));
         // A final Pass or iterator Continue reaches the same loop backedge,
         // including inside an enclosing try/finally. Earlier elif arms cannot
         // enter its erased false edge, so that edge still normalizes independently.
         // Comparison chains retain a separate jump to the Pass backedge.
-        let protected_direct_loop_else = eligible_else
-            && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
-            && self.control.in_loop_tail_without_nested_cleanup()
-            && self
-                .control
-                .loops
-                .contexts
-                .last()
-                .is_some_and(|context| context.continue_label == restart)
-            && statement
-                .elif_else_clauses
-                .iter()
-                .rev()
-                .find_map(|clause| {
-                    clause
-                        .test
-                        .as_ref()
-                        .map(|test| (test, clause.body.as_slice()))
-                })
-                .or(Some((statement.test.as_ref(), statement.body.as_slice())))
-                .is_some_and(|(test, body)| {
-                    condition_has_runtime_iterator_leaves(test)
-                        && !expression_suspends_current_scope(test)
-                        && ((matches!(body, [Stmt::Pass(_)])
-                            && condition_has_linear_runtime_leaves(test))
-                            || (matches!(body, [Stmt::Continue(_)])
-                                && self.control.loops.contexts.last().is_some_and(|context| {
-                                    context.iterator_cleanup != IteratorCleanup::None
-                                })))
-                });
+        let protected_direct_loop_else =
+            eligible_else
+                && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+                && self.control.in_loop_tail_without_nested_cleanup()
+                && self
+                    .control
+                    .loops
+                    .contexts
+                    .last()
+                    .is_some_and(|context| context.continue_label == restart)
+                && condition_has_runtime_iterator_leaves(final_test)
+                && !expression_suspends_current_scope(final_test)
+                && ((matches!(final_body, [Stmt::Pass(_)])
+                    && condition_has_linear_runtime_leaves(final_test))
+                    || (matches!(final_body, [Stmt::Continue(_)])
+                        && self.control.loops.contexts.last().is_some_and(|context| {
+                            context.iterator_cleanup != IteratorCleanup::None
+                        })));
         // With no intervening cleanup, the removed else reaches the iterator
         // directly. Native normalizes that backward condition into fresh slots.
         // A comparison chain keeps its own operand cleanup before the same exit.
+        // In an elif chain only the final tested arm reaches this erased else;
+        // earlier populated arms have their own exits to the iterator.
         let protected_iterator_work_else = eligible_else
-            && statement.elif_else_clauses.len() == 1
             && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
             && self.control.in_loop_tail_without_nested_cleanup()
             && self.control.finally.active_finally_try_bodies == 0
@@ -18519,10 +18519,10 @@ impl<'source> Compiler<'source> {
                 .contexts
                 .last()
                 .is_some_and(|context| context.iterator_cleanup != IteratorCleanup::None)
-            && condition_has_runtime_iterator_leaves(&statement.test)
-            && (suite_has_linear_borrow_fallthrough(&statement.body)
-                || (!statement.body.is_empty()
-                    && statement.body.iter().all(|statement| {
+            && condition_has_runtime_iterator_leaves(final_test)
+            && (suite_has_linear_borrow_fallthrough(final_body)
+                || (!final_body.is_empty()
+                    && final_body.iter().all(|statement| {
                         self.context.is_elided_statement(statement)
                             || suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement))
                             || matches!(statement, Stmt::If(branch)
