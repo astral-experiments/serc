@@ -23,6 +23,44 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn enclosing_finalizer_preserves_live_loop_join() {
+    let source = r"def process(items, owner):
+    try:
+        context = owner.context()
+        with context:
+            for item in items:
+                prepare(item)
+                if owner.enabled():
+                    if ready():
+                        assert context.valid
+                    else:
+                        assert context.other
+                    context.reset()
+        finish()
+    finally:
+        heartbeat()
+        with timeout():
+            owner.close()
+    finish_all()
+";
+    for source in [
+        source.to_owned(),
+        source.replace(
+            "        heartbeat()\n        with timeout():\n            owner.close()\n",
+            "        cleanup()\n",
+        ),
+        source.replace("for item in items:", "while owner.more():"),
+        source.replace("if ready():", "if ready() or other():"),
+        source.replace(
+            "                    context.reset()",
+            "                    assert context.valid",
+        ),
+    ] {
+        assert_matches_cpython(&source, "finally_loop_join.py", &LEVELS);
+    }
+}
+
+#[test]
 fn nested_erased_condition_keeps_live_loop_successor() {
     for successor in ["emit(item)", "result = transform(item)"] {
         let source = format!(

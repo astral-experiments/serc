@@ -15142,6 +15142,37 @@ impl<'source> Compiler<'source> {
                         && finalizers
                             .last()
                             .is_some_and(|finalizer| finalizer_has_located_entry(finalizer.body));
+                    // An enclosing finalizer runs after the loop leaves this region.
+                    // Live work precedes both cleanup and the backedge, so the manager
+                    // still owns the erased conditional's forward join.
+                    let enclosing_finally_loop_join =
+                        matches!(self.unit.scope, Scope::Function { .. })
+                            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                                == 0
+                            && self
+                                .control
+                                .statements
+                                .context
+                                .elided_join_has_live_successor
+                            && !self.control.withs.active_with_region_exclusions.is_empty()
+                            && !finalizers.is_empty()
+                            && finalizers.len() == self.control.finally.active_finally_try_bodies
+                            && finalizers.iter().all(|finalizer| {
+                                finalizer.loop_depth < self.control.loops.contexts.len()
+                            })
+                            && self.control.loops.contexts.last().is_some_and(|context| {
+                                matches!(
+                                    context.iterator_cleanup,
+                                    IteratorCleanup::None | IteratorCleanup::Sync
+                                ) && context.with_depth
+                                    == self.control.withs.active_with_exits.len()
+                                    && context.exception_region_depth
+                                        == self
+                                            .control
+                                            .exceptions
+                                            .active_exception_region_exclusions
+                                            .len()
+                            });
                     let optimized_empty_both = self.context.python_version
                         >= crate::PythonVersion::Py314
                         && branch_index + 2 == branch_count
@@ -15181,7 +15212,8 @@ impl<'source> Compiler<'source> {
                         && !self.control.in_exception_handler()
                         && self.control.exceptions.active_exception_group_handlers == 0
                         && (self.control.finally.active_finally_try_bodies == 0
-                            || direct_finally_body_join)
+                            || direct_finally_body_join
+                            || enclosing_finally_loop_join)
                         && self.control.finally.active_normal_finally_bodies == 0
                         && self.control.finally.active_copied_finally_bodies == 0
                         && self.control.finally.active_finally_end_blocks == 0
