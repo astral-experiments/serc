@@ -412,6 +412,16 @@ fn elided_for_after_completed_prefix_preserves_legacy_footer_location() {
     ] {
         assert_matches_cpython(source, "completed_for_prefix.py", &LEVELS);
     }
+    for (target, first, last) in [
+        ("item", "items", "range(count)"),
+        ("key, value", "items.items()", "others"),
+        ("key, value", "items.items()", "range(count)"),
+    ] {
+        let source = format!(
+            "def f(items, others, count):\n    if ready():\n        assert items\n    if active():\n        value = prepare()\n        for {target} in {first}:\n            assert items\n        for other in {last}:\n            assert other\n"
+        );
+        assert_matches_cpython(&source, "completed_iterator_call_prefix.py", &LEVELS);
+    }
 }
 
 #[test]

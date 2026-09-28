@@ -4511,6 +4511,18 @@ impl<'source> Compiler<'source> {
                 // Preserve its original return until native exit copying finishes.
                 self.assembler.record_current_original_scope_exit();
             }
+            let linear_iterator = |iterator: &ruff_python_ast::StmtFor| {
+                (matches!(iterator.target.as_ref(), Expr::Name(_))
+                    || matches!(iterator.target.as_ref(), Expr::Tuple(tuple)
+                        if tuple.elts.iter().all(|element| matches!(element, Expr::Name(_)))))
+                    && (matches!(iterator.iter.as_ref(), Expr::Name(_))
+                        || matches!(iterator.iter.as_ref(), Expr::Attribute(attribute)
+                            if matches!(attribute.value.as_ref(), Expr::Name(_)))
+                        || matches!(iterator.iter.as_ref(), Expr::Call(call)
+                            if matches!(call.func.as_ref(), Expr::Name(_) | Expr::Attribute(_))))
+                    && !expression_contains_inline_branch(&iterator.iter)
+                    && !expression_suspends_current_scope(&iterator.iter)
+            };
             if plain_312_scope_exit
                 && statement.elif_else_clauses.is_empty()
                 && early_condition_truthiness(&statement.test).is_none()
@@ -4522,8 +4534,6 @@ impl<'source> Compiler<'source> {
                 && iterator.orelse.is_empty()
                 && (prefix.iter().all(|part| self.context.is_elided_statement(part))
                     || (!self.control.statements.in_match
-                        && matches!(iterator.target.as_ref(), Expr::Name(_))
-                        && matches!(iterator.iter.as_ref(), Expr::Name(_))
                         && condition_jump_target_count(&statement.test, false) == 1
                         && iterator.body.iter().all(|part| self.context.is_elided_statement(part))
                         && prefix.iter().all(|part| {
@@ -4532,8 +4542,7 @@ impl<'source> Compiler<'source> {
                                 || matches!(part, Stmt::For(previous)
                                     if !previous.is_async
                                         && previous.orelse.is_empty()
-                                        && matches!(previous.target.as_ref(), Expr::Name(_))
-                                        && matches!(previous.iter.as_ref(), Expr::Name(_))
+                                        && linear_iterator(previous)
                                         && !previous.body.is_empty()
                                         && previous.body.iter().all(|part| {
                                             self.context.is_elided_statement(part)
@@ -4553,16 +4562,7 @@ impl<'source> Compiler<'source> {
                                         condition_jump_target_count(leaf, false) == 1
                                             && condition_jump_target_count(leaf, true) == 1
                                     })))
-                        && (matches!(iterator.target.as_ref(), Expr::Name(_))
-                            || matches!(iterator.target.as_ref(), Expr::Tuple(tuple)
-                                if tuple.elts.iter().all(|element| matches!(element, Expr::Name(_)))))
-                        && (matches!(iterator.iter.as_ref(), Expr::Name(_))
-                            || matches!(iterator.iter.as_ref(), Expr::Attribute(attribute)
-                                if matches!(attribute.value.as_ref(), Expr::Name(_)))
-                            || matches!(iterator.iter.as_ref(), Expr::Call(call)
-                                if matches!(call.func.as_ref(), Expr::Name(_) | Expr::Attribute(_))))
-                        && !expression_contains_inline_branch(&iterator.iter)
-                        && !expression_suspends_current_scope(&iterator.iter)
+                        && linear_iterator(iterator)
                         && (iterator.body.iter().all(|part| self.context.is_elided_statement(part))
                             || iterator.body.split_last().is_some_and(|(last, body_prefix)| {
                                 (body_prefix.is_empty()
@@ -4588,7 +4588,7 @@ impl<'source> Compiler<'source> {
                 // A linear call body and two simple AND leaves retain the same exit.
                 // Linear iterator calls, unpacking, and call arguments leave those edges intact.
                 // Completed linear work and erased-body loops before a final erased
-                // Name loop add no edge to the shared footer.
+                // loop add no edge to the shared footer.
                 // Direct calls and a conditional continue keep their edges inside the
                 // loop, leaving the original scope footer's predecessors unchanged.
                 // Its iterator exhaustion stays unlocated until the native line pass.
