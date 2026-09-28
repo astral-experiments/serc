@@ -4306,6 +4306,35 @@ impl<'source> Compiler<'source> {
         } else {
             statement.body.last()
         };
+        let runtime_name =
+            |value: &Expr| matches!(value, Expr::Name(name) if name.id.as_str() != "__debug__");
+        let conditional_expression_tail = if self.context.python_version
+            >= crate::PythonVersion::Py314
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.control.loops.contexts.is_empty()
+            && !self.control.loops.suite_fallthrough_to_loop_backedge
+            && self.control.withs.active_with_exits.is_empty()
+            && !self.has_active_control_flow_region()
+            && !self.control.in_exception_handler()
+            && self.control.exceptions.active_exception_group_handlers == 0
+            && self.control.finally.is_inactive_for_return_unwind()
+            && !self.control.statements.in_match
+            && statement.elif_else_clauses.is_empty()
+            && runtime_name(&statement.test)
+            && let [tail @ Stmt::Expr(expression), pass @ Stmt::Pass(_)] = statement.body.as_slice()
+            && !self.context.is_elided_statement(pass)
+            && matches!(expression.value.as_ref(), Expr::If(conditional)
+                if runtime_name(&conditional.test)
+                    && runtime_name(&conditional.body)
+                    && runtime_name(&conditional.orelse))
+        {
+            // The Pass donates its location before its NOP is removed. Keep the
+            // expression's discard separate from the enclosing If's footer.
+            Some(tail)
+        } else {
+            conditional_expression_tail
+        };
         if statement.elif_else_clauses.is_empty()
             && matches!(conditional_expression_tail, Some(Stmt::Expr(expression))
                 if matches!(expression.value.as_ref(), Expr::If(conditional)

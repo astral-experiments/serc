@@ -165,6 +165,12 @@ fn erased_false_branch_preserves_borrowed_local_loads() {
 }
 
 #[test]
+fn genuine_pass_preserves_conditional_expression_join() {
+    let source = "def f(a, b, x, y):\n    if a:\n        x if b else y\n        pass\n";
+    assert_matches_cpython(source, "case.py", &LEVELS);
+}
+
+#[test]
 fn erased_suffix_preserves_conditional_expression_join() {
     for condition in ["b", "b is not None"] {
         for (left, right) in [("x", "y"), ("left(x)", "right(y)")] {
