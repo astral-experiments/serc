@@ -5028,6 +5028,39 @@ fn terminating_if_before_elided_assert_preserves_branch_location() {
 }
 
 #[test]
+fn erased_match_cases_inherit_copied_return_locations() {
+    let source = r#"class Example:
+    @property
+    def case(self):
+        match self.state.data.kind:
+            case Kind.FIRST:
+                assert isinstance(self.state.data, First)
+            case Kind.SECOND:
+                assert isinstance(self.state.data, Second)
+            case Kind.THIRD:
+                assert isinstance(self.state.data, Third)
+            case _:
+                raise AssertionError(f"unknown: {self.state.data.kind}")
+        return self.state.data
+"#;
+    for source in [
+        source.to_owned(),
+        source.replace("return self.state.data", "return self.state"),
+        source.replace("return self.state.data", "return self.state.data.payload"),
+        source.replace("case Kind.FIRST:", "case None:"),
+        source.replace("case Kind.FIRST:", "case [value]:"),
+        source.replace("case Kind.FIRST:", "case Kind.FIRST if valid(self):"),
+        source.replace("assert isinstance(self.state.data, First)", "pass"),
+        source.replace(
+            "        return self.state.data",
+            "        work(self)\n        return self.state.data",
+        ),
+    ] {
+        assert_matches_cpython(&source, "copied_match_return.py", &LEVELS);
+    }
+}
+
+#[test]
 fn nonterminal_elided_match_case_preserves_unlocated_exit() {
     for source in [
         "def f(x):\n match x:\n  case str():\n   assert x\n  case int():\n   work()\n  case _:\n   other()\n after()\n",

@@ -1251,6 +1251,23 @@ impl Compiler<'_> {
                                 .body
                                 .iter()
                                 .all(|statement| self.context.is_elided_statement(statement));
+                        // An erased case leaves only its NEXT_LOCATION subject pop
+                        // before the success jump. Copying the continuation must not insert
+                        // a located NOP between that pop and the copied return.
+                        let erased_subject_fallthrough = self.context.python_version
+                            >= PythonVersion::Py314
+                            && match_has_following
+                            && copied_subject
+                            // Folded guards can retain a located NOP before the subject pop.
+                            && case
+                                .guard
+                                .as_ref()
+                                .is_none_or(|guard| early_condition_truthiness(guard).is_none())
+                            && !case.body.is_empty()
+                            && case
+                                .body
+                                .iter()
+                                .all(|statement| self.context.is_elided_statement(statement));
                         let previous_instruction_covers_branch = context.fail_pop.is_empty()
                             && !subject_pop_is_optimized_away
                             && body_previous_location.is_some_and(|location| {
@@ -1267,6 +1284,7 @@ impl Compiler<'_> {
                             self.assembler.preserve_authored_pass_jump_nop(success_exit);
                         } else if self.assembler.instruction_count() == body_start + 1
                             && !previous_instruction_covers_branch
+                            && !erased_subject_fallthrough
                             && !matches!(self.unit.scope, Scope::Class { .. })
                             // A pass or erased body still owns its case-success JUMP.
                             // With original failure cleanup at a loop tail, it must thread
