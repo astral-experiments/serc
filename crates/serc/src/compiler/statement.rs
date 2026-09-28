@@ -1763,6 +1763,15 @@ impl<'source> Compiler<'source> {
         &self,
         conditional: &ruff_python_ast::StmtIf,
     ) -> bool {
+        let has_return_donor = |body: &[Stmt]| {
+            self.coroutine_branch_has_linear_tail(body)
+                // Suspension inside a comprehension finishes before its result store.
+                // That store remains the sole normal return donor for this arm.
+                || matches!(body, [Stmt::Assign(assignment)]
+                    if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                        && matches!(assignment.value.as_ref(),
+                            Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_)))
+        };
         std::iter::once(conditional.body.as_slice())
             .chain(
                 conditional
@@ -1771,7 +1780,7 @@ impl<'source> Compiler<'source> {
                     .map(|clause| clause.body.as_slice()),
             )
             .all(|branch| {
-                self.coroutine_branch_has_linear_tail(branch)
+                has_return_donor(branch)
                     || matches!(branch, [Stmt::With(manager)]
                         if !manager.is_async
                             && manager.items.iter().all(|item| {
@@ -1780,7 +1789,7 @@ impl<'source> Compiler<'source> {
                                         !expression_suspends_current_scope(target)
                                     })
                             })
-                            && self.coroutine_branch_has_linear_tail(&manager.body))
+                            && has_return_donor(&manager.body))
             })
     }
 

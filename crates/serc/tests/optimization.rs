@@ -9155,6 +9155,37 @@ fn comprehension_branches_preserve_sibling_return_donors() {
 }
 
 #[test]
+fn suspended_comprehension_siblings_preserve_return_locations() {
+    let source = r#"async def collect(flag, items):
+    if flag:
+        with manager():
+            result = [item async for item in items]
+    else:
+        result = [item async for item in items]
+    assert result
+"#;
+    for source in [
+        source.to_owned(),
+        source.replace(
+            "[item async for item in items]",
+            "{item async for item in items}",
+        ),
+        source.replace(
+            "[item async for item in items]",
+            "{item: item async for item in items}",
+        ),
+        source.replace(
+            "[item async for item in items]",
+            "[await transform(item) for item in items]",
+        ),
+        source.replace("async for", "for"),
+        source.replace("assert result", "consume(result)"),
+    ] {
+        assert_matches_cpython(&source, "suspended_comprehension_siblings.py", &LEVELS);
+    }
+}
+
+#[test]
 fn coroutine_comprehension_siblings_preserve_return_locations() {
     let source = "async def collect(flag, items, fields):\n    await prepare()\n    if flag:\n        with manager():\n            result = [tuple(item for field in fields) for item in items]\n    else:\n        result = [\n            tuple(item for field in fields)\n            for item in items\n        ]\n    assert result\n";
     for source in [
