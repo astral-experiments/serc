@@ -20153,16 +20153,34 @@ impl<'source> Compiler<'source> {
                     && self.control.finally.active_finally_end_blocks == 0
                     && self.control.finally.active_overriding_finally_returns == 0
                     && self.assembler.at_shared_match_failure_join();
+                // The enclosing managers also keep a coroutine arm in the same
+                // iterator region. No cleanup or suspension enters its empty
+                // shared true target before its copied exits return to the loop.
+                let managed_coroutine_branch = self.unit.flags
+                    & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                    == CO_COROUTINE
+                    && self.control.generators.generator_region_start.is_some()
+                    && self.control.exceptions.active_exception_group_handlers == 0
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .is_empty()
+                    && !self.control.withs.active_with_exits.is_empty()
+                    && self.control.withs.active_with_exits.len()
+                        == self.control.withs.active_with_region_exclusions.len()
+                    && self.control.in_loop_tail_without_nested_cleanup();
                 let copied_erased_branch_exit = self.context.python_version
                     >= crate::PythonVersion::Py314
                     && branch_index + 1 < branch_count
-                    && !non_final_branch
+                    && (!non_final_branch || managed_coroutine_branch)
                     && !try_body_normal_exit
                     && matches!(self.unit.scope, Scope::Function { .. })
-                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    && ((self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                        && !self.has_active_control_flow_region()
+                        && self.control.withs.active_with_exits.is_empty())
+                        || managed_coroutine_branch)
                     && !self.control.statements.in_match
-                    && !self.has_active_control_flow_region()
-                    && self.control.withs.active_with_exits.is_empty()
                     && !self.control.in_exception_handler()
                     && self.control.finally.is_inactive_for_return_unwind()
                     && self.control.loops.contexts.len() == 1

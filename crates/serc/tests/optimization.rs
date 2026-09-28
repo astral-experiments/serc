@@ -12338,3 +12338,28 @@ fn erased_assert_suffix_preserves_pass_iterator_exits() {
         &LEVELS,
     );
 }
+
+#[test]
+fn managed_coroutine_erased_shared_arm_preserves_copied_loop_exits() {
+    let source = r"async def f(items, outer, manager, enabled, extra):
+    async with outer:
+        with manager:
+            for item in items:
+                if item.kind:
+                    if enabled or extra:
+                        assert item.valid
+                    else:
+                        value = item.value
+                        assert value
+                else:
+                    consume(item)
+";
+    for source in [
+        source.to_owned(),
+        source.replace("async with outer:", "with outer:"),
+        source.replace("with manager:", "with manager, other:"),
+        source.replace("enabled or extra", "enabled or extra or item.third"),
+    ] {
+        assert_matches_cpython(&source, "managed_coroutine_shared_loop_exit.py", &LEVELS);
+    }
+}
