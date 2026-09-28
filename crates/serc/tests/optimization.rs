@@ -4732,6 +4732,51 @@ fn nonterminal_elided_match_in_suspended_function_matches_cpython() {
 }
 
 #[test]
+fn coroutine_erased_else_preserves_nested_backedge_donor() {
+    let source = r#"async def consume(records):
+    done = False
+    for record in records:
+        if not record:
+            continue
+        if not done:
+            record = record[2:]
+            try:
+                event = parse(record)
+            except ValueError:
+                continue
+            if event.kind == "piece":
+                accept(record)
+            elif event.kind == "end":
+                result = finish(record)
+                done = True
+                assert result.valid
+            else:
+                assert False
+        else:
+            assert record == "end"
+"#;
+    for source in [
+        source.to_owned(),
+        source.replace("async def", "def"),
+        source.replace("                assert result.valid\n", ""),
+        source.replace(
+            "elif event.kind == \"end\":",
+            "elif event.kind == \"end\" or ready(record):",
+        ),
+        source.replace(
+            "elif event.kind == \"end\":",
+            "elif (\n                event.kind\n                == \"end\"\n            ):",
+        ),
+        source.replace(
+            "                assert False",
+            "                reject(record)",
+        ),
+    ] {
+        assert_matches_cpython(&source, "coroutine_erased_else_donor.py", &LEVELS);
+    }
+}
+
+#[test]
 fn elided_inner_else_keeps_for_loop_backedge_location() {
     for source in [
         "def f(xs,a,b):\n for x in xs:\n  if a:\n   if b:\n    z = x\n   else:\n    assert b\n  else:\n   other(x)\n",

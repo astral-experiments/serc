@@ -19538,6 +19538,19 @@ impl<'source> Compiler<'source> {
                                     && !expression_suspends_current_scope(test)
                             })
                     });
+                let linear_exit_body = |body: &[Stmt]| {
+                    if self.unit.flags & CO_COROUTINE == 0 {
+                        return suite_has_linear_borrow_fallthrough(body);
+                    }
+                    let Some(end) = body
+                        .iter()
+                        .rposition(|part| !self.context.is_elided_statement(part))
+                    else {
+                        return false;
+                    };
+                    suite_has_linear_borrow_fallthrough(&body[..=end])
+                        && suite_has_nonsuspending_conditional_work(&body[..=end])
+                };
                 if shared_match_failure || copied_erased_branch_exit {
                     self.assembler.set_location(SourceLocation::NONE);
                 } else if let Some(range) = suite_match_failure_range(body) {
@@ -19559,11 +19572,16 @@ impl<'source> Compiler<'source> {
                                 ))))
                     && elided_else
                     && matches!(self.unit.scope, Scope::Function { .. })
-                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
                     // A single ordinary try keeps the backedge's exception owner while
                     // the false condition supplies its location. A normal try exit's
                     // converted POP_BLOCK prevents threading but keeps the same donor.
                     && (!self.has_active_control_flow_region()
+                        // A coroutine's implicit stop-iteration wrapper does not
+                        // change this nonsuspending false edge's source donor.
+                        || (self.unit.flags & CO_COROUTINE != 0
+                            && self.control.withs.active_with_region_exclusions.is_empty()
+                            && self.control.exceptions.active_exception_region_exclusions.is_empty())
                         || (self.control.generators.generator_region_start.is_none()
                             && self.control.withs.active_with_region_exclusions.is_empty()
                             && self
@@ -19592,12 +19610,12 @@ impl<'source> Compiler<'source> {
                         .is_some_and(|context| context.iterator_cleanup == IteratorCleanup::Sync)
                     && condition_has_linear_runtime_leaves(&statement.test)
                     && !expression_suspends_current_scope(&statement.test)
-                    && suite_has_linear_borrow_fallthrough(&statement.body)
+                    && linear_exit_body(&statement.body)
                     && statement.elif_else_clauses.iter().all(|clause| {
                         clause.test.as_ref().is_none_or(|test| {
                             condition_has_linear_runtime_leaves(test)
                                 && !expression_suspends_current_scope(test)
-                                && suite_has_linear_borrow_fallthrough(&clause.body)
+                                && linear_exit_body(&clause.body)
                         })
                     })
                     && let Some(last_test) = statement
