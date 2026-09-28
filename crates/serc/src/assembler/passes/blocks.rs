@@ -1726,25 +1726,30 @@ fn propagate_normal_try_pop_continuations(
 /// Replays only the recorded SWAP-to-NOP conversion and complete store exchange.
 fn static_swap_tail_location(
     source: &[Item],
-    [swap, first, last]: [Instruction; 3],
+    instructions: &[Instruction],
 ) -> Option<SourceLocation> {
-    let mut removed_swap = swap;
+    let [swap, first, middle @ .., last] = instructions else {
+        return None;
+    };
+    let mut removed_swap = *swap;
     removed_swap.opcode = NOP;
     removed_swap.set_operand(Operand::Value(0));
-    (source
-        == [
-            Item::Instruction(removed_swap),
-            Item::Instruction(last),
-            Item::Instruction(first),
-        ])
-    .then_some(last.location)
+    source
+        .iter()
+        .copied()
+        .eq([removed_swap, *last]
+            .into_iter()
+            .chain(middle.iter().copied())
+            .chain([*first])
+            .map(Item::Instruction))
+        .then_some(last.location)
 }
 
 /// Replays the original store donor only across the exact static-SWAP permutation.
 fn comprehension_assignment_exit_location(
     source: &[Item],
     target: &[Item],
-    origins: &FxHashMap<Label, (Vec<Label>, [Instruction; 3])>,
+    origins: &FxHashMap<Label, (Vec<Label>, Vec<Instruction>)>,
 ) -> Option<SourceLocation> {
     let entry_len = target
         .iter()
@@ -1766,7 +1771,7 @@ fn comprehension_assignment_exit_location(
         Item::Label(exit) => origins.get(exit),
         Item::Instruction(_) => None,
     })?;
-    if source.len() != entries.len() + 3 {
+    if source.len() != entries.len() + instructions.len() {
         return None;
     }
     let (labels, tail) = source.split_at(entries.len());
@@ -1777,7 +1782,7 @@ fn comprehension_assignment_exit_location(
     {
         return None;
     }
-    static_swap_tail_location(tail, *instructions)
+    static_swap_tail_location(tail, instructions)
 }
 
 /// Original normal-try exits threaded through one shared, unlocated branch join.
@@ -2017,7 +2022,7 @@ fn match_join_store_exit_location(
     if source.len() != original.len() || source[..prefix.len()] != *prefix {
         return None;
     }
-    static_swap_tail_location(&source[prefix.len()..], [*swap, *first, *last])
+    static_swap_tail_location(&source[prefix.len()..], &[*swap, *first, *last])
 }
 
 fn propagate_exit_block_locations(
@@ -2027,7 +2032,7 @@ fn propagate_exit_block_locations(
     exception_regions: &[ExceptionRegion],
     original_boundaries: &FxHashSet<Label>,
     original_location_absence: &FxHashSet<Label>,
-    comprehension_assignment_exits: &FxHashMap<Label, (Vec<Label>, [Instruction; 3])>,
+    comprehension_assignment_exits: &FxHashMap<Label, (Vec<Label>, Vec<Instruction>)>,
     preserved_boundaries: &FxHashSet<Label>,
     source_boundaries: &FxHashSet<Label>,
     setups: &[(Label, Option<SourceLocation>)],
@@ -2080,7 +2085,7 @@ fn propagate_exit_block_locations_inner<const SKIP_LOCATED: bool>(
     exception_regions: &[ExceptionRegion],
     original_boundaries: &FxHashSet<Label>,
     original_location_absence: &FxHashSet<Label>,
-    comprehension_assignment_exits: &FxHashMap<Label, (Vec<Label>, [Instruction; 3])>,
+    comprehension_assignment_exits: &FxHashMap<Label, (Vec<Label>, Vec<Instruction>)>,
     preserved_boundaries: &FxHashSet<Label>,
     source_boundaries: &FxHashSet<Label>,
     setups: &[(Label, Option<SourceLocation>)],

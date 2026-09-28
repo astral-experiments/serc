@@ -9047,6 +9047,9 @@ fn comprehension_branches_preserve_backedge_store_locations() {
     let source = "def check_groups(groups, flag):\n    for group in groups:\n        if flag:\n            selected = [item for item in group if ready(item)]\n            assert selected\n        else:\n            selected = [item for item in group if item.active]\n            assert selected\n        assert len(selected) == 1\n";
     for source in [
         source.to_owned(),
+        source.replace("[item for item in group", "[index for index, item in enumerate(group)"),
+        source.replace("[item for item in group", "[index for index, item, extra in triples(group)"),
+        source.replace("[item for item in group", "[(item, other) for item in group for other in group"),
         source.replace("[item for item in group if item.active]", "[\n                item\n                for item in group\n                if item.active\n            ]"),
         source.replace("[item for item in group if ready(item)]", "{item for item in group if ready(item)}").replace("[item for item in group if item.active]", "{item for item in group if item.active}"),
         source.replace("[item for item in group if ready(item)]", "{item: item for item in group if ready(item)}").replace("[item for item in group if item.active]", "{item: item for item in group if item.active}"),

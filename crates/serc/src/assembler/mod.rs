@@ -4017,70 +4017,72 @@ impl Assembler {
         count
     }
 
-    /// Certifies a single comprehension restore followed by its result assignment.
-    pub(crate) fn current_original_block_is_single_comprehension_assignment(&self) -> bool {
-        let [
-            ..,
-            Item::Label(entry),
-            Item::Instruction(swap),
-            Item::Instruction(restore),
-            Item::Instruction(store),
-        ] = self.linear_items()
-        else {
-            return false;
-        };
-        swap.opcode == SWAP
-            && swap.operand() == Operand::Value(2)
-            && restore.opcode == STORE_FAST
-            && restore.local_policy.may_store_null()
-            && store.opcode == STORE_FAST
-            && !store.local_policy.may_store_null()
-            && restore.operand() != store.operand()
-            && self
-                .exception_owner_provenance
-                .original_comprehension_normal_restores
-                .get(entry)
-                .is_some_and(|original| original.as_slice() == [*swap, *restore])
-            && self
-                .exception_owner_provenance
-                .original_comprehension_normal_exits
-                .iter()
-                .any(|(target, jump)| {
-                    target == entry
-                        && jump.opcode == JUMP_FORWARD
-                        && jump.operand() == Operand::Forward(*entry)
-                })
-            && [swap, restore, store].into_iter().all(|instruction| {
-                instruction.pre_fold_extra_instructions() == 0
-                    && !instruction.jump_policy.borrow_empty_block()
-                    && instruction.no_location_policy.borrow_fallthrough()
-                        == BorrowFallthrough::Reachable
-            })
-    }
-
-    /// Captures the original assignment donor before its comprehension restore is exchanged.
-    pub(crate) fn record_comprehension_assignment_exit(&mut self, exit: Label) {
-        if !self.current_original_block_is_single_comprehension_assignment() {
-            return;
-        }
+    /// Captures the original normal restores followed by a distinct result assignment.
+    fn current_original_comprehension_assignment(&self) -> Option<(Vec<Label>, Vec<Instruction>)> {
         let items = self.linear_items();
-        let [
-            ..,
-            Item::Label(_),
-            Item::Instruction(swap),
-            Item::Instruction(restore),
-            Item::Instruction(store),
-        ] = items
-        else {
-            unreachable!("certified comprehension assignment array");
+        let entry_index = items
+            .iter()
+            .rposition(|item| matches!(item, Item::Label(_)))?;
+        let Item::Label(entry) = items[entry_index] else {
+            unreachable!();
         };
-        let instructions = [*swap, *restore, *store];
+        let instructions = items[entry_index + 1..]
+            .iter()
+            .map(|item| match item {
+                Item::Instruction(instruction) => Some(*instruction),
+                Item::Label(_) => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let [swap, restores @ .., store] = instructions.as_slice() else {
+            return None;
+        };
+        let mut locals = FxHashSet::default();
+        if restores.is_empty()
+            || swap.opcode != SWAP
+            || swap.operand() != Operand::Value(u32::try_from(restores.len() + 1).ok()?)
+            || store.opcode != STORE_FAST
+            || store.local_policy.may_store_null()
+            || restores.iter().any(|restore| {
+                restore.opcode != STORE_FAST || !restore.local_policy.may_store_null()
+            })
+            || !restores.iter().chain([store]).all(|instruction| {
+                matches!(instruction.operand(), Operand::Value(local) if locals.insert(local))
+            })
+            || !self.exception_owner_provenance.original_comprehension_normal_restores
+                .get(&entry)
+                .is_some_and(|original| original.as_slice() == &instructions[..instructions.len() - 1])
+            || !self.exception_owner_provenance.original_comprehension_normal_exits
+                .iter().any(|(target, jump)| {
+                    *target == entry && jump.opcode == JUMP_FORWARD
+                        && jump.operand() == Operand::Forward(entry)
+                })
+            || instructions.iter().any(|instruction| {
+                instruction.pre_fold_extra_instructions() != 0
+                    || instruction.jump_policy.borrow_empty_block()
+                    || instruction.no_location_policy.borrow_fallthrough()
+                        != BorrowFallthrough::Reachable
+            })
+        {
+            return None;
+        }
         // The cold cleanup's end can share the normal entry's original offset.
         // Retain that entire emitted label prefix, including its exact order.
-        let mut entries = trailing_labels(&items[..items.len() - 3]).collect::<Vec<_>>();
+        let mut entries = trailing_labels(&items[..=entry_index]).collect::<Vec<_>>();
         entries.reverse();
-        self.comprehension_assignment_exits
-            .insert(exit, (entries, instructions));
+        Some((entries, instructions))
+    }
+
+    /// Certifies a single comprehension restore followed by its result assignment.
+    pub(crate) fn current_original_block_is_single_comprehension_assignment(&self) -> bool {
+        self.current_original_comprehension_assignment()
+            .is_some_and(|(_, instructions)| instructions.len() == 3)
+    }
+
+    /// Captures the original assignment donor before its comprehension restores are exchanged.
+    pub(crate) fn record_comprehension_assignment_exit(&mut self, exit: Label) {
+        if let Some(original) = self.current_original_comprehension_assignment() {
+            self.comprehension_assignment_exits.insert(exit, original);
+        }
     }
 
     /// Certifies that the current empty join follows its captured comprehension assignment.

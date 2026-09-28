@@ -1662,7 +1662,7 @@ pub(crate) struct Assembler {
     /// Original ordinary jump blocks that can thread conditional predecessors after exit copying.
     pub(super) conditional_threading_targets: FxHashMap<Label, SourceLocation>,
     /// Exact pre-swap comprehension assignment arrays and their shared match exits.
-    pub(super) comprehension_assignment_exits: FxHashMap<Label, (Vec<Label>, [Instruction; 3])>,
+    pub(super) comprehension_assignment_exits: FxHashMap<Label, (Vec<Label>, Vec<Instruction>)>,
     /// Original match fallthrough arrays ending in an ordinary two-store exchange.
     pub(super) match_join_store_origins: FxHashMap<Label, Vec<Item>>,
     /// Labels preceding an authored NOP omitted during statement lowering.
@@ -1780,7 +1780,7 @@ pub(super) struct OptimizationPipeline {
     /// Original ordinary jump blocks that can thread conditional predecessors after exit copying.
     pub(super) conditional_threading_targets: FxHashMap<Label, SourceLocation>,
     /// Exact pre-swap comprehension assignment arrays and their shared match exits.
-    pub(super) comprehension_assignment_exits: FxHashMap<Label, (Vec<Label>, [Instruction; 3])>,
+    pub(super) comprehension_assignment_exits: FxHashMap<Label, (Vec<Label>, Vec<Instruction>)>,
     /// Original match fallthrough arrays ending in an ordinary two-store exchange.
     pub(super) match_join_store_origins: FxHashMap<Label, Vec<Item>>,
     /// Labels preceding an authored NOP omitted during statement lowering.
