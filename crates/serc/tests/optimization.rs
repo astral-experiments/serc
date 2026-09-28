@@ -2034,6 +2034,43 @@ fn completed_generator_call_preserves_nested_branch_join() {
 }
 
 #[test]
+fn populated_nested_elif_preserves_outer_join() {
+    let source = r#"def select(outer, first, second, flag, value, action):
+    if outer:
+        count = action()
+        if first is not None:
+            assert value is None
+            values = [count]
+            value = action(values)
+        else:
+            if second is not None:
+                assert value.ready
+                assert value.valid
+                if value.stride(-1) != 1:
+                    raise ValueError("invalid stride")
+                value = value.T
+            elif flag:
+                value = action(count)
+            else:
+                value = action(count)
+                value = value.T
+    else:
+        assert first is None
+    action(value)
+"#;
+    for source in [
+        source.to_owned(),
+        source.replace(
+            "                if value.stride(-1) != 1:\n                    raise ValueError(\"invalid stride\")\n",
+            "",
+        ),
+        source.replace("        assert first is None", "        action(first)"),
+    ] {
+        assert_matches_cpython(&source, "populated_nested_elif_join.py", &LEVELS);
+    }
+}
+
+#[test]
 fn generator_call_stores_preserve_populated_nested_join() {
     let source = r"def choose(result, items):
     if result is None:

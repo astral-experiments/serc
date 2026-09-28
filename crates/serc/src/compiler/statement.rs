@@ -1538,6 +1538,53 @@ impl<'source> Compiler<'source> {
             && self.control.finally.active_finally_try_bodies == 0
     }
 
+    /// Certifies nested populated arms that finish before their enclosing `IfEnd`.
+    fn has_populated_conditional_fallthrough(&self, body: &[Stmt]) -> bool {
+        if crate::stack_growth_required() {
+            return crate::grow_stack(|| self.has_populated_conditional_fallthrough(body));
+        }
+        let runtime_test = |test: &Expr| {
+            condition_has_linear_runtime_leaves(test)
+                && !expression_suspends_current_scope(test)
+                && original_condition_has_unique_jump_target(test, true)
+                && original_condition_has_unique_jump_target(test, false)
+        };
+        let Some((last, leading)) = body.split_last() else {
+            return false;
+        };
+        leading.iter().all(|part| {
+            self.context.is_elided_statement(part)
+                || (suite_has_linear_borrow_fallthrough(std::slice::from_ref(part))
+                    && suite_has_nonsuspending_conditional_work(std::slice::from_ref(part)))
+                // A raising guard has no edge into the later conditional join.
+                || matches!(part, Stmt::If(guard)
+                    if runtime_test(&guard.test)
+                        && guard.elif_else_clauses.is_empty()
+                        && matches!(guard.body.as_slice(), [Stmt::Raise(raised)]
+                            if raised.exc.iter().chain(&raised.cause).all(|value| {
+                                !expression_contains_inline_branch(value)
+                                    && !expression_suspends_current_scope(value)
+                            })))
+        }) && match last {
+            Stmt::If(branch) => {
+                runtime_test(&branch.test)
+                    && self.has_populated_conditional_fallthrough(&branch.body)
+                    && branch
+                        .elif_else_clauses
+                        .last()
+                        .is_some_and(|clause| clause.test.is_none())
+                    && branch.elif_else_clauses.iter().all(|clause| {
+                        clause.test.as_ref().is_none_or(runtime_test)
+                            && self.has_populated_conditional_fallthrough(&clause.body)
+                    })
+            }
+            _ => {
+                suite_has_linear_borrow_fallthrough(std::slice::from_ref(last))
+                    && suite_has_nonsuspending_conditional_work(std::slice::from_ref(last))
+            }
+        }
+    }
+
     /// A name or inherited small return, its line NOP, and the replaced jump fit four slots.
     pub(super) fn following_name_return_fits_match_copy_budget(&self) -> bool {
         // A suite-tail match reaches the same return through an enclosing conditional.
@@ -15679,6 +15726,20 @@ impl<'source> Compiler<'source> {
                                             || suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement)),
                                     }
                                 });
+                            // Completed nested arms retain their separate original joins.
+                            // After threading, the last false arm still supplies the line
+                            // for the enclosing exit's late NOP. Raising prefix guards
+                            // cannot add a predecessor to that normal continuation.
+                            let populated_nested_arm = |arm: &[Stmt]| {
+                                populated_arm(arm)
+                                    || (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                                        && !self.control.statements.in_match
+                                        && !self.has_active_control_flow_region()
+                                        && self.control.loops.contexts.is_empty()
+                                        && self.control.withs.active_with_exits.is_empty()
+                                        && self.control.finally.is_inactive_for_return_unwind()
+                                        && self.has_populated_conditional_fallthrough(arm))
+                            };
                             // Ruff flattens elif clauses. Each clause still has a distinct
                             // original IfEnd; linear work completes before entering it.
                             // The final false edge donates the enclosing exit's NOP line.
@@ -15689,7 +15750,7 @@ impl<'source> Compiler<'source> {
                                         .chain(nested.elif_else_clauses.iter().map(|clause| clause.body.as_slice()))
                                         .all(|arm| is_elided_suite(arm)
                                             || (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
-                                                && populated_arm(arm)
+                                                && populated_nested_arm(arm)
                                                 && !suite_contains_yield(arm)))
                                     && std::iter::once(nested.test.as_ref())
                                         .chain(nested.elif_else_clauses.iter().filter_map(|clause| clause.test.as_ref()))
@@ -15719,11 +15780,11 @@ impl<'source> Compiler<'source> {
                                             && original_condition_has_unique_jump_target(&nested.test, false))
                                             || (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                                                 && !self.has_active_control_flow_region()
-                                                && populated_arm(&nested.body)
-                                                && populated_arm(&clause.body)))
-                                        && (populated_arm(&nested.body)
+                                                && populated_nested_arm(&nested.body)
+                                                && populated_nested_arm(&clause.body)))
+                                        && (populated_nested_arm(&nested.body)
                                             || is_elided_suite(&nested.body))
-                                        && (populated_arm(&clause.body)
+                                        && (populated_nested_arm(&clause.body)
                                             || is_elided_suite(&clause.body))
                                         && !suite_contains_yield(&clause.body))))
                         });
