@@ -105,6 +105,27 @@ fn annotated_comprehension_preserves_implicit_return_location() {
 }
 
 #[test]
+fn erased_match_default_keeps_manager_exit_outside_exception_regions() {
+    let source = "def f(manager, other, value):\n    with manager:\n        match value:\n            case 1:\n                return first()\n            case 2:\n                return second()\n            case _:\n                assert False\n";
+    for (case, source) in [
+        source.to_string(),
+        source.replace("with manager:", "with manager, other:"),
+        source.replace("case 1:", "case 1 if value:"),
+        source.replace("case _:", "case _ if value:"),
+        format!("{source}        finish()\n"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            &source,
+            &format!("match_default_manager_{case}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn erased_match_case_suffix_preserves_protected_conditional_join() {
     for managers in ["manager", "manager, other"] {
         for suffix in ["", "        finish()\n"] {

@@ -34803,6 +34803,35 @@ impl<'source> Compiler<'source> {
                     // assertion arms. Only an originally unique success edge donates a line.
                     body_noop = Some(WithBodyExitNoop::ConvertedPopBlock);
                 }
+            } else if self.context.python_version >= crate::PythonVersion::Py314
+                && let Some(Stmt::Match(statement)) = terminal_body.last()
+                && let Some((fallback, preceding)) = statement.cases.split_last()
+                && !preceding.is_empty()
+                && is_wildcard_pattern(&fallback.pattern)
+                && fallback.guard.is_none()
+                && fallback
+                    .body
+                    .iter()
+                    .all(|statement| self.context.is_elided_statement(statement))
+                && preceding
+                    .iter()
+                    .all(|case| suite_terminates_before_constant_folding(&case.body))
+                && self.assembler.last_instruction_location()
+                    == Some(self.source_location(fallback.pattern.range()))
+            {
+                // Terminating cases leave only the erased wildcard at the normal exit.
+                // Its NOP donates its line to the converted POP_BLOCK,
+                // so the retained marker belongs outside the manager's protected body.
+                let previous_location = self.assembler.location();
+                self.assembler
+                    .set_location(self.source_location(fallback.pattern.range()));
+                if self.take_trailing_nop_location().is_some() {
+                    body_noop = Some(WithBodyExitNoop::LocatedConvertedPopBlock(
+                        fallback.pattern.range(),
+                    ));
+                } else {
+                    self.assembler.set_location(previous_location);
+                }
             }
         } else {
             self.compile_with_items(remaining, body, false, false, following_return)?;
