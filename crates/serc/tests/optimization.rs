@@ -254,6 +254,18 @@ fn erased_suffix_preserves_with_pop_block() {
 }
 
 #[test]
+fn erased_coroutine_handler_assertions_preserve_manager_pop_block() {
+    for work in ["worker()", "await worker()"] {
+        for exit in ["raise Failure('expected')", "return 42"] {
+            let source = format!(
+                "async def verify(manager, worker):\n    with manager:\n        try:\n            {work}\n            {exit}\n        except Problem as error:\n            assert error.value\n    await worker()\n"
+            );
+            assert_matches_cpython(&source, "erased_coroutine_handler_exit.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn erased_handler_assertions_preserve_manager_pop_block() {
     const SOURCE: &str = "def f(manager, factory):\n    with manager():\n        obj = factory()\n        try:\n            obj.run()\n            raise ValueError(\"failed\")\n        except Error as exc:\n            text = str(exc)\n            assert \"bad\" in text\n        assert obj.ready\n    finish()\n";
     for (index, assignment) in [

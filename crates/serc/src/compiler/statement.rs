@@ -34901,7 +34901,14 @@ impl<'source> Compiler<'source> {
                 .assembler
                 .original_manager_cleanup_join(
                     protected_end,
-                    remaining.is_empty() && with_body_has_cold_normal_donor(body),
+                    remaining.is_empty()
+                        && with_body_has_cold_normal_donor(
+                            body,
+                            self.context.python_version >= crate::PythonVersion::Py314
+                                && self.unit.flags
+                                    & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                                    == CO_COROUTINE,
+                        ),
                 )
                 .map(|entry| WithBodyExitNoop::RetainedManagerPopBlock(SourceLocation::NONE, entry))
                 .or_else(|| {
@@ -37368,7 +37375,7 @@ fn with_chained_manager_exit_location(
 // These source exits reach a distinct manager POP after the cold COPY/POP_EXCEPT/
 // RERAISE footer. The assembler still certifies that exact original footer and its
 // sole source/block join; the existing graph pass resolves live predecessor counts.
-fn with_body_has_cold_normal_donor(body: &[Stmt]) -> bool {
+fn with_body_has_cold_normal_donor(body: &[Stmt], allow_erased_named_handler: bool) -> bool {
     if with_body_has_terminal_manager_suppression(body) {
         return true;
     }
@@ -37396,6 +37403,18 @@ fn with_body_has_cold_normal_donor(body: &[Stmt]) -> bool {
         let Some(handler) = normal_handlers.next() else {
             return false;
         };
+        if allow_erased_named_handler
+            && handler.name.is_some()
+            && !handler.body.is_empty()
+            && handler
+                .body
+                .iter()
+                .all(|part| matches!(part, Stmt::Global(global) if global.names.is_empty()))
+        {
+            // The named cleanup is the only continuing predecessor. Let the
+            // original join proof retain its POP_BLOCK and resolve the donor.
+            return normal_handlers.next().is_none();
+        }
         let Some(Stmt::For(loop_statement)) = handler.body.last() else {
             return false;
         };
