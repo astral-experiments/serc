@@ -23,6 +23,26 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn erased_assertions_preserve_manager_while_exit() {
+    let source = "def f(manager, worker):\n    with manager:\n        while len(worker.items) != 1:\n            worker.advance()\n        assert len(worker.items) == 1\n";
+    let repeated = source.replace(
+        "        assert len(worker.items) == 1\n",
+        "        assert len(worker.items) == 1\n        worker.restart()\n        while len(worker.items) != 2:\n            worker.advance()\n        assert len(worker.items) == 2\n",
+    );
+    for (index, source) in [
+        source.to_owned(),
+        repeated,
+        source.replace("        assert len(worker.items) == 1\n", "        pass\n"),
+        format!("{source}        worker.finish()\n"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(&source, &format!("manager_while_exit_{index}.py"), &LEVELS);
+    }
+}
+
+#[test]
 fn elided_handler_assertion_preserves_while_break_cleanup() {
     for suffix in ["assert found", "pass", "after()"] {
         let source = format!(

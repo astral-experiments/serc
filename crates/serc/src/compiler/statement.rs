@@ -20613,12 +20613,32 @@ impl<'source> Compiler<'source> {
                             == context.exception_region_depth
                         && self.control.withs.direct_final_async_with_while == Some(statement.range)
                 });
+        // Assertions omitted at codegen leave this loop as the direct manager exit,
+        // even though lexical sibling information still includes their source spans.
+        let elided_manager_tail =
+            self.control
+                .withs
+                .active_with_exits
+                .last()
+                .is_some_and(|context| {
+                    !context.is_async
+                        && context.exception_region_depth
+                            == self
+                                .control
+                                .exceptions
+                                .active_exception_region_exclusions
+                                .len()
+                        && matches!(context.normal_exit,
+                        WithBodyNormalExit::WhileBeforeElided(range) if range == statement.range)
+                });
         // CPython keeps the converted protected-region POP_BLOCK marker only when the while
         // condition contributes one edge to the normal exit. An innermost async-with drops that
         // marker unless an intervening exception region owns the loop exit.
         if statement.orelse.is_empty()
-            && !self.control.statements.context.has_following
-            && self.control.statements.context.same_region_continuation != Some(statement.range)
+            && (elided_manager_tail
+                || (!self.control.statements.context.has_following
+                    && self.control.statements.context.same_region_continuation
+                        != Some(statement.range)))
             && self.control.statements.while_before_conditional_join != Some(statement.range)
             && self.control.loops.split_loop_tail_prefix_end != Some(statement.range)
             && !innermost_async_with
@@ -20634,7 +20654,9 @@ impl<'source> Compiler<'source> {
                         .len()
                         != context.exception_region_depth
                         || matches!(context.normal_exit, WithBodyNormalExit::Unknown)
-                        || matches!(context.normal_exit, WithBodyNormalExit::While(range) if range == statement.range)
+                        || matches!(context.normal_exit,
+                            WithBodyNormalExit::While(range) | WithBodyNormalExit::WhileBeforeElided(range)
+                                if range == statement.range)
                 })
             && self
                 .control
@@ -34418,7 +34440,19 @@ impl<'source> Compiler<'source> {
                 None
             },
             normal_exit: if remaining.is_empty() {
-                with_body_normal_exit(body)
+                let live_end = body.iter().rposition(|statement| {
+                    !matches!(statement, Stmt::Global(global) if global.names.is_empty())
+                        || !self.context.is_elided_statement(statement)
+                });
+                match live_end.and_then(|index| body.get(index).map(|tail| (index, tail))) {
+                    Some((index, Stmt::While(tail)))
+                        if self.context.python_version >= crate::PythonVersion::Py314
+                            && index + 1 < body.len() =>
+                    {
+                        WithBodyNormalExit::WhileBeforeElided(tail.range)
+                    }
+                    _ => with_body_normal_exit(body),
+                }
             } else {
                 WithBodyNormalExit::Unknown
             },
@@ -36435,6 +36469,8 @@ enum WithBodyNormalExit {
     Unknown,
     Terminated,
     While(TextRange),
+    // Optimized-away assertions leave this direct while as the manager's normal exit.
+    WhileBeforeElided(TextRange),
     Other,
 }
 
