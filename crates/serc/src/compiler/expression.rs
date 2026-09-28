@@ -7584,10 +7584,10 @@ impl Compiler<'_> {
                 && self.control.stack.depth == 0
                 && continuation.is_none()
                 && !self.control.statements.in_match
-                && self.control.loops.contexts.is_empty()
-                && !self.control.loops.suite_fallthrough_to_loop_backedge
+                && !self.control.in_loop()
+                && !self.control.is_loop_backedge_suite()
                 && self.control.generators.generator_region_start.is_none()
-                && self.control.withs.active_with_exits.is_empty()
+                && self.control.active_with_count() == 0
                 && self.control.withs.active_with_region_exclusions.is_empty()
                 && self
                     .control

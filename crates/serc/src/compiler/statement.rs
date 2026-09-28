@@ -889,6 +889,11 @@ impl ControlFlowState<'_> {
         !self.loops.contexts.is_empty()
     }
 
+    /// Whether the surrounding suite is marked to reach a loop backedge.
+    pub(super) fn is_loop_backedge_suite(&self) -> bool {
+        self.loops.suite_fallthrough_to_loop_backedge
+    }
+
     pub(super) fn falls_through_to_loop_backedge(&self) -> bool {
         self.loops.suite_fallthrough_to_loop_backedge && !self.statements.context.has_following
     }
