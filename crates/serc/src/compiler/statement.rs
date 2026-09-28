@@ -717,7 +717,7 @@ pub(super) struct StatementContext {
     followed_by_call_expression: bool,
     // Whether the next statement assigns or deletes one name in this suite.
     followed_by_name_assignment_or_deletion: bool,
-    // Whether an elided conditional join reaches a call/name store/delete after erased asserts.
+    // Whether an elided conditional join reaches a call, linear store, or name delete.
     elided_join_has_live_successor: bool,
     // Two tuple elements, BUILD_TUPLE, POP_BLOCK, and RETURN exceed the four-record
     // exit-copy budget before folding or fusion in a direct try body.
@@ -3261,7 +3261,13 @@ impl<'source> Compiler<'source> {
                     elided_join_has_live_successor: matches!(elided_join_successor,
                         Some(Stmt::Expr(expression)) if matches!(expression.value.as_ref(), Expr::Call(_)))
                         || matches!(elided_join_successor,
-                            Some(Stmt::Assign(assignment)) if matches!(assignment.targets.as_slice(), [Expr::Name(_)]))
+                            Some(next @ Stmt::Assign(assignment))
+                                if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                                    // A straight-line attribute or subscript store also keeps
+                                    // the original join ahead of the loop's backedge.
+                                    || (suite_has_linear_borrow_fallthrough(std::slice::from_ref(next))
+                                        && suite_has_nonsuspending_conditional_work(std::slice::from_ref(next))
+                                        && !suite_contains_yield(std::slice::from_ref(next))))
                         || matches!(elided_join_successor,
                             Some(Stmt::AugAssign(assignment)) if matches!(assignment.target.as_ref(), Expr::Name(_)))
                         || matches!(elided_join_successor,

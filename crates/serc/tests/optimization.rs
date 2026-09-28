@@ -2020,6 +2020,16 @@ fn erased_match_case_suffix_preserves_join_before_successor() {
 }
 
 #[test]
+fn coroutine_loop_store_preserves_elided_join_nop() {
+    for target in ["item.state", "item.parent.state", "item[0]"] {
+        let source = format!(
+            "async def f(items):\n    await prepare()\n    for item in items:\n        if item.kind == 1:\n            assert item\n        else:\n            assert items\n        {target} = None\n        assert item\n"
+        );
+        assert_matches_cpython(&source, "coroutine_loop_store_join.py", &LEVELS);
+    }
+}
+
+#[test]
 fn coroutine_linear_prefix_preserves_nested_elided_join_nop() {
     for manager in ["with", "async with"] {
         for prefix in [
