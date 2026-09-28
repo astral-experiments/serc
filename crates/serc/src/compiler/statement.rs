@@ -15896,6 +15896,25 @@ impl<'source> Compiler<'source> {
                         })
                         && (suite_has_linear_borrow_fallthrough(&statement.body)
                             || matches!(statement.body.as_slice(), [Stmt::Return(_) | Stmt::Raise(_)])
+                            // A nested iterator's exhaustion still reaches the same outer
+                            // backedge. Erased assertions do not turn that conditional's
+                            // separate false edges into one located loop exit.
+                            || (matches!(self.unit.scope, Scope::Function { .. })
+                                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                                && self.control.withs.active_with_exits.is_empty()
+                                && self.control.loops.contexts.last().is_some_and(|context| {
+                                    context.iterator_cleanup == IteratorCleanup::Sync
+                                        && !context.has_orelse
+                                        && context.continue_label == restart
+                                })
+                                && matches!(statement.body.as_slice(), [Stmt::For(iterator)]
+                                    if !iterator.is_async
+                                        && iterator.orelse.is_empty()
+                                        && !suite_contains_loop_break(&iterator.body)
+                                        && iterator.body.iter().all(|part| {
+                                            suite_has_linear_borrow_fallthrough(std::slice::from_ref(part))
+                                                || is_linear_delete(part)
+                                        })))
                             // Calls before a return cannot reach the original backedge;
                             // the conditional's false edge still targets it directly.
                             || (matches!(self.unit.scope, Scope::Function { .. })

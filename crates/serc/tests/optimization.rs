@@ -23,6 +23,21 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn elided_assertion_after_nested_iterator_preserves_condition_backedges() {
+    for suffix in ["assert item", "pass", "after()"] {
+        let source = format!(
+            "def f(items, first, second, left, right, target):\n    for item in items:\n        if first:\n            if left and right:\n                for value in item:\n                    del target[value]\n            {suffix}\n        elif second:\n            values = [value for value in item]\n            assert values\n        else:\n            assert item\n"
+        );
+        assert_matches_cpython(&source, "nested_iterator_condition_backedges.py", &LEVELS);
+    }
+    assert_matches_cpython(
+        "def f(items, first, left, right, target):\n    for item in items:\n        if first:\n            if left and right:\n                for value in item:\n                    del target[value]\n            assert item\n",
+        "nested_iterator_terminal_condition.py",
+        &LEVELS,
+    );
+}
+
+#[test]
 fn chained_condition_loop_exit_preserves_iterator_location() {
     for source in [
         "def f(a, b, items):\n    assert a\n    if check(a):\n        assert b\n    if a < b < items:\n        assert a\n        for item in items:\n            assert item\n",
