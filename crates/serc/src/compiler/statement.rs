@@ -18638,6 +18638,34 @@ impl<'source> Compiler<'source> {
                         && self.control.loops.contexts.last().is_some_and(|context| {
                             context.iterator_cleanup != IteratorCleanup::None
                         })));
+        // A finally entered before this synchronous iterator is not unwound by
+        // its backedge. The saved protected-loop depth distinguishes that owner
+        // from a try/finally entered inside the iteration.
+        let iterator_inside_finally = matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.control.finally.active_finally_try_bodies == 1
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .len()
+                == 1
+            && self
+                .control
+                .finally
+                .innermost_finally_exception_exclusion_depth
+                == Some(1)
+            && matches!(self.control.finally.protected_try_loop_depths.as_slice(),
+                [(1, loop_depth)] if *loop_depth < self.control.loops.contexts.len())
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.withs.active_with_region_exclusions.is_empty()
+            && self.control.loops.contexts.last().is_some_and(|context| {
+                context.iterator_cleanup == IteratorCleanup::Sync
+                    && context.continue_label == restart
+            })
+            && condition_has_linear_runtime_leaves(final_test)
+            && condition_jump_target_count(final_test, false) == 1
+            && suite_has_linear_borrow_fallthrough(final_body);
         // With no intervening cleanup, the removed else reaches the iterator
         // directly. Native normalizes that backward condition into fresh slots.
         // A comparison chain keeps its own operand cleanup before the same exit.
@@ -18651,7 +18679,7 @@ impl<'source> Compiler<'source> {
         let protected_iterator_work_else = eligible_else
             && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
             && self.control.in_loop_tail_without_nested_cleanup()
-            && self.control.finally.active_finally_try_bodies == 0
+            && (self.control.finally.active_finally_try_bodies == 0 || iterator_inside_finally)
             && self
                 .control
                 .loops

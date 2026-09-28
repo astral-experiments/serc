@@ -11096,3 +11096,48 @@ fn normal_finalizer_none_marker_reuses_original_local_load_owner() {
         assert_matches_cpython(&source, &format!("normal_finalizer_local_load_owner_{index}.py"), &LEVELS);
     }
 }
+
+#[test]
+fn erased_iterator_else_stays_inside_enclosing_finally() {
+    let source = r"def f(items, expected, count):
+    try:
+        result = prepare()
+    except Failure:
+        raise
+    else:
+        if count > 1:
+            for item in items:
+                value = item.read()
+                current = extract(value)
+                if expected != checksum(current):
+                    report(expected, current)
+                else:
+                    assert result == value
+    finally:
+        close()
+";
+    for (index, source) in [
+        source.to_owned(),
+        source.replace(
+            "                else:\n                    assert result == value\n",
+            "                else:\n                    pass\n",
+        ),
+        source.replace(
+            "                    assert result == value\n",
+            "                    consume(value)\n",
+        ),
+        source.replace(
+            "                    assert result == value\n",
+            "                    assert result == value\n                finish(item)\n",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            &source,
+            &format!("finally_iterator_else_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
