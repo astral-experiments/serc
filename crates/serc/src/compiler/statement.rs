@@ -16319,6 +16319,8 @@ impl<'source> Compiler<'source> {
                     || (mode.non_final_branch
                         && !mode.try_body_normal_exit
                         && self.has_active_control_flow_region()
+                        && !self.control.in_exception_handler()
+                        && self.control.finally.is_inactive_for_return_unwind()
                         && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
                         && self.control.in_loop_tail_without_nested_cleanup()
                         && self.control.in_iterator_loop()
