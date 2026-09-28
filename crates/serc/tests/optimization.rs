@@ -23,6 +23,21 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn elided_finally_assertion_preserves_exceptional_exit_locations() {
+    for tail in ["assert flag", "pass", "after()"] {
+        let source = format!(
+            "def f(manager, flag):\n    with manager:\n        try:\n            work()\n        finally:\n            if flag:\n                cleanup()\n            {tail}\n"
+        );
+        assert_matches_cpython(&source, "finally_assertion_tail.py", &LEVELS);
+    }
+    assert_matches_cpython(
+        "def f(manager, flag):\n    with manager:\n        try:\n            work()\n        finally:\n            while flag:\n                cleanup()\n            assert flag\n",
+        "finally_loop_assertion_tail.py",
+        &LEVELS,
+    );
+}
+
+#[test]
 fn conditional_assignment_preserves_original_statement_joins() {
     for source in [
         r"def example(flag, choice, build):

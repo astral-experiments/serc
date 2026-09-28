@@ -33586,18 +33586,24 @@ impl<'source> Compiler<'source> {
                         compiler.compile_exceptional_finally_suite(&statement.finalbody)?;
                     }
                     if !suite_terminates(&statement.finalbody) {
+                        let effective_tail = statement
+                            .finalbody
+                            .iter()
+                            .rev()
+                            .find(|statement| !compiler.context.is_elided_statement(statement));
                         if (compiler.context.python_version == crate::PythonVersion::Py312
                             && statement.finalbody.last().is_some_and(|statement| {
                                 matches!(statement, Stmt::Assign(_))
                                     || matches!(statement, Stmt::AnnAssign(assignment) if assignment.value.is_some())
                             }))
                             || matches!(
-                                statement.finalbody.last(),
+                                effective_tail,
                                 Some(Stmt::If(_) | Stmt::For(_) | Stmt::While(_) | Stmt::Match(_))
                             )
                         {
                             // CPython leaves the shared exceptional exit unlocated. Each incoming
                             // branch, including a loop break, supplies the copied exit's location.
+                            // Elided assertions do not replace that shared exit's original tail.
                             compiler.assembler.set_location(SourceLocation::NONE);
                         } else if compiler.context.python_version == crate::PythonVersion::Py312
                             && matches!(statement.finalbody.last(), Some(Stmt::Assert(assertion))
