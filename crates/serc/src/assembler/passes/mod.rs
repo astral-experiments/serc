@@ -617,7 +617,7 @@ impl OptimizationPipeline {
             );
         }
         let local_nop_donors = self.capture_local_nop_donors();
-        let reversed_store_handler_exits = self.capture_reversed_store_handler_exits();
+        let reversed_store_exits = self.capture_reversed_store_exits();
         self.preserve_shared_original_manager_pop_locations();
         self.record_shared_unlocated_jump_entries();
         let mut original_owners = FusionOwnerCertificates::capture_original_owners(&self);
@@ -731,7 +731,7 @@ impl OptimizationPipeline {
                     &mut copied_exit_owner_retargets,
                     &mut copied_exit_region_retargets,
                 ),
-                &reversed_store_handler_exits,
+                &reversed_store_exits,
                 &threaded_normal_try_joins,
                 &mut static_swap_store_gaps,
                 constants

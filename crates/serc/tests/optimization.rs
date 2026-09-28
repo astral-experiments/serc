@@ -492,6 +492,32 @@ fn coroutine_protected_iterator_preserves_erased_else_backedge() {
 }
 
 #[test]
+fn unpacked_store_preserves_loop_backedge_location() {
+    let source = "def reset_groups(groups, enabled, limit):\n    first, second, total = 0, 0, 0\n    for group in groups:\n        for item in group:\n            consume(item)\n            if enabled and (item > limit or total > limit):\n                if item:\n                    report(item)\n                first, second, total = 0, 0, 0\n            assert first >= 0\n    finish(total)\n";
+    for (index, source) in [
+        source.to_owned(),
+        source.replace(
+            "                if item:\n                    report(item)\n",
+            "                report(item)\n",
+        ),
+        source.replace("first, second, total = 0, 0, 0", "first, second = 0, 0"),
+        source.replace(
+            "first, second, total = 0, 0, 0",
+            "first, second, first = 0, 0, 0",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            &source,
+            &format!("unpacked_store_backedge_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn erased_assertion_preserves_legacy_loop_return_copies() {
     let source = "def f(worker):\n    if not worker.ready:\n        value = worker.read()\n        while value not in [\"a\", \"b\"]:\n            value = worker.read()\n        assert value == \"a\"\n";
     for (index, source) in [
