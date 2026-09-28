@@ -12395,3 +12395,21 @@ fn protected_iterator_tail_accepts_completed_conditional_work() {
         assert_matches_cpython(&source, "protected_iterator_completed_work.py", &LEVELS);
     }
 }
+
+#[test]
+fn erased_match_case_threads_through_enclosing_branch() {
+    for calls in [2, 30] {
+        for pattern in ["A() | B()", "A()"] {
+            let mut source = format!(
+                "def f(subject, enabled, emit):\n    if enabled:\n        match subject:\n            case {pattern}:\n                assert False\n            case C():\n"
+            );
+            for index in 0..calls {
+                writeln!(source, "                emit({index})").unwrap();
+            }
+            source.push_str(
+                "            case _:\n                emit(subject)\n    else:\n        emit(enabled)\n    emit(subject)\n    emit(enabled)\n    return subject\n",
+            );
+            assert_matches_cpython(&source, "erased_match_branch.py", &LEVELS);
+        }
+    }
+}

@@ -1264,11 +1264,12 @@ impl Compiler<'_> {
                                 .iter()
                                 .all(|statement| self.context.is_elided_statement(statement));
                         // An erased case leaves only its NEXT_LOCATION subject pop
-                        // before the success jump. Copying the continuation must not insert
-                        // a located NOP between that pop and the copied return.
+                        // before the success jump. The continuation may belong to an
+                        // enclosing branch: allow the jump to thread through it without
+                        // retaining an extra NOP after the subject pop.
                         let erased_subject_fallthrough = self.context.python_version
                             >= PythonVersion::Py314
-                            && match_has_following
+                            && (match_has_following || elided_case_body)
                             && copied_subject
                             // Folded guards can retain a located NOP before the subject pop.
                             && case
