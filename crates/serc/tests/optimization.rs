@@ -294,10 +294,16 @@ fn completed_iterator_prefix_preserves_finalizer_manager_exit() {
 #[test]
 fn elided_conditional_preserves_jump_before_finalizer() {
     for body in ["assert value.ready", "pass", "record(value)"] {
-        let source = format!(
-            "def f(flag):\n    try:\n        value = work()\n        assert value\n        if flag:\n            {body}\n        else:\n            assert value.done\n    finally:\n        cleanup()\n        finish()\n"
-        );
-        assert_matches_cpython(&source, "conditional_before_finalizer.py", &LEVELS);
+        for successor in [
+            "",
+            "        record(value)\n",
+            "        result = build(value)\n",
+        ] {
+            let source = format!(
+                "def f(flag):\n    try:\n        value = work()\n        assert value\n        if flag:\n            {body}\n        else:\n            assert value.done\n{successor}    finally:\n        cleanup()\n        finish()\n"
+            );
+            assert_matches_cpython(&source, "conditional_before_finalizer.py", &LEVELS);
+        }
     }
 }
 

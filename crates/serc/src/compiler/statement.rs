@@ -14874,8 +14874,8 @@ impl<'source> Compiler<'source> {
                                 || self.control.loops.contexts.last().is_some_and(|context| {
                                     context.with_depth < self.control.withs.active_with_exits.len()
                                 })));
-                    // The direct try-body join precedes POP_BLOCK and a separate,
-                    // live finalizer array. Its empty true-arm jump still receives
+                    // A direct try-body join precedes live work or POP_BLOCK and
+                    // a separate finalizer array. Its empty true-arm jump receives
                     // the condition's line before redundant-jump removal.
                     let direct_finally_body_join = matches!(
                         self.unit.scope,
@@ -14893,9 +14893,19 @@ impl<'source> Compiler<'source> {
                             .len()
                             == 1
                         && self.control.finally.active_finally_try_bodies == 1
-                        && !self.control.statements.context.has_following
-                        && self.control.exceptions.direct_try_body_statements.last()
-                            == Some(&statement.range)
+                        && ((!self.control.statements.context.has_following
+                            && self.control.exceptions.direct_try_body_statements.last()
+                                == Some(&statement.range))
+                            || (self
+                                .control
+                                .statements
+                                .context
+                                .elided_join_has_live_successor
+                                && self
+                                    .control
+                                    .exceptions
+                                    .direct_try_body_statements
+                                    .contains(&statement.range)))
                         && matches!(statement.elif_else_clauses.as_slice(), [clause]
                             if clause.test.is_none())
                         && matches!(self.control.finally.active_return_finally_contexts.as_slice(), [finalizer]
