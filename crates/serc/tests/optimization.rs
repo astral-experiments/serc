@@ -8459,6 +8459,21 @@ fn nonlinear_match_cases_keep_their_shared_exits() {
 }
 
 #[test]
+fn completed_managers_preserve_coroutine_match_returns() {
+    for manager in [
+        "with manager as stream:\n                saved = stream.read()",
+        "with manager:\n                saved = read()",
+    ] {
+        for suffix in ["assert value", "pass", "after()"] {
+            let source = format!(
+                "async def f(kind, manager, value):\n    match kind:\n        case 1:\n            {manager}\n            if change := compare(saved, value):\n                consume(change)\n            assert change == []\n        case 2:\n            with manager as stream:\n                stream.write(value)\n    {suffix}\n"
+            );
+            assert_matches_cpython(&source, "completed_manager_match.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn coroutine_match_cases_preserve_nested_condition_return_donors() {
     for prefix in [
         "",

@@ -1620,7 +1620,7 @@ impl<'source> Compiler<'source> {
                 Some(super::optimization::OptimizedLocation::Elided)
             )
         };
-        let is_flat = |statement: &Stmt| {
+        let is_supported_work = |statement: &Stmt| {
             is_elided(statement)
                 || matches!(
                     statement,
@@ -1631,8 +1631,20 @@ impl<'source> Compiler<'source> {
                         && matches!(assignment.target.as_ref(), Expr::Name(_)))
                 || (suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement))
                     && suite_has_nonsuspending_conditional_work(std::slice::from_ref(statement)))
+                // Normal and suppressed manager exits join before the case's
+                // terminal conditional or success jump.
+                || (self.context.python_version >= crate::PythonVersion::Py314
+                    && self.unit.flags & CO_COROUTINE != 0
+                    && matches!(statement, Stmt::With(manager)
+                        if !manager.is_async
+                            && matches!(manager.items.as_slice(), [item]
+                                if !expression_suspends_current_scope(&item.context_expr)
+                                    && !expression_contains_inline_branch(&item.context_expr)
+                                    && item.optional_vars.as_deref().is_none_or(|target| matches!(target, Expr::Name(_))))
+                            && suite_has_linear_borrow_fallthrough(&manager.body)
+                            && suite_has_nonsuspending_conditional_work(&manager.body)))
         };
-        if body.iter().all(is_flat) {
+        if body.iter().all(is_supported_work) {
             return true;
         }
         let Some((Stmt::If(conditional), prefix)) =
@@ -1640,7 +1652,7 @@ impl<'source> Compiler<'source> {
         else {
             return false;
         };
-        prefix.iter().all(is_flat)
+        prefix.iter().all(is_supported_work)
             && conditional.elif_else_clauses.is_empty()
             && condition_has_linear_runtime_leaves(&conditional.test)
             && !expression_suspends_current_scope(&conditional.test)
