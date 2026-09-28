@@ -7163,6 +7163,22 @@ fn elided_assertion_after_manager_finally_matches_cpython() {
 }
 
 #[test]
+fn completed_prefix_preserves_finally_manager_exit() {
+    for function in ["def", "async def"] {
+        for prefix in [
+            "        from package import item\n        saved = obj.value\n",
+            "        with manager:\n            prepare()\n        saved = obj.value\n",
+            "        with acquire() as resource:\n            prepare(resource)\n        from package import item\n        saved = obj.value\n",
+        ] {
+            let source = format!(
+                "{function} f(manager, obj):\n    with manager:\n{prefix}        try:\n            result = obj.work()\n        finally:\n            obj.value = saved\n        assert result\n        assert obj\n"
+            );
+            assert_matches_cpython(&source, "completed_prefix_finally.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn nested_definition_before_finally_preserves_manager_exit() {
     for definition in [
         "async def child():\n            yield flag",

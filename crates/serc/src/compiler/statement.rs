@@ -34199,6 +34199,17 @@ impl<'source> Compiler<'source> {
                         || leading.iter().all(|prefix| {
                             matches!(prefix, Stmt::Pass(_))
                                 || suite_has_linear_borrow_fallthrough(std::slice::from_ref(prefix))
+                                // Imports and completed managers can precede the linear
+                                // work that repopulates the prefix's final array.
+                                || matches!(prefix, Stmt::Import(_) | Stmt::ImportFrom(_))
+                                || matches!(prefix, Stmt::With(manager)
+                                    if !manager.is_async
+                                        && matches!(manager.items.as_slice(), [item]
+                                            if !expression_suspends_current_scope(&item.context_expr)
+                                                && !expression_contains_inline_branch(&item.context_expr)
+                                                && item.optional_vars.as_deref().is_none_or(|target| matches!(target, Expr::Name(_))))
+                                        && suite_has_linear_borrow_fallthrough(&manager.body)
+                                        && suite_has_nonsuspending_conditional_work(&manager.body))
                                 // Plain definitions emit linear function creation here. Modern
                                 // annotations and child bodies compile in independent scopes.
                                 || (self.context.python_version >= crate::PythonVersion::Py314
