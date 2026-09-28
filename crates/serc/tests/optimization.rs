@@ -23,6 +23,19 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn erased_else_preserves_protected_iterator_continue() {
+    for body in [
+        "            if value == 1:\n                continue\n            else:\n                assert False\n",
+        "            if value == 0:\n                await sink(value)\n            elif value == 1:\n                continue\n            else:\n                assert False\n",
+    ] {
+        let source = format!(
+            "async def f(values):\n    try:\n        async for value in values:\n{body}    finally:\n        print(values)\n",
+        );
+        assert_matches_cpython(&source, "protected_iterator_continue.py", &LEVELS);
+    }
+}
+
+#[test]
 fn erased_branches_preserve_protected_while_join() {
     for loop_test in ["True", "flag", "flag != stop"] {
         let source = format!(

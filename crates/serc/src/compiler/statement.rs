@@ -18378,10 +18378,36 @@ impl<'source> Compiler<'source> {
                     && context.finally_end_depth == self.control.finally.active_finally_end_blocks
                     && self.assembler.instruction_count() == context.body_start
             });
+        // A direct Continue in the final tested arm reaches the same iterator,
+        // including inside an enclosing try/finally. Earlier elif arms cannot
+        // enter its erased false edge, so that edge still normalizes independently.
+        let protected_iterator_continue_else = eligible_else
+            && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+            && self.control.in_loop_tail_without_nested_cleanup()
+            && self.control.loops.contexts.last().is_some_and(|context| {
+                context.iterator_cleanup != IteratorCleanup::None
+                    && context.continue_label == restart
+            })
+            && statement
+                .elif_else_clauses
+                .iter()
+                .rev()
+                .find_map(|clause| {
+                    clause
+                        .test
+                        .as_ref()
+                        .map(|test| (test, clause.body.as_slice()))
+                })
+                .or(Some((statement.test.as_ref(), statement.body.as_slice())))
+                .is_some_and(|(test, body)| {
+                    condition_has_runtime_iterator_leaves(test)
+                        && !expression_suspends_current_scope(test)
+                        && matches!(body, [Stmt::Continue(_)])
+                });
         // With no intervening cleanup, the removed else reaches the iterator
         // directly. Native normalizes that backward condition into fresh slots.
         // A comparison chain keeps its own operand cleanup before the same exit.
-        let protected_iterator_loop_else = eligible_else
+        let protected_iterator_work_else = eligible_else
             && statement.elif_else_clauses.len() == 1
             && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
             && self.control.in_loop_tail_without_nested_cleanup()
@@ -18406,6 +18432,8 @@ impl<'source> Compiler<'source> {
                                     })
                                     && suite_has_nonsuspending_conditional_work(std::slice::from_ref(statement)))
                     })));
+        let protected_iterator_loop_else =
+            protected_iterator_work_else || protected_iterator_continue_else;
         // The erased else threads directly to the while backedge. Completed
         // managers inside an arm do not change that target; normalizing the
         // backward condition creates fresh slots outside the enclosing owner.
