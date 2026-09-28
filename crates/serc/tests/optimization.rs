@@ -995,6 +995,33 @@ fn erased_assertion_after_terminating_guard_preserves_footer_location() {
 }
 
 #[test]
+fn erased_handler_assertions_preserve_guard_cleanup_location() {
+    for source in [
+        "def f(flag, other, obj):\n    try:\n        yield\n    except Error as exc:\n        if flag:\n            raise exc\n        assert flag\n        assert other\n        assert obj.ready\n    else:\n        if not flag:\n            assert False\n",
+        "def f(flag, other, obj):\n    try:\n        yield\n    except Error as exc:\n        if flag:\n            raise\n        assert flag\n        assert other\n        assert obj.ready\n    else:\n        if not flag:\n            assert False\n",
+        "def f(flag, other, obj):\n    try:\n        yield\n    except Error:\n        if flag:\n            raise Error\n        assert flag\n        assert other\n        assert obj.ready\n    else:\n        if not flag:\n            assert False\n",
+        "def f(flag, other, obj):\n    try:\n        obj.work()\n    except Error as exc:\n        if flag:\n            raise exc\n        assert flag\n        assert other\n        assert obj.ready\n    else:\n        if not flag:\n            assert False\n",
+        "async def f(flag, other, obj):\n    try:\n        await obj.work()\n    except Error as exc:\n        if flag:\n            raise exc\n        assert flag\n        assert other\n        assert obj.ready\n    else:\n        if not flag:\n            assert False\n",
+        "async def f(flag, other, obj):\n    try:\n        yield\n    except Error as exc:\n        if flag:\n            raise exc\n        assert flag\n        assert other\n        assert obj.ready\n    else:\n        if not flag:\n            assert False\n",
+        "def f(flag, other, obj):\n    try:\n        yield\n    except Error as exc:\n        if flag:\n            raise exc\n    else:\n        if not flag:\n            assert False\n",
+        "def f(flag, other, obj):\n    try:\n        yield\n    except Error as exc:\n        if flag:\n            raise exc\n        pass\n    else:\n        if not flag:\n            assert False\n",
+        "def f(flag, other, obj):\n    try:\n        yield\n    except Error as exc:\n        if flag:\n            raise exc\n        assert flag\n        obj.after()\n    else:\n        if not flag:\n            assert False\n",
+        "def f(flag, other, obj):\n    try:\n        yield\n    except Error as exc:\n        if flag and other:\n            raise exc\n        assert flag\n        assert other\n        assert obj.ready\n    else:\n        if not flag:\n            assert False\n",
+        "def f(flag, other, obj):\n    try:\n        yield\n    except Error as exc:\n        if flag or other:\n            raise exc\n        assert flag\n        assert other\n        assert obj.ready\n    else:\n        if not flag:\n            assert False\n",
+        "def f(flag, other, obj):\n    try:\n        yield\n    except Error as exc:\n        if flag:\n            raise exc\n        assert flag\n        assert other\n        assert obj.ready\n",
+        "def f(flag, other, obj):\n    try:\n        yield\n    except obj.Error as exc:\n        if flag:\n            raise exc\n        assert flag\n        assert other\n        assert obj.ready\n    else:\n        if not flag:\n            assert False\n",
+        "def f(flag, other, obj):\n    for item in obj.items:\n        try:\n            yield\n        except Error as exc:\n            if flag:\n                raise exc\n            assert flag\n            assert other\n            assert obj.ready\n        else:\n            if not flag:\n                assert False\n",
+    ] {
+        assert_matches_cpython(source, "erased_handler_assertion_cleanup.py", &LEVELS);
+    }
+    assert_matches_cpython(
+        "def f(flag, other, obj):\n    with obj:\n        try:\n            yield\n        except Error as exc:\n            if flag:\n                raise exc\n            assert flag\n            assert other\n            assert obj.ready\n        else:\n            if not flag:\n                assert False\n",
+        "protected_erased_handler_assertion_cleanup.py",
+        &[OptimizationLevel::One, OptimizationLevel::Two],
+    );
+}
+
+#[test]
 fn elided_call_suffix_preserves_legacy_footer_location() {
     for (first, second) in [("a", "b"), ("a is not None", "b is not None")] {
         for call in ["action(obj)", "obj.update(b)"] {

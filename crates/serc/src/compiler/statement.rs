@@ -27229,7 +27229,18 @@ impl<'source> Compiler<'source> {
             let cold_with_cleanup_location = cleanup_has_small_return_successor
                 .then(|| handler_cold_with_exit_range(&handler.body))
                 .flatten();
-            let handler_cleanup_fallthrough = handler.body.last().and_then(|tail| match tail {
+            // Removed assertions add no predecessor to the normal cleanup. Keep
+            // the last live guard visible to its existing false-edge donor proof.
+            let handler_cleanup_tail = if self.context.python_version >= crate::PythonVersion::Py314
+            {
+                handler.body.iter().rfind(|part| {
+                    !(matches!(part, Stmt::Global(global) if global.names.is_empty())
+                        && self.context.is_elided_statement(part))
+                })
+            } else {
+                handler.body.last()
+            };
+            let handler_cleanup_fallthrough = handler_cleanup_tail.and_then(|tail| match tail {
                 Stmt::If(tail) => {
                     handler_cleanup_fallthrough_test(tail).or(guarded_raise_finally_test)
                 }
