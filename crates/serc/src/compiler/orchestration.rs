@@ -991,9 +991,12 @@ impl<'source> Compiler<'source> {
         // Native 3.12's StopIteration wrapper appends an unlocated return even
         // after a terminating source suite, separating its final source joins
         // from the handler. Keep the suite's location selection above unchanged.
+        // A retained dead If join likewise needs its original nonempty footer
+        // until native-label capture and unreachable-code removal finish.
         let add_implicit_return = add_implicit_return
             || (self.context.python_version == PythonVersion::Py312
-                && self.control.generators.generator_region_start.is_some()
+                && (self.control.generators.generator_region_start.is_some()
+                    || self.control.statements.retained_native_if_join)
                 && !self.control.statements.emitted_fallthrough_return);
         if self.context.python_version == PythonVersion::Py312
             && add_implicit_return

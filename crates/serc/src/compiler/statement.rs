@@ -676,6 +676,8 @@ pub(super) struct StatementState {
     // Incremental Boolean-value marker history for the return value currently being lowered.
     pub(super) current_return_boolean_value_marker_scan: Option<BooleanValueMarkerScan>,
     pub(super) emitted_fallthrough_return: bool,
+    /// A retained original jump may target the otherwise omitted native footer.
+    pub(super) retained_native_if_join: bool,
 }
 
 /// Facts about the current statement's source neighbors, restored as one scoped value.
@@ -14639,6 +14641,20 @@ impl<'source> Compiler<'source> {
                 }
                 if branch_index == 0 && first_branch_is_always_true {
                     first_branch_max_depth = Some(self.control.stack.max_depth);
+                }
+                if self.context.python_version == crate::PythonVersion::Py312
+                    && matches!(self.unit.scope, Scope::Function { .. })
+                    && self.native_label_plan.is_some()
+                    && branch_index + 1 < branch_count
+                    && suite_terminates(body)
+                    && matches!(body.last(), Some(Stmt::If(_)))
+                {
+                    // Native emits this jump even after a terminating nested If.
+                    // Its empty end and the next arm have distinct source labels;
+                    // keep their original separator until unreachable-code removal.
+                    self.assembler.set_location(SourceLocation::NONE);
+                    self.emit_jump_forward(JUMP_FORWARD, end, 0)?;
+                    self.control.statements.retained_native_if_join = true;
                 }
                 if !suite_terminates(body) && branch_index + 1 < branch_count {
                     let direct_try_body_exit = direct_try_body_exit
