@@ -1818,19 +1818,20 @@ impl OptimizationPipeline {
                     .iter()
                     .filter(|region| region.start == entry && region.target == origin.cleanup);
                 let region = regions.next()?;
+                let end_block = self.graph.label_block(region.end)?;
                 if regions.next().is_some()
                     || region.is_scope_fallback
                     || region.preserve_lasti
                     || region.end != origin.yielded_end
-                    || self.graph.label_block(region.end).and_then(|block| {
-                        self.graph[block]
-                            .items()
-                            .iter()
-                            .find_map(|item| match item {
-                                Item::Instruction(instruction) => Some(instruction),
-                                Item::Label(_) => None,
-                            })
-                    }) != body.get(1).copied()
+                    || !groups[position].contains(&end_block)
+                    || self.graph[end_block]
+                        .items()
+                        .iter()
+                        .find_map(|item| match item {
+                            Item::Instruction(instruction) => Some(instruction),
+                            Item::Label(_) => None,
+                        })
+                        != body.get(1).copied()
                     || self
                         .exception_owner_provenance
                         .legacy_protocol_await_setups
@@ -4347,7 +4348,7 @@ mod protected_repeated_backedge_tests {
 
         for (protocol, case) in (0..7)
             .map(|case| (false, case))
-            .chain((0..12).map(|case| (true, case)))
+            .chain((0..13).map(|case| (true, case)))
         {
             let [
                 send_label,
@@ -4382,7 +4383,7 @@ mod protected_repeated_backedge_tests {
             let send = forward(SEND, end);
             let end_send = normal(END_SEND, 0);
             let cleanup_instruction = normal(if case == 9 { NOP } else { CLEANUP_THROW }, 0);
-            let mut assembler = Assembler::from_linear_items(vec![
+            let mut items = vec![
                 Item::Label(send_label),
                 Item::Instruction(send),
                 Item::Label(yielded),
@@ -4409,10 +4410,22 @@ mod protected_repeated_backedge_tests {
                 Item::Instruction(backward(JUMP_BACKWARD, first)),
                 Item::Label(exit),
                 Item::Instruction(normal(RETURN_CONST, 0)),
-            ]);
+            ];
+            if case == 12 {
+                let first_index = items
+                    .iter()
+                    .position(|item| *item == Item::Label(first))
+                    .unwrap();
+                items.insert(
+                    first_index + 1,
+                    Item::Instruction(normal(RESUME, ResumeLocation::AFTER_AWAIT.argument())),
+                );
+            }
+            let mut assembler = Assembler::from_linear_items(items);
+            let region_end = if case == 12 { first } else { yielded_end };
             assembler.python_version = PythonVersion::Py312;
             assembler.next_label = 9;
-            assembler.add_exception_region(yielded, yielded_end, cleanup, 0, false);
+            assembler.add_exception_region(yielded, region_end, cleanup, 0, false);
             assembler.record_exception_setup(yielded, false);
             if case != 1 {
                 assembler.record_legacy_native_setup_target(yielded, cleanup);
@@ -4424,7 +4437,7 @@ mod protected_repeated_backedge_tests {
                 if case != 3 {
                     assembler.record_legacy_protocol_await_setup(
                         yielded,
-                        if case == 7 { end } else { yielded_end },
+                        if case == 7 { end } else { region_end },
                         if case == 6 { exit } else { cleanup },
                         send_label,
                         if case == 5 { exit } else { end },
@@ -4465,6 +4478,21 @@ mod protected_repeated_backedge_tests {
             }
             let pipeline = assembler.into_optimization_pipeline();
             let arrays = pipeline.legacy_instruction_arrays();
+            if case == 12 {
+                let actual = pipeline.graph.label_block(yielded_end).unwrap();
+                let unrelated = pipeline.graph.label_block(first).unwrap();
+                assert_ne!(arrays[&actual], arrays[&unrelated]);
+                let first_instruction = |block| {
+                    pipeline.graph[block]
+                        .items()
+                        .iter()
+                        .find_map(|item| match item {
+                            Item::Instruction(instruction) => Some(instruction),
+                            Item::Label(_) => None,
+                        })
+                };
+                assert_eq!(first_instruction(actual), first_instruction(unrelated));
+            }
             let found = pipeline.legacy_repeated_tails_with_setups(&arrays);
             if case == 0 {
                 assert!(found.unwrap().iter().any(|(block, _, ordinary, native)| {
