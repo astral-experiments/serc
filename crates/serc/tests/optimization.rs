@@ -12508,3 +12508,37 @@ fn terminal_nested_erased_if_keeps_finalizer_join() {
         );
     }
 }
+
+#[test]
+fn boolean_call_prefix_keeps_terminal_finalizer_join() {
+    let source = r#"async def f(first, second, mapping):
+    try:
+        if first:
+            consume(first)
+            assert first
+        else:
+            value = coerce(mapping.get("entry") or {})
+            assert value
+            if second:
+                assert first
+            else:
+                assert second
+    finally:
+        cleanup()
+"#;
+    for (index, source) in [
+        source.to_owned(),
+        source.replace("async def", "def"),
+        source.replace(" or {}", " and {}"),
+        source.replace("coerce(mapping", "factory.coerce(value=mapping"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            &source,
+            &format!("boolean_call_finalizer_prefix_{index}.py"),
+            &LEVELS,
+        );
+    }
+}

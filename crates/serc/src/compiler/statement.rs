@@ -16287,6 +16287,11 @@ impl<'source> Compiler<'source> {
                                 && suite_has_nonsuspending_conditional_work(std::slice::from_ref(
                                     part,
                                 )))
+                            // Argument branches finish at CALL and STORE before the
+                            // separate terminal conditional starts its own join.
+                            || matches!(part, Stmt::Assign(assignment)
+                                if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                                    && call_has_completed_boolean_argument(&assignment.value))
                     })
                     .then_some(tail.range)
             })
@@ -44549,50 +44554,49 @@ fn condition_reaches_async_break_entry(expression: &Expr) -> bool {
     }
 }
 
+/// Certifies one nonsuspending Boolean argument that rejoins before an eager call.
+fn call_has_completed_boolean_argument(expression: &Expr) -> bool {
+    let Expr::Call(call) = expression else {
+        return false;
+    };
+    if !(matches!(call.func.as_ref(), Expr::Name(_))
+        || matches!(call.func.as_ref(), Expr::Attribute(attribute)
+            if matches!(attribute.value.as_ref(), Expr::Name(_))))
+        || expression_suspends_current_scope(expression)
+        || call.arguments.args.len() + call.arguments.keywords.len() * 2
+            > super::CPYTHON_STACK_USE_GUIDELINE
+        || call
+            .arguments
+            .keywords
+            .iter()
+            .any(|keyword| keyword.arg.is_none())
+    {
+        return false;
+    }
+    let mut boolean_arguments = 0;
+    call.arguments
+        .args
+        .iter()
+        .chain(call.arguments.keywords.iter().map(|keyword| &keyword.value))
+        .all(|argument| match argument {
+            Expr::BoolOp(boolean) => {
+                boolean_arguments += 1;
+                boolean_arguments == 1
+                    && boolean.values.iter().enumerate().all(|(index, value)| {
+                        !expression_contains_inline_branch(value)
+                            && (index + 1 == boolean.values.len()
+                                || (fold_constant(value).is_none()
+                                    && early_condition_truthiness(value).is_none()))
+                    })
+            }
+            Expr::Starred(_) => false,
+            _ => !expression_contains_inline_branch(argument),
+        })
+        && boolean_arguments == 1
+}
+
 /// Finds a terminal break behind runtime conditions, including returning arms.
 fn suite_ends_in_terminal_conditional_break(body: &[Stmt]) -> bool {
-    // Boolean argument edges rejoin before CALL/CALL_KW. The discarded call
-    // keeps that join nonempty before the later iterator discard and break.
-    fn call_has_completed_boolean_argument(expression: &Expr) -> bool {
-        let Expr::Call(call) = expression else {
-            return false;
-        };
-        if !(matches!(call.func.as_ref(), Expr::Name(_))
-            || matches!(call.func.as_ref(), Expr::Attribute(attribute)
-                if matches!(attribute.value.as_ref(), Expr::Name(_))))
-            || expression_suspends_current_scope(expression)
-            || call.arguments.args.len() + call.arguments.keywords.len() * 2
-                > super::CPYTHON_STACK_USE_GUIDELINE
-            || call
-                .arguments
-                .keywords
-                .iter()
-                .any(|keyword| keyword.arg.is_none())
-        {
-            return false;
-        }
-        let mut boolean_arguments = 0;
-        call.arguments
-            .args
-            .iter()
-            .chain(call.arguments.keywords.iter().map(|keyword| &keyword.value))
-            .all(|argument| match argument {
-                Expr::BoolOp(boolean) => {
-                    boolean_arguments += 1;
-                    boolean_arguments == 1
-                        && boolean.values.iter().enumerate().all(|(index, value)| {
-                            !expression_contains_inline_branch(value)
-                                && (index + 1 == boolean.values.len()
-                                    || (fold_constant(value).is_none()
-                                        && early_condition_truthiness(value).is_none()))
-                        })
-                }
-                Expr::Starred(_) => false,
-                _ => !expression_contains_inline_branch(argument),
-            })
-            && boolean_arguments == 1
-    }
-
     // These earlier arms return to the async header or raise. Neither route
     // enters the final elif's iterator discard and removed break edge.
     fn earlier_arm_keeps_terminal_break(body: &[Stmt]) -> bool {
