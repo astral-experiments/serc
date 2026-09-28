@@ -750,6 +750,21 @@ fn elided_conditional_preserves_jump_before_nested_finalizers() {
 }
 
 #[test]
+fn elided_handler_assertion_preserves_shared_false_cleanup() {
+    for (condition, suffix) in [
+        ("config.recover and not stopped", "assert False"),
+        ("config.recover and not stopped", "pass"),
+        ("config.recover and not stopped", "repair(error)"),
+        ("config.recover or not stopped", "assert False"),
+    ] {
+        let source = format!(
+            "def collect(items, config, fallback, stopped):\n    for item in items:\n        try:\n            value = parse(item)\n        except ValueError as error:\n            if {condition}:\n                report(error)\n                return fallback\n            {suffix}\n        consume(value)\n    return items\n"
+        );
+        assert_matches_cpython(&source, "shared_handler_false_cleanup.py", &LEVELS);
+    }
+}
+
+#[test]
 fn elided_handler_assertion_preserves_conditional_cleanup() {
     for suffix in ["assert value in str(error)", "pass", "after()"] {
         let source = format!(

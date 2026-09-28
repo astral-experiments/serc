@@ -28282,10 +28282,11 @@ impl<'source> Compiler<'source> {
                 self.assembler.record_unlocated_cleanup_targets();
                 // Multiple false edges share one original artificial cleanup, whether or not
                 // the handler binds the exception. Keep it unlocated until exit duplication.
+                // Elided assertions after the guard add no predecessor or location donor.
                 let handler_has_shared_terminating_false_cleanup = (terminal
                     || handler.name.is_some())
                     && matches!(
-                        handler.body.last(),
+                        handler_cleanup_tail,
                         Some(Stmt::If(tail))
                             if tail.elif_else_clauses.is_empty()
                                 && (matches!(tail.body.last(), Some(Stmt::Raise(_)))
