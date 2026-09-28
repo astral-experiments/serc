@@ -513,6 +513,21 @@ fn elided_conditional_preserves_jump_before_coroutine_finalizer() {
 }
 
 #[test]
+fn elided_conditional_preserves_jump_before_erased_try_tail() {
+    for prefix in [
+        "        value = work()\n",
+        "        with manager:\n            value = work()\n",
+    ] {
+        for suffix in ["assert complete()", "record()"] {
+            let source = format!(
+                "async def f(manager, flag):\n    try:\n{prefix}        if flag == expected:\n            assert valid(value)\n        else:\n            assert ready(value)\n        assert done()\n        {suffix}\n    finally:\n        cleanup()\n        finish()\n"
+            );
+            assert_matches_cpython(&source, "conditional_erased_try_tail.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn elided_conditional_preserves_jump_before_managed_finalizer() {
     for managers in ["manager", "manager, other"] {
         for body in ["assert value.ready", "pass", "record(value)"] {

@@ -15042,9 +15042,20 @@ impl<'source> Compiler<'source> {
                             == 1
                             && self.control.finally.active_finally_try_bodies == 1)
                             || nested_finally_contexts)
-                        && ((!self.control.statements.context.has_following
-                            && self.control.exceptions.direct_try_body_statements.last()
-                                == Some(&statement.range))
+                        && ((self
+                            .control
+                            .exceptions
+                            .direct_try_body_statements
+                            .iter()
+                            // Erased assertions add no instructions or predecessors
+                            // between this join and the try body's POP_BLOCK.
+                            .rfind(|range| {
+                                !matches!(
+                                    self.context.optimized_locations.get(range),
+                                    Some(super::optimization::OptimizedLocation::Elided)
+                                )
+                            })
+                            == Some(&statement.range))
                             || (self
                                 .control
                                 .statements
