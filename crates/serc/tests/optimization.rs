@@ -80,6 +80,20 @@ fn annotated_comprehension_preserves_implicit_return_location() {
 }
 
 #[test]
+fn erased_match_case_suffix_preserves_protected_conditional_join() {
+    for managers in ["manager", "manager, other"] {
+        for suffix in ["", "        finish()\n"] {
+            for body in ["action()", "pass"] {
+                let source = format!(
+                    "def f(value, ready, manager, other):\n    with {managers}:\n        match value:\n            case 1:\n                if ready:\n                    {body}\n                assert ready\n{suffix}"
+                );
+                assert_matches_cpython(&source, "protected_match_conditional_join.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
 fn compacted_branch_pass_preserves_return_copy_location() {
     for definition in ["def", "async def"] {
         let source = format!(

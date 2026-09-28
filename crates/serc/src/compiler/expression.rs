@@ -438,14 +438,24 @@ impl Compiler<'_> {
     }
 
     /// Exposes a terminal case conditional hidden by optimizer-elided statements.
-    pub(super) fn terminal_match_case_body<'b>(&self, body: &'b [Stmt]) -> &'b [Stmt] {
+    pub(super) fn terminal_match_case_body<'b>(
+        &self,
+        body: &'b [Stmt],
+        allow_protected_continuation: bool,
+    ) -> &'b [Stmt] {
+        let protected_continuation = allow_protected_continuation
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.control.in_synchronous_with()
+            && self.control.active_with_count()
+                == self.control.withs.active_with_region_exclusions.len();
         if self.context.python_version < PythonVersion::Py314
             || !matches!(self.unit.scope, Scope::Function { .. })
             || self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) != 0
-            || self.control.in_loop()
             || self.control.falls_through_to_loop_backedge()
-            || self.control.active_with_count() != 0
-            || !self.control.withs.active_with_region_exclusions.is_empty()
+            || (!protected_continuation
+                && (self.control.in_loop()
+                    || self.control.active_with_count() != 0
+                    || !self.control.withs.active_with_region_exclusions.is_empty()))
             || !self
                 .control
                 .exceptions
@@ -472,6 +482,8 @@ impl Compiler<'_> {
         };
         if matches!(&body[last], Stmt::If(conditional)
             if conditional.elif_else_clauses.is_empty()
+                && (!protected_continuation
+                    || suite_has_linear_borrow_fallthrough(&conditional.body))
                 && (suite_has_linear_borrow_fallthrough(&conditional.body)
                     || (self.unit.flags & CO_COROUTINE != 0
                         && self.coroutine_branch_has_linear_tail(&conditional.body))
@@ -890,10 +902,10 @@ impl Compiler<'_> {
                 }
                 let body_previous_location = self.assembler.last_instruction_location();
                 let body_start = self.assembler.instruction_count();
-                let terminal_body = self.terminal_match_case_body(&case.body);
+                let terminal_body = self.terminal_match_case_body(&case.body, !terminal);
                 // Elided assertions leave the conditional's original join immediately
                 // before the case-success jump, just as a direct case-tail If does.
-                let effective_body = if self.supports_terminal_match_case(&case.body) {
+                let effective_body = if self.supports_terminal_match_case(terminal_body) {
                     terminal_body
                 } else {
                     &case.body
@@ -1400,7 +1412,7 @@ impl Compiler<'_> {
                 failure_reaches_end = true;
             }
             let body_start = self.assembler.instruction_count();
-            let terminal_body = self.terminal_match_case_body(&case.body);
+            let terminal_body = self.terminal_match_case_body(&case.body, false);
             let emitted_fallthrough =
                 if terminal && matches!(terminal_body.last(), Some(Stmt::If(_) | Stmt::Match(_))) {
                     let ((), emitted_fallthrough) = self.with_fallthrough_tracking(|compiler| {

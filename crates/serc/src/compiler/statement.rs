@@ -1648,7 +1648,7 @@ impl<'source> Compiler<'source> {
             return true;
         }
         let Some((Stmt::If(conditional), prefix)) =
-            self.terminal_match_case_body(body).split_last()
+            self.terminal_match_case_body(body, false).split_last()
         else {
             return false;
         };
