@@ -4226,12 +4226,24 @@ impl<'source> Compiler<'source> {
                             body.last()
                                 .is_some_and(|last| self.context.is_elided_statement(last))
                         })));
+        // A coroutine's implicit StopIteration handler wraps the same original
+        // comparison joins and footer; it does not add a normal exit predecessor.
+        let coroutine_empty_comparison_exit = has_empty_comparison_arm
+            && self.context.python_version >= crate::PythonVersion::Py314
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+            && self.control.withs.active_with_region_exclusions.is_empty()
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty();
         if (has_empty_comparison_arm || has_optimized_join)
             && self.control.loops.contexts.is_empty()
-            && !self.has_active_control_flow_region()
+            && (!self.has_active_control_flow_region() || coroutine_empty_comparison_exit)
             && self.control.withs.active_with_exits.is_empty()
             && !self.control.in_exception_handler()
-            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                || coroutine_empty_comparison_exit)
             && self.control.finally.active_finally_try_bodies == 0
             && self.control.finally.active_normal_finally_bodies == 0
             && self.control.finally.active_copied_finally_bodies == 0

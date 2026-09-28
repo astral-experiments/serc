@@ -23,6 +23,16 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn erased_coroutine_comparison_arms_preserve_shared_cleanup() {
+    for prefix in ["", "    await worker()\n"] {
+        let source = format!(
+            "async def f(a, b, worker):\n{prefix}    if a == b == \"ready\":\n        assert a\n    else:\n        assert b\n"
+        );
+        assert_matches_cpython(&source, "coroutine_comparison_cleanup.py", &LEVELS);
+    }
+}
+
+#[test]
 fn coroutine_protected_iterator_preserves_erased_else_backedge() {
     for manager in ["with", "async with"] {
         for body in ["previous = value", "consume(value)", "await consume(value)"] {
