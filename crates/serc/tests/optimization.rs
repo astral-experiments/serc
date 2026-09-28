@@ -1784,6 +1784,20 @@ fn erased_assertions_preserve_raising_try_guard_exit_locations() {
 }
 
 #[test]
+fn erased_assertions_preserve_raising_try_else_guard_exit_locations() {
+    for scope in ["def", "async def"] {
+        for condition in ["flag is not None", "not flag", "flag or other"] {
+            for suffix in ["", "        assert flag\n        assert other, explain()\n"] {
+                let source = format!(
+                    "{scope} f(flag, other):\n    try:\n        work()\n    except Exception:\n        recover()\n    else:\n        if {condition}:\n            raise ValueError(flag) from other\n{suffix}    finish()\n"
+                );
+                assert_matches_cpython(&source, "erased_raising_else_guard_exit.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
 fn nested_boolean_assignment_joins_preserve_nops_before_elided_else() {
     for condition in ["b or c", "b and c", "(b or c) and d", "not (b and c)"] {
         for continuation in ["work(value)", "return value"] {

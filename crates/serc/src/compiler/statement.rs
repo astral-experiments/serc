@@ -15782,7 +15782,6 @@ impl<'source> Compiler<'source> {
             || !matches!(self.unit.scope, Scope::Function { .. })
             || self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) != 0
             || statement.is_star
-            || !statement.orelse.is_empty()
             || !statement.finalbody.is_empty()
             || !self.control.loops.contexts.is_empty()
             || self.control.loops.suite_fallthrough_to_loop_backedge
@@ -15806,14 +15805,18 @@ impl<'source> Compiler<'source> {
                     Some(super::optimization::OptimizedLocation::Elided)
                 )
         };
-        if !statement.body.last().is_some_and(is_elided_assert) {
+        let normal_exit_suite = if statement.orelse.is_empty() {
+            &statement.body
+        } else {
+            &statement.orelse
+        };
+        if !normal_exit_suite.last().is_some_and(is_elided_assert) {
             return None;
         }
-        let guard_index = statement
-            .body
+        let guard_index = normal_exit_suite
             .iter()
             .rposition(|stmt| !is_elided_assert(stmt))?;
-        let Stmt::If(guard) = &statement.body[guard_index] else {
+        let Stmt::If(guard) = &normal_exit_suite[guard_index] else {
             return None;
         };
         let [Stmt::Raise(raise)] = guard.body.as_slice() else {
@@ -15829,7 +15832,7 @@ impl<'source> Compiler<'source> {
             || !raise.exc.as_deref().is_none_or(linear_expression)
             || !raise.cause.as_deref().is_none_or(linear_expression)
             || (guard_index > 0
-                && !suite_has_linear_borrow_fallthrough(&statement.body[..guard_index]))
+                && !suite_has_linear_borrow_fallthrough(&normal_exit_suite[..guard_index]))
         {
             return None;
         }
