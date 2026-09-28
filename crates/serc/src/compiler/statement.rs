@@ -4464,7 +4464,17 @@ impl<'source> Compiler<'source> {
                 && (self.has_erased_binary_if_scope_exit(statement)
                     || Self::has_nested_raising_if_scope_exit(statement)
                     || (!self.control.statements.in_match
-                        && self.has_nested_erased_branch_scope_exit(statement)))
+                        && (self.has_nested_erased_branch_scope_exit(statement)
+                            || (matches!(statement.test.as_ref(), Expr::Name(name) if name.id != "__debug__")
+                                && statement.elif_else_clauses.is_empty()
+                                && matches!(statement.body.as_slice(), [Stmt::If(inner)]
+                                    if matches!(inner.test.as_ref(), Expr::Name(name) if name.id != "__debug__")
+                                        && inner.elif_else_clauses.is_empty()
+                                        && matches!(inner.body.as_slice(), [Stmt::Return(return_statement)]
+                                            if return_statement.value.as_deref().is_some_and(|value| {
+                                                value.is_literal_expr()
+                                                    || matches!(value, Expr::Name(name) if name.id != "__debug__")
+                                            })))))))
             {
                 // An earlier erased conditional can count this shared exit twice.
                 // Preserve its original return until native exit copying finishes.

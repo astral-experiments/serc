@@ -8843,3 +8843,42 @@ fn erased_branch_assertions_preserve_copied_footer_donors() {
         assert_matches_cpython(source, &format!("copied_binary_footer_{case}.py"), &LEVELS);
     }
 }
+
+#[test]
+fn nested_leaf_returns_preserve_repeated_scope_footer() {
+    for (case, source) in [
+        r"def f(a, b, c):
+    if a:
+        assert a
+    if b:
+        if c:
+            return None
+",
+        r"def f(a, b, c):
+    if a:
+        assert a
+    if b:
+        if c:
+            return 1
+",
+        r"def f(a, b, c):
+    if a:
+        assert a
+    if b:
+        if c:
+            return a
+",
+        r"def f(a, b, c):
+    if a:
+        pass
+    if b:
+        if c:
+            return None
+",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(source, &format!("nested_leaf_footer_{case}.py"), &LEVELS);
+    }
+}
