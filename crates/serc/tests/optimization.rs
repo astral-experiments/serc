@@ -8388,6 +8388,21 @@ fn nonlinear_match_cases_keep_their_shared_exits() {
 }
 
 #[test]
+fn coroutine_match_cases_preserve_nested_condition_return_donors() {
+    for prefix in [
+        "",
+        "    with cm:\n        with obj:\n            async for item in items:\n                action()\n            assert items\n",
+    ] {
+        for suffix in ["", "    assert a\n", "    after()\n"] {
+            let source = format!(
+                "async def f(a, b, c, obj, items, cm):\n{prefix}    match a:\n        case 1:\n            if b:\n                if c:\n                    action()\n                action()\n            assert b\n{suffix}"
+            );
+            assert_matches_cpython(&source, "nested_match_returns.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn terminal_match_case_conditionals_keep_returns_before_erased_assertions() {
     for (case, source) in [
         "def f(a, b):\n    match a:\n        case 1:\n            if b:\n                action()\n            assert b\n",

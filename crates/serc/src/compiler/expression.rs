@@ -473,6 +473,8 @@ impl Compiler<'_> {
         if matches!(&body[last], Stmt::If(conditional)
             if conditional.elif_else_clauses.is_empty()
                 && (suite_has_linear_borrow_fallthrough(&conditional.body)
+                    || (self.unit.flags & CO_COROUTINE != 0
+                        && self.coroutine_branch_has_linear_tail(&conditional.body))
                     || matches!(conditional.body.as_slice(), [Stmt::Pass(_)])
                     || (conditional.body.iter().all(is_elided)
                         && condition_jump_target_count(&conditional.test, true) == 1)))

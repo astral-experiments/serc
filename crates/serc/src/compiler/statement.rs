@@ -1612,7 +1612,7 @@ impl<'source> Compiler<'source> {
         self.compile_suite_inner(body, false)
     }
 
-    /// Certifies case exits with flat work and at most one final conditional.
+    /// Certifies case exits ending in ordinary work or a supported conditional.
     pub(super) fn supports_terminal_match_case(&self, body: &[Stmt]) -> bool {
         let is_elided = |statement: &Stmt| {
             matches!(
@@ -1646,6 +1646,9 @@ impl<'source> Compiler<'source> {
             && !expression_suspends_current_scope(&conditional.test)
             && ((suite_has_linear_borrow_fallthrough(&conditional.body)
                 && suite_has_nonsuspending_conditional_work(&conditional.body))
+                || (self.context.python_version >= crate::PythonVersion::Py314
+                    && self.unit.flags & CO_COROUTINE != 0
+                    && self.coroutine_branch_has_linear_tail(&conditional.body))
                 || matches!(conditional.body.as_slice(), [Stmt::Pass(_)])
                 || (conditional.body.iter().all(is_elided)
                     && condition_jump_target_count(&conditional.test, true) == 1))
@@ -1715,7 +1718,7 @@ impl<'source> Compiler<'source> {
     }
 
     /// Certifies ordinary coroutine work ending after its conditional prefixes.
-    fn coroutine_branch_has_linear_tail(&self, body: &[Stmt]) -> bool {
+    pub(super) fn coroutine_branch_has_linear_tail(&self, body: &[Stmt]) -> bool {
         let is_elided = |statement: &Stmt| self.context.is_elided_statement(statement);
         let linear = |statement: &Stmt| {
             let single = std::slice::from_ref(statement);
