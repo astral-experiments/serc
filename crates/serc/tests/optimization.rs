@@ -2553,6 +2553,28 @@ fn elided_terminal_boolean_preserves_shared_return_order() {
 }
 
 #[test]
+fn erased_try_arms_preserve_large_tuple_return_join() {
+    for returned in [
+        "value,",
+        "value, owner",
+        "1, 2",
+        "1, 2, 3",
+        "value, owner, first",
+        "value, owner, first, {\"first\": first, \"second\": second}",
+    ] {
+        let source = format!(
+            "def f(flag, first, second):\n    owner = acquire()\n    try:\n        value = owner.value\n        if flag:\n            assert ready(value)\n        else:\n            assert valid(value)\n        assert complete(value)\n        return {returned}\n    except Exception:\n        owner.close()\n        raise\n"
+        );
+        assert_matches_cpython(&source, "erased_try_tuple_return.py", &LEVELS);
+    }
+    assert_matches_cpython(
+        "def f(flag, first, second):\n    if flag:\n        assert first\n    else:\n        assert second\n    assert flag\n    return first, second\n",
+        "erased_unprotected_tuple_return.py",
+        &LEVELS,
+    );
+}
+
+#[test]
 fn erased_assertions_preserve_try_body_joins_and_false_edge_locations() {
     for function in ["def", "async def"] {
         for alternate in [

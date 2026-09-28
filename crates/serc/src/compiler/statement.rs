@@ -719,6 +719,9 @@ pub(super) struct StatementContext {
     followed_by_name_assignment_or_deletion: bool,
     // Whether an elided conditional join reaches a call/name store/delete after erased asserts.
     elided_join_has_live_successor: bool,
+    // Two tuple elements, BUILD_TUPLE, POP_BLOCK, and RETURN exceed the four-record
+    // exit-copy budget before folding or fusion in a direct try body.
+    elided_join_has_large_tuple_return: bool,
     // Whether an elided join reaches another runtime conditional after erased asserts.
     elided_join_has_conditional_successor: bool,
     // Whether the next statement is a direct if with a name test.
@@ -3270,6 +3273,13 @@ impl<'source> Compiler<'source> {
                             && self.control.statements.context.same_region_continuation
                                 == Some(statement.range())
                             && self.control.statements.context.elided_join_has_live_successor),
+                    elided_join_has_large_tuple_return: matches!(elided_join_successor,
+                        Some(Stmt::Return(returned))
+                            if matches!(returned.value.as_deref(), Some(value @ Expr::Tuple(tuple))
+                                if tuple.elts.len() >= 2
+                                    && tuple.elts.iter().all(|element| !matches!(element, Expr::Starred(_)))
+                                    && !expression_contains_inline_branch(value)
+                                    && !expression_suspends_current_scope(value))),
                     elided_join_has_conditional_successor: matches!(elided_join_successor,
                         Some(Stmt::If(branch)) if condition_has_linear_runtime_leaves(&branch.test)
                             && !expression_suspends_current_scope(&branch.test))
@@ -15104,7 +15114,8 @@ impl<'source> Compiler<'source> {
                                 && self.control.exceptions.active_exception_region_exclusions.len() == 1
                                 // These statements survive optimization, so this try body
                                 // has a real successor after the original conditional join.
-                                && self.control.statements.context.elided_join_has_live_successor
+                                && (self.control.statements.context.elided_join_has_live_successor
+                                    || self.control.statements.context.elided_join_has_large_tuple_return)
                                 && self.control.exceptions.direct_try_body_statements.contains(&statement.range)
                                 && !direct_try_body_exit)
                             || (self.context.python_version == crate::PythonVersion::Py315
