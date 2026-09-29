@@ -66,25 +66,15 @@ clean_caches() {
 
 tree_summary() {
     "$python" -I -S -c '
-import hashlib
 import pathlib
 import sys
 
-root = pathlib.Path(sys.argv[1])
-suffix = sys.argv[2]
-paths = sorted(path for path in root.rglob(f"*{suffix}") if path.is_file())
-digest = hashlib.sha256()
-size = 0
-for path in paths:
-    relative = path.relative_to(root).as_posix().encode()
-    contents = path.read_bytes()
-    digest.update(len(relative).to_bytes(8, "big"))
-    digest.update(relative)
-    digest.update(len(contents).to_bytes(8, "big"))
-    digest.update(contents)
-    size += len(contents)
-print(len(paths), size, digest.hexdigest(), sep="\t")
-' "$1" "$2"
+sys.path.insert(0, sys.argv[1])
+from pgo_corpus import tree_summary
+
+summary = tree_summary(pathlib.Path(sys.argv[2]), sys.argv[3])
+print(summary["files"], summary["bytes"], summary["sha256"], sep="\t")
+' "$repo_root/scripts" "$1" "$2"
 }
 
 sha256_file() {
