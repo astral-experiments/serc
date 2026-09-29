@@ -79,20 +79,7 @@ fn reserved_debug_writes_match_target_rules() {
     ];
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("reserved_debug.py");
-    let oracle = r"
-import marshal, sys
-try:
-    code = compile(sys.argv[1], sys.argv[2], 'exec', dont_inherit=True, optimize=0)
-except SyntaxError as error:
-    print(error.msg)
-    raise SystemExit(1)
-sys.stdout.buffer.write(marshal.dumps(code))
-";
     for version in common::PYTHON_VERSIONS {
-        let options = CompileOptions {
-            python_version: version,
-            ..CompileOptions::default()
-        };
         for (source, kind) in cases {
             let modern = matches!(version, PythonVersion::Py314 | PythonVersion::Py315);
             let expected = match kind {
@@ -116,49 +103,7 @@ sys.stdout.buffer.write(marshal.dumps(code))
                 "delete" if modern => Some("cannot delete __debug__"),
                 _ => None,
             };
-            let mut python = common::python_command(version);
-            let native = python
-                .args(["-c", oracle, source])
-                .arg(&path)
-                .output()
-                .unwrap();
-            assert_eq!(
-                native.status.success(),
-                expected.is_none(),
-                "{version}: {source}: {native:?}"
-            );
-            for compiled in [
-                compile_with_options(source, path.to_str().unwrap(), &options),
-                compile_bytes_with_options(source.as_bytes(), path.to_str().unwrap(), &options),
-            ] {
-                if let Some(expected) = expected {
-                    assert_eq!(String::from_utf8_lossy(&native.stdout).trim(), expected);
-                    let error = compiled.unwrap_err();
-                    assert!(
-                        error.to_string().ends_with(expected),
-                        "{version}: {source}: {error}"
-                    );
-                } else {
-                    assert_eq!(
-                        compiled.unwrap().marshal(),
-                        native.stdout,
-                        "{version}: {source}"
-                    );
-                }
-            }
-            fs_err::write(&path, source).unwrap();
-            let output = common::check(&path, version);
-            assert_eq!(
-                output.status.success(),
-                expected.is_none(),
-                "{version}: {source}: {output:?}"
-            );
-            if let Some(expected) = expected {
-                assert!(
-                    String::from_utf8_lossy(&output.stderr).contains(expected),
-                    "{output:?}"
-                );
-            }
+            common::diagnostics::assert_compilation(source, &path, version, expected);
         }
     }
 }
