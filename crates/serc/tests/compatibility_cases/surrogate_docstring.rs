@@ -5,12 +5,7 @@ use serc::{
 use crate::common;
 
 const FILENAME: &str = "surrogate_docstring.py";
-const TARGETS: [PythonVersion; 4] = [
-    PythonVersion::Py312,
-    PythonVersion::Py313,
-    PythonVersion::Py314,
-    PythonVersion::Py315,
-];
+const TARGETS: [PythonVersion; 4] = common::cpython::VERSIONS;
 
 #[test]
 fn surrogate_docstrings_match_native_version_and_scope_rejections() {

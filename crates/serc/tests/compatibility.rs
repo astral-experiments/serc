@@ -374,7 +374,7 @@ print(replace_group())
     #[test]
     fn distinguishes_a_byte_order_mark_in_text_and_byte_source() {
         use serc::{
-            CompileOptions, InitialInternState, PythonVersion, compile_bytes_with_options,
+            CompileOptions, InitialInternState, compile_bytes_with_options,
             compile_with_intern_state, compile_with_options,
         };
 
@@ -390,12 +390,7 @@ print(replace_group())
         assert_rejected(
             compile_with_intern_state(text, "bom.py", &InitialInternState::default()).unwrap_err(),
         );
-        for python_version in [
-            PythonVersion::Py312,
-            PythonVersion::Py313,
-            PythonVersion::Py314,
-            PythonVersion::Py315,
-        ] {
+        for python_version in crate::common::cpython::VERSIONS {
             let options = CompileOptions {
                 python_version,
                 ..CompileOptions::default()
@@ -430,8 +425,8 @@ print(replace_group())
     #[test]
     fn rejects_null_characters_in_text_source() {
         use serc::{
-            CompileOptions, InitialInternState, PythonVersion, SourceDecodeError,
-            compile_with_intern_state, compile_with_options,
+            CompileOptions, InitialInternState, SourceDecodeError, compile_with_intern_state,
+            compile_with_options,
         };
 
         let expected = CompileError::Decode(SourceDecodeError::NullByte);
@@ -449,12 +444,7 @@ print(replace_group())
                     .unwrap_err(),
                 expected
             );
-            for python_version in [
-                PythonVersion::Py312,
-                PythonVersion::Py313,
-                PythonVersion::Py314,
-                PythonVersion::Py315,
-            ] {
+            for python_version in crate::common::cpython::VERSIONS {
                 let options = CompileOptions {
                     python_version,
                     ..CompileOptions::default()
@@ -472,9 +462,8 @@ print(replace_group())
     #[test]
     fn rejects_null_characters_in_filenames_before_reading_source() {
         use serc::{
-            CompileOptions, InitialInternState, PythonVersion, SourceDecodeError,
-            compile_bytes_with_intern_state, compile_bytes_with_options, compile_with_intern_state,
-            compile_with_options,
+            CompileOptions, InitialInternState, SourceDecodeError, compile_bytes_with_intern_state,
+            compile_bytes_with_options, compile_with_intern_state, compile_with_options,
         };
 
         let expected = CompileError::InvalidFilename;
@@ -507,12 +496,7 @@ print(replace_group())
                     expected
                 );
             }
-            for python_version in [
-                PythonVersion::Py312,
-                PythonVersion::Py313,
-                PythonVersion::Py314,
-                PythonVersion::Py315,
-            ] {
+            for python_version in crate::common::cpython::VERSIONS {
                 let options = CompileOptions {
                     python_version,
                     ..CompileOptions::default()
@@ -579,17 +563,12 @@ for filename in ["\0", "\0prefix", "in\0side", "suffix\0"]:
         use std::path::Path;
 
         use serc::{
-            CompileOptions, PythonVersion, SourceDecodeError, compile_bytes_with_options,
+            CompileOptions, SourceDecodeError, compile_bytes_with_options,
             compile_bytes_with_path_and_options,
         };
 
         let sources: &[&[u8]] = &[b"pass", b"if =", b"\0", b"\xff", b"# coding: unknown\npass"];
-        for python_version in [
-            PythonVersion::Py312,
-            PythonVersion::Py313,
-            PythonVersion::Py314,
-            PythonVersion::Py315,
-        ] {
+        for python_version in crate::common::cpython::VERSIONS {
             let options = CompileOptions {
                 python_version,
                 ..CompileOptions::default()
@@ -646,7 +625,7 @@ for filename in ["\0", "\0prefix", "in\0side", "suffix\0"]:
         use std::os::unix::ffi::OsStrExt as _;
         use std::path::Path;
 
-        use serc::{CompileOptions, PythonVersion, compile_bytes_with_path_and_options};
+        use serc::{CompileOptions, compile_bytes_with_path_and_options};
 
         let source = b"def outer():\n    def inner():\n        return 42\n    return inner\n";
         let filenames: &[&[u8]] = &[
@@ -677,12 +656,7 @@ assert_filenames(code)
 sys.stdout.buffer.write(marshal.dumps(code))
 ";
 
-        for python_version in [
-            PythonVersion::Py312,
-            PythonVersion::Py313,
-            PythonVersion::Py314,
-            PythonVersion::Py315,
-        ] {
+        for python_version in crate::common::cpython::VERSIONS {
             let target = python_version.target();
             let options = CompileOptions {
                 python_version,
@@ -799,17 +773,11 @@ sys.stdout.buffer.write(marshal.dumps(code))
         use std::path::Path;
 
         use serc::{
-            CompileOptions, PythonVersion, compile_bytes_with_options,
-            compile_bytes_with_path_and_options,
+            CompileOptions, compile_bytes_with_options, compile_bytes_with_path_and_options,
         };
 
         let script = "import importlib.util, marshal, sys; assert sys.implementation.name == 'cpython'; assert sys.version.split()[0] == sys.argv[1]; assert importlib.util.MAGIC_NUMBER.hex() == sys.argv[2]; code = compile(sys.stdin.buffer.read(), 'codec_effects.py', 'exec', dont_inherit=True, optimize=0); sys.stdout.buffer.write(marshal.dumps(code))";
-        for version in [
-            PythonVersion::Py312,
-            PythonVersion::Py313,
-            PythonVersion::Py314,
-            PythonVersion::Py315,
-        ] {
+        for version in crate::common::cpython::VERSIONS {
             let target = version.target();
             let options = CompileOptions {
                 python_version: version,
@@ -3509,15 +3477,10 @@ fn nested_finally_condition_marker_matches_each_target() {
 }
 
 fn assert_finally_condition_marker_matches_each_target(source: &str) {
-    use serc::{CompileOptions, PythonVersion, compile_with_options};
+    use serc::{CompileOptions, compile_with_options};
 
     let oracle = "import importlib.util, marshal, sys; assert sys.implementation.name == 'cpython'; assert sys.version.split()[0] == sys.argv[1]; assert importlib.util.MAGIC_NUMBER.hex() == sys.argv[2]; code = compile(sys.stdin.read(), 'nested_finally_targets.py', 'exec', dont_inherit=True, optimize=0); sys.stdout.buffer.write(marshal.dumps(code))";
-    for version in [
-        PythonVersion::Py312,
-        PythonVersion::Py313,
-        PythonVersion::Py314,
-        PythonVersion::Py315,
-    ] {
+    for version in crate::common::cpython::VERSIONS {
         let target = version.target();
         let expected = crate::common::cpython::run_with_input(
             crate::common::cpython::command(version)
