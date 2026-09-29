@@ -137,3 +137,49 @@ pub(crate) fn assert_matches_cpython_versions(
         }
     }
 }
+
+/// Uses an oracle whose identity was checked by a preceding compilation.
+pub(crate) fn probe(index: usize) -> Command {
+    Command::new(ORACLES[index].get().expect("oracle identity was checked"))
+}
+
+/// Retains the command's stdout policy; callers pipe it when inspecting output.
+#[track_caller]
+pub(crate) fn run_successfully(command: &mut Command, input: &[u8]) -> Vec<u8> {
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    let result = child.wait_with_output().unwrap();
+    assert!(
+        result.status.success(),
+        "{}: status {}, {}",
+        command.get_program().to_string_lossy(),
+        result.status,
+        String::from_utf8_lossy(&result.stderr)
+    );
+    result.stdout
+}
+
+#[track_caller]
+pub(crate) fn assert_runs(command: &mut Command, [native, actual]: [&[u8]; 2]) {
+    run_successfully(command, native);
+    run_successfully(command, actual);
+}
+
+/// Captures stdout and compares it only after both runs succeed.
+#[track_caller]
+pub(crate) fn assert_outputs_match(command: &mut Command, [native, actual]: [&[u8]; 2]) -> Vec<u8> {
+    command.stdout(Stdio::piped());
+    let expected = run_successfully(command, native);
+    let actual = run_successfully(command, actual);
+    assert_eq!(
+        actual,
+        expected,
+        "{}",
+        command.get_program().to_string_lossy()
+    );
+    expected
+}
