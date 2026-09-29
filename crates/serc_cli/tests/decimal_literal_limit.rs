@@ -1,7 +1,5 @@
 mod common;
 
-use std::process::Command;
-
 use serc::{CompileError, CompileOptions, compile_bytes_with_options, compile_with_options};
 
 #[test]
@@ -72,17 +70,7 @@ sys.stdout.buffer.write(marshal.dumps(code))
                 }
             }
             fs_err::write(&path, source).unwrap();
-            let output = Command::new(env!("CARGO_BIN_EXE_serc"))
-                .args([
-                    "compile",
-                    "--check",
-                    "--quiet",
-                    "--python-version",
-                    &version.to_string(),
-                ])
-                .arg(&path)
-                .output()
-                .unwrap();
+            let output = common::check(&path, version);
             assert_eq!(output.status.success(), *accepted, "{version}: {output:?}");
             if !accepted {
                 assert!(

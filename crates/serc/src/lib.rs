@@ -22,6 +22,7 @@ mod type_alias_syntax;
 mod yield_from_syntax;
 mod yield_syntax;
 
+use std::borrow::Cow;
 use std::error::Error;
 use std::fmt;
 use std::path::Path;
@@ -544,43 +545,28 @@ fn compile_byte_source(
     mapping_key_int_max_str_digits: Option<u32>,
 ) -> Result<CompiledModule, CompileError> {
     let decoded = source::decode_source_with_codec(source).map_err(CompileError::Decode)?;
-    if !options
+    let mut options = Cow::Borrowed(options);
+    if options
         .initial_intern_state
         .models_standard_source_codec_effects()
     {
-        return compile_normalized(
-            &decoded.source,
-            filename,
-            options,
-            parse_int_max_str_digits,
-            mapping_key_int_max_str_digits,
-        );
+        let strings = decoded.codec.map_or(&[][..], |codec| {
+            target::source_codec_strings(options.python_version, codec)
+        });
+        if !strings.is_empty() || decoded.registry_name.is_some() {
+            let state = options.initial_intern_state.with_additional_strings(
+                strings
+                    .iter()
+                    .copied()
+                    .chain(decoded.registry_name.as_deref()),
+            );
+            options.to_mut().initial_intern_state = state;
+        }
     }
-    let strings = decoded.codec.map_or(&[][..], |codec| {
-        target::source_codec_strings(options.python_version, codec)
-    });
-    if strings.is_empty() && decoded.registry_name.is_none() {
-        return compile_normalized(
-            &decoded.source,
-            filename,
-            options,
-            parse_int_max_str_digits,
-            mapping_key_int_max_str_digits,
-        );
-    }
-    let state = options.initial_intern_state.with_additional_strings(
-        strings
-            .iter()
-            .copied()
-            .chain(decoded.registry_name.as_deref()),
-    );
     compile_normalized(
         &decoded.source,
         filename,
-        &CompileOptions {
-            initial_intern_state: state,
-            ..options.clone()
-        },
+        &options,
         parse_int_max_str_digits,
         mapping_key_int_max_str_digits,
     )

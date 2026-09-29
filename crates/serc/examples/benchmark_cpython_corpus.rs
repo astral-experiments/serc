@@ -1069,117 +1069,51 @@ fn metadata(
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     };
-    let mut metadata = vec![
-        ("python_requested".to_string(), options.python.clone()),
-        (
-            "python_realpath".to_string(),
-            identity.python_realpath.clone(),
-        ),
-        (
-            "python_executable_hash".to_string(),
-            identity.python_executable_hash.clone(),
-        ),
-        (
-            "python_version".to_string(),
-            CPYTHON_TARGET.version_string(),
-        ),
-        (
-            "python_magic".to_string(),
-            CPYTHON_TARGET.magic_hex(),
-        ),
-        ("phase".to_string(), options.phase.label().to_string()),
-        ("warmups".to_string(), options.warmups.to_string()),
-        ("samples".to_string(), options.samples.to_string()),
+    let mut metadata = [
+        ("python_requested", options.python.clone()),
+        ("python_realpath", identity.python_realpath.clone()),
+        ("python_executable_hash", identity.python_executable_hash.clone()),
+        ("python_version", CPYTHON_TARGET.version_string()),
+        ("python_magic", CPYTHON_TARGET.magic_hex()),
+        ("phase", options.phase.label().to_string()),
+        ("warmups", options.warmups.to_string()),
+        ("samples", options.samples.to_string()),
         cooldown_metadata(options),
-        ("schedule".to_string(), "ABBA_BAAB".to_string()),
+        ("schedule", "ABBA_BAAB".to_string()),
+        ("primary_attribution_metric", "process_cpu_ns".to_string()),
+        ("process_cpu_semantics", "whole-process user-plus-system CPU time".to_string()),
+        ("wall_time_role", "diagnostic".to_string()),
+        ("observations_per_block", "4".to_string()),
+        ("observations_per_engine_per_block", "2".to_string()),
         (
-            "primary_attribution_metric".to_string(),
-            "process_cpu_ns".to_string(),
-        ),
-        (
-            "process_cpu_semantics".to_string(),
-            "whole-process user-plus-system CPU time".to_string(),
-        ),
-        (
-            "wall_time_role".to_string(),
-            "diagnostic".to_string(),
-        ),
-        ("observations_per_block".to_string(), "4".to_string()),
-        (
-            "observations_per_engine_per_block".to_string(),
-            "2".to_string(),
-        ),
-        (
-            "ratio_contract".to_string(),
+            "ratio_contract",
             "process_cpu_ns mean_rust_ns/mean_cpython_ns; relative_mad<=0.03; half_delta<=0.03; order_delta<=0.03".to_string(),
         ),
-        ("discovered_files".to_string(), sources.len().to_string()),
-        (
-            "discovered_source_bytes".to_string(),
-            discovered_source_bytes.to_string(),
-        ),
-        (
-            "accepted_files".to_string(),
-            manifest.accepted.to_string(),
-        ),
-        (
-            "cpython_rejected".to_string(),
-            manifest.rejected.to_string(),
-        ),
-        (
-            "accepted_source_bytes".to_string(),
-            manifest.source_bytes.to_string(),
-        ),
-        (
-            "exact_marshal_preflight".to_string(),
-            "passed".to_string(),
-        ),
-        (
-            "exact_marshal_files".to_string(),
-            manifest.accepted.to_string(),
-        ),
-        ("hash_scheme".to_string(), identity.hash_scheme.clone()),
-        (
-            "serc_commit".to_string(),
-            identity.serc_commit.clone(),
-        ),
-        (
-            "serc_dirty".to_string(),
-            identity.serc_dirty.to_string(),
-        ),
-        (
-            "serc_diff_hash".to_string(),
-            identity.serc_diff_hash.clone(),
-        ),
-        (
-            "cargo_lock_hash".to_string(),
-            identity.cargo_lock_hash.clone(),
-        ),
-        (
-            "corpus_content_hash".to_string(),
-            identity.corpus_content_hash.clone(),
-        ),
-        (
-            "benchmark_executable".to_string(),
-            identity.benchmark_executable.clone(),
-        ),
-        (
-            "benchmark_executable_hash".to_string(),
-            identity.benchmark_executable_hash.clone(),
-        ),
-        (
-            "rustc".to_string(),
-            command_output("rustc", &["-Vv"])?.replace('\n', " | "),
-        ),
-        ("cargo".to_string(), command_output("cargo", &["-V"])?),
-        ("os".to_string(), env::consts::OS.to_string()),
-        ("arch".to_string(), env::consts::ARCH.to_string()),
-        ("profile".to_string(), identity.profile.clone()),
-        (
-            "target_dir".to_string(),
-            env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".to_string()),
-        ),
-    ];
+        ("discovered_files", sources.len().to_string()),
+        ("discovered_source_bytes", discovered_source_bytes.to_string()),
+        ("accepted_files", manifest.accepted.to_string()),
+        ("cpython_rejected", manifest.rejected.to_string()),
+        ("accepted_source_bytes", manifest.source_bytes.to_string()),
+        ("exact_marshal_preflight", "passed".to_string()),
+        ("exact_marshal_files", manifest.accepted.to_string()),
+        ("hash_scheme", identity.hash_scheme.clone()),
+        ("serc_commit", identity.serc_commit.clone()),
+        ("serc_dirty", identity.serc_dirty.to_string()),
+        ("serc_diff_hash", identity.serc_diff_hash.clone()),
+        ("cargo_lock_hash", identity.cargo_lock_hash.clone()),
+        ("corpus_content_hash", identity.corpus_content_hash.clone()),
+        ("benchmark_executable", identity.benchmark_executable.clone()),
+        ("benchmark_executable_hash", identity.benchmark_executable_hash.clone()),
+        ("rustc", command_output("rustc", &["-Vv"])?.replace('\n', " | ")),
+        ("cargo", command_output("cargo", &["-V"])?),
+        ("os", env::consts::OS.to_string()),
+        ("arch", env::consts::ARCH.to_string()),
+        ("profile", identity.profile.clone()),
+        ("target_dir", env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".to_string())),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.to_string(), value))
+    .collect::<Vec<_>>();
     for (index, root) in options.roots.iter().enumerate() {
         metadata.push((format!("root_{index}"), root.display().to_string()));
     }
@@ -1189,11 +1123,8 @@ fn metadata(
     Ok(metadata)
 }
 
-fn cooldown_metadata(options: &Options) -> (String, String) {
-    (
-        "cooldown_ms".to_string(),
-        options.cooldown.as_millis().to_string(),
-    )
+fn cooldown_metadata(options: &Options) -> (&'static str, String) {
+    ("cooldown_ms", options.cooldown.as_millis().to_string())
 }
 
 fn write_raw(
@@ -1463,6 +1394,21 @@ mod tests {
         profile_from_executable, ratio_statistics, summarize, verify_exact_marshal, write_raw,
     };
 
+    fn parse_options(args: &[&str]) -> Result<Options, clap::Error> {
+        Options::try_parse_from(
+            [
+                "benchmark_cpython_corpus",
+                "--python",
+                "python3",
+                "--output",
+                "samples.tsv",
+            ]
+            .into_iter()
+            .chain(args.iter().copied())
+            .chain(["corpus"]),
+        )
+    }
+
     #[test]
     fn python_helper_rejects_prerelease_interpreters() {
         let python = std::env::var("SERC_TEST_PYTHON").unwrap_or_else(|_| "python3.14".to_string());
@@ -1662,10 +1608,7 @@ mod tests {
             ("compile_marshal", Phase::CompileMarshal),
             ("marshal_only", Phase::MarshalOnly),
         ] {
-            let options = Options::try_parse_from([
-                "benchmark_cpython_corpus",
-                "--python",
-                "python3",
+            let options = parse_options(&[
                 "--phase",
                 label,
                 "--warmups",
@@ -1674,9 +1617,6 @@ mod tests {
                 "1",
                 "--cooldown-ms",
                 "0",
-                "--output",
-                "samples.tsv",
-                "corpus",
             ])
             .expect("supported phase");
             assert_eq!(options.phase, phase);
@@ -1685,28 +1625,12 @@ mod tests {
 
     #[test]
     fn requires_a_supported_phase() {
-        let missing = Options::try_parse_from([
-            "benchmark_cpython_corpus",
-            "--python",
-            "python3",
-            "--warmups",
-            "1",
-            "--samples",
-            "1",
-            "--cooldown-ms",
-            "0",
-            "--output",
-            "samples.tsv",
-            "corpus",
-        ])
-        .expect_err("phase is required");
+        let missing = parse_options(&["--warmups", "1", "--samples", "1", "--cooldown-ms", "0"])
+            .expect_err("phase is required");
         assert_eq!(missing.kind(), ErrorKind::MissingRequiredArgument);
         assert!(missing.to_string().contains("--phase"));
 
-        let unsupported = Options::try_parse_from([
-            "benchmark_cpython_corpus",
-            "--python",
-            "python3",
+        let unsupported = parse_options(&[
             "--phase",
             "all",
             "--warmups",
@@ -1715,9 +1639,6 @@ mod tests {
             "1",
             "--cooldown-ms",
             "0",
-            "--output",
-            "samples.tsv",
-            "corpus",
         ])
         .expect_err("unsupported phase must fail");
         assert_eq!(unsupported.kind(), ErrorKind::InvalidValue);
@@ -1726,10 +1647,7 @@ mod tests {
     #[test]
     fn rejects_zero_iteration_counts() {
         for (warmups, samples, limit) in [("0", "1", "1"), ("1", "0", "1"), ("1", "1", "0")] {
-            let error = Options::try_parse_from([
-                "benchmark_cpython_corpus",
-                "--python",
-                "python3",
+            let error = parse_options(&[
                 "--phase",
                 "compiler_core",
                 "--warmups",
@@ -1740,9 +1658,6 @@ mod tests {
                 limit,
                 "--cooldown-ms",
                 "0",
-                "--output",
-                "samples.tsv",
-                "corpus",
             ])
             .expect_err("zero iteration counts must fail");
             assert_eq!(error.kind(), ErrorKind::ValueValidation);
@@ -1751,19 +1666,13 @@ mod tests {
 
     #[test]
     fn requires_cooldown() {
-        let error = Options::try_parse_from([
-            "benchmark_cpython_corpus",
-            "--python",
-            "python3",
+        let error = parse_options(&[
             "--phase",
             "compiler_core",
             "--warmups",
             "1",
             "--samples",
             "1",
-            "--output",
-            "samples.tsv",
-            "corpus",
         ])
         .expect_err("cooldown is required");
         assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
@@ -1784,7 +1693,7 @@ mod tests {
         };
         assert_eq!(
             cooldown_metadata(&options),
-            ("cooldown_ms".to_string(), "5000".to_string())
+            ("cooldown_ms", "5000".to_string())
         );
     }
 

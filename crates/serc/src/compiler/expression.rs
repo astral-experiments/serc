@@ -10331,22 +10331,7 @@ pub(super) fn expression_suspends_current_scope(expression: &Expr) -> bool {
                 self.found = true;
                 return;
             }
-            let has_async_comprehension = match expression {
-                Expr::ListComp(comprehension) => comprehension
-                    .generators
-                    .iter()
-                    .any(|generator| generator.is_async),
-                Expr::SetComp(comprehension) => comprehension
-                    .generators
-                    .iter()
-                    .any(|generator| generator.is_async),
-                Expr::DictComp(comprehension) => comprehension
-                    .generators
-                    .iter()
-                    .any(|generator| generator.is_async),
-                _ => false,
-            };
-            if has_async_comprehension {
+            if expression_defers_async_comprehension_restore(expression) {
                 self.found = true;
                 return;
             }
@@ -10359,21 +10344,8 @@ pub(super) fn expression_suspends_current_scope(expression: &Expr) -> bool {
     collector.found
 }
 pub(super) fn expression_defers_async_comprehension_restore(expression: &Expr) -> bool {
-    match expression {
-        Expr::ListComp(comprehension) => comprehension
-            .generators
-            .iter()
-            .any(|generator| generator.is_async),
-        Expr::SetComp(comprehension) => comprehension
-            .generators
-            .iter()
-            .any(|generator| generator.is_async),
-        Expr::DictComp(comprehension) => comprehension
-            .generators
-            .iter()
-            .any(|generator| generator.is_async),
-        _ => false,
-    }
+    super::comprehension_parts(expression)
+        .is_some_and(|(generators, _, _)| generators.iter().any(|generator| generator.is_async))
 }
 pub(super) fn literal_truthiness(expression: &Expr) -> Option<bool> {
     match expression {
