@@ -1,5 +1,141 @@
 # Changelog
 
+## 0.1.1
+
+Released on 2026-09-29.
+
+Serc 0.1.1 adds Python optimization modes and hash-based bytecode caches,
+improves compilation performance, and expands compatibility with CPython.
+
+### Enhancements
+
+- Compile with Python’s `-O` and `-OO` optimization modes through CLI flags or
+  `CompileOptions` (astral-sh/serc#841;
+  https://github.com/astral-sh/serc/pull/841)
+- Generate checked or unchecked hash-based bytecode caches with
+  `--invalidation-mode` or `CompiledModule::to_hash_pyc` (astral-sh/serc#840;
+  https://github.com/astral-sh/serc/pull/840)
+- Opt into caller-selected decimal literal parsing limits through new text,
+  byte, and path compilation APIs (astral-sh/serc#911;
+  https://github.com/astral-sh/serc/pull/911)
+- Model the caller’s integer-to-string limit when formatting duplicate
+  mapping-key diagnostics through opt-in compilation APIs (astral-sh/serc#887;
+  https://github.com/astral-sh/serc/pull/887)
+- Reproduce floating-point constant folding from documented CPython 3.14.5 GCC
+  and Clang builds on supported GNU/Linux x86-64 hosts by selecting a native
+  build profile (astral-sh/serc#824; https://github.com/astral-sh/serc/pull/824)
+
+### Bug fixes
+
+- Produce CPython-compatible control flow, source locations, exception tables,
+  and constant sharing under `-O` and `-OO` (astral-sh/serc#912;
+  https://github.com/astral-sh/serc/pull/912)
+- Preserve requested `.opt-N.pyc` cache suffixes for repeated optimization flags
+  while applying `-OO` semantics (astral-sh/serc#912;
+  https://github.com/astral-sh/serc/pull/912)
+- Compile nested `continue` statements in `finally` suites without negative
+  stack-depth errors or incorrect exception restoration (astral-sh/serc#825;
+  https://github.com/astral-sh/serc/pull/825)
+- Compile deeply nested expressions and postponed annotations without
+  overflowing the compiler stack (astral-sh/serc#827;
+  https://github.com/astral-sh/serc/pull/827)
+- Honor selected native build profiles throughout nested constant folding
+  (astral-sh/serc#827; https://github.com/astral-sh/serc/pull/827)
+- Keep enclosing cleanup and exception handlers active when tracing raises at a
+  nested no-op `finally` suite (astral-sh/serc#900;
+  https://github.com/astral-sh/serc/pull/900) (astral-sh/serc#908;
+  https://github.com/astral-sh/serc/pull/908)
+- Convert `StopIteration` raised by tracing in nested generator finalizers into
+  `RuntimeError` instead of silently terminating the generator
+  (astral-sh/serc#903; https://github.com/astral-sh/serc/pull/903)
+- Resolve private type-parameter names and their mangled aliases to the same
+  binding in generic class headers (astral-sh/serc#828;
+  https://github.com/astral-sh/serc/pull/828)
+- Preserve marshal object identity for retained native startup names on Python
+  3.14 (astral-sh/serc#830; https://github.com/astral-sh/serc/pull/830)
+- Remove redundant `NOP` instructions before module annotations after literal
+  and negated conditions on Python 3.14 and 3.15 (astral-sh/serc#894;
+  https://github.com/astral-sh/serc/pull/894) (astral-sh/serc#906;
+  https://github.com/astral-sh/serc/pull/906)
+- Match CPython opcode ordering when breaking from an exceptional `finally`
+  suite into nested handler cleanup (astral-sh/serc#829;
+  https://github.com/astral-sh/serc/pull/829)
+- Preserve async-comprehension assertion exits in terminal conditionals on
+  Python 3.12 (astral-sh/serc#889; https://github.com/astral-sh/serc/pull/889)
+- Match CPython’s exception-table coverage for markers in nested finalizers
+  after a handler returns (astral-sh/serc#904;
+  https://github.com/astral-sh/serc/pull/904)
+- Match CPython bytecode and exception-table ownership after branching `try`
+  bodies enter nested finalizers (astral-sh/serc#909;
+  https://github.com/astral-sh/serc/pull/909)
+- Match CPython 3.12 source locations for successful assertions at the end of
+  `finally` suites (astral-sh/serc#907;
+  https://github.com/astral-sh/serc/pull/907)
+- Reject lambdas and comprehensions in Python 3.12 generic headers when their
+  annotation scopes can see an enclosing class namespace (astral-sh/serc#831;
+  https://github.com/astral-sh/serc/pull/831)
+- Reject repeated explicit keyword arguments in calls, including unreachable
+  code (astral-sh/serc#845; https://github.com/astral-sh/serc/pull/845)
+- Reject invalid uses of `__debug__` in attributes, call and class keywords, and
+  class patterns according to the target Python version (astral-sh/serc#847;
+  https://github.com/astral-sh/serc/pull/847)
+- Reject commas immediately following bare `yield` expressions while continuing
+  to accept parenthesized yields and yield tuples (astral-sh/serc#846;
+  https://github.com/astral-sh/serc/pull/846)
+- Reject Python sources with more than 99 active indentation levels
+  (astral-sh/serc#834; https://github.com/astral-sh/serc/pull/834)
+- Enforce CPython’s default 4,300-digit limit for decimal integer literals
+  (astral-sh/serc#835; https://github.com/astral-sh/serc/pull/835)
+- Reject parameter specification and variadic type-parameter defaults when
+  targeting Python 3.12 (astral-sh/serc#869;
+  https://github.com/astral-sh/serc/pull/869) (astral-sh/serc#870;
+  https://github.com/astral-sh/serc/pull/870)
+- Include the repeated type-parameter name in duplicate-name diagnostics
+  (astral-sh/serc#850; https://github.com/astral-sh/serc/pull/850)
+- Match CPython diagnostics for unknown `__future__` features
+  (astral-sh/serc#858; https://github.com/astral-sh/serc/pull/858)
+- Match CPython diagnostics for misplaced `__future__` imports
+  (astral-sh/serc#860; https://github.com/astral-sh/serc/pull/860)
+- Prioritize misplaced `__future__` imports over unknown features in the same
+  statement (astral-sh/serc#865; https://github.com/astral-sh/serc/pull/865)
+- Match CPython diagnostics and source ranges for duplicate mapping-pattern keys
+  (astral-sh/serc#857; https://github.com/astral-sh/serc/pull/857)
+- Reject large integer mapping-pattern keys that compare equal to floating-point
+  or complex keys (astral-sh/serc#861;
+  https://github.com/astral-sh/serc/pull/861)
+- Preserve lone surrogates when validating and folding mapping-pattern keys
+  (astral-sh/serc#877; https://github.com/astral-sh/serc/pull/877)
+- Match CPython diagnostics for assignment expressions targeting attributes
+  (astral-sh/serc#871; https://github.com/astral-sh/serc/pull/871)
+- Match CPython diagnostics for unparenthesized tuples after `yield from`
+  (astral-sh/serc#872; https://github.com/astral-sh/serc/pull/872)
+- Preserve type-alias default diagnostics when later syntax errors are also
+  present (astral-sh/serc#867; https://github.com/astral-sh/serc/pull/867)
+- Report the appropriate comprehension-specific error for `yield` and
+  `yield from` expressions inside comprehensions (astral-sh/serc#879;
+  https://github.com/astral-sh/serc/pull/879)
+- Report direct dictionary-comprehension value `yield` errors before
+  corresponding key errors (astral-sh/serc#880;
+  https://github.com/astral-sh/serc/pull/880)
+- Report nested comprehension `yield` errors in operand order
+  (astral-sh/serc#884; https://github.com/astral-sh/serc/pull/884)
+- Prioritize comprehension `yield` errors over earlier bare starred expressions
+  (astral-sh/serc#885; https://github.com/astral-sh/serc/pull/885)
+- Prioritize supported comprehension `yield` errors over async-generator
+  value-return errors (astral-sh/serc#895;
+  https://github.com/astral-sh/serc/pull/895)
+- Match CPython diagnostics for `await` inside synchronous functions and lambdas
+  (astral-sh/serc#896; https://github.com/astral-sh/serc/pull/896)
+- Resolve invalid `global` and `nonlocal` declarations before reporting
+  mapping-pattern errors (astral-sh/serc#881;
+  https://github.com/astral-sh/serc/pull/881)
+
+### Performance
+
+- Reduce compilation overhead across scope analysis, source handling, assembler
+  passes, and marshal serialization (astral-sh/serc#848;
+  https://github.com/astral-sh/serc/pull/848)
+
 ## 0.1.0
 
 Released on 2026-09-25.
