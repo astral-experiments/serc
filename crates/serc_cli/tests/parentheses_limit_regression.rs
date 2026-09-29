@@ -166,12 +166,7 @@ fn nesting_limit_matches_each_supported_python_version() {
                 .arg(&path)
                 .output()
                 .unwrap();
-            let compiled = Command::new(env!("CARGO_BIN_EXE_serc"))
-                .args(["compile", "--check", "--quiet", "--python-version"])
-                .arg(version.to_string())
-                .arg(&path)
-                .output()
-                .unwrap();
+            let compiled = common::check(&path, version);
             assert_eq!(
                 compiled.status.success(),
                 native.status.success(),
@@ -209,12 +204,7 @@ fn template_string_nesting_depends_on_the_target_version() {
                     .arg(&path)
                     .output()
                     .unwrap();
-                let compiled = Command::new(env!("CARGO_BIN_EXE_serc"))
-                    .args(["compile", "--check", "--quiet", "--python-version"])
-                    .arg(version.to_string())
-                    .arg(&path)
-                    .output()
-                    .unwrap();
+                let compiled = common::check(&path, version);
                 assert_eq!(compiled.status.success(), native.status.success());
                 assert_eq!(
                     String::from_utf8_lossy(&compiled.stderr)

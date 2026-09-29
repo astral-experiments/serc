@@ -2525,15 +2525,7 @@ impl Compiler<'_> {
         preserve_location: bool,
         compact_trailing_nop: bool,
     ) -> Result<EmittedJump, CompileError> {
-        self.control.clear_direct_comprehension_assignment_results();
-        let removed_nop = (compact_trailing_nop
-            && self.context.python_version >= crate::PythonVersion::Py314
-            && is_unconditional_jump(opcode))
-        .then(|| self.take_trailing_nop_location())
-        .flatten();
-        if !preserve_location && let Some((location, _)) = removed_nop {
-            self.assembler.set_location(location);
-        }
+        let original_slots = self.prepare_jump(opcode, preserve_location, compact_trailing_nop);
         let effect = required_compiler_stack_effect(self.assembler.python_version(), opcode, 0)?;
         self.apply_stack_effect(effect)?;
         let jump = self.assembler.emit_forward_with_depth(
@@ -2542,8 +2534,7 @@ impl Compiler<'_> {
             self.control.stack.depth.cast_unsigned(),
             exception_policy,
         );
-        self.assembler
-            .add_last_original_block_slots(removed_nop.map_or(0, |(_, slots)| slots));
+        self.assembler.add_last_original_block_slots(original_slots);
         Ok(jump)
     }
 
@@ -2554,14 +2545,7 @@ impl Compiler<'_> {
         effect: i32,
         exception_policy: ExceptionPolicy,
     ) -> Result<(), CompileError> {
-        self.control.clear_direct_comprehension_assignment_results();
-        let removed_nop = (self.context.python_version >= crate::PythonVersion::Py314
-            && is_unconditional_jump(opcode))
-        .then(|| self.take_trailing_nop_location())
-        .flatten();
-        if let Some((location, _)) = removed_nop {
-            self.assembler.set_location(location);
-        }
+        let original_slots = self.prepare_jump(opcode, false, true);
         self.apply_compiler_stack_effect(opcode, 0, effect)?;
         self.assembler.emit_forward_with_depth(
             opcode,
@@ -2569,8 +2553,7 @@ impl Compiler<'_> {
             self.control.stack.depth.cast_unsigned(),
             exception_policy,
         );
-        self.assembler
-            .add_last_original_block_slots(removed_nop.map_or(0, |(_, slots)| slots));
+        self.assembler.add_last_original_block_slots(original_slots);
         Ok(())
     }
 
@@ -2594,14 +2577,7 @@ impl Compiler<'_> {
         opcode: Opcode,
         label: Label,
     ) -> Result<EmittedJump, CompileError> {
-        self.control.clear_direct_comprehension_assignment_results();
-        let removed_nop = (self.context.python_version >= crate::PythonVersion::Py314
-            && is_unconditional_jump(opcode))
-        .then(|| self.take_trailing_nop_location())
-        .flatten();
-        if let Some((location, _)) = removed_nop {
-            self.assembler.set_location(location);
-        }
+        let original_slots = self.prepare_jump(opcode, false, true);
         let effect = required_compiler_stack_effect(self.assembler.python_version(), opcode, 0)?;
         self.apply_stack_effect(effect)?;
         let jump = self
@@ -2612,8 +2588,7 @@ impl Compiler<'_> {
                 self.control.stack.depth.cast_unsigned(),
                 ExceptionPolicy::default(),
             );
-        self.assembler
-            .add_last_original_block_slots(removed_nop.map_or(0, |(_, slots)| slots));
+        self.assembler.add_last_original_block_slots(original_slots);
         Ok(jump)
     }
 
@@ -2624,14 +2599,7 @@ impl Compiler<'_> {
         effect: i32,
         exception_policy: ExceptionPolicy,
     ) -> Result<(), CompileError> {
-        self.control.clear_direct_comprehension_assignment_results();
-        let removed_nop = (self.context.python_version >= crate::PythonVersion::Py314
-            && is_unconditional_jump(opcode))
-        .then(|| self.take_trailing_nop_location())
-        .flatten();
-        if let Some((location, _)) = removed_nop {
-            self.assembler.set_location(location);
-        }
+        let original_slots = self.prepare_jump(opcode, false, true);
         self.apply_compiler_stack_effect(opcode, 0, effect)?;
         self.assembler
             .emit_backward_with_depth_and_exception_policy(
@@ -2640,9 +2608,30 @@ impl Compiler<'_> {
                 self.control.stack.depth.cast_unsigned(),
                 exception_policy,
             );
-        self.assembler
-            .add_last_original_block_slots(removed_nop.map_or(0, |(_, slots)| slots));
+        self.assembler.add_last_original_block_slots(original_slots);
         Ok(())
+    }
+
+    /// Clears pending comprehension results and optionally removes a preceding NOP
+    /// for unconditional jumps on 3.14+, updating exclusions.
+    /// Returns the original slots that must be attached after emitting the jump;
+    /// folded conditions can retain their jump location instead of inheriting the NOP's.
+    fn prepare_jump(
+        &mut self,
+        opcode: Opcode,
+        preserve_location: bool,
+        compact_trailing_nop: bool,
+    ) -> usize {
+        self.control.clear_direct_comprehension_assignment_results();
+        let removed_nop = (compact_trailing_nop
+            && self.context.python_version >= crate::PythonVersion::Py314
+            && is_unconditional_jump(opcode))
+        .then(|| self.take_trailing_nop_location())
+        .flatten();
+        if !preserve_location && let Some((location, _)) = removed_nop {
+            self.assembler.set_location(location);
+        }
+        removed_nop.map_or(0, |(_, slots)| slots)
     }
 
     pub(super) fn take_trailing_nop_location(&mut self) -> Option<(SourceLocation, usize)> {

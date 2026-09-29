@@ -15,18 +15,7 @@ pub(super) fn validate(body: &[Stmt], version: PythonVersion) -> Result<(), Comp
             && import.module.as_deref() == Some("__future__")
             && import.names.iter().any(|alias| alias.name.as_str() == "annotations"))
     });
-    let mut validator = Validator {
-        scopes: vec![Scope::new(ScopeKind::Module, None)],
-        current: 0,
-        private_name: None,
-        version,
-        future_annotations,
-        error: None,
-        stop_pattern_debug: None,
-        stop_node: None,
-        finding_stop: false,
-        stopped: false,
-    };
+    let mut validator = Validator::new(version, future_annotations);
     validator.visit_body(body);
     if let Some(error) = validator.error {
         return Err(error);
@@ -47,16 +36,8 @@ pub(super) fn immediate_before_pattern_debug(
             && import.names.iter().any(|alias| alias.name.as_str() == "annotations"))
     });
     let mut validator = Validator {
-        scopes: vec![Scope::new(ScopeKind::Module, None)],
-        current: 0,
-        private_name: None,
-        version,
-        future_annotations,
-        error: None,
         stop_pattern_debug: Some(range),
-        stop_node: None,
-        finding_stop: false,
-        stopped: false,
+        ..Validator::new(version, future_annotations)
     };
     validator.visit_body(body);
     validator.error
@@ -75,16 +56,9 @@ pub(super) fn immediate_before_node(
             && import.names.iter().any(|alias| alias.name.as_str() == "annotations"))
     });
     let new_validator = |finding_stop| Validator {
-        scopes: vec![Scope::new(ScopeKind::Module, None)],
-        current: 0,
-        private_name: None,
-        version,
-        future_annotations,
-        error: None,
-        stop_pattern_debug: None,
         stop_node: Some(range),
         finding_stop,
-        stopped: false,
+        ..Validator::new(version, future_annotations)
     };
     // Some reported ranges refer to identifiers rather than visited statements or expressions.
     // Do not consider a declaration after such an unmatched range to precede the error.
@@ -183,6 +157,21 @@ struct Validator<'a> {
 }
 
 impl<'a> Validator<'a> {
+    fn new(version: PythonVersion, future_annotations: bool) -> Self {
+        Self {
+            scopes: vec![Scope::new(ScopeKind::Module, None)],
+            current: 0,
+            private_name: None,
+            version,
+            future_annotations,
+            error: None,
+            stop_pattern_debug: None,
+            stop_node: None,
+            finding_stop: false,
+            stopped: false,
+        }
+    }
+
     fn name(&self, spelling: &str) -> String {
         mangle_name(spelling, self.private_name).into_owned()
     }

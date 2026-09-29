@@ -1,7 +1,8 @@
 #[allow(dead_code)]
 pub(crate) mod diagnostics;
 
-use std::process::Command;
+use std::path::Path;
+use std::process::{Command, Output};
 use std::sync::OnceLock;
 
 use serc::{CPYTHON_TARGET, PythonVersion};
@@ -23,6 +24,16 @@ pub(crate) fn python_command(version: PythonVersion) -> Command {
         PythonVersion::Py314 => python_3145_command(),
         PythonVersion::Py315 => python_315_command(),
     }
+}
+
+#[allow(dead_code)]
+pub(crate) fn check(source: &Path, version: PythonVersion) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_serc"))
+        .args(["compile", "--check", "--quiet", "--python-version"])
+        .arg(version.to_string())
+        .arg(source)
+        .output()
+        .unwrap()
 }
 
 const PYTHON_3145_IDENTITY_CHECK: &str = "import importlib.util, sys; expected = tuple(map(int, sys.argv[2].split('.'))) + ('final', 0); actual = sys.version_info; magic = importlib.util.MAGIC_NUMBER.hex(); ok = sys.implementation.name == sys.argv[1] and actual == expected and magic == sys.argv[3]; print(f'{sys.implementation.name} {'.'.join(map(str, actual[:3]))} {actual.releaselevel} {actual.serial} magic {magic}', file=sys.stderr); raise SystemExit(not ok)";

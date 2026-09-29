@@ -221,6 +221,28 @@ fn original_computed_return(items: &[Item]) -> Option<OriginalTail> {
 }
 
 impl OptimizationPipeline {
+    /// Detects copied/folded aliases or rewritten instruction policies in a return array.
+    ///
+    /// All policy fields must match a fresh instruction, including fields not used by
+    /// return recognition.
+    fn return_array_has_rewritten_items(&self, items: &[Item]) -> bool {
+        items.iter().any(|item| match item {
+            Item::Label(label) => {
+                self.borrow_block_aliases.contains(label)
+                    || self.folded_original_predecessor_targets.contains(label)
+            }
+            Item::Instruction(instruction) => {
+                *instruction
+                    != Instruction::new(
+                        instruction.opcode,
+                        instruction.operand(),
+                        instruction.location,
+                        instruction.depth_after(),
+                    )
+            }
+        })
+    }
+
     /// Schedules exact local-tuple exits through their original unprotected arrays.
     pub(in crate::assembler) fn prepare_plain_tuple_copy_plan(&mut self) {
         use crate::target::opcodes::{
@@ -524,21 +546,7 @@ impl OptimizationPipeline {
                     .contains(&end)
                 || !intact(target, false, false)
                 || original_local_tuple_return(graph[target].items()).is_none()
-                || graph[target].items().iter().any(|item| match item {
-                    Item::Label(label) => {
-                        self.borrow_block_aliases.contains(label)
-                            || self.folded_original_predecessor_targets.contains(label)
-                    }
-                    Item::Instruction(instruction) => {
-                        *instruction
-                            != Instruction::new(
-                                instruction.opcode,
-                                instruction.operand(),
-                                instruction.location,
-                                instruction.depth_after(),
-                            )
-                    }
-                })
+                || self.return_array_has_rewritten_items(graph[target].items())
             {
                 return false;
             }
@@ -582,21 +590,7 @@ impl OptimizationPipeline {
                     .original_match_join_boundaries
                     .contains(&end)
                 || original_local_tuple_return(graph[target].items()).is_none()
-                || graph[target].items().iter().any(|item| match item {
-                    Item::Label(label) => {
-                        self.borrow_block_aliases.contains(label)
-                            || self.folded_original_predecessor_targets.contains(label)
-                    }
-                    Item::Instruction(instruction) => {
-                        *instruction
-                            != Instruction::new(
-                                instruction.opcode,
-                                instruction.operand(),
-                                instruction.location,
-                                instruction.depth_after(),
-                            )
-                    }
-                })
+                || self.return_array_has_rewritten_items(graph[target].items())
                 || jump.location.line < 0
             {
                 return false;
@@ -982,21 +976,7 @@ impl OptimizationPipeline {
                         Item::Label(label) if self.exception_owner_provenance
                             .original_match_join_boundaries.contains(label))
                     })
-                    || graph[block].items().iter().any(|item| match item {
-                        Item::Label(label) => {
-                            self.borrow_block_aliases.contains(label)
-                                || self.folded_original_predecessor_targets.contains(label)
-                        }
-                        Item::Instruction(instruction) => {
-                            *instruction
-                                != Instruction::new(
-                                    instruction.opcode,
-                                    instruction.operand(),
-                                    instruction.location,
-                                    instruction.depth_after(),
-                                )
-                        }
-                    })
+                    || self.return_array_has_rewritten_items(graph[block].items())
                 {
                     continue;
                 }
@@ -1040,21 +1020,7 @@ impl OptimizationPipeline {
                     .exception_owner_provenance
                     .original_match_join_boundaries
                     .contains(&end)
-                || graph[target].items().iter().any(|item| match item {
-                    Item::Label(label) => {
-                        self.borrow_block_aliases.contains(label)
-                            || self.folded_original_predecessor_targets.contains(label)
-                    }
-                    Item::Instruction(instruction) => {
-                        *instruction
-                            != Instruction::new(
-                                instruction.opcode,
-                                instruction.operand(),
-                                instruction.location,
-                                instruction.depth_after(),
-                            )
-                    }
-                })
+                || self.return_array_has_rewritten_items(graph[target].items())
                 || jump.jump_policy.preserves_nop_after_threading()
                 || jump.no_location_policy.preserves_location()
                 || jump.pre_fold_extra_instructions() != 0
@@ -2887,6 +2853,33 @@ impl OptimizationPipeline {
         );
     }
 
+    /// Checks that a discard-exit label has no borrowing, folding, or omitted-NOP provenance.
+    ///
+    /// Setup donors and handler entries also cannot certify an original discard exit.
+    fn original_discard_label_is_intact(&self, label: Label) -> bool {
+        !self.original_nop_targets.contains(&label)
+            && !self.folded_original_predecessor_targets.contains(&label)
+            && !self.folded_condition_exit_targets.contains(&label)
+            && !self.borrow_block_aliases.contains(&label)
+            && !self
+                .exception_owner_provenance
+                .omitted_nop_counts
+                .contains_key(&label)
+            && !self
+                .exception_owner_provenance
+                .omitted_nop_locations
+                .contains_key(&label)
+            && !self
+                .exception_owner_provenance
+                .setups
+                .iter()
+                .any(|(entry, _)| *entry == label)
+            && !self
+                .exception_regions
+                .iter()
+                .any(|region| region.target == label)
+    }
+
     /// Certifies a discarded runtime expression's original direct ordinary-try exit.
     fn original_discard_try_exit_joins(&self) -> FxHashMap<BasicBlockId, (Label, BasicBlockId)> {
         use crate::target::opcodes::POP_TOP;
@@ -2903,29 +2896,6 @@ impl OptimizationPipeline {
         let position = |label| {
             let block = graph.label_block(label)?;
             order.iter().position(|candidate| *candidate == block)
-        };
-        let intact = |label| {
-            !self.original_nop_targets.contains(&label)
-                && !self.folded_original_predecessor_targets.contains(&label)
-                && !self.folded_condition_exit_targets.contains(&label)
-                && !self.borrow_block_aliases.contains(&label)
-                && !self
-                    .exception_owner_provenance
-                    .omitted_nop_counts
-                    .contains_key(&label)
-                && !self
-                    .exception_owner_provenance
-                    .omitted_nop_locations
-                    .contains_key(&label)
-                && !self
-                    .exception_owner_provenance
-                    .setups
-                    .iter()
-                    .any(|(entry, _)| *entry == label)
-                && !self
-                    .exception_regions
-                    .iter()
-                    .any(|region| region.target == label)
         };
         order
             .windows(2)
@@ -2949,8 +2919,8 @@ impl OptimizationPipeline {
                             SourceLocation::NONE,
                             Some(0),
                         )
-                    || !intact(*join)
-                    || !intact(*split)
+                    || !self.original_discard_label_is_intact(*join)
+                    || !self.original_discard_label_is_intact(*split)
                     || !self.preserved_block_boundaries.contains(join)
                     || !self
                         .exception_owner_provenance
@@ -3089,29 +3059,6 @@ impl OptimizationPipeline {
             let block = graph.label_block(label)?;
             order.iter().position(|candidate| *candidate == block)
         };
-        let intact = |label| {
-            !self.original_nop_targets.contains(&label)
-                && !self.folded_original_predecessor_targets.contains(&label)
-                && !self.folded_condition_exit_targets.contains(&label)
-                && !self.borrow_block_aliases.contains(&label)
-                && !self
-                    .exception_owner_provenance
-                    .omitted_nop_counts
-                    .contains_key(&label)
-                && !self
-                    .exception_owner_provenance
-                    .omitted_nop_locations
-                    .contains_key(&label)
-                && !self
-                    .exception_owner_provenance
-                    .setups
-                    .iter()
-                    .any(|(entry, _)| *entry == label)
-                && !self
-                    .exception_regions
-                    .iter()
-                    .any(|region| region.target == label)
-        };
         order
             .windows(2)
             .filter_map(|pair| {
@@ -3218,7 +3165,7 @@ impl OptimizationPipeline {
                     })
                     || [*join, *split, target, tail]
                         .iter()
-                        .any(|label| !intact(*label))
+                        .any(|label| !self.original_discard_label_is_intact(*label))
                     || !self.preserved_block_boundaries.contains(join)
                     || ![*join, target, tail].iter().all(|label| {
                         self.exception_owner_provenance
