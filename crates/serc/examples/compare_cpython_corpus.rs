@@ -2,44 +2,18 @@
 
 use std::any::Any;
 use std::collections::BTreeMap;
-use std::env;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::Instant;
 
 use clap::Parser;
-use serc::{
-    CompileError, CompileOptions, CompiledModule, OptimizationLevel, PythonVersion,
-    compile_bytes_with_options, compile_with_options,
-};
-
-#[path = "support/caller_intern_model.rs"]
-mod caller_intern_model;
-#[path = "support/initial_intern_profile.rs"]
-mod initial_intern_profile;
-#[path = "support/native_output_cache.rs"]
-mod native_output_cache;
-#[path = "support/native_output_reader.rs"]
-mod native_output_reader;
 use rayon::prelude::*;
+use serc::{
+    CompileError, CompileOptions, OptimizationLevel, PythonVersion, compile_bytes_with_options,
+};
 use walkdir::WalkDir;
 
 const WORKER_STACK_SIZE: usize = 32 * 1024 * 1024;
-
-const ORACLE: &str = r#"
-import marshal
-import pathlib
-import sys
-
-path = pathlib.Path(sys.argv[1])
-source = path.read_bytes()
-try:
-    code = compile(source, str(path), "exec", dont_inherit=True, optimize=0)
-except Exception as error:
-    print(f"{type(error).__name__}: {error}", file=sys.stderr)
-    raise SystemExit(2)
-sys.stdout.buffer.write(marshal.dumps(code))
-"#;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum OutcomeKind {
@@ -50,12 +24,11 @@ enum OutcomeKind {
     CompilerFailure,
     MatchedRejection,
     RejectionMismatch,
-    NonUtf8,
     OracleFailure,
 }
 
 impl OutcomeKind {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 8] = [
         Self::Exact,
         Self::ByteMismatch,
         Self::Unsupported,
@@ -63,7 +36,6 @@ impl OutcomeKind {
         Self::CompilerFailure,
         Self::MatchedRejection,
         Self::RejectionMismatch,
-        Self::NonUtf8,
         Self::OracleFailure,
     ];
 
@@ -76,7 +48,6 @@ impl OutcomeKind {
             Self::CompilerFailure => "compiler failure",
             Self::MatchedRejection => "matched rejection",
             Self::RejectionMismatch => "rejection mismatch",
-            Self::NonUtf8 => "non-UTF-8",
             Self::OracleFailure => "oracle failure",
         }
     }
@@ -90,7 +61,6 @@ impl OutcomeKind {
             Self::CompilerFailure => "compiler-failure",
             Self::MatchedRejection => "matched-rejection",
             Self::RejectionMismatch => "rejection-mismatch",
-            Self::NonUtf8 => "non-utf8",
             Self::OracleFailure => "oracle-failure",
         }
     }
@@ -119,41 +89,9 @@ struct MismatchBytes {
     oracle: Vec<u8>,
 }
 
-enum CompilerInput {
-    Bytes(Vec<u8>),
-    Text(String),
-}
-
 enum OracleOutcome {
     Compiled(Vec<u8>),
     Rejected(String),
-}
-
-#[derive(Clone, Copy)]
-enum Oracle<'a> {
-    Python(&'a str),
-    Reference(&'a Path),
-}
-
-impl<'a> Oracle<'a> {
-    fn executable(self) -> &'a Path {
-        match self {
-            Self::Python(python) => Path::new(python),
-            Self::Reference(reference) => reference,
-        }
-    }
-
-    /// Configures a fresh oracle process. The minimal reference keeps startup fixed
-    /// when changing compilation optimization and runs no Python wrapper.
-    fn command(self, path: &Path, optimization: OptimizationLevel) -> Command {
-        let mut command = Command::new(self.executable());
-        match self {
-            Self::Python(_) => command.args(["-I", "-S", "-c", ORACLE]),
-            Self::Reference(_) => command.args(["--optimize", &optimization.to_string()]),
-        };
-        command.arg(path);
-        command
-    }
 }
 
 enum CompilerOutcome {
@@ -166,14 +104,12 @@ enum CompilerOutcome {
 #[derive(Debug, Parser)]
 #[command(about = "Compare a Python corpus against the pinned CPython target")]
 struct Options {
-    #[arg(long, default_value = "python3", value_name = "PATH")]
-    python: String,
     /// Use a fresh minimal CPython reference process for each source file.
-    #[arg(long, value_name = "PATH", conflicts_with_all = ["python", "initial_intern_state", "caller_intern_model", "diagnostic_startup_state"])]
-    reference: Option<PathBuf>,
+    #[arg(long, value_name = "PATH")]
+    reference: PathBuf,
     /// Compile at this optimization level in the minimal reference process and Serc.
-    #[arg(long, value_name = "0|1|2", requires = "reference")]
-    optimize: Option<OptimizationLevel>,
+    #[arg(long, default_value_t = OptimizationLevel::default(), value_name = "0|1|2")]
+    optimize: OptimizationLevel,
     #[arg(long, default_value_t = PythonVersion::default(), value_name = "3.12|3.13|3.14|3.15")]
     python_version: PythonVersion,
     #[arg(value_name = "ROOT", default_values_os_t = default_roots())]
@@ -191,80 +127,18 @@ struct Options {
     expected_exact: Option<usize>,
     #[arg(long)]
     expected_cpython_rejected: Option<usize>,
-    /// Require all accepted inputs to match; requires a minimal reference, caller provenance, or an explicit diagnostic assumption.
+    /// Require every CPython-accepted input to match exactly.
     #[arg(long)]
     require_all: bool,
-    /// Diagnostic only: allow --require-all to compare bytes using isolated startup state.
-    #[arg(long, conflicts_with_all = ["initial_intern_state", "caller_intern_model"])]
-    diagnostic_startup_state: bool,
     #[arg(long)]
     require_rejection_parity: bool,
     #[arg(long, default_value_t = 10)]
     examples: usize,
     #[arg(long, value_name = "DIR")]
     dump_mismatches: Option<PathBuf>,
-    #[arg(long)]
-    source_bytes: bool,
-    #[arg(long, value_name = "PROFILE.json")]
-    initial_intern_state: Option<PathBuf>,
-    /// Reproduce a validated caller protocol from an independent pre-path baseline.
-    #[arg(long, value_name = "MODEL.json")]
-    caller_intern_model: Option<PathBuf>,
-    /// Diagnostic only: preserve known caller entries and assume every other entry absent.
-    #[arg(long, requires = "caller_intern_model")]
-    caller_intern_assume_absent: bool,
 }
 
 impl Options {
-    fn validate_caller_state(&self) -> Result<(), &'static str> {
-        if self.require_all && self.reference.is_none() && !self.diagnostic_startup_state {
-            if self.initial_intern_state.is_none() {
-                return Err(
-                    "--require-all requires --initial-intern-state matching the oracle caller; use --diagnostic-startup-state only for a diagnostic byte comparison",
-                );
-            }
-            if self.python_version == PythonVersion::Py312 && self.caller_intern_model.is_none() {
-                return Err(
-                    "--require-all on Python 3.12 also requires --caller-intern-model: pathlib interns each filename's components, so one captured snapshot cannot describe every input",
-                );
-            }
-        }
-        Ok(())
-    }
-
-    fn caller_state_notice(&self) -> &'static str {
-        if self.reference.is_some() {
-            "Caller intern state: fresh minimal CPython startup; exact marshal bytes"
-        } else if self.caller_intern_assume_absent {
-            "Caller intern state: diagnostic assumption that unproved entries are absent"
-        } else if self.caller_intern_model.is_some() {
-            "Caller intern state: validated per-file model"
-        } else if self.initial_intern_state.is_none() {
-            "Caller intern state: diagnostic startup assumption; oracle imports and filenames can change marshal sharing, so a byte mismatch alone does not establish a compiler regression"
-        } else if self.python_version == PythonVersion::Py312 {
-            "Caller intern state: diagnostic fixed snapshot; Python 3.12 filename effects require a per-file model"
-        } else {
-            "Caller intern state: captured process snapshot; assumes its entries remain retained for each input, without proving unknown entries absent"
-        }
-    }
-
-    /// Keeps outputs from different caller protocols out of the same cache.
-    fn validate_reference_cache(&self, read: bool, write: bool) -> Result<(), &'static str> {
-        if self.reference.is_some() && (read || write) {
-            Err("--reference cannot use native caches captured by a different caller protocol")
-        } else {
-            Ok(())
-        }
-    }
-
-    fn validate_assume_absent(&self, cache_read: bool) -> Result<(), String> {
-        if self.caller_intern_assume_absent && !cache_read {
-            Err("--caller-intern-assume-absent requires admitted native cache reading".to_string())
-        } else {
-            Ok(())
-        }
-    }
-
     fn expected_outcome_counts(&self) -> Result<BTreeMap<OutcomeKind, usize>, String> {
         let mut outcomes = BTreeMap::new();
         for (kind, count) in self
@@ -286,10 +160,6 @@ impl Options {
 
 fn main() -> ExitCode {
     let options = Options::parse();
-    if let Err(message) = options.validate_caller_state() {
-        eprintln!("{message}");
-        return ExitCode::from(2);
-    }
     let expected_outcomes = match options.expected_outcome_counts() {
         Ok(outcomes) => outcomes,
         Err(message) => {
@@ -297,108 +167,13 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    if options.caller_intern_model.is_some()
-        && (!options.source_bytes
-            || options.initial_intern_state.is_none()
-            || env::var_os("SERC_NATIVE_CACHE_WRITE").is_some())
-    {
-        eprintln!(
-            "caller modeling requires byte sources and a native provenance profile, and cannot capture new native output"
-        );
-        return ExitCode::from(2);
-    }
-    let read_config = env::var_os("SERC_NATIVE_CACHE_READ");
-    if let Err(message) = options.validate_reference_cache(
-        read_config.is_some(),
-        env::var_os("SERC_NATIVE_CACHE_WRITE").is_some(),
-    ) {
+    if let Err(message) = verify_reference(&options.reference, options.python_version) {
         eprintln!("{message}");
         return ExitCode::from(2);
     }
-    if let Err(message) = options.validate_assume_absent(read_config.is_some()) {
-        eprintln!("{message}");
-        return ExitCode::from(2);
-    }
-    if read_config.is_some()
-        && (env::var_os("SERC_NATIVE_CACHE_WRITE").is_some()
-            || options.dump_mismatches.is_some()
-            || !options.source_bytes
-            || options.initial_intern_state.is_none())
-    {
-        eprintln!(
-            "native cache reading requires byte sources and an intern profile, and cannot combine writing or native mismatch dumping"
-        );
-        return ExitCode::from(2);
-    }
-    let identity = if let Some(reference) = &options.reference {
-        verify_reference(reference, options.python_version)
-    } else {
-        verify_python(&options.python, options.python_version)
-    };
-    if let Err(message) = identity {
-        eprintln!("{message}");
-        return ExitCode::from(2);
-    }
-    let profile = match options
-        .initial_intern_state
-        .as_deref()
-        .map(|path| {
-            initial_intern_profile::load(
-                path,
-                &options.python,
-                options.python_version,
-                options.source_bytes,
-                ORACLE,
-            )
-        })
-        .transpose()
-    {
-        Ok(profile) => profile,
-        Err(error) => {
-            eprintln!("invalid initial intern-state profile: {error}");
-            return ExitCode::from(2);
-        }
-    };
-    if let Some(profile) = &profile {
-        let role = if options.caller_intern_model.is_some() {
-            "Native provenance snapshot"
-        } else {
-            "Initial intern-state snapshot"
-        };
-        println!(
-            "{role}: {} ({} entries; captured process state)",
-            profile.snapshot_sha256, profile.entries
-        );
-    }
-    let caller_model = match options
-        .caller_intern_model
-        .as_deref()
-        .map(|path| {
-            caller_intern_model::load(
-                path,
-                options
-                    .initial_intern_state
-                    .as_deref()
-                    .expect("caller profile checked"),
-                options.python_version,
-                options.source_bytes,
-                ORACLE,
-                options.caller_intern_assume_absent,
-            )
-        })
-        .transpose()
-    {
-        Ok(model) => model,
-        Err(error) => {
-            eprintln!("invalid caller intern-state model: {error}");
-            return ExitCode::from(2);
-        }
-    };
-    println!("{}", options.caller_state_notice());
     let compile_options = CompileOptions {
         python_version: options.python_version,
-        optimization_level: options.optimize.unwrap_or_default(),
-        initial_intern_state: profile.map(|profile| profile.state).unwrap_or_default(),
+        optimization_level: options.optimize,
         ..CompileOptions::default()
     };
     let mut paths = match discover(&options.roots, &options.extensions) {
@@ -424,74 +199,6 @@ fn main() -> ExitCode {
     if let Some(limit) = options.limit {
         paths.truncate(limit);
     }
-    if caller_model.is_some() {
-        for path in &paths {
-            if let Err(error) = caller_intern_model::validate_filename(path) {
-                eprintln!(
-                    "unsupported caller-model filename {}: {error}",
-                    path.display()
-                );
-                return ExitCode::from(2);
-            }
-        }
-    }
-
-    let cache = match env::var_os("SERC_NATIVE_CACHE_WRITE") {
-        Some(config) => {
-            let Some(profile) = options
-                .initial_intern_state
-                .as_deref()
-                .filter(|_| options.source_bytes)
-            else {
-                eprintln!(
-                    "native output capture requires --source-bytes and --initial-intern-state"
-                );
-                return ExitCode::from(2);
-            };
-            match native_output_cache::Writer::new(
-                Path::new(&config),
-                profile,
-                &options.python,
-                ORACLE,
-                &paths,
-            ) {
-                Ok(writer) => Some(writer),
-                Err(error) => {
-                    eprintln!("failed to initialize native output capture: {error}");
-                    return ExitCode::FAILURE;
-                }
-            }
-        }
-        None => None,
-    };
-
-    let reader = match read_config {
-        Some(config) => match native_output_reader::Reader::new(
-            Path::new(&config),
-            options
-                .initial_intern_state
-                .as_deref()
-                .expect("reader profile checked"),
-            &options.python,
-            ORACLE,
-            options.python_version,
-            &paths,
-            caller_model.as_ref(),
-        ) {
-            Ok(reader) => {
-                println!(
-                    "Native oracle source: admitted cached bytes; every candidate is freshly compiled"
-                );
-                Some(reader)
-            }
-            Err(error) => {
-                eprintln!("failed to open admitted native cache: {error}");
-                return ExitCode::FAILURE;
-            }
-        },
-        None => None,
-    };
-
     let pool = match rayon::ThreadPoolBuilder::new()
         .stack_size(WORKER_STACK_SIZE)
         .build()
@@ -519,36 +226,17 @@ fn main() -> ExitCode {
     };
 
     let started = Instant::now();
-    let oracle = options
-        .reference
-        .as_deref()
-        .map_or(Oracle::Python(&options.python), Oracle::Reference);
     let outcomes: Result<Vec<_>, std::io::Error> = pool.install(|| {
         paths
             .par_iter()
             .enumerate()
             .map(|(index, path)| {
-                if let Some(reader) = &reader {
-                    return Ok(reader.compare(
-                        index,
-                        path,
-                        &compile_options,
-                        caller_model.as_ref(),
-                    ));
-                }
-                let mut observation = cache.as_ref().map(|writer| writer.begin(index, path));
                 let mut outcome = compare(
                     path,
-                    oracle,
-                    options.source_bytes || options.reference.is_some(),
+                    &options.reference,
                     &compile_options,
-                    caller_model.as_ref(),
-                    observation.as_mut(),
                     options.dump_mismatches.is_some(),
                 );
-                if let Some(observation) = observation {
-                    observation.finish(&outcome);
-                }
                 if let Some(stage) = &dump_stage {
                     stage_mismatch(&mut outcome, stage.path(), index)?;
                 }
@@ -576,7 +264,7 @@ fn main() -> ExitCode {
     println!(
         "Compared {} Python files with {} in {:.2?}",
         outcomes.len(),
-        oracle.executable().display(),
+        options.reference.display(),
         started.elapsed()
     );
     println!(
@@ -592,7 +280,6 @@ fn main() -> ExitCode {
         OutcomeKind::Unsupported,
         OutcomeKind::ParseMismatch,
         OutcomeKind::CompilerFailure,
-        OutcomeKind::NonUtf8,
         OutcomeKind::OracleFailure,
     ] {
         let count = counts.get(&kind).copied().unwrap_or_default();
@@ -664,18 +351,6 @@ fn main() -> ExitCode {
     for failure in &gate_failures {
         eprintln!("compatibility gate failed: {failure}");
     }
-    if let Some(reader) = reader {
-        if let Err(error) = reader.finish(gate_failures.is_empty()) {
-            eprintln!("admitted native cache comparison failed: {error}");
-            return ExitCode::FAILURE;
-        }
-    }
-    if let Some(cache) = cache {
-        if let Err(error) = cache.finish(gate_failures.is_empty()) {
-            eprintln!("native output capture failed: {error}");
-            return ExitCode::FAILURE;
-        }
-    }
     if gate_failures.is_empty() {
         ExitCode::SUCCESS
     } else {
@@ -739,7 +414,8 @@ fn validate_outcome_counts(
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct PythonIdentity {
+struct ReferenceIdentity {
+    protocol: String,
     implementation: String,
     version: String,
     release_level: String,
@@ -747,61 +423,19 @@ struct PythonIdentity {
     magic: String,
 }
 
-impl PythonIdentity {
+impl ReferenceIdentity {
     fn matches(&self, version: PythonVersion) -> bool {
         let target = version.target();
         let (release_level, release_serial) = match version {
             PythonVersion::Py312 | PythonVersion::Py313 | PythonVersion::Py314 => ("final", 0),
             PythonVersion::Py315 => ("candidate", 2),
         };
-        self.implementation == target.implementation
+        self.protocol == "minimal-v2"
+            && self.implementation == target.implementation
             && self.version == target.version_string()
             && self.release_level == release_level
             && self.release_serial == release_serial
             && self.magic == target.magic_hex()
-    }
-}
-
-fn verify_python(python: &str, python_version: PythonVersion) -> Result<(), String> {
-    let target = python_version.target();
-    let output = Command::new(python)
-        .args([
-            "-B",
-            "-I",
-            "-S",
-            "-c",
-            "import importlib.util, json, sys; print(json.dumps(dict(implementation=sys.implementation.name, version='.'.join(map(str, sys.version_info[:3])), release_level=sys.version_info.releaselevel, release_serial=sys.version_info.serial, magic=importlib.util.MAGIC_NUMBER.hex())))",
-        ])
-        .output()
-        .map_err(|error| format!("failed to run {python}: {error}"))?;
-    let identity: PythonIdentity = serde_json::from_slice(&output.stdout).map_err(|error| {
-        format!(
-            "failed to read {python} identity: {error}; {}",
-            one_line(&output.stderr)
-        )
-    })?;
-    if output.status.success() && identity.matches(python_version) {
-        Ok(())
-    } else {
-        Err(format!(
-            "{python} is {identity:?}; the compiler and oracle require {} {} with magic {}",
-            target.implementation,
-            target.tag,
-            target.magic_hex()
-        ))
-    }
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct ReferenceIdentity {
-    protocol: String,
-    #[serde(flatten)]
-    python: PythonIdentity,
-}
-
-impl ReferenceIdentity {
-    fn matches(&self, version: PythonVersion) -> bool {
-        self.protocol == "minimal-v1" && self.python.matches(version)
     }
 }
 
@@ -822,7 +456,7 @@ fn verify_reference(reference: &Path, python_version: PythonVersion) -> Result<(
         Ok(())
     } else {
         Err(format!(
-            "{} is {identity:?}; the reference requires minimal-v1 and {} with magic {}",
+            "{} is {identity:?}; the reference requires minimal-v2 and {} with magic {}",
             reference.display(),
             python_version.target().tag,
             python_version.target().magic_hex()
@@ -940,19 +574,17 @@ fn discover(roots: &[PathBuf], extensions: &[String]) -> Result<Vec<PathBuf>, St
     Ok(paths)
 }
 
+/// Compares source bytes against a fresh reference process without normalizing marshal output.
 fn compare(
     path: &Path,
-    oracle: Oracle<'_>,
-    source_bytes: bool,
+    reference: &Path,
     options: &CompileOptions,
-    caller_model: Option<&caller_intern_model::LoadedModel>,
-    mut observation: Option<&mut native_output_cache::Observation<'_>>,
     retain_mismatch_bytes: bool,
 ) -> Outcome {
-    let output = oracle.command(path, options.optimization_level).output();
-    if let Some(observation) = &mut observation {
-        observation.native(&output);
-    }
+    let output = Command::new(reference)
+        .args(["--optimize", &options.optimization_level.to_string()])
+        .arg(path)
+        .output();
     let oracle = match output {
         Ok(output) if output.status.success() => OracleOutcome::Compiled(output.stdout),
         Ok(output) if output.status.code() == Some(2) => {
@@ -982,81 +614,25 @@ fn compare(
         }
     };
     let oracle_rejected = matches!(&oracle, OracleOutcome::Rejected(_));
-
-    let source = if source_bytes {
-        fs_err::read(path).map(CompilerInput::Bytes)
-    } else {
-        read_utf8_file(path).map(CompilerInput::Text)
-    };
-    let source = match source {
+    let source = match fs_err::read(path) {
         Ok(source) => source,
         Err(error) => {
             return Outcome {
                 path: path.to_path_buf(),
-                kind: if error.kind() == std::io::ErrorKind::InvalidData {
-                    OutcomeKind::NonUtf8
-                } else {
-                    OutcomeKind::OracleFailure
-                },
+                kind: OutcomeKind::OracleFailure,
                 detail: error.to_string(),
                 oracle_rejected,
                 mismatch_bytes: None,
             };
         }
     };
-
-    let filename = path.to_string_lossy();
-    let compiled = compile_input(&source, &filename, options, caller_model);
-    if let Some(observation) = observation {
-        observation.compiled(&source, &compiled);
-    }
-
+    let compiled = compile_input(&source, &path.to_string_lossy(), options);
     classify_with_mismatch_bytes(path, oracle, compiled, retain_mismatch_bytes)
 }
 
-/// Consume an optional file encoding signature before passing decoded text to the compiler.
-fn read_utf8_file(path: &Path) -> std::io::Result<String> {
-    let mut source = fs_err::read_to_string(path)?;
-    if source.starts_with('\u{feff}') {
-        source.replace_range(..'\u{feff}'.len_utf8(), "");
-    }
-    Ok(source)
-}
-
-fn compile_module_input(
-    source: &CompilerInput,
-    filename: &str,
-    options: &CompileOptions,
-    caller_model: Option<&caller_intern_model::LoadedModel>,
-) -> Result<CompiledModule, CompileError> {
-    // Derive the per-input mask from the same in-memory bytes that the cache
-    // reader hashes and this invocation compiles. Never reread for the model.
-    let file_options = match (caller_model, source) {
-        (Some(model), CompilerInput::Bytes(bytes)) => {
-            Some(model.options_for(filename, bytes, options))
-        }
-        (Some(_), CompilerInput::Text(_)) => {
-            return Err(CompileError::Internal(
-                "caller model requires source-bytes input".to_string(),
-            ));
-        }
-        (None, _) => None,
-    };
-    let options = file_options.as_ref().unwrap_or(options);
-    match source {
-        CompilerInput::Bytes(source) => compile_bytes_with_options(source, filename, options),
-        CompilerInput::Text(source) => compile_with_options(source, filename, options),
-    }
-}
-
-fn compile_input(
-    source: &CompilerInput,
-    filename: &str,
-    options: &CompileOptions,
-    caller_model: Option<&caller_intern_model::LoadedModel>,
-) -> CompilerOutcome {
+fn compile_input(source: &[u8], filename: &str, options: &CompileOptions) -> CompilerOutcome {
     capture_compiler(|| {
-        compile_module_input(source, filename, options, caller_model).map(|module| module.marshal())
+        compile_bytes_with_options(source, filename, options).map(|module| module.marshal())
     })
 }
 
@@ -1083,6 +659,7 @@ fn capture_compiler(compile: impl FnOnce() -> Result<Vec<u8>, CompileError>) -> 
     }
 }
 
+#[cfg(test)]
 fn classify(path: &Path, oracle: OracleOutcome, compiled: CompilerOutcome) -> Outcome {
     classify_with_mismatch_bytes(path, oracle, compiled, false)
 }
@@ -1175,77 +752,49 @@ fn one_line(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CompileOptions, CompilerInput, CompilerOutcome, ORACLE, Options, OracleOutcome,
-        OutcomeKind, PythonIdentity, PythonVersion, capture_compiler, classify, compile_input,
-        compile_module_input, discover, validate_outcome_counts, verify_python,
+        CompileOptions, CompilerOutcome, Options, OracleOutcome, OutcomeKind, PythonVersion,
+        ReferenceIdentity, capture_compiler, classify, compile_input, discover,
+        validate_outcome_counts,
     };
     use clap::{Parser, error::ErrorKind};
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::Path;
-    use std::process::Command;
+
+    fn parse_options(args: &[&str]) -> Result<Options, clap::Error> {
+        Options::try_parse_from(
+            ["compare_cpython_corpus", "--reference", "reference"]
+                .into_iter()
+                .chain(args.iter().copied()),
+        )
+    }
 
     #[test]
     fn default_corpus_and_explicit_roots() {
-        let options = Options::try_parse_from(["compare_cpython_corpus"]).unwrap();
+        let options = parse_options(&[]).unwrap();
         assert_eq!(options.roots, super::default_roots());
-        assert_eq!(options.python, "python3");
         assert_eq!(options.python_version, PythonVersion::Py314);
+        assert_eq!(options.optimize, serc::OptimizationLevel::Zero);
         assert_eq!(options.examples, 10);
-        let options = Options::try_parse_from(["compare_cpython_corpus", "corpus"]).unwrap();
+        let options = parse_options(&["corpus"]).unwrap();
         assert_eq!(options.roots, [Path::new("corpus")]);
     }
 
     #[test]
-    fn minimal_reference_requires_its_own_protocol() {
-        let options = Options::try_parse_from([
-            "compare_cpython_corpus",
-            "--reference",
-            "cpython-reference",
-            "--optimize",
-            "2",
-            "--require-all",
-        ])
-        .unwrap();
-        assert!(options.validate_caller_state().is_ok());
-        assert_eq!(options.optimize, Some(serc::OptimizationLevel::Two));
-        assert!(options.validate_reference_cache(false, false).is_ok());
-        for (read, write) in [(true, false), (false, true), (true, true)] {
-            assert!(options.validate_reference_cache(read, write).is_err());
-        }
-        for conflicting in [
-            &["--python", "python3"][..],
-            &["--initial-intern-state", "profile.json"],
-            &["--caller-intern-model", "model.json"],
-            &["--diagnostic-startup-state"],
-        ] {
-            let error = Options::try_parse_from(
-                ["compare_cpython_corpus", "--reference", "cpython-reference"]
-                    .into_iter()
-                    .chain(conflicting.iter().copied()),
-            )
-            .unwrap_err();
-            assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
-        }
-        let error =
-            Options::try_parse_from(["compare_cpython_corpus", "--optimize", "1"]).unwrap_err();
+    fn minimal_reference_is_required_and_optimization_is_validated() {
+        let error = Options::try_parse_from(["compare_cpython_corpus"]).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
-        assert!(
-            Options::try_parse_from([
-                "compare_cpython_corpus",
-                "--reference",
-                "cpython-reference",
-                "--optimize",
-                "3",
-            ])
-            .is_err()
-        );
+        let options = parse_options(&["--optimize", "2", "--require-all"]).unwrap();
+        assert_eq!(options.reference, Path::new("reference"));
+        assert_eq!(options.optimize, serc::OptimizationLevel::Two);
+        assert!(options.require_all);
+        assert!(parse_options(&["--optimize", "3"]).is_err());
     }
 
     #[test]
     fn minimal_reference_identity_checks_protocol_and_runtime() {
         let mut value = serde_json::json!({
-            "protocol": "minimal-v1",
+            "protocol": "minimal-v2",
             "implementation": "cpython",
             "version": "3.14.5",
             "release_level": "final",
@@ -1255,7 +804,7 @@ mod tests {
         let identity: super::ReferenceIdentity = serde_json::from_value(value.clone()).unwrap();
         assert!(identity.matches(PythonVersion::Py314));
         assert!(!identity.matches(PythonVersion::Py313));
-        value["protocol"] = "another-caller".into();
+        value["protocol"] = "minimal-v1".into();
         let identity: super::ReferenceIdentity = serde_json::from_value(value.clone()).unwrap();
         assert!(!identity.matches(PythonVersion::Py314));
         value.as_object_mut().unwrap().remove("protocol");
@@ -1264,15 +813,29 @@ mod tests {
 
     #[test]
     fn minimal_reference_compares_exact_bytes_at_each_optimization_level() {
+        for (version, variable) in [
+            (PythonVersion::Py312, "SERC_TEST_CPYTHON_REFERENCE_312"),
+            (PythonVersion::Py313, "SERC_TEST_CPYTHON_REFERENCE_313"),
+            (PythonVersion::Py314, "SERC_TEST_CPYTHON_REFERENCE"),
+            (PythonVersion::Py315, "SERC_TEST_CPYTHON_REFERENCE_315"),
+        ] {
+            let Some(reference) = std::env::var_os(variable) else {
+                eprintln!("skipping {version} minimal reference test: {variable} is unset");
+                continue;
+            };
+            assert_reference_matches(Path::new(&reference), version);
+        }
+    }
+
+    /// Checks byte identity and source rejection under each reference's fixed startup.
+    fn assert_reference_matches(reference: &Path, python_version: PythonVersion) {
         use serc::OptimizationLevel;
 
-        let Some(reference) = std::env::var_os("SERC_TEST_CPYTHON_REFERENCE") else {
-            eprintln!("skipping minimal reference test: SERC_TEST_CPYTHON_REFERENCE is unset");
-            return;
+        super::verify_reference(reference, python_version).unwrap();
+        let options = CompileOptions {
+            python_version,
+            ..CompileOptions::default()
         };
-        let reference = Path::new(&reference);
-        super::verify_reference(reference, PythonVersion::Py314).unwrap();
-        let oracle = super::Oracle::Reference(reference);
         let directory = tempfile::tempdir().unwrap();
         let sharing = concat!(
             "values = {'high', 'low', 'medium'}\n",
@@ -1285,6 +848,7 @@ mod tests {
             "def f():\n    'function docstring'\n    assert False\n    return __debug__\n",
         );
         for (name, source) in [
+            ("module_only.py", b"pass\n".as_slice()),
             ("sharing.py", sharing.as_bytes()),
             ("optimized.py", optimized.as_bytes()),
             ("latin1.py", b"# coding: latin-1\nvalue = 'caf\xe9'\n"),
@@ -1297,18 +861,22 @@ mod tests {
                 OptimizationLevel::Two,
             ] {
                 let options = CompileOptions {
+                    python_version,
                     optimization_level,
                     ..CompileOptions::default()
                 };
-                let outcome = super::compare(&path, oracle, true, &options, None, None, true);
+                let outcome = super::compare(&path, reference, &options, true);
                 assert_eq!(
                     outcome.kind,
                     OutcomeKind::Exact,
-                    "{name} -O{optimization_level}: {}",
+                    "{python_version} {name} -O{optimization_level}: {}",
                     outcome.detail
                 );
 
-                let mut command = oracle.command(&path, optimization_level);
+                let mut command = std::process::Command::new(reference);
+                command
+                    .args(["--optimize", &optimization_level.to_string()])
+                    .arg(&path);
                 let output = command
                     .current_dir(directory.path())
                     .env("PYTHONHOME", "/unused-python-home")
@@ -1319,17 +887,12 @@ mod tests {
                     .output()
                     .unwrap();
                 assert!(output.status.success(), "{output:?}");
-                let compiled = compile_input(
-                    &CompilerInput::Bytes(source.to_vec()),
-                    path.to_str().unwrap(),
-                    &options,
-                    None,
-                );
+                let compiled = compile_input(source, path.to_str().unwrap(), &options);
                 let outcome = classify(&path, OracleOutcome::Compiled(output.stdout), compiled);
                 assert_eq!(
                     outcome.kind,
                     OutcomeKind::Exact,
-                    "noisy {name} -O{optimization_level}: {}",
+                    "noisy {python_version} {name} -O{optimization_level}: {}",
                     outcome.detail
                 );
             }
@@ -1337,33 +900,30 @@ mod tests {
         for (name, source) in [
             ("syntax.py", b"if:\n".as_slice()),
             ("nul.py", b"value = 1\0\n"),
+            ("semantic.py", b"return\n"),
+            ("surrogate_docstring.py", b"def f():\n    '\\ud800'\n"),
             ("encoding.py", b"# coding: invalid-encoding\npass\n"),
         ] {
             let path = directory.path().join(name);
             fs::write(&path, source).unwrap();
-            let outcome = super::compare(
-                &path,
-                oracle,
-                true,
-                &CompileOptions::default(),
-                None,
-                None,
-                false,
-            );
+            let outcome = super::compare(&path, reference, &options, false);
+            // Python 3.12 accepts surrogate docstrings; later versions reject them.
+            let expected =
+                if python_version == PythonVersion::Py312 && name == "surrogate_docstring.py" {
+                    OutcomeKind::Exact
+                } else {
+                    OutcomeKind::MatchedRejection
+                };
             assert_eq!(
-                outcome.kind,
-                OutcomeKind::MatchedRejection,
-                "{name}: {}",
+                outcome.kind, expected,
+                "{python_version} {name}: {}",
                 outcome.detail
             );
         }
         let outcome = super::compare(
             &directory.path().join("missing.py"),
-            oracle,
-            true,
-            &CompileOptions::default(),
-            None,
-            None,
+            reference,
+            &options,
             false,
         );
         assert_eq!(
@@ -1391,109 +951,6 @@ mod tests {
     }
 
     #[test]
-    fn assume_absent_is_opt_in_and_requires_a_model_and_cached_native_outputs() {
-        let defaults = Options::try_parse_from(["compare_cpython_corpus"]).unwrap();
-        assert!(!defaults.caller_intern_assume_absent);
-        assert!(defaults.validate_assume_absent(false).is_ok());
-        let error =
-            Options::try_parse_from(["compare_cpython_corpus", "--caller-intern-assume-absent"])
-                .unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
-        let diagnostic = Options::try_parse_from([
-            "compare_cpython_corpus",
-            "--caller-intern-model",
-            "model.json",
-            "--caller-intern-assume-absent",
-        ])
-        .unwrap();
-        assert!(diagnostic.validate_assume_absent(false).is_err());
-        assert!(diagnostic.validate_assume_absent(true).is_ok());
-        assert!(
-            diagnostic
-                .caller_state_notice()
-                .contains("diagnostic assumption")
-        );
-    }
-
-    #[test]
-    fn require_all_needs_caller_provenance_and_312_filename_effects() {
-        for version in ["3.12", "3.13", "3.14", "3.15"] {
-            let diagnostic = Options::try_parse_from([
-                "compare_cpython_corpus",
-                "--python-version",
-                version,
-                "--expected-exact",
-                "1",
-            ])
-            .unwrap();
-            assert!(diagnostic.validate_caller_state().is_ok());
-            assert!(
-                diagnostic
-                    .caller_state_notice()
-                    .contains("diagnostic startup assumption")
-            );
-
-            let mut strict = Options::try_parse_from([
-                "compare_cpython_corpus",
-                "--python-version",
-                version,
-                "--require-all",
-            ])
-            .unwrap();
-            assert!(
-                strict
-                    .validate_caller_state()
-                    .unwrap_err()
-                    .contains("--initial-intern-state")
-            );
-            strict.diagnostic_startup_state = true;
-            assert!(strict.validate_caller_state().is_ok());
-            assert!(
-                strict
-                    .caller_state_notice()
-                    .contains("diagnostic startup assumption")
-            );
-            strict.diagnostic_startup_state = false;
-            strict.initial_intern_state = Some("profile.json".into());
-            if version == "3.12" {
-                assert!(
-                    strict
-                        .validate_caller_state()
-                        .unwrap_err()
-                        .contains("--caller-intern-model")
-                );
-                assert!(
-                    strict
-                        .caller_state_notice()
-                        .contains("diagnostic fixed snapshot")
-                );
-                strict.caller_intern_model = Some("model.json".into());
-            } else {
-                assert!(
-                    strict
-                        .caller_state_notice()
-                        .contains("without proving unknown entries absent")
-                );
-            }
-            assert!(strict.validate_caller_state().is_ok());
-        }
-    }
-
-    #[test]
-    fn diagnostic_startup_assumption_cannot_replace_supplied_provenance() {
-        for profile in ["--initial-intern-state", "--caller-intern-model"] {
-            let error = Options::try_parse_from([
-                "compare_cpython_corpus",
-                "--diagnostic-startup-state",
-                profile,
-                "profile.json",
-            ])
-            .unwrap_err();
-            assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
-        }
-    }
-
-    #[test]
     fn selected_python_version_is_parsed_and_validated() {
         for version in [
             PythonVersion::Py312,
@@ -1501,25 +958,17 @@ mod tests {
             PythonVersion::Py314,
             PythonVersion::Py315,
         ] {
-            let options = Options::try_parse_from([
-                "compare_cpython_corpus",
-                "--python-version",
-                &version.to_string(),
-            ])
-            .unwrap();
+            let options = parse_options(&["--python-version", &version.to_string()]).unwrap();
             assert_eq!(options.python_version, version);
         }
-        let error = Options::try_parse_from(["compare_cpython_corpus", "--python-version", "3.11"])
-            .unwrap_err();
+        let error = parse_options(&["--python-version", "3.11"]).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::ValueValidation);
     }
 
     #[test]
     fn rejects_non_bare_extensions() {
         for extension in ["", ".pyi", "nested/pyi"] {
-            let error =
-                Options::try_parse_from(["compare_cpython_corpus", "--extension", extension])
-                    .unwrap_err();
+            let error = parse_options(&["--extension", extension]).unwrap_err();
             assert_eq!(error.kind(), ErrorKind::ValueValidation);
         }
     }
@@ -1536,9 +985,7 @@ mod tests {
             ["--expected-outcome", "exact=2", "--expected-exact", "2"],
             ["--expected-exact", "2", "--expected-outcome", "exact=2"],
         ] {
-            let options =
-                Options::try_parse_from(std::iter::once("compare_cpython_corpus").chain(args))
-                    .unwrap();
+            let options = parse_options(&args).unwrap();
             assert!(
                 options
                     .expected_outcome_counts()
@@ -1549,14 +996,8 @@ mod tests {
     }
 
     #[test]
-    fn explicit_profile_and_frozen_counts_are_preserved() {
-        let options = Options::try_parse_from([
-            "compare_cpython_corpus",
-            "--python",
-            "/cpython-3.14.5",
-            "--source-bytes",
-            "--initial-intern-state",
-            "profile.json",
+    fn frozen_counts_are_preserved() {
+        let options = parse_options(&[
             "--expected-files",
             "3",
             "--expected-exact",
@@ -1574,12 +1015,7 @@ mod tests {
             "corpus",
         ])
         .unwrap();
-        assert_eq!(options.python, "/cpython-3.14.5");
-        assert!(options.source_bytes && options.require_all && options.require_rejection_parity);
-        assert_eq!(
-            options.initial_intern_state.as_deref(),
-            Some(Path::new("profile.json"))
-        );
+        assert!(options.require_all && options.require_rejection_parity);
         assert_eq!(options.expected_files, Some(3));
         assert_eq!(options.expected_cpython_rejected, Some(1));
         assert_eq!(options.examples, 0);
@@ -1606,7 +1042,8 @@ mod tests {
                 PythonVersion::Py312 | PythonVersion::Py313 | PythonVersion::Py314 => ("final", 0),
                 PythonVersion::Py315 => ("candidate", 2),
             };
-            let mut identity = PythonIdentity {
+            let mut identity = ReferenceIdentity {
+                protocol: "minimal-v2".to_string(),
                 implementation: target.implementation.to_string(),
                 version: target.version_string(),
                 release_level: release_level.to_string(),
@@ -1634,17 +1071,7 @@ mod tests {
     }
 
     #[test]
-    fn frozen_native_oracle_script_remains_unchanged() {
-        use sha2::{Digest, Sha256};
-
-        assert_eq!(
-            format!("{:x}", Sha256::digest(ORACLE.as_bytes())),
-            "6812e016e7e871700001ad9f8f832c5998d553bc33c84afb1745dbd664a965fb"
-        );
-    }
-
-    #[test]
-    fn selected_target_reaches_both_input_modes() {
+    fn selected_target_reaches_byte_input() {
         for python_version in [
             PythonVersion::Py312,
             PythonVersion::Py313,
@@ -1655,61 +1082,44 @@ mod tests {
                 python_version,
                 ..CompileOptions::default()
             };
-            for input in [
-                CompilerInput::Text("value = 1\n".to_string()),
-                CompilerInput::Bytes(b"value = 1\n".to_vec()),
-            ] {
-                let module = compile_module_input(&input, "target.py", &options, None).unwrap();
-                assert_eq!(module.python_version(), python_version);
-                assert_eq!(module.target(), python_version.target());
-            }
+            let module =
+                serc::compile_bytes_with_options(b"value = 1\n", "target.py", &options).unwrap();
+            assert_eq!(module.python_version(), python_version);
+            assert_eq!(module.target(), python_version.target());
         }
     }
 
     #[test]
-    fn text_file_input_consumes_exactly_one_byte_order_mark() {
+    fn byte_input_consumes_exactly_one_byte_order_mark() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("bom.py");
         let filename = path.to_str().unwrap();
-        let options = CompileOptions::default();
         for (source, expected) in [
             ("value = '\u{feff}'\n", Some("value = '\u{feff}'\n")),
             ("\u{feff}value = 1\n", Some("value = 1\n")),
             ("\u{feff}\u{feff}value = 1\n", None),
         ] {
             fs::write(&path, source).unwrap();
-            let decoded = super::read_utf8_file(&path).unwrap();
-            let text =
-                compile_module_input(&CompilerInput::Text(decoded), filename, &options, None);
-            let bytes = compile_module_input(
-                &CompilerInput::Bytes(fs::read(&path).unwrap()),
+            let compiled = compile_input(
+                &fs::read(&path).unwrap(),
                 filename,
-                &options,
-                None,
+                &CompileOptions::default(),
             );
             if let Some(expected) = expected {
                 let expected = serc::compile(expected, filename).unwrap().marshal();
-                assert_eq!(text.unwrap().marshal(), expected);
-                assert_eq!(bytes.unwrap().marshal(), expected);
+                let CompilerOutcome::Compiled(bytes) = compiled else {
+                    panic!("a single BOM must be accepted");
+                };
+                assert_eq!(bytes, expected);
             } else {
-                assert!(text.is_err());
-                assert!(bytes.is_err());
+                assert!(matches!(compiled, CompilerOutcome::Rejected(_)));
             }
         }
-        assert!(
-            compile_module_input(
-                &CompilerInput::Text("\u{feff}value = 1\n".to_string()),
-                filename,
-                &options,
-                None,
-            )
-            .is_err()
-        );
     }
 
     #[cfg(unix)]
     #[test]
-    fn mismatch_dumps_preserve_the_original_comparison_for_both_input_modes() {
+    fn mismatch_dumps_preserve_the_original_comparison() {
         use std::os::unix::fs::PermissionsExt;
 
         let directory = tempfile::tempdir().unwrap();
@@ -1725,108 +1135,80 @@ mod tests {
             serc::compile_with_intern_state(source, second_path.to_str().unwrap(), &state)
                 .unwrap()
                 .marshal();
-        for source_bytes in [false, true] {
-            fs::write(&path, source).unwrap();
-            fs::write(&second_path, source).unwrap();
-            fs::write(&oracle, "#!/bin/sh\nprintf 'oracle bytes'\n").unwrap();
-            fs::set_permissions(&oracle, fs::Permissions::from_mode(0o700)).unwrap();
-            let options = CompileOptions {
-                initial_intern_state: state.clone(),
-                ..CompileOptions::default()
-            };
-            let without_dump = super::compare(
-                &path,
-                super::Oracle::Python(oracle.to_str().unwrap()),
-                source_bytes,
-                &options,
-                None,
-                None,
-                false,
-            );
-            assert_eq!(
-                without_dump.kind,
-                OutcomeKind::ByteMismatch,
-                "source_bytes={source_bytes}; first compare: {}",
-                without_dump.detail
-            );
-            assert!(without_dump.mismatch_bytes.is_none());
-            let mut outcome = super::compare(
-                &path,
-                super::Oracle::Python(oracle.to_str().unwrap()),
-                source_bytes,
-                &options,
-                None,
-                None,
-                true,
-            );
-            assert_eq!(
-                outcome.kind,
-                OutcomeKind::ByteMismatch,
-                "source_bytes={source_bytes}; retained compare: {}",
-                outcome.detail
-            );
-            fs::write(&oracle, "#!/bin/sh\nprintf 'other oracle bytes'\n").unwrap();
-            let mut second_outcome = super::compare(
-                &second_path,
-                super::Oracle::Python(oracle.to_str().unwrap()),
-                source_bytes,
-                &options,
-                None,
-                None,
-                true,
-            );
-            assert_eq!(
-                second_outcome.kind,
-                OutcomeKind::ByteMismatch,
-                "source_bytes={source_bytes}; second compare: {}",
-                second_outcome.detail
-            );
+        fs::write(&path, source).unwrap();
+        fs::write(&second_path, source).unwrap();
+        fs::write(&oracle, "#!/bin/sh\nprintf 'oracle bytes'\n").unwrap();
+        fs::set_permissions(&oracle, fs::Permissions::from_mode(0o700)).unwrap();
+        let options = CompileOptions {
+            initial_intern_state: state.clone(),
+            ..CompileOptions::default()
+        };
+        let without_dump = super::compare(&path, &oracle, &options, false);
+        assert_eq!(
+            without_dump.kind,
+            OutcomeKind::ByteMismatch,
+            "first compare: {}",
+            without_dump.detail
+        );
+        assert!(without_dump.mismatch_bytes.is_none());
+        let mut outcome = super::compare(&path, &oracle, &options, true);
+        assert_eq!(
+            outcome.kind,
+            OutcomeKind::ByteMismatch,
+            "retained compare: {}",
+            outcome.detail
+        );
+        fs::write(&oracle, "#!/bin/sh\nprintf 'other oracle bytes'\n").unwrap();
+        let mut second_outcome = super::compare(&second_path, &oracle, &options, true);
+        assert_eq!(
+            second_outcome.kind,
+            OutcomeKind::ByteMismatch,
+            "second compare: {}",
+            second_outcome.detail
+        );
 
-            let dump = directory
-                .path()
-                .join(if source_bytes { "bytes" } else { "text" });
-            fs::create_dir_all(&dump).unwrap();
-            let stage = tempfile::tempdir_in(&dump).unwrap();
-            super::stage_mismatch(&mut outcome, stage.path(), 0).unwrap();
-            super::stage_mismatch(&mut second_outcome, stage.path(), 2).unwrap();
-            assert!(outcome.mismatch_bytes.is_none());
-            assert!(second_outcome.mismatch_bytes.is_none());
+        let dump = directory.path().join("dump");
+        fs::create_dir_all(&dump).unwrap();
+        let stage = tempfile::tempdir_in(&dump).unwrap();
+        super::stage_mismatch(&mut outcome, stage.path(), 0).unwrap();
+        super::stage_mismatch(&mut second_outcome, stage.path(), 2).unwrap();
+        assert!(outcome.mismatch_bytes.is_none());
+        assert!(second_outcome.mismatch_bytes.is_none());
 
-            // Neither the source nor a subsequent oracle invocation may replace
-            // the bytes that produced the reported mismatch.
-            fs::write(&path, "changed = True\n").unwrap();
-            fs::write(&second_path, "changed = True\n").unwrap();
-            fs::write(&oracle, "#!/bin/sh\nexit 1\n").unwrap();
-            let exact = super::Outcome {
-                path: path.clone(),
-                kind: OutcomeKind::Exact,
-                detail: String::new(),
-                oracle_rejected: false,
-                mismatch_bytes: None,
-            };
-            super::dump_mismatches(&[outcome, exact, second_outcome], stage.path(), &dump).unwrap();
-            assert_eq!(fs::read(dump.join("0000.ours.marshal")).unwrap(), expected);
-            assert_eq!(
-                fs::read(dump.join("0000.cpython.marshal")).unwrap(),
-                b"oracle bytes"
-            );
-            assert_eq!(
-                fs::read(dump.join("0001.ours.marshal")).unwrap(),
-                second_expected
-            );
-            assert_eq!(
-                fs::read(dump.join("0001.cpython.marshal")).unwrap(),
-                b"other oracle bytes"
-            );
-            assert_eq!(
-                fs::read_to_string(dump.join("0000.path")).unwrap(),
-                path.to_string_lossy()
-            );
-            assert_eq!(
-                fs::read_to_string(dump.join("0001.path")).unwrap(),
-                second_path.to_string_lossy()
-            );
-        }
+        // Neither the source nor a subsequent oracle invocation may replace
+        // the bytes that produced the reported mismatch.
+        fs::write(&path, "changed = True\n").unwrap();
+        fs::write(&second_path, "changed = True\n").unwrap();
+        fs::write(&oracle, "#!/bin/sh\nexit 1\n").unwrap();
+        let exact = super::Outcome {
+            path: path.clone(),
+            kind: OutcomeKind::Exact,
+            detail: String::new(),
+            oracle_rejected: false,
+            mismatch_bytes: None,
+        };
+        super::dump_mismatches(&[outcome, exact, second_outcome], stage.path(), &dump).unwrap();
+        assert_eq!(fs::read(dump.join("0000.ours.marshal")).unwrap(), expected);
+        assert_eq!(
+            fs::read(dump.join("0000.cpython.marshal")).unwrap(),
+            b"oracle bytes"
+        );
+        assert_eq!(
+            fs::read(dump.join("0001.ours.marshal")).unwrap(),
+            second_expected
+        );
+        assert_eq!(
+            fs::read(dump.join("0001.cpython.marshal")).unwrap(),
+            b"other oracle bytes"
+        );
+        assert_eq!(
+            fs::read_to_string(dump.join("0000.path")).unwrap(),
+            path.to_string_lossy()
+        );
+        assert_eq!(
+            fs::read_to_string(dump.join("0001.path")).unwrap(),
+            second_path.to_string_lossy()
+        );
     }
 
     #[test]
@@ -1845,113 +1227,6 @@ mod tests {
     }
 
     #[test]
-    fn explicit_state_reaches_both_input_modes_and_default_stays_unchanged() {
-        let source = "f = lambda x: x in {'profile_specific_identifier', 'z'}\nx in {'profile_specific_identifier', 'z'}\n";
-        let state = serc::InitialInternState::new(["profile_specific_identifier"]);
-        for input in [
-            CompilerInput::Text(source.to_string()),
-            CompilerInput::Bytes(source.as_bytes().to_vec()),
-        ] {
-            let default =
-                compile_module_input(&input, "profile.py", &CompileOptions::default(), None)
-                    .unwrap()
-                    .marshal();
-            let supplied = compile_module_input(
-                &input,
-                "profile.py",
-                &CompileOptions {
-                    initial_intern_state: state.clone(),
-                    ..CompileOptions::default()
-                },
-                None,
-            )
-            .unwrap()
-            .marshal();
-            assert_eq!(
-                default,
-                serc::compile(source, "profile.py").unwrap().marshal()
-            );
-            assert_eq!(
-                supplied,
-                serc::compile_with_intern_state(source, "profile.py", &state)
-                    .unwrap()
-                    .marshal()
-            );
-            assert_ne!(default, supplied);
-        }
-    }
-
-    #[test]
-    fn oracle_caller_imports_and_filenames_affect_shared_constants() {
-        let source = "def first(value):\n    return value in {'full', 'novel_marker'}, 1\n\ndef second(value):\n    'second docstring'\n    return value in {'full', 'novel_marker'}, 2\n";
-        let directory = tempfile::tempdir().unwrap();
-        for (version, variable, fallback) in [
-            (PythonVersion::Py312, "SERC_TEST_PYTHON_312", "python3.12"),
-            (PythonVersion::Py313, "SERC_TEST_PYTHON_313", "python3.13"),
-            (PythonVersion::Py314, "SERC_TEST_PYTHON", "python3.14"),
-            (PythonVersion::Py315, "SERC_TEST_PYTHON_315", "python3.15"),
-        ] {
-            let python = std::env::var(variable).unwrap_or_else(|_| fallback.to_string());
-            verify_python(&python, version).unwrap();
-            for parent in ["neutral", "novel_marker"] {
-                if parent == "novel_marker" && version != PythonVersion::Py312 {
-                    continue;
-                }
-                let source = if parent == "novel_marker" {
-                    source.replace("'full'", "'path_sibling'")
-                } else {
-                    source.to_string()
-                };
-                let path = directory.path().join(parent).join("input.py");
-                fs::create_dir_all(path.parent().unwrap()).unwrap();
-                fs::write(&path, &source).unwrap();
-                let output = Command::new(&python)
-                    .args(["-I", "-S", "-c", ORACLE])
-                    .arg(&path)
-                    .output()
-                    .unwrap();
-                assert!(output.status.success(), "{output:?}");
-                let mut options = CompileOptions {
-                    python_version: version,
-                    initial_intern_state: if version == PythonVersion::Py315 {
-                        serc::InitialInternState::default()
-                    } else {
-                        serc::InitialInternState::new(["full"])
-                    },
-                    ..CompileOptions::default()
-                };
-                let input = CompilerInput::Bytes(source.as_bytes().to_vec());
-                let fixed_snapshot =
-                    compile_module_input(&input, path.to_str().unwrap(), &options, None)
-                        .unwrap()
-                        .marshal();
-                if version == PythonVersion::Py312 && parent == "novel_marker" {
-                    assert_ne!(fixed_snapshot, output.stdout);
-                    options.initial_intern_state = options
-                        .initial_intern_state
-                        .with_additional_strings(["novel_marker"]);
-                } else {
-                    assert_eq!(fixed_snapshot, output.stdout, "{version}: {parent}");
-                }
-                let matched = compile_module_input(&input, path.to_str().unwrap(), &options, None)
-                    .unwrap()
-                    .marshal();
-                assert_eq!(matched, output.stdout, "{version}: {parent}");
-                if parent == "neutral"
-                    && matches!(version, PythonVersion::Py312 | PythonVersion::Py314)
-                {
-                    options.initial_intern_state = serc::InitialInternState::default();
-                    let startup =
-                        compile_module_input(&input, path.to_str().unwrap(), &options, None)
-                            .unwrap()
-                            .marshal();
-                    assert_ne!(startup, output.stdout, "{version}: {parent}");
-                }
-            }
-        }
-    }
-
-    #[test]
     fn require_all_rejects_a_corpus_without_exact_matches() {
         let counts = BTreeMap::from([(OutcomeKind::MatchedRejection, 3)]);
 
@@ -1966,67 +1241,22 @@ mod tests {
     }
 
     #[test]
-    fn oracle_distinguishes_compilation_rejections_and_io_failures() {
-        let python = std::env::var("SERC_TEST_PYTHON").unwrap_or_else(|_| "python3.14".to_string());
-        verify_python(&python, PythonVersion::Py314).unwrap();
-        let directory = tempfile::tempdir().unwrap();
+    fn cpython_rejection_requires_serc_rejection() {
+        let compiled = compile_input(b"if:\n", "invalid.py", &CompileOptions::default());
+        let outcome = classify(
+            Path::new("invalid.py"),
+            OracleOutcome::Rejected("SyntaxError: invalid syntax".to_string()),
+            compiled,
+        );
 
-        for (filename, source, expected_status) in [
-            ("valid.py", Some("pass\n"), 0),
-            ("syntax.py", Some("if:\n"), 2),
-            ("semantic.py", Some("return\n"), 2),
-            ("missing.py", None, 1),
-        ] {
-            let path = directory.path().join(filename);
-            if let Some(source) = source {
-                fs::write(&path, source).unwrap();
-            }
-            let output = Command::new(&python)
-                .args(["-I", "-S", "-c", ORACLE])
-                .arg(&path)
-                .output()
-                .unwrap();
-            assert_eq!(output.status.code(), Some(expected_status), "{output:?}");
-            if expected_status == 0 {
-                let expected = serc::compile(source.unwrap(), path.to_str().unwrap())
-                    .unwrap()
-                    .marshal();
-                assert_eq!(output.stdout, expected);
-                assert!(output.stderr.is_empty(), "{output:?}");
-            } else {
-                assert!(output.stdout.is_empty(), "{output:?}");
-                assert!(!output.stderr.is_empty(), "{output:?}");
-            }
-        }
-    }
-
-    #[test]
-    fn cpython_rejection_requires_serc_rejection_for_text_and_bytes() {
-        for source in [
-            CompilerInput::Text("if:\n".to_string()),
-            CompilerInput::Bytes(b"if:\n".to_vec()),
-        ] {
-            let compiled = compile_input(&source, "invalid.py", &CompileOptions::default(), None);
-            let outcome = classify(
-                Path::new("invalid.py"),
-                OracleOutcome::Rejected("SyntaxError: invalid syntax".to_string()),
-                compiled,
-            );
-
-            assert_eq!(outcome.kind, OutcomeKind::MatchedRejection);
-            assert!(outcome.oracle_rejected);
-            assert!(outcome.detail.contains("Serc rejected"));
-        }
+        assert_eq!(outcome.kind, OutcomeKind::MatchedRejection);
+        assert!(outcome.oracle_rejected);
+        assert!(outcome.detail.contains("Serc rejected"));
     }
 
     #[test]
     fn cpython_semantic_rejection_requires_serc_rejection() {
-        let compiled = compile_input(
-            &CompilerInput::Text("return\n".to_string()),
-            "invalid.py",
-            &CompileOptions::default(),
-            None,
-        );
+        let compiled = compile_input(b"return\n", "invalid.py", &CompileOptions::default());
         let outcome = classify(
             Path::new("invalid.py"),
             OracleOutcome::Rejected("SyntaxError: 'return' outside function".to_string()),
@@ -2039,23 +1269,18 @@ mod tests {
     }
 
     #[test]
-    fn cpython_rejection_detects_serc_acceptance_for_text_and_bytes() {
-        for source in [
-            CompilerInput::Text("pass\n".to_string()),
-            CompilerInput::Bytes(b"pass\n".to_vec()),
-        ] {
-            let compiled = compile_input(&source, "valid.py", &CompileOptions::default(), None);
-            let outcome = classify(
-                Path::new("valid.py"),
-                OracleOutcome::Rejected("SyntaxError: invalid syntax".to_string()),
-                compiled,
-            );
+    fn cpython_rejection_detects_serc_acceptance() {
+        let compiled = compile_input(b"pass\n", "valid.py", &CompileOptions::default());
+        let outcome = classify(
+            Path::new("valid.py"),
+            OracleOutcome::Rejected("SyntaxError: invalid syntax".to_string()),
+            compiled,
+        );
 
-            assert_eq!(outcome.kind, OutcomeKind::RejectionMismatch);
-            assert!(outcome.kind.is_failure());
-            assert!(outcome.oracle_rejected);
-            assert!(outcome.detail.contains("Serc compiled successfully"));
-        }
+        assert_eq!(outcome.kind, OutcomeKind::RejectionMismatch);
+        assert!(outcome.kind.is_failure());
+        assert!(outcome.oracle_rejected);
+        assert!(outcome.detail.contains("Serc compiled successfully"));
     }
 
     #[test]
@@ -2074,9 +1299,9 @@ mod tests {
 
     #[test]
     fn surrogate_docstring_errors_count_as_matched_rejections() {
-        let source = CompilerInput::Text("def f():\n    '\\ud800'\n".to_string());
+        let source = b"def f():\n    '\\ud800'\n";
         let filename = "surrogate_docstring.py";
-        let compiled = compile_input(&source, filename, &CompileOptions::default(), None);
+        let compiled = compile_input(source, filename, &CompileOptions::default());
         let outcome = classify(
             Path::new(filename),
             OracleOutcome::Rejected("UnicodeEncodeError: surrogates not allowed".to_string()),
@@ -2124,12 +1349,11 @@ mod tests {
         fs::write(directory.path().join("notes.txt"), "not Python\n").unwrap();
         let roots = [directory.path().to_path_buf()];
 
-        let options = Options::try_parse_from(["compare_cpython_corpus"]).unwrap();
+        let options = parse_options(&[]).unwrap();
         let default = discover(&roots, &options.extensions).unwrap();
         assert_eq!(default, vec![directory.path().join("module.py")]);
 
-        let options =
-            Options::try_parse_from(["compare_cpython_corpus", "--extension", "pyi"]).unwrap();
+        let options = parse_options(&["--extension", "pyi"]).unwrap();
         let with_stubs = discover(&roots, &options.extensions).unwrap();
         assert_eq!(
             with_stubs,

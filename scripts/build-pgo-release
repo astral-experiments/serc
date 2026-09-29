@@ -325,6 +325,17 @@ def main():
             output / "generate-target",
             f"-Cprofile-generate={raw}",
         )
+        reference = run_dir / "cpython-reference"
+        run(
+            [
+                args.python,
+                "-I",
+                "-S",
+                repo / "scripts/build-cpython-reference.py",
+                "--output",
+                reference,
+            ]
+        )
         # Use the comparator's default roots.
         expectations = run(
             [repo / "scripts/ruff-corpus-expectations", "3.14"]
@@ -332,8 +343,8 @@ def main():
         run(
             [
                 training,
-                "--python",
-                args.python,
+                "--reference",
+                reference,
                 "--python-version",
                 "3.14",
                 *expectations,

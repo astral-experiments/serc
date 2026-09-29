@@ -17,7 +17,7 @@ artifact identities, explicit selection, and runtime qualification requirements.
 
 ## Required Ruff gate
 
-From the repository root:
+From the repository root, on Linux with shared-library CPython builds:
 
 ```console
 git submodule update --init vendor/ruff
@@ -34,17 +34,18 @@ their published source revisions and the clean submodule must all match
 
 | CPython   | Byte-identical accepted | CPython-rejected | Matched rejections | Serc accepted | Compiler failures |
 | --------- | ----------------------: | ---------------: | -----------------: | ------------: | ----------------: |
-| 3.12.14   |                   2,190 |              280 |                271 |             7 |                 2 |
+| 3.12.14   |                   2,190 |              280 |                277 |             1 |                 2 |
 | 3.13.15   |                   2,209 |              261 |                258 |             1 |                 2 |
-| 3.14.5    |                   2,246 |              224 |                221 |             1 |                 2 |
+| 3.14.5    |                   2,246 |              224 |                222 |             0 |                 2 |
 | 3.15.0rc2 |                   2,266 |              204 |                202 |             0 |                 2 |
 
 The last three columns partition CPython-rejected inputs and expose existing
 rejection discrepancies. All other failure categories must be zero. Every
-accepted input must match `marshal.dumps(compile(...))` byte for byte; a
-compiler failure on an accepted input always fails the gate. Each outcome count
-is frozen independently, so improvements also require an explicit baseline
-update. The 3.12, 3.13, and 3.15 gates pass source bytes to both compilers.
+accepted input must match the minimal reference's marshal output byte for byte;
+a compiler failure on an accepted input always fails the gate. Each outcome
+count is frozen independently, so improvements also require an explicit baseline
+update. Each gate builds the minimal reference with the selected interpreter and
+passes source bytes to both compilers.
 
 ## Comparing another corpus
 
@@ -62,7 +63,9 @@ Each file gets a fresh CPython process with UTF-8 mode, hash seed 0, and site
 initialization disabled. The reference compiles source bytes and marshals
 through the C API, without a Python wrapper or additional imports. It uses
 normal interpreter startup, modeled by Serc's default intern state, and retains
-a second reference to the root code object as `marshal.dumps(code)` would.
+the filename argument and a second reference to the root code object as a Python
+caller would. The `minimal-v2` protocol fixes this ownership across Python
+versions and rejects older reference artifacts.
 
 The comparator verifies the reference protocol, CPython release, and magic
 number, then compares raw marshal bytes, including string interning and object
@@ -73,34 +76,6 @@ interpreter startup stays at level 0.
 inputs. Add `--require-rejection-parity` to require clean Serc rejections for
 every CPython-rejected input. Use `--dump-mismatches DIR` to inspect failures;
 `--limit N` checks only a sorted prefix, not the complete corpus.
-
-### Existing Python-script comparisons
-
-The `--python /path/to/python3.14.5 --source-bytes` mode retains the Python
-wrapper used by the recorded corpus measurements below. The comparator rejects
-an oracle with the wrong implementation, release, or magic number, and rejects
-missing or empty corpus roots. Without an explicit caller-state profile, this is
-a diagnostic comparison using Serc's isolated startup state. The oracle imports
-`pathlib`, which can intern additional strings and change marshal sharing. A
-byte mismatch alone therefore does not establish a compiler regression. Exact
-counts still report observed byte equality.
-
-In this mode, `--require-all` requires a validated
-[initial intern-state profile](../crates/serc/examples/support/initial-intern-profile.md)
-for the oracle caller, at least one exact match, and no failures on
-CPython-accepted inputs. Python 3.12 additionally requires
-`--caller-intern-model MODEL.json`, since `pathlib` interns the current
-filename's components; one fixed snapshot cannot describe different input paths.
-Profiles and models retain their documented assumptions: a captured process
-snapshot does not prove the absence or lifetime of every other interned string.
-The explicit `--caller-intern-assume-absent` override remains diagnostic.
-
-For an observed-byte regression check under startup assumptions, use
-`--require-all --diagnostic-startup-state`. The explicit diagnostic override
-preserves the accepted-input failure checks but does not establish that the
-caller's state matches. The Ruff baseline and limited mypy-primer checks use
-this mode; their expected counts and failure categories are unchanged. Caller
-profiles and native output caches cannot be combined with `--reference`.
 
 ## Public corpus compatibility
 
@@ -113,45 +88,16 @@ required Ruff gate:
 ./scripts/check-mypy-primer-compatibility /path/to/python3.14.5
 ```
 
-The [latest measurement](../corpora/results/current.json), from September 22,
-2026, uses CPython 3.14.5 and Serc `af3806c`. It records compiler and corpus
-identities, every outcome category, and a link to the original evidence summary.
-The Ruff fixture measurement uses commit
-`e4a063a136ae0e3d6801bd0dad47d09a0f419530`, earlier than the required gate.
+The minimal-reference baseline has 73,371 exact matches, 157 matched rejections,
+one rejection mismatch, six byte mismatches, and two compiler failures. CPython
+rejects 160 inputs; there are no unsupported inputs, parse/decode mismatches, or
+oracle failures.
 
-| Corpus               |      Files | CPython-rejected | Byte-identical accepted | Byte mismatches | Accepted-input compiler failures | Accepted-input match rate |
-| -------------------- | ---------: | ---------------: | ----------------------: | --------------: | -------------------------------: | ------------------------: |
-| Ruff fixtures        |      2,451 |              221 |                   2,230 |               0 |                                0 |                      100% |
-| NumPy `v2.4.6`       |        505 |                0 |                     505 |               0 |                                0 |                      100% |
-| mypy-primer snapshot |     73,537 |              160 |                  73,364 |              13 |                                0 |                    99.98% |
-| **Combined**         | **76,493** |          **381** |              **76,099** |          **13** |                            **0** |                **99.98%** |
-
-Of the 160 CPython-rejected mypy-primer files, Serc matches 123 rejections,
-accepts 29, and fails internally on 8. There are no compiler failures on
-accepted inputs, unsupported inputs, parse/decode mismatches, non-UTF-8 inputs,
-or oracle failures. Comparisons use default intern state and raw marshal bytes,
-without caller profiles, normalization, or nondeterminism exclusions.
-
-The check verifies the snapshot before comparing source bytes and freezes each
-outcome category independently. Append `--limit 100` for a prefix diagnostic
-without the full outcome baseline. Snapshot identity and update instructions
+The check verifies the snapshot, builds the minimal reference with the selected
+interpreter, and compares source bytes, freezing each outcome category
+independently. Append `--limit 100` to check a prefix with `--require-all`
+instead of the full outcome baseline. Snapshot identity and update instructions
 live in the [corpus guide](../corpora/README.md).
 
-## Holdout compatibility
-
-The same compiler and CPython target were tested against four OSS projects
-absent from the mypy-primer snapshot. The comparison covers tracked regular
-`.py` files, excluding symlinks and stubs. Every CPython-accepted file matched
-byte for byte.
-
-| Holdout project                                                                                                     |      Files | CPython-rejected | Byte-identical accepted | Byte mismatches | Accepted-input match rate |
-| ------------------------------------------------------------------------------------------------------------------- | ---------: | ---------------: | ----------------------: | --------------: | ------------------------: |
-| [Django `bf5e73c`](https://github.com/django/django/tree/bf5e73c576c8c7d8b3ef1c03a22cf724dbb2f306)                  |      2,927 |                1 |                   2,926 |               0 |                      100% |
-| [Airflow `cad6220`](https://github.com/apache/airflow/tree/cad6220034e87c586eb87e14b5a75f4b82984fd0)                |      7,621 |                0 |                   7,621 |               0 |                      100% |
-| [Transformers `ab1771c`](https://github.com/huggingface/transformers/tree/ab1771c9e42891d893189978a8009426d70b4688) |      4,643 |                0 |                   4,643 |               0 |                      100% |
-| [Ansible `3217c35`](https://github.com/ansible/ansible/tree/3217c352bb7b77392317aac0cf8b859d7d43b5b5)               |      1,810 |                0 |                   1,810 |               0 |                      100% |
-| **Combined holdout**                                                                                                | **17,001** |            **1** |              **17,000** |           **0** |                  **100%** |
-
-Serc matched the one CPython-rejected Django input. All other failure categories
-were zero. This holdout comparison is a separate diagnostic, not part of the
-required CI gate.
+Earlier Python-wrapper and holdout measurements are recorded in
+[the measurement archive](../corpora/results/current.json).

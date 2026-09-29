@@ -31,17 +31,18 @@ for corpus_root in "${corpus_roots[@]}"; do
     fi
 done
 
+reference_dir="$(mktemp -d)"
+trap 'rm -rf "$reference_dir"' EXIT
+reference="$reference_dir/cpython-reference"
+"$python" -I -S "$repo_root/scripts/build-cpython-reference.py" --output "$reference"
+
 comparison_args=(
-    --python "$python"
+    --reference "$reference"
     --python-version "$python_version"
 )
 while IFS= read -r arg; do
     comparison_args+=("$arg")
 done <<< "$expected_args"
-if [[ "$python_version" != 3.14 ]]; then
-    comparison_args+=(--source-bytes)
-fi
-
 cargo run --locked --manifest-path "$repo_root/Cargo.toml" \
   -p serc --example compare_cpython_corpus -- \
   "${comparison_args[@]}" \

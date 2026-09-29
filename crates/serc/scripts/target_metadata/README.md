@@ -147,10 +147,11 @@ complete reads to agree, unchanged executable bytes, and identical observed and
 unobserved marshal output. Never derive startup entries from corpus strings or
 another release.
 
-Subtract generated static/AST names and cached single-character strings. Keep
-installation paths in the
-[explicit runtime profile](../../examples/support/initial-intern-profile.md),
-not in these sorted, unique supplements. Update the fixture's pinned digest in
+Subtract generated static/AST names and cached single-character strings. Exclude
+installation paths from these sorted, unique supplements; runtime-specific state
+can be supplied through `InitialInternState`. Corpus comparisons use the
+[minimal reference](../../../../docs/compatibility.md#comparing-another-corpus).
+Update the fixture's pinned digest in
 [`generate_cpython_target.py`](../generate_cpython_target.py), then
 [regenerate and check the target](../../README.md#updating-the-cpython-target).
 

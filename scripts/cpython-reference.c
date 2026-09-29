@@ -62,7 +62,7 @@ static int identity(void) {
         default: return 1;
     }
     uint32_t magic = (uint32_t)PyImport_GetMagicNumber();
-    return printf("{\"protocol\":\"minimal-v1\",\"implementation\":\"cpython\","
+    return printf("{\"protocol\":\"minimal-v2\",\"implementation\":\"cpython\","
                   "\"version\":\"%d.%d.%d\",\"release_level\":\"%s\","
                   "\"release_serial\":%d,\"magic\":\"%02x%02x%02x%02x\"}\n",
                   PY_MAJOR_VERSION, PY_MINOR_VERSION, PY_MICRO_VERSION,
@@ -119,13 +119,22 @@ static int compile_file(const char *path, int optimization) {
     }
     source[length] = '\0';
     PyCompilerFlags flags = {0};
-    PyObject *code = Py_CompileStringExFlags(source, path, Py_file_input,
-                                           &flags, optimization);
+    /* Retain the filename argument, as a Python compile caller would. */
+    PyObject *filename = PyUnicode_DecodeFSDefault(path);
+    if (!filename) {
+        free(source);
+        PyErr_Print();
+        return 1;
+    }
+    PyObject *code = Py_CompileStringObject(source, filename, Py_file_input,
+                                          &flags, optimization);
     free(source);
     if (!code) {
-        int result = PyErr_ExceptionMatches(PyExc_SyntaxError) ? 2 : 1;
+        Py_DECREF(filename);
+        /* Compilation exceptions reject the source; initialization, I/O and
+           marshal failures remain oracle errors. */
         PyErr_Print();
-        return result;
+        return 2;
     }
     /* Match a named code variable passed to marshal.dumps. Root ownership affects
        marshal's reference flag and indexes, so this is part of the protocol. */
@@ -133,6 +142,7 @@ static int compile_file(const char *path, int optimization) {
     PyObject *bytes = PyMarshal_WriteObjectToString(code, Py_MARSHAL_VERSION);
     Py_DECREF(code);
     Py_DECREF(code);
+    Py_DECREF(filename);
     if (!bytes) {
         PyErr_Print();
         return 1;
