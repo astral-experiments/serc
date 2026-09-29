@@ -1,6 +1,7 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
+use ruff_python_ast::{Comprehension, Expr};
 use ruff_text_size::TextSize;
 use rustc_hash::FxHashMap;
 
@@ -129,5 +130,22 @@ impl Compiler<'_> {
 impl CachedSourceLine {
     fn contains(self, offset: TextSize) -> bool {
         self.start <= offset && (offset < self.end || self.is_last && offset == self.end)
+    }
+}
+
+/// Borrows list, set, and dict comprehension parts without visiting children.
+/// Generator expressions retain their separate scope handling at each call site.
+fn comprehension_parts(expression: &Expr) -> Option<(&[Comprehension], Option<&Expr>, &Expr)> {
+    match expression {
+        Expr::ListComp(comprehension) => {
+            Some((&comprehension.generators, None, &comprehension.elt))
+        }
+        Expr::SetComp(comprehension) => Some((&comprehension.generators, None, &comprehension.elt)),
+        Expr::DictComp(comprehension) => Some((
+            &comprehension.generators,
+            comprehension.key.as_deref(),
+            &comprehension.value,
+        )),
+        _ => None,
     }
 }

@@ -19,7 +19,7 @@ use crate::{CompileError, PythonVersion};
 
 use super::source::SourceAnalysis;
 use super::symbol::mangle_name;
-use super::{Compiler, SHADOWED_SUPER_SENTINEL, Scope};
+use super::{Compiler, SHADOWED_SUPER_SENTINEL, Scope, comprehension_parts};
 
 #[cfg(test)]
 thread_local! {
@@ -3476,35 +3476,22 @@ impl LocalCollector {
                     return crate::grow_stack(|| self.visit_expr(expression));
                 }
 
-                let (generators, key, value) = match expression {
-                    Expr::ListComp(comprehension) => (
-                        &comprehension.generators[..],
-                        None,
-                        comprehension.elt.as_ref(),
-                    ),
-                    Expr::SetComp(comprehension) => (
-                        &comprehension.generators[..],
-                        None,
-                        comprehension.elt.as_ref(),
-                    ),
-                    Expr::DictComp(comprehension) => (
-                        &comprehension.generators[..],
-                        comprehension.key.as_deref(),
-                        comprehension.value.as_ref(),
-                    ),
-                    Expr::Generator(generator) => {
-                        if let Some(first) = generator.generators.first() {
-                            self.visit_expr(&first.iter);
+                let Some((generators, key, value)) = comprehension_parts(expression) else {
+                    match expression {
+                        Expr::Generator(generator) => {
+                            if let Some(first) = generator.generators.first() {
+                                self.visit_expr(&first.iter);
+                            }
+                            return;
                         }
-                        return;
-                    }
-                    Expr::Lambda(lambda) => {
-                        visit_lambda_defaults(self, lambda);
-                        return;
-                    }
-                    _ => {
-                        walk_expr(self, expression);
-                        return;
+                        Expr::Lambda(lambda) => {
+                            visit_lambda_defaults(self, lambda);
+                            return;
+                        }
+                        _ => {
+                            walk_expr(self, expression);
+                            return;
+                        }
                     }
                 };
                 if let Some(first) = generators.first() {
@@ -5032,25 +5019,7 @@ impl<'ast> Visitor<'ast> for ScopeBodyFactsCollector<'ast> {
             return;
         }
         if self.generator_depth == 0 {
-            let comprehension = match expression {
-                Expr::ListComp(comprehension) => Some((
-                    &comprehension.generators[..],
-                    None,
-                    comprehension.elt.as_ref(),
-                )),
-                Expr::SetComp(comprehension) => Some((
-                    &comprehension.generators[..],
-                    None,
-                    comprehension.elt.as_ref(),
-                )),
-                Expr::DictComp(comprehension) => Some((
-                    &comprehension.generators[..],
-                    comprehension.key.as_deref(),
-                    comprehension.value.as_ref(),
-                )),
-                _ => None,
-            };
-            if let Some((generators, key, value)) = comprehension {
+            if let Some((generators, key, value)) = comprehension_parts(expression) {
                 let cells = comprehension_cell_names_in_private_context(
                     generators,
                     key,
@@ -5564,43 +5533,31 @@ fn collect_header_slot_names(
                 return crate::grow_stack(|| self.visit_expr(expression));
             }
 
-            let (generators, key, value) = match expression {
-                Expr::ListComp(comprehension) => (
-                    &comprehension.generators[..],
-                    None,
-                    comprehension.elt.as_ref(),
-                ),
-                Expr::SetComp(comprehension) => (
-                    &comprehension.generators[..],
-                    None,
-                    comprehension.elt.as_ref(),
-                ),
-                Expr::DictComp(comprehension) => (
-                    &comprehension.generators[..],
-                    comprehension.key.as_deref(),
-                    comprehension.value.as_ref(),
-                ),
-                Expr::Generator(generator) => {
-                    if let Some(first) = generator.generators.first() {
-                        self.visit_expr(&first.iter);
+            let Some((generators, key, value)) = comprehension_parts(expression) else {
+                match expression {
+                    Expr::Generator(generator) => {
+                        if let Some(first) = generator.generators.first() {
+                            self.visit_expr(&first.iter);
+                        }
+                        return;
                     }
-                    return;
-                }
-                Expr::Lambda(lambda) => {
-                    visit_lambda_defaults(self, lambda);
-                    return;
-                }
-                Expr::Name(name) => {
-                    let emitted = (self.instruction_name)(name.id.as_str());
-                    if self.ordinary_locals.contains(&emitted) && !self.cellvars.contains(&emitted)
-                    {
-                        self.names.push(emitted);
+                    Expr::Lambda(lambda) => {
+                        visit_lambda_defaults(self, lambda);
+                        return;
                     }
-                    return;
-                }
-                _ => {
-                    walk_expr(self, expression);
-                    return;
+                    Expr::Name(name) => {
+                        let emitted = (self.instruction_name)(name.id.as_str());
+                        if self.ordinary_locals.contains(&emitted)
+                            && !self.cellvars.contains(&emitted)
+                        {
+                            self.names.push(emitted);
+                        }
+                        return;
+                    }
+                    _ => {
+                        walk_expr(self, expression);
+                        return;
+                    }
                 }
             };
             if let Some(first) = generators.first() {
@@ -5958,35 +5915,22 @@ pub(super) fn annotation_comprehension_requirements(
                 return crate::grow_stack(|| self.visit_expr(expression));
             }
 
-            let (generators, key, value) = match expression {
-                Expr::ListComp(comprehension) => (
-                    &comprehension.generators[..],
-                    None,
-                    comprehension.elt.as_ref(),
-                ),
-                Expr::SetComp(comprehension) => (
-                    &comprehension.generators[..],
-                    None,
-                    comprehension.elt.as_ref(),
-                ),
-                Expr::DictComp(comprehension) => (
-                    &comprehension.generators[..],
-                    comprehension.key.as_deref(),
-                    comprehension.value.as_ref(),
-                ),
-                Expr::Lambda(lambda) => {
-                    visit_lambda_defaults(self, lambda);
-                    return;
-                }
-                Expr::Generator(generator) => {
-                    if let Some(first) = generator.generators.first() {
-                        self.visit_expr(&first.iter);
+            let Some((generators, key, value)) = comprehension_parts(expression) else {
+                match expression {
+                    Expr::Lambda(lambda) => {
+                        visit_lambda_defaults(self, lambda);
+                        return;
                     }
-                    return;
-                }
-                _ => {
-                    walk_expr(self, expression);
-                    return;
+                    Expr::Generator(generator) => {
+                        if let Some(first) = generator.generators.first() {
+                            self.visit_expr(&first.iter);
+                        }
+                        return;
+                    }
+                    _ => {
+                        walk_expr(self, expression);
+                        return;
+                    }
                 }
             };
             self.0.captures.extend(
@@ -6443,80 +6387,69 @@ fn comprehension_symbol_names(
                 return crate::grow_stack(|| self.visit_expr(expression));
             }
 
-            let (generators, key, value) = match expression {
-                Expr::ListComp(comprehension) => (
-                    &comprehension.generators[..],
-                    None,
-                    comprehension.elt.as_ref(),
-                ),
-                Expr::SetComp(comprehension) => (
-                    &comprehension.generators[..],
-                    None,
-                    comprehension.elt.as_ref(),
-                ),
-                Expr::DictComp(comprehension) => (
-                    &comprehension.generators[..],
-                    comprehension.key.as_deref(),
-                    comprehension.value.as_ref(),
-                ),
-                Expr::Generator(generator) => {
-                    if let Some(first) = generator.generators.first() {
-                        self.visit_expr(&first.iter);
-                    }
-                    if self.all_symbols {
-                        self.closure_references
-                            .extend(generator_required_names(generator));
-                    }
-                    return;
-                }
-                Expr::Lambda(lambda) => {
-                    visit_lambda_defaults(self, lambda);
-                    if self.all_symbols {
-                        self.closure_references
-                            .extend(analyze_lambda_scope(lambda).required);
-                    }
-                    return;
-                }
-                Expr::Named(named) if self.module_walrus_targets.is_some() => {
-                    if let Expr::Name(name) = named.target.as_ref()
-                        && self.module_walrus_targets.is_some_and(|targets| {
-                            targets
-                                .contains(mangle_name(name.id.as_str(), self.private_name).as_ref())
-                        })
-                    {
-                        // Native extends the containing scope before visiting the value.
-                        // Its DEF_GLOBAL admission reserves this symbol's first position.
-                        self.targets
-                            .insert(mangle_name(name.id.as_str(), self.private_name).into_owned());
-                        self.names.push((name.id.to_string(), false));
-                    }
-                    self.visit_expr(&named.value);
-                    self.visit_expr(&named.target);
-                    return;
-                }
-                Expr::Name(name) => {
-                    self.names.push((name.id.as_str().to_string(), false));
-                    if self.all_symbols && name.id.as_str() == "super" {
-                        self.names.push(("__class__".to_string(), false));
-                    }
-                    return;
-                }
-                Expr::Dict(dictionary)
-                    if self.all_symbols || self.module_walrus_targets.is_some() =>
-                {
-                    for item in &dictionary.items {
-                        if let Some(key) = &item.key {
-                            self.visit_expr(key);
+            let Some((generators, key, value)) = comprehension_parts(expression) else {
+                match expression {
+                    Expr::Generator(generator) => {
+                        if let Some(first) = generator.generators.first() {
+                            self.visit_expr(&first.iter);
                         }
+                        if self.all_symbols {
+                            self.closure_references
+                                .extend(generator_required_names(generator));
+                        }
+                        return;
                     }
-                    for item in &dictionary.items {
-                        self.visit_expr(&item.value);
+                    Expr::Lambda(lambda) => {
+                        visit_lambda_defaults(self, lambda);
+                        if self.all_symbols {
+                            self.closure_references
+                                .extend(analyze_lambda_scope(lambda).required);
+                        }
+                        return;
                     }
-                    return;
-                }
-                _ => {
-                    walk_expr(self, expression);
-                    return;
+                    Expr::Named(named) if self.module_walrus_targets.is_some() => {
+                        if let Expr::Name(name) = named.target.as_ref()
+                            && self.module_walrus_targets.is_some_and(|targets| {
+                                targets.contains(
+                                    mangle_name(name.id.as_str(), self.private_name).as_ref(),
+                                )
+                            })
+                        {
+                            // Native extends the containing scope before visiting the value.
+                            // Its DEF_GLOBAL admission reserves this symbol's first position.
+                            self.targets.insert(
+                                mangle_name(name.id.as_str(), self.private_name).into_owned(),
+                            );
+                            self.names.push((name.id.to_string(), false));
+                        }
+                        self.visit_expr(&named.value);
+                        self.visit_expr(&named.target);
+                        return;
+                    }
+                    Expr::Name(name) => {
+                        self.names.push((name.id.as_str().to_string(), false));
+                        if self.all_symbols && name.id.as_str() == "super" {
+                            self.names.push(("__class__".to_string(), false));
+                        }
+                        return;
+                    }
+                    Expr::Dict(dictionary)
+                        if self.all_symbols || self.module_walrus_targets.is_some() =>
+                    {
+                        for item in &dictionary.items {
+                            if let Some(key) = &item.key {
+                                self.visit_expr(key);
+                            }
+                        }
+                        for item in &dictionary.items {
+                            self.visit_expr(&item.value);
+                        }
+                        return;
+                    }
+                    _ => {
+                        walk_expr(self, expression);
+                        return;
+                    }
                 }
             };
             if let Some(first) = generators.first() {
@@ -6640,68 +6573,55 @@ fn comprehension_name_bindings_with_parent_requirements<'ast>(
                 return crate::grow_stack(|| self.visit_expr(expression));
             }
 
-            let (generators, key, value) = match expression {
-                Expr::ListComp(comprehension) => (
-                    &comprehension.generators[..],
-                    None,
-                    comprehension.elt.as_ref(),
-                ),
-                Expr::SetComp(comprehension) => (
-                    &comprehension.generators[..],
-                    None,
-                    comprehension.elt.as_ref(),
-                ),
-                Expr::DictComp(comprehension) => (
-                    &comprehension.generators[..],
-                    comprehension.key.as_deref(),
-                    comprehension.value.as_ref(),
-                ),
-                Expr::Generator(generator) => {
-                    if let Some(first) = generator.generators.first() {
-                        self.visit_expr(&first.iter);
-                    }
-                    let required = if self.include_generator_parent_requirements {
-                        generator_parent_requirements_with_cache(generator, self.cache)
-                    } else {
-                        generator_required_names_with_cache(generator, self.cache)
-                    };
-                    self.closure_references.extend(required);
-                    return;
-                }
-                Expr::Lambda(lambda) => {
-                    visit_lambda_defaults(self, lambda);
-                    self.closure_references
-                        .extend(lambda_required_names_with_cache(lambda, self.cache));
-                    return;
-                }
-                Expr::Dict(dictionary) => {
-                    for item in &dictionary.items {
-                        if let Some(key) = &item.key {
-                            self.visit_expr(key);
+            let Some((generators, key, value)) = comprehension_parts(expression) else {
+                match expression {
+                    Expr::Generator(generator) => {
+                        if let Some(first) = generator.generators.first() {
+                            self.visit_expr(&first.iter);
                         }
+                        let required = if self.include_generator_parent_requirements {
+                            generator_parent_requirements_with_cache(generator, self.cache)
+                        } else {
+                            generator_required_names_with_cache(generator, self.cache)
+                        };
+                        self.closure_references.extend(required);
+                        return;
                     }
-                    for item in &dictionary.items {
-                        self.visit_expr(&item.value);
+                    Expr::Lambda(lambda) => {
+                        visit_lambda_defaults(self, lambda);
+                        self.closure_references
+                            .extend(lambda_required_names_with_cache(lambda, self.cache));
+                        return;
                     }
-                    return;
-                }
-                Expr::Named(named) => {
-                    if let Expr::Name(name) = named.target.as_ref() {
+                    Expr::Dict(dictionary) => {
+                        for item in &dictionary.items {
+                            if let Some(key) = &item.key {
+                                self.visit_expr(key);
+                            }
+                        }
+                        for item in &dictionary.items {
+                            self.visit_expr(&item.value);
+                        }
+                        return;
+                    }
+                    Expr::Named(named) => {
+                        if let Expr::Name(name) = named.target.as_ref() {
+                            self.symbols.entry(name.id.to_string()).or_insert(false);
+                        }
+                        self.visit_expr(&named.value);
+                        return;
+                    }
+                    Expr::Name(name) if name.ctx == ExprContext::Load => {
                         self.symbols.entry(name.id.to_string()).or_insert(false);
+                        if name.id.as_str() == "super" {
+                            self.symbols.entry("__class__".to_string()).or_insert(false);
+                        }
+                        return;
                     }
-                    self.visit_expr(&named.value);
-                    return;
-                }
-                Expr::Name(name) if name.ctx == ExprContext::Load => {
-                    self.symbols.entry(name.id.to_string()).or_insert(false);
-                    if name.id.as_str() == "super" {
-                        self.symbols.entry("__class__".to_string()).or_insert(false);
+                    _ => {
+                        walk_expr(self, expression);
+                        return;
                     }
-                    return;
-                }
-                _ => {
-                    walk_expr(self, expression);
-                    return;
                 }
             };
             if let Some(first) = generators.first() {
@@ -6902,44 +6822,31 @@ pub(super) fn collect_generator_slot_names(
                 return crate::grow_stack(|| self.visit_expr(expression));
             }
 
-            let (generators, key, value) = match expression {
-                Expr::ListComp(comprehension) => (
-                    &comprehension.generators[..],
-                    None,
-                    comprehension.elt.as_ref(),
-                ),
-                Expr::SetComp(comprehension) => (
-                    &comprehension.generators[..],
-                    None,
-                    comprehension.elt.as_ref(),
-                ),
-                Expr::DictComp(comprehension) => (
-                    &comprehension.generators[..],
-                    comprehension.key.as_deref(),
-                    comprehension.value.as_ref(),
-                ),
-                Expr::Generator(generator) => {
-                    if let Some(first) = generator.generators.first() {
-                        self.visit_expr(&first.iter);
+            let Some((generators, key, value)) = comprehension_parts(expression) else {
+                match expression {
+                    Expr::Generator(generator) => {
+                        if let Some(first) = generator.generators.first() {
+                            self.visit_expr(&first.iter);
+                        }
+                        return;
                     }
-                    return;
-                }
-                Expr::Lambda(lambda) => {
-                    visit_lambda_defaults(self, lambda);
-                    return;
-                }
-                Expr::Name(name) => {
-                    let name = name.id.as_str();
-                    if self.generator_locals.contains(name)
-                        && !self.generator_cellvars.contains(name)
-                    {
-                        self.names.push(name.to_owned());
+                    Expr::Lambda(lambda) => {
+                        visit_lambda_defaults(self, lambda);
+                        return;
                     }
-                    return;
-                }
-                _ => {
-                    walk_expr(self, expression);
-                    return;
+                    Expr::Name(name) => {
+                        let name = name.id.as_str();
+                        if self.generator_locals.contains(name)
+                            && !self.generator_cellvars.contains(name)
+                        {
+                            self.names.push(name.to_owned());
+                        }
+                        return;
+                    }
+                    _ => {
+                        walk_expr(self, expression);
+                        return;
+                    }
                 }
             };
             if let Some(first) = generators.first() {
@@ -7260,67 +7167,54 @@ fn generator_external_names_with_cache<'ast>(
                 return crate::grow_stack(|| self.visit_expr(expression));
             }
 
-            let (generators, key, value) = match expression {
-                Expr::ListComp(comprehension) => (
-                    &comprehension.generators[..],
-                    None,
-                    comprehension.elt.as_ref(),
-                ),
-                Expr::SetComp(comprehension) => (
-                    &comprehension.generators[..],
-                    None,
-                    comprehension.elt.as_ref(),
-                ),
-                Expr::DictComp(comprehension) => (
-                    &comprehension.generators[..],
-                    comprehension.key.as_deref(),
-                    comprehension.value.as_ref(),
-                ),
-                Expr::Lambda(lambda) => {
-                    visit_lambda_defaults(self, lambda);
-                    for name in lambda_required_names_with_cache(lambda, self.cache) {
-                        self.insert_closure(&name);
-                    }
-                    return;
-                }
-                Expr::Generator(generator) => {
-                    if let Some(first) = generator.generators.first() {
-                        self.visit_expr(&first.iter);
-                    }
-                    let mut own_targets = Vec::new();
-                    for comprehension in &generator.generators {
-                        collect_target_names(&comprehension.target, &mut own_targets);
-                    }
-                    let own_targets = own_targets
-                        .iter()
-                        .map(|name| (self.mangle)(name))
-                        .collect::<FxHashSet<_>>();
-                    let (names, _, _) =
-                        generator_external_names_with_cache(generator, self.mangle, self.cache);
-                    for name in names.into_iter().collect::<BTreeSet<_>>() {
-                        if !own_targets.contains(&(self.mangle)(&name)) {
+            let Some((generators, key, value)) = comprehension_parts(expression) else {
+                match expression {
+                    Expr::Lambda(lambda) => {
+                        visit_lambda_defaults(self, lambda);
+                        for name in lambda_required_names_with_cache(lambda, self.cache) {
                             self.insert_closure(&name);
                         }
+                        return;
                     }
-                    return;
-                }
-                Expr::Named(named) => {
-                    if let Expr::Name(name) = named.target.as_ref() {
+                    Expr::Generator(generator) => {
+                        if let Some(first) = generator.generators.first() {
+                            self.visit_expr(&first.iter);
+                        }
+                        let mut own_targets = Vec::new();
+                        for comprehension in &generator.generators {
+                            collect_target_names(&comprehension.target, &mut own_targets);
+                        }
+                        let own_targets = own_targets
+                            .iter()
+                            .map(|name| (self.mangle)(name))
+                            .collect::<FxHashSet<_>>();
+                        let (names, _, _) =
+                            generator_external_names_with_cache(generator, self.mangle, self.cache);
+                        for name in names.into_iter().collect::<BTreeSet<_>>() {
+                            if !own_targets.contains(&(self.mangle)(&name)) {
+                                self.insert_closure(&name);
+                            }
+                        }
+                        return;
+                    }
+                    Expr::Named(named) => {
+                        if let Expr::Name(name) = named.target.as_ref() {
+                            self.insert(name.id.as_str());
+                        }
+                        self.visit_expr(&named.value);
+                        return;
+                    }
+                    Expr::Name(name) if name.ctx == ExprContext::Load => {
                         self.insert(name.id.as_str());
+                        if name.id.as_str() == "super" {
+                            self.insert("__class__");
+                        }
+                        return;
                     }
-                    self.visit_expr(&named.value);
-                    return;
-                }
-                Expr::Name(name) if name.ctx == ExprContext::Load => {
-                    self.insert(name.id.as_str());
-                    if name.id.as_str() == "super" {
-                        self.insert("__class__");
+                    _ => {
+                        walk_expr(self, expression);
+                        return;
                     }
-                    return;
-                }
-                _ => {
-                    walk_expr(self, expression);
-                    return;
                 }
             };
 
@@ -7481,40 +7375,27 @@ fn generator_required_names_with_cache<'ast>(
                 return crate::grow_stack(|| self.visit_expr(expression));
             }
 
-            let (generators, key, value) = match expression {
-                Expr::ListComp(comprehension) => (
-                    &comprehension.generators[..],
-                    None,
-                    comprehension.elt.as_ref(),
-                ),
-                Expr::SetComp(comprehension) => (
-                    &comprehension.generators[..],
-                    None,
-                    comprehension.elt.as_ref(),
-                ),
-                Expr::DictComp(comprehension) => (
-                    &comprehension.generators[..],
-                    comprehension.key.as_deref(),
-                    comprehension.value.as_ref(),
-                ),
-                Expr::Lambda(lambda) => {
-                    visit_lambda_defaults(self, lambda);
-                    self.nested
-                        .extend(lambda_required_names_with_cache(lambda, self.cache));
-                    return;
-                }
-                Expr::Generator(generator) => {
-                    if let Some(first) = generator.generators.first() {
-                        self.visit_expr(&first.iter);
+            let Some((generators, key, value)) = comprehension_parts(expression) else {
+                match expression {
+                    Expr::Lambda(lambda) => {
+                        visit_lambda_defaults(self, lambda);
+                        self.nested
+                            .extend(lambda_required_names_with_cache(lambda, self.cache));
+                        return;
                     }
-                    self.nested.extend(generator_parent_requirements_with_cache(
-                        generator, self.cache,
-                    ));
-                    return;
-                }
-                _ => {
-                    walk_expr(self, expression);
-                    return;
+                    Expr::Generator(generator) => {
+                        if let Some(first) = generator.generators.first() {
+                            self.visit_expr(&first.iter);
+                        }
+                        self.nested.extend(generator_parent_requirements_with_cache(
+                            generator, self.cache,
+                        ));
+                        return;
+                    }
+                    _ => {
+                        walk_expr(self, expression);
+                        return;
+                    }
                 }
             };
             if let Some(first) = generators.first() {

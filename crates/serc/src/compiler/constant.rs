@@ -17,10 +17,10 @@ use crate::assembler::{FoldAdmissionId, Label, OperandPatchId};
 use crate::target::operands::Conversion;
 use crate::{CompileError, PythonVersion};
 
-use super::Compiler;
 use super::expression::{jump_constant_truthiness, literal_truthiness};
 use super::scope::NameId;
 use super::symbol::{mangle_name, to_u32};
+use super::{Compiler, comprehension_parts};
 use crate::code_object::{CodeObject, Constant, MetadataId, MetadataName, NonReflexiveRemap};
 
 #[derive(Debug, Default)]
@@ -4318,25 +4318,7 @@ fn first_constant(
                 }
             }
             if self.compiler.context.python_version <= PythonVersion::Py313 {
-                let comprehension = match expression {
-                    Expr::ListComp(comprehension) => Some((
-                        &comprehension.generators[..],
-                        None,
-                        comprehension.elt.as_ref(),
-                    )),
-                    Expr::SetComp(comprehension) => Some((
-                        &comprehension.generators[..],
-                        None,
-                        comprehension.elt.as_ref(),
-                    )),
-                    Expr::DictComp(comprehension) => Some((
-                        &comprehension.generators[..],
-                        comprehension.key.as_deref(),
-                        comprehension.value.as_ref(),
-                    )),
-                    _ => None,
-                };
-                if let Some((generators, key, value)) = comprehension {
+                if let Some((generators, key, value)) = comprehension_parts(expression) {
                     for generator in generators {
                         self.visit_iterable_expression(&generator.iter);
                         if generator.is_async && !self.is_complete() {

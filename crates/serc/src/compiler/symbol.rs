@@ -34,7 +34,7 @@ use super::constant::{
 };
 use super::scope::{NameId, NameSet, definitely_evaluated_references};
 use super::source::unparse_annotation;
-use super::{Compiler, Scope};
+use super::{Compiler, Scope, comprehension_parts};
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct SymbolState {
@@ -1895,25 +1895,7 @@ impl Compiler<'_> {
                     }
                     _ => {}
                 }
-                let comprehension = match expression {
-                    Expr::ListComp(comprehension) => Some((
-                        &comprehension.generators[..],
-                        None,
-                        comprehension.elt.as_ref(),
-                    )),
-                    Expr::SetComp(comprehension) => Some((
-                        &comprehension.generators[..],
-                        None,
-                        comprehension.elt.as_ref(),
-                    )),
-                    Expr::DictComp(comprehension) => Some((
-                        &comprehension.generators[..],
-                        comprehension.key.as_deref(),
-                        comprehension.value.as_ref(),
-                    )),
-                    _ => None,
-                };
-                if let Some((generators, key, value)) = comprehension {
+                if let Some((generators, key, value)) = comprehension_parts(expression) {
                     let build = self.build_discarded && self.record_string_origins;
                     if build {
                         self.flush_origins();
