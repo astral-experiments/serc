@@ -364,11 +364,7 @@ impl ExceptionOwnerProvenance {
         for origin in &mut self.ordinary_await_ends {
             visit(&mut origin.send);
             visit(&mut origin.end_send);
-            for item in &mut origin.cleanup {
-                if let Item::Instruction(instruction) = item {
-                    visit(instruction);
-                }
-            }
+            visit_instructions_mut(&mut origin.cleanup, &mut visit);
             if let Some(record) = origin.bridge.as_mut() {
                 visit(&mut record.1);
             }
@@ -410,112 +406,56 @@ impl ExceptionOwnerProvenance {
             }
         }
         for origin in &mut self.named_handler_pop_pairs {
-            for item in &mut origin.items {
-                if let Item::Instruction(instruction) = item {
-                    visit(instruction);
-                }
-            }
+            visit_instructions_mut(&mut origin.items, &mut visit);
         }
         for origin in &mut self.named_handler_try_prefixes {
-            for item in &mut origin.items {
-                if let Item::Instruction(instruction) = item {
-                    visit(instruction);
-                }
-            }
+            visit_instructions_mut(&mut origin.items, &mut visit);
         }
         for origin in &mut self.continued_handler_try_prefixes {
-            for item in &mut origin.items {
-                if let Item::Instruction(instruction) = item {
-                    visit(instruction);
-                }
-            }
+            visit_instructions_mut(&mut origin.items, &mut visit);
         }
         for origin in self
             .copied_handler_finally_pops
             .iter_mut()
             .chain(&mut self.copied_method_cleanup_pop_spans)
         {
-            for item in &mut origin.items {
-                if let Item::Instruction(instruction) = item {
-                    visit(instruction);
-                }
-            }
+            visit_instructions_mut(&mut origin.items, &mut visit);
         }
         for record in &mut self.iterator_return_pop_spans {
             visit(&mut record.0);
-            for item in &mut record.1.items {
-                if let Item::Instruction(instruction) = item {
-                    visit(instruction);
-                }
-            }
+            visit_instructions_mut(&mut record.1.items, &mut visit);
         }
         for record in &mut self.fused_manager_owners {
             visit(&mut record.0);
             visit(&mut record.1);
         }
         for origin in &mut self.named_handler_truth_prefixes {
-            for item in &mut origin.items {
-                if let Item::Instruction(instruction) = item {
-                    visit(instruction);
-                }
-            }
+            visit_instructions_mut(&mut origin.items, &mut visit);
         }
         for origin in &mut self.handler_dispatch_arrays {
-            for item in &mut origin.items {
-                if let Item::Instruction(instruction) = item {
-                    visit(instruction);
-                }
-            }
+            visit_instructions_mut(&mut origin.items, &mut visit);
         }
         for record in &mut self.original_value_jump_prefixes {
-            for item in &mut record.1 {
-                if let Item::Instruction(instruction) = item {
-                    visit(instruction);
-                }
-            }
+            visit_instructions_mut(&mut record.1, &mut visit);
         }
         for origin in &mut self.retained_setup_value_arrays {
-            for item in &mut origin.prefix {
-                if let Item::Instruction(instruction) = item {
-                    visit(instruction);
-                }
-            }
+            visit_instructions_mut(&mut origin.prefix, &mut visit);
         }
         for record in &mut self.copied_finally_iterator_returns {
-            for item in &mut record.1 {
-                if let Item::Instruction(instruction) = item {
-                    visit(instruction);
-                }
-            }
+            visit_instructions_mut(&mut record.1, &mut visit);
         }
         for prefix in &mut self.copied_conjunction_break_prefixes {
-            for item in prefix.iter_mut() {
-                if let Item::Instruction(instruction) = item {
-                    visit(instruction);
-                }
-            }
+            visit_instructions_mut(prefix, &mut visit);
         }
         for origin in &mut self.copied_named_break_truth_prefixes {
-            for item in &mut origin.items {
-                if let Item::Instruction(instruction) = item {
-                    visit(instruction);
-                }
-            }
+            visit_instructions_mut(&mut origin.items, &mut visit);
             visit(&mut origin.original_condition);
         }
         for prefix in &mut self.copied_shared_break_truth_prefixes {
-            for item in prefix.iter_mut() {
-                if let Item::Instruction(instruction) = item {
-                    visit(instruction);
-                }
-            }
+            visit_instructions_mut(prefix, &mut visit);
         }
         for origin in &mut self.original_normal_finally_arrays {
-            for item in &mut origin.prefix {
-                if let Item::Instruction(instruction) = item {
-                    visit(instruction);
-                }
-            }
+            visit_instructions_mut(&mut origin.prefix, &mut visit);
             for instruction in &mut origin.incoming {
                 visit(instruction);
             }
@@ -626,11 +566,7 @@ impl ExceptionOwnerProvenance {
             }
         }
         for origin in &mut self.saved_named_handler_none_prefixes {
-            for item in &mut origin.items {
-                if let Item::Instruction(instruction) = item {
-                    visit(instruction);
-                }
-            }
+            visit_instructions_mut(&mut origin.items, &mut visit);
         }
         for origin in &mut self.copied_manager_return_none_prefixes {
             for instruction in &mut origin.prefix {
@@ -684,11 +620,7 @@ impl ExceptionOwnerProvenance {
             visit(&mut origin.condition);
         }
         for origin in &mut self.uncompacted_conditional_arrays {
-            for item in &mut origin.prefix {
-                if let Item::Instruction(instruction) = item {
-                    visit(instruction);
-                }
-            }
+            visit_instructions_mut(&mut origin.prefix, &mut visit);
         }
         for instruction in &mut self.original_pass_nops {
             visit(instruction);
@@ -721,16 +653,8 @@ impl ExceptionOwnerProvenance {
         }
         for origin in &mut self.async_with_setups {
             visit(&mut origin.send);
-            for item in &mut origin.prefix {
-                if let Item::Instruction(instruction) = item {
-                    visit(instruction);
-                }
-            }
-            for item in &mut origin.cleanup {
-                if let Item::Instruction(instruction) = item {
-                    visit(instruction);
-                }
-            }
+            visit_instructions_mut(&mut origin.prefix, &mut visit);
+            visit_instructions_mut(&mut origin.cleanup, &mut visit);
             if let Some(record) = origin.bridge.as_mut() {
                 visit(&mut record.1);
             }
@@ -739,11 +663,7 @@ impl ExceptionOwnerProvenance {
             visit(&mut record.1);
         }
         for origin in &mut self.normal_try_break_pop_owners {
-            for item in &mut origin.prefix {
-                if let Item::Instruction(instruction) = item {
-                    visit(instruction);
-                }
-            }
+            visit_instructions_mut(&mut origin.prefix, &mut visit);
         }
         for record in self.normal_try_fallthrough_donors.values_mut() {
             visit(&mut record.0);
@@ -772,16 +692,20 @@ impl ExceptionOwnerProvenance {
         for origin in &mut self.source_none_conditions {
             visit(&mut origin.instruction);
             if let Some(prefix) = origin.entry_prefix.as_mut() {
-                for item in prefix.iter_mut() {
-                    if let Item::Instruction(instruction) = item {
-                        visit(instruction);
-                    }
-                }
+                visit_instructions_mut(prefix, &mut visit);
             }
         }
         for record in &mut self.threaded_condition_origins {
             visit(&mut record.0);
             visit(&mut record.1);
+        }
+    }
+}
+
+fn visit_instructions_mut(items: &mut [Item], visit: &mut impl FnMut(&mut Instruction)) {
+    for item in items {
+        if let Item::Instruction(instruction) = item {
+            visit(instruction);
         }
     }
 }
