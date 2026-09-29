@@ -1,0 +1,10 @@
+def f(items, flag, mode, values):
+    for item in items:
+        if mode:
+            if flag:
+                result = consume(item)
+            else:
+                result = consume(item)
+        else:
+            assert False
+        consume(result)

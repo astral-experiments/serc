@@ -47,28 +47,3 @@ type Alias = "Forward" | T
         );
     }
 }
-
-#[test]
-fn private_name_normalization_preserves_nested_scope_bindings() {
-    let source = r"class C:
-    def build(self, values):
-        __x = 1
-        function = lambda __x: _C__x
-        closures = [(lambda: _C__x) for __x in values]
-        generator = (__x for _C__x in values)
-        return function, closures, generator
-";
-    common::assert_matches_cpython_marshal(source, "private_scope_traversal.py");
-}
-
-#[test]
-fn condition_traversal_preserves_branch_and_loop_lowering() {
-    let source = r"def choose(value, flag, values):
-    if not (not value):
-        return 1 if flag else 2
-    while value and flag:
-        break
-    return [item for item in values if not (not item) and flag]
-";
-    common::assert_matches_cpython_marshal(source, "condition_traversal.py");
-}

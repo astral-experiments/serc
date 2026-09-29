@@ -1,0 +1,1 @@
+value = (rf"\ud800" f"\udfff")[-1]

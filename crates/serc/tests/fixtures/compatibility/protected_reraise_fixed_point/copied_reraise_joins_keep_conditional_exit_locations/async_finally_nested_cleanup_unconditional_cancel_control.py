@@ -1,0 +1,15 @@
+async def run(fut):
+    try:
+        return await work()
+    finally:
+        try:
+            fut = start_cleanup()
+            await finish_cleanup(fut)
+        except TimeoutError:
+            warn()
+            try:
+                fut.cancel()
+            except Exception:
+                pass
+        except Exception as error:
+            warn(error)

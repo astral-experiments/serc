@@ -69,16 +69,3 @@ fn matches_cpython_private_global_comprehension_cell_aliases() {
         common::assert_matches_cpython_marshal(&source, "private_global_comprehension_cells.py");
     }
 }
-
-#[test]
-fn matches_cpython_global_comprehension_scope_boundaries() {
-    for source in [
-        "def f(values):\n    global saved\n    (saved := x for x in values)\n    return saved\n",
-        "def f(values):\n    global saved\n    lambda: [saved := x for x in values]\n    return saved\n",
-        "def outer(values):\n    saved = 0\n    def f():\n        nonlocal saved\n        [saved := x for x in values]\n        return saved\n",
-        "def f[T](values):\n    global saved\n    [saved := x for x in values]\n    return saved\n",
-        "[saved := x for x in values]\n",
-    ] {
-        common::assert_matches_cpython_marshal(source, "global_comprehension_scope.py");
-    }
-}

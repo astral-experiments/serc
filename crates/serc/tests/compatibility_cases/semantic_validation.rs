@@ -46,30 +46,6 @@ fn rejects_semantic_errors_before_discarding_code() {
 }
 
 #[test]
-fn semantic_validation_respects_scope_boundaries() {
-    for source in [
-        "from .__future__ import annotations\nx = 1\n",
-        "def f():\n    yield 1\n    def g(x=(yield 2)): pass\n",
-        "async def f():\n    def g(x=await value): pass\n",
-        "def f():\n    return (await x for x in xs)\n",
-        "def f():\n    return (x async for x in xs)\n",
-        "async def f():\n    return [[x async for x in xs] for xs in groups]\n",
-        "from __future__ import annotations\ndef outer():\n    def inner(x: (lambda: (yield 1))): pass\n",
-        "type X = lambda: (yield 1)\n",
-        "type X = lambda: (x := 1)\n",
-        "type X = lambda: (await x for x in xs)\n",
-        "type X = (await x for x in xs)\n",
-        "type X = (x async for x in xs)\n",
-        "from __future__ import annotations\ndef f(x: (await y for y in ys)): pass\n",
-        "def f[T: (await x for x in xs)](): pass\n",
-        "def f[T: (lambda: (yield 1))](): pass\n",
-        "while outer:\n    while inner: pass\n    else: break\n",
-    ] {
-        assert_matches_cpython_marshal(source, "semantic.py");
-    }
-}
-
-#[test]
 fn mapping_pattern_keys_preserve_surrogate_values() {
     let patterns = [
         r"{'\ud800': _, '\ud801': _}",
@@ -345,25 +321,6 @@ fn source_position(source: &str, offset: usize) -> (usize, usize) {
     let line = prefix.bytes().filter(|&byte| byte == b'\n').count() + 1;
     let column = prefix.rsplit('\n').next().unwrap().len() + 1;
     (line, column)
-}
-
-#[test]
-fn final_irrefutable_or_arms_keep_cpython_bytecode() {
-    for source in [
-        "match subject:\n    case [1 | _]: pass\n",
-        "match subject:\n    case [(1 | _)] | [2]: pass\n",
-        "match subject:\n    case {'field': (1 | _)}: pass\n",
-        "match subject:\n    case {'field': (1 | _)} | [2]: pass\n",
-        "match subject:\n    case Point(field=(1 | _)): pass\n",
-        "match subject:\n    case Point(1 | _) | Point(2): pass\n",
-        "match subject:\n    case [([value] | value)]: pass\n",
-        "match subject:\n    case ((1 as value) | value): pass\n",
-        "match subject:\n    case (1 as value) | (_ as value): pass\n",
-        "match subject:\n    case ([value] | value) if condition: pass\n    case _: pass\n",
-        "match subject:\n    case [([value] | value)] | [([value] | value)]: pass\n",
-    ] {
-        assert_matches_cpython_marshal(source, "semantic.py");
-    }
 }
 
 #[test]

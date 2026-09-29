@@ -1,0 +1,3 @@
+with manager:
+    use()
+"ignored"

@@ -20,19 +20,3 @@ fn matches_cpython_empty_finally_join_locations() {
         }
     }
 }
-
-#[test]
-fn matches_cpython_terminal_while_assertion_joins() {
-    common::assert_matches_cpython_marshal(
-        r"def f(flag, stop, first, second):
-    while flag:
-        if stop:
-            break
-        try:
-            assert first or second
-        except Exception:
-            pass
-",
-        "terminal_while_assertion_joins.py",
-    );
-}

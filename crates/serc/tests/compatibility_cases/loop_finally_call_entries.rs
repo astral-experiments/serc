@@ -1,36 +1,6 @@
 use crate::common;
 
 #[test]
-fn matches_cpython_finally_borrows_after_match_break_and_continue() {
-    let source = r#"class Consumer:
-    async def finish(self):
-        await self.input.put(None)
-        try:
-            if self.pending is not None:
-                result = await self.pending
-                if result == Status.FAIL:
-                    raise self.error("input")
-            while True:
-                result = await self.output.get()
-                match result:
-                    case Status.OK:
-                        continue
-                    case Status.FAIL:
-                        record("failure", extra={"id": self.identifier, "streaming": self.streaming})
-                        if not self.streaming:
-                            raise self.error("output")
-                    case None:
-                        break
-                    case _:
-                        unreachable(result)
-        finally:
-            await self.task
-            await self.logger.flush()
-"#;
-    common::assert_matches_cpython_marshal(source, "match_break_async_finally.py");
-}
-
-#[test]
 fn matches_cpython_finally_calls_reached_by_retained_breaks() {
     for (prefix, cleanup) in [("", "x.close()"), ("async ", "await x.close()")] {
         for (name, body) in [
@@ -189,62 +159,4 @@ fn matches_cpython_nested_setup_finally_break_entries() {
     ] {
         common::assert_matches_cpython_marshal(&source, &format!("nested_setup_finally_{name}.py"));
     }
-}
-
-#[test]
-fn matches_cpython_normal_finally_authored_break_await_keyword() {
-    let source = r"async def target(queue, finished, pending, gather, task):
-    try:
-        while True:
-            if not pending:
-                if finished and not pending:
-                    break
-                item = await queue.get()
-                pending.append(item)
-                continue
-            item = pending.pop()
-            yield item
-    except Exception:
-        task.cancel()
-        raise
-    finally:
-        await gather(task, return_exceptions=True)
-        if pending:
-            await gather(*pending, return_exceptions=True)
-";
-    common::assert_matches_cpython_marshal(
-        source,
-        "normal_finally_authored_break_await_keyword.py",
-    );
-}
-
-#[test]
-fn matches_cpython_normal_finally_authored_break_await_name_with() {
-    let source = r"async def target(manager, queue, cleanup, record):
-    with manager as token:
-        total = 0
-        try:
-            while True:
-                if total == 0:
-                    item = await queue.get()
-                else:
-                    item = await queue.get()
-                if isinstance(item, Exception):
-                    raise item
-                if item is None:
-                    break
-                total += 1
-                yield item
-        except Exception:
-            record(token)
-            raise
-        finally:
-            await cleanup
-        fresh = total + 1
-        record(token, total, fresh)
-";
-    common::assert_matches_cpython_marshal(
-        source,
-        "normal_finally_authored_break_await_name_with.py",
-    );
 }

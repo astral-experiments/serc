@@ -26,28 +26,6 @@ fn matches_cpython_condition_span_after_terminating_nested_handler() {
 }
 
 #[test]
-fn matches_cpython_nested_handler_condition_span_with_setup() {
-    let source = r"def f(flag, value):
-    if flag:
-        try:
-            return primary(value)
-        except ValueError:
-            try:
-                parsed = parse(value)
-            except TypeError:
-                return None
-            if isinstance(parsed, str):
-                prepared = parsed.strip()
-                try:
-                    return secondary(prepared)
-                except TypeError:
-                    return None
-    return None
-";
-    common::assert_matches_cpython_marshal(source, "nested_handler_condition_span_with_setup.py");
-}
-
-#[test]
 fn matches_cpython_nested_handler_cleanup_locations() {
     for binding in ["", " as error"] {
         for condition in ["flag", "flag and value", "flag or value"] {

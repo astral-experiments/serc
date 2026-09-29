@@ -60,65 +60,6 @@ fn matches_cpython_exceptional_finally_handler_copy_locations() {
 }
 
 #[test]
-fn matches_cpython_handler_finally_return_cleanup_locations() {
-    for (filename, source) in [
-        (
-            "handler_finally_attribute_assignment_return_location_target.py",
-            r"def f(load, manager, state, saved):
-    try:
-        return load()
-    except ValueError:
-        try:
-            with manager():
-                return load()
-        finally:
-            state.value = saved
-",
-        ),
-        (
-            "handler_finally_local_delete_return_location_target.py",
-            r"def f(load, make_frame):
-    try:
-        return load()
-    except NameError:
-        frame = make_frame()
-        try:
-            return load(frame)
-        except Exception:
-            return {}
-        finally:
-            del frame
-",
-        ),
-        (
-            "handler_finally_call_return_location_control.py",
-            r"def f(load, manager, cleanup):
-    try:
-        return load()
-    except ValueError:
-        try:
-            with manager():
-                return load()
-        finally:
-            cleanup()
-",
-        ),
-        (
-            "finally_attribute_assignment_no_outer_handler_control.py",
-            r"def f(load, manager, state, saved):
-    try:
-        with manager():
-            return load()
-    finally:
-        state.value = saved
-",
-        ),
-    ] {
-        common::assert_matches_cpython_marshal(source, filename);
-    }
-}
-
-#[test]
 fn preserves_original_jump_slot_before_attribute_store_reraise() {
     for value in ["0", "False", "None"] {
         let source = format!(

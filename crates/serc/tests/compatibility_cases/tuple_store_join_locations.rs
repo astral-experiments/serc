@@ -22,36 +22,3 @@ fn matches_cpython_tuple_store_join_locations() {
         common::assert_matches_cpython_marshal(&source, "tuple_store_join.py");
     }
 }
-
-#[test]
-fn matches_cpython_tuple_store_shared_and_flat_join_controls() {
-    for source in [
-        // The inner join becomes private, while the enclosing join remains shared.
-        r"def f(a, b, c, d):
-    if a:
-        left = work()
-        right = work()
-    elif b:
-        if c:
-            if d:
-                left = work()
-                right = work()
-            else:
-                left, right = [], []
-        else:
-            left, right = [], []
-    else:
-        left, right = [], []
-    return left, right
-",
-        r"def f(a):
-    if a:
-        left, right = [], []
-    else:
-        left, right = [], []
-    return left, right
-",
-    ] {
-        common::assert_matches_cpython_marshal(source, "tuple_store_shared_join.py");
-    }
-}

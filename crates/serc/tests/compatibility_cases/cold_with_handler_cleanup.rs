@@ -2,46 +2,6 @@ use crate::common;
 use crate::common::indent;
 
 #[test]
-fn matches_cpython_module_with_discarded_tail_boundaries() {
-    for (filename, source) in [
-        (
-            "with_then_constant_terminal_if.py",
-            "if enabled:\n    with manager:\n        use()\n    \"ignored\"\n",
-        ),
-        (
-            "with_then_false_terminal_if.py",
-            "with manager:\n    use()\nif False:\n    ignored()\n",
-        ),
-        (
-            "terminal_with_control.py",
-            "if enabled:\n    with manager:\n        use()\n",
-        ),
-        (
-            "with_then_call_control.py",
-            "with manager:\n    use()\nfinish()\n",
-        ),
-        (
-            "module_with_string_single.py",
-            "with manager:\n    use()\n\"ignored\"\n",
-        ),
-        (
-            "module_with_string_multiline.py",
-            "with manager:\n    use()\n\"\"\"ignored\nsecond line\n\"\"\"\n",
-        ),
-        (
-            "module_nested_with_string_multiline.py",
-            "with first:\n    with second:\n        use()\n\"\"\"ignored\nsecond line\n\"\"\"\n",
-        ),
-        (
-            "folded_true_with_string_control.py",
-            "if True:\n    with manager:\n        use()\n    \"ignored\"\n",
-        ),
-    ] {
-        common::assert_matches_cpython_marshal(source, filename);
-    }
-}
-
-#[test]
 fn matches_cpython_terminal_named_with_cleanup_copies() {
     for (scope, prefix, with_keyword) in [
         ("def", "", "with"),
@@ -169,53 +129,6 @@ fn matches_cpython_nested_handler_pop_preserves_intervening_manager() {
         );
         common::assert_matches_cpython_marshal(&source, "nested_handler_intervening_manager.py");
     }
-}
-
-#[test]
-fn matches_cpython_original_manager_pop_blocks_after_finally() {
-    common::assert_matches_cpython_marshal(
-        r"async def f(manager, items):
-    count = 0
-    with manager:
-        try:
-            async for item in items:
-                count += 1
-                yield item
-        finally:
-            report(count)
-",
-        "1814_async_for_finally.py",
-    );
-    common::assert_matches_cpython_marshal(
-        r"def f(manager, first, second):
-    with manager:
-        try:
-            prepare()
-            with first, second:
-                yield
-        finally:
-            try:
-                flush()
-                flush_other()
-            except Error:
-                pass
-            try:
-                restore()
-            finally:
-                close()
-",
-        "1688_nested_finally.py",
-    );
-    common::assert_matches_cpython_marshal(
-        r"def f(manager):
-    with manager:
-        try:
-            work()
-        finally:
-            close()
-",
-        "manager_pop_simple_control.py",
-    );
 }
 
 #[test]

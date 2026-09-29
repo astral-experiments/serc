@@ -104,21 +104,6 @@ fn preserves_nested_tuple_construction_order_after_exit_copying() {
 }
 
 #[test]
-fn matches_cpython_marshal_for_conditional_constant_tuple_exit_locations() {
-    for source in [
-        "def f(flag):\n    return (\n        0 if flag else 1,\n        0,\n        '',\n    )\n",
-        "def f(flag):\n    if flag:\n        return (0 if flag else 1, 0, '')\n    return (1, 2)\n",
-        "def f(flag):\n    return (1, 0 if flag else 1, 0)\n",
-        "def f(flag):\n    return ((1, 2), 0 if flag else 1, 0)\n",
-    ] {
-        common::assert_matches_cpython_marshal(
-            source,
-            "conditional_constant_tuple_exit_locations.py",
-        );
-    }
-}
-
-#[test]
 fn matches_cpython_constant_tuple_order_after_exit_copying() {
     for definition in ["def", "async def"] {
         for prefix in [

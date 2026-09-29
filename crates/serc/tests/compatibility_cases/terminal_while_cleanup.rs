@@ -38,14 +38,6 @@ def retry(request):
 "#;
 
 #[test]
-fn matches_cpython_terminal_while_raising_handler_cleanup_target() {
-    common::assert_matches_cpython_marshal(
-        RETRY_CLEANUP,
-        "terminal_while_raising_handler_cleanup_target.py",
-    );
-}
-
-#[test]
 fn matches_cpython_terminal_while_linear_handler_cleanup_control() {
     let source = RETRY_CLEANUP.replace("        raise error\n", "");
     common::assert_matches_cpython_marshal(

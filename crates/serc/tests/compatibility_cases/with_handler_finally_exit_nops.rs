@@ -102,12 +102,6 @@ fn matches_cpython_nested_pass_finally_continuation() {
 }
 
 #[test]
-fn matches_cpython_manager_pop_after_conditional_for_exhaustion() {
-    let source = "def example(manager, values, flag):\n    with manager:\n        if flag:\n            for value in values:\n                consume(value)\n        else:\n            raise Error\n    finish()\n";
-    common::assert_matches_cpython_marshal(source, "manager_pop_conditional_for.py");
-}
-
-#[test]
 fn matches_cpython_nested_manager_in_coroutine_finally() {
     for (prefix, suspension, inner) in [
         ("", "", "log()"),

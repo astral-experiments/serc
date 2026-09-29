@@ -1,118 +1,6 @@
 use crate::common;
 
 #[test]
-fn matches_cpython_folded_condition_at_an_empty_join() {
-    for (filename, source) in [
-        (
-            "truthy_and_after_conditional_join.py",
-            r"def scan(lines):
-    found = False
-    for line in lines:
-        if 'first' in line:
-            found = True
-        if 'enabled' and 'second' in line:
-            found = True
-    return found
-",
-        ),
-        (
-            "false_or_after_conditional_join.py",
-            r"def scan(lines):
-    found = False
-    for line in lines:
-        if 'first' in line:
-            found = True
-        if 0 or 'second' in line:
-            found = True
-    return found
-",
-        ),
-    ] {
-        common::assert_matches_cpython_marshal(source, filename);
-    }
-}
-
-#[test]
-fn matches_cpython_folded_condition_borrow_controls() {
-    for (filename, source) in [
-        (
-            "truthy_and_in_nonempty_block.py",
-            r"def scan(lines):
-    found = False
-    for line in lines:
-        found = False
-        if 'enabled' and 'second' in line:
-            found = True
-    return found
-",
-        ),
-        (
-            "retained_multiline_truthy_operand.py",
-            r"def scan(lines):
-    found = False
-    for line in lines:
-        if 'first' in line:
-            found = True
-        if (
-            'enabled'
-            and 'second' in line
-        ):
-            found = True
-    return found
-",
-        ),
-        (
-            "runtime_operand_after_conditional_join.py",
-            r"def scan(lines, enabled):
-    found = False
-    for line in lines:
-        if 'first' in line:
-            found = True
-        if enabled and 'second' in line:
-            found = True
-    return found
-",
-        ),
-    ] {
-        common::assert_matches_cpython_marshal(source, filename);
-    }
-}
-
-#[test]
-fn matches_cpython_taken_constant_borrow_controls() {
-    for (filename, source) in [
-        (
-            "retained_truthy_after_nonempty_block.py",
-            r"def scan(lines):
-    found = False
-    for line in lines:
-        found = False
-        if (
-            'enabled'
-            and 'second' in line
-        ):
-            found = True
-    return found
-",
-        ),
-        (
-            "taken_number_after_conditional_join.py",
-            r"def scan(lines):
-    found = False
-    for line in lines:
-        if 'first' in line:
-            found = True
-        if 1 and 'second' in line:
-            found = True
-    return found
-",
-        ),
-    ] {
-        common::assert_matches_cpython_marshal(source, filename);
-    }
-}
-
-#[test]
 fn matches_cpython_short_circuit_constant_borrow_entries() {
     for (filename, condition) in [
         ("false_and_dead_operand.py", "0 and check(x)"),
@@ -135,15 +23,6 @@ fn matches_cpython_short_circuit_constant_borrow_entries() {
         );
         common::assert_matches_cpython_marshal(&source, filename);
     }
-}
-
-#[test]
-fn matches_cpython_pending_outer_boolean_entry() {
-    let source = r"def f(x):
-    if ready() or (True or check(x)):
-        consume(x)
-";
-    common::assert_matches_cpython_marshal(source, "pending_outer_boolean_entry.py");
 }
 
 #[test]

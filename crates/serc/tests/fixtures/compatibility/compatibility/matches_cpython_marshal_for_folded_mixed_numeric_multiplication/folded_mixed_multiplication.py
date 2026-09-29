@@ -1,0 +1,10 @@
+int_float = 65 * 1e9
+float_int = 1e9 * 65
+negative_int_float = -7 * 0.25
+float_negative_int = 0.25 * -7
+bool_float = True * 1.5
+float_bool = 1.5 * False
+signed_zero_left = -0.0 * 3
+signed_zero_right = 3 * -0.0
+overflow = 1e308 * 10
+underflow = 1e-308 * 1e-308

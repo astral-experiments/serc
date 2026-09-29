@@ -1,0 +1,1 @@
+value = item[r"\ud800" "\udfff":]

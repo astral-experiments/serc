@@ -196,14 +196,6 @@ fn copied_return_pop_slot_source(request: &str) -> String {
 }
 
 #[test]
-fn copied_call_return_none_marker_after_completed_async_manager() {
-    common::assert_matches_cpython_marshal(
-        copied_call_return_none_source(),
-        "copied_call_return_none_after_async_manager.py",
-    );
-}
-
-#[test]
 fn copied_call_return_none_marker_without_handler_control() {
     let source = copied_call_return_none_source().replace(
         "    except Exception:\n        return Result(value=None)\n",
@@ -213,60 +205,15 @@ fn copied_call_return_none_marker_without_handler_control() {
 }
 
 fn copied_call_return_none_source() -> &'static str {
-    r"async def collect(resource, payload):
-    try:
-        async with channel(resource):
-            await ready()
-        return Result(value=payload)
-    except Exception:
-        return Result(value=None)
-    finally:
-        if resource is not None:
-            await resource.close()
-"
+    include_str!(
+        "../fixtures/compatibility/earlier_exception_owner_slots/copied_call_return_none_marker_after_completed_async_manager/copied_call_return_none_after_async_manager.py"
+    )
 }
 
 fn missing_not_taken_owner_duplicate_store_source() -> &'static str {
-    r#"class Worker(Base):
-    async def run(self, sample):
-        result = await super().run(sample)
-        accepted = result.items[0].accepted if result.items else None
-        output = output = result.metadata.get("response")
-        extra = result.extra.copy() if result.extra else {}
-        extra["accepted"] = accepted
-        extra["output"] = output
-        if result.items:
-            data = result.metadata.copy()
-            data["accepted"] = accepted
-            return Result.good(
-                worker_name="worker",
-                sample_id=sample.sample_id,
-                reward_name="worker",
-                accepted=True,
-                metadata=data,
-                extra_metadata=extra,
-                metrics=result.metrics,
-            )
-        else:
-            data = result.metadata.copy()
-            data["accepted"] = None
-            return Result.failed(
-                worker_name="worker",
-                sample_id=sample.sample_id,
-                errors=result.errors,
-                answer=result.answer,
-                extra_metadata=extra,
-                metadata=data,
-            )
-"#
-}
-
-#[test]
-fn missing_not_taken_owner_after_duplicate_store() {
-    common::assert_matches_cpython_marshal(
-        missing_not_taken_owner_duplicate_store_source(),
-        "missing_not_taken_owner_after_duplicate_store.py",
-    );
+    include_str!(
+        "../fixtures/compatibility/earlier_exception_owner_slots/missing_not_taken_owner_after_duplicate_store/missing_not_taken_owner_after_duplicate_store.py"
+    )
 }
 
 #[test]
@@ -282,38 +229,9 @@ fn missing_not_taken_owner_single_store_control() {
 }
 
 fn cell_try_else_ternary_owner_source() -> &'static str {
-    r#"def select_values(rows, fraction=0.10):
-    values = (
-        rows.map(lambda item: item.get("value"))
-        .filter(lambda value: value is not None)
-        .map(lambda value: (float(value),))
-        .persist()
+    include_str!(
+        "../fixtures/compatibility/earlier_exception_owner_slots/cell_try_else_ternary_owner/cell_try_else_ternary_owner.py"
     )
-    threshold = None
-    try:
-        try:
-            values.first()
-        except Exception:
-            threshold = None
-        else:
-            session = Session.builder.config(conf=rows.context.getConf()).getOrCreate()
-            table = session.createDataFrame(values, schema=["value"])
-            samples = table.approxQuantile("value", [fraction], 0.001)
-            threshold = samples[0] if samples else None
-    finally:
-        values.unpersist()
-    if threshold is None:
-        return rows.context.parallelize([])
-    return rows.filter(lambda item: item.get("value") is not None and float(item["value"]) <= threshold)
-"#
-}
-
-#[test]
-fn cell_try_else_ternary_owner() {
-    common::assert_matches_cpython_marshal(
-        cell_try_else_ternary_owner_source(),
-        "cell_try_else_ternary_owner.py",
-    );
 }
 
 #[test]

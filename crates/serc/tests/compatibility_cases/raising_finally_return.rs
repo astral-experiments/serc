@@ -1,26 +1,6 @@
 use crate::common;
 
 #[test]
-fn matches_cpython_return_through_raising_finally() {
-    for source in [
-        "def f():\n    try:\n        return 1\n    finally:\n        raise RuntimeError('cleanup')\n",
-        "async def f():\n    try:\n        return 1\n    finally:\n        raise RuntimeError('cleanup')\n",
-        "def f():\n    try:\n        yield 1\n        pass\n        return 2\n    finally:\n        raise RuntimeError('cleanup')\n",
-        "def f():\n    try:\n        yield 1\n        x = 1\n        return x\n    finally:\n        raise RuntimeError('cleanup')\n",
-        "def f():\n    try:\n        yield from ()\n        return 2\n    finally:\n        raise RuntimeError('cleanup')\n",
-        "def f(value, cleanup, cause):\n    try:\n        return value()\n    finally:\n        record()\n        raise cleanup() from cause\n",
-        "def f():\n    try:\n        return\n    finally:\n        raise\n",
-        "def f():\n    try:\n        return 1\n    finally:\n        raise RuntimeError('cleanup')\n        pass\n",
-        "def f(flag, first, second):\n    try:\n        return 1\n    finally:\n        raise first if flag else second\n",
-        "async def f(value, cleanup):\n    try:\n        return await value()\n    finally:\n        raise await cleanup()\n",
-        "def f(flag):\n    try:\n        return 1\n    finally:\n        if flag:\n            raise ValueError()\n        else:\n            raise RuntimeError()\n",
-        "def f():\n    try:\n        return 1\n    finally:\n        try:\n            record()\n        finally:\n            raise RuntimeError()\n",
-    ] {
-        common::assert_matches_cpython_marshal(source, "raising_finally_return.py");
-    }
-}
-
-#[test]
 fn matches_cpython_raising_finally_with_branches_and_suspensions() {
     for (returned, cleanup) in [
         ("payload", "raise error"),
