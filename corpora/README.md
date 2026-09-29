@@ -44,5 +44,7 @@ python3 scripts/mypy_primer_corpus.py verify
 Review every resolved repository revision. Keep the catalog revision in the lock
 and `.github/workflows/ci.yml` identical. Rerun the catalog check, manager
 tests, and full compatibility comparison, explicitly updating the outcome
-baseline and [measurement summary](results/current.json) when results change.
-Ordinary validation must not refresh revisions or resolve moving branches.
+baseline and
+[compatibility guide](../docs/compatibility.md#public-corpus-compatibility) when
+results change. Ordinary validation must not refresh revisions or resolve moving
+branches.
