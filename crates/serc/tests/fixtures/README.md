@@ -18,4 +18,5 @@ adjacent Markdown files, outside the compiled source.
 
 Run all fixtures with `cargo test -p serc --test fixtures`, or append
 `-- <path-substring>` to select a case or group. Generated sources and tests
-with additional runtime or compiler assertions remain in Rust.
+with platform restrictions or additional runtime or compiler assertions remain
+in Rust.
