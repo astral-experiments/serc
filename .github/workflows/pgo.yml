@@ -3,7 +3,7 @@ name: PGO
 on:
   push:
     branches: [main]
-    paths:
+    paths: &pgo-paths
       - .github/workflows/pgo.yml
       - .github/actions/setup-python/**
       - scripts/build-pgo-release
@@ -18,20 +18,7 @@ on:
       - rust-toolchain.toml
       - vendor/ruff
   pull_request:
-    paths:
-      - .github/workflows/pgo.yml
-      - .github/actions/setup-python/**
-      - scripts/build-pgo-release
-      - scripts/check-cpython-compatibility
-      - scripts/check-ruff-pin
-      - scripts/ruff-corpus-expectations
-      - scripts/pgo_corpus.py
-      - scripts/test_pgo_corpus.py
-      - scripts/benchmarks/**
-      - Cargo.toml
-      - Cargo.lock
-      - rust-toolchain.toml
-      - vendor/ruff
+    paths: *pgo-paths
   workflow_dispatch:
 
 permissions: {}
