@@ -1,6 +1,3 @@
-use std::io::Write as _;
-use std::process::{Command, Stdio};
-
 use serc::{CompileOptions, PythonVersion, compile_bytes_with_options, compile_with_options};
 
 const SOURCE: &str =
@@ -11,7 +8,6 @@ const FILENAME: &str = "exceptional_finally_assert_success.py";
 fn matches_cpython_312_exceptional_finally_assert_success() {
     let version = PythonVersion::Py312;
     let target = version.target();
-    let python = std::env::var_os("SERC_TEST_PYTHON_312").unwrap_or_else(|| "python3.12".into());
     let oracle = r"
 import importlib.util, marshal, sys
 assert sys.implementation.name == 'cpython'
@@ -33,21 +29,12 @@ sys.stdout.buffer.write(marshal.dumps(code))
         "def f(a, b, c):\n    for _ in range(2):\n        try:\n            g()\n        finally:\n            assert a is b and not a.value\n",
         "def f(a, b, c):\n    try:\n        yield a\n    finally:\n        assert a is b and not a.value\n",
     ] {
-        let mut child = Command::new(&python)
-            .args(["-I", "-S", "-X", "utf8", "-c", oracle])
-            .args([&target.magic_hex(), FILENAME])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(source.as_bytes())
-            .unwrap();
-        let expected = child.wait_with_output().unwrap();
+        let expected = crate::common::cpython::run_with_input(
+            crate::common::cpython::command(version)
+                .args(["-I", "-S", "-X", "utf8", "-c", oracle])
+                .args([&target.magic_hex(), FILENAME]),
+            source.as_bytes(),
+        );
         assert!(
             expected.status.success(),
             "CPython 3.12 oracle failed: {}",

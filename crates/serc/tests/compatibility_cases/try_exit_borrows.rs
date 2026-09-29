@@ -1515,9 +1515,6 @@ fn preserves_nested_try_body_conditional_borrow_successors() {
 
 #[test]
 fn preserves_native_borrowed_prefix_after_noelse_recovery() {
-    use std::io::Write as _;
-    use std::process::Stdio;
-
     // These sources still differ in later shared-cleanup layout. Their normal
     // prefix was already native-exact; preserve its bytes and source positions.
     // Keep the whole-marshal checks above and the corpus checks unchanged.
@@ -1547,15 +1544,10 @@ assert actual.co_varnames == expected.co_varnames
         );
         let filename = "noelse_recovery_borrow_prefix.py";
         let actual = serc::compile(&source, filename).unwrap().marshal();
-        let mut child = common::python_3145_command()
-            .args(["-c", oracle, &source, filename])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        child.stdin.take().unwrap().write_all(&actual).unwrap();
-        let output = child.wait_with_output().unwrap();
+        let output = crate::common::cpython::run_with_input(
+            common::python_3145_command().args(["-c", oracle, &source, filename]),
+            &actual,
+        );
         assert!(
             output.status.success(),
             "native borrowed prefix changed for named={named}: {}",
@@ -1566,9 +1558,6 @@ assert actual.co_varnames == expected.co_varnames
 
 #[test]
 fn preserves_native_borrowed_prefix_after_folded_false_recovery_loop() {
-    use std::io::Write as _;
-    use std::process::Stdio;
-
     // This source retains an inherited marshal mismatch. Its normal prefix was
     // native-exact before orphan detection; preserve its bytes and positions.
     let oracle = r#"
@@ -1595,15 +1584,10 @@ assert actual.co_varnames == expected.co_varnames
 ";
     let filename = "folded_false_recovery_borrow_prefix.py";
     let actual = serc::compile(source, filename).unwrap().marshal();
-    let mut child = common::python_3145_command()
-        .args(["-c", oracle, source, filename])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child.stdin.take().unwrap().write_all(&actual).unwrap();
-    let output = child.wait_with_output().unwrap();
+    let output = crate::common::cpython::run_with_input(
+        common::python_3145_command().args(["-c", oracle, source, filename]),
+        &actual,
+    );
     assert!(
         output.status.success(),
         "native borrowed prefix changed after a folded false loop: {}",

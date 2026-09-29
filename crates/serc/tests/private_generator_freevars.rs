@@ -1,5 +1,5 @@
-use std::io::Write;
-use std::process::{Command, Stdio};
+#[path = "common/cpython.rs"]
+mod cpython;
 
 use serc::{CompileOptions, PythonVersion, compile_with_options};
 
@@ -60,34 +60,24 @@ assert list(g) == [(1, 2)]
     ];
     let oracle = "import importlib.util, marshal, sys; assert sys.implementation.name == 'cpython'; assert sys.version.split()[0] == sys.argv[1]; assert importlib.util.MAGIC_NUMBER.hex() == sys.argv[2]; code = compile(sys.stdin.read(), 'private_generator.py', 'exec', dont_inherit=True, optimize=0); sys.stdout.buffer.write(marshal.dumps(code))";
     let run = "import marshal, sys; exec(marshal.loads(sys.stdin.buffer.read()))";
-    for (version, variable, fallback) in [
-        (PythonVersion::Py312, "SERC_TEST_PYTHON_312", "python3.12"),
-        (PythonVersion::Py313, "SERC_TEST_PYTHON_313", "python3.13"),
-        (PythonVersion::Py314, "SERC_TEST_PYTHON", "python3.14"),
-        (PythonVersion::Py315, "SERC_TEST_PYTHON_315", "python3.15"),
+    for version in [
+        PythonVersion::Py312,
+        PythonVersion::Py313,
+        PythonVersion::Py314,
+        PythonVersion::Py315,
     ] {
-        let executable = std::env::var_os(variable).unwrap_or_else(|| fallback.into());
         let target = version.target();
         let options = CompileOptions {
             python_version: version,
             ..CompileOptions::default()
         };
         for (index, source) in cases.iter().enumerate() {
-            let mut child = Command::new(&executable)
-                .args(["-I", "-S", "-c", oracle])
-                .args([target.tag.trim_start_matches('v'), &target.magic_hex()])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("start the pinned CPython oracle");
-            child
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(source.as_bytes())
-                .unwrap();
-            let expected = child.wait_with_output().unwrap();
+            let expected = cpython::run_with_input(
+                cpython::command(version)
+                    .args(["-I", "-S", "-c", oracle])
+                    .args([target.tag.trim_start_matches('v'), &target.magic_hex()]),
+                source.as_bytes(),
+            );
             assert!(
                 expected.status.success(),
                 "{}",
@@ -106,15 +96,10 @@ assert list(g) == [(1, 2)]
                 actual.len(),
                 expected.stdout.len()
             );
-            let mut child = Command::new(&executable)
-                .args(["-I", "-S", "-c", run])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("start the pinned CPython runtime");
-            child.stdin.take().unwrap().write_all(&actual).unwrap();
-            let result = child.wait_with_output().unwrap();
+            let result = cpython::run_with_input(
+                cpython::command(version).args(["-I", "-S", "-c", run]),
+                &actual,
+            );
             assert!(
                 result.status.success(),
                 "{version:?}, case {index}: {}",

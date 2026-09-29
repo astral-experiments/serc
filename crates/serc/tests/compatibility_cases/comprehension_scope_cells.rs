@@ -234,9 +234,6 @@ print(C().outer())
 
 #[test]
 fn nested_generator_global_matches_other_cpython_targets() {
-    use std::io::Write as _;
-    use std::process::{Command, Stdio};
-
     use serc::{CompileOptions, PythonVersion, compile_with_options};
 
     let oracle = r"
@@ -248,12 +245,11 @@ code = compile(sys.stdin.read(), sys.argv[3], 'exec', dont_inherit=True, optimiz
 sys.stdout.buffer.write(marshal.dumps(code))
 ";
     let filename = "nested_generator_scope.py";
-    for (version, variable, default) in [
-        (PythonVersion::Py312, "SERC_TEST_PYTHON_312", "python3.12"),
-        (PythonVersion::Py313, "SERC_TEST_PYTHON_313", "python3.13"),
-        (PythonVersion::Py315, "SERC_TEST_PYTHON_315", "python3.15"),
+    for version in [
+        PythonVersion::Py312,
+        PythonVersion::Py313,
+        PythonVersion::Py315,
     ] {
-        let python = std::env::var_os(variable).unwrap_or_else(|| default.into());
         let target = version.target();
         let options = CompileOptions {
             python_version: version,
@@ -264,25 +260,16 @@ sys.stdout.buffer.write(marshal.dumps(code))
             "def outer():\n    x = 1\n    def f():\n        return (x for y in [x for x in [1]])\n",
             "def outer():\n    def f():\n        return (x for y in [(lambda: x) for x in [1]])\n",
         ] {
-            let mut child = Command::new(&python)
-                .args(["-I", "-S", "-X", "utf8", "-c", oracle])
-                .args([
-                    target.tag.strip_prefix('v').unwrap(),
-                    &target.magic_hex(),
-                    filename,
-                ])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap();
-            child
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(source.as_bytes())
-                .unwrap();
-            let expected = child.wait_with_output().unwrap();
+            let expected = crate::common::cpython::run_with_input(
+                crate::common::cpython::command(version)
+                    .args(["-I", "-S", "-X", "utf8", "-c", oracle])
+                    .args([
+                        target.tag.strip_prefix('v').unwrap(),
+                        &target.magic_hex(),
+                        filename,
+                    ]),
+                source.as_bytes(),
+            );
             assert!(
                 expected.status.success(),
                 "{version}: {}",

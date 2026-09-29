@@ -115,34 +115,21 @@ fn mapping_pattern_keys_preserve_surrogate_values() {
 
 #[test]
 fn surrogate_mapping_keys_match_other_cpython_targets() {
-    use std::io::Write as _;
-    use std::process::{Command, Stdio};
-
     let source = "match subject:\n    case {'\\ud800': _, '\\ud801': _, '\\ufffd': _}: pass\n";
     let script = "import importlib.util, marshal, sys; assert sys.implementation.name == 'cpython'; assert sys.version.split()[0] == sys.argv[1]; assert importlib.util.MAGIC_NUMBER.hex() == sys.argv[2]; code = compile(sys.stdin.buffer.read(), 'semantic.py', 'exec', dont_inherit=True, optimize=0); sys.stdout.buffer.write(marshal.dumps(code))";
-    for (python_version, variable, default) in [
-        (PythonVersion::Py312, "SERC_TEST_PYTHON_312", "python3.12"),
-        (PythonVersion::Py313, "SERC_TEST_PYTHON_313", "python3.13"),
-        (PythonVersion::Py314, "SERC_TEST_PYTHON", "python3.14"),
-        (PythonVersion::Py315, "SERC_TEST_PYTHON_315", "python3.15"),
+    for python_version in [
+        PythonVersion::Py312,
+        PythonVersion::Py313,
+        PythonVersion::Py314,
+        PythonVersion::Py315,
     ] {
-        let executable = std::env::var_os(variable).unwrap_or_else(|| default.into());
         let target = python_version.target();
-        let mut child = Command::new(executable)
-            .args(["-I", "-S", "-X", "utf8", "-c", script])
-            .args([target.tag.strip_prefix('v').unwrap(), &target.magic_hex()])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(source.as_bytes())
-            .unwrap();
-        let expected = child.wait_with_output().unwrap();
+        let expected = crate::common::cpython::run_with_input(
+            crate::common::cpython::command(python_version)
+                .args(["-I", "-S", "-X", "utf8", "-c", script])
+                .args([target.tag.strip_prefix('v').unwrap(), &target.magic_hex()]),
+            source.as_bytes(),
+        );
         assert!(
             expected.status.success(),
             "{}",

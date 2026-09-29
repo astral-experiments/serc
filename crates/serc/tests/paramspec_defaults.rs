@@ -1,6 +1,5 @@
-use std::ffi::OsString;
-use std::io::Write;
-use std::process::{Command, Stdio};
+#[path = "common/cpython.rs"]
+mod cpython;
 
 use serc::{
     CompileError, CompileOptions, PythonVersion, compile_bytes_with_options, compile_with_options,
@@ -100,33 +99,23 @@ fn newer_targets_keep_parameter_specification_defaults() {
         "def f[**P = ...](): pass\n",
         "async def f[**P = ...](): pass\n",
     ];
-    for (version, variable, fallback) in [
-        (PythonVersion::Py313, "SERC_TEST_PYTHON_313", "python3.13"),
-        (PythonVersion::Py314, "SERC_TEST_PYTHON", "python3.14"),
-        (PythonVersion::Py315, "SERC_TEST_PYTHON_315", "python3.15"),
+    for version in [
+        PythonVersion::Py313,
+        PythonVersion::Py314,
+        PythonVersion::Py315,
     ] {
-        let executable: OsString = std::env::var_os(variable).unwrap_or_else(|| fallback.into());
         let target = version.target();
         let options = CompileOptions {
             python_version: version,
             ..CompileOptions::default()
         };
         for source in cases {
-            let mut child = Command::new(&executable)
-                .args(["-I", "-S", "-c", ORACLE])
-                .args([target.tag.trim_start_matches('v'), &target.magic_hex()])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("start the pinned CPython oracle");
-            child
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(source.as_bytes())
-                .unwrap();
-            let expected = child.wait_with_output().unwrap();
+            let expected = cpython::run_with_input(
+                cpython::command(version)
+                    .args(["-I", "-S", "-c", ORACLE])
+                    .args([target.tag.trim_start_matches('v'), &target.magic_hex()]),
+                source.as_bytes(),
+            );
             assert!(
                 expected.status.success(),
                 "{version:?}: {source}: {}",

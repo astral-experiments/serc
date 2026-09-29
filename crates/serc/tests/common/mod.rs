@@ -1,8 +1,8 @@
-use std::io::Write as _;
-use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+pub(crate) mod cpython;
 
-use serc::{CPYTHON_TARGET, compile, compile_bytes, compile_to_pyc};
+use std::process::Command;
+
+use serc::{compile, compile_bytes, compile_to_pyc};
 use tempfile::tempdir;
 
 const CPYTHON_MARSHAL: &str = "import marshal, sys; code = compile(sys.stdin.read(), sys.argv[1], 'exec', dont_inherit=True, optimize=0); sys.stdout.buffer.write(marshal.dumps(code))";
@@ -39,54 +39,8 @@ for code in walk(root):
         print(code.co_qualname, positions)
 "#;
 
-const PYTHON_3145_IDENTITY_CHECK: &str = "import importlib.util, sys; expected = tuple(map(int, sys.argv[2].split('.'))) + ('final', 0); actual = sys.version_info; magic = importlib.util.MAGIC_NUMBER.hex(); ok = sys.implementation.name == sys.argv[1] and actual == expected and magic == sys.argv[3]; print(f'{sys.implementation.name} {'.'.join(map(str, actual[:3]))} {actual.releaselevel} {actual.serial} magic {magic}', file=sys.stderr); raise SystemExit(not ok)";
-
-static PYTHON_3145: OnceLock<Result<String, String>> = OnceLock::new();
-
-fn python_3145() -> &'static str {
-    match PYTHON_3145.get_or_init(discover_python_3145) {
-        Ok(executable) => executable,
-        Err(error) => panic!("{error}"),
-    }
-}
-
-fn discover_python_3145() -> Result<String, String> {
-    let configured = std::env::var("SERC_TEST_PYTHON").ok();
-    let executable = configured.as_deref().unwrap_or("python3.14");
-    let version = CPYTHON_TARGET.version_string();
-    let magic = CPYTHON_TARGET.magic_hex();
-    let output = Command::new(executable)
-        .args([
-            "-I",
-            "-S",
-            "-c",
-            PYTHON_3145_IDENTITY_CHECK,
-            CPYTHON_TARGET.implementation,
-            version.as_str(),
-            magic.as_str(),
-        ])
-        .output()
-        .map_err(|error| {
-            format!(
-                "oracle-dependent tests require CPython {version} with magic {magic}; failed to run `{executable}`: {error}. Set SERC_TEST_PYTHON to the pinned interpreter"
-            )
-        })?;
-    if output.status.success() {
-        return Ok(executable.to_string());
-    }
-    let source = if configured.is_some() {
-        "SERC_TEST_PYTHON"
-    } else {
-        "the default `python3.14` interpreter"
-    };
-    Err(format!(
-        "{source} must name CPython {version} with magic {magic}: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
-    ))
-}
-
 pub(crate) fn python_3145_command() -> Command {
-    let mut command = Command::new(python_3145());
+    let mut command = cpython::command(serc::PythonVersion::Py314);
     // Keep text passed through stdin and stdout deterministic across the Unix UTF-8 locale and
     // Windows' legacy console code page. `-I` ignores `PYTHONUTF8`, so select UTF-8 explicitly.
     command.args(["-I", "-S", "-X", "utf8"]);
@@ -94,17 +48,7 @@ pub(crate) fn python_3145_command() -> Command {
 }
 
 fn python_3145_output(arguments: &[&str], input: &[u8]) -> std::process::Output {
-    python_3145_command()
-        .args(arguments)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            child.stdin.take().unwrap().write_all(input)?;
-            child.wait_with_output()
-        })
-        .unwrap()
+    cpython::run_with_input(python_3145_command().args(arguments), input)
 }
 
 fn python_text_stdout(stdout: Vec<u8>) -> String {
@@ -254,17 +198,22 @@ pub(crate) fn indent(source: &str) -> String {
 
 #[test]
 fn python_3145_identity_rejects_prereleases() {
+    use serc::CPYTHON_TARGET;
+
     let script = "import collections, sys; Version = collections.namedtuple('Version', 'major minor micro releaselevel serial'); sys.version_info = Version(3, 14, 5, 'candidate', 1); exec(sys.argv.pop(1))";
-    let output = Command::new(python_3145())
+    let output = cpython::command(serc::PythonVersion::Py314)
         .args([
             "-I",
             "-S",
             "-c",
             script,
-            PYTHON_3145_IDENTITY_CHECK,
+            cpython::IDENTITY,
             CPYTHON_TARGET.implementation,
             &CPYTHON_TARGET.version_string(),
             &CPYTHON_TARGET.magic_hex(),
+            "final",
+            "0",
+            CPYTHON_TARGET.tag.trim_start_matches('v'),
         ])
         .output()
         .unwrap();

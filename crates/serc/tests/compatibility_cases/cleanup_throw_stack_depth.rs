@@ -51,14 +51,10 @@ fn matches_cpython_folded_loop_cleanup_with_extended_arguments() {
 
 #[test]
 fn matches_cpython_315_removed_and_live_suspension_cleanup() {
-    use std::io::Write as _;
-    use std::process::{Command, Stdio};
-
     use serc::{CompileOptions, PythonVersion, compile_with_options};
 
     let version = PythonVersion::Py315;
     let target = version.target();
-    let python = std::env::var_os("SERC_TEST_PYTHON_315").unwrap_or_else(|| "python3.15".into());
     let script = r"
 import importlib.util, marshal, sys
 assert sys.implementation.name == 'cpython'
@@ -78,25 +74,16 @@ sys.stdout.buffer.write(marshal.dumps(code))
         "def f(values):\n    for value in values:\n        yield from values\n",
         "def f(values):\n    if False:\n        yield from values\n",
     ] {
-        let mut oracle = Command::new(&python)
-            .args(["-I", "-S", "-X", "utf8", "-c", script])
-            .args([
-                target.tag.strip_prefix('v').unwrap(),
-                &target.magic_hex(),
-                filename,
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        oracle
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(source.as_bytes())
-            .unwrap();
-        let expected = oracle.wait_with_output().unwrap();
+        let expected = crate::common::cpython::run_with_input(
+            crate::common::cpython::command(version)
+                .args(["-I", "-S", "-X", "utf8", "-c", script])
+                .args([
+                    target.tag.strip_prefix('v').unwrap(),
+                    &target.magic_hex(),
+                    filename,
+                ]),
+            source.as_bytes(),
+        );
         assert!(
             expected.status.success(),
             "CPython 3.15 oracle failed: {}",

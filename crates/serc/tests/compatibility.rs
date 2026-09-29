@@ -643,10 +643,8 @@ for filename in ["\0", "\0prefix", "in\0side", "suffix\0"]:
     #[test]
     fn matches_cpython_marshal_for_in_memory_unix_path_filenames() {
         use std::ffi::OsStr;
-        use std::io::Write as _;
         use std::os::unix::ffi::OsStrExt as _;
         use std::path::Path;
-        use std::process::{Command, Stdio};
 
         use serc::{CompileOptions, PythonVersion, compile_bytes_with_path_and_options};
 
@@ -679,13 +677,12 @@ assert_filenames(code)
 sys.stdout.buffer.write(marshal.dumps(code))
 ";
 
-        for (python_version, variable, default) in [
-            (PythonVersion::Py312, "SERC_TEST_PYTHON_312", "python3.12"),
-            (PythonVersion::Py313, "SERC_TEST_PYTHON_313", "python3.13"),
-            (PythonVersion::Py314, "SERC_TEST_PYTHON", "python3.14"),
-            (PythonVersion::Py315, "SERC_TEST_PYTHON_315", "python3.15"),
+        for python_version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
         ] {
-            let executable = std::env::var_os(variable).unwrap_or_else(|| default.into());
             let target = python_version.target();
             let options = CompileOptions {
                 python_version,
@@ -696,20 +693,16 @@ sys.stdout.buffer.write(marshal.dumps(code))
                 for byte in filename {
                     write!(hex, "{byte:02x}").unwrap();
                 }
-                let mut oracle = Command::new(&executable)
-                    .args(["-B", "-I", "-S", "-X", "utf8", "-c", oracle_script])
-                    .args([
-                        &hex,
-                        target.tag.strip_prefix('v').unwrap(),
-                        &target.magic_hex(),
-                    ])
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .unwrap_or_else(|error| panic!("could not start {executable:?}: {error}"));
-                oracle.stdin.take().unwrap().write_all(source).unwrap();
-                let expected = oracle.wait_with_output().unwrap();
+                let expected = crate::common::cpython::run_with_input(
+                    crate::common::cpython::command(python_version)
+                        .args(["-B", "-I", "-S", "-X", "utf8", "-c", oracle_script])
+                        .args([
+                            &hex,
+                            target.tag.strip_prefix('v').unwrap(),
+                            &target.magic_hex(),
+                        ]),
+                    source,
+                );
                 assert!(
                     expected.status.success(),
                     "{python_version}, {hex}: {}",
@@ -803,9 +796,7 @@ sys.stdout.buffer.write(marshal.dumps(code))
 
     #[test]
     fn matches_source_codec_interns_for_all_targets() {
-        use std::io::Write as _;
         use std::path::Path;
-        use std::process::{Command, Stdio};
 
         use serc::{
             CompileOptions, PythonVersion, compile_bytes_with_options,
@@ -813,13 +804,12 @@ sys.stdout.buffer.write(marshal.dumps(code))
         };
 
         let script = "import importlib.util, marshal, sys; assert sys.implementation.name == 'cpython'; assert sys.version.split()[0] == sys.argv[1]; assert importlib.util.MAGIC_NUMBER.hex() == sys.argv[2]; code = compile(sys.stdin.buffer.read(), 'codec_effects.py', 'exec', dont_inherit=True, optimize=0); sys.stdout.buffer.write(marshal.dumps(code))";
-        for (version, variable, default) in [
-            (PythonVersion::Py312, "SERC_TEST_PYTHON_312", "python3.12"),
-            (PythonVersion::Py313, "SERC_TEST_PYTHON_313", "python3.13"),
-            (PythonVersion::Py314, "SERC_TEST_PYTHON", "python3.14"),
-            (PythonVersion::Py315, "SERC_TEST_PYTHON_315", "python3.15"),
+        for version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
         ] {
-            let executable = std::env::var_os(variable).unwrap_or_else(|| default.into());
             let target = version.target();
             let options = CompileOptions {
                 python_version: version,
@@ -846,21 +836,12 @@ sys.stdout.buffer.write(marshal.dumps(code))
                         "# coding: {encoding}\ndef first(value):\n    return value in {{{value:?}, 'novel_marker'}}, 1\n\ndef second(value):\n    'second docstring'\n    return value in {{{value:?}, 'novel_marker'}}, 2\n"
                     )
                 };
-                let mut oracle = Command::new(&executable)
-                    .args(["-B", "-I", "-S", "-X", "utf8", "-c", script])
-                    .args([target.tag.strip_prefix('v').unwrap(), &target.magic_hex()])
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .unwrap_or_else(|error| panic!("could not start {executable:?}: {error}"));
-                oracle
-                    .stdin
-                    .take()
-                    .unwrap()
-                    .write_all(source.as_bytes())
-                    .unwrap();
-                let expected = oracle.wait_with_output().unwrap();
+                let expected = crate::common::cpython::run_with_input(
+                    crate::common::cpython::command(version)
+                        .args(["-B", "-I", "-S", "-X", "utf8", "-c", script])
+                        .args([target.tag.strip_prefix('v').unwrap(), &target.magic_hex()]),
+                    source.as_bytes(),
+                );
                 assert!(
                     expected.status.success(),
                     "{version}, {encoding}: {}",
@@ -3528,35 +3509,22 @@ fn nested_finally_condition_marker_matches_each_target() {
 }
 
 fn assert_finally_condition_marker_matches_each_target(source: &str) {
-    use std::io::Write as _;
-    use std::process::{Command, Stdio};
-
     use serc::{CompileOptions, PythonVersion, compile_with_options};
 
     let oracle = "import importlib.util, marshal, sys; assert sys.implementation.name == 'cpython'; assert sys.version.split()[0] == sys.argv[1]; assert importlib.util.MAGIC_NUMBER.hex() == sys.argv[2]; code = compile(sys.stdin.read(), 'nested_finally_targets.py', 'exec', dont_inherit=True, optimize=0); sys.stdout.buffer.write(marshal.dumps(code))";
-    for (version, variable, fallback) in [
-        (PythonVersion::Py312, "SERC_TEST_PYTHON_312", "python3.12"),
-        (PythonVersion::Py313, "SERC_TEST_PYTHON_313", "python3.13"),
-        (PythonVersion::Py314, "SERC_TEST_PYTHON", "python3.14"),
-        (PythonVersion::Py315, "SERC_TEST_PYTHON_315", "python3.15"),
+    for version in [
+        PythonVersion::Py312,
+        PythonVersion::Py313,
+        PythonVersion::Py314,
+        PythonVersion::Py315,
     ] {
-        let executable = std::env::var_os(variable).unwrap_or_else(|| fallback.into());
         let target = version.target();
-        let mut child = Command::new(executable)
-            .args(["-I", "-S", "-B", "-c", oracle])
-            .args([target.tag.trim_start_matches('v'), &target.magic_hex()])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("start the pinned CPython oracle");
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(source.as_bytes())
-            .unwrap();
-        let expected = child.wait_with_output().unwrap();
+        let expected = crate::common::cpython::run_with_input(
+            crate::common::cpython::command(version)
+                .args(["-I", "-S", "-B", "-c", oracle])
+                .args([target.tag.trim_start_matches('v'), &target.magic_hex()]),
+            source.as_bytes(),
+        );
         assert!(
             expected.status.success(),
             "{version:?}: {}",

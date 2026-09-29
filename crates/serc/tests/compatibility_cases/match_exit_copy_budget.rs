@@ -1,6 +1,3 @@
-use std::io::Write as _;
-use std::process::Stdio;
-
 use crate::common;
 
 // The earlier nested arms still have a separate small-exit copying difference.
@@ -72,15 +69,10 @@ print([
 ])
 "#;
         let inspect = |mode: &str, input: &[u8]| {
-            let mut child = common::python_3145_command()
-                .args(["-c", inspector, mode, filename])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap();
-            child.stdin.take().unwrap().write_all(input).unwrap();
-            let output = child.wait_with_output().unwrap();
+            let output = crate::common::cpython::run_with_input(
+                common::python_3145_command().args(["-c", inspector, mode, filename]),
+                input,
+            );
             assert!(
                 output.status.success(),
                 "failed to inspect {mode} for {filename}: {}",

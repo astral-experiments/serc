@@ -1,12 +1,12 @@
-use std::io::Write;
-use std::process::{Command, Stdio};
-
 use serc::PythonVersion;
 
-#[path = "common/private_type_parameters.rs"]
+#[path = "common/cpython.rs"]
 mod cpython;
+#[path = "common/private_type_parameters.rs"]
+mod private_type_parameters;
 
-use cpython::{assert_matches_cpython, targets};
+use cpython::{VERSIONS, command, run_with_input};
+use private_type_parameters::assert_matches_cpython;
 
 #[test]
 fn private_type_parameter_aliases_match_cpython() {
@@ -355,26 +355,21 @@ class C[__T](base(lambda: (__T, _C__T))):
 ",
         ),
     ];
-    for (version, executable) in targets() {
+    for version in VERSIONS {
         for (name, requires_python_313, source) in cases {
             if requires_python_313 && version == PythonVersion::Py312 {
                 continue;
             }
-            let code = assert_matches_cpython(version, &executable, name, source);
-            let mut child = Command::new(&executable)
-                .args([
+            let code = assert_matches_cpython(version, name, source);
+            let result = run_with_input(
+                command(version).args([
                     "-I",
                     "-S",
                     "-c",
                     "import marshal, sys; exec(marshal.loads(sys.stdin.buffer.read()))",
-                ])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("start the pinned CPython runtime");
-            child.stdin.take().unwrap().write_all(&code).unwrap();
-            let result = child.wait_with_output().unwrap();
+                ]),
+                &code,
+            );
             assert!(
                 result.status.success(),
                 "{version:?} {name}: {}",
