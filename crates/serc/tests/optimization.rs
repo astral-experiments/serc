@@ -1,14 +1,13 @@
 use std::fmt::Write as _;
-use std::io::Write as _;
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Stdio};
 
 #[path = "common/optimization.rs"]
 mod cpython;
 
 use cpython::{
-    LEVELS, ORACLES, VERSIONS, assert_matches_cpython, assert_matches_cpython_versions,
-    compile_both, oracle,
+    LEVELS, VERSIONS, assert_matches_cpython, assert_matches_cpython_versions,
+    assert_outputs_match, assert_runs, compile_both, oracle, probe, run_successfully,
 };
 use serc::{
     CompileOptions, OptimizationLevel, PythonVersion, compile, compile_bytes_with_options,
@@ -3668,25 +3667,9 @@ print(json.dumps(rows))
                     optimization_level,
                 );
                 assert_eq!(actual, native, "{python_version}, {optimization_level:?}");
-                let mut outputs = Vec::new();
-                for payload in [&native, &actual] {
-                    let result = run_with_input(
-                        Command::new(ORACLES[index].get().unwrap())
-                            .args(["-I", "-S", "-B", "-c", TRACE])
-                            .stdout(Stdio::piped()),
-                        payload,
-                    );
-                    assert!(
-                        result.status.success(),
-                        "{python_version}, {optimization_level:?}: status {}, {}",
-                        result.status,
-                        String::from_utf8_lossy(&result.stderr)
-                    );
-                    outputs.push(result.stdout);
-                }
-                assert_eq!(
-                    outputs[0], outputs[1],
-                    "{python_version}, {optimization_level:?}"
+                assert_outputs_match(
+                    probe(index).args(["-I", "-S", "-B", "-c", TRACE]),
+                    [&native, &actual],
                 );
             }
         }
@@ -3844,25 +3827,9 @@ print(json.dumps(rows))
                     optimization_level,
                 );
                 assert_eq!(actual, native, "{python_version}, {optimization_level:?}");
-                let mut outputs = Vec::new();
-                for payload in [&native, &actual] {
-                    let result = run_with_input(
-                        Command::new(ORACLES[index].get().unwrap())
-                            .args(["-I", "-S", "-B", "-c", trace])
-                            .stdout(Stdio::piped()),
-                        payload,
-                    );
-                    assert!(
-                        result.status.success(),
-                        "{python_version}, {optimization_level:?}: status {}, {}",
-                        result.status,
-                        String::from_utf8_lossy(&result.stderr)
-                    );
-                    outputs.push(result.stdout);
-                }
-                assert_eq!(
-                    outputs[0], outputs[1],
-                    "{python_version}, {optimization_level:?}"
+                assert_outputs_match(
+                    probe(index).args(["-I", "-S", "-B", "-c", trace]),
+                    [&native, &actual],
                 );
             }
         }
@@ -3927,19 +3894,12 @@ finally:
             optimization_level,
         );
         assert_eq!(actual, native, "{optimization_level:?}");
-        for code in [&native, &actual] {
-            let result = run_with_input(
-                Command::new(ORACLES[1].get().unwrap())
-                    .args(["-I", "-S", "-B", "-c", TRACE])
-                    .stdout(Stdio::piped()),
-                code,
-            );
-            assert!(
-                result.status.success(),
-                "{optimization_level:?}: {}",
-                String::from_utf8_lossy(&result.stderr)
-            );
-        }
+        assert_runs(
+            probe(1)
+                .args(["-I", "-S", "-B", "-c", TRACE])
+                .stdout(Stdio::piped()),
+            [&native, &actual],
+        );
     }
 }
 
@@ -4008,19 +3968,12 @@ if events != ['enter', 'work', 'cleanup', 'exit:None'] or result is not None:
             optimization_level,
         );
         assert_eq!(actual, native, "{optimization_level:?}");
-        for code in [&native, &actual] {
-            let result = run_with_input(
-                Command::new(ORACLES[1].get().unwrap())
-                    .args(["-I", "-S", "-B", "-c", TRACE])
-                    .stdout(Stdio::piped()),
-                code,
-            );
-            assert!(
-                result.status.success(),
-                "{optimization_level:?}: {}",
-                String::from_utf8_lossy(&result.stderr)
-            );
-        }
+        assert_runs(
+            probe(1)
+                .args(["-I", "-S", "-B", "-c", TRACE])
+                .stdout(Stdio::piped()),
+            [&native, &actual],
+        );
     }
 }
 
@@ -4093,18 +4046,10 @@ finally:
                 optimization_level,
             );
             assert_eq!(actual, native, "{python_version}, {optimization_level:?}");
-            for code in [&native, &actual] {
-                let result = run_with_input(
-                    Command::new(ORACLES[index].get().unwrap())
-                        .args(["-I", "-S", "-B", "-c", TRACE]),
-                    code,
-                );
-                assert!(
-                    result.status.success(),
-                    "{python_version}, {optimization_level:?}: {}",
-                    String::from_utf8_lossy(&result.stderr)
-                );
-            }
+            assert_runs(
+                probe(index).args(["-I", "-S", "-B", "-c", TRACE]),
+                [&native, &actual],
+            );
         }
     }
 }
@@ -4188,22 +4133,10 @@ print(json.dumps(rows))
             optimization_level,
         );
         assert_eq!(actual, native, "{optimization_level:?}");
-        let mut outputs = Vec::new();
-        for payload in [&native, &actual] {
-            let result = run_with_input(
-                Command::new(ORACLES[1].get().unwrap())
-                    .args(["-I", "-S", "-B", "-c", TRACE])
-                    .stdout(Stdio::piped()),
-                payload,
-            );
-            assert!(
-                result.status.success(),
-                "{}",
-                String::from_utf8_lossy(&result.stderr)
-            );
-            outputs.push(result.stdout);
-        }
-        assert_eq!(outputs[0], outputs[1], "{optimization_level:?}");
+        assert_outputs_match(
+            probe(1).args(["-I", "-S", "-B", "-c", TRACE]),
+            [&native, &actual],
+        );
     }
 }
 
@@ -4294,19 +4227,12 @@ monitor.free_tool_id(5)
                 optimization_level,
             );
             assert_eq!(actual, native, "{python_version}, {optimization_level:?}");
-            for code in [&native, &actual] {
-                let result = run_with_input(
-                    Command::new(ORACLES[index].get().unwrap())
-                        .args(["-I", "-S", "-B", "-c", TRACE])
-                        .stdout(Stdio::piped()),
-                    code,
-                );
-                assert!(
-                    result.status.success(),
-                    "{python_version}, {optimization_level:?}: {}",
-                    String::from_utf8_lossy(&result.stderr)
-                );
-            }
+            assert_runs(
+                probe(index)
+                    .args(["-I", "-S", "-B", "-c", TRACE])
+                    .stdout(Stdio::piped()),
+                [&native, &actual],
+            );
         }
     }
 }
@@ -4379,23 +4305,16 @@ monitor.free_tool_id(5)
                     actual, native,
                     "{optimization_level:?}, {generator}, {has_sibling}"
                 );
-                for code in [&native, &actual] {
-                    let result = run_with_input(
-                        Command::new(ORACLES[0].get().unwrap())
-                            .args(["-I", "-S", "-B", "-c", TRACE])
-                            .args([
-                                if generator { "1" } else { "0" },
-                                if has_sibling { "1" } else { "0" },
-                            ])
-                            .stdout(Stdio::piped()),
-                        code,
-                    );
-                    assert!(
-                        result.status.success(),
-                        "{optimization_level:?}, {generator}, {has_sibling}: {}",
-                        String::from_utf8_lossy(&result.stderr)
-                    );
-                }
+                assert_runs(
+                    probe(0)
+                        .args(["-I", "-S", "-B", "-c", TRACE])
+                        .args([
+                            if generator { "1" } else { "0" },
+                            if has_sibling { "1" } else { "0" },
+                        ])
+                        .stdout(Stdio::piped()),
+                    [&native, &actual],
+                );
             }
         }
     }
@@ -4496,19 +4415,12 @@ monitor.free_tool_id(5)
                         {
                             continue;
                         }
-                        for code in [&native, &actual] {
-                            let result = run_with_input(
-                                Command::new(ORACLES[index].get().unwrap())
-                                    .args(["-I", "-S", "-B", "-c", TRACE, &marker.to_string()])
-                                    .stdout(Stdio::piped()),
-                                code,
-                            );
-                            assert!(
-                                result.status.success(),
-                                "{}",
-                                String::from_utf8_lossy(&result.stderr)
-                            );
-                        }
+                        assert_runs(
+                            probe(index)
+                                .args(["-I", "-S", "-B", "-c", TRACE, &marker.to_string()])
+                                .stdout(Stdio::piped()),
+                            [&native, &actual],
+                        );
                     }
                 }
             }
@@ -4561,20 +4473,11 @@ print(json.dumps('ok'))
                 version,
                 optimization_level,
             );
-            for bytes in [&native[..], &actual] {
-                let output = run_with_input(
-                    Command::new(ORACLES[index].get().unwrap())
-                        .args(["-I", "-S", "-c", TRACE])
-                        .stdout(Stdio::piped()),
-                    bytes,
-                );
-                assert!(
-                    output.status.success(),
-                    "{}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-                assert_eq!(output.stdout, b"\"ok\"\n");
-            }
+            let output = assert_outputs_match(
+                probe(index).args(["-I", "-S", "-c", TRACE]),
+                [&native, &actual],
+            );
+            assert_eq!(output, b"\"ok\"\n");
         }
     }
 }
@@ -4660,17 +4563,10 @@ monitor.free_tool_id(5)
             level,
         );
         assert_eq!(actual, native);
-        for payload in [&native, &actual] {
-            let result = run_with_input(
-                Command::new(ORACLES[0].get().unwrap()).args(["-I", "-S", "-B", "-c", TRACE]),
-                payload,
-            );
-            assert!(
-                result.status.success(),
-                "{}",
-                String::from_utf8_lossy(&result.stderr)
-            );
-        }
+        assert_runs(
+            probe(0).args(["-I", "-S", "-B", "-c", TRACE]),
+            [&native, &actual],
+        );
     }
 }
 
@@ -4733,17 +4629,10 @@ monitor.free_tool_id(5)
         let [native, actual] =
             compile_both(SOURCE, "generator_backedge.py", PythonVersion::Py312, level);
         assert_eq!(actual, native);
-        for payload in [&native, &actual] {
-            let result = run_with_input(
-                Command::new(ORACLES[0].get().unwrap()).args(["-I", "-S", "-B", "-c", TRACE]),
-                payload,
-            );
-            assert!(
-                result.status.success(),
-                "{}",
-                String::from_utf8_lossy(&result.stderr)
-            );
-        }
+        assert_runs(
+            probe(0).args(["-I", "-S", "-B", "-c", TRACE]),
+            [&native, &actual],
+        );
     }
 }
 
@@ -4951,17 +4840,10 @@ if events != ['finish']:
                 optimization_level,
             );
             assert_eq!(actual, native);
-            for payload in [&native, &actual] {
-                let result = run_with_input(
-                    Command::new(ORACLES[index].get().unwrap()).args(["-I", "-S", "-c", TRACE]),
-                    payload,
-                );
-                assert!(
-                    result.status.success(),
-                    "{python_version:?} {optimization_level:?}: {}",
-                    String::from_utf8_lossy(&result.stderr)
-                );
-            }
+            assert_runs(
+                probe(index).args(["-I", "-S", "-c", TRACE]),
+                [&native, &actual],
+            );
         }
     }
 }
@@ -5061,25 +4943,9 @@ print(json.dumps(events))
             PythonVersion::Py312,
             optimization_level,
         );
-        let execute = |bytes: &[u8]| {
-            run_with_input(
-                Command::new(ORACLES[0].get().unwrap())
-                    .args(["-I", "-S", "-c", TRACE])
-                    .stdout(Stdio::piped()),
-                bytes,
-            )
-        };
-        for result in [execute(&native), execute(&actual)] {
-            assert!(
-                result.status.success(),
-                "{}",
-                String::from_utf8_lossy(&result.stderr)
-            );
-            assert_eq!(
-                result.stdout,
-                b"[\"enter\", \"exit:ValueError\", \"escaped\"]\n"
-            );
-        }
+        let output =
+            assert_outputs_match(probe(0).args(["-I", "-S", "-c", TRACE]), [&native, &actual]);
+        assert_eq!(output, b"[\"enter\", \"exit:ValueError\", \"escaped\"]\n");
     }
 }
 
@@ -5279,19 +5145,12 @@ for name, injected, expected in [
             .iter()
             .position(|(target, _, _)| *target == version)
             .unwrap();
-        for (label, payload) in [("native", native.as_slice()), ("serc", actual.as_slice())] {
-            let result = run_with_input(
-                Command::new(ORACLES[index].get().unwrap())
-                    .args(["-I", "-S", "-X", "utf8", "-c", TRACE_JOIN])
-                    .stdout(Stdio::piped()),
-                payload,
-            );
-            assert!(
-                result.status.success(),
-                "{level:?}, {label}: {}",
-                String::from_utf8_lossy(&result.stderr)
-            );
-        }
+        assert_runs(
+            probe(index)
+                .args(["-I", "-S", "-X", "utf8", "-c", TRACE_JOIN])
+                .stdout(Stdio::piped()),
+            [&native, &actual],
+        );
     }
 }
 
@@ -5388,20 +5247,13 @@ for prefix, line, argument, expected in cases:
                     .iter()
                     .position(|(candidate, _, _)| *candidate == version)
                     .unwrap();
-                for (label, payload) in [("native", &native), ("serc", &actual)] {
-                    let result = run_with_input(
-                        Command::new(ORACLES[index].get().unwrap())
-                            .args(["-I", "-S", "-B", "-c", TRACE])
-                            .args(&lines)
-                            .stdout(Stdio::piped()),
-                        payload,
-                    );
-                    assert!(
-                        result.status.success(),
-                        "{version}, {level:?}, {label}: {}",
-                        String::from_utf8_lossy(&result.stderr)
-                    );
-                }
+                assert_runs(
+                    probe(index)
+                        .args(["-I", "-S", "-B", "-c", TRACE])
+                        .args(&lines)
+                        .stdout(Stdio::piped()),
+                    [&native, &actual],
+                );
             }
         }
     }
@@ -5553,32 +5405,15 @@ if hits != [target] or values != [1] or events != ['enter', 'recover', 'exit:non
                     .iter()
                     .position(|(candidate, _, _)| *candidate == version)
                     .unwrap();
-                for (label, bytes) in [("native", &native), ("serc", &actual)] {
-                    let result = run_with_input(
-                        Command::new(ORACLES[index].get().unwrap())
-                            .args(["-I", "-S", "-B", "-c", TRACE, target_line, argument])
-                            .stdout(Stdio::piped()),
-                        bytes,
-                    );
-                    assert!(
-                        result.status.success(),
-                        "{version}, {level:?}, {label}: {}",
-                        String::from_utf8_lossy(&result.stderr)
-                    );
-                }
+                assert_runs(
+                    probe(index)
+                        .args(["-I", "-S", "-B", "-c", TRACE, target_line, argument])
+                        .stdout(Stdio::piped()),
+                    [&native, &actual],
+                );
             }
         }
     }
-}
-
-fn run_with_input(command: &mut Command, input: &[u8]) -> Output {
-    let mut child = command
-        .stdin(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child.stdin.take().unwrap().write_all(input).unwrap();
-    child.wait_with_output().unwrap()
 }
 
 #[test]
@@ -6023,18 +5858,10 @@ monitor.free_tool_id(5)
                     python_version,
                     optimization_level,
                 );
-                for code in [&native, &actual] {
-                    let result = run_with_input(
-                        Command::new(ORACLES[index].get().unwrap())
-                            .args(["-I", "-S", "-B", "-c", TRACE, mode]),
-                        code,
-                    );
-                    assert!(
-                        result.status.success(),
-                        "{python_version}, {optimization_level:?}, {mode}: {}",
-                        String::from_utf8_lossy(&result.stderr)
-                    );
-                }
+                assert_runs(
+                    probe(index).args(["-I", "-S", "-B", "-c", TRACE, mode]),
+                    [&native, &actual],
+                );
             }
         }
     }
@@ -6098,18 +5925,10 @@ monitor.free_tool_id(5)
                 optimization_level,
             );
             assert_eq!(actual, native, "{python_version}, {optimization_level:?}");
-            for code in [&native, &actual] {
-                let result = run_with_input(
-                    Command::new(ORACLES[index].get().unwrap())
-                        .args(["-I", "-S", "-B", "-c", TRACE]),
-                    code,
-                );
-                assert!(
-                    result.status.success(),
-                    "{python_version}, {optimization_level:?}: {}",
-                    String::from_utf8_lossy(&result.stderr)
-                );
-            }
+            assert_runs(
+                probe(index).args(["-I", "-S", "-B", "-c", TRACE]),
+                [&native, &actual],
+            );
         }
     }
 }
@@ -6232,24 +6051,9 @@ print(json.dumps(events))
                 python_version,
                 *optimization_level,
             );
-            let mut outputs = Vec::new();
-            for payload in [&native, &actual] {
-                let result = run_with_input(
-                    Command::new(ORACLES[index].get().unwrap())
-                        .args(["-I", "-S", "-B", "-c", TRACE])
-                        .stdout(Stdio::piped()),
-                    payload,
-                );
-                assert!(
-                    result.status.success(),
-                    "{}",
-                    String::from_utf8_lossy(&result.stderr)
-                );
-                outputs.push(result.stdout);
-            }
-            assert_eq!(
-                outputs[0], outputs[1],
-                "{python_version}, {optimization_level:?}"
+            assert_outputs_match(
+                probe(index).args(["-I", "-S", "-B", "-c", TRACE]),
+                [&native, &actual],
             );
         }
     }
@@ -6452,29 +6256,12 @@ print(json.dumps(events))
             for optimization_level in LEVELS {
                 let [native, actual] =
                     compile_both(source, "case.py", python_version, optimization_level);
-                let execute = |bytes: &[u8]| {
-                    run_with_input(
-                        Command::new(ORACLES[index].get().unwrap())
-                            .args(["-I", "-S", "-c", TRACE_BACKEDGE])
-                            .stdout(Stdio::piped()),
-                        bytes,
-                    )
-                };
-                let expected_run = execute(&native);
-                let actual_run = execute(&actual);
-                for result in [&expected_run, &actual_run] {
-                    assert!(
-                        result.status.success(),
-                        "{}",
-                        String::from_utf8_lossy(&result.stderr)
-                    );
-                }
-                assert_eq!(
-                    expected_run.stdout, expected_events,
-                    "{python_version}, {optimization_level:?}"
+                let output = assert_outputs_match(
+                    probe(index).args(["-I", "-S", "-c", TRACE_BACKEDGE]),
+                    [&native, &actual],
                 );
                 assert_eq!(
-                    actual_run.stdout, expected_run.stdout,
+                    output, expected_events,
                     "{python_version}, {optimization_level:?}"
                 );
                 assert_eq!(actual, native, "{python_version}, {optimization_level:?}");
@@ -6632,24 +6419,16 @@ print(outcome)
                     } else {
                         &b"escaped\n"[..]
                     };
-                    for code in [&native, &actual] {
-                        let result = run_with_input(
-                            Command::new(ORACLES[index].get().unwrap())
-                                .args(["-I", "-S", "-B", "-c", TRACE_CONDITION])
-                                .arg(condition_line.to_string())
-                                .stdout(Stdio::piped()),
-                            code,
-                        );
-                        assert!(
-                            result.status.success(),
-                            "{}",
-                            String::from_utf8_lossy(&result.stderr)
-                        );
-                        assert_eq!(
-                            result.stdout, expected,
-                            "{python_version}, {optimization_level:?}, {expression}"
-                        );
-                    }
+                    let output = assert_outputs_match(
+                        probe(index)
+                            .args(["-I", "-S", "-B", "-c", TRACE_CONDITION])
+                            .arg(condition_line.to_string()),
+                        [&native, &actual],
+                    );
+                    assert_eq!(
+                        output, expected,
+                        "{python_version}, {optimization_level:?}, {expression}"
+                    );
                 }
             }
         }
@@ -6749,53 +6528,33 @@ assert (sets[0] is sets[1]) == (sys.argv[1] == 'shared')
                     .iter()
                     .position(|(candidate, _, _)| *candidate == version)
                     .unwrap();
-                let executable = ORACLES[index].get().expect("oracle identity was checked");
                 let level_arg = if level == OptimizationLevel::One {
                     "1"
                 } else {
                     "2"
                 };
-                let mut child = Command::new(executable)
-                    .args([
-                        "-I",
-                        "-S",
-                        "-X",
-                        "utf8",
-                        "-c",
-                        TEXT_ORACLE,
-                        level_arg,
-                        "case.py",
-                    ])
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .unwrap();
-                child
-                    .stdin
-                    .take()
-                    .unwrap()
-                    .write_all(source.as_bytes())
-                    .unwrap();
-                let expected_text = child.wait_with_output().unwrap();
-                assert!(
-                    expected_text.status.success(),
-                    "{}",
-                    String::from_utf8_lossy(&expected_text.stderr)
+                let expected_text = run_successfully(
+                    probe(index)
+                        .args([
+                            "-I",
+                            "-S",
+                            "-X",
+                            "utf8",
+                            "-c",
+                            TEXT_ORACLE,
+                            level_arg,
+                            "case.py",
+                        ])
+                        .stdout(Stdio::piped()),
+                    source.as_bytes(),
                 );
                 let actual_text = compile_with_options(&source, "case.py", &options)
                     .unwrap()
                     .marshal();
-                assert_eq!(
-                    actual_text, expected_text.stdout,
-                    "{version}, {level:?}, text"
-                );
+                assert_eq!(actual_text, expected_text, "{version}, {level:?}, text");
 
-                for (label, payload) in [
-                    ("native", expected.stdout.as_slice()),
-                    ("serc", actual.as_slice()),
-                ] {
-                    let mut child = Command::new(executable)
+                assert_runs(
+                    probe(index)
                         .args([
                             "-I",
                             "-S",
@@ -6805,19 +6564,9 @@ assert (sets[0] is sets[1]) == (sys.argv[1] == 'shared')
                             IDENTITY_ORACLE,
                             if shared { "shared" } else { "distinct" },
                         ])
-                        .stdin(Stdio::piped())
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped())
-                        .spawn()
-                        .unwrap();
-                    child.stdin.take().unwrap().write_all(payload).unwrap();
-                    let identity = child.wait_with_output().unwrap();
-                    assert!(
-                        identity.status.success(),
-                        "{version}, {level:?}, {label}: {}",
-                        String::from_utf8_lossy(&identity.stderr)
-                    );
-                }
+                        .stdout(Stdio::piped()),
+                    [&expected.stdout, &actual],
+                );
             }
         }
     }
@@ -7011,22 +6760,12 @@ finally:
                 .iter()
                 .position(|(candidate, _, _)| *candidate == version)
                 .unwrap();
-            for (label, payload) in [
-                ("native", expected.stdout.as_slice()),
-                ("serc", actual.as_slice()),
-            ] {
-                let result = run_with_input(
-                    Command::new(ORACLES[index].get().unwrap())
-                        .args(["-I", "-S", "-X", "utf8", "-c", TRACE_ORACLE])
-                        .stdout(Stdio::piped()),
-                    payload,
-                );
-                assert!(
-                    result.status.success(),
-                    "{version}, {level:?}, {label}: {}",
-                    String::from_utf8_lossy(&result.stderr)
-                );
-            }
+            assert_runs(
+                probe(index)
+                    .args(["-I", "-S", "-X", "utf8", "-c", TRACE_ORACLE])
+                    .stdout(Stdio::piped()),
+                [&expected.stdout, &actual],
+            );
         }
     }
 }
@@ -7089,22 +6828,12 @@ for value in (False, True):
                 .iter()
                 .position(|(candidate, _, _)| *candidate == version)
                 .unwrap();
-            for (label, payload) in [
-                ("native", expected.stdout.as_slice()),
-                ("serc", actual.as_slice()),
-            ] {
-                let result = run_with_input(
-                    Command::new(ORACLES[index].get().unwrap())
-                        .args(["-I", "-S", "-X", "utf8", "-c", TRACE_ORACLE])
-                        .stdout(Stdio::piped()),
-                    payload,
-                );
-                assert!(
-                    result.status.success(),
-                    "{version}, {level:?}, {label}: {}",
-                    String::from_utf8_lossy(&result.stderr)
-                );
-            }
+            assert_runs(
+                probe(index)
+                    .args(["-I", "-S", "-X", "utf8", "-c", TRACE_ORACLE])
+                    .stdout(Stdio::piped()),
+                [&expected.stdout, &actual],
+            );
         }
     }
 }
@@ -7164,24 +6893,13 @@ print(outcome, events)
                 PythonVersion::Py314,
                 optimization_level,
             );
-            for code in [&native, &actual] {
-                let result = run_with_input(
-                    Command::new(ORACLES[2].get().unwrap())
-                        .args(["-I", "-S", "-B", "-c", TRACE_CONDITION])
-                        .arg(line.to_string())
-                        .stdout(Stdio::piped()),
-                    code,
-                );
-                assert!(
-                    result.status.success(),
-                    "{}",
-                    String::from_utf8_lossy(&result.stderr)
-                );
-                assert_eq!(
-                    result.stdout, expected,
-                    "{optimization_level:?}, line {line}"
-                );
-            }
+            let output = assert_outputs_match(
+                probe(2)
+                    .args(["-I", "-S", "-B", "-c", TRACE_CONDITION])
+                    .arg(line.to_string()),
+                [&native, &actual],
+            );
+            assert_eq!(output, expected, "{optimization_level:?}, line {line}");
         }
     }
 }
@@ -7393,17 +7111,10 @@ assert events == ['caught'], events
             let [native, actual] =
                 compile_both(SOURCE, "nested_pass_exit.py", version, optimization_level);
             assert_eq!(actual, native, "{version} {optimization_level:?}");
-            for payload in [&native, &actual] {
-                let result = run_with_input(
-                    Command::new(ORACLES[index].get().unwrap()).args(["-I", "-S", "-c", TRACE]),
-                    payload,
-                );
-                assert!(
-                    result.status.success(),
-                    "{version} {optimization_level:?}: {}",
-                    String::from_utf8_lossy(&result.stderr)
-                );
-            }
+            assert_runs(
+                probe(index).args(["-I", "-S", "-c", TRACE]),
+                [&native, &actual],
+            );
         }
     }
 }
@@ -7556,17 +7267,10 @@ for name, expected in [
             .iter()
             .position(|(version, _, _)| *version == PythonVersion::Py314)
             .unwrap();
-        for payload in [&native, &actual] {
-            let result = run_with_input(
-                Command::new(ORACLES[index].get().unwrap()).args(["-I", "-S", "-c", TRACE]),
-                payload,
-            );
-            assert!(
-                result.status.success(),
-                "{level:?}: {}",
-                String::from_utf8_lossy(&result.stderr)
-            );
-        }
+        assert_runs(
+            probe(index).args(["-I", "-S", "-c", TRACE]),
+            [&native, &actual],
+        );
     }
 }
 
@@ -7682,17 +7386,10 @@ for name, flag, expected in (
                 .iter()
                 .position(|(candidate, _, _)| *candidate == version)
                 .unwrap();
-            for payload in [&native, &actual] {
-                let result = run_with_input(
-                    Command::new(ORACLES[index].get().unwrap()).args(["-I", "-S", "-c", TRACE]),
-                    payload,
-                );
-                assert!(
-                    result.status.success(),
-                    "{version:?} {level:?}: {}",
-                    String::from_utf8_lossy(&result.stderr)
-                );
-            }
+            assert_runs(
+                probe(index).args(["-I", "-S", "-c", TRACE]),
+                [&native, &actual],
+            );
         }
     }
 }
@@ -7756,17 +7453,10 @@ for name, offset, args, expected in [
                 .iter()
                 .position(|(target, _, _)| *target == version)
                 .unwrap();
-            for payload in [&native, &actual] {
-                let result = run_with_input(
-                    Command::new(ORACLES[index].get().unwrap()).args(["-I", "-S", "-c", TRACE]),
-                    payload,
-                );
-                assert!(
-                    result.status.success(),
-                    "{version:?} {level:?}: {}",
-                    String::from_utf8_lossy(&result.stderr)
-                );
-            }
+            assert_runs(
+                probe(index).args(["-I", "-S", "-c", TRACE]),
+                [&native, &actual],
+            );
         }
     }
 }
@@ -7865,17 +7555,7 @@ for target, expected in (
         let [native, actual] =
             compile_both(SOURCE, "async_for_assert.py", PythonVersion::Py314, level);
         assert_eq!(actual, native);
-        for payload in [&native, &actual] {
-            let result = run_with_input(
-                Command::new(ORACLES[2].get().unwrap()).args(["-I", "-S", "-c", TRACE]),
-                payload,
-            );
-            assert!(
-                result.status.success(),
-                "{level:?}: {}",
-                String::from_utf8_lossy(&result.stderr)
-            );
-        }
+        assert_runs(probe(2).args(["-I", "-S", "-c", TRACE]), [&native, &actual]);
     }
 }
 
