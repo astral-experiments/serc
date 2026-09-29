@@ -61,12 +61,7 @@ fn mapping_pattern_keys_preserve_surrogate_values() {
     ];
     for pattern in patterns {
         let source = format!("match subject:\n    case {pattern}: pass\n");
-        for python_version in [
-            PythonVersion::Py312,
-            PythonVersion::Py313,
-            PythonVersion::Py314,
-            PythonVersion::Py315,
-        ] {
+        for python_version in crate::common::cpython::VERSIONS {
             let options = CompileOptions {
                 python_version,
                 ..CompileOptions::default()
@@ -99,12 +94,7 @@ fn mapping_pattern_keys_preserve_surrogate_values() {
         "semantic.py",
     );
     let rest = "match subject:\n    case {'\\ud800': _, '\\ud801': _, **rest}: pass\n";
-    for python_version in [
-        PythonVersion::Py312,
-        PythonVersion::Py313,
-        PythonVersion::Py314,
-        PythonVersion::Py315,
-    ] {
+    for python_version in crate::common::cpython::VERSIONS {
         let options = CompileOptions {
             python_version,
             ..CompileOptions::default()
@@ -117,12 +107,7 @@ fn mapping_pattern_keys_preserve_surrogate_values() {
 fn surrogate_mapping_keys_match_other_cpython_targets() {
     let source = "match subject:\n    case {'\\ud800': _, '\\ud801': _, '\\ufffd': _}: pass\n";
     let script = "import importlib.util, marshal, sys; assert sys.implementation.name == 'cpython'; assert sys.version.split()[0] == sys.argv[1]; assert importlib.util.MAGIC_NUMBER.hex() == sys.argv[2]; code = compile(sys.stdin.buffer.read(), 'semantic.py', 'exec', dont_inherit=True, optimize=0); sys.stdout.buffer.write(marshal.dumps(code))";
-    for python_version in [
-        PythonVersion::Py312,
-        PythonVersion::Py313,
-        PythonVersion::Py314,
-        PythonVersion::Py315,
-    ] {
+    for python_version in crate::common::cpython::VERSIONS {
         let target = python_version.target();
         let expected = crate::common::cpython::run_with_input(
             crate::common::cpython::command(python_version)
@@ -201,12 +186,7 @@ fn mapping_pattern_surrogate_duplicates_and_error_precedence() {
             String::from_utf8_lossy(&native.stderr).contains(diagnostic),
             "{source}"
         );
-        for python_version in [
-            PythonVersion::Py312,
-            PythonVersion::Py313,
-            PythonVersion::Py314,
-            PythonVersion::Py315,
-        ] {
+        for python_version in crate::common::cpython::VERSIONS {
             let options = CompileOptions {
                 python_version,
                 ..CompileOptions::default()
@@ -267,12 +247,7 @@ else:
             String::from_utf8_lossy(&output.stderr)
         );
         let expected: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        let configurations = [
-            PythonVersion::Py312,
-            PythonVersion::Py313,
-            PythonVersion::Py314,
-            PythonVersion::Py315,
-        ];
+        let configurations = crate::common::cpython::VERSIONS;
         let results = configurations
             .into_iter()
             .map(|python_version| {
@@ -387,12 +362,7 @@ fn declarations_precede_unreachable_pattern_lowering_but_not_existing_symbol_err
             .unwrap();
         assert!(!expected.status.success(), "CPython accepted {source}");
         assert!(String::from_utf8_lossy(&expected.stderr).contains(diagnostic));
-        for python_version in [
-            PythonVersion::Py312,
-            PythonVersion::Py313,
-            PythonVersion::Py314,
-            PythonVersion::Py315,
-        ] {
+        for python_version in crate::common::cpython::VERSIONS {
             let options = CompileOptions {
                 python_version,
                 ..CompileOptions::default()
@@ -451,12 +421,7 @@ fn reserved_pattern_capture_and_declarations_follow_target_phase_order() {
             .unwrap();
         assert!(!expected.status.success(), "CPython accepted {source}");
         assert!(String::from_utf8_lossy(&expected.stderr).contains(modern_message));
-        for python_version in [
-            PythonVersion::Py312,
-            PythonVersion::Py313,
-            PythonVersion::Py314,
-            PythonVersion::Py315,
-        ] {
+        for python_version in crate::common::cpython::VERSIONS {
             let options = CompileOptions {
                 python_version,
                 ..CompileOptions::default()
@@ -479,12 +444,7 @@ fn reserved_pattern_capture_and_declarations_follow_target_phase_order() {
     }
 }
 
-const STARRED_TARGETS: [PythonVersion; 4] = [
-    PythonVersion::Py312,
-    PythonVersion::Py313,
-    PythonVersion::Py314,
-    PythonVersion::Py315,
-];
+const STARRED_TARGETS: [PythonVersion; 4] = crate::common::cpython::VERSIONS;
 
 fn assert_rejects_raw_starred_expression(
     source: &str,

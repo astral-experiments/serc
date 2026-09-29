@@ -4771,12 +4771,7 @@ fn elided_inner_else_in_for_else_matches_cpython() {
             &source,
             "elided_inner_else_for_else.py",
             &LEVELS,
-            &[
-                PythonVersion::Py312,
-                PythonVersion::Py313,
-                PythonVersion::Py314,
-                PythonVersion::Py315,
-            ],
+            &VERSIONS.map(|(version, _, _)| version),
         );
     }
 }
@@ -5311,12 +5306,7 @@ fn protected_elided_assertion_preserves_terminal_control_flow() {
 
 #[test]
 fn folded_protected_branch_before_elided_assertion_keeps_exit_location() {
-    let versions = [
-        PythonVersion::Py312,
-        PythonVersion::Py313,
-        PythonVersion::Py314,
-        PythonVersion::Py315,
-    ];
+    let versions = VERSIONS.map(|(version, _, _)| version);
     for (index, source) in [
         "def f(a):\n try:\n  if True:\n   pass\n  else:\n   other()\n  assert a\n except ValueError:\n  work()\n",
         "def f(a, b):\n try:\n  if 1:\n   pass\n  else:\n   pass\n  assert a\n  assert b\n except ValueError:\n  work()\n",
@@ -7038,12 +7028,7 @@ fn terminal_match_case_conditionals_keep_returns_before_erased_assertions() {
             source,
             &format!("terminal_match_case_{case}.py"),
             &LEVELS,
-            &[
-                PythonVersion::Py312,
-                PythonVersion::Py313,
-                PythonVersion::Py314,
-                PythonVersion::Py315,
-            ],
+            &VERSIONS.map(|(version, _, _)| version),
         );
     }
 }
@@ -7058,12 +7043,7 @@ fn optimized_with_assertion_join_before_call_matches_cpython() {
             &source,
             "optimized_with_join.py",
             &LEVELS,
-            &[
-                PythonVersion::Py312,
-                PythonVersion::Py313,
-                PythonVersion::Py314,
-                PythonVersion::Py315,
-            ],
+            &VERSIONS.map(|(version, _, _)| version),
         );
     }
 

@@ -1,7 +1,7 @@
 #[path = "common/cpython.rs"]
 mod cpython;
 
-use serc::{CompileOptions, PythonVersion, compile_with_options};
+use serc::{CompileOptions, compile_with_options};
 
 #[test]
 fn private_generator_freevars_match_cpython() {
@@ -60,12 +60,7 @@ assert list(g) == [(1, 2)]
     ];
     let oracle = "import importlib.util, marshal, sys; assert sys.implementation.name == 'cpython'; assert sys.version.split()[0] == sys.argv[1]; assert importlib.util.MAGIC_NUMBER.hex() == sys.argv[2]; code = compile(sys.stdin.read(), 'private_generator.py', 'exec', dont_inherit=True, optimize=0); sys.stdout.buffer.write(marshal.dumps(code))";
     let run = "import marshal, sys; exec(marshal.loads(sys.stdin.buffer.read()))";
-    for version in [
-        PythonVersion::Py312,
-        PythonVersion::Py313,
-        PythonVersion::Py314,
-        PythonVersion::Py315,
-    ] {
+    for version in cpython::VERSIONS {
         let target = version.target();
         let options = CompileOptions {
             python_version: version,
