@@ -2,9 +2,7 @@ mod common;
 
 use std::process::Command;
 
-use serc::{
-    CompileError, CompileOptions, PythonVersion, compile_bytes_with_options, compile_with_options,
-};
+use serc::{CompileError, CompileOptions, compile_bytes_with_options, compile_with_options};
 
 #[test]
 fn decimal_literal_digit_limit_matches_cpython() {
@@ -44,23 +42,13 @@ except SyntaxError as error:
     raise SystemExit(1)
 sys.stdout.buffer.write(marshal.dumps(code))
 ";
-    for version in [
-        PythonVersion::Py312,
-        PythonVersion::Py313,
-        PythonVersion::Py314,
-        PythonVersion::Py315,
-    ] {
+    for version in common::PYTHON_VERSIONS {
         let options = CompileOptions {
             python_version: version,
             ..CompileOptions::default()
         };
         for (source, accepted) in &cases {
-            let mut python = match version {
-                PythonVersion::Py312 => common::python_312_command(),
-                PythonVersion::Py313 => common::python_313_command(),
-                PythonVersion::Py314 => common::python_3145_command(),
-                PythonVersion::Py315 => common::python_315_command(),
-            };
+            let mut python = common::python_command(version);
             let native = python
                 .args(["-c", oracle, source])
                 .arg(&path)
@@ -196,23 +184,13 @@ except SyntaxError as error:
 else:
     print('accepted')
 ";
-    for version in [
-        PythonVersion::Py312,
-        PythonVersion::Py313,
-        PythonVersion::Py314,
-        PythonVersion::Py315,
-    ] {
+    for version in common::PYTHON_VERSIONS {
         let options = CompileOptions {
             python_version: version,
             ..CompileOptions::default()
         };
         for (source, unsupported_message) in &cases {
-            let mut python = match version {
-                PythonVersion::Py312 => common::python_312_command(),
-                PythonVersion::Py313 => common::python_313_command(),
-                PythonVersion::Py314 => common::python_3145_command(),
-                PythonVersion::Py315 => common::python_315_command(),
-            };
+            let mut python = common::python_command(version);
             let native = python.args(["-c", oracle, source]).output().unwrap();
             assert!(native.status.success(), "{version}: {native:?}");
             let expected = String::from_utf8(native.stdout).unwrap();
@@ -278,23 +256,13 @@ except SyntaxError as error:
     raise SystemExit(1)
 sys.stdout.buffer.write(marshal.dumps(code))
 ";
-    for version in [
-        PythonVersion::Py312,
-        PythonVersion::Py313,
-        PythonVersion::Py314,
-        PythonVersion::Py315,
-    ] {
+    for version in common::PYTHON_VERSIONS {
         for (limit, source, accepted) in &cases {
             let options = CompileOptions {
                 python_version: version,
                 ..CompileOptions::default()
             };
-            let mut python = match version {
-                PythonVersion::Py312 => common::python_312_command(),
-                PythonVersion::Py313 => common::python_313_command(),
-                PythonVersion::Py314 => common::python_3145_command(),
-                PythonVersion::Py315 => common::python_315_command(),
-            };
+            let mut python = common::python_command(version);
             let native = python
                 .args(["-c", oracle, &limit.to_string(), source])
                 .arg(path)
@@ -384,12 +352,7 @@ fn decimal_parse_limit_is_validated_and_defaults_are_preserved() {
 fn decimal_parsing_and_mapping_key_formatting_have_separate_limits() {
     let key = "1".repeat(641);
     let source = format!("match subject:\n case {{{key}: _, {key}: _}}: pass\n");
-    for version in [
-        PythonVersion::Py312,
-        PythonVersion::Py313,
-        PythonVersion::Py314,
-        PythonVersion::Py315,
-    ] {
+    for version in common::PYTHON_VERSIONS {
         for (parse_limit, format_limit) in [(640, 0), (0, 640), (4300, 0)] {
             let options = CompileOptions {
                 python_version: version,
@@ -438,12 +401,7 @@ fn explicit_decimal_parse_limit_precedes_later_semantic_validation() {
     let digits = "1".repeat(641);
     let source = format!("match subject:\n case {{1: _, 1: _}}: pass\nlater = {digits}\n");
     let malformed = format!("# {digits}\nmatch subject:\n case +: pass\n");
-    for version in [
-        PythonVersion::Py312,
-        PythonVersion::Py313,
-        PythonVersion::Py314,
-        PythonVersion::Py315,
-    ] {
+    for version in common::PYTHON_VERSIONS {
         for limit in [640, 0, 4300] {
             let options = CompileOptions {
                 python_version: version,

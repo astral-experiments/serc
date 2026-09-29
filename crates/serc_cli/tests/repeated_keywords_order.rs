@@ -206,12 +206,7 @@ except SyntaxError as error:
     print(error.lineno, error.offset, error.end_lineno, error.end_offset)
     raise SystemExit(1)
 ";
-    for version in [
-        PythonVersion::Py312,
-        PythonVersion::Py313,
-        PythonVersion::Py314,
-        PythonVersion::Py315,
-    ] {
+    for version in common::PYTHON_VERSIONS {
         let options = CompileOptions {
             python_version: version,
             ..CompileOptions::default()
@@ -219,42 +214,18 @@ except SyntaxError as error:
         let modern = matches!(version, PythonVersion::Py314 | PythonVersion::Py315);
         for (source, legacy, current) in cases {
             let (expected_message, expected_span) = if modern { current } else { legacy };
-            let mut python = match version {
-                PythonVersion::Py312 => common::python_312_command(),
-                PythonVersion::Py313 => common::python_313_command(),
-                PythonVersion::Py314 => common::python_3145_command(),
-                PythonVersion::Py315 => common::python_315_command(),
-            };
+            let mut python = common::python_command(version);
             let native = python.args(["-c", oracle, source]).output().unwrap();
             assert!(
                 !native.status.success(),
                 "{version}: {source:?}: {native:?}"
             );
-            let stdout = String::from_utf8(native.stdout).unwrap();
-            let mut lines = stdout.lines();
+            let diagnostic = common::diagnostics::parse_diagnostic(native.stdout);
             assert_eq!(
-                lines.next(),
-                Some(expected_message),
+                diagnostic.message, expected_message,
                 "{version}: {source:?}"
             );
-            let positions: Vec<usize> = lines
-                .next()
-                .unwrap()
-                .split_whitespace()
-                .map(|part| part.parse().unwrap())
-                .collect();
-            assert_eq!(positions.len(), 4);
-            let offset = |line: usize, column: usize| {
-                source
-                    .split_inclusive('\n')
-                    .take(line - 1)
-                    .map(str::len)
-                    .sum::<usize>()
-                    + column
-                    - 1
-            };
-            let native_start = offset(positions[0], positions[1]);
-            let native_end = offset(positions[2], positions[3]);
+            let (native_start, native_end) = diagnostic.byte_range(source);
             assert_eq!(&source[native_start..native_end], expected_span);
 
             let error = compile_with_options(source, "synthetic.py", &options).unwrap_err();

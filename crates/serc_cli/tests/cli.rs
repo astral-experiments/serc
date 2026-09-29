@@ -3,17 +3,81 @@ mod common;
 mod except_star_transfers;
 
 use std::fmt::Write as _;
-use std::process::Command;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
 use std::time::{Duration, UNIX_EPOCH};
 
 fn serc() -> Command {
     Command::new(env!("CARGO_BIN_EXE_serc"))
 }
 
+/// Compiles a source with the CLI while leaving its assertions to the caller.
+fn compile_for_version(source: &Path, version: serc::PythonVersion) -> Output {
+    serc()
+        .args([
+            "compile",
+            "--quiet",
+            "--python-version",
+            &version.to_string(),
+        ])
+        .arg(source)
+        .output()
+        .unwrap()
+}
+
+/// Compares the complete timestamp cache, including its header, against CPython.
+fn assert_compile_matches_cpython(
+    source: &Path,
+    native_path: &Path,
+    version: serc::PythonVersion,
+    oracle: &mut Command,
+) -> PathBuf {
+    let native = oracle
+        .args([
+            "-c",
+            "import py_compile, sys; py_compile.compile(sys.argv[1], cfile=sys.argv[2], doraise=True, optimize=0, invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)",
+        ])
+        .arg(source)
+        .arg(native_path)
+        .output()
+        .unwrap();
+    assert!(
+        native.status.success(),
+        "{version}: {}: {native:?}",
+        source.display()
+    );
+    let compiled = compile_for_version(source, version);
+    assert!(
+        compiled.status.success(),
+        "{version}: {}: {compiled:?}",
+        source.display()
+    );
+    let (_, minor, _) = version.target().version;
+    let cache_path = source.parent().unwrap().join(format!(
+        "__pycache__/{}.cpython-3{minor}.pyc",
+        source.file_stem().unwrap().to_str().unwrap()
+    ));
+    assert_eq!(
+        fs_err::read(&cache_path).unwrap(),
+        fs_err::read(native_path).unwrap(),
+        "Python {version}: {}",
+        source.display()
+    );
+    cache_path
+}
+
+/// Runs a compiled artifact with the caller's interpreter flags.
+fn assert_executes(oracle: &mut Command, path: &Path, version: serc::PythonVersion) {
+    let output = oracle.arg(path).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{version}: {}: {output:?}",
+        path.display()
+    );
+}
+
 #[test]
 fn compile_matches_cpython_for_negated_ellipsis() {
-    use serc::PythonVersion;
-
     let cases = [
         "result = not ...\n",
         "def f():\n    return not ...\n",
@@ -67,20 +131,10 @@ fn compile_matches_cpython_for_negated_ellipsis() {
     let directory = tempfile::tempdir().unwrap();
     let source_path = directory.path().join("negated_ellipsis.py");
     let native_path = directory.path().join("native.pyc");
-    for version in [
-        PythonVersion::Py312,
-        PythonVersion::Py313,
-        PythonVersion::Py314,
-        PythonVersion::Py315,
-    ] {
+    for version in common::PYTHON_VERSIONS {
         for source in cases {
             fs_err::write(&source_path, source).unwrap();
-            let mut oracle = match version {
-                PythonVersion::Py312 => common::python_312_command(),
-                PythonVersion::Py313 => common::python_313_command(),
-                PythonVersion::Py314 => common::python_3145_command(),
-                PythonVersion::Py315 => common::python_315_command(),
-            };
+            let mut oracle = common::python_command(version);
             let native = oracle
                 .args([
                     "-c",
@@ -92,16 +146,7 @@ fn compile_matches_cpython_for_negated_ellipsis() {
                 .unwrap();
             assert!(native.status.success(), "{version}: {source}: {native:?}");
 
-            let compiled = serc()
-                .args([
-                    "compile",
-                    "--quiet",
-                    "--python-version",
-                    &version.to_string(),
-                ])
-                .arg(&source_path)
-                .output()
-                .unwrap();
+            let compiled = compile_for_version(&source_path, version);
             assert!(
                 compiled.status.success(),
                 "{version}: {source}: {compiled:?}"
@@ -131,8 +176,6 @@ fn help_describes_compile_command() {
 
 #[test]
 fn compile_optimization_modes_match_cpython_and_use_distinct_caches() {
-    use serc::PythonVersion;
-
     let directory = tempfile::tempdir().unwrap();
     let source_path = directory.path().join("optimized.py");
     let native_path = directory.path().join("native.pyc");
@@ -145,12 +188,7 @@ fn compile_optimization_modes_match_cpython_and_use_distinct_caches() {
     .unwrap();
 
     let many_flags = format!("-{}", "O".repeat(256));
-    for version in [
-        PythonVersion::Py312,
-        PythonVersion::Py313,
-        PythonVersion::Py314,
-        PythonVersion::Py315,
-    ] {
+    for version in common::PYTHON_VERSIONS {
         for (level, arguments) in [
             ("0", vec![]),
             ("0", vec!["--optimize", "0"]),
@@ -179,12 +217,7 @@ fn compile_optimization_modes_match_cpython_and_use_distinct_caches() {
                 "{version} {arguments:?}: {output:?}"
             );
 
-            let mut oracle = match version {
-                PythonVersion::Py312 => common::python_312_command(),
-                PythonVersion::Py313 => common::python_313_command(),
-                PythonVersion::Py314 => common::python_3145_command(),
-                PythonVersion::Py315 => common::python_315_command(),
-            };
+            let mut oracle = common::python_command(version);
             oracle.arg("-B");
             if level.parse::<usize>().unwrap() > 2 {
                 oracle.arg(format!("-{}", "O".repeat(level.parse().unwrap())));
@@ -280,12 +313,7 @@ fn compile_invalidation_modes_match_cpython() {
     let source_path = directory.path().join("module.py");
     let oracle_path = directory.path().join("oracle.pyc");
 
-    for version in [
-        serc::PythonVersion::Py312,
-        serc::PythonVersion::Py313,
-        serc::PythonVersion::Py314,
-        serc::PythonVersion::Py315,
-    ] {
+    for version in common::PYTHON_VERSIONS {
         let (_, minor, _) = version.target().version;
         let pyc_path = directory
             .path()
@@ -304,12 +332,7 @@ fn compile_invalidation_modes_match_cpython() {
                 ("checked-hash", "CHECKED_HASH"),
                 ("unchecked-hash", "UNCHECKED_HASH"),
             ] {
-                let mut oracle = match version {
-                    serc::PythonVersion::Py312 => common::python_312_command(),
-                    serc::PythonVersion::Py313 => common::python_313_command(),
-                    serc::PythonVersion::Py314 => common::python_3145_command(),
-                    serc::PythonVersion::Py315 => common::python_315_command(),
-                };
+                let mut oracle = common::python_command(version);
                 let native = oracle
                     .args([
                         "-c",
@@ -476,22 +499,8 @@ fn compile_keeps_python_versions_in_separate_caches() {
     let source_path = directory.path().join("module.py");
     fs_err::write(&source_path, "answer = 42\n").unwrap();
 
-    for version in [
-        serc::PythonVersion::Py312,
-        serc::PythonVersion::Py313,
-        serc::PythonVersion::Py314,
-        serc::PythonVersion::Py315,
-    ] {
-        let output = serc()
-            .args([
-                "compile",
-                "--quiet",
-                "--python-version",
-                &version.to_string(),
-            ])
-            .arg(&source_path)
-            .output()
-            .unwrap();
+    for version in common::PYTHON_VERSIONS {
+        let output = compile_for_version(&source_path, version);
         assert!(output.status.success(), "{output:?}");
         assert!(output.stderr.is_empty());
         let (_, minor, _) = version.target().version;
@@ -648,56 +657,17 @@ fn private_nonlocal_aliases_match_native_bindings_and_pyc() {
         include_str!("../../serc/tests/fixtures/private_nonlocal_aliases.py"),
     )
     .unwrap();
-    for version in [
-        serc::PythonVersion::Py312,
-        serc::PythonVersion::Py313,
-        serc::PythonVersion::Py314,
-        serc::PythonVersion::Py315,
-    ] {
-        let oracle = || match version {
-            serc::PythonVersion::Py312 => common::python_312_command(),
-            serc::PythonVersion::Py313 => common::python_313_command(),
-            serc::PythonVersion::Py314 => common::python_3145_command(),
-            serc::PythonVersion::Py315 => common::python_315_command(),
-        };
-        let output = serc()
-            .args([
-                "compile",
-                "--quiet",
-                "--python-version",
-                &version.to_string(),
-            ])
-            .arg(&source_path)
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{version}: {output:?}");
+    for version in common::PYTHON_VERSIONS {
         let (_, minor, _) = version.target().version;
-        let cache_path = directory.path().join(format!(
-            "__pycache__/private_nonlocal_aliases.cpython-3{minor}.pyc"
-        ));
         let native_path = directory.path().join(format!("native-3{minor}.pyc"));
-        let native = oracle()
-            .args([
-                "-B",
-                "-c",
-                "import py_compile, sys; py_compile.compile(sys.argv[1], cfile=sys.argv[2], doraise=True, optimize=0, invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)",
-            ])
-            .arg(&source_path)
-            .arg(&native_path)
-            .output()
-            .unwrap();
-        assert!(native.status.success(), "{version}: {native:?}");
-        assert_eq!(
-            fs_err::read(&cache_path).unwrap(),
-            fs_err::read(&native_path).unwrap(),
-            "Python {version}"
+        let cache_path = assert_compile_matches_cpython(
+            &source_path,
+            &native_path,
+            version,
+            common::python_command(version).arg("-B"),
         );
         for artifact in [&native_path, &cache_path] {
-            let output = oracle().arg("-B").arg(artifact).output().unwrap();
-            assert!(
-                output.status.success(),
-                "{version}: {artifact:?}: {output:?}"
-            );
+            assert_executes(common::python_command(version).arg("-B"), artifact, version);
         }
     }
 }
@@ -711,68 +681,24 @@ fn private_local_aliases_match_native_bindings_and_marshal() {
         include_str!("../../serc/tests/fixtures/private_local_aliases.py"),
     )
     .unwrap();
-    for version in [
-        serc::PythonVersion::Py312,
-        serc::PythonVersion::Py313,
-        serc::PythonVersion::Py314,
-        serc::PythonVersion::Py315,
-    ] {
-        let oracle = || match version {
-            serc::PythonVersion::Py312 => common::python_312_command(),
-            serc::PythonVersion::Py313 => common::python_313_command(),
-            serc::PythonVersion::Py314 => common::python_3145_command(),
-            serc::PythonVersion::Py315 => common::python_315_command(),
-        };
-        let output = serc()
-            .args([
-                "compile",
-                "--quiet",
-                "--python-version",
-                &version.to_string(),
-            ])
-            .arg(&source_path)
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{version}: {output:?}");
+    for version in common::PYTHON_VERSIONS {
         let (_, minor, _) = version.target().version;
-        let cache_path = directory.path().join(format!(
-            "__pycache__/private_local_aliases.cpython-3{minor}.pyc"
-        ));
         let native_path = directory.path().join(format!("native-3{minor}.pyc"));
-        let native = oracle()
-            .args([
-                "-B",
-                "-c",
-                "import py_compile, sys; py_compile.compile(sys.argv[1], cfile=sys.argv[2], doraise=True, optimize=0, invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)",
-            ])
-            .arg(&source_path)
-            .arg(&native_path)
-            .output()
-            .unwrap();
-        assert!(native.status.success(), "{version}: {native:?}");
-        assert_eq!(
-            fs_err::read(&cache_path).unwrap(),
-            fs_err::read(&native_path).unwrap(),
-            "Python {version}"
+        let cache_path = assert_compile_matches_cpython(
+            &source_path,
+            &native_path,
+            version,
+            common::python_command(version).arg("-B"),
         );
         for artifact in [&native_path, &cache_path] {
-            let output = oracle().arg("-B").arg(artifact).output().unwrap();
-            assert!(
-                output.status.success(),
-                "{version}: {artifact:?}: {output:?}"
-            );
+            assert_executes(common::python_command(version).arg("-B"), artifact, version);
         }
     }
 }
 
 #[test]
 fn class_bindings_preserve_type_parameter_wrapper_cells() {
-    for version in [
-        serc::PythonVersion::Py312,
-        serc::PythonVersion::Py313,
-        serc::PythonVersion::Py314,
-        serc::PythonVersion::Py315,
-    ] {
+    for version in common::PYTHON_VERSIONS {
         let mut sources = vec![
             "T = 'global'\nclass C:\n global T\n locals()['T'] = 'class'\n def f[T](arg: T): return T\n",
             "T = lambda: 'global'\nclass C:\n global T\n locals()['T'] = lambda: 'class'\n def f[T](arg: T()): return T\n",
@@ -802,12 +728,7 @@ fn class_bindings_preserve_type_parameter_wrapper_cells() {
             ]);
         }
         for source in sources {
-            let mut oracle = match version {
-                serc::PythonVersion::Py312 => common::python_312_command(),
-                serc::PythonVersion::Py313 => common::python_313_command(),
-                serc::PythonVersion::Py314 => common::python_3145_command(),
-                serc::PythonVersion::Py315 => common::python_315_command(),
-            };
+            let mut oracle = common::python_command(version);
             let native = oracle
                 .args([
                     "-c",
@@ -846,12 +767,8 @@ fn compile_preserves_empty_sequence_repetition_boundaries() {
     )
     .unwrap();
 
-    for (version, mut oracle) in [
-        (serc::PythonVersion::Py312, common::python_312_command()),
-        (serc::PythonVersion::Py313, common::python_313_command()),
-        (serc::PythonVersion::Py314, common::python_3145_command()),
-        (serc::PythonVersion::Py315, common::python_315_command()),
-    ] {
+    for version in common::PYTHON_VERSIONS {
+        let mut oracle = common::python_command(version);
         let (_, minor, _) = version.target().version;
         let pyc_path = directory.path().join(format!(
             "__pycache__/empty_sequence_repetition.cpython-3{minor}.pyc"
@@ -868,16 +785,7 @@ fn compile_preserves_empty_sequence_repetition_boundaries() {
         assert!(native.status.success(), "{version}: {native:?}");
         let expected = fs_err::read(&pyc_path).unwrap();
 
-        let output = serc()
-            .args([
-                "compile",
-                "--quiet",
-                "--python-version",
-                &version.to_string(),
-            ])
-            .arg(&source_path)
-            .output()
-            .unwrap();
+        let output = compile_for_version(&source_path, version);
         assert!(output.status.success(), "{version}: {output:?}");
         assert_eq!(
             fs_err::read(&pyc_path).unwrap(),
@@ -885,12 +793,7 @@ fn compile_preserves_empty_sequence_repetition_boundaries() {
             "Python {version}"
         );
 
-        let mut runtime = match version {
-            serc::PythonVersion::Py312 => common::python_312_command(),
-            serc::PythonVersion::Py313 => common::python_313_command(),
-            serc::PythonVersion::Py314 => common::python_3145_command(),
-            serc::PythonVersion::Py315 => common::python_315_command(),
-        };
+        let mut runtime = common::python_command(version);
         let output = runtime.arg(&pyc_path).output().unwrap();
         assert!(output.status.success(), "{version}: {output:?}");
     }
@@ -902,12 +805,7 @@ fn generic_class_headers_respect_enclosing_class_bindings() {
     let source_path = directory.path().join("generic_class_header.py");
     let prelude =
         "class Base:\n    def __init_subclass__(cls, *, value):\n        cls.value = value\n";
-    for version in [
-        serc::PythonVersion::Py312,
-        serc::PythonVersion::Py313,
-        serc::PythonVersion::Py314,
-        serc::PythonVersion::Py315,
-    ] {
+    for version in common::PYTHON_VERSIONS {
         let mut sources = Vec::new();
         for keyword in [false, true] {
             for (before, after, expected) in [
@@ -982,51 +880,17 @@ fn generic_class_headers_respect_enclosing_class_bindings() {
                 ));
             }
         }
-        let (_, minor, _) = version.target().version;
-        let pyc_path = directory.path().join(format!(
-            "__pycache__/generic_class_header.cpython-3{minor}.pyc"
-        ));
         let native_path = directory.path().join("native.pyc");
-        let oracle = || match version {
-            serc::PythonVersion::Py312 => common::python_312_command(),
-            serc::PythonVersion::Py313 => common::python_313_command(),
-            serc::PythonVersion::Py314 => common::python_3145_command(),
-            serc::PythonVersion::Py315 => common::python_315_command(),
-        };
         for source in sources {
             fs_err::write(&source_path, &source).unwrap();
-            let output = serc()
-                .args([
-                    "compile",
-                    "--quiet",
-                    "--python-version",
-                    &version.to_string(),
-                ])
-                .arg(&source_path)
-                .output()
-                .unwrap();
-            assert!(output.status.success(), "{version}: {source}: {output:?}");
-            let native = oracle()
-                .args([
-                    "-B", "-c",
-                    "import py_compile, sys; py_compile.compile(sys.argv[1], cfile=sys.argv[2], doraise=True, optimize=0, invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)",
-                ])
-                .arg(&source_path)
-                .arg(&native_path)
-                .output()
-                .unwrap();
-            assert!(native.status.success(), "{version}: {source}: {native:?}");
-            assert_eq!(
-                fs_err::read(&pyc_path).unwrap(),
-                fs_err::read(&native_path).unwrap(),
-                "Python {version}: {source}"
+            let pyc_path = assert_compile_matches_cpython(
+                &source_path,
+                &native_path,
+                version,
+                common::python_command(version).arg("-B"),
             );
             for artifact in [&native_path, &pyc_path] {
-                let output = oracle().arg("-B").arg(artifact).output().unwrap();
-                assert!(
-                    output.status.success(),
-                    "{version}: {artifact:?}: {source}: {output:?}"
-                );
+                assert_executes(common::python_command(version).arg("-B"), artifact, version);
             }
         }
     }
@@ -1037,12 +901,7 @@ fn private_class_captures_match_native_marshal_and_execution() {
     let directory = tempfile::tempdir().unwrap();
     let source_path = directory.path().join("private_class_captures.py");
 
-    for version in [
-        serc::PythonVersion::Py312,
-        serc::PythonVersion::Py313,
-        serc::PythonVersion::Py314,
-        serc::PythonVersion::Py315,
-    ] {
+    for version in common::PYTHON_VERSIONS {
         let mut source =
             include_str!("../../serc/tests/fixtures/private_class_captures.py").to_string();
         if version >= serc::PythonVersion::Py313 {
@@ -1051,12 +910,7 @@ fn private_class_captures_match_native_marshal_and_execution() {
             ));
         }
         fs_err::write(&source_path, source).unwrap();
-        let oracle = || match version {
-            serc::PythonVersion::Py312 => common::python_312_command(),
-            serc::PythonVersion::Py313 => common::python_313_command(),
-            serc::PythonVersion::Py314 => common::python_3145_command(),
-            serc::PythonVersion::Py315 => common::python_315_command(),
-        };
+        let oracle = || common::python_command(version);
         let native = oracle()
             .args([
                 "-B",
@@ -1077,16 +931,7 @@ fn private_class_captures_match_native_marshal_and_execution() {
         assert!(native.status.success(), "{version}: {native:?}");
         assert!(native.stdout.is_empty(), "{version}: {native:?}");
 
-        let output = serc()
-            .args([
-                "compile",
-                "--quiet",
-                "--python-version",
-                &version.to_string(),
-            ])
-            .arg(&source_path)
-            .output()
-            .unwrap();
+        let output = compile_for_version(&source_path, version);
         assert!(output.status.success(), "{version}: {output:?}");
         assert_eq!(
             fs_err::read(&pyc_path).unwrap(),
@@ -1131,18 +976,8 @@ fn compile_matches_cpython_for_negative_empty_sequence_repetition() {
     }
     for source in sources {
         fs_err::write(&source_path, &source).unwrap();
-        for version in [
-            serc::PythonVersion::Py312,
-            serc::PythonVersion::Py313,
-            serc::PythonVersion::Py314,
-            serc::PythonVersion::Py315,
-        ] {
-            let mut oracle = match version {
-                serc::PythonVersion::Py312 => common::python_312_command(),
-                serc::PythonVersion::Py313 => common::python_313_command(),
-                serc::PythonVersion::Py314 => common::python_3145_command(),
-                serc::PythonVersion::Py315 => common::python_315_command(),
-            };
+        for version in common::PYTHON_VERSIONS {
+            let mut oracle = common::python_command(version);
             let native = oracle
             .args([
                 "-B",
@@ -1158,16 +993,7 @@ fn compile_matches_cpython_for_negative_empty_sequence_repetition() {
                 "__pycache__/negative_empty_sequence_repetition.cpython-3{minor}.pyc"
             ));
             let expected = fs_err::read(&pyc_path).unwrap();
-            let compiled = serc()
-                .args([
-                    "compile",
-                    "--quiet",
-                    "--python-version",
-                    &version.to_string(),
-                ])
-                .arg(&source_path)
-                .output()
-                .unwrap();
+            let compiled = compile_for_version(&source_path, version);
             assert!(compiled.status.success(), "Python {version}: {compiled:?}");
             assert_eq!(
                 fs_err::read(&pyc_path).unwrap(),
@@ -1267,12 +1093,7 @@ fn compile_matches_cpython_for_version_specific_marshal_identity() {
             .unwrap();
         }
     }
-    for version in [
-        serc::PythonVersion::Py312,
-        serc::PythonVersion::Py313,
-        serc::PythonVersion::Py314,
-        serc::PythonVersion::Py315,
-    ] {
+    for version in common::PYTHON_VERSIONS {
         let (_, minor, _) = version.target().version;
         let pyc_path = directory
             .path()
@@ -1472,12 +1293,7 @@ fn compile_matches_cpython_for_version_specific_marshal_identity() {
         }
         for source in sources {
             fs_err::write(&source_path, source).unwrap();
-            let mut oracle = match version {
-                serc::PythonVersion::Py312 => common::python_312_command(),
-                serc::PythonVersion::Py313 => common::python_313_command(),
-                serc::PythonVersion::Py314 => common::python_3145_command(),
-                serc::PythonVersion::Py315 => common::python_315_command(),
-            };
+            let mut oracle = common::python_command(version);
             let output = oracle
                 .args([
                     "-m",
@@ -1495,16 +1311,7 @@ fn compile_matches_cpython_for_version_specific_marshal_identity() {
             assert!(output.status.success(), "{output:?}");
             let expected = fs_err::read(&pyc_path).unwrap();
 
-            let output = serc()
-                .args([
-                    "compile",
-                    "--quiet",
-                    "--python-version",
-                    &version.to_string(),
-                ])
-                .arg(&source_path)
-                .output()
-                .unwrap();
+            let output = compile_for_version(&source_path, version);
             assert!(output.status.success(), "{output:?}");
             assert_eq!(
                 fs_err::read(&pyc_path).unwrap(),
@@ -1526,56 +1333,15 @@ fn compile_matches_cpython_for_class_local_closure_shadowing() {
     )
     .unwrap();
 
-    for version in [
-        serc::PythonVersion::Py312,
-        serc::PythonVersion::Py313,
-        serc::PythonVersion::Py314,
-        serc::PythonVersion::Py315,
-    ] {
-        let oracle = || match version {
-            serc::PythonVersion::Py312 => common::python_312_command(),
-            serc::PythonVersion::Py313 => common::python_313_command(),
-            serc::PythonVersion::Py314 => common::python_3145_command(),
-            serc::PythonVersion::Py315 => common::python_315_command(),
-        };
-        let native = oracle()
-            .args([
-                "-c",
-                "import py_compile, sys; py_compile.compile(sys.argv[1], cfile=sys.argv[2], doraise=True, optimize=0, invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)",
-            ])
-            .arg(&source_path)
-            .arg(&native_path)
-            .output()
-            .unwrap();
-        assert!(native.status.success(), "{version}: {native:?}");
-
-        let output = serc()
-            .args([
-                "compile",
-                "--quiet",
-                "--python-version",
-                &version.to_string(),
-            ])
-            .arg(&source_path)
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{version}: {output:?}");
-        let (_, minor, _) = version.target().version;
-        let pyc_path = directory
-            .path()
-            .join(format!("__pycache__/module.cpython-3{minor}.pyc"));
-        assert_eq!(
-            fs_err::read(&pyc_path).unwrap(),
-            fs_err::read(&native_path).unwrap(),
-            "Python {version}"
+    for version in common::PYTHON_VERSIONS {
+        let cache_path = assert_compile_matches_cpython(
+            &source_path,
+            &native_path,
+            version,
+            &mut common::python_command(version),
         );
-        for path in [&native_path, &pyc_path] {
-            let executed = oracle().arg(path).output().unwrap();
-            assert!(
-                executed.status.success(),
-                "{version}: {}: {executed:?}",
-                path.display()
-            );
+        for artifact in [&native_path, &cache_path] {
+            assert_executes(&mut common::python_command(version), artifact, version);
         }
     }
 }
@@ -2024,20 +1790,10 @@ fn compile_matches_cpython_for_non_utf8_paths() {
     }
 
     fn oracle(version: serc::PythonVersion) -> Command {
-        match version {
-            serc::PythonVersion::Py312 => common::python_312_command(),
-            serc::PythonVersion::Py313 => common::python_313_command(),
-            serc::PythonVersion::Py314 => common::python_3145_command(),
-            serc::PythonVersion::Py315 => common::python_315_command(),
-        }
+        common::python_command(version)
     }
 
-    let versions = [
-        serc::PythonVersion::Py312,
-        serc::PythonVersion::Py313,
-        serc::PythonVersion::Py314,
-        serc::PythonVersion::Py315,
-    ];
+    let versions = common::PYTHON_VERSIONS;
     let directory = tempfile::tempdir().unwrap();
     let nested = directory
         .path()
@@ -2353,56 +2109,15 @@ fn compile_matches_cpython_for_class_comprehension_closure_slots() {
     )
     .unwrap();
 
-    for version in [
-        serc::PythonVersion::Py312,
-        serc::PythonVersion::Py313,
-        serc::PythonVersion::Py314,
-        serc::PythonVersion::Py315,
-    ] {
-        let oracle = || match version {
-            serc::PythonVersion::Py312 => common::python_312_command(),
-            serc::PythonVersion::Py313 => common::python_313_command(),
-            serc::PythonVersion::Py314 => common::python_3145_command(),
-            serc::PythonVersion::Py315 => common::python_315_command(),
-        };
-        let native = oracle()
-            .args([
-                "-c",
-                "import py_compile, sys; py_compile.compile(sys.argv[1], cfile=sys.argv[2], doraise=True, optimize=0, invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)",
-            ])
-            .arg(&source_path)
-            .arg(&native_path)
-            .output()
-            .unwrap();
-        assert!(native.status.success(), "{version}: {native:?}");
-
-        let output = serc()
-            .args([
-                "compile",
-                "--quiet",
-                "--python-version",
-                &version.to_string(),
-            ])
-            .arg(&source_path)
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{version}: {output:?}");
-        let (_, minor, _) = version.target().version;
-        let pyc_path = directory
-            .path()
-            .join(format!("__pycache__/module.cpython-3{minor}.pyc"));
-        assert_eq!(
-            fs_err::read(&pyc_path).unwrap(),
-            fs_err::read(&native_path).unwrap(),
-            "Python {version}"
+    for version in common::PYTHON_VERSIONS {
+        let cache_path = assert_compile_matches_cpython(
+            &source_path,
+            &native_path,
+            version,
+            &mut common::python_command(version),
         );
-        for path in [&native_path, &pyc_path] {
-            let executed = oracle().arg(path).output().unwrap();
-            assert!(
-                executed.status.success(),
-                "{version}: {}: {executed:?}",
-                path.display()
-            );
+        for artifact in [&native_path, &cache_path] {
+            assert_executes(&mut common::python_command(version), artifact, version);
         }
     }
 }
@@ -2425,54 +2140,12 @@ fn compile_matches_cpython_for_legacy_class_comprehension_cells() {
         let native_path = directory.path().join("native.pyc");
         fs_err::write(&source_path, source).unwrap();
 
-        for version in [
-            serc::PythonVersion::Py312,
-            serc::PythonVersion::Py313,
-            serc::PythonVersion::Py314,
-            serc::PythonVersion::Py315,
-        ] {
-            let mut oracle = match version {
-                serc::PythonVersion::Py312 => common::python_312_command(),
-                serc::PythonVersion::Py313 => common::python_313_command(),
-                serc::PythonVersion::Py314 => common::python_3145_command(),
-                serc::PythonVersion::Py315 => common::python_315_command(),
-            };
-            let native = oracle
-                .args([
-                    "-c",
-                    "import py_compile, sys; py_compile.compile(sys.argv[1], cfile=sys.argv[2], doraise=True, optimize=0, invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)",
-                ])
-                .arg(&source_path)
-                .arg(&native_path)
-                .output()
-                .unwrap();
-            assert!(
-                native.status.success(),
-                "{version}, before={before}: {native:?}"
-            );
-
-            let output = serc()
-                .args([
-                    "compile",
-                    "--quiet",
-                    "--python-version",
-                    &version.to_string(),
-                ])
-                .arg(&source_path)
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{version}, before={before}: {output:?}"
-            );
-            let (_, minor, _) = version.target().version;
-            let pyc_path = directory
-                .path()
-                .join(format!("__pycache__/module.cpython-3{minor}.pyc"));
-            assert_eq!(
-                fs_err::read(&pyc_path).unwrap(),
-                fs_err::read(&native_path).unwrap(),
-                "Python {version}, before={before}"
+        for version in common::PYTHON_VERSIONS {
+            assert_compile_matches_cpython(
+                &source_path,
+                &native_path,
+                version,
+                &mut common::python_command(version),
             );
         }
     }

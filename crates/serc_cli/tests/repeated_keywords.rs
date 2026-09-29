@@ -146,12 +146,7 @@ except SyntaxError as error:
     raise SystemExit(1)
 sys.stdout.buffer.write(marshal.dumps(code))
 ";
-    for version in [
-        PythonVersion::Py312,
-        PythonVersion::Py313,
-        PythonVersion::Py314,
-        PythonVersion::Py315,
-    ] {
+    for version in common::PYTHON_VERSIONS {
         let options = CompileOptions {
             python_version: version,
             ..CompileOptions::default()
@@ -166,12 +161,7 @@ sys.stdout.buffer.write(marshal.dumps(code))
             {
                 expected = Some("keyword argument repeated: x");
             }
-            let mut python = match version {
-                PythonVersion::Py312 => common::python_312_command(),
-                PythonVersion::Py313 => common::python_313_command(),
-                PythonVersion::Py314 => common::python_3145_command(),
-                PythonVersion::Py315 => common::python_315_command(),
-            };
+            let mut python = common::python_command(version);
             let native = python
                 .args(["-c", oracle, source])
                 .arg(&path)

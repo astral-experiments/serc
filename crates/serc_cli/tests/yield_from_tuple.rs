@@ -1,8 +1,6 @@
 mod common;
 
-use serc::{
-    CompileError, CompileOptions, PythonVersion, compile_bytes_with_options, compile_with_options,
-};
+use serc::{CompileError, CompileOptions, compile_with_options};
 
 #[test]
 fn unknown_decimal_parse_limit_takes_precedence() {
@@ -18,20 +16,6 @@ fn unknown_decimal_parse_limit_takes_precedence() {
         ),
         "{error}"
     );
-}
-
-fn byte_offset(source: &str, line: usize, column: usize) -> usize {
-    let prefix: usize = source
-        .split_inclusive('\n')
-        .take(line - 1)
-        .map(str::len)
-        .sum();
-    let line = source[prefix..].split('\n').next().unwrap();
-    prefix
-        + line
-            .char_indices()
-            .nth(column - 1)
-            .map_or(line.len(), |(offset, _)| offset)
 }
 
 #[test]
@@ -67,74 +51,22 @@ fn yield_from_tuple_diagnostics_match_native() {
         "def f():\n    yield from a, (b, c)\n",
         "def f():\n    yield from a \\\n       ,\n",
     ];
-    let oracle = r"
-import sys
-try:
-    compile(sys.argv[1], 'case.py', 'exec', dont_inherit=True)
-except SyntaxError as error:
-    print(error.msg)
-    print(error.lineno, error.offset, error.end_lineno, error.end_offset)
-else:
-    raise AssertionError('expected a syntax error')
-";
-    for version in [
-        PythonVersion::Py312,
-        PythonVersion::Py313,
-        PythonVersion::Py314,
-        PythonVersion::Py315,
-    ] {
+    for version in common::PYTHON_VERSIONS {
         let options = CompileOptions {
             python_version: version,
             ..CompileOptions::default()
         };
         for source in cases {
-            let mut python = match version {
-                PythonVersion::Py312 => common::python_312_command(),
-                PythonVersion::Py313 => common::python_313_command(),
-                PythonVersion::Py314 => common::python_3145_command(),
-                PythonVersion::Py315 => common::python_315_command(),
-            };
-            let native = python.args(["-c", oracle, source]).output().unwrap();
-            assert!(native.status.success(), "{version}: {source:?}: {native:?}");
-            let output = String::from_utf8(native.stdout).unwrap();
-            let mut lines = output.lines();
-            let message = lines.next().unwrap();
-            let positions: Vec<usize> = lines
-                .next()
-                .unwrap()
-                .split_whitespace()
-                .map(|value| value.parse().unwrap())
-                .collect();
-            let start = byte_offset(source, positions[0], positions[1]);
-            let end = byte_offset(source, positions[2], positions[3]);
-            for result in [
-                compile_with_options(source, "case.py", &options),
-                compile_bytes_with_options(source.as_bytes(), "case.py", &options),
-            ] {
-                let error = result.unwrap_err();
-                assert!(
-                    error.to_string().ends_with(message),
-                    "{version}: {source:?}: {message:?} != {error}"
-                );
-                let range = error.range().unwrap();
-                assert_eq!(
-                    (range.start().to_usize(), range.end().to_usize()),
-                    (start, end),
-                    "{version}: {source:?}: {error}"
-                );
-            }
+            let diagnostic = common::diagnostics::syntax_diagnostic(version, source);
+            let expected = diagnostic.character_range(source);
+            diagnostic.assert_error(source, &options, expected);
         }
     }
 }
 
 #[test]
 fn yield_from_tuple_does_not_override_other_parser_errors() {
-    for version in [
-        PythonVersion::Py312,
-        PythonVersion::Py313,
-        PythonVersion::Py314,
-        PythonVersion::Py315,
-    ] {
+    for version in common::PYTHON_VERSIONS {
         let options = CompileOptions {
             python_version: version,
             ..CompileOptions::default()
