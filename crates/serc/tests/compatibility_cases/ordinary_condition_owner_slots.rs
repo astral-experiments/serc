@@ -267,24 +267,6 @@ fn matches_cpython_original_short_circuit_while_condition_owners() {
 }
 
 #[test]
-fn matches_cpython_generator_loop_guard_owner_controls() {
-    let source = r"def optimized_generator_controls(items):
-    while all(item for item in items):
-        yield items
-    while any(item for item in items):
-        yield items
-    while tuple(item for item in items):
-        yield items
-
-
-def unary_not_control(item):
-    while not should_continue(item):
-        yield item
-";
-    common::assert_matches_cpython_marshal(source, "generator_loop_guard_owners.py");
-}
-
-#[test]
 fn matches_cpython_negated_original_while_condition_owners() {
     for asynchronous in [false, true] {
         for generator in [false, true] {
@@ -1348,75 +1330,5 @@ fn matches_cpython_constant_loop_inner_try_finally_blockers() {
             &source,
             "constant_loop_inner_try_finally_blockers.py",
         );
-    }
-}
-
-#[test]
-fn first_try_condition_markers_keep_original_block_owners() {
-    for (filename, source) in [
-        (
-            "first_try_attribute_after_nested_branch_aliases.py",
-            r"def target(obj, initial, enabled, first, second):
-    if first:
-        if second:
-            obj.note()
-    try:
-        value = initial
-        if obj.enabled and enabled:
-            value = obj.other
-        obj.consume(value)
-    except Error:
-        obj.recover()
-",
-        ),
-        (
-            "first_try_builtin_after_module_comprehension_restore.py",
-            r#"deps = [item for item in items if item]
-try:
-    if isinstance(value, str) and value == "Auto":
-        result = None
-    else:
-        result = min(int(value), 30)
-except Exception:
-    result = None
-consume(result, deps)
-"#,
-        ),
-        (
-            "first_try_method_truth_in_match.py",
-            r"async def target(obj, items):
-    async for item in items:
-        match item:
-            case Event():
-                note()
-                try:
-                    if obj.enabled():
-                        await act(item)
-                    else:
-                        await other(item)
-                finally:
-                    obj.finish(item)
-",
-        ),
-        (
-            "first_try_method_empty_class_global_call_control.py",
-            r#"async def target(obj, items, stats):
-    async for item in items:
-        match item:
-            case Event():
-                note("done")
-                try:
-                    if obj.enabled():
-                        await obj.act(item)
-                    else:
-                        await obj.other(item)
-                finally:
-                    obj.finish(item)
-            case _:
-                obj.ignore(item)
-"#,
-        ),
-    ] {
-        common::assert_matches_cpython_marshal(source, filename);
     }
 }

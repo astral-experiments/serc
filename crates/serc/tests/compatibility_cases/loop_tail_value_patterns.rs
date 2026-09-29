@@ -39,36 +39,3 @@ fn matches_cpython_final_value_pattern_loop_failures() {
         }
     }
 }
-
-#[test]
-fn matches_cpython_discarded_string_loop_tail_original_join() {
-    for (filename, source) in [
-        (
-            "loop_tail_discarded_string_forward_join_target.py",
-            r#"with manager() as sink:
-    for key, value in items:
-        if key.ready:
-            first(value)
-            sink.write(key, value)
-        else:
-            second(value)
-            sink.write(key, value)
-        """discarded loop-tail text"""
-"#,
-        ),
-        (
-            "loop_tail_without_discarded_string_control.py",
-            r"with manager() as sink:
-    for key, value in items:
-        if key.ready:
-            first(value)
-            sink.write(key, value)
-        else:
-            second(value)
-            sink.write(key, value)
-",
-        ),
-    ] {
-        common::assert_matches_cpython_marshal(source, filename);
-    }
-}

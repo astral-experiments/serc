@@ -1,0 +1,1 @@
+value = "a\ud800b\udfff"[1:4:2]

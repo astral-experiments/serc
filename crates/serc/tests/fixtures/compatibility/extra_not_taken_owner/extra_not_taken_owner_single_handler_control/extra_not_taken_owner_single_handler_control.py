@@ -1,0 +1,12 @@
+class Worker:
+    def run(self):
+        print(f"worker started; name={self._config.name}; store={self._config.store}; directory={self._directory}", file=sink.stderr)
+        while True:
+            try:
+                self.step()
+                if self._state.requested() and (not self._state.pending()):
+                    print("worker drained", file=sink.stderr)
+                    return 0
+            except Exception as error:
+                print(f"worker step failed: {error!r}", file=sink.stderr)
+            self._sleep(self._config.interval)

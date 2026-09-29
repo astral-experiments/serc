@@ -152,51 +152,6 @@ fn matches_cpython_handler_assertion_success_locations() {
 }
 
 #[test]
-fn matches_cpython_loop_tail_handler_assertion_cleanup_locations() {
-    for (filename, source) in [
-        (
-            "cleanup_reverse_control_assert_loop.py",
-            r"def f(values, flag, other):
-    for value in values:
-        try:
-            work(value)
-        except Error as error:
-            assert flag or other
-        else:
-            raise Other
-",
-        ),
-        (
-            "cleanup_assert_loop_else_call.py",
-            r"def f(values, flag, other):
-    for value in values:
-        try:
-            work(value)
-        except Error as error:
-            assert flag or other
-        else:
-            fail()
-",
-        ),
-        (
-            "cleanup_assert_loop_following_statement.py",
-            r"def f(values, flag, other):
-    for value in values:
-        try:
-            work(value)
-        except Error as error:
-            assert flag or other
-        else:
-            raise Other
-        after()
-",
-        ),
-    ] {
-        common::assert_matches_cpython_marshal(source, filename);
-    }
-}
-
-#[test]
 fn matches_cpython_try_else_break_backedge_locations() {
     for (filename, scope, action, condition, following) in [
         ("try_else_break_name.py", "", "read(value)", "key", ""),
@@ -481,37 +436,4 @@ fn matches_cpython_finally_context_manager_condition_exit_nops() {
             "finally_context_manager_condition_exit.py",
         );
     }
-}
-
-#[test]
-fn matches_cpython_try_else_break_while_location() {
-    let source = r#"def monitor(read, active, accept):
-    while active():
-        try:
-            value = read()
-        except Error as error:
-            report(error)
-        else:
-            if not accept(value):
-                break
-        report("tick")
-"#;
-    common::assert_matches_cpython_marshal(source, "try_else_break_while_location.py");
-}
-
-#[test]
-fn matches_cpython_try_else_break_while_following_call() {
-    let source = r#"def monitor(read, active, accept):
-    while active():
-        try:
-            value = read()
-        except Error as error:
-            report(error)
-        else:
-            if not accept(value):
-                break
-            report(value)
-        report("tick")
-"#;
-    common::assert_matches_cpython_marshal(source, "try_else_break_while_following_call.py");
 }

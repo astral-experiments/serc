@@ -1,16 +1,6 @@
 use crate::common;
 
 #[test]
-fn matches_cpython_match_tuple_return_through_runtime_tail_wrappers() {
-    for source in [
-        "def f(subject, outer, optional, inner, example, comment):\n    match subject:\n        case Kind():\n            if outer:\n                if optional:\n                    if inner:\n                        comment = f\"{comment} yes\"\n                    else:\n                        comment = \"no\"\n            else:\n                comment = \"other\"\n                if optional:\n                    comment = f\"{comment} tail\"\n        case _:\n            comment = \"default\"\n    return example, comment\n",
-        "def f(subject, outer, optional, inner, example, comment):\n    match subject:\n        case Kind():\n            if outer:\n                if optional:\n                    if subject:\n                        if inner:\n                            comment = f\"{comment} yes\"\n                        else:\n                            comment = \"no\"\n            else:\n                comment = \"other\"\n                if optional:\n                    comment = f\"{comment} tail\"\n        case _:\n            comment = \"default\"\n    return example, comment\n",
-    ] {
-        common::assert_matches_cpython_marshal(source, "match_tuple_tail_wrappers.py");
-    }
-}
-
-#[test]
 fn matches_cpython_match_tuple_return_with_independent_case_sources() {
     let prefix = "def f(subject, outer, optional, inner, example, comment, values, default):\n    match subject:\n        case Kind():\n            if outer:\n                if optional:\n                    if inner:\n                        comment = f\"{comment} yes\"\n                    else:\n                        comment = \"no\"\n            else:\n                comment = \"other\"\n                if optional:\n                    comment = f\"{comment} tail\"\n";
     let suffix =

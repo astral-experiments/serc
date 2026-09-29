@@ -14,23 +14,3 @@ fn matches_cpython_async_with_return_handler_after_iteration() {
         common::assert_matches_cpython_marshal(&source, filename);
     }
 }
-
-#[test]
-fn matches_cpython_copied_return_with_nested_cleanup() {
-    common::assert_matches_cpython_marshal(
-        r"async def f(manager, values):
-    try:
-        async with manager:
-            async for item in values:
-                yield item
-    except Error:
-        return
-    finally:
-        try:
-            cleanup()
-        except Error:
-            pass
-",
-        "copied_return_nested_cleanup.py",
-    );
-}

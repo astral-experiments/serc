@@ -1,0 +1,2 @@
+first: int
+second: str

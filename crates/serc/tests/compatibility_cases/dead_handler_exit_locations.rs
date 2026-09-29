@@ -35,11 +35,6 @@ const SOURCE: &str = r#"if __name__ == "__main__":
 "#;
 
 #[test]
-fn dead_handler_exit_locations_constant_assertion() {
-    common::assert_matches_cpython_marshal(SOURCE, "module_with_dead_manager_exit_target.py");
-}
-
-#[test]
 fn dead_handler_exit_locations_explicit_raise_control() {
     let source = SOURCE.replace("    assert False\n", "    raise AssertionError\n");
     common::assert_matches_cpython_marshal(

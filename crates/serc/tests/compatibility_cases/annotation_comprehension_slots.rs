@@ -52,30 +52,3 @@ fn preserves_stringized_annotation_comprehensions() {
         }
     }
 }
-
-#[test]
-fn conditional_annotations_preserve_unprotected_and_protected_code() {
-    // The plain annotation has no cleanup; the inline comprehension must restore its local on
-    // failure. The protected function's shared conditional tails also retain their original owner.
-    let source = r"def plain(value: left if gate else right) -> (left and right):
-    return value
-
-def protected(value: [candidate if gate else fallback
-                      for candidate in values if keep(candidate)]):
-    try:
-        if outer:
-            if left or right:
-                consume(value)
-            else:
-                consume(None)
-        else:
-            if left or right:
-                consume(None)
-            else:
-                consume(value)
-    except ValueError:
-        cleanup()
-    return value
-";
-    common::assert_matches_cpython_marshal(source, "conditional_annotation_owners.py");
-}

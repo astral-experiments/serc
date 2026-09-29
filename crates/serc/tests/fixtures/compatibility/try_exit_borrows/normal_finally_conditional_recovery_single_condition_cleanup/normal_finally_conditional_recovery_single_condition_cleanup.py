@@ -1,0 +1,17 @@
+def f(factory, exists, emit, value):
+    output = None
+    published = False
+    try:
+        output = factory()
+        emit(output, value)
+        output.close()
+        published = True
+    except Error:
+        if not exists():
+            raise
+        published = True
+    finally:
+        if output is not None:
+            output.cancel()
+    emit(output, value)
+    return value, output

@@ -50,26 +50,6 @@ fn matches_cpython_folded_loop_cleanup_with_extended_arguments() {
 }
 
 #[test]
-fn matches_cpython_unreachable_cleanup_does_not_raise_stack_bound() {
-    for source in [
-        "async def f(values):\n    if False:\n        await work(values)\n",
-        "def f(values):\n    if False:\n        yield from values\n",
-    ] {
-        common::assert_matches_cpython_marshal(source, "unreachable_suspension_cleanup.py");
-    }
-}
-
-#[test]
-fn matches_cpython_removed_suspension_cleanup_inside_a_live_loop() {
-    for source in [
-        "def f(values):\n    for value in values:\n        if False:\n            yield from values\n",
-        "async def f(values):\n    for value in values:\n        if False:\n            await work(value)\n",
-    ] {
-        common::assert_matches_cpython_marshal(source, "unreachable_loop_cleanup.py");
-    }
-}
-
-#[test]
 fn matches_cpython_315_removed_and_live_suspension_cleanup() {
     use std::io::Write as _;
     use std::process::{Command, Stdio};

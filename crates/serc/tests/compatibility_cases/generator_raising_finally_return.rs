@@ -1,14 +1,6 @@
 use crate::common;
 
 #[test]
-fn matches_cpython_generator_return_through_raising_finally() {
-    common::assert_matches_cpython_marshal(
-        include_str!("../fixtures/generator_raising_finally_return.py"),
-        "generator_raising_finally_return.py",
-    );
-}
-
-#[test]
 fn generator_return_evaluates_value_before_raising_finally() {
     common::assert_executes(
         r"

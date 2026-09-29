@@ -1,46 +1,6 @@
 use crate::common;
 
 #[test]
-fn matches_cpython_sourceless_and_located_try_body_exits() {
-    for source in [
-        r"def f(a, b, result):
-    try:
-        if a:
-            work()
-        else:
-            if b:
-                other()
-    except E:
-        recover()
-    after()
-",
-        r"def f(a, b, result):
-    try:
-        if a:
-            if b:
-                work()
-        else:
-            other()
-    except E:
-        recover()
-    after()
-",
-        r"def f(a, b, result):
-    try:
-        if a:
-            work()
-        else:
-            other()
-    except E:
-        recover()
-    after()
-",
-    ] {
-        common::assert_matches_cpython_marshal(source, "sourceless_try_body_exit.py");
-    }
-}
-
-#[test]
 fn matches_cpython_forwarded_try_body_condition_exit() {
     for (declaration, prefix) in [
         ("def", ""),

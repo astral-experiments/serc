@@ -32,6 +32,7 @@ smallvec = { workspace = true }
 stacker = { workspace = true }
 
 [dev-dependencies]
+datatest-stable = { workspace = true }
 insta = { workspace = true }
 clap = { workspace = true }
 cpu-time = { workspace = true }
@@ -43,3 +44,7 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
 walkdir = { workspace = true }
+
+[[test]]
+name = "fixtures"
+harness = false

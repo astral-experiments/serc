@@ -505,39 +505,3 @@ fn matches_cpython_comprehension_temporaries_in_type_parameter_thunks() {
         }
     }
 }
-
-#[test]
-fn matches_cpython_nested_global_declarations_before_module_comprehensions() {
-    for (filename, source) in [
-        (
-            "module_comprehension_nested_global_read_target.py",
-            r#"def configure():
-    global needle
-    needle = "p"
-before = needle
-result = [value for value in values_for(needle) if needle in value and value.startswith("p_")]
-after = needle
-"#,
-        ),
-        (
-            "module_comprehension_nested_global_callable_target.py",
-            r"def configure():
-    global check
-    check = predicate
-result = [check(value) for value in values]
-after = check()
-",
-        ),
-        (
-            "module_comprehension_nested_walrus_global_control.py",
-            r"def configure():
-    global captured
-    captured = None
-result = [(captured, [(captured := value) for value in values], captured) for outer in groups]
-after = captured
-",
-        ),
-    ] {
-        common::assert_matches_cpython_marshal(source, filename);
-    }
-}

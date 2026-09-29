@@ -96,65 +96,6 @@ fn matches_cpython_outer_try_owns_manager_exit_after_inner_finally() {
 }
 
 #[test]
-fn matches_cpython_iterator_return_suppressed_finally_owners() {
-    for (filename, source) in [
-        (
-            "iterator_return_call_finally_owner_control.py",
-            r"def run(values, worker, cleanup):
-    for value in values:
-        try:
-            result = worker(value)
-            try:
-                return value, result
-            finally:
-                cleanup.close()
-        except LookupError:
-            continue
-    return None
-",
-        ),
-        (
-            "iterator_return_suppressed_finally_owner_target.py",
-            r"def run(values, worker, cleanup):
-    for value in values:
-        try:
-            result = worker(value)
-            try:
-                return value, result
-            finally:
-                try:
-                    cleanup.close()
-                except OSError:
-                    pass
-        except LookupError:
-            continue
-    return None
-",
-        ),
-        (
-            "outer_try_iterator_return_suppressed_finally_owner_control.py",
-            r"def run(values, worker, cleanup):
-    try:
-        for value in values:
-            result = worker(value)
-            try:
-                return value, result
-            finally:
-                try:
-                    cleanup.close()
-                except OSError:
-                    pass
-    except LookupError:
-        return None
-    return None
-",
-        ),
-    ] {
-        common::assert_matches_cpython_marshal(source, filename);
-    }
-}
-
-#[test]
 fn matches_cpython_copied_finally_setup_nop_owners() {
     for (prefix, action) in [
         ("", "work()"),

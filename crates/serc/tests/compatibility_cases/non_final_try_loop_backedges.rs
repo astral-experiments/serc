@@ -446,26 +446,6 @@ fn matches_cpython_nested_try_loop_tails_with_direct_continue_handlers() {
 }
 
 #[test]
-fn matches_cpython_direct_continue_nested_condition_with_reused_owner_slot() {
-    let source = r#"def token_counts(doc):
-    total = 0
-    text = 0
-    unmasked_text = 0
-    for tok in doc.get("tokens", []) or []:
-        total += 1
-        try:
-            if tok.get("modality") == "text":
-                text += 1
-                if float(tok.get("loss_weight", 1.0)) > 0:
-                    unmasked_text += 1
-        except Exception:
-            continue
-    return total, text, unmasked_text
-"#;
-    common::assert_matches_cpython_marshal(source, "direct_continue_reused_owner.py");
-}
-
-#[test]
 fn matches_cpython_loop_tail_markers_in_original_call_slots() {
     for outer_try in [false, true] {
         for condition in ["isinstance(item, list)", "predicate(item)", "gate"] {

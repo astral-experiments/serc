@@ -1,0 +1,38 @@
+def f(items, retries, mode, flag, values):
+    for item in items:
+        for retry in retries:
+            if mode == 0:
+                if flag:
+                    result = 0
+                    for value in values:
+                        result += consume(value)
+                    log(result)
+                else:
+                    result = consume(item)
+            elif mode == 1:
+                if flag:
+                    assert False
+                else:
+                    result = 0
+                    for value in values:
+                        if skip(value):
+                            continue
+                        result += consume(value)
+                    log(result)
+            elif mode == 2:
+                if flag:
+                    result = 0
+                    for value in values:
+                        result += consume(value)
+                else:
+                    result = consume(item)
+            else:
+                assert False
+            consume(result)
+            if done(result):
+                break
+            log(result)
+        else:
+            log(item)
+        finish(item)
+    return result

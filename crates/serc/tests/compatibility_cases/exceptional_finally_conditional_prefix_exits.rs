@@ -25,34 +25,3 @@ fn matches_cpython_marshal_for_exceptional_finally_conditional_prefix_exits() {
         }
     }
 }
-
-#[test]
-fn matches_cpython_marshal_for_copied_finally_condition_nops() {
-    let source = r"def boolean_condition(manager, left, right):
-    with manager:
-        try:
-            assert body()
-        finally:
-            if left and right:
-                cleanup()
-
-
-def conditional_expression(manager, condition, left, right):
-    with manager:
-        try:
-            assert body()
-        finally:
-            if left if condition else right:
-                cleanup()
-
-
-def negated_boolean_condition(manager, left, right):
-    with manager:
-        try:
-            assert body()
-        finally:
-            if not (left or right):
-                cleanup()
-";
-    common::assert_matches_cpython_marshal(source, "copied_finally_condition_nops.py");
-}

@@ -1,0 +1,9 @@
+int_float = 7 ** 0.5
+float_int = 2.0 ** 53
+int_negative = 10 ** -10
+signed_base_negative = (-2) ** -3
+float_base_integer = (-2.0) ** 3
+underflow = 10 ** -100000
+true_negative = True ** -1
+zero_negative = 0 ** -1
+float_overflow = 1e308 ** 2

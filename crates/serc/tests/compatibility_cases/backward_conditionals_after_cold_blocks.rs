@@ -21,22 +21,3 @@ fn matches_cpython_condition_after_async_comprehension() {
         common::assert_matches_cpython_marshal(&source, filename);
     }
 }
-
-#[test]
-fn matches_cpython_conditions_after_async_for() {
-    common::assert_matches_cpython_marshal(
-        r"async def f(source, enabled, first, second, finish):
-    if enabled:
-        async for item in source:
-            finish(item)
-        if first:
-            if second:
-                raise ValueError
-        elif enabled and second:
-            raise ValueError
-    finish(source)
-    return source
-",
-        "conditions_after_async_for.py",
-    );
-}

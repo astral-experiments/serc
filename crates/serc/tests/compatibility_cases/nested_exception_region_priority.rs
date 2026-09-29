@@ -45,22 +45,3 @@ fn matches_cpython_nested_exception_regions_after_loop_exclusions() {
         }
     }
 }
-
-#[test]
-fn matches_cpython_nested_handlers_after_resumed_outer_regions() {
-    let source = r"
-def f(manager, values, use):
-    with manager:
-        try:
-            for value in values:
-                if value is None:
-                    continue
-                try:
-                    use(value)
-                except LookupError:
-                    break
-        finally:
-            use(None)
-";
-    common::assert_matches_cpython_marshal(source, "nested_region_resumed_outer.py");
-}

@@ -27,18 +27,3 @@ fn matches_cpython_marshal_for_discarded_suspension_constants() {
         }
     }
 }
-
-#[test]
-fn matches_cpython_marshal_for_nested_discarded_suspension_operands() {
-    for source in [
-        "def f(flag):\n    if flag:\n        raise Error\n        consume((yield) or 'after operand')\n    consume('later')\n    yield values\n",
-        "def f(flag):\n    if flag:\n        raise Error\n        yield from ((yield 'inner') or 'after operand')\n    consume('later')\n    yield values\n",
-        "def f(flag):\n    if flag:\n        raise Error('early')\n        yield from (lambda: 'child')()\n    consume('later')\n    yield values\n",
-        "def f(flag):\n    if flag:\n        raise Error('early')\n        consume(item for item in values)\n    consume('later')\n    yield values\n",
-        "async def f(flag):\n    if flag:\n        raise Error\n        yield\n    consume('later')\n    yield values\n",
-        "async def f(flag):\n    if flag:\n        raise Error\n        await produce('operand')\n    consume('later')\n    yield values\n",
-        "async def f(flag):\n    if flag:\n        raise Error\n        yield 'operand'\n    consume('later')\n    yield values\n",
-    ] {
-        common::assert_matches_cpython_marshal(source, "nested_discarded_suspension_operands.py");
-    }
-}

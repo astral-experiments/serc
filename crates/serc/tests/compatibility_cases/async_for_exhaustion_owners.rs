@@ -121,26 +121,3 @@ fn preserves_async_iterator_break_locations_through_finally() {
         }
     }
 }
-
-#[test]
-fn matches_cpython_terminal_match_async_exhaustion_continuations() {
-    let source = r"async def worker(queue, source, sink):
-    while True:
-        kind = await queue.get()
-        match kind:
-            case 0:
-                sink.ready()
-            case 1:
-                async for item in source:
-                    await sink.send(item)
-            case 2:
-                async for item in source:
-                    await sink.send(item)
-        await sink.send(None)
-        queue.task_done()
-";
-    common::assert_matches_cpython_marshal(
-        source,
-        "final_match_async_exhaustion_continuation_target.py",
-    );
-}

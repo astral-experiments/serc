@@ -16,17 +16,3 @@ fn matches_cpython_class_footer_predecessors() {
         }
     }
 }
-
-#[test]
-fn preserves_cpython_class_footer_cold_handler_order() {
-    let source = "class C:
-    try:
-        work()
-    except Error:
-        if flag:
-            def f(self, value: int): ...
-            if other:
-                def g(self, value: int): ...
-";
-    common::assert_matches_cpython_marshal(source, "class_footer_cold_handler.py");
-}

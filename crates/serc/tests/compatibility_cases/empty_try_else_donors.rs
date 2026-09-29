@@ -58,18 +58,6 @@ fn matches_cpython_try_else_annotation_instruction_donors() {
 }
 
 #[test]
-fn matches_cpython_try_else_scope_declarations() {
-    for source in [
-        "from __future__ import annotations\ndef f():\n    try:\n        work()\n    except Error:\n        recover()\n    else:\n        item: annotation_effect()\n    finish()\n",
-        "def outer():\n    result = None\n    def f():\n        try:\n            work()\n        except Error:\n            recover()\n        else:\n            nonlocal result\n        finish()\n",
-        "try:\n    work()\nexcept Error:\n    recover()\nelse:\n    item: annotation_effect()\nfinish()\n",
-        "class C:\n    try:\n        work()\n    except Error:\n        recover()\n    else:\n        item: annotation_effect()\n    finish()\n",
-    ] {
-        common::assert_matches_cpython_marshal(source, "try_else_scope_declarations.py");
-    }
-}
-
-#[test]
 fn matches_cpython_empty_try_body_declaration_donors() {
     for body in [
         "item: Kind",

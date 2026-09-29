@@ -1,0 +1,3 @@
+crates/serc/tests/fixtures/compatibility/**/*.py -text whitespace=-blank-at-eof
+crates/serc/tests/fixtures/optimization/** -text whitespace=-blank-at-eof
+crates/serc/tests/fixtures/private_type_parameters/**/*.py -text whitespace=-blank-at-eof

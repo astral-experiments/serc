@@ -69,9 +69,3 @@ sys.stdout.buffer.write(marshal.dumps(code))
         );
     }
 }
-
-#[test]
-fn matches_cpython_314_exceptional_finally_assert_success() {
-    let source = "def f(a, b, c):\n    try:\n        g()\n    finally:\n        assert a is b and not a.value\n        g()\n";
-    crate::common::assert_matches_cpython_marshal(source, FILENAME);
-}

@@ -284,6 +284,8 @@ jobs:
       # Bash-specific tooling.
       - name: "Test CPython compatibility"
         run: cargo test -p serc --test compatibility --all-features --locked
+      - name: "Test compatibility fixtures"
+        run: "cargo test -p serc --test fixtures --all-features --locked -- cpython::"
       - name: "Test pinned inputs"
         shell: bash
         run: '"$SERC_TEST_PYTHON" -m unittest discover -s scripts -p test_ruff_pin.py'

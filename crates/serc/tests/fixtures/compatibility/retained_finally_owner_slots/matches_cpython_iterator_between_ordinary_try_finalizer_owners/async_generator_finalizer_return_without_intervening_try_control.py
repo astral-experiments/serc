@@ -1,0 +1,15 @@
+async def stream(items, emit):
+    try:
+        for item in items:
+            while True:
+                try:
+                    yield item
+                    return
+                except ValueError:
+                    raise
+                finally:
+                    emit(item)
+    except RuntimeError:
+        raise
+    finally:
+        emit(None)

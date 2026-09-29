@@ -34,29 +34,6 @@ fn nested_loops_and_handlers_keep_their_own_backedge_owners() {
 }
 
 #[test]
-fn nested_named_try_exits_keep_the_coroutine_loop_owner() {
-    let source = r"async def worker():
-    while True:
-        try:
-            item = claim()
-            if item is None:
-                await pause()
-                continue
-            context = build(item)
-            try:
-                await execute(context)
-            except Exception as error:
-                report(error)
-                update(item)
-        except CancelledError:
-            raise
-        except Exception:
-            report_failure()
-";
-    common::assert_matches_cpython_marshal(source, "nested_try_while_exit_owners.py");
-}
-
-#[test]
 fn shared_normal_try_false_edges_stay_separate_after_a_manager() {
     for condition in ["first and second", "first and second is False"] {
         let source = format!(

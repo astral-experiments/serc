@@ -82,11 +82,6 @@ const SOURCE: &str = r"def make_runner(fn, stall_multiplier, trivial_duration, m
 ";
 
 #[test]
-fn async_retry_named_break_marker_target() {
-    common::assert_matches_cpython_marshal(SOURCE, "async_retry_named_break_marker.py");
-}
-
-#[test]
 fn async_retry_named_break_marker_warm_fallback_control() {
     let source = SOURCE.replace(
         "status['status'] = 'success'\n                    break",

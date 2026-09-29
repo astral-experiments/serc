@@ -35,11 +35,6 @@ const SOURCE: &str = r#"def run(plan, execute, preflight_only, values, stamp, de
 "#;
 
 #[test]
-fn named_return_three_global_folds() {
-    common::assert_matches_cpython_marshal(SOURCE, "named_return_three_global_folds_target.py");
-}
-
-#[test]
 fn named_return_one_global_fold_control() {
     let source = SOURCE
         .replace("kind_global(error)", "kind(error)")

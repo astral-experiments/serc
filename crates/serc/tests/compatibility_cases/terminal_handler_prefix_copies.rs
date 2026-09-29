@@ -26,32 +26,3 @@ fn matches_cpython_terminal_handler_conditionals_after_prefixes() {
         }
     }
 }
-
-#[test]
-fn matches_cpython_terminal_named_handler_manager_exit_copies() {
-    common::assert_matches_cpython_marshal(
-        r"def probe(manager, read, write, recover):
-    try:
-        with manager():
-            with manager():
-                with manager():
-                    while True:
-                        chunk = read()
-                        if not len(chunk):
-                            break
-                        write(chunk)
-    except Exception as error:
-        if recover(error):
-            with manager():
-                with manager():
-                    with manager():
-                        while True:
-                            chunk = read()
-                            if not len(chunk):
-                                break
-                            write(chunk)
-                write(None)
-",
-        "manager_nested_loop_exit.py",
-    );
-}

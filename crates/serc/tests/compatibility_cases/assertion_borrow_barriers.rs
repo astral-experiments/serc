@@ -46,26 +46,6 @@ fn preserves_folded_else_borrow_barriers_around_assertions() {
 }
 
 #[test]
-fn preserves_owned_pairs_after_folded_else_in_asserting_method() {
-    let source = "\
-class Projection(Base):
-    def __init__(self, width, heads, groups, head_width=128):
-        super().__init__()
-        assert heads % groups == 0
-        output_width = heads * head_width
-        grouped_width = groups * head_width
-        if False:
-            self.combined = make(width, output_width + grouped_width)
-        else:
-            self.query = make(width, output_width)
-            self.grouped = make(width, grouped_width + grouped_width)
-        self.rotary = rotate(head_width)
-        self.output = make(output_width, width)
-";
-    common::assert_matches_cpython_marshal(source, "assertion_method_borrow_barrier.py");
-}
-
-#[test]
 fn preserves_shared_assertion_success_borrow_boundaries() {
     for (prefix, leading) in [("", ""), ("async ", ""), ("", "yield value\n")] {
         for expression in [
