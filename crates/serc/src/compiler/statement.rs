@@ -4398,17 +4398,10 @@ impl<'source> Compiler<'source> {
                 && matches!(statement.test.as_ref(), Expr::BoolOp(_))))
             && (self.optimized_conditional_join(statement)
                 || (self.context.python_version == crate::PythonVersion::Py313
-                    && std::iter::once(statement.body.as_slice())
-                        .chain(
-                            statement
-                                .elif_else_clauses
-                                .iter()
-                                .map(|clause| clause.body.as_slice()),
-                        )
-                        .any(|body| {
-                            body.last()
-                                .is_some_and(|last| self.context.is_elided_statement(last))
-                        })));
+                    && if_suites(statement).any(|body| {
+                        body.last()
+                            .is_some_and(|last| self.context.is_elided_statement(last))
+                    })));
         // A coroutine's implicit StopIteration handler wraps the same original
         // comparison joins and footer; it does not add a normal exit predecessor.
         let coroutine_empty_comparison_exit = has_empty_comparison_arm
@@ -4438,14 +4431,7 @@ impl<'source> Compiler<'source> {
                 && self.context.python_version >= crate::PythonVersion::Py314
             {
                 let mut empty_comparison_arms = empty_comparison_arms;
-                let mut suites: Vec<_> = std::iter::once(statement.body.as_slice())
-                    .chain(
-                        statement
-                            .elif_else_clauses
-                            .iter()
-                            .map(|clause| clause.body.as_slice()),
-                    )
-                    .collect();
+                let mut suites: Vec<_> = if_suites(statement).collect();
                 while let Some(body) = suites.pop() {
                     let Some(Stmt::If(tail)) = body.iter().rev().find(|statement| {
                         !matches!(statement, Stmt::Global(_) | Stmt::Nonlocal(_))
@@ -4678,13 +4664,7 @@ impl<'source> Compiler<'source> {
             && !self.control.statements.in_match
             && self.has_nested_erased_branch_scope_exit(statement);
         if self.context.python_version <= crate::PythonVersion::Py313
-            && (nested_312_scope_exit || std::iter::once(statement.body.as_slice())
-                .chain(
-                    statement
-                        .elif_else_clauses
-                        .iter()
-                        .map(|clause| clause.body.as_slice()),
-                )
+            && (nested_312_scope_exit || if_suites(statement)
                 .any(|body| {
                     matches!(body.last(), Some(Stmt::While(_)))
                         || (self.context.python_version == crate::PythonVersion::Py312
@@ -27778,14 +27758,7 @@ impl<'source> Compiler<'source> {
                 && terminal_handler_if.is_none()
                 && handler.body.last().is_some_and(|tail| match tail {
                     Stmt::Try(_) => true,
-                    Stmt::If(statement) => std::iter::once(statement.body.as_slice())
-                        .chain(
-                            statement
-                                .elif_else_clauses
-                                .iter()
-                                .map(|clause| clause.body.as_slice()),
-                        )
-                        .all(|body| !suite_terminates(body)),
+                    Stmt::If(statement) => if_suites(statement).all(|body| !suite_terminates(body)),
                     _ => false,
                 });
             let mut terminal_handler_suite_return = false;
@@ -35298,13 +35271,7 @@ impl<'source> Compiler<'source> {
                                 .elif_else_clauses
                                 .iter()
                                 .any(|clause| suite_terminates(&clause.body))
-                            || !std::iter::once(statement.body.as_slice())
-                                .chain(
-                                    statement
-                                        .elif_else_clauses
-                                        .iter()
-                                        .map(|clause| clause.body.as_slice()),
-                                )
+                            || !if_suites(statement)
                                 .all(|body| matches!(body, [Stmt::Assign(_)])))
             );
             if terminal_if || terminal_branching {
@@ -35645,14 +35612,7 @@ impl<'source> Compiler<'source> {
                         .as_ref()
                         .is_some_and(condition_has_only_runtime_tests)
                 })
-                && std::iter::once(statement.body.as_slice())
-                    .chain(
-                        statement
-                            .elif_else_clauses
-                            .iter()
-                            .map(|clause| clause.body.as_slice()),
-                    )
-                    .all(suite_terminates_before_constant_folding)
+                && if_suites(statement).all(suite_terminates_before_constant_folding)
                 && original_condition_has_unique_jump_target(test, false)
                 && let Some(exit_test) = unique_condition_jump_target(test, false)
             {
@@ -37544,13 +37504,7 @@ fn if_contains_copied_nested_handler_exit(
     statement: &ruff_python_ast::StmtIf,
     allow_general_fallthrough: bool,
 ) -> bool {
-    std::iter::once(statement.body.as_slice())
-        .chain(
-            statement
-                .elif_else_clauses
-                .iter()
-                .map(|clause| clause.body.as_slice()),
-        )
+    if_suites(statement)
         .flatten()
         .any(|statement| {
             matches!(
@@ -37691,14 +37645,7 @@ fn is_loop_conversion_try(statement: &ruff_python_ast::StmtTry) -> bool {
 fn handler_cold_with_exit_range(body: &[Stmt]) -> Option<TextRange> {
     let normal_body = match body.last()? {
         Stmt::If(statement) => {
-            let mut fallthroughs = std::iter::once(statement.body.as_slice())
-                .chain(
-                    statement
-                        .elif_else_clauses
-                        .iter()
-                        .map(|clause| clause.body.as_slice()),
-                )
-                .filter(|body| !suite_terminates(body));
+            let mut fallthroughs = if_suites(statement).filter(|body| !suite_terminates(body));
             let body = fallthroughs.next()?;
             if fallthroughs.next().is_some()
                 || statement
@@ -37862,12 +37809,7 @@ fn with_body_normal_exit(body: &[Stmt]) -> WithBodyNormalExit {
                 // becomes constant only after the first native line-resolution pass.
                 WithBodyNormalExit::Other
             };
-            for arm in std::iter::once(statement.body.as_slice()).chain(
-                statement
-                    .elif_else_clauses
-                    .iter()
-                    .map(|clause| clause.body.as_slice()),
-            ) {
+            for arm in if_suites(statement) {
                 exit = match (exit, with_body_normal_exit(arm)) {
                     (WithBodyNormalExit::Unknown, _) | (_, WithBodyNormalExit::Unknown) => {
                         WithBodyNormalExit::Unknown
@@ -38384,12 +38326,7 @@ fn with_chained_manager_exit_location(
         return None;
     }
     let mut location = None;
-    for arm in std::iter::once(statement.body.as_slice()).chain(
-        statement
-            .elif_else_clauses
-            .iter()
-            .map(|clause| clause.body.as_slice()),
-    ) {
+    for arm in if_suites(statement) {
         if suite_terminates(arm) {
             if !(matches!(arm.last(), Some(Stmt::Return(_) | Stmt::Raise(_)))
                 || allow_break && matches!(arm.last(), Some(Stmt::Break(_))))
@@ -38791,19 +38728,12 @@ fn suite_retained_try_exit_has_normal_fallthrough(body: &[Stmt]) -> bool {
         return suite_retained_try_exit_has_normal_fallthrough(selected);
     }
     if_normal_exit_count(statement) > 0
-        && std::iter::once(statement.body.as_slice())
-            .chain(
-                statement
-                    .elif_else_clauses
-                    .iter()
-                    .map(|clause| clause.body.as_slice()),
+        && if_suites(statement).any(|body| {
+            matches!(
+                body.last(),
+                Some(Stmt::Break(_) | Stmt::Continue(_) | Stmt::Return(_) | Stmt::Raise(_))
             )
-            .any(|body| {
-                matches!(
-                    body.last(),
-                    Some(Stmt::Break(_) | Stmt::Continue(_) | Stmt::Return(_) | Stmt::Raise(_))
-                )
-            })
+        })
 }
 
 // A nested try with a terminal protected body has no normal edge to the branch join.
@@ -38815,20 +38745,13 @@ fn suite_retained_try_exit_has_terminal_protected_body(body: &[Stmt]) -> bool {
     };
     early_condition_truthiness(&statement.test).is_none()
         && if_normal_exit_count(statement) > 0
-        && std::iter::once(statement.body.as_slice())
-            .chain(
-                statement
-                    .elif_else_clauses
-                    .iter()
-                    .map(|clause| clause.body.as_slice()),
-            )
-            .any(|body| {
-                matches!(body.last(), Some(Stmt::Try(statement))
+        && if_suites(statement).any(|body| {
+            matches!(body.last(), Some(Stmt::Try(statement))
                     if !statement.is_star
                         && statement.orelse.is_empty()
                         && statement.finalbody.is_empty()
                         && matches!(statement.body.last(), Some(Stmt::Return(_) | Stmt::Raise(_))))
-            })
+        })
 }
 
 // A terminal branch or nested try can leave the normal exit with one direct condition
@@ -39131,6 +39054,16 @@ fn suite_ends_in_sole_else_fallthrough(body: &[Stmt]) -> bool {
                 .is_some_and(condition_has_only_runtime_tests)
                 && suite_terminates_before_constant_folding(&clause.body)
         })
+}
+
+/// Iterates authored `if`, `elif`, and `else` suites in source order, including empty suites.
+fn if_suites(statement: &ruff_python_ast::StmtIf) -> impl Iterator<Item = &[Stmt]> {
+    std::iter::once(statement.body.as_slice()).chain(
+        statement
+            .elif_else_clauses
+            .iter()
+            .map(|clause| clause.body.as_slice()),
+    )
 }
 
 fn if_normal_exit_count(statement: &ruff_python_ast::StmtIf) -> usize {
@@ -43241,32 +43174,17 @@ fn handler_cleanup_has_runtime_jump_exit(statement: &ruff_python_ast::StmtIf) ->
                 .as_ref()
                 .is_none_or(condition_has_only_runtime_tests)
         })
-        || !std::iter::once(statement.body.as_slice())
-            .chain(
-                statement
-                    .elif_else_clauses
-                    .iter()
-                    .map(|clause| clause.body.as_slice()),
-            )
-            .all(handler_cleanup_has_runtime_exit_location)
+        || !if_suites(statement).all(handler_cleanup_has_runtime_exit_location)
     {
         return false;
     }
 
-    std::iter::once(statement.body.as_slice())
-        .chain(
-            statement
-                .elif_else_clauses
-                .iter()
-                .map(|clause| clause.body.as_slice()),
-        )
-        .enumerate()
-        .any(|(index, body)| {
-            suite_has_normal_fallthrough(body)
-                && (index < statement.elif_else_clauses.len()
-                    || matches!(body.last(), Some(Stmt::If(tail))
+    if_suites(statement).enumerate().any(|(index, body)| {
+        suite_has_normal_fallthrough(body)
+            && (index < statement.elif_else_clauses.len()
+                || matches!(body.last(), Some(Stmt::If(tail))
                         if handler_cleanup_has_runtime_jump_exit(tail)))
-        })
+    })
 }
 
 // The final fallthrough arm donates its location after exit copying. CPython resolves
@@ -43301,17 +43219,10 @@ fn handler_cleanup_has_stable_fallthrough_location(statement: &ruff_python_ast::
 // during native early copying. A following small return can grow the shared cleanup
 // past the copy limit. Keep the existing path until those counts are represented.
 fn handler_cleanup_has_nested_branch_exit(statement: &ruff_python_ast::StmtIf) -> bool {
-    std::iter::once(statement.body.as_slice())
-        .chain(
-            statement
-                .elif_else_clauses
-                .iter()
-                .map(|clause| clause.body.as_slice()),
-        )
-        .any(|body| {
-            suite_has_normal_fallthrough(body)
-                && matches!(body.last(), Some(Stmt::Try(_) | Stmt::If(_)))
-        })
+    if_suites(statement).any(|body| {
+        suite_has_normal_fallthrough(body)
+            && matches!(body.last(), Some(Stmt::Try(_) | Stmt::If(_)))
+    })
 }
 
 // Declarations emit no instruction and cannot donate the location of a copied exit.
@@ -43561,17 +43472,10 @@ fn handler_cleanup_fallthrough_test(statement: &ruff_python_ast::StmtIf) -> Opti
 }
 
 fn terminal_exception_handler_if_supported(statement: &ruff_python_ast::StmtIf) -> bool {
-    std::iter::once(statement.body.as_slice())
-        .chain(
-            statement
-                .elif_else_clauses
-                .iter()
-                .map(|clause| clause.body.as_slice()),
-        )
-        .all(|body| {
-            !suite_terminates(body)
-                || matches!(body, [Stmt::Return(statement)] if statement.value.is_none())
-        })
+    if_suites(statement).all(|body| {
+        !suite_terminates(body)
+            || matches!(body, [Stmt::Return(statement)] if statement.value.is_none())
+    })
 }
 
 fn terminal_try_distributes_implicit_return(statement: &Stmt) -> bool {
