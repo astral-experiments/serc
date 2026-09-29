@@ -1411,6 +1411,8 @@ fn validate_qualified_name_intern_state(
     Ok(())
 }
 
+/// Rejects recorded canonical names with unknown startup membership, in constant traversal order.
+/// Collects unrecorded origins for the caller's serialization-order fallback.
 fn validate_recorded_qualified_name_intern_state<'a>(
     code: &'a CodeObject,
     python_version: PythonVersion,

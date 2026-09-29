@@ -58,20 +58,16 @@ cargo run --release -p serc --example compare_cpython_corpus -- \
   --python-version 3.14 --reference /tmp/cpython-reference --require-all path/to/corpus
 ```
 
-Each file gets a fresh, isolated CPython process with UTF-8 mode, a fixed hash
-seed, and site initialization disabled. The C reference reads the source bytes
-and calls CPython's compiler and marshal writer directly. It runs no Python
-wrapper and imports no additional modules. Normal interpreter initialization
-still supplies the startup state modeled by Serc's default target metadata. It
-retains a second reference to the root code object while marshaling, matching a
-named `code` variable passed to `marshal.dumps(code)`.
+Each file gets a fresh CPython process with UTF-8 mode, hash seed 0, and site
+initialization disabled. The reference compiles source bytes and marshals
+through the C API, without a Python wrapper or additional imports. It uses
+normal interpreter startup, modeled by Serc's default intern state, and retains
+a second reference to the root code object as `marshal.dumps(code)` would.
 
-The comparator validates the reference protocol, CPython release, and magic
-number before comparing raw marshal bytes. String interning, object sharing,
-reference indexes, and all code-object fields remain part of byte equality. Use
-`--optimize 1` or `--optimize 2` to select the compilation optimization level;
-interpreter startup always uses level 0. The CLI uses the same default intern
-state as the library.
+The comparator verifies the reference protocol, CPython release, and magic
+number, then compares raw marshal bytes, including string interning and object
+sharing. Use `--optimize 1` or `--optimize 2` for optimized compilation;
+interpreter startup stays at level 0.
 
 `--require-all` requires at least one exact match and no failures on accepted
 inputs. Add `--require-rejection-parity` to require clean Serc rejections for

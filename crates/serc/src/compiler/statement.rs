@@ -1675,12 +1675,7 @@ impl<'source> Compiler<'source> {
 
     /// Certifies case exits ending in ordinary work or a supported conditional.
     pub(super) fn supports_terminal_match_case(&self, body: &[Stmt]) -> bool {
-        let is_elided = |statement: &Stmt| {
-            matches!(
-                self.context.optimized_locations.get(&statement.range()),
-                Some(super::optimization::OptimizedLocation::Elided)
-            )
-        };
+        let is_elided = |statement: &Stmt| self.context.is_elided_statement(statement);
         let is_supported_work = |statement: &Stmt| {
             is_elided(statement)
                 || matches!(
@@ -1755,23 +1750,27 @@ impl<'source> Compiler<'source> {
             })
     }
 
-    // Optimized-away statements emit no instructions, so the preceding
-    // conditional supplies the normal exits of the terminal try body. A folded
-    // true branch can also carry a nested runtime conditional or breaking loop.
+    /// Finds the normal exits of a terminal try body before erased statements.
+    /// Folded true arms qualify when they end in a runtime conditional or breaking loop.
     fn protected_terminal_if_before_elided(&self, statement: &Stmt, following: &[Stmt]) -> bool {
-        matches!(statement, Stmt::If(_))
-            && !following.is_empty()
+        let Stmt::If(conditional) = statement else {
+            return false;
+        };
+        !following.is_empty()
             && following
                 .iter()
                 .all(|statement| self.context.is_elided_statement(statement))
-            && matches!(statement, Stmt::If(conditional)
-                if early_condition_truthiness(&conditional.test).is_none()
-                    || (early_condition_truthiness(&conditional.test) == Some(true)
-                        && (matches!(conditional.body.last(), Some(Stmt::If(nested))
-                                if early_condition_truthiness(&nested.test).is_none())
-                            || matches!(conditional.body.last(), Some(Stmt::While(loop_statement))
-                                if loop_statement.orelse.is_empty()
-                                    && suite_contains_loop_break(&loop_statement.body)))))
+            && match early_condition_truthiness(&conditional.test) {
+                None => true,
+                Some(true) => {
+                    matches!(conditional.body.last(), Some(Stmt::If(nested))
+                        if early_condition_truthiness(&nested.test).is_none())
+                        || matches!(conditional.body.last(), Some(Stmt::While(loop_statement))
+                            if loop_statement.orelse.is_empty()
+                                && suite_contains_loop_break(&loop_statement.body))
+                }
+                Some(false) => false,
+            }
     }
 
     fn supports_protected_terminal_if(&self) -> bool {
@@ -4234,13 +4233,8 @@ impl<'source> Compiler<'source> {
             }
             _ => false,
         };
-        let inner_test = match inner.test.as_ref() {
-            Expr::Name(_) => true,
-            Expr::Attribute(attribute) => matches!(attribute.value.as_ref(), Expr::Name(_)),
-            _ => false,
-        };
         linear_prefix
-            && inner_test
+            && identity_operand(&inner.test)
             && !inner.body.is_empty()
             && inner
                 .body
@@ -4494,8 +4488,7 @@ impl<'source> Compiler<'source> {
             }
             return Ok(());
         }
-        let conditional_expression_tail = if self.context.python_version
-            >= crate::PythonVersion::Py314
+        let supports_expression_tail = self.context.python_version >= crate::PythonVersion::Py314
             && matches!(self.unit.scope, Scope::Function { .. })
             && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
             && self.control.loops.contexts.is_empty()
@@ -4505,7 +4498,8 @@ impl<'source> Compiler<'source> {
             && !self.control.in_exception_handler()
             && self.control.exceptions.active_exception_group_handlers == 0
             && self.control.finally.is_inactive_for_return_unwind()
-            && !self.control.statements.in_match
+            && !self.control.statements.in_match;
+        let conditional_expression_tail = if supports_expression_tail
             && statement
                 .body
                 .last()
@@ -4531,17 +4525,7 @@ impl<'source> Compiler<'source> {
         };
         let runtime_name =
             |value: &Expr| matches!(value, Expr::Name(name) if name.id.as_str() != "__debug__");
-        let pass_expression_tail = if self.context.python_version >= crate::PythonVersion::Py314
-            && matches!(self.unit.scope, Scope::Function { .. })
-            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
-            && self.control.loops.contexts.is_empty()
-            && !self.control.loops.suite_fallthrough_to_loop_backedge
-            && self.control.withs.active_with_exits.is_empty()
-            && !self.has_active_control_flow_region()
-            && !self.control.in_exception_handler()
-            && self.control.exceptions.active_exception_group_handlers == 0
-            && self.control.finally.is_inactive_for_return_unwind()
-            && !self.control.statements.in_match
+        let pass_expression_tail = if supports_expression_tail
             && statement.elif_else_clauses.is_empty()
             && runtime_name(&statement.test)
             && let [tail @ Stmt::Expr(expression), pass @ Stmt::Pass(_)] = statement.body.as_slice()
@@ -5393,11 +5377,7 @@ impl<'source> Compiler<'source> {
             return None;
         }
         body.iter()
-            .rev()
-            .find(|statement| !matches!(
-                self.context.optimized_locations.get(&statement.range()),
-                Some(super::optimization::OptimizedLocation::Elided)
-            ))
+            .rfind(|statement| !self.context.is_elided_statement(statement))
             .filter(|statement| matches!(statement, Stmt::Assign(assignment)
                 if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
                     && matches!(assignment.value.as_ref(), Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_))
@@ -8067,9 +8047,6 @@ impl<'source> Compiler<'source> {
                         };
                         (depth, start)
                     });
-                // A while has no stack cleanup of its own. Synchronous iterators created
-                // inside this sole ordinary try keep its owner through a computed return's
-                // SWAP/POP pairs, even when a while is the innermost loop.
                 let protected_sync_iterator_below_while =
                     self.protected_sync_iterator_below_while(return_is_overridden, preserve_tos);
                 // A result returned from a loop that was already protected by this try keeps the
@@ -16417,6 +16394,8 @@ impl<'source> Compiler<'source> {
         .then_some(tail.test.as_ref())
     }
 
+    /// Finds the false-edge location after a terminating guard and erased assertions.
+    /// The guard must have one false target and no enclosing cleanup or loop backedge.
     fn elided_terminating_if_fallthrough<'a>(&self, body: &'a [Stmt]) -> Option<&'a Expr> {
         if self.context.python_version < crate::PythonVersion::Py314
             || !matches!(self.unit.scope, Scope::Function { .. })
@@ -16474,10 +16453,7 @@ impl<'source> Compiler<'source> {
         }
         let is_elided_assert = |statement: &Stmt| {
             matches!(statement, Stmt::Global(global) if global.names.is_empty())
-                && matches!(
-                    self.context.optimized_locations.get(&statement.range()),
-                    Some(super::optimization::OptimizedLocation::Elided)
-                )
+                && self.context.is_elided_statement(statement)
         };
         let normal_exit_suite = if statement.orelse.is_empty() {
             &statement.body
@@ -18163,6 +18139,8 @@ impl<'source> Compiler<'source> {
         Ok(())
     }
 
+    /// Recognizes a computed return whose iterator cleanup keeps the enclosing try's owner.
+    /// An innermost `while` adds no cleanup, so the surrounding synchronous iterators qualify.
     #[inline(never)]
     fn protected_sync_iterator_below_while(
         &self,
@@ -18205,8 +18183,8 @@ impl<'source> Compiler<'source> {
             })
     }
 
-    // The exceptional-finally state lies between one older handler and its
-    // inner managers. A newer try region needs a separate exclusion boundary.
+    /// Recognizes an exceptional finalizer between an older handler and its inner managers.
+    /// A newer try region needs a separate exclusion boundary.
     #[inline(never)]
     fn handler_outside_finally_end(&self, inner_manager_boundary: Option<usize>) -> bool {
         self.control.finally.active_finally_end_blocks == 1
@@ -18235,6 +18213,9 @@ impl<'source> Compiler<'source> {
                     && handler.loop_depth == 0)
     }
 
+    /// Finds the first manager and loop entered inside the exceptional finalizer.
+    /// The final flag allows its cleanup to wait until those inner scopes have exited;
+    /// absent inner managers use `None`, while absent inner loops use the loop count.
     #[inline(never)]
     fn return_finally_manager_boundaries(
         &self,
@@ -18305,6 +18286,7 @@ impl<'source> Compiler<'source> {
         )
     }
 
+    /// Restores deferred exception state while retaining an earlier region boundary.
     #[inline(never)]
     fn emit_return_deferred_finally_end(
         &mut self,
@@ -21911,8 +21893,8 @@ impl<'source> Compiler<'source> {
         Ok(())
     }
 
-    // A removed assertion can leave an original empty conditional join. Its
-    // Boolean edges must be copied from that join, not synthesized at codegen.
+    /// Finds an empty conditional join left by assertion removal.
+    /// Its Boolean edges must be copied from that original join.
     fn optimized_conditional_join(&self, branch: &ruff_python_ast::StmtIf) -> bool {
         let is_elided = |body: &[Stmt]| {
             !body.is_empty()
@@ -21953,6 +21935,8 @@ impl<'source> Compiler<'source> {
                 .all(|clause| clause.test.as_ref().is_none_or(valid_test) && linear(&clause.body))
     }
 
+    /// Finds an erased Boolean join that must precede the iterator's unlocated backedge.
+    /// Linear prefixes and enclosing one-arm conditions preserve that same join.
     fn optimized_iterator_if_join(
         &self,
         statement: &ruff_python_ast::StmtFor,
@@ -22272,10 +22256,9 @@ impl<'source> Compiler<'source> {
             .rposition(|part| !self.context.is_elided_statement(part))?;
         let suffix = &statement.body[end + 1..];
         if suffix.is_empty()
-            || !suffix.iter().all(|part| {
-                matches!(part, Stmt::Global(global) if global.names.is_empty())
-                    && self.context.is_elided_statement(part)
-            })
+            || !suffix
+                .iter()
+                .all(|part| matches!(part, Stmt::Global(global) if global.names.is_empty()))
         {
             return None;
         }
@@ -37842,8 +37825,8 @@ enum WithBodyNormalExit {
     Other,
 }
 
-// Declarations emit no instructions or line events. For one authored pass with
-// trailing declarations, use the pass location for the empty-body fallback.
+/// Selects the empty-body fallback location without treating declarations as line events.
+/// When enabled, a sole authored `pass` supplies the location before trailing declarations.
 fn with_body_fallback_statement(body: &[Stmt], use_authored_pass: bool) -> Option<&Stmt> {
     let last = body.last()?;
     if matches!(last, Stmt::Global(_) | Stmt::Nonlocal(_)) {

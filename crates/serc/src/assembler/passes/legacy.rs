@@ -1338,7 +1338,10 @@ impl OptimizationPipeline {
         predecessors
     }
 
-    /// Recovers repeated predecessor counts for certified unlocated 3.12 tails.
+    /// Recovers 3.12 predecessor counts inflated by repeated reachability visits.
+    ///
+    /// Each result records the surviving instruction and ordinary edge count that
+    /// cleanup must preserve before restoring the native count for line propagation.
     fn legacy_repeated_tail_predecessors(
         &self,
         original_arrays: &FxHashMap<BasicBlockId, usize>,
@@ -1583,7 +1586,7 @@ impl OptimizationPipeline {
     /// Simulates 3.12's reachability walk over original instruction arrays.
     ///
     /// Exception range boundaries can split one native array into several Serc
-    /// blocks.  Merge those fragments in a temporary graph, then restore the
+    /// blocks. Merge those fragments in a temporary graph, then restore the
     /// authored SETUP edges that do not appear in the emitted instructions.
     /// Return `None` when the retained provenance cannot establish this graph.
     fn legacy_repeated_tails_with_setups(
@@ -1681,6 +1684,15 @@ impl OptimizationPipeline {
             .iter()
             .map(|&label| label_group(label))
             .collect::<Option<FxHashSet<_>>>()?;
+        let group_instructions = |index: usize| {
+            groups[index]
+                .iter()
+                .flat_map(|block| self.graph[*block].items())
+                .filter_map(|item| match item {
+                    Item::Instruction(instruction) => Some(instruction),
+                    Item::Label(_) => None,
+                })
+        };
         if let Some(entry) = wrapper {
             let handler = targets[&entry];
             let entry_group = label_group(entry)?;
@@ -1697,17 +1709,7 @@ impl OptimizationPipeline {
             {
                 return None;
             }
-            let instructions = |index: usize| {
-                groups[index]
-                    .iter()
-                    .flat_map(|block| self.graph[*block].items())
-                    .filter_map(|item| match item {
-                        Item::Instruction(instruction) => Some(instruction),
-                        Item::Label(_) => None,
-                    })
-                    .collect::<Vec<_>>()
-            };
-            let prefix = instructions(0);
+            let prefix = group_instructions(0).collect::<Vec<_>>();
             let [before @ .., generator, pop] = prefix.as_slice() else {
                 return None;
             };
@@ -1719,15 +1721,15 @@ impl OptimizationPipeline {
                     instruction.opcode != MAKE_CELL
                         && !(index == 0 && instruction.opcode == COPY_FREE_VARS)
                 })
-                || !instructions(entry_group)
-                    .first()
+                || !group_instructions(entry_group)
+                    .next()
                     .is_some_and(|instruction| {
                         instruction.opcode == RESUME && instruction.operand() == Operand::Value(0)
                     })
             {
                 return None;
             }
-            let cleanup = instructions(handler_group);
+            let cleanup = group_instructions(handler_group).collect::<Vec<_>>();
             if !matches!(cleanup.as_slice(), [call, reraise]
                 if call.opcode == CALL_INTRINSIC_1 && call.operand() == Operand::Value(3)
                     && reraise.opcode == RERAISE && reraise.operand() == Operand::Value(1))
@@ -1765,17 +1767,8 @@ impl OptimizationPipeline {
                 // SEND ends its native array. The following ordinary-await
                 // SETUP starts the fallthrough array, before YIELD_VALUE.
                 let previous = position.checked_sub(1)?;
-                let send = groups[previous]
-                    .iter()
-                    .rev()
-                    .find_map(|block| self.graph[*block].last_instruction())?;
-                let first = groups[position]
-                    .iter()
-                    .flat_map(|block| self.graph[*block].items())
-                    .find_map(|item| match item {
-                        Item::Instruction(instruction) => Some(instruction),
-                        Item::Label(_) => None,
-                    })?;
+                let send = group_instructions(previous).next_back()?;
+                let first = group_instructions(position).next()?;
                 if send.opcode != SEND
                     || first.opcode != YIELD_VALUE
                     || !self
@@ -1802,17 +1795,7 @@ impl OptimizationPipeline {
                 let previous = position.checked_sub(1)?;
                 let cleanup_group = label_group(origin.cleanup)?;
                 let exit_group = label_group(origin.exit)?;
-                let instructions = |index: usize| {
-                    groups[index]
-                        .iter()
-                        .flat_map(|block| self.graph[*block].items())
-                        .filter_map(|item| match item {
-                            Item::Instruction(instruction) => Some(instruction),
-                            Item::Label(_) => None,
-                        })
-                        .collect::<Vec<_>>()
-                };
-                let body = instructions(position);
+                let body = group_instructions(position).collect::<Vec<_>>();
                 let mut regions = self
                     .exception_regions
                     .iter()
@@ -1843,18 +1826,20 @@ impl OptimizationPipeline {
                     || label_group(origin.send) != Some(previous)
                     || cleanup_group != position + 1
                     || exit_group != cleanup_group + 1
-                    || !instructions(previous).last().is_some_and(|send| {
-                        send.opcode == SEND && send.operand() == Operand::Forward(origin.exit)
-                    })
+                    || !group_instructions(previous)
+                        .next_back()
+                        .is_some_and(|send| {
+                            send.opcode == SEND && send.operand() == Operand::Forward(origin.exit)
+                        })
                     || !matches!(body.as_slice(), [yielded, resume, back]
                         if yielded.opcode == YIELD_VALUE
                             && resume.opcode == RESUME
                             && resume.operand() == Operand::Value(ResumeLocation::AFTER_AWAIT.argument())
                             && back.opcode == JUMP_BACKWARD_NO_INTERRUPT
                             && back.operand() == Operand::Backward(origin.send))
-                    || !matches!(instructions(cleanup_group).as_slice(), [cleanup]
+                    || !matches!(group_instructions(cleanup_group).collect::<Vec<_>>().as_slice(), [cleanup]
                         if cleanup.opcode == CLEANUP_THROW && cleanup.operand() == Operand::Value(0))
-                    || !instructions(exit_group).first().is_some_and(|end| {
+                    || !group_instructions(exit_group).next().is_some_and(|end| {
                         end.opcode == END_SEND && end.operand() == Operand::Value(0)
                     })
                 {
@@ -1863,10 +1848,7 @@ impl OptimizationPipeline {
                 position
             } else {
                 let owner = position.checked_sub(1)?;
-                let last = groups[owner]
-                    .iter()
-                    .rev()
-                    .find_map(|block| self.graph[*block].last_instruction());
+                let last = group_instructions(owner).next_back();
                 if last.is_some_and(|instruction| {
                     is_unconditional_jump(instruction.opcode)
                         || matches!(
@@ -1887,15 +1869,8 @@ impl OptimizationPipeline {
         }
 
         let mut edges = vec![Vec::new(); groups.len()];
-        for (index, fragments) in groups.iter().enumerate() {
-            let instructions = fragments
-                .iter()
-                .flat_map(|block| self.graph[*block].items())
-                .filter_map(|item| match item {
-                    Item::Instruction(instruction) => Some(instruction),
-                    Item::Label(_) => None,
-                })
-                .collect::<Vec<_>>();
+        for (index, successors) in edges.iter_mut().enumerate() {
+            let instructions = group_instructions(index).collect::<Vec<_>>();
             if instructions
                 .iter()
                 .take(instructions.len().saturating_sub(1))
@@ -1913,16 +1888,16 @@ impl OptimizationPipeline {
                     && !crate::target::is_scope_exit_for(self.python_version, instruction.opcode)
             });
             if falls_through && index + 1 < groups.len() {
-                edges[index].push(index + 1);
+                successors.push(index + 1);
             }
             // CPython queues fallthrough first, then scans SETUP and jump
             // instructions in array order. SETUP in a handler precedes its
             // terminal jump; a body SETUP belongs to a non-branching array.
-            edges[index].extend(setup_edges[index].iter().copied());
+            successors.extend(setup_edges[index].iter().copied());
             if let Some(instruction) = instructions.last() {
                 match instruction.operand() {
                     Operand::Forward(label) | Operand::Backward(label) => {
-                        edges[index].push(label_group(label)?);
+                        successors.push(label_group(label)?);
                     }
                     Operand::Value(_) | Operand::Deferred(_) => {}
                 }
@@ -1963,6 +1938,11 @@ impl OptimizationPipeline {
             .enumerate()
             .map(|(index, &block)| (block, index))
             .collect::<FxHashMap<_, _>>();
+        let position = |label| {
+            self.graph
+                .label_block(label)
+                .and_then(|block| block_positions.get(&block).copied())
+        };
         let mut tails = Vec::new();
         for (index, fragments) in groups.iter().enumerate() {
             if !repeated_successors[index] {
@@ -1996,11 +1976,6 @@ impl OptimizationPipeline {
                     if region.is_scope_fallback {
                         return true;
                     }
-                    let position = |label| {
-                        self.graph
-                            .label_block(label)
-                            .and_then(|block| block_positions.get(&block).copied())
-                    };
                     let (Some(start), Some(end)) = (position(region.start), position(region.end))
                     else {
                         return false;
@@ -2040,11 +2015,6 @@ impl OptimizationPipeline {
                 let source = block_positions[&block];
                 let target = block_positions[&target_block];
                 self.exception_regions.iter().all(|region| {
-                    let position = |label| {
-                        self.graph
-                            .label_block(label)
-                            .and_then(|block| block_positions.get(&block).copied())
-                    };
                     let (Some(start), Some(end)) = (position(region.start), position(region.end))
                     else {
                         return false;

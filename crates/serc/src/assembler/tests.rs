@@ -602,6 +602,58 @@ fn direct_jump_nop_provenance_requires_a_forward_jump() {
 }
 
 #[test]
+fn nested_match_copy_budget_rejects_compacted_arms_atomically() {
+    let [first, second, join, success, exit] = [0, 1, 2, 3, 4].map(super::Label::from_u32);
+    for compacted_arm in [None, Some(0), Some(1)] {
+        let mut items = Vec::new();
+        for (index, entry) in [first, second].into_iter().enumerate() {
+            let mut jump = Instruction::new(
+                JUMP_FORWARD,
+                Operand::Forward(join),
+                SourceLocation::NONE,
+                Some(0),
+            );
+            if compacted_arm == Some(index) {
+                jump.add_pre_fold_extra_instructions(1);
+            }
+            items.extend([Item::Label(entry), Item::Instruction(jump)]);
+        }
+        let mut join_jump = Instruction::new(
+            JUMP_FORWARD,
+            Operand::Forward(success),
+            SourceLocation::NONE,
+            Some(0),
+        );
+        join_jump.jump_policy.mark_original_empty_join();
+        items.extend([
+            Item::Label(join),
+            Item::Instruction(join_jump),
+            Item::Label(success),
+        ]);
+        let mut assembler = Assembler::from_linear_items(items);
+        let emitted =
+            assembler.emit_forward_with_depth(JUMP_FORWARD, exit, 0, ExceptionPolicy::default());
+        assembler.record_original_match_success(emitted, false);
+        assembler.preserve_nested_match_exit_copy_budget(emitted);
+        let entries = assembler
+            .exception_owner_provenance
+            .nested_match_exit_copy_origins
+            .iter()
+            .map(|(entry, ..)| *entry)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            entries,
+            if compacted_arm.is_none() {
+                vec![first, second]
+            } else {
+                Vec::new()
+            },
+            "compacted arm: {compacted_arm:?}"
+        );
+    }
+}
+
+#[test]
 fn borrow_fallthrough_barrier_stays_on_predecessor_across_labels_and_emission() {
     let mut assembler = Assembler::default();
     let predecessor = assembler.emit(LOAD_CONST, 0);

@@ -1441,8 +1441,7 @@ impl Assembler {
 
     /// Certifies the current authored join without introducing a new boundary.
     pub(crate) fn record_current_original_scope_exit(&mut self) {
-        if let Some(Item::Label(label)) = self.linear_items().last() {
-            let label = *label;
+        if let Some(&Item::Label(label)) = self.linear_items().last() {
             self.record_original_scope_exit(label);
         }
     }
@@ -4017,7 +4016,10 @@ impl Assembler {
         count
     }
 
-    /// Captures the original normal restores followed by a distinct result assignment.
+    /// Captures a comprehension's local restores and result store before static swaps.
+    ///
+    /// Every restored local and the destination must differ. The returned labels retain
+    /// their original order so later passes can match the complete assignment block.
     fn current_original_comprehension_assignment(&self) -> Option<(Vec<Label>, Vec<Instruction>)> {
         let items = self.linear_items();
         let entry_index = items
@@ -8148,7 +8150,10 @@ impl Assembler {
         }
     }
 
-    /// Preserves the original copy budget of a nested join before a four-slot return.
+    /// Preserves CPython's exit-copy budget for nested branches within a match case.
+    ///
+    /// All matching predecessors must retain their original instruction slots; a
+    /// compacted `pass` or cleanup in any arm prevents recording the entire case.
     pub(crate) fn preserve_nested_match_exit_copy_budget(&mut self, emitted: EmittedJump) {
         let success_index = usize::try_from(emitted.instruction().item_index)
             .expect("emitted instruction index should fit in usize");
@@ -8172,58 +8177,52 @@ impl Assembler {
                 Item::Instruction(_) => next_instruction = index,
             }
         }
-        let mut unsupported_source = false;
-        let sources = items[..success_index]
-            .iter()
-            .enumerate()
-            .filter_map(|(index, item)| {
-                let Item::Instruction(source) = item else {
-                    return None;
-                };
-                let Operand::Forward(join_label) = source.operand() else {
-                    return None;
-                };
-                let join_index = *labels.get(&join_label)?;
-                let Item::Instruction(join) = items[join_index] else {
-                    return None;
-                };
-                let Operand::Forward(success_label) = join.operand() else {
-                    return None;
-                };
-                if source.opcode != JUMP_FORWARD
-                    || join.opcode != JUMP_FORWARD
-                    || index >= join_index
-                    || join_index >= success_index
-                    || labels.get(&success_label) != Some(&success_index)
-                    || !join.jump_policy.is_original_empty_join()
-                {
-                    return None;
-                }
-                // An authored Pass or cleanup can give one predecessor a different
-                // original array. Keep this case's admission atomic across its arms.
-                if ![source, &join, &success].iter().all(|record| {
-                    record.depth_after() == Some(0)
-                        && record.exception_policy() == ExceptionPolicy::default()
-                        && record.pre_fold_extra_instructions() == 0
-                        && record.local_policy.hidden_exception_owner_slots() == 0
-                        && !record.fusion_policy.is_authored_break()
-                        && !record.fusion_policy.is_converted_pop_block()
-                }) {
-                    unsupported_source = true;
-                    return None;
-                }
-                let entry = items[..index].iter().rev().find_map(|item| match item {
-                    Item::Label(label) => Some(*label),
-                    Item::Instruction(_) => None,
-                })?;
-                Some((entry, *source, success_label, exit))
-            })
-            .collect::<Vec<_>>();
-        if !unsupported_source {
-            self.exception_owner_provenance
-                .nested_match_exit_copy_origins
-                .extend(sources);
+        let mut sources = Vec::new();
+        for (index, item) in items[..success_index].iter().enumerate() {
+            let Item::Instruction(source) = item else {
+                continue;
+            };
+            let Operand::Forward(join_label) = source.operand() else {
+                continue;
+            };
+            let Some(&join_index) = labels.get(&join_label) else {
+                continue;
+            };
+            let Item::Instruction(join) = items[join_index] else {
+                continue;
+            };
+            let Operand::Forward(success_label) = join.operand() else {
+                continue;
+            };
+            if source.opcode != JUMP_FORWARD
+                || join.opcode != JUMP_FORWARD
+                || index >= join_index
+                || join_index >= success_index
+                || labels.get(&success_label) != Some(&success_index)
+                || !join.jump_policy.is_original_empty_join()
+            {
+                continue;
+            }
+            if ![source, &join, &success].iter().all(|record| {
+                record.depth_after() == Some(0)
+                    && record.exception_policy() == ExceptionPolicy::default()
+                    && record.pre_fold_extra_instructions() == 0
+                    && record.local_policy.hidden_exception_owner_slots() == 0
+                    && !record.fusion_policy.is_authored_break()
+                    && !record.fusion_policy.is_converted_pop_block()
+            }) {
+                return;
+            }
+            if let Some(entry) = items[..index].iter().rev().find_map(|item| match item {
+                Item::Label(label) => Some(*label),
+                Item::Instruction(_) => None,
+            }) {
+                sources.push((entry, *source, success_label, exit));
+            }
         }
+        self.exception_owner_provenance
+            .nested_match_exit_copy_origins
+            .extend(sources);
     }
 
     pub(crate) fn preserve_inlined_jump_nop(&mut self, emitted: EmittedJump) {

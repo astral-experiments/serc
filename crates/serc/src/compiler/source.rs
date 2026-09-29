@@ -24,13 +24,19 @@ use super::constant::{
     constant_slice_with_literals, explicit_surrogate_string, fold_constant,
     fold_constant_for_version, fold_constant_with_profile, is_literal_constant, literal_constant,
 };
-use super::scope::parameter_default_expressions;
-use super::scope::{ModulePlan, NameId, ScopeArena};
+use super::scope::{ModulePlan, NameId, ScopeArena, parameter_default_expressions};
 use super::statement::function_body_contains_yield;
 use super::symbol::mangle_name;
 use super::{CachedSourceLine, Compiler};
 
-/// Find legacy coroutine symbols in removed assertions without crossing nested scopes.
+/// Finds assertion expressions that give a function coroutine flags in CPython 3.12–3.13,
+/// even when `-O` or `-OO` removes the assertion. Nested bodies do not contribute, but
+/// lambda defaults and a generator expression's first iterable belong to this scope.
+///
+/// ```python
+/// def f():
+///     assert await task()
+/// ```
 pub(super) fn function_has_elided_coroutine_assertion(body: &[Stmt]) -> bool {
     #[derive(Default)]
     struct Detector {
@@ -359,7 +365,6 @@ impl<'source> CompilationContext<'source> {
         }
     }
 
-    /// Returns whether optimization recorded this statement as elided.
     pub(super) fn is_elided_statement(&self, statement: &Stmt) -> bool {
         matches!(
             self.optimized_locations.get(&statement.range()),
@@ -422,11 +427,8 @@ impl<'source> CompilationContext<'source> {
                 .raw_private_identifiers
                 .contains(name.as_str())
         });
-        #[expect(
-            clippy::iter_over_hash_type,
-            reason = "The retained names are used only for membership."
-        )]
-        for (name, _) in original_source.origins {
+        // The retained names are used only for membership.
+        for name in original_source.origins.into_keys() {
             if !original_source
                 .generated_mangled_strings
                 .contains(name.as_ref())
@@ -868,7 +870,8 @@ impl<'source> CompilationContext<'source> {
     }
 }
 
-/// Checks an accumulated dotted-name prefix without constructing or hashing every prefix.
+/// Checks whether `value` is a proper dot-delimited prefix of a name in the sorted index.
+/// Complete spellings are tracked separately; searching this index avoids allocating every prefix.
 fn dotted_name_prefix_is_interned(names: &[String], value: &str) -> bool {
     let index = names.partition_point(|name| match name.strip_prefix(value) {
         Some(tail) => tail < ".",
@@ -967,10 +970,9 @@ impl<'ast> SourceAnalysis<'ast> {
         self.record_raw_name_effects(name);
     }
 
+    /// Records parser-interned import names, including prefixes of imports later optimized away.
+    /// Prefixes stay implicit in the full spelling to avoid quadratic storage for long imports.
     fn record_dotted_name(&mut self, name: &'ast str) {
-        // CPython interns each accumulated dotted-name prefix while parsing, before
-        // optimization can discard the import containing it. Index the complete name
-        // rather than hashing every potentially long prefix.
         if name.contains('.') {
             self.dotted_import_names.push(name);
         }

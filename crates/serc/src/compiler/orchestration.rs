@@ -194,6 +194,7 @@ pub(super) struct CodeUnit {
     positional_only_arg_count: u32,
     keyword_only_arg_count: u32,
     pub(super) flags: u32,
+    /// A synchronous function marked as a coroutine by an assertion removed under `-O`.
     pub(super) legacy_sync_coroutine: bool,
     pub(super) first_line_number: u32,
     pub(super) annotation_thunk: bool,
@@ -935,10 +936,7 @@ impl<'source> Compiler<'source> {
         let terminal_statement = body.last();
         let is_elided_statement = |statement: &Stmt| {
             matches!(statement, Stmt::Global(global) if global.names.is_empty())
-                && matches!(
-                    self.context.optimized_locations.get(&statement.range()),
-                    Some(super::optimization::OptimizedLocation::Elided)
-                )
+                && self.context.is_elided_statement(statement)
         };
         let annotated_comprehension_store = |statement: &Stmt| {
             if self.context.python_version >= PythonVersion::Py314

@@ -1392,7 +1392,7 @@ impl UncompactedPrefixIndexes {
         }
     }
 
-    /// Finds the same recorded SETUP/NOP pair without rescanning all prior SETUPs.
+    /// Finds a recorded NOP range with unique boundary labels, followed by its SETUP label.
     fn has_fallthrough_setup_pair(
         &self,
         provenance: &ExceptionOwnerProvenance,
@@ -1407,23 +1407,17 @@ impl UncompactedPrefixIndexes {
                 .filter_map(|(index, item)| matches!(item, Item::Instruction(_)).then_some(index))
                 .collect();
             let mut setups = FxHashMap::<SourceLocation, Vec<usize>>::default();
-            let mut setup_locations = Vec::new();
             for (label, location) in &provenance.setups {
                 if let (Some(location), Some(&position)) = (location, self.positions.get(label)) {
-                    setups
-                        .entry(*location)
-                        .or_insert_with(|| {
-                            setup_locations.push(*location);
-                            Vec::new()
-                        })
-                        .push(position);
+                    setups.entry(*location).or_default().push(position);
                 }
             }
-            for location in setup_locations {
-                setups
-                    .get_mut(&location)
-                    .expect("recorded setup location")
-                    .sort_unstable();
+            #[expect(
+                clippy::iter_over_hash_type,
+                reason = "Each entry is sorted independently; map iteration order does not affect the result."
+            )]
+            for positions in setups.values_mut() {
+                positions.sort_unstable();
             }
 
             let mut pairs = FxHashMap::<(Label, Instruction), FxHashSet<Label>>::default();
@@ -1484,6 +1478,8 @@ impl UncompactedPrefixIndexes {
         })
     }
 
+    /// Requires the NOP to occur exactly once in both the authored passes and live input.
+    /// Matching an instruction signature alone does not establish its identity.
     fn has_unique_authored_pass(
         &self,
         all: &[Item],
@@ -2418,6 +2414,8 @@ impl ExceptionOwnerProvenance {
         )
     }
 
+    /// Certifies the original slot layout of a conditional prefix.
+    /// Only recorded entry boundaries and transformations with known slot counts are admitted.
     fn uncompacted_prefix_inner(
         &self,
         prefix: &[Item],
@@ -2905,19 +2903,9 @@ impl ExceptionOwnerProvenance {
                         expanded_collection = true;
                     }
                 }
-                BUILD_MAP => {
-                    // CPython does not fold BUILD_MAP; after the certified restore
-                    // the comprehension supplies a runtime value to this array.
-                    if comprehension_restore_count == 0
-                        || index <= comprehension_restore_count
-                        || !matches!(instruction.operand(), Operand::Value(1..))
-                    {
-                        return false;
-                    }
-                }
-                DICT_UPDATE => {
-                    // The update is a standalone, non-swappable record. Restrict
-                    // it to the authenticated comprehension continuation.
+                BUILD_MAP | DICT_UPDATE => {
+                    // Neither operation folds or swaps with a restore. The certified
+                    // comprehension continuation supplies a runtime value to this array.
                     if comprehension_restore_count == 0
                         || index <= comprehension_restore_count
                         || !matches!(instruction.operand(), Operand::Value(1..))
@@ -3487,6 +3475,21 @@ impl LayoutAssembler {
                         .any(|region| region.target == *label)
                 }
             };
+            let splits_original_array = |label: &Label| {
+                jump_targets.contains(label)
+                    || (origin.fallthrough.is_some() && fallthrough_unsafe_alias(label))
+                    || self
+                        .exception_owner_provenance
+                        .block_boundaries
+                        .contains(label)
+                    || self
+                        .exception_owner_provenance
+                        .source_boundaries
+                        .contains(label)
+                    || self.preserved_block_boundaries.contains(label)
+                    || is_setup_boundary(label)
+                    || is_handler_boundary(label)
+            };
             if let Some([condition, marker]) = origin.fallthrough {
                 if start == 0
                     || self.items[start - 1] != Item::Instruction(marker)
@@ -3501,20 +3504,7 @@ impl LayoutAssembler {
                     .checked_sub(1)
                     .and_then(|index| self.items.get(index))
                 {
-                    if jump_targets.contains(label)
-                        || (origin.fallthrough.is_some() && fallthrough_unsafe_alias(label))
-                        || self
-                            .exception_owner_provenance
-                            .block_boundaries
-                            .contains(label)
-                        || self
-                            .exception_owner_provenance
-                            .source_boundaries
-                            .contains(label)
-                        || self.preserved_block_boundaries.contains(label)
-                        || is_setup_boundary(label)
-                        || is_handler_boundary(label)
-                    {
+                    if splits_original_array(label) {
                         break;
                     }
                     before_marker -= 1;
@@ -3543,20 +3533,7 @@ impl LayoutAssembler {
                     && !original_labels.contains(label)
                 {
                     // Range-only aliases carry no original instruction cells.
-                    if jump_targets.contains(label)
-                        || (origin.fallthrough.is_some() && fallthrough_unsafe_alias(label))
-                        || self
-                            .exception_owner_provenance
-                            .block_boundaries
-                            .contains(label)
-                        || self
-                            .exception_owner_provenance
-                            .source_boundaries
-                            .contains(label)
-                        || self.preserved_block_boundaries.contains(label)
-                        || is_setup_boundary(label)
-                        || is_handler_boundary(label)
-                    {
+                    if splits_original_array(label) {
                         valid = false;
                         break;
                     }

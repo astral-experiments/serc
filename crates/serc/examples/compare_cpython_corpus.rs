@@ -143,6 +143,8 @@ impl<'a> Oracle<'a> {
         }
     }
 
+    /// Configures a fresh oracle process. The minimal reference keeps startup fixed
+    /// when changing compilation optimization and runs no Python wrapper.
     fn command(self, path: &Path, optimization: OptimizationLevel) -> Command {
         let mut command = Command::new(self.executable());
         match self {
@@ -246,6 +248,7 @@ impl Options {
         }
     }
 
+    /// Keeps outputs from different caller protocols out of the same cache.
     fn validate_reference_cache(&self, read: bool, write: bool) -> Result<(), &'static str> {
         if self.reference.is_some() && (read || write) {
             Err("--reference cannot use native caches captured by a different caller protocol")
@@ -802,6 +805,7 @@ impl ReferenceIdentity {
     }
 }
 
+/// Checks the protocol and linked runtime of the executable used for compilation.
 fn verify_reference(reference: &Path, python_version: PythonVersion) -> Result<(), String> {
     let output = Command::new(reference)
         .arg("--identity")

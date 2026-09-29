@@ -141,12 +141,18 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
         || validator.lowering_numeric_error
         || debug_pattern_replay;
     let mut error = validator.error.into_inner();
-    if error
+    let legacy_async_generator_return = error
         .as_ref()
-        .is_some_and(|error| error.is_legacy_async_generator_return)
+        .is_some_and(|error| error.is_legacy_async_generator_return);
+    if legacy_async_generator_return
+        || (error
+            .as_ref()
+            .is_some_and(|error| error.is_async_generator_return)
+            && simple_comprehension_module(body))
     {
-        // A legacy sync function can gain async-generator flags from a removed assertion.
-        // The return is rejected during lowering, after the entire symbol-table pass.
+        // Value returns in async generators fail during lowering, after symbol checks.
+        // A legacy sync function can gain those flags from a removed assertion; simple
+        // comprehension modules have no competing symbol-table diagnostics.
         let mut replay = new_validator::<false, false>(
             source,
             body,
@@ -157,7 +163,8 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
         replay.pre_lowering_only = true;
         replay.visit_body(body);
         if let Some(priority_error) = replay.error.into_inner() {
-            if (source.contains("global") || source.contains("nonlocal"))
+            if legacy_async_generator_return
+                && (source.contains("global") || source.contains("nonlocal"))
                 && let Some(range) = priority_error.error.range()
                 && let Some(declaration_error) =
                     declarations::immediate_before_node(body, python_version, range)
@@ -166,26 +173,8 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
             }
             return Err(priority_error.error);
         }
-        validate_declarations(source, body, python_version)?;
-    }
-    if error
-        .as_ref()
-        .is_some_and(|error| error.is_async_generator_return)
-        && simple_comprehension_module(body)
-    {
-        // The admitted forms have no competing symbol-table diagnostics. In that subset,
-        // check the module for comprehension yields before the lowering-only return.
-        let mut replay = new_validator::<false, false>(
-            source,
-            body,
-            python_version,
-            optimization_level,
-            mapping_key_int_max_str_digits,
-        );
-        replay.pre_lowering_only = true;
-        replay.visit_body(body);
-        if let Some(priority_error) = replay.error.into_inner() {
-            return Err(priority_error.error);
+        if legacy_async_generator_return {
+            validate_declarations(source, body, python_version)?;
         }
     }
     if lowering_keyword_error

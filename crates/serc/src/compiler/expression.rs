@@ -438,6 +438,7 @@ impl Compiler<'_> {
     }
 
     /// Exposes a terminal case conditional hidden by optimizer-elided statements.
+    /// Keeps the original suite when trimming would change a protected exit or loop backedge.
     pub(super) fn terminal_match_case_body<'b>(
         &self,
         body: &'b [Stmt],
@@ -471,25 +472,24 @@ impl Compiler<'_> {
         {
             return body;
         }
-        let is_elided = |statement: &Stmt| {
-            matches!(
-                self.context.optimized_locations.get(&statement.range()),
-                Some(super::optimization::OptimizedLocation::Elided)
-            )
-        };
+        let is_elided = |statement: &Stmt| self.context.is_elided_statement(statement);
         let Some(last) = body.iter().rposition(|statement| !is_elided(statement)) else {
             return body;
         };
-        if matches!(&body[last], Stmt::If(conditional)
-            if conditional.elif_else_clauses.is_empty()
-                && (!protected_continuation
-                    || suite_has_linear_borrow_fallthrough(&conditional.body))
-                && (suite_has_linear_borrow_fallthrough(&conditional.body)
-                    || (self.unit.flags & CO_COROUTINE != 0
-                        && self.coroutine_branch_has_linear_tail(&conditional.body))
-                    || matches!(conditional.body.as_slice(), [Stmt::Pass(_)])
-                    || (conditional.body.iter().all(is_elided)
-                        && condition_jump_target_count(&conditional.test, true) == 1)))
+        let Stmt::If(conditional) = &body[last] else {
+            return body;
+        };
+        if !conditional.elif_else_clauses.is_empty() {
+            return body;
+        }
+        let linear_fallthrough = suite_has_linear_borrow_fallthrough(&conditional.body);
+        if (!protected_continuation || linear_fallthrough)
+            && (linear_fallthrough
+                || (self.unit.flags & CO_COROUTINE != 0
+                    && self.coroutine_branch_has_linear_tail(&conditional.body))
+                || matches!(conditional.body.as_slice(), [Stmt::Pass(_)])
+                || (conditional.body.iter().all(is_elided)
+                    && condition_jump_target_count(&conditional.test, true) == 1))
         {
             &body[..=last]
         } else {
@@ -588,7 +588,6 @@ impl Compiler<'_> {
         )
     }
 
-    /// Lowers the match while preserving its enclosing exit-owner context.
     fn compile_match_with_context(
         &mut self,
         statement: &ruff_python_ast::StmtMatch,
@@ -852,6 +851,10 @@ impl Compiler<'_> {
                 }
             }
             if !guard_always_false {
+                let body_is_elided = case
+                    .body
+                    .iter()
+                    .all(|statement| self.context.is_elided_statement(statement));
                 // An erased class/OR case keeps its subject pop unlocated. A refutable
                 // folded true guard before a small copied return does likewise, so its
                 // original NOP survives before the pop through line compaction.
@@ -884,12 +887,7 @@ impl Compiler<'_> {
                     && !self.control.in_exception_handler()
                     && self.control.finally.is_inactive_for_return_unwind()
                     && !case.body.is_empty()
-                    && case.body.iter().all(|statement| {
-                        matches!(
-                            self.context.optimized_locations.get(&statement.range()),
-                            Some(super::optimization::OptimizedLocation::Elided)
-                        )
-                    });
+                    && body_is_elided;
                 if copied_subject {
                     let location = if self.context.python_version <= PythonVersion::Py313 {
                         self.source_location(case.pattern.range())
@@ -1259,10 +1257,7 @@ impl Compiler<'_> {
                             && matches!(&case.pattern, Pattern::MatchAs(pattern)
                                 if pattern.pattern.is_none() && pattern.name.is_some())
                             && !case.body.is_empty()
-                            && case
-                                .body
-                                .iter()
-                                .all(|statement| self.context.is_elided_statement(statement));
+                            && body_is_elided;
                         // An erased case leaves only its NEXT_LOCATION subject pop
                         // before the success jump. The continuation may belong to an
                         // enclosing branch: allow the jump to thread through it without
@@ -1277,10 +1272,7 @@ impl Compiler<'_> {
                                 .as_ref()
                                 .is_none_or(|guard| early_condition_truthiness(guard).is_none())
                             && !case.body.is_empty()
-                            && case
-                                .body
-                                .iter()
-                                .all(|statement| self.context.is_elided_statement(statement));
+                            && body_is_elided;
                         let previous_instruction_covers_branch = context.fail_pop.is_empty()
                             && !subject_pop_is_optimized_away
                             && body_previous_location.is_some_and(|location| {
@@ -1304,10 +1296,7 @@ impl Compiler<'_> {
                             // to the backedge instead of retaining a removed-jump NOP.
                             && !(case.guard.is_none()
                                 && (matches!(case.body.as_slice(), [Stmt::Pass(_)])
-                                    || case
-                                        .body
-                                        .iter()
-                                        .all(|statement| self.context.is_elided_statement(statement)))
+                                    || body_is_elided)
                                 && self.control.falls_through_to_loop_backedge()
                                 && ((has_default
                                     && matches!(case.pattern, Pattern::MatchValue(_)))
@@ -3316,9 +3305,7 @@ impl Compiler<'_> {
         self.assembler.mark(send);
         self.emit_jump_forward(SEND, end, 0)?;
         self.assembler.record_exception_setup(yielded, false);
-        if self.unit.flags & CO_COROUTINE != 0
-            && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
-        {
+        if self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE {
             self.assembler
                 .record_legacy_native_setup_target(yielded, cleanup);
         }

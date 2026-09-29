@@ -12,7 +12,10 @@ use super::super::{
 use super::normal_try_copy_plan::{OriginalNode, OriginalTail, PrefixSlot, plan_normal_try_copies};
 use crate::target::opcodes::{JUMP_BACKWARD, JUMP_FORWARD, NOP, POP_EXCEPT};
 
-/// Checks that clearing a jump's exclusion cannot select a different existing owner.
+/// Checks whether restored owners retain priority when a jump's exclusion is cleared.
+///
+/// Unknown ranges or priorities are rejected. Existing regions win ties, so a tied
+/// region must preserve the selected owner's handler, stack depth, and `lasti` policy.
 fn restored_empty_try_owner_is_unshadowed(
     owners: &[ExceptionRegion],
     regions: &[ExceptionRegion],
@@ -1679,6 +1682,9 @@ impl OptimizationPipeline {
     }
 
     /// Restores original empty-try owners before a live prefix or shared finalizer exit.
+    ///
+    /// An unlocated jump needs either the shared finalizer's enclosing owners or
+    /// an intact SETUP donor that cannot expose a higher-priority exception region.
     fn restore_empty_try_jump_owners(&mut self) {
         let graph = &self.graph;
         if !self

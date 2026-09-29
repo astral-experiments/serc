@@ -4164,34 +4164,15 @@ print(json.dumps(rows))
     ] {
         for (index, (python_version, _, _)) in VERSIONS.iter().copied().enumerate() {
             for optimization_level in LEVELS {
-                let native = oracle(
-                    source.as_bytes(),
+                let [native, actual] = compile_both(
+                    source,
                     "return_finally.py",
                     python_version,
                     optimization_level,
                 );
-                assert!(
-                    native.status.success(),
-                    "{}",
-                    String::from_utf8_lossy(&native.stderr)
-                );
-                let actual = compile_with_options(
-                    source,
-                    "return_finally.py",
-                    &CompileOptions {
-                        python_version,
-                        optimization_level,
-                        ..CompileOptions::default()
-                    },
-                )
-                .unwrap()
-                .marshal();
-                assert_eq!(
-                    actual, native.stdout,
-                    "{python_version}, {optimization_level:?}"
-                );
+                assert_eq!(actual, native, "{python_version}, {optimization_level:?}");
                 let mut outputs = Vec::new();
-                for payload in [&native.stdout, &actual] {
+                for payload in [&native, &actual] {
                     let result = run_with_input(
                         Command::new(ORACLES[index].get().unwrap())
                             .args(["-I", "-S", "-B", "-c", TRACE])
@@ -4359,34 +4340,15 @@ print(json.dumps(rows))
     for (source, trace) in [(GENERATOR, GENERATOR_TRACE), (ASYNC, ASYNC_TRACE)] {
         for (index, (python_version, _, _)) in VERSIONS.iter().copied().enumerate() {
             for optimization_level in LEVELS {
-                let native = oracle(
-                    source.as_bytes(),
+                let [native, actual] = compile_both(
+                    source,
                     "return_older_handler.py",
                     python_version,
                     optimization_level,
                 );
-                assert!(
-                    native.status.success(),
-                    "{}",
-                    String::from_utf8_lossy(&native.stderr)
-                );
-                let actual = compile_with_options(
-                    source,
-                    "return_older_handler.py",
-                    &CompileOptions {
-                        python_version,
-                        optimization_level,
-                        ..CompileOptions::default()
-                    },
-                )
-                .unwrap()
-                .marshal();
-                assert_eq!(
-                    actual, native.stdout,
-                    "{python_version}, {optimization_level:?}"
-                );
+                assert_eq!(actual, native, "{python_version}, {optimization_level:?}");
                 let mut outputs = Vec::new();
-                for payload in [&native.stdout, &actual] {
+                for payload in [&native, &actual] {
                     let result = run_with_input(
                         Command::new(ORACLES[index].get().unwrap())
                             .args(["-I", "-S", "-B", "-c", trace])
@@ -4517,30 +4479,14 @@ finally:
     monitor.free_tool_id(5)
 ";
     for optimization_level in LEVELS {
-        let native = oracle(
-            SOURCE.as_bytes(),
+        let [native, actual] = compile_both(
+            SOURCE,
             "manager_footer.py",
             PythonVersion::Py313,
             optimization_level,
         );
-        assert!(
-            native.status.success(),
-            "{}",
-            String::from_utf8_lossy(&native.stderr)
-        );
-        let actual = compile_with_options(
-            SOURCE,
-            "manager_footer.py",
-            &CompileOptions {
-                python_version: PythonVersion::Py313,
-                optimization_level,
-                ..CompileOptions::default()
-            },
-        )
-        .unwrap()
-        .marshal();
-        assert_eq!(actual, native.stdout, "{optimization_level:?}");
-        for code in [&native.stdout, &actual] {
+        assert_eq!(actual, native, "{optimization_level:?}");
+        for code in [&native, &actual] {
             let result = run_with_input(
                 Command::new(ORACLES[1].get().unwrap())
                     .args(["-I", "-S", "-B", "-c", TRACE])
@@ -4614,30 +4560,14 @@ if events != ['enter', 'work', 'cleanup', 'exit:None'] or result is not None:
     raise RuntimeError((events, result))
 ";
     for optimization_level in LEVELS {
-        let native = oracle(
-            SOURCE.as_bytes(),
+        let [native, actual] = compile_both(
+            SOURCE,
             "manager_footer.py",
             PythonVersion::Py313,
             optimization_level,
         );
-        assert!(
-            native.status.success(),
-            "{}",
-            String::from_utf8_lossy(&native.stderr)
-        );
-        let actual = compile_with_options(
-            SOURCE,
-            "manager_footer.py",
-            &CompileOptions {
-                python_version: PythonVersion::Py313,
-                optimization_level,
-                ..CompileOptions::default()
-            },
-        )
-        .unwrap()
-        .marshal();
-        assert_eq!(actual, native.stdout, "{optimization_level:?}");
-        for code in [&native.stdout, &actual] {
+        assert_eq!(actual, native, "{optimization_level:?}");
+        for code in [&native, &actual] {
             let result = run_with_input(
                 Command::new(ORACLES[1].get().unwrap())
                     .args(["-I", "-S", "-B", "-c", TRACE])
@@ -4715,33 +4645,14 @@ finally:
 ";
     for (index, python_version) in [(1, PythonVersion::Py313)] {
         for optimization_level in LEVELS {
-            let native = oracle(
-                SOURCE.as_bytes(),
+            let [native, actual] = compile_both(
+                SOURCE,
                 "manager_finally_footer.py",
                 python_version,
                 optimization_level,
             );
-            assert!(
-                native.status.success(),
-                "{}",
-                String::from_utf8_lossy(&native.stderr)
-            );
-            let actual = compile_with_options(
-                SOURCE,
-                "manager_finally_footer.py",
-                &CompileOptions {
-                    python_version,
-                    optimization_level,
-                    ..CompileOptions::default()
-                },
-            )
-            .unwrap()
-            .marshal();
-            assert_eq!(
-                actual, native.stdout,
-                "{python_version}, {optimization_level:?}"
-            );
-            for code in [&native.stdout, &actual] {
+            assert_eq!(actual, native, "{python_version}, {optimization_level:?}");
+            for code in [&native, &actual] {
                 let result = run_with_input(
                     Command::new(ORACLES[index].get().unwrap())
                         .args(["-I", "-S", "-B", "-c", TRACE]),
@@ -4829,31 +4740,15 @@ if covered != {'footer', 'return', 'suppressed', 'inner_exit_fault', 'outer_exit
 print(json.dumps(rows))
 ";
     for optimization_level in LEVELS {
-        let native = oracle(
-            SOURCE.as_bytes(),
+        let [native, actual] = compile_both(
+            SOURCE,
             "return_manager_footer.py",
             PythonVersion::Py313,
             optimization_level,
         );
-        assert!(
-            native.status.success(),
-            "{}",
-            String::from_utf8_lossy(&native.stderr)
-        );
-        let actual = compile_with_options(
-            SOURCE,
-            "return_manager_footer.py",
-            &CompileOptions {
-                python_version: PythonVersion::Py313,
-                optimization_level,
-                ..CompileOptions::default()
-            },
-        )
-        .unwrap()
-        .marshal();
-        assert_eq!(actual, native.stdout, "{optimization_level:?}");
+        assert_eq!(actual, native, "{optimization_level:?}");
         let mut outputs = Vec::new();
-        for payload in [&native.stdout, &actual] {
+        for payload in [&native, &actual] {
             let result = run_with_input(
                 Command::new(ORACLES[1].get().unwrap())
                     .args(["-I", "-S", "-B", "-c", TRACE])
@@ -4976,33 +4871,14 @@ monitor.free_tool_id(5)
     }
     for (index, python_version) in versions.into_iter().enumerate() {
         for optimization_level in LEVELS {
-            let native = oracle(
-                SOURCE.as_bytes(),
+            let [native, actual] = compile_both(
+                SOURCE,
                 "legacy_finally.py",
                 python_version,
                 optimization_level,
             );
-            assert!(
-                native.status.success(),
-                "{}",
-                String::from_utf8_lossy(&native.stderr)
-            );
-            let actual = compile_with_options(
-                SOURCE,
-                "legacy_finally.py",
-                &CompileOptions {
-                    python_version,
-                    optimization_level,
-                    ..CompileOptions::default()
-                },
-            )
-            .unwrap()
-            .marshal();
-            assert_eq!(
-                actual, native.stdout,
-                "{python_version}, {optimization_level:?}"
-            );
-            for code in [&native.stdout, &actual] {
+            assert_eq!(actual, native, "{python_version}, {optimization_level:?}");
+            for code in [&native, &actual] {
                 let result = run_with_input(
                     Command::new(ORACLES[index].get().unwrap())
                         .args(["-I", "-S", "-B", "-c", TRACE])
@@ -5077,33 +4953,17 @@ monitor.free_tool_id(5)
                 "def f(manager,flag):\n    try:\n        try:\n            work()\n        finally:\n            try:\n                if flag:\n                    pass\n            finally:\n                pass\n{sibling}    except Exception:\n        recover()\n    {exit}\n"
             );
             for optimization_level in LEVELS {
-                let native = oracle(
-                    source.as_bytes(),
+                let [native, actual] = compile_both(
+                    &source,
                     "legacy_normal_finalizer.py",
                     PythonVersion::Py312,
                     optimization_level,
                 );
-                assert!(
-                    native.status.success(),
-                    "{}",
-                    String::from_utf8_lossy(&native.stderr)
-                );
-                let actual = compile_with_options(
-                    &source,
-                    "legacy_normal_finalizer.py",
-                    &CompileOptions {
-                        python_version: PythonVersion::Py312,
-                        optimization_level,
-                        ..CompileOptions::default()
-                    },
-                )
-                .unwrap()
-                .marshal();
                 assert_eq!(
-                    actual, native.stdout,
+                    actual, native,
                     "{optimization_level:?}, {generator}, {has_sibling}"
                 );
-                for code in [&native.stdout, &actual] {
+                for code in [&native, &actual] {
                     let result = run_with_input(
                         Command::new(ORACLES[0].get().unwrap())
                             .args(["-I", "-S", "-B", "-c", TRACE])
@@ -5207,26 +5067,10 @@ monitor.free_tool_id(5)
                     .enumerate()
                 {
                     for level in LEVELS {
-                        let native =
-                            oracle(source.as_bytes(), "suppressed_assert.py", version, level);
-                        assert!(
-                            native.status.success(),
-                            "{}",
-                            String::from_utf8_lossy(&native.stderr)
-                        );
-                        let actual = compile_with_options(
-                            &source,
-                            "suppressed_assert.py",
-                            &CompileOptions {
-                                python_version: version,
-                                optimization_level: level,
-                                ..CompileOptions::default()
-                            },
-                        )
-                        .unwrap()
-                        .marshal();
+                        let [native, actual] =
+                            compile_both(&source, "suppressed_assert.py", version, level);
                         assert_eq!(
-                            actual, native.stdout,
+                            actual, native,
                             "{version}, {level:?}, {nested}, {generator}"
                         );
                         if !trace
@@ -5236,7 +5080,7 @@ monitor.free_tool_id(5)
                         {
                             continue;
                         }
-                        for code in [&native.stdout, &actual] {
+                        for code in [&native, &actual] {
                             let result = run_with_input(
                                 Command::new(ORACLES[index].get().unwrap())
                                     .args(["-I", "-S", "-B", "-c", TRACE, &marker.to_string()])
@@ -5400,29 +5244,13 @@ print(json.dumps('ok'))
 ";
     for (index, (version, _, _)) in VERSIONS.iter().copied().enumerate().skip(2) {
         for optimization_level in LEVELS {
-            let native = oracle(
-                SOURCE.as_bytes(),
+            let [native, actual] = compile_both(
+                SOURCE,
                 "terminal_finally_pass.py",
                 version,
                 optimization_level,
             );
-            assert!(
-                native.status.success(),
-                "{}",
-                String::from_utf8_lossy(&native.stderr)
-            );
-            let actual = compile_with_options(
-                SOURCE,
-                "terminal_finally_pass.py",
-                &CompileOptions {
-                    python_version: version,
-                    optimization_level,
-                    ..CompileOptions::default()
-                },
-            )
-            .unwrap()
-            .marshal();
-            for bytes in [&native.stdout[..], &actual] {
+            for bytes in [&native[..], &actual] {
                 let output = run_with_input(
                     Command::new(ORACLES[index].get().unwrap())
                         .args(["-I", "-S", "-c", TRACE])
@@ -5574,26 +5402,14 @@ for fail in (False, True):
 monitor.free_tool_id(5)
 ";
     for level in [OptimizationLevel::One, OptimizationLevel::Two] {
-        let native = oracle(
-            SOURCE.as_bytes(),
+        let [native, actual] = compile_both(
+            SOURCE,
             "preceding_exception_trace.py",
             PythonVersion::Py312,
             level,
         );
-        assert!(native.status.success());
-        let actual = compile_with_options(
-            SOURCE,
-            "preceding_exception_trace.py",
-            &CompileOptions {
-                python_version: PythonVersion::Py312,
-                optimization_level: level,
-                ..CompileOptions::default()
-            },
-        )
-        .unwrap()
-        .marshal();
-        assert_eq!(actual, native.stdout);
-        for payload in [&native.stdout, &actual] {
+        assert_eq!(actual, native);
+        for payload in [&native, &actual] {
             let result = run_with_input(
                 Command::new(ORACLES[0].get().unwrap()).args(["-I", "-S", "-B", "-c", TRACE]),
                 payload,
@@ -5663,26 +5479,10 @@ for fail in (False, True):
 monitor.free_tool_id(5)
 ";
     for level in [OptimizationLevel::One, OptimizationLevel::Two] {
-        let native = oracle(
-            SOURCE.as_bytes(),
-            "generator_backedge.py",
-            PythonVersion::Py312,
-            level,
-        );
-        assert!(native.status.success());
-        let actual = compile_with_options(
-            SOURCE,
-            "generator_backedge.py",
-            &CompileOptions {
-                python_version: PythonVersion::Py312,
-                optimization_level: level,
-                ..CompileOptions::default()
-            },
-        )
-        .unwrap()
-        .marshal();
-        assert_eq!(actual, native.stdout);
-        for payload in [&native.stdout, &actual] {
+        let [native, actual] =
+            compile_both(SOURCE, "generator_backedge.py", PythonVersion::Py312, level);
+        assert_eq!(actual, native);
+        for payload in [&native, &actual] {
             let result = run_with_input(
                 Command::new(ORACLES[0].get().unwrap()).args(["-I", "-S", "-B", "-c", TRACE]),
                 payload,
@@ -6011,26 +5811,14 @@ if events != ['finish']:
             .position(|(version, _, _)| *version == python_version)
             .unwrap();
         for optimization_level in [OptimizationLevel::One, OptimizationLevel::Two] {
-            let native = oracle(
-                SOURCE.as_bytes(),
+            let [native, actual] = compile_both(
+                SOURCE,
                 "elided_inner_else_for_else.py",
                 python_version,
                 optimization_level,
             );
-            assert!(native.status.success());
-            let actual = compile_with_options(
-                SOURCE,
-                "elided_inner_else_for_else.py",
-                &CompileOptions {
-                    python_version,
-                    optimization_level,
-                    ..CompileOptions::default()
-                },
-            )
-            .unwrap()
-            .marshal();
-            assert_eq!(actual, native.stdout);
-            for payload in [&native.stdout, &actual] {
+            assert_eq!(actual, native);
+            for payload in [&native, &actual] {
                 let result = run_with_input(
                     Command::new(ORACLES[index].get().unwrap()).args(["-I", "-S", "-c", TRACE]),
                     payload,
@@ -6406,24 +6194,12 @@ assert fired[0]
 print(json.dumps(events))
 ";
     for optimization_level in LEVELS {
-        let native = oracle(
-            SOURCE.as_bytes(),
+        let [native, actual] = compile_both(
+            SOURCE,
             "terminal_elided_assert.py",
             PythonVersion::Py312,
             optimization_level,
         );
-        assert!(native.status.success());
-        let actual = compile_with_options(
-            SOURCE,
-            "terminal_elided_assert.py",
-            &CompileOptions {
-                python_version: PythonVersion::Py312,
-                optimization_level,
-                ..CompileOptions::default()
-            },
-        )
-        .unwrap()
-        .marshal();
         let execute = |bytes: &[u8]| {
             run_with_input(
                 Command::new(ORACLES[0].get().unwrap())
@@ -6432,7 +6208,7 @@ print(json.dumps(events))
                 bytes,
             )
         };
-        for result in [execute(&native.stdout), execute(&actual)] {
+        for result in [execute(&native), execute(&actual)] {
             assert!(
                 result.status.success(),
                 "{}",
@@ -7019,28 +6795,13 @@ for name, injected, expected in [
         (PythonVersion::Py315, OptimizationLevel::One),
         (PythonVersion::Py315, OptimizationLevel::Two),
     ] {
-        let native = oracle(SOURCE.as_bytes(), "optimized_join.py", version, level);
-        assert!(native.status.success());
-        let actual = compile_with_options(
-            SOURCE,
-            "optimized_join.py",
-            &CompileOptions {
-                python_version: version,
-                optimization_level: level,
-                ..CompileOptions::default()
-            },
-        )
-        .unwrap()
-        .marshal();
-        assert_eq!(actual, native.stdout);
+        let [native, actual] = compile_both(SOURCE, "optimized_join.py", version, level);
+        assert_eq!(actual, native);
         let index = VERSIONS
             .iter()
             .position(|(target, _, _)| *target == version)
             .unwrap();
-        for (label, payload) in [
-            ("native", native.stdout.as_slice()),
-            ("serc", actual.as_slice()),
-        ] {
+        for (label, payload) in [("native", native.as_slice()), ("serc", actual.as_slice())] {
             let result = run_with_input(
                 Command::new(ORACLES[index].get().unwrap())
                     .args(["-I", "-S", "-X", "utf8", "-c", TRACE_JOIN])
@@ -7160,25 +6921,13 @@ for prefix, line, argument, expected in cases:
         });
         for version in [PythonVersion::Py314, PythonVersion::Py315] {
             for level in [OptimizationLevel::One, OptimizationLevel::Two] {
-                let native = oracle(source.as_bytes(), "protected_owner.py", version, level);
-                assert!(native.status.success());
-                let actual = compile_with_options(
-                    source,
-                    "protected_owner.py",
-                    &CompileOptions {
-                        python_version: version,
-                        optimization_level: level,
-                        ..CompileOptions::default()
-                    },
-                )
-                .unwrap()
-                .marshal();
-                assert_eq!(actual, native.stdout, "{version}, {level:?}");
+                let [native, actual] = compile_both(source, "protected_owner.py", version, level);
+                assert_eq!(actual, native, "{version}, {level:?}");
                 let index = VERSIONS
                     .iter()
                     .position(|(candidate, _, _)| *candidate == version)
                     .unwrap();
-                for (label, payload) in [("native", &native.stdout), ("serc", &actual)] {
+                for (label, payload) in [("native", &native), ("serc", &actual)] {
                     let result = run_with_input(
                         Command::new(ORACLES[index].get().unwrap())
                             .args(["-I", "-S", "-B", "-c", TRACE])
@@ -7337,24 +7086,13 @@ if hits != [target] or values != [1] or events != ['enter', 'recover', 'exit:non
         );
         for version in [PythonVersion::Py314, PythonVersion::Py315] {
             for level in [OptimizationLevel::One, OptimizationLevel::Two] {
-                let native = oracle(source.as_bytes(), "folded_pass_owner.py", version, level);
-                assert!(native.status.success());
-                let actual = compile_with_options(
-                    &source,
-                    "folded_pass_owner.py",
-                    &CompileOptions {
-                        python_version: version,
-                        optimization_level: level,
-                        ..CompileOptions::default()
-                    },
-                )
-                .unwrap()
-                .marshal();
+                let [native, actual] =
+                    compile_both(&source, "folded_pass_owner.py", version, level);
                 let index = VERSIONS
                     .iter()
                     .position(|(candidate, _, _)| *candidate == version)
                     .unwrap();
-                for (label, bytes) in [("native", &native.stdout), ("serc", &actual)] {
+                for (label, bytes) in [("native", &native), ("serc", &actual)] {
                     let result = run_with_input(
                         Command::new(ORACLES[index].get().unwrap())
                             .args(["-I", "-S", "-B", "-c", TRACE, target_line, argument])
@@ -7439,6 +7177,38 @@ fn oracle(
     child.wait_with_output().unwrap()
 }
 
+#[track_caller]
+fn compile_both(
+    source: &str,
+    filename: &str,
+    python_version: PythonVersion,
+    optimization_level: OptimizationLevel,
+) -> [Vec<u8>; 2] {
+    let native = oracle(
+        source.as_bytes(),
+        filename,
+        python_version,
+        optimization_level,
+    );
+    assert!(
+        native.status.success(),
+        "{python_version}, {optimization_level:?}, {filename}: {}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+    let actual = compile_with_options(
+        source,
+        filename,
+        &CompileOptions {
+            python_version,
+            optimization_level,
+            ..CompileOptions::default()
+        },
+    )
+    .unwrap_or_else(|error| panic!("{python_version}, {optimization_level:?}, {filename}: {error}"))
+    .marshal();
+    [native.stdout, actual]
+}
+
 fn assert_matches_cpython(source: &str, filename: &str, levels: &[OptimizationLevel]) {
     let versions = VERSIONS.map(|(version, _, _)| version);
     assert_matches_cpython_versions(source, filename, levels, &versions);
@@ -7452,37 +7222,18 @@ fn assert_matches_cpython_versions(
 ) {
     for &python_version in versions {
         for &optimization_level in levels {
-            let options = CompileOptions {
-                python_version,
-                optimization_level,
-                ..CompileOptions::default()
-            };
-            let expected = oracle(
-                source.as_bytes(),
-                filename,
-                python_version,
-                optimization_level,
-            );
-            assert!(
-                expected.status.success(),
-                "{python_version}, {optimization_level:?}, {filename}: {}",
-                String::from_utf8_lossy(&expected.stderr)
-            );
-            let actual = compile_with_options(source, filename, &options)
-                .unwrap_or_else(|error| {
-                    panic!("{python_version}, {optimization_level:?}, {filename}: {error}")
-                })
-                .marshal();
+            let [expected, actual] =
+                compile_both(source, filename, python_version, optimization_level);
             let first_difference = actual
                 .iter()
-                .zip(&expected.stdout)
+                .zip(&expected)
                 .position(|(actual, expected)| actual != expected);
             assert!(
-                actual == expected.stdout,
+                actual == expected,
                 "{python_version}, {optimization_level:?}, {filename}: first difference \
                  {first_difference:?}, lengths {} and {}",
                 actual.len(),
-                expected.stdout.len()
+                expected.len()
             );
         }
     }
@@ -8756,29 +8507,13 @@ monitor.free_tool_id(5)
                 if mode == "assert" && optimization_level != OptimizationLevel::Zero {
                     continue;
                 }
-                let native = oracle(
-                    source.as_bytes(),
+                let [native, actual] = compile_both(
+                    source,
                     "modern_manager_finally.py",
                     python_version,
                     optimization_level,
                 );
-                assert!(
-                    native.status.success(),
-                    "{}",
-                    String::from_utf8_lossy(&native.stderr)
-                );
-                let actual = compile_with_options(
-                    source,
-                    "modern_manager_finally.py",
-                    &CompileOptions {
-                        python_version,
-                        optimization_level,
-                        ..CompileOptions::default()
-                    },
-                )
-                .unwrap()
-                .marshal();
-                for code in [&native.stdout, &actual] {
+                for code in [&native, &actual] {
                     let result = run_with_input(
                         Command::new(ORACLES[index].get().unwrap())
                             .args(["-I", "-S", "-B", "-c", TRACE, mode]),
@@ -8846,33 +8581,14 @@ monitor.free_tool_id(5)
         .enumerate()
     {
         for optimization_level in LEVELS {
-            let native = oracle(
-                SOURCE.as_bytes(),
+            let [native, actual] = compile_both(
+                SOURCE,
                 "legacy_manager_finally.py",
                 python_version,
                 optimization_level,
             );
-            assert!(
-                native.status.success(),
-                "{}",
-                String::from_utf8_lossy(&native.stderr)
-            );
-            let actual = compile_with_options(
-                SOURCE,
-                "legacy_manager_finally.py",
-                &CompileOptions {
-                    python_version,
-                    optimization_level,
-                    ..CompileOptions::default()
-                },
-            )
-            .unwrap()
-            .marshal();
-            assert_eq!(
-                actual, native.stdout,
-                "{python_version}, {optimization_level:?}"
-            );
-            for code in [&native.stdout, &actual] {
+            assert_eq!(actual, native, "{python_version}, {optimization_level:?}");
+            for code in [&native, &actual] {
                 let result = run_with_input(
                     Command::new(ORACLES[index].get().unwrap())
                         .args(["-I", "-S", "-B", "-c", TRACE]),
@@ -9272,30 +8988,14 @@ print(json.dumps(events))
 ";
     for (index, (python_version, _, _)) in VERSIONS.iter().copied().enumerate().skip(2) {
         for optimization_level in &LEVELS[1..] {
-            let native = oracle(
-                SOURCE.as_bytes(),
+            let [native, actual] = compile_both(
+                SOURCE,
                 "manager_finally_assert.py",
                 python_version,
                 *optimization_level,
             );
-            assert!(
-                native.status.success(),
-                "{}",
-                String::from_utf8_lossy(&native.stderr)
-            );
-            let actual = compile_with_options(
-                SOURCE,
-                "manager_finally_assert.py",
-                &CompileOptions {
-                    python_version,
-                    optimization_level: *optimization_level,
-                    ..CompileOptions::default()
-                },
-            )
-            .unwrap()
-            .marshal();
             let mut outputs = Vec::new();
-            for payload in [&native.stdout, &actual] {
+            for payload in [&native, &actual] {
                 let result = run_with_input(
                     Command::new(ORACLES[index].get().unwrap())
                         .args(["-I", "-S", "-B", "-c", TRACE])
@@ -9518,25 +9218,8 @@ print(json.dumps(events))
     for (source, expected_events) in cases {
         for (index, (python_version, _, _)) in VERSIONS.iter().copied().enumerate() {
             for optimization_level in LEVELS {
-                let native = oracle(
-                    source.as_bytes(),
-                    "case.py",
-                    python_version,
-                    optimization_level,
-                );
-                assert!(
-                    native.status.success(),
-                    "{}",
-                    String::from_utf8_lossy(&native.stderr)
-                );
-                let options = CompileOptions {
-                    python_version,
-                    optimization_level,
-                    ..CompileOptions::default()
-                };
-                let actual = compile_with_options(source, "case.py", &options)
-                    .unwrap()
-                    .marshal();
+                let [native, actual] =
+                    compile_both(source, "case.py", python_version, optimization_level);
                 let execute = |bytes: &[u8]| {
                     run_with_input(
                         Command::new(ORACLES[index].get().unwrap())
@@ -9545,7 +9228,7 @@ print(json.dumps(events))
                         bytes,
                     )
                 };
-                let expected_run = execute(&native.stdout);
+                let expected_run = execute(&native);
                 let actual_run = execute(&actual);
                 for result in [&expected_run, &actual_run] {
                     assert!(
@@ -9562,10 +9245,7 @@ print(json.dumps(events))
                     actual_run.stdout, expected_run.stdout,
                     "{python_version}, {optimization_level:?}"
                 );
-                assert_eq!(
-                    actual, native.stdout,
-                    "{python_version}, {optimization_level:?}"
-                );
+                assert_eq!(actual, native, "{python_version}, {optimization_level:?}");
             }
         }
     }
@@ -9823,27 +9503,10 @@ print(outcome)
         );
         for (index, (python_version, _, _)) in VERSIONS.iter().copied().enumerate() {
             for optimization_level in LEVELS {
-                let native = oracle(
-                    source.as_bytes(),
-                    "case.py",
-                    python_version,
-                    optimization_level,
-                );
-                assert!(
-                    native.status.success(),
-                    "{}",
-                    String::from_utf8_lossy(&native.stderr)
-                );
-                let options = CompileOptions {
-                    python_version,
-                    optimization_level,
-                    ..CompileOptions::default()
-                };
-                let actual = compile_with_options(&source, "case.py", &options)
-                    .unwrap()
-                    .marshal();
+                let [native, actual] =
+                    compile_both(&source, "case.py", python_version, optimization_level);
                 assert_eq!(
-                    actual, native.stdout,
+                    actual, native,
                     "{python_version}, {optimization_level:?}, {expression}"
                 );
                 if matches!(python_version, PythonVersion::Py314 | PythonVersion::Py315) {
@@ -9852,7 +9515,7 @@ print(outcome)
                     } else {
                         &b"escaped\n"[..]
                     };
-                    for code in [&native.stdout, &actual] {
+                    for code in [&native, &actual] {
                         let result = run_with_input(
                             Command::new(ORACLES[index].get().unwrap())
                                 .args(["-I", "-S", "-B", "-c", TRACE_CONDITION])
@@ -10686,29 +10349,13 @@ print(outcome, events)
         (RETAINED, 6, &b"returned ['cleanup']\n"[..]),
     ] {
         for optimization_level in LEVELS {
-            let native = oracle(
-                source.as_bytes(),
+            let [native, actual] = compile_both(
+                source,
                 "fallthrough_nested_try.py",
                 PythonVersion::Py314,
                 optimization_level,
             );
-            assert!(
-                native.status.success(),
-                "{}",
-                String::from_utf8_lossy(&native.stderr)
-            );
-            let actual = compile_with_options(
-                source,
-                "fallthrough_nested_try.py",
-                &CompileOptions {
-                    python_version: PythonVersion::Py314,
-                    optimization_level,
-                    ..CompileOptions::default()
-                },
-            )
-            .unwrap()
-            .marshal();
-            for code in [&native.stdout, &actual] {
+            for code in [&native, &actual] {
                 let result = run_with_input(
                     Command::new(ORACLES[2].get().unwrap())
                         .args(["-I", "-S", "-B", "-c", TRACE_CONDITION])
@@ -11038,26 +10685,10 @@ assert events == ['caught'], events
 ";
     for (version, index) in [(PythonVersion::Py314, 2), (PythonVersion::Py315, 3)] {
         for optimization_level in LEVELS {
-            let native = oracle(
-                SOURCE.as_bytes(),
-                "nested_pass_exit.py",
-                version,
-                optimization_level,
-            );
-            assert!(native.status.success());
-            let actual = compile_with_options(
-                SOURCE,
-                "nested_pass_exit.py",
-                &CompileOptions {
-                    python_version: version,
-                    optimization_level,
-                    ..CompileOptions::default()
-                },
-            )
-            .unwrap()
-            .marshal();
-            assert_eq!(actual, native.stdout, "{version} {optimization_level:?}");
-            for payload in [&native.stdout, &actual] {
+            let [native, actual] =
+                compile_both(SOURCE, "nested_pass_exit.py", version, optimization_level);
+            assert_eq!(actual, native, "{version} {optimization_level:?}");
+            for payload in [&native, &actual] {
                 let result = run_with_input(
                     Command::new(ORACLES[index].get().unwrap()).args(["-I", "-S", "-c", TRACE]),
                     payload,
@@ -11209,30 +10840,18 @@ for name, expected in [
     assert events == expected, (name, events, expected)
 ";
     for level in [OptimizationLevel::One, OptimizationLevel::Two] {
-        let native = oracle(
-            SOURCE.as_bytes(),
+        let [native, actual] = compile_both(
+            SOURCE,
             "optimized_with_join_owner.py",
             PythonVersion::Py314,
             level,
         );
-        assert!(native.status.success());
-        let actual = compile_with_options(
-            SOURCE,
-            "optimized_with_join_owner.py",
-            &CompileOptions {
-                python_version: PythonVersion::Py314,
-                optimization_level: level,
-                ..CompileOptions::default()
-            },
-        )
-        .unwrap()
-        .marshal();
-        assert_eq!(actual, native.stdout);
+        assert_eq!(actual, native);
         let index = VERSIONS
             .iter()
             .position(|(version, _, _)| *version == PythonVersion::Py314)
             .unwrap();
-        for payload in [&native.stdout, &actual] {
+        for payload in [&native, &actual] {
             let result = run_with_input(
                 Command::new(ORACLES[index].get().unwrap()).args(["-I", "-S", "-c", TRACE]),
                 payload,
@@ -11352,25 +10971,13 @@ for name, flag, expected in (
     for version in [PythonVersion::Py314, PythonVersion::Py315] {
         assert_matches_cpython_versions(SOURCE, "protected_with_join.py", &LEVELS, &[version]);
         for level in [OptimizationLevel::One, OptimizationLevel::Two] {
-            let native = oracle(SOURCE.as_bytes(), "protected_with_join.py", version, level);
-            assert!(native.status.success());
-            let actual = compile_with_options(
-                SOURCE,
-                "protected_with_join.py",
-                &CompileOptions {
-                    python_version: version,
-                    optimization_level: level,
-                    ..CompileOptions::default()
-                },
-            )
-            .unwrap()
-            .marshal();
-            assert_eq!(actual, native.stdout);
+            let [native, actual] = compile_both(SOURCE, "protected_with_join.py", version, level);
+            assert_eq!(actual, native);
             let index = VERSIONS
                 .iter()
                 .position(|(candidate, _, _)| *candidate == version)
                 .unwrap();
-            for payload in [&native.stdout, &actual] {
+            for payload in [&native, &actual] {
                 let result = run_with_input(
                     Command::new(ORACLES[index].get().unwrap()).args(["-I", "-S", "-c", TRACE]),
                     payload,
@@ -11476,30 +11083,14 @@ for name, offset, args, expected in [
 ";
     for version in [PythonVersion::Py314, PythonVersion::Py315] {
         for level in LEVELS {
-            let native = oracle(
-                SOURCE.as_bytes(),
-                "protected_with_join_pass.py",
-                version,
-                level,
-            );
-            assert!(native.status.success());
-            let actual = compile_with_options(
-                SOURCE,
-                "protected_with_join_pass.py",
-                &CompileOptions {
-                    python_version: version,
-                    optimization_level: level,
-                    ..CompileOptions::default()
-                },
-            )
-            .unwrap()
-            .marshal();
-            assert_eq!(actual, native.stdout);
+            let [native, actual] =
+                compile_both(SOURCE, "protected_with_join_pass.py", version, level);
+            assert_eq!(actual, native);
             let index = VERSIONS
                 .iter()
                 .position(|(target, _, _)| *target == version)
                 .unwrap();
-            for payload in [&native.stdout, &actual] {
+            for payload in [&native, &actual] {
                 let result = run_with_input(
                     Command::new(ORACLES[index].get().unwrap()).args(["-I", "-S", "-c", TRACE]),
                     payload,
@@ -11615,26 +11206,10 @@ for target, expected in (
         );
     }
     for level in [OptimizationLevel::One, OptimizationLevel::Two] {
-        let native = oracle(
-            SOURCE.as_bytes(),
-            "async_for_assert.py",
-            PythonVersion::Py314,
-            level,
-        );
-        assert!(native.status.success());
-        let actual = compile_with_options(
-            SOURCE,
-            "async_for_assert.py",
-            &CompileOptions {
-                python_version: PythonVersion::Py314,
-                optimization_level: level,
-                ..CompileOptions::default()
-            },
-        )
-        .unwrap()
-        .marshal();
-        assert_eq!(actual, native.stdout);
-        for payload in [&native.stdout, &actual] {
+        let [native, actual] =
+            compile_both(SOURCE, "async_for_assert.py", PythonVersion::Py314, level);
+        assert_eq!(actual, native);
+        for payload in [&native, &actual] {
             let result = run_with_input(
                 Command::new(ORACLES[2].get().unwrap()).args(["-I", "-S", "-c", TRACE]),
                 payload,

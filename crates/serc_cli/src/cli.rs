@@ -73,6 +73,7 @@ struct CompileCommand {
     invalidation_mode: InvalidationMode,
 
     /// Remove assertions and set __debug__ to false; repeat to also remove docstrings.
+    // Clap's Count action caps occurrences at 255, but the cache tag must retain them all.
     #[arg(short = 'O', action = clap::ArgAction::Append, num_args = 0, default_missing_value = "true", conflicts_with = "optimize")]
     optimization_flags: Vec<bool>,
 
@@ -637,11 +638,8 @@ fn cache_path(
         filename.push(".");
     }
     filename.push(cache_tag(python_version));
-    match cache_optimization {
-        0 => {}
-        1 => filename.push(".opt-1"),
-        2 => filename.push(".opt-2"),
-        count => filename.push(format!(".opt-{count}")),
+    if cache_optimization > 0 {
+        filename.push(format!(".opt-{cache_optimization}"));
     }
     filename.push(".pyc");
     let parent = path
