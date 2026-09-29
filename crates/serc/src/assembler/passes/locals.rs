@@ -3225,20 +3225,17 @@ impl OptimizationPipeline {
             if std::mem::replace(&mut borrowed[block.index()], true) {
                 continue;
             }
-            let items = self.graph[block].items();
-            let Some(last) = items.iter().rev().find_map(|item| match item {
-                Item::Instruction(instruction) => Some(instruction),
-                Item::Label(_) => None,
-            }) else {
+            let Some(last) = self.graph[block].last_instruction() else {
                 continue;
             };
-            if block_has_fallthrough(items)
+            let (falls_through, target) = self.graph[block].successors();
+            if falls_through
                 && last.no_location_policy.borrow_fallthrough() != BorrowFallthrough::Barrier
                 && let Some(next) = order.get(positions[block.index()] + 1)
             {
                 pending.push(*next);
             }
-            if let Some(target) = block_jump_target(items)
+            if let Some(target) = target
                 && let Some(target) = self.graph.label_block(target)
             {
                 pending.push(target);
@@ -3255,10 +3252,7 @@ impl OptimizationPipeline {
                 .count();
             let first_instruction = global_instruction;
             global_instruction += instruction_count;
-            let Some(last) = items.iter().rev().find_map(|item| match item {
-                Item::Instruction(instruction) => Some(instruction),
-                Item::Label(_) => None,
-            }) else {
+            let Some(last) = self.graph[block].last_instruction() else {
                 continue;
             };
             // Preserve the complete original array of a normally reached authored break,
