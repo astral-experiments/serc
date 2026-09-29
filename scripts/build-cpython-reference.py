@@ -56,7 +56,7 @@ def main() -> None:
         [str(output), "--identity"], check=True, capture_output=True, text=True
     )
     expected = {
-        "protocol": "minimal-v1",
+        "protocol": "minimal-v2",
         "implementation": "cpython",
         "version": ".".join(map(str, sys.version_info[:3])),
         "release_level": sys.version_info.releaselevel,

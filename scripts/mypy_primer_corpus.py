@@ -13,6 +13,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from pathlib import Path
@@ -25,11 +26,11 @@ DEFAULT_CORPUS = REPO_ROOT / "target" / "corpora" / "mypy-primer"
 CATALOG_URL = "https://github.com/hauntsaninja/mypy_primer"
 SOURCE_SUFFIXES = (".py", ".pyi")
 LOCK_FORMAT = 1
-EXPECTED_BYTE_MISMATCHES = 13
+EXPECTED_BYTE_MISMATCHES = 6
 EXPECTED_CPYTHON_REJECTED = 160
-EXPECTED_MATCHED_REJECTIONS = 123
-EXPECTED_REJECTION_MISMATCHES = 29
-EXPECTED_COMPILER_FAILURES = 8
+EXPECTED_MATCHED_REJECTIONS = 157
+EXPECTED_REJECTION_MISMATCHES = 1
+EXPECTED_COMPILER_FAILURES = 2
 HEX_REVISION = re.compile(r"[0-9a-f]{40}\Z")
 SAFE_ID = re.compile(r"[A-Za-z0-9._-]+\Z")
 
@@ -495,7 +496,8 @@ def inspect_content(
     corpus_root: Path, repositories: Sequence[dict[str, Any]]
 ) -> dict[str, Any]:
     digest = hashlib.sha256()
-    digest.update(b"serc-mypy-primer-corpus-v1\0")
+    # Version 1 locks retain the original project name in their digest domain.
+    digest.update(b"penguin-mypy-primer-corpus-v1\0")
     files = 0
     source_bytes = 0
     for identifier, relative, path in iter_sources(corpus_root, repositories):
@@ -577,7 +579,7 @@ def lock_content(args: argparse.Namespace) -> None:
 
 
 def compatibility_command(
-    python: str,
+    reference: Path,
     roots: Sequence[Path],
     files: int,
     limit: int | None,
@@ -593,11 +595,10 @@ def compatibility_command(
         "--example",
         "compare_cpython_corpus",
         "--",
-        "--python",
-        python,
+        "--reference",
+        str(reference),
         "--expected-files",
         str(files),
-        "--source-bytes",
         "--extension",
         "pyi",
     ]
@@ -619,16 +620,13 @@ def compatibility_command(
             ("compiler-failure", EXPECTED_COMPILER_FAILURES),
             ("matched-rejection", EXPECTED_MATCHED_REJECTIONS),
             ("rejection-mismatch", EXPECTED_REJECTION_MISMATCHES),
-            ("non-utf8", 0),
             ("oracle-failure", 0),
         ]
         for outcome, expected in expected_outcomes:
             command.extend(["--expected-outcome", f"{outcome}={expected}"])
         command.extend(["--expected-cpython-rejected", str(EXPECTED_CPYTHON_REJECTED)])
     else:
-        command.extend(
-            ["--limit", str(limit), "--require-all", "--diagnostic-startup-state"]
-        )
+        command.extend(["--limit", str(limit), "--require-all"])
     command.extend(map(str, roots))
     return command
 
@@ -641,8 +639,21 @@ def check_compatibility(args: argparse.Namespace) -> None:
         checkout_path(args.corpus_root, repository)
         for repository in lock["repositories"]
     ]
-    command = compatibility_command(args.python, roots, content["files"], args.limit)
-    os.execvp(command[0], command)
+    with tempfile.TemporaryDirectory(prefix="serc-cpython-reference-") as directory:
+        reference = Path(directory) / "cpython-reference"
+        run(
+            [
+                args.python,
+                "-I",
+                "-S",
+                REPO_ROOT / "scripts" / "build-cpython-reference.py",
+                "--output",
+                reference,
+            ]
+        )
+        command = compatibility_command(reference, roots, content["files"], args.limit)
+        if subprocess.run(command, check=False).returncode:
+            raise CorpusError("compatibility comparison failed")
 
 
 def positive_int(value: str) -> int:

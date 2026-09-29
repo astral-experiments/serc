@@ -102,6 +102,14 @@ def get_projects():
 
             lock = {"repositories": [repository]}
             expected = corpus.inspect_content(corpus_root, lock["repositories"])
+            self.assertEqual(
+                expected,
+                {
+                    "files": 2,
+                    "bytes": 21,
+                    "sha256": "914a9531d0a9bc974e11e4269862e49146265417357d2d3f76afbb60c2bd2a48",
+                },
+            )
             lock["content"] = expected
             self.assertEqual(corpus.verify_checkouts(corpus_root, lock), expected)
 
@@ -154,7 +162,9 @@ def get_projects():
     def test_compatibility_command_accounts_for_every_outcome(self) -> None:
         roots = [Path("/corpus/first"), Path("/corpus/second")]
         files = 100_000
-        full = corpus.compatibility_command("python3.14", roots, files, None)
+        reference = Path("/tmp/cpython-reference")
+        full = corpus.compatibility_command(reference, roots, files, None)
+        self.assertEqual(full[full.index("--reference") + 1], str(reference))
         expected_outcomes = {
             value.split("=", 1)[0]: int(value.split("=", 1)[1])
             for option, value in pairwise(full)
@@ -173,7 +183,6 @@ def get_projects():
                 "parse-mismatch",
                 "compiler-failure",
                 "rejection-mismatch",
-                "non-utf8",
                 "oracle-failure",
             },
         )
@@ -188,12 +197,12 @@ def get_projects():
         self.assertLessEqual(expected_rejected, files - expected_exact)
         self.assertNotIn("--require-all", full)
 
-        limited = corpus.compatibility_command("python3.14", roots, files, 100)
+        limited = corpus.compatibility_command(reference, roots, files, 100)
+        self.assertEqual(limited[limited.index("--reference") + 1], str(reference))
         self.assertNotIn("--expected-outcome", limited)
         self.assertNotIn("--expected-cpython-rejected", limited)
         self.assertEqual(limited[limited.index("--limit") + 1], "100")
         self.assertIn("--require-all", limited)
-        self.assertIn("--diagnostic-startup-state", limited)
 
 
 if __name__ == "__main__":
