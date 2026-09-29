@@ -472,15 +472,6 @@ fn compile_path_with_metadata(
         .transpose()?;
     let source_bytes = read_source(path, metadata.as_ref())
         .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
-    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
-    let options = &CompileOptions {
-        initial_intern_state: crate::compileall_profiles::for_path(
-            options.python_version,
-            cache_optimization,
-            path,
-        ),
-        ..options.clone()
-    };
     let module =
         compile_bytes_with_path_and_options(&source_bytes, path, options).map_err(|error| {
             match &error {

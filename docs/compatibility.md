@@ -48,19 +48,48 @@ update. The 3.12, 3.13, and 3.15 gates pass source bytes to both compilers.
 
 ## Comparing another corpus
 
+Build a minimal reference executable with the pinned CPython interpreter. This
+currently requires Linux, a C compiler, and that interpreter's development
+headers and shared library:
+
 ```console
+/path/to/python3.14.5 scripts/build-cpython-reference.py --output /tmp/cpython-reference
 cargo run --release -p serc --example compare_cpython_corpus -- \
-  --python-version 3.14 --python /path/to/python3.14.5 --source-bytes path/to/corpus
+  --python-version 3.14 --reference /tmp/cpython-reference --require-all path/to/corpus
 ```
 
-The comparator rejects an oracle with the wrong implementation, release, or
-magic number, and rejects missing or empty corpus roots. Without an explicit
-caller-state profile, this is a diagnostic comparison using Serc's isolated
-startup state. The oracle imports `pathlib`, which can intern additional strings
-and change marshal sharing. A byte mismatch alone therefore does not establish a
-compiler regression. Exact counts still report observed byte equality.
+Each file gets a fresh, isolated CPython process with UTF-8 mode, a fixed hash
+seed, and site initialization disabled. The C reference reads the source bytes
+and calls CPython's compiler and marshal writer directly. It runs no Python
+wrapper and imports no additional modules. Normal interpreter initialization
+still supplies the startup state modeled by Serc's default target metadata. It
+retains a second reference to the root code object while marshaling, matching a
+named `code` variable passed to `marshal.dumps(code)`.
 
-`--require-all` requires a validated
+The comparator validates the reference protocol, CPython release, and magic
+number before comparing raw marshal bytes. String interning, object sharing,
+reference indexes, and all code-object fields remain part of byte equality. Use
+`--optimize 1` or `--optimize 2` to select the compilation optimization level;
+interpreter startup always uses level 0. The CLI uses the same default intern
+state as the library.
+
+`--require-all` requires at least one exact match and no failures on accepted
+inputs. Add `--require-rejection-parity` to require clean Serc rejections for
+every CPython-rejected input. Use `--dump-mismatches DIR` to inspect failures;
+`--limit N` checks only a sorted prefix, not the complete corpus.
+
+### Existing Python-script comparisons
+
+The `--python /path/to/python3.14.5 --source-bytes` mode retains the Python
+wrapper used by the recorded corpus measurements below. The comparator rejects
+an oracle with the wrong implementation, release, or magic number, and rejects
+missing or empty corpus roots. Without an explicit caller-state profile, this is
+a diagnostic comparison using Serc's isolated startup state. The oracle imports
+`pathlib`, which can intern additional strings and change marshal sharing. A
+byte mismatch alone therefore does not establish a compiler regression. Exact
+counts still report observed byte equality.
+
+In this mode, `--require-all` requires a validated
 [initial intern-state profile](../crates/serc/examples/support/initial-intern-profile.md)
 for the oracle caller, at least one exact match, and no failures on
 CPython-accepted inputs. Python 3.12 additionally requires
@@ -74,10 +103,8 @@ For an observed-byte regression check under startup assumptions, use
 `--require-all --diagnostic-startup-state`. The explicit diagnostic override
 preserves the accepted-input failure checks but does not establish that the
 caller's state matches. The Ruff baseline and limited mypy-primer checks use
-this mode; their expected counts and failure categories are unchanged. Add
-`--require-rejection-parity` to require clean Serc rejections for every
-CPython-rejected input. Use `--dump-mismatches DIR` to inspect failures;
-`--limit N` checks only a sorted prefix, not the complete corpus.
+this mode; their expected counts and failure categories are unchanged. Caller
+profiles and native output caches cannot be combined with `--reference`.
 
 ## Public corpus compatibility
 
