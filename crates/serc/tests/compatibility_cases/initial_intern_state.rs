@@ -1,6 +1,3 @@
-use std::io::Write as _;
-use std::process::Stdio;
-
 use serc::{
     InitialInternState, compile, compile_bytes_with_intern_state, compile_with_intern_state,
 };
@@ -12,21 +9,12 @@ use crate::common;
 const BOOTSTRAP: &str = "import marshal, sys; retained = tuple(map(sys.intern, sys.argv[2:])); code = compile(sys.stdin.buffer.read(), sys.argv[1], 'exec', dont_inherit=True, optimize=0); sys.stdout.buffer.write(marshal.dumps(code))";
 
 fn cpython_in_context(source: &str, filename: &str, entries: &[&str]) -> Vec<u8> {
-    let mut child = common::python_3145_command()
-        .args(["-c", BOOTSTRAP, filename])
-        .args(entries)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(source.as_bytes())
-        .unwrap();
-    let output = child.wait_with_output().unwrap();
+    let output = crate::common::cpython::run_with_input(
+        common::python_3145_command()
+            .args(["-c", BOOTSTRAP, filename])
+            .args(entries),
+        source.as_bytes(),
+    );
     assert!(
         output.status.success(),
         "{}",

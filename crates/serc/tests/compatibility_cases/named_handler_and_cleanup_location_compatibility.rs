@@ -199,9 +199,6 @@ fn named_handler_return_clear_keeps_the_remaining_finally_owner() {
 
 #[test]
 fn keeps_overriding_loop_return_after_unregistered_nested_finalizer() {
-    use std::io::Write as _;
-    use std::process::Stdio;
-
     // Later nested-finalizer copies still have inherited bytecode differences.
     // This regression checks the native return on the normal loop-exit path:
     // a stale inner-finalizer counter used to discard its value and fall through.
@@ -239,15 +236,10 @@ assert normal_returns(actual) == wanted
 "#;
     let filename = "nested_finally_loop_return.py";
     let actual = serc::compile(source, filename).unwrap().marshal();
-    let mut child = common::python_3145_command()
-        .args(["-c", oracle, source, filename])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child.stdin.take().unwrap().write_all(&actual).unwrap();
-    let output = child.wait_with_output().unwrap();
+    let output = crate::common::cpython::run_with_input(
+        common::python_3145_command().args(["-c", oracle, source, filename]),
+        &actual,
+    );
     assert!(
         output.status.success(),
         "overriding loop-exit return differs from CPython: {}",
@@ -257,9 +249,6 @@ assert normal_returns(actual) == wanted
 
 #[test]
 fn preserves_native_outer_iterator_owners_before_enclosing_finalizer() {
-    use std::io::Write as _;
-    use std::process::Stdio;
-
     // These cases retain inherited POP_EXCEPT/name-clear owner differences.
     // Check the complete native code and locations, plus the iterator cleanup
     // words that previously retained the inner ordinary try's handler.
@@ -330,15 +319,10 @@ assert selected_owners(actual) == selected_owners(expected)
     ] {
         let filename = "outer_iterator_before_finally.py";
         let actual = serc::compile(source, filename).unwrap().marshal();
-        let mut child = common::python_3145_command()
-            .args(["-c", oracle, source, filename, offsets])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        child.stdin.take().unwrap().write_all(&actual).unwrap();
-        let output = child.wait_with_output().unwrap();
+        let output = crate::common::cpython::run_with_input(
+            common::python_3145_command().args(["-c", oracle, source, filename, offsets]),
+            &actual,
+        );
         assert!(
             output.status.success(),
             "outer iterator cleanup owner differs from CPython: {}",

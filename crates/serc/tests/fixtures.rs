@@ -5,6 +5,7 @@ use serc::{OptimizationLevel, PythonVersion};
 
 #[allow(dead_code)]
 mod common;
+use common::cpython;
 #[allow(dead_code)]
 #[path = "common/optimization.rs"]
 mod optimization;
@@ -60,8 +61,8 @@ fn private_types(path: &Utf8Path) -> datatest_stable::Result<()> {
         .parent()
         .and_then(Utf8Path::file_name)
         .expect("fixture has a case directory");
-    for (version, executable) in private_type_parameters::targets() {
-        private_type_parameters::assert_matches_cpython(version, &executable, name, &source);
+    for version in cpython::VERSIONS {
+        private_type_parameters::assert_matches_cpython(version, name, &source);
     }
     Ok(())
 }
