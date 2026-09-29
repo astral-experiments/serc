@@ -10,6 +10,125 @@ use crate::target::opcodes::*;
 use crate::target::operands::{CommonConstant, Conversion, FunctionAttribute, ResumeLocation};
 
 #[test]
+fn conditional_normal_try_borrow_head_requires_proven_fallthrough() {
+    let source = super::Label::from_u32(0);
+    let fallthrough = super::Label::from_u32(1);
+    let head = super::Label::from_u32(2);
+    let exit = super::Label::from_u32(3);
+    let extra = super::Label::from_u32(4);
+    let located = SourceLocation::new(1, 1, 0, 1);
+
+    for (variation, expected) in [
+        ("converging", true),
+        ("missing-provenance", false),
+        ("wrong-entry", false),
+        ("wrong-target", false),
+        ("intervening-conditional", false),
+        ("unreachable-fallthrough", false),
+        ("extra-incoming", false),
+        ("python-315", false),
+        ("live-jump", true),
+    ] {
+        let instruction =
+            |opcode, operand| Item::Instruction(Instruction::new(opcode, operand, located, None));
+        let mut items = Vec::new();
+        if variation == "extra-incoming" {
+            items.extend([
+                instruction(JUMP_FORWARD, Operand::Forward(source)),
+                Item::Label(extra),
+                instruction(JUMP_FORWARD, Operand::Forward(head)),
+            ]);
+        }
+        items.extend([
+            Item::Label(source),
+            instruction(LOAD_CONST, Operand::Value(0)),
+            instruction(POP_JUMP_IF_FALSE, Operand::Forward(head)),
+            instruction(NOT_TAKEN, Operand::Value(0)),
+        ]);
+        if variation == "unreachable-fallthrough" {
+            items.push(instruction(JUMP_FORWARD, Operand::Forward(exit)));
+        }
+        items.push(Item::Label(fallthrough));
+        if variation == "intervening-conditional" {
+            items.extend([
+                instruction(LOAD_CONST, Operand::Value(0)),
+                instruction(POP_JUMP_IF_TRUE, Operand::Forward(exit)),
+                instruction(NOT_TAKEN, Operand::Value(0)),
+            ]);
+        }
+        items.extend([
+            instruction(NOP, Operand::Value(0)),
+            Item::Label(head),
+            Item::Instruction(Instruction::new(
+                JUMP_FORWARD,
+                Operand::Forward(exit),
+                SourceLocation::NONE,
+                None,
+            )),
+        ]);
+        if variation == "live-jump" {
+            items.extend([Item::Label(extra), instruction(NOP, Operand::Value(0))]);
+        }
+        items.extend([
+            Item::Label(exit),
+            instruction(LOAD_CONST, Operand::Value(0)),
+            instruction(RETURN_VALUE, Operand::Value(0)),
+        ]);
+        let mut assembler = Assembler::from_linear_items(items);
+        assembler.next_label = 5;
+        assembler.python_version = if variation == "python-315" {
+            crate::PythonVersion::Py315
+        } else {
+            crate::PythonVersion::Py314
+        };
+        if variation != "missing-provenance" {
+            assembler.exception_owner_provenance.normal_try_exits.push((
+                if variation == "wrong-entry" {
+                    fallthrough
+                } else {
+                    head
+                },
+                if variation == "wrong-target" {
+                    fallthrough
+                } else {
+                    exit
+                },
+            ));
+        }
+        let mut pipeline = assembler.into_optimization_pipeline();
+        assert_eq!(
+            pipeline.record_borrow_empty_jump_heads(),
+            expected,
+            "{variation}"
+        );
+        let jump = pipeline
+            .graph
+            .iter_items()
+            .find_map(|item| match item {
+                Item::Instruction(jump)
+                    if jump.opcode == JUMP_FORWARD && jump.location == SourceLocation::NONE =>
+                {
+                    Some(jump)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            jump.jump_policy.borrow_empty_block(),
+            expected,
+            "{variation}"
+        );
+        if variation == "live-jump" {
+            pipeline.remove_redundant_forward_jumps(true);
+            assert!(pipeline.graph.iter_items().any(|item| {
+                matches!(item, Item::Instruction(jump)
+                    if jump.opcode == JUMP_FORWARD && jump.operand() == Operand::Forward(exit))
+            }));
+        }
+    }
+}
+
+#[test]
 #[cfg(target_pointer_width = "64")]
 fn instruction_items_remain_cache_compact() {
     assert_eq!(std::mem::size_of::<Option<super::Label>>(), 4);
@@ -480,6 +599,58 @@ fn direct_jump_nop_provenance_requires_a_forward_jump() {
     let target = assembler.label();
     let jump = assembler.emit_backward(JUMP_BACKWARD, target);
     assembler.preserve_direct_inlined_jump_nop(jump);
+}
+
+#[test]
+fn nested_match_copy_budget_rejects_compacted_arms_atomically() {
+    let [first, second, join, success, exit] = [0, 1, 2, 3, 4].map(super::Label::from_u32);
+    for compacted_arm in [None, Some(0), Some(1)] {
+        let mut items = Vec::new();
+        for (index, entry) in [first, second].into_iter().enumerate() {
+            let mut jump = Instruction::new(
+                JUMP_FORWARD,
+                Operand::Forward(join),
+                SourceLocation::NONE,
+                Some(0),
+            );
+            if compacted_arm == Some(index) {
+                jump.add_pre_fold_extra_instructions(1);
+            }
+            items.extend([Item::Label(entry), Item::Instruction(jump)]);
+        }
+        let mut join_jump = Instruction::new(
+            JUMP_FORWARD,
+            Operand::Forward(success),
+            SourceLocation::NONE,
+            Some(0),
+        );
+        join_jump.jump_policy.mark_original_empty_join();
+        items.extend([
+            Item::Label(join),
+            Item::Instruction(join_jump),
+            Item::Label(success),
+        ]);
+        let mut assembler = Assembler::from_linear_items(items);
+        let emitted =
+            assembler.emit_forward_with_depth(JUMP_FORWARD, exit, 0, ExceptionPolicy::default());
+        assembler.record_original_match_success(emitted, false);
+        assembler.preserve_nested_match_exit_copy_budget(emitted);
+        let entries = assembler
+            .exception_owner_provenance
+            .nested_match_exit_copy_origins
+            .iter()
+            .map(|(entry, ..)| *entry)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            entries,
+            if compacted_arm.is_none() {
+                vec![first, second]
+            } else {
+                Vec::new()
+            },
+            "compacted arm: {compacted_arm:?}"
+        );
+    }
 }
 
 #[test]
@@ -8768,5 +8939,164 @@ fn falling_forward_guards_reject_unstable_joins_and_nonstatement_arms() {
             _ => unreachable!(),
         }
         assert!(!recognizes(items), "{change}");
+    }
+}
+
+#[test]
+fn terminal_guard_fallthrough_alias_locations_match_the_graph() {
+    let [target, alias, trailing] = [0, 1, 2].map(super::Label::from_u32);
+    let located = SourceLocation::new(2, 2, 4, 11);
+    let later = SourceLocation::new(3, 3, 2, 8);
+    let item = |opcode, argument, location, depth| {
+        Item::Instruction(Instruction::new(
+            opcode,
+            Operand::Value(argument),
+            location,
+            Some(depth),
+        ))
+    };
+    for (marker, first_location, return_location, preserve, nop, trailing_label) in [
+        (
+            located,
+            SourceLocation::NONE,
+            SourceLocation::NONE,
+            false,
+            false,
+            false,
+        ),
+        (
+            later,
+            SourceLocation::NONE,
+            SourceLocation::NONE,
+            false,
+            false,
+            false,
+        ),
+        (
+            located,
+            SourceLocation::NONE,
+            SourceLocation::NONE,
+            false,
+            false,
+            true,
+        ),
+        (
+            located,
+            SourceLocation::NONE,
+            SourceLocation::NONE,
+            true,
+            false,
+            false,
+        ),
+        (
+            located,
+            SourceLocation::NONE,
+            SourceLocation::NONE,
+            false,
+            true,
+            false,
+        ),
+        (located, located, SourceLocation::NONE, false, false, false),
+        (located, SourceLocation::NONE, later, false, false, false),
+    ] {
+        let mut first = Instruction::new(LOAD_CONST, Operand::Value(0), first_location, Some(1));
+        if preserve {
+            first.no_location_policy.preserve_location();
+        }
+        let mut items = vec![
+            item(
+                RESUME,
+                ResumeLocation::AT_FUNC_START.argument(),
+                SourceLocation::new(1, 1, 0, 0),
+                0,
+            ),
+            item(LOAD_FAST, 0, located, 1),
+            Item::Instruction(Instruction::new(
+                POP_JUMP_IF_FALSE,
+                Operand::Forward(target),
+                located,
+                Some(0),
+            )),
+            item(NOT_TAKEN, 0, marker, 0),
+            Item::Label(alias),
+        ];
+        if nop {
+            items.push(item(NOP, 0, SourceLocation::NONE, 0));
+        }
+        items.extend([
+            Item::Instruction(first),
+            item(RETURN_VALUE, 0, return_location, 0),
+            Item::Label(target),
+            item(LOAD_CONST, 0, SourceLocation::NONE, 1),
+            item(RETURN_VALUE, 0, SourceLocation::NONE, 0),
+        ]);
+        if trailing_label {
+            items.push(Item::Label(trailing));
+        }
+        let make_assembler = || {
+            let mut assembler = Assembler::from_linear_items(items.clone());
+            assembler.next_label = 3;
+            assembler
+        };
+        assert_terminal_guards_match_graph(make_assembler, 1, 1);
+    }
+}
+
+#[test]
+fn terminal_guard_alias_rejects_additional_incoming_edges() {
+    let [target, alias] = [0, 1].map(super::Label::from_u32);
+    let location = SourceLocation::new(2, 2, 4, 11);
+    let instruction = |opcode, operand, depth| {
+        Item::Instruction(Instruction::new(opcode, operand, location, Some(depth)))
+    };
+    let original = vec![
+        instruction(RESUME, Operand::Value(0), 0),
+        instruction(LOAD_FAST, Operand::Value(0), 1),
+        instruction(POP_JUMP_IF_FALSE, Operand::Forward(target), 0),
+        instruction(NOT_TAKEN, Operand::Value(0), 0),
+        Item::Label(alias),
+        instruction(LOAD_CONST, Operand::Value(0), 1),
+        instruction(RETURN_VALUE, Operand::Value(0), 0),
+        Item::Label(target),
+        instruction(LOAD_CONST, Operand::Value(0), 1),
+        instruction(RETURN_VALUE, Operand::Value(0), 0),
+    ];
+    let mut valid = Assembler::from_linear_items(original.clone());
+    valid.next_label = 2;
+    assert!(valid.has_only_linear_terminal_guards());
+
+    for (opcode, operand, prepend) in [
+        (JUMP_BACKWARD, Operand::Backward(alias), false),
+        (POP_JUMP_IF_TRUE, Operand::Backward(alias), false),
+        (POP_JUMP_IF_TRUE, Operand::Forward(alias), true),
+    ] {
+        let mut items = original.clone();
+        if prepend {
+            items.splice(
+                1..1,
+                [
+                    instruction(LOAD_FAST, Operand::Value(0), 1),
+                    instruction(opcode, operand, 0),
+                    instruction(NOT_TAKEN, Operand::Value(0), 0),
+                ],
+            );
+        } else {
+            items.splice(
+                5..5,
+                [
+                    instruction(LOAD_FAST, Operand::Value(0), 1),
+                    instruction(opcode, operand, 0),
+                ],
+            );
+        }
+        let mut assembler = Assembler::from_linear_items(items);
+        assembler.next_label = 2;
+        assert!(!assembler.has_only_linear_terminal_guards());
+        assert!(!assembler.has_only_linear_assertion_side_exits());
+        assert!(!assembler.has_only_linear_constant_return());
+        assert!(!assembler.has_only_linear_instructions(1));
+        assembler.used_constant_indices(1);
+        assert!(!assembler.has_proven_linear_terminal_guards);
+        assert!(matches!(assembler.code, UnoptimizedCode::Prepared { .. }));
     }
 }

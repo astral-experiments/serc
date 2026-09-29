@@ -9,8 +9,8 @@ use std::time::Instant;
 
 use clap::Parser;
 use serc::{
-    CompileError, CompileOptions, CompiledModule, PythonVersion, compile_bytes_with_options,
-    compile_with_options,
+    CompileError, CompileOptions, CompiledModule, OptimizationLevel, PythonVersion,
+    compile_bytes_with_options, compile_with_options,
 };
 
 #[path = "support/caller_intern_model.rs"]
@@ -129,6 +129,33 @@ enum OracleOutcome {
     Rejected(String),
 }
 
+#[derive(Clone, Copy)]
+enum Oracle<'a> {
+    Python(&'a str),
+    Reference(&'a Path),
+}
+
+impl<'a> Oracle<'a> {
+    fn executable(self) -> &'a Path {
+        match self {
+            Self::Python(python) => Path::new(python),
+            Self::Reference(reference) => reference,
+        }
+    }
+
+    /// Configures a fresh oracle process. The minimal reference keeps startup fixed
+    /// when changing compilation optimization and runs no Python wrapper.
+    fn command(self, path: &Path, optimization: OptimizationLevel) -> Command {
+        let mut command = Command::new(self.executable());
+        match self {
+            Self::Python(_) => command.args(["-I", "-S", "-c", ORACLE]),
+            Self::Reference(_) => command.args(["--optimize", &optimization.to_string()]),
+        };
+        command.arg(path);
+        command
+    }
+}
+
 enum CompilerOutcome {
     Compiled(Vec<u8>),
     Unsupported(String),
@@ -141,6 +168,12 @@ enum CompilerOutcome {
 struct Options {
     #[arg(long, default_value = "python3", value_name = "PATH")]
     python: String,
+    /// Use a fresh minimal CPython reference process for each source file.
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["python", "initial_intern_state", "caller_intern_model", "diagnostic_startup_state"])]
+    reference: Option<PathBuf>,
+    /// Compile at this optimization level in the minimal reference process and Serc.
+    #[arg(long, value_name = "0|1|2", requires = "reference")]
+    optimize: Option<OptimizationLevel>,
     #[arg(long, default_value_t = PythonVersion::default(), value_name = "3.12|3.13|3.14|3.15")]
     python_version: PythonVersion,
     #[arg(value_name = "ROOT", default_values_os_t = default_roots())]
@@ -158,7 +191,7 @@ struct Options {
     expected_exact: Option<usize>,
     #[arg(long)]
     expected_cpython_rejected: Option<usize>,
-    /// Require all accepted inputs to match; requires caller provenance or an explicit diagnostic assumption.
+    /// Require all accepted inputs to match; requires a minimal reference, caller provenance, or an explicit diagnostic assumption.
     #[arg(long)]
     require_all: bool,
     /// Diagnostic only: allow --require-all to compare bytes using isolated startup state.
@@ -184,7 +217,7 @@ struct Options {
 
 impl Options {
     fn validate_caller_state(&self) -> Result<(), &'static str> {
-        if self.require_all && !self.diagnostic_startup_state {
+        if self.require_all && self.reference.is_none() && !self.diagnostic_startup_state {
             if self.initial_intern_state.is_none() {
                 return Err(
                     "--require-all requires --initial-intern-state matching the oracle caller; use --diagnostic-startup-state only for a diagnostic byte comparison",
@@ -200,7 +233,9 @@ impl Options {
     }
 
     fn caller_state_notice(&self) -> &'static str {
-        if self.caller_intern_assume_absent {
+        if self.reference.is_some() {
+            "Caller intern state: fresh minimal CPython startup; exact marshal bytes"
+        } else if self.caller_intern_assume_absent {
             "Caller intern state: diagnostic assumption that unproved entries are absent"
         } else if self.caller_intern_model.is_some() {
             "Caller intern state: validated per-file model"
@@ -210,6 +245,15 @@ impl Options {
             "Caller intern state: diagnostic fixed snapshot; Python 3.12 filename effects require a per-file model"
         } else {
             "Caller intern state: captured process snapshot; assumes its entries remain retained for each input, without proving unknown entries absent"
+        }
+    }
+
+    /// Keeps outputs from different caller protocols out of the same cache.
+    fn validate_reference_cache(&self, read: bool, write: bool) -> Result<(), &'static str> {
+        if self.reference.is_some() && (read || write) {
+            Err("--reference cannot use native caches captured by a different caller protocol")
+        } else {
+            Ok(())
         }
     }
 
@@ -264,6 +308,13 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
     let read_config = env::var_os("SERC_NATIVE_CACHE_READ");
+    if let Err(message) = options.validate_reference_cache(
+        read_config.is_some(),
+        env::var_os("SERC_NATIVE_CACHE_WRITE").is_some(),
+    ) {
+        eprintln!("{message}");
+        return ExitCode::from(2);
+    }
     if let Err(message) = options.validate_assume_absent(read_config.is_some()) {
         eprintln!("{message}");
         return ExitCode::from(2);
@@ -279,7 +330,12 @@ fn main() -> ExitCode {
         );
         return ExitCode::from(2);
     }
-    if let Err(message) = verify_python(&options.python, options.python_version) {
+    let identity = if let Some(reference) = &options.reference {
+        verify_reference(reference, options.python_version)
+    } else {
+        verify_python(&options.python, options.python_version)
+    };
+    if let Err(message) = identity {
         eprintln!("{message}");
         return ExitCode::from(2);
     }
@@ -341,6 +397,7 @@ fn main() -> ExitCode {
     println!("{}", options.caller_state_notice());
     let compile_options = CompileOptions {
         python_version: options.python_version,
+        optimization_level: options.optimize.unwrap_or_default(),
         initial_intern_state: profile.map(|profile| profile.state).unwrap_or_default(),
         ..CompileOptions::default()
     };
@@ -462,6 +519,10 @@ fn main() -> ExitCode {
     };
 
     let started = Instant::now();
+    let oracle = options
+        .reference
+        .as_deref()
+        .map_or(Oracle::Python(&options.python), Oracle::Reference);
     let outcomes: Result<Vec<_>, std::io::Error> = pool.install(|| {
         paths
             .par_iter()
@@ -478,8 +539,8 @@ fn main() -> ExitCode {
                 let mut observation = cache.as_ref().map(|writer| writer.begin(index, path));
                 let mut outcome = compare(
                     path,
-                    &options.python,
-                    options.source_bytes,
+                    oracle,
+                    options.source_bytes || options.reference.is_some(),
                     &compile_options,
                     caller_model.as_ref(),
                     observation.as_mut(),
@@ -515,7 +576,7 @@ fn main() -> ExitCode {
     println!(
         "Compared {} Python files with {} in {:.2?}",
         outcomes.len(),
-        options.python,
+        oracle.executable().display(),
         started.elapsed()
     );
     println!(
@@ -731,6 +792,44 @@ fn verify_python(python: &str, python_version: PythonVersion) -> Result<(), Stri
     }
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct ReferenceIdentity {
+    protocol: String,
+    #[serde(flatten)]
+    python: PythonIdentity,
+}
+
+impl ReferenceIdentity {
+    fn matches(&self, version: PythonVersion) -> bool {
+        self.protocol == "minimal-v1" && self.python.matches(version)
+    }
+}
+
+/// Checks the protocol and linked runtime of the executable used for compilation.
+fn verify_reference(reference: &Path, python_version: PythonVersion) -> Result<(), String> {
+    let output = Command::new(reference)
+        .arg("--identity")
+        .output()
+        .map_err(|error| format!("failed to run {}: {error}", reference.display()))?;
+    let identity: ReferenceIdentity = serde_json::from_slice(&output.stdout).map_err(|error| {
+        format!(
+            "failed to read {} identity: {error}; {}",
+            reference.display(),
+            one_line(&output.stderr)
+        )
+    })?;
+    if output.status.success() && identity.matches(python_version) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} is {identity:?}; the reference requires minimal-v1 and {} with magic {}",
+            reference.display(),
+            python_version.target().tag,
+            python_version.target().magic_hex()
+        ))
+    }
+}
+
 fn default_roots() -> Vec<PathBuf> {
     let ruff = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vendor/ruff");
     [
@@ -843,17 +942,14 @@ fn discover(roots: &[PathBuf], extensions: &[String]) -> Result<Vec<PathBuf>, St
 
 fn compare(
     path: &Path,
-    python: &str,
+    oracle: Oracle<'_>,
     source_bytes: bool,
     options: &CompileOptions,
     caller_model: Option<&caller_intern_model::LoadedModel>,
     mut observation: Option<&mut native_output_cache::Observation<'_>>,
     retain_mismatch_bytes: bool,
 ) -> Outcome {
-    let output = Command::new(python)
-        .args(["-I", "-S", "-c", ORACLE])
-        .arg(path)
-        .output();
+    let output = oracle.command(path, options.optimization_level).output();
     if let Some(observation) = &mut observation {
         observation.native(&output);
     }
@@ -1098,6 +1194,200 @@ mod tests {
         assert_eq!(options.examples, 10);
         let options = Options::try_parse_from(["compare_cpython_corpus", "corpus"]).unwrap();
         assert_eq!(options.roots, [Path::new("corpus")]);
+    }
+
+    #[test]
+    fn minimal_reference_requires_its_own_protocol() {
+        let options = Options::try_parse_from([
+            "compare_cpython_corpus",
+            "--reference",
+            "cpython-reference",
+            "--optimize",
+            "2",
+            "--require-all",
+        ])
+        .unwrap();
+        assert!(options.validate_caller_state().is_ok());
+        assert_eq!(options.optimize, Some(serc::OptimizationLevel::Two));
+        assert!(options.validate_reference_cache(false, false).is_ok());
+        for (read, write) in [(true, false), (false, true), (true, true)] {
+            assert!(options.validate_reference_cache(read, write).is_err());
+        }
+        for conflicting in [
+            &["--python", "python3"][..],
+            &["--initial-intern-state", "profile.json"],
+            &["--caller-intern-model", "model.json"],
+            &["--diagnostic-startup-state"],
+        ] {
+            let error = Options::try_parse_from(
+                ["compare_cpython_corpus", "--reference", "cpython-reference"]
+                    .into_iter()
+                    .chain(conflicting.iter().copied()),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+        }
+        let error =
+            Options::try_parse_from(["compare_cpython_corpus", "--optimize", "1"]).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+        assert!(
+            Options::try_parse_from([
+                "compare_cpython_corpus",
+                "--reference",
+                "cpython-reference",
+                "--optimize",
+                "3",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn minimal_reference_identity_checks_protocol_and_runtime() {
+        let mut value = serde_json::json!({
+            "protocol": "minimal-v1",
+            "implementation": "cpython",
+            "version": "3.14.5",
+            "release_level": "final",
+            "release_serial": 0,
+            "magic": PythonVersion::Py314.target().magic_hex(),
+        });
+        let identity: super::ReferenceIdentity = serde_json::from_value(value.clone()).unwrap();
+        assert!(identity.matches(PythonVersion::Py314));
+        assert!(!identity.matches(PythonVersion::Py313));
+        value["protocol"] = "another-caller".into();
+        let identity: super::ReferenceIdentity = serde_json::from_value(value.clone()).unwrap();
+        assert!(!identity.matches(PythonVersion::Py314));
+        value.as_object_mut().unwrap().remove("protocol");
+        assert!(serde_json::from_value::<super::ReferenceIdentity>(value).is_err());
+    }
+
+    #[test]
+    fn minimal_reference_compares_exact_bytes_at_each_optimization_level() {
+        use serc::OptimizationLevel;
+
+        let Some(reference) = std::env::var_os("SERC_TEST_CPYTHON_REFERENCE") else {
+            eprintln!("skipping minimal reference test: SERC_TEST_CPYTHON_REFERENCE is unset");
+            return;
+        };
+        let reference = Path::new(&reference);
+        super::verify_reference(reference, PythonVersion::Py314).unwrap();
+        let oracle = super::Oracle::Reference(reference);
+        let directory = tempfile::tempdir().unwrap();
+        let sharing = concat!(
+            "values = {'high', 'low', 'medium'}\n",
+            "def second(x):\n    return x in {'high', 'low', 'medium'}\n",
+            "f = lambda x: x in {('bootstrap_token_827',), ('secondary_827',)}\n",
+            "x in {('bootstrap_token_827',), ('secondary_827',)}\n",
+        );
+        let optimized = concat!(
+            "'module docstring'\nassert __debug__\n",
+            "def f():\n    'function docstring'\n    assert False\n    return __debug__\n",
+        );
+        for (name, source) in [
+            ("sharing.py", sharing.as_bytes()),
+            ("optimized.py", optimized.as_bytes()),
+            ("latin1.py", b"# coding: latin-1\nvalue = 'caf\xe9'\n"),
+        ] {
+            let path = directory.path().join(name);
+            fs::write(&path, source).unwrap();
+            for optimization_level in [
+                OptimizationLevel::Zero,
+                OptimizationLevel::One,
+                OptimizationLevel::Two,
+            ] {
+                let options = CompileOptions {
+                    optimization_level,
+                    ..CompileOptions::default()
+                };
+                let outcome = super::compare(&path, oracle, true, &options, None, None, true);
+                assert_eq!(
+                    outcome.kind,
+                    OutcomeKind::Exact,
+                    "{name} -O{optimization_level}: {}",
+                    outcome.detail
+                );
+
+                let mut command = oracle.command(&path, optimization_level);
+                let output = command
+                    .current_dir(directory.path())
+                    .env("PYTHONHOME", "/unused-python-home")
+                    .env("PYTHONPATH", directory.path())
+                    .env("PYTHONOPTIMIZE", "2")
+                    .env("PYTHONHASHSEED", "random")
+                    .env("PYTHONUTF8", "0")
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{output:?}");
+                let compiled = compile_input(
+                    &CompilerInput::Bytes(source.to_vec()),
+                    path.to_str().unwrap(),
+                    &options,
+                    None,
+                );
+                let outcome = classify(&path, OracleOutcome::Compiled(output.stdout), compiled);
+                assert_eq!(
+                    outcome.kind,
+                    OutcomeKind::Exact,
+                    "noisy {name} -O{optimization_level}: {}",
+                    outcome.detail
+                );
+            }
+        }
+        for (name, source) in [
+            ("syntax.py", b"if:\n".as_slice()),
+            ("nul.py", b"value = 1\0\n"),
+            ("encoding.py", b"# coding: invalid-encoding\npass\n"),
+        ] {
+            let path = directory.path().join(name);
+            fs::write(&path, source).unwrap();
+            let outcome = super::compare(
+                &path,
+                oracle,
+                true,
+                &CompileOptions::default(),
+                None,
+                None,
+                false,
+            );
+            assert_eq!(
+                outcome.kind,
+                OutcomeKind::MatchedRejection,
+                "{name}: {}",
+                outcome.detail
+            );
+        }
+        let outcome = super::compare(
+            &directory.path().join("missing.py"),
+            oracle,
+            true,
+            &CompileOptions::default(),
+            None,
+            None,
+            false,
+        );
+        assert_eq!(
+            outcome.kind,
+            OutcomeKind::OracleFailure,
+            "{}",
+            outcome.detail
+        );
+    }
+
+    #[test]
+    fn marshal_sharing_differences_remain_byte_mismatches() {
+        let source = "f = lambda x: x in {'profile_specific_identifier', 'z'}\nx in {'profile_specific_identifier', 'z'}\n";
+        let state = serc::InitialInternState::new(["profile_specific_identifier"]);
+        let ordinary = serc::compile(source, "sharing.py").unwrap().marshal();
+        let interned = serc::compile_with_intern_state(source, "sharing.py", &state)
+            .unwrap()
+            .marshal();
+        let outcome = classify(
+            Path::new("sharing.py"),
+            OracleOutcome::Compiled(ordinary),
+            CompilerOutcome::Compiled(interned),
+        );
+        assert_eq!(outcome.kind, OutcomeKind::ByteMismatch);
     }
 
     #[test]
@@ -1446,36 +1736,51 @@ mod tests {
             };
             let without_dump = super::compare(
                 &path,
-                oracle.to_str().unwrap(),
+                super::Oracle::Python(oracle.to_str().unwrap()),
                 source_bytes,
                 &options,
                 None,
                 None,
                 false,
             );
-            assert_eq!(without_dump.kind, OutcomeKind::ByteMismatch);
+            assert_eq!(
+                without_dump.kind,
+                OutcomeKind::ByteMismatch,
+                "source_bytes={source_bytes}; first compare: {}",
+                without_dump.detail
+            );
             assert!(without_dump.mismatch_bytes.is_none());
             let mut outcome = super::compare(
                 &path,
-                oracle.to_str().unwrap(),
+                super::Oracle::Python(oracle.to_str().unwrap()),
                 source_bytes,
                 &options,
                 None,
                 None,
                 true,
             );
-            assert_eq!(outcome.kind, OutcomeKind::ByteMismatch);
+            assert_eq!(
+                outcome.kind,
+                OutcomeKind::ByteMismatch,
+                "source_bytes={source_bytes}; retained compare: {}",
+                outcome.detail
+            );
             fs::write(&oracle, "#!/bin/sh\nprintf 'other oracle bytes'\n").unwrap();
             let mut second_outcome = super::compare(
                 &second_path,
-                oracle.to_str().unwrap(),
+                super::Oracle::Python(oracle.to_str().unwrap()),
                 source_bytes,
                 &options,
                 None,
                 None,
                 true,
             );
-            assert_eq!(second_outcome.kind, OutcomeKind::ByteMismatch);
+            assert_eq!(
+                second_outcome.kind,
+                OutcomeKind::ByteMismatch,
+                "source_bytes={source_bytes}; second compare: {}",
+                second_outcome.detail
+            );
 
             let dump = directory
                 .path()

@@ -2133,16 +2133,12 @@ impl ScopeArena {
         Self::analyze_with_source_options(body, python_version, source, AssertionMode::Keep)
     }
 
-    pub(super) fn analyze_with_optimized_assertions(
-        body: &[Stmt],
+    pub(super) fn analyze_with_optimized_assertions<'ast>(
+        body: &'ast [Stmt],
         python_version: PythonVersion,
+        source: &mut SourceAnalysis<'ast>,
     ) -> Self {
-        Self::analyze_with_source_options(
-            body,
-            python_version,
-            &mut SourceAnalysis::new(python_version, 0),
-            AssertionMode::Elide,
-        )
+        Self::analyze_with_source_options(body, python_version, source, AssertionMode::Elide)
     }
 
     fn analyze_with_source_options<'ast>(

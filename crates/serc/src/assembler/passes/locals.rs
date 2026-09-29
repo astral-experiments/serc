@@ -4816,6 +4816,59 @@ mod tests {
         assert_eq!(items, eagerly_scanned);
     }
 
+    #[test]
+    fn marked_live_jump_keeps_borrow_traversal_to_target() {
+        let head = Label::from_u32(0);
+        let exit = Label::from_u32(1);
+        for (marked, live, expected) in [
+            (false, true, LOAD_FAST_BORROW),
+            (true, true, LOAD_FAST_BORROW),
+            (true, false, LOAD_FAST),
+        ] {
+            let mut jump = Instruction::new(
+                JUMP_FORWARD,
+                Operand::Forward(exit),
+                SourceLocation::NONE,
+                None,
+            );
+            if marked {
+                jump.jump_policy.mark_borrow_empty_block();
+            }
+            let mut items = vec![
+                borrow_instruction(LOAD_CONST, Operand::Value(0), 1),
+                borrow_instruction(super::POP_JUMP_IF_FALSE, Operand::Forward(head), 0),
+                borrow_instruction(NOT_TAKEN, Operand::Value(0), 0),
+                borrow_instruction(NOP, Operand::Value(0), 0),
+                Item::Label(head),
+                Item::Instruction(jump),
+            ];
+            if live {
+                items.extend([
+                    borrow_instruction(LOAD_CONST, Operand::Value(0), 1),
+                    borrow_instruction(POP_TOP, Operand::Value(0), 0),
+                ]);
+            }
+            items.extend([
+                Item::Label(exit),
+                owned_borrow_instruction(false, false),
+                borrow_instruction(RETURN_VALUE, Operand::Value(0), 0),
+            ]);
+            for direct in [false, true] {
+                let mut observed = items.clone();
+                if direct {
+                    general_borrow::<true>(&mut observed, &FxHashSet::default());
+                } else {
+                    general_borrow::<false>(&mut observed, &FxHashSet::default());
+                }
+                assert_eq!(
+                    borrow_opcodes(&observed),
+                    vec![expected],
+                    "{marked} {live} {direct}"
+                );
+            }
+        }
+    }
+
     fn borrow_opcodes(items: &[Item]) -> Vec<crate::target::Opcode> {
         items
             .iter()

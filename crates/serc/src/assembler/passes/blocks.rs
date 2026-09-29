@@ -1726,25 +1726,30 @@ fn propagate_normal_try_pop_continuations(
 /// Replays only the recorded SWAP-to-NOP conversion and complete store exchange.
 fn static_swap_tail_location(
     source: &[Item],
-    [swap, first, last]: [Instruction; 3],
+    instructions: &[Instruction],
 ) -> Option<SourceLocation> {
-    let mut removed_swap = swap;
+    let [swap, first, middle @ .., last] = instructions else {
+        return None;
+    };
+    let mut removed_swap = *swap;
     removed_swap.opcode = NOP;
     removed_swap.set_operand(Operand::Value(0));
-    (source
-        == [
-            Item::Instruction(removed_swap),
-            Item::Instruction(last),
-            Item::Instruction(first),
-        ])
-    .then_some(last.location)
+    source
+        .iter()
+        .copied()
+        .eq([removed_swap, *last]
+            .into_iter()
+            .chain(middle.iter().copied())
+            .chain([*first])
+            .map(Item::Instruction))
+        .then_some(last.location)
 }
 
 /// Replays the original store donor only across the exact static-SWAP permutation.
 fn comprehension_assignment_exit_location(
     source: &[Item],
     target: &[Item],
-    origins: &FxHashMap<Label, (Vec<Label>, [Instruction; 3])>,
+    origins: &FxHashMap<Label, (Vec<Label>, Vec<Instruction>)>,
 ) -> Option<SourceLocation> {
     let entry_len = target
         .iter()
@@ -1759,14 +1764,14 @@ fn comprehension_assignment_exit_location(
         }
         _ => return None,
     };
-    if jump.opcode != JUMP_FORWARD || jump.location.line >= 0 {
+    if !matches!(jump.opcode, JUMP_FORWARD | JUMP_BACKWARD) || jump.location.line >= 0 {
         return None;
     }
     let (entries, instructions) = target[..entry_len].iter().find_map(|item| match item {
         Item::Label(exit) => origins.get(exit),
         Item::Instruction(_) => None,
     })?;
-    if source.len() != entries.len() + 3 {
+    if source.len() != entries.len() + instructions.len() {
         return None;
     }
     let (labels, tail) = source.split_at(entries.len());
@@ -1777,7 +1782,7 @@ fn comprehension_assignment_exit_location(
     {
         return None;
     }
-    static_swap_tail_location(tail, *instructions)
+    static_swap_tail_location(tail, instructions)
 }
 
 /// Original normal-try exits threaded through one shared, unlocated branch join.
@@ -1828,19 +1833,19 @@ impl ThreadedNormalTryJoins {
     }
 }
 
-/// Original reversed-store fallthroughs whose unnamed handler cleanup is shared.
-pub(in crate::assembler) struct ReversedStoreHandlerExits {
+/// Original reversed-store fallthroughs into shared cleanup or loop exits.
+pub(in crate::assembler) struct ReversedStoreExits {
     original_labels: FxHashSet<Label>,
-    entries: FxHashMap<Label, ReversedStoreHandlerExit>,
+    entries: FxHashMap<Label, ReversedStoreExit>,
 }
 
-struct ReversedStoreHandlerExit {
+struct ReversedStoreExit {
     swapped_source: Vec<Item>,
-    cleanup: Vec<Item>,
+    target: Vec<Item>,
     donor: SourceLocation,
 }
 
-impl ReversedStoreHandlerExits {
+impl ReversedStoreExits {
     /// Replays only the captured SWAP-to-NOP conversion and complete store exchange.
     fn location(&self, source: &[Item], target: &[Item]) -> Option<SourceLocation> {
         let origin = target
@@ -1850,7 +1855,7 @@ impl ReversedStoreHandlerExits {
                 Item::Label(label) => self.entries.get(label),
                 Item::Instruction(_) => None,
             })?;
-        if target != origin.cleanup.as_slice() || !source.ends_with(&origin.swapped_source) {
+        if target != origin.target.as_slice() || !source.ends_with(&origin.swapped_source) {
             return None;
         }
         // Exit copying can prepend fresh aliases, but cannot replace an original
@@ -2017,7 +2022,7 @@ fn match_join_store_exit_location(
     if source.len() != original.len() || source[..prefix.len()] != *prefix {
         return None;
     }
-    static_swap_tail_location(&source[prefix.len()..], [*swap, *first, *last])
+    static_swap_tail_location(&source[prefix.len()..], &[*swap, *first, *last])
 }
 
 fn propagate_exit_block_locations(
@@ -2027,7 +2032,7 @@ fn propagate_exit_block_locations(
     exception_regions: &[ExceptionRegion],
     original_boundaries: &FxHashSet<Label>,
     original_location_absence: &FxHashSet<Label>,
-    comprehension_assignment_exits: &FxHashMap<Label, (Vec<Label>, [Instruction; 3])>,
+    comprehension_assignment_exits: &FxHashMap<Label, (Vec<Label>, Vec<Instruction>)>,
     preserved_boundaries: &FxHashSet<Label>,
     source_boundaries: &FxHashSet<Label>,
     setups: &[(Label, Option<SourceLocation>)],
@@ -2080,7 +2085,7 @@ fn propagate_exit_block_locations_inner<const SKIP_LOCATED: bool>(
     exception_regions: &[ExceptionRegion],
     original_boundaries: &FxHashSet<Label>,
     original_location_absence: &FxHashSet<Label>,
-    comprehension_assignment_exits: &FxHashMap<Label, (Vec<Label>, [Instruction; 3])>,
+    comprehension_assignment_exits: &FxHashMap<Label, (Vec<Label>, Vec<Instruction>)>,
     preserved_boundaries: &FxHashSet<Label>,
     source_boundaries: &FxHashSet<Label>,
     setups: &[(Label, Option<SourceLocation>)],
@@ -2881,6 +2886,56 @@ impl OptimizationPipeline {
         if !temperatures.contains(&COLD_BLOCK) {
             normalize_unmoved_interruptible_jumps(graph);
             return omitted_markers;
+        }
+
+        if self.python_version >= crate::PythonVersion::Py314 {
+            for pair in order.windows(2) {
+                let [current, next] = *pair else {
+                    unreachable!()
+                };
+                if temperatures[current.index()] != COLD_BLOCK
+                    || temperatures[next.index()] != WARM_BLOCK
+                {
+                    continue;
+                }
+                let mut instructions =
+                    graph[current]
+                        .items()
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .filter_map(|(offset, item)| match item {
+                            Item::Instruction(instruction) => Some((offset, instruction)),
+                            Item::Label(_) => None,
+                        });
+                let Some((offset, jump)) = instructions.next() else {
+                    continue;
+                };
+                let Some((_, previous)) = instructions.next() else {
+                    continue;
+                };
+                if jump.opcode == JUMP_FORWARD
+                    && matches!(jump.operand(), Operand::Forward(target)
+                        if graph.label_block(target) == Some(next))
+                    && *jump
+                        == Instruction::new(
+                            JUMP_FORWARD,
+                            jump.operand(),
+                            jump.location,
+                            jump.depth_after(),
+                        )
+                    && jump.location.line == previous.location.line
+                    && graph[next].items().iter().find_map(|item| match item {
+                        Item::Instruction(instruction) => Some(instruction.location.line >= 0),
+                        Item::Label(_) => None,
+                    }) == Some(true)
+                {
+                    // Exit copying can leave a deferred adjacent branch jump here.
+                    // CPython removes it before cold relocation creates an ownerless
+                    // bridge with the final instruction's post-SWAP location.
+                    graph.remove_item(ItemPosition::new(current, offset));
+                }
+            }
         }
 
         let explicit_jumps = (0..order.len().saturating_sub(1))
@@ -4162,42 +4217,37 @@ impl OptimizationPipeline {
     }
 
     /// Captures the original donor before static swaps reverse a certified store tail.
-    pub(in crate::assembler) fn capture_reversed_store_handler_exits(
-        &self,
-    ) -> ReversedStoreHandlerExits {
+    pub(in crate::assembler) fn capture_reversed_store_exits(&self) -> ReversedStoreExits {
         let mut entries = FxHashMap::default();
-        if self.exception_owner_provenance.source_boundaries.is_empty() {
-            return ReversedStoreHandlerExits {
-                original_labels: FxHashSet::default(),
-                entries,
-            };
-        }
         for pair in self.graph.order().windows(2) {
             let source = self.graph[pair[0]].items();
             let target = self.graph[pair[1]].items();
             let Some(label) = self.graph[pair[1]].first_label() else {
                 continue;
             };
-            if !self
-                .exception_owner_provenance
-                .source_boundaries
-                .contains(&label)
-            {
-                continue;
-            }
             let entry_len = target
                 .iter()
                 .take_while(|item| matches!(item, Item::Label(_)))
                 .count();
-            let [Item::Instruction(pop), Item::Instruction(jump)] = &target[entry_len..] else {
-                continue;
-            };
-            if pop.opcode != POP_EXCEPT
-                || pop.location != SourceLocation::NONE
-                || jump.opcode != JUMP_FORWARD
-                || jump.location != SourceLocation::NONE
-                || !matches!(jump.operand(), Operand::Forward(_))
-            {
+            let original_handler_exit = matches!(&target[entry_len..],
+                [Item::Instruction(pop), Item::Instruction(jump)]
+                    if pop.opcode == POP_EXCEPT
+                        && pop.location == SourceLocation::NONE
+                        && jump.opcode == JUMP_FORWARD
+                        && jump.location == SourceLocation::NONE
+                        && matches!(jump.operand(), Operand::Forward(_)))
+                && self
+                    .exception_owner_provenance
+                    .source_boundaries
+                    .contains(&label);
+            // Native resolves this shared backedge before reversing the stores. Keep
+            // the original last-store donor only while both arrays survive unchanged.
+            let original_loop_exit = matches!(&target[entry_len..],
+                [Item::Instruction(jump)]
+                    if jump.opcode == JUMP_BACKWARD
+                        && jump.location == SourceLocation::NONE
+                        && matches!(jump.operand(), Operand::Backward(_)));
+            if !original_handler_exit && !original_loop_exit {
                 continue;
             }
             if let Some([swap, first, last]) = super::super::constant_pair_store_tail(source) {
@@ -4213,9 +4263,9 @@ impl OptimizationPipeline {
                 ]);
                 entries.insert(
                     label,
-                    ReversedStoreHandlerExit {
+                    ReversedStoreExit {
                         swapped_source,
-                        cleanup: target.to_vec(),
+                        target: target.to_vec(),
                         donor: last.location,
                     },
                 );
@@ -4254,9 +4304,9 @@ impl OptimizationPipeline {
             ]);
             entries.insert(
                 label,
-                ReversedStoreHandlerExit {
+                ReversedStoreExit {
                     swapped_source,
-                    cleanup: target.to_vec(),
+                    target: target.to_vec(),
                     donor: last.location,
                 },
             );
@@ -4272,7 +4322,7 @@ impl OptimizationPipeline {
                 })
                 .collect()
         };
-        ReversedStoreHandlerExits {
+        ReversedStoreExits {
             original_labels,
             entries,
         }
@@ -4284,7 +4334,7 @@ impl OptimizationPipeline {
         original_location_absence: &FxHashSet<Label>,
         owner_retargets: &mut Vec<(Instruction, Instruction)>,
     ) -> Vec<Label> {
-        let origins = self.capture_reversed_store_handler_exits();
+        let origins = self.capture_reversed_store_exits();
         let threaded_normal_try_joins = self.capture_threaded_normal_try_joins();
         self.duplicate_exit_blocks_with_store_origins(
             original_location_absence,
@@ -4301,7 +4351,7 @@ impl OptimizationPipeline {
         &mut self,
         original_location_absence: &FxHashSet<Label>,
         retargets: ExitCopyRetargets<'_>,
-        reversed_store_handler_exits: &ReversedStoreHandlerExits,
+        reversed_store_exits: &ReversedStoreExits,
         threaded_normal_try_joins: &ThreadedNormalTryJoins,
         static_swap_store_gaps: &mut [super::swaps::StaticSwapStoreGap],
         mut constants: Option<&mut dyn ConstantTable>,
@@ -5616,6 +5666,15 @@ impl OptimizationPipeline {
                     .iter()
                     .rev()
                     .find_map(|item| match item {
+                        Item::Instruction(instruction)
+                            if instruction.fusion_policy.location_from_next()
+                                && instruction.location == SourceLocation::NONE
+                                && instruction.no_location_policy.preserves_location() =>
+                        {
+                            // An explicitly unlocated NEXT_LOCATION pop stops the earlier
+                            // pattern from donating to an erased body's copied loop exit.
+                            Some(SourceLocation::NONE)
+                        }
                         Item::Instruction(instruction) if instruction.location.line >= 0 => {
                             Some(instruction.location)
                         }
@@ -7926,7 +7985,7 @@ impl OptimizationPipeline {
                     && !planned_blocks.contains(&target)
                     && positions[source.index()] + 1 == target_position
                     && block_has_fallthrough(graph[source].items())
-                    && let Some(location) = reversed_store_handler_exits
+                    && let Some(location) = reversed_store_exits
                         .location(graph[source].items(), graph[target].items())
                         .or_else(|| fused_store_tail_location(graph[source].items()))
                 {

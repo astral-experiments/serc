@@ -141,13 +141,18 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
         || validator.lowering_numeric_error
         || debug_pattern_replay;
     let mut error = validator.error.into_inner();
-    if error
+    let legacy_async_generator_return = error
         .as_ref()
-        .is_some_and(|error| error.is_async_generator_return)
-        && simple_comprehension_module(body)
+        .is_some_and(|error| error.is_legacy_async_generator_return);
+    if legacy_async_generator_return
+        || (error
+            .as_ref()
+            .is_some_and(|error| error.is_async_generator_return)
+            && simple_comprehension_module(body))
     {
-        // The admitted forms have no competing symbol-table diagnostics. In that subset,
-        // check the module for comprehension yields before the lowering-only return.
+        // Value returns in async generators fail during lowering, after symbol checks.
+        // A legacy sync function can gain those flags from a removed assertion; simple
+        // comprehension modules have no competing symbol-table diagnostics.
         let mut replay = new_validator::<false, false>(
             source,
             body,
@@ -158,7 +163,18 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
         replay.pre_lowering_only = true;
         replay.visit_body(body);
         if let Some(priority_error) = replay.error.into_inner() {
+            if legacy_async_generator_return
+                && (source.contains("global") || source.contains("nonlocal"))
+                && let Some(range) = priority_error.error.range()
+                && let Some(declaration_error) =
+                    declarations::immediate_before_node(body, python_version, range)
+            {
+                return Err(declaration_error);
+            }
             return Err(priority_error.error);
+        }
+        if legacy_async_generator_return {
+            validate_declarations(source, body, python_version)?;
         }
     }
     if lowering_keyword_error
@@ -403,6 +419,11 @@ fn new_validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY:
         deferred_comprehension_errors: RefCell::new(Vec::new()),
         source,
         may_have_debug_patterns: source.contains("__debug__") || !source.is_ascii(),
+        may_have_legacy_coroutines: matches!(
+            python_version,
+            PythonVersion::Py312 | PythonVersion::Py313
+        ) && optimization_level != OptimizationLevel::Zero
+            && (source.contains("await") || source.contains("async")),
         body,
         mapping_key_int_max_str_digits,
         python_version: match python_version {
@@ -627,6 +648,7 @@ fn simple_function_checker_view(function: &ast::StmtFunctionDef) -> Option<Stmt>
 struct Validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> {
     pre_lowering_only: bool,
     optimization_level: OptimizationLevel,
+    may_have_legacy_coroutines: bool,
     comprehension_yield_operand: bool,
     checking_comprehension_yield: bool,
     collecting_comprehension_errors: bool,
@@ -753,6 +775,7 @@ fn surrogate_mapping_key_outcomes(
 struct ValidationError {
     error: CompileError,
     is_async_generator_return: bool,
+    is_legacy_async_generator_return: bool,
 }
 
 impl From<CompileError> for ValidationError {
@@ -760,6 +783,7 @@ impl From<CompileError> for ValidationError {
         Self {
             error,
             is_async_generator_return: false,
+            is_legacy_async_generator_return: false,
         }
     }
 }
@@ -1891,11 +1915,16 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
                 if let Some(returns) = &function.returns {
                     self.visit_annotation(returns);
                 }
+                // Before 3.14, symbol-table traversal can mark a sync function as a
+                // coroutine from an assertion that optimization subsequently removes.
+                let legacy_coroutine = !function.is_async
+                    && self.may_have_legacy_coroutines
+                    && super::source::function_has_elided_coroutine_assertion(&function.body);
                 self.with_scope(
                     ScopeKind::Function {
                         is_async: function.is_async,
                         // Ruff's return checker skips eager nested headers and defaults.
-                        is_async_generator: function.is_async
+                        is_async_generator: (function.is_async || legacy_coroutine)
                             && suite_contains_yield_in_function_scope(
                                 &function.body,
                                 !self.future_annotations
@@ -2724,6 +2753,14 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
             _ => error.to_string(),
         };
         let is_async_generator_return = matches!(error.kind, Kind::ReturnInGenerator);
+        let is_legacy_async_generator_return = is_async_generator_return
+            && matches!(
+                self.scope().kind,
+                ScopeKind::Function {
+                    is_async: false,
+                    ..
+                }
+            );
         *reported = Some(ValidationError {
             error: if matches!(
                 error.kind,
@@ -2742,6 +2779,7 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
                 CompileError::invalid_syntax(message, error.range)
             },
             is_async_generator_return,
+            is_legacy_async_generator_return,
         });
     }
 }

@@ -529,7 +529,10 @@ impl Assembler {
                     .is_empty())
         {
             self.exception_owner_provenance
-                .capture_uncompacted_conditional_arrays(&graph.copy_items());
+                .capture_uncompacted_conditional_arrays(
+                    &graph.copy_items(),
+                    self.python_version == crate::PythonVersion::Py314,
+                );
         }
         Self::restore_legacy_return_pop_blocks(&mut graph, &self.legacy_return_pop_blocks);
         OptimizationPipeline {
@@ -571,6 +574,7 @@ impl Assembler {
             comprehension_assignment_exits: self.comprehension_assignment_exits,
             match_join_store_origins: self.match_join_store_origins,
             original_nop_targets: self.original_nop_targets,
+            original_scope_exit_labels: self.original_scope_exit_labels,
             original_unlocated_cleanup_targets: self.original_unlocated_cleanup_targets,
             original_unlocated_discard_targets: self.original_unlocated_discard_targets,
             copied_finally_iterator_break_origins: self.copied_finally_iterator_break_origins,
@@ -613,7 +617,7 @@ impl OptimizationPipeline {
             );
         }
         let local_nop_donors = self.capture_local_nop_donors();
-        let reversed_store_handler_exits = self.capture_reversed_store_handler_exits();
+        let reversed_store_exits = self.capture_reversed_store_exits();
         self.preserve_shared_original_manager_pop_locations();
         self.record_shared_unlocated_jump_entries();
         let mut original_owners = FusionOwnerCertificates::capture_original_owners(&self);
@@ -727,7 +731,7 @@ impl OptimizationPipeline {
                     &mut copied_exit_owner_retargets,
                     &mut copied_exit_region_retargets,
                 ),
-                &reversed_store_handler_exits,
+                &reversed_store_exits,
                 &threaded_normal_try_joins,
                 &mut static_swap_store_gaps,
                 constants

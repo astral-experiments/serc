@@ -9,8 +9,8 @@ use crate::CompileError;
 use crate::assembler::ConstantTable;
 use crate::assembler::block_graph::{ItemMut, fuse_adjacent_instructions};
 use crate::target::opcodes::{
-    COPY, LOAD_FAST, LOAD_FAST_BORROW, LOAD_FAST_CHECK, LOAD_FAST_LOAD_FAST, POP_JUMP_IF_NONE,
-    POP_JUMP_IF_NOT_NONE,
+    COPY, LOAD_FAST, LOAD_FAST_BORROW, LOAD_FAST_CHECK, LOAD_FAST_LOAD_FAST, NOT_TAKEN,
+    POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE,
 };
 
 use super::control_flow::{
@@ -129,7 +129,7 @@ fn optimize_boolean_conversions_and_redundant_stores(
     }
 }
 
-fn propagate_assertion_exit_locations(items: &mut [Item]) {
+fn propagate_assertion_exit_locations(items: &mut [Item], conditional_targets: Option<u8>) {
     let mut position = 0;
     while position < items.len() {
         let Item::Instruction(jump) = items[position] else {
@@ -146,6 +146,37 @@ fn propagate_assertion_exit_locations(items: &mut [Item]) {
         let Operand::Forward(label) = jump.operand() else {
             unreachable!("a terminal guard must jump forward");
         };
+        // A physical alias immediately after NOT_TAKEN is still reached only by
+        // fallthrough when no jump targets any of its labels. The graph path
+        // propagates that predecessor's location into its first instruction.
+        if let (Some(targets), Some(Item::Instruction(marker))) =
+            (conditional_targets, items.get(position + 1).copied())
+            && marker.opcode == NOT_TAKEN
+            && marker.location.line >= 0
+        {
+            let mut next = position + 2;
+            let mut has_alias = false;
+            let mut unique = true;
+            while let Some(Item::Label(alias)) = items.get(next) {
+                has_alias = true;
+                unique &= 1_u8
+                    .checked_shl(alias.as_u32())
+                    .is_some_and(|bit| targets & bit == 0);
+                next += 1;
+            }
+            if has_alias
+                && unique
+                && items[next..]
+                    .iter()
+                    .take_while(|item| !matches!(item, Item::Label(_)))
+                    .all(|item| matches!(item, Item::Instruction(instruction) if instruction.location.line < 0))
+                && let Some(Item::Instruction(first)) = items.get_mut(next)
+                && first.location.line < 0
+                && !first.no_location_policy.preserves_location()
+            {
+                first.location = marker.location;
+            }
+        }
         let target = position
             + 1
             + items[position + 1..]
@@ -386,7 +417,8 @@ impl Assembler {
         // A small certified guard can contain unreferenced return aliases. The generic
         // borrowing traversal ignores them; all physical labels remain for the other passes.
         let track_conditional_targets = (3..=4).contains(&self.next_label);
-        let candidates = if track_conditional_targets {
+        let track_fallthrough_targets = (2..=4).contains(&self.next_label);
+        let candidates = if track_fallthrough_targets {
             LinearCandidates::with_conditional_targets(&items)
         } else {
             LinearCandidates::from_items(&items)
@@ -400,7 +432,10 @@ impl Assembler {
             AssemblerStage::OptimizeBooleanConversions,
         )?;
         if self.next_label != 0 {
-            propagate_assertion_exit_locations(&mut items);
+            propagate_assertion_exit_locations(
+                &mut items,
+                track_fallthrough_targets.then_some(candidates.conditional_targets),
+            );
         }
         #[cfg(any(test, debug_assertions))]
         super::validate_structure(

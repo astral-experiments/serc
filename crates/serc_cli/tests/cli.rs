@@ -144,6 +144,7 @@ fn compile_optimization_modes_match_cpython_and_use_distinct_caches() {
     )
     .unwrap();
 
+    let many_flags = format!("-{}", "O".repeat(256));
     for version in [
         PythonVersion::Py312,
         PythonVersion::Py313,
@@ -157,6 +158,10 @@ fn compile_optimization_modes_match_cpython_and_use_distinct_caches() {
             ("1", vec!["--optimize", "1"]),
             ("2", vec!["-OO"]),
             ("2", vec!["--optimize", "2"]),
+            ("3", vec!["-OOO"]),
+            ("3", vec!["-O", "-OO"]),
+            ("4", vec!["-OOOO"]),
+            ("256", vec![many_flags.as_str()]),
         ] {
             let output = serc()
                 .args([
@@ -180,10 +185,14 @@ fn compile_optimization_modes_match_cpython_and_use_distinct_caches() {
                 PythonVersion::Py314 => common::python_3145_command(),
                 PythonVersion::Py315 => common::python_315_command(),
             };
+            oracle.arg("-B");
+            if level.parse::<usize>().unwrap() > 2 {
+                oracle.arg(format!("-{}", "O".repeat(level.parse().unwrap())));
+            }
             let native = oracle
                 .args([
                     "-c",
-                    "import importlib.util, pathlib, py_compile, sys; source, native, level = sys.argv[1:]; py_compile.compile(source, cfile=native, doraise=True, optimize=int(level), invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP); cache = importlib.util.cache_from_source(source, optimization='' if level == '0' else level); assert pathlib.Path(cache).read_bytes() == pathlib.Path(native).read_bytes(), cache",
+                    "import importlib.util, pathlib, py_compile, sys; source, native, level = sys.argv[1:]; level = int(level); py_compile.compile(source, cfile=native, doraise=True, optimize=level if level <= 2 else -1, invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP); cache = importlib.util.cache_from_source(source, optimization='' if level == 0 else str(level)); assert pathlib.Path(cache).read_bytes() == pathlib.Path(native).read_bytes(), cache",
                 ])
                 .arg(&source_path)
                 .arg(&native_path)
@@ -200,7 +209,7 @@ fn compile_optimization_modes_match_cpython_and_use_distinct_caches() {
         fs_err::read_dir(directory.path().join("__pycache__"))
             .unwrap()
             .count(),
-        12
+        24
     );
 }
 
@@ -220,7 +229,11 @@ fn optimized_check_mode_skips_cache_output() {
 
 #[test]
 fn rejects_invalid_or_conflicting_optimization_options() {
-    for arguments in [vec!["--optimize", "3"], vec!["-O", "--optimize", "2"]] {
+    for arguments in [
+        vec!["--optimize", "3"],
+        vec!["-O", "--optimize", "2"],
+        vec!["--optimize", "2", "-OOO"],
+    ] {
         let output = serc().arg("compile").args(arguments).output().unwrap();
         assert_eq!(output.status.code(), Some(2));
         assert!(!output.stderr.is_empty());
@@ -1615,7 +1628,12 @@ fn parallel_compile_writes_identical_caches_including_colliding_names() {
     }
     let deeply_nested = format!("value = {}1{}\n", "call(".repeat(24), ")".repeat(24));
     fs_err::write(directory.path().join("deep.py"), deeply_nested).unwrap();
-    for optimization in ["0", "1", "2"] {
+    for (optimization, arguments) in [
+        ("0", vec!["--optimize", "0"]),
+        ("1", vec!["--optimize", "1"]),
+        ("2", vec!["--optimize", "2"]),
+        ("3", vec!["-OOO"]),
+    ] {
         let caches = [
             directory.path().join("__pycache__/py.cpython-314.pyc"),
             directory.path().join("__pycache__/module.cpython-314.pyc"),
@@ -1632,7 +1650,8 @@ fn parallel_compile_writes_identical_caches_including_colliding_names() {
             }
         });
         let serial = serc()
-            .args(["compile", "--jobs", "1", "--optimize", optimization])
+            .args(["compile", "--jobs", "1"])
+            .args(&arguments)
             .arg(directory.path())
             .output()
             .unwrap();
@@ -1646,7 +1665,8 @@ fn parallel_compile_writes_identical_caches_including_colliding_names() {
             fs_err::remove_dir_all(nested.join("__pycache__")).unwrap();
             let mut command = serc();
             command
-                .args(["compile", "--optimize", optimization])
+                .arg("compile")
+                .args(&arguments)
                 .env("RAYON_NUM_THREADS", "2");
             if let Some(jobs) = jobs {
                 command.args(["-j", jobs]);

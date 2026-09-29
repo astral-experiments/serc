@@ -222,7 +222,7 @@ jobs:
 
   test:
     name: "cargo test on linux"
-    timeout-minutes: 10
+    timeout-minutes: 20
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -236,6 +236,10 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-python
+      - name: "Build minimal CPython reference"
+        run: |
+          "$SERC_TEST_PYTHON" scripts/build-cpython-reference.py --output "$RUNNER_TEMP/cpython-reference"
+          echo "SERC_TEST_CPYTHON_REFERENCE=$RUNNER_TEMP/cpython-reference" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: "Install Rust toolchain"
         run: rustup show

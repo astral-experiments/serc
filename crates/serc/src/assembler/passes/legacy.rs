@@ -9,11 +9,13 @@ use super::super::{
     block_jump_target,
 };
 use crate::target::opcodes::{
-    COMPARE_OP, CONTAINS_OP, COPY, IS_OP, JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD,
-    LOAD_CLOSURE, LOAD_CONST, LOAD_FAST, LOAD_FAST_LOAD_FAST, LOAD_GLOBAL, NOP, POP_TOP, PUSH_NULL,
-    RETURN_GENERATOR, RETURN_VALUE, STORE_FAST, STORE_FAST_LOAD_FAST, STORE_FAST_STORE_FAST,
-    TO_BOOL, UNARY_NOT, YIELD_VALUE,
+    CALL, CALL_FUNCTION_EX, CALL_INTRINSIC_1, CLEANUP_THROW, COMPARE_OP, CONTAINS_OP, COPY,
+    COPY_FREE_VARS, END_SEND, IS_OP, JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD,
+    LOAD_CLOSURE, LOAD_CONST, LOAD_FAST, LOAD_FAST_LOAD_FAST, LOAD_GLOBAL, MAKE_CELL, NOP, POP_TOP,
+    PUSH_NULL, RERAISE, RESUME, RETURN_CONST, RETURN_GENERATOR, RETURN_VALUE, SEND, STORE_FAST,
+    STORE_FAST_LOAD_FAST, STORE_FAST_STORE_FAST, TO_BOOL, UNARY_NOT, YIELD_VALUE,
 };
+use crate::target::operands::ResumeLocation;
 use crate::target::{is_conditional_jump_for, is_unconditional_jump};
 use crate::{CompileError, PythonVersion};
 
@@ -157,6 +159,11 @@ impl OptimizationPipeline {
         if self.python_version == PythonVersion::Py312 {
             self.inline_legacy_exit_blocks(&original_arrays, false);
         }
+        let repeated_predecessors = if self.python_version == PythonVersion::Py312 {
+            self.legacy_repeated_tail_predecessors(&original_arrays)
+        } else {
+            Vec::new()
+        };
         self.remove_unreachable_instructions();
         loop {
             let before = self.graph.copy_items();
@@ -235,6 +242,26 @@ impl OptimizationPipeline {
         let mut predecessors = self.legacy_predecessors();
         if self.python_version == PythonVersion::Py312 {
             predecessors.retain(|block, _| blocks_before_cold_relocation.contains(block));
+            if !repeated_predecessors.is_empty() {
+                let surviving_blocks = self.graph.order().iter().copied().collect::<FxHashSet<_>>();
+                for (block, expected, before, native) in repeated_predecessors {
+                    let mut instructions = self.graph[block].items().iter().filter_map(|item| {
+                        if let Item::Instruction(instruction) = item {
+                            Some(instruction)
+                        } else {
+                            None
+                        }
+                    });
+                    if surviving_blocks.contains(&block)
+                        && let Some(instruction) = instructions.next()
+                        && instructions.next().is_none()
+                        && *instruction == expected
+                        && predecessors.get(&block) == Some(&before)
+                    {
+                        predecessors.insert(block, native);
+                    }
+                }
+            }
         }
         self.resolve_legacy_locations(predecessors, &original_arrays);
         if self.python_version == PythonVersion::Py312 {
@@ -1309,6 +1336,723 @@ impl OptimizationPipeline {
             }
         }
         predecessors
+    }
+
+    /// Recovers 3.12 predecessor counts inflated by repeated reachability visits.
+    ///
+    /// Each result records the surviving instruction and ordinary edge count that
+    /// cleanup must preserve before restoring the native count for line propagation.
+    fn legacy_repeated_tail_predecessors(
+        &self,
+        original_arrays: &FxHashMap<BasicBlockId, usize>,
+    ) -> Vec<(BasicBlockId, Instruction, usize, usize)> {
+        let full_order = self.graph.order();
+        // Avoid building provenance maps when no conditional can queue its
+        // fallthrough twice, the only shape this analysis can repair.
+        if !full_order.windows(2).any(|pair| {
+            block_has_fallthrough(self.graph[pair[0]].items())
+                && block_jump_target(self.graph[pair[0]].items())
+                    .and_then(|label| self.graph.label_block(label))
+                    == Some(pair[1])
+        }) {
+            return Vec::new();
+        }
+        if !self.exception_regions.is_empty()
+            && let Some(tails) = self.legacy_repeated_tails_with_setups(original_arrays)
+        {
+            return tails;
+        }
+        let mut prefix_len = full_order.len();
+        if !self.exception_regions.is_empty() || !self.exception_owner_provenance.setups.is_empty()
+        {
+            // Native 3.12 also traverses SETUP targets. Only simulate the prefix
+            // before every original handler target when each setup is mapped
+            // to its authored target and no later jump can reenter the prefix.
+            // Stop at an empty or split native instruction array because the
+            // physical Serc blocks no longer establish the native traversal.
+            let setups = &self.exception_owner_provenance.setups;
+            let captured = &self.exception_owner_provenance.legacy_native_setup_targets;
+            let targets = captured.iter().copied().collect::<FxHashMap<_, _>>();
+            let setup_entries = setups
+                .iter()
+                .map(|(entry, _)| *entry)
+                .collect::<FxHashSet<_>>();
+            if self.exception_regions.is_empty()
+                || setups.is_empty()
+                || self
+                    .exception_regions
+                    .iter()
+                    .any(|region| region.is_scope_fallback)
+                || targets.len() != captured.len()
+                || setup_entries.len() != setups.len()
+                || targets.len() != setups.len()
+                || setups.iter().any(|(entry, _)| !targets.contains_key(entry))
+            {
+                return Vec::new();
+            }
+            let positions = full_order
+                .iter()
+                .enumerate()
+                .map(|(i, &block)| (block, i))
+                .collect::<FxHashMap<_, _>>();
+            for target in targets
+                .values()
+                .copied()
+                .chain(self.exception_regions.iter().map(|region| region.target))
+            {
+                let Some(handler) = self
+                    .graph
+                    .label_block(target)
+                    .and_then(|block| positions.get(&block).copied())
+                else {
+                    return Vec::new();
+                };
+                prefix_len = prefix_len.min(handler);
+            }
+            let mut prefix_arrays = FxHashSet::default();
+            for (index, &block) in full_order[..prefix_len].iter().enumerate() {
+                if self.graph[block].last_instruction().is_none()
+                    || !original_arrays
+                        .get(&block)
+                        .is_some_and(|array| prefix_arrays.insert(*array))
+                {
+                    prefix_len = index;
+                    break;
+                }
+            }
+            if full_order[prefix_len..].iter().any(|block| {
+                self.graph[*block].items().iter().any(|item| {
+                    let Item::Instruction(instruction) = item else {
+                        return false;
+                    };
+                    let (Operand::Forward(target) | Operand::Backward(target)) =
+                        instruction.operand()
+                    else {
+                        return false;
+                    };
+                    self.graph
+                        .label_block(target)
+                        .and_then(|block| positions.get(&block))
+                        .is_none_or(|position| *position < prefix_len)
+                })
+            }) {
+                return Vec::new();
+            }
+        }
+        let order = &full_order[..prefix_len];
+        let Some(&entry) = order.first() else {
+            return Vec::new();
+        };
+        // A conditional that targets its fallthrough queues the same not-yet-
+        // visited block twice in 3.12's depth-first reachability traversal.
+        if !order.windows(2).any(|pair| {
+            block_has_fallthrough(self.graph[pair[0]].items())
+                && block_jump_target(self.graph[pair[0]].items())
+                    .and_then(|label| self.graph.label_block(label))
+                    == Some(pair[1])
+        }) {
+            return Vec::new();
+        }
+        let mut arrays = FxHashSet::default();
+        for &block in order {
+            if self.graph[block].last_instruction().is_none()
+                || !original_arrays
+                    .get(&block)
+                    .is_some_and(|array| arrays.insert(*array))
+            {
+                return Vec::new();
+            }
+        }
+        let positions = order
+            .iter()
+            .enumerate()
+            .map(|(index, &block)| (block, index))
+            .collect::<FxHashMap<_, _>>();
+        let mut visited = FxHashSet::default();
+        let mut visits = FxHashMap::<BasicBlockId, usize>::default();
+        let mut pending = vec![entry];
+        let mut repeated_successors = FxHashSet::default();
+        let mut predecessor_counts = FxHashMap::<BasicBlockId, (usize, usize)>::default();
+        while let Some(block) = pending.pop() {
+            let Some(&position) = positions.get(&block) else {
+                return Vec::new();
+            };
+            let repeated = !visited.insert(block);
+            let count = visits.entry(block).or_default();
+            *count += 1;
+            if *count > 2 {
+                return Vec::new();
+            }
+            let fallthrough = block_has_fallthrough(self.graph[block].items())
+                .then(|| order.get(position + 1).copied())
+                .flatten();
+            let target = block_jump_target(self.graph[block].items())
+                .and_then(|label| self.graph.label_block(label))
+                .filter(|target| positions.contains_key(target));
+            for successor in fallthrough.into_iter().chain(target) {
+                // Native increments on every pop, including an already visited
+                // block. Keep the ordinary count too: cleanup must leave the
+                // certified tail's incoming edges unchanged before restoration.
+                let (ordinary, native) = predecessor_counts.entry(successor).or_default();
+                *native += 1;
+                if !repeated {
+                    *ordinary += 1;
+                }
+                if repeated {
+                    repeated_successors.insert(successor);
+                }
+                if !visited.contains(&successor) {
+                    pending.push(successor);
+                }
+            }
+        }
+        order
+            .iter()
+            .copied()
+            .filter(|block| repeated_successors.contains(block))
+            .filter_map(|block| {
+                let mut instructions = self.graph[block].items().iter().filter_map(|item| {
+                    if let Item::Instruction(instruction) = item {
+                        Some(instruction)
+                    } else {
+                        None
+                    }
+                });
+                let instruction = instructions.next()?;
+                let backedge = instruction.opcode == JUMP_BACKWARD
+                    || instruction.opcode == JUMP_BACKWARD_NO_INTERRUPT;
+                let counts = predecessor_counts.get(&block).copied();
+                let has_call_fallthrough =
+                    positions[&block].checked_sub(1).is_some_and(|previous| {
+                        let previous = order[previous];
+                        if !visited.contains(&previous) {
+                            return false;
+                        }
+                        let mut tail =
+                            self.graph[previous]
+                                .items()
+                                .iter()
+                                .rev()
+                                .filter_map(|item| {
+                                    if let Item::Instruction(instruction) = item {
+                                        Some(instruction.opcode)
+                                    } else {
+                                        None
+                                    }
+                                });
+                        tail.next() == Some(POP_TOP)
+                            && matches!(tail.next(), Some(CALL | CALL_FUNCTION_EX))
+                    });
+                let original_scope_exit = self.graph[block].items().iter().any(|item| {
+                    matches!(item, Item::Label(label)
+                        if self.original_scope_exit_labels.contains(label))
+                });
+                let unprotected_tail = self.exception_regions.is_empty()
+                    && self.exception_owner_provenance.setups.is_empty()
+                    && (instruction.opcode == JUMP_FORWARD
+                        // Native's early fallthrough donation sees the call's
+                        // artificial POP_TOP as unlocated. A source-certified
+                        // scope footer also admits one ordinary predecessor;
+                        // eager branch-return footers have no such certificate.
+                        || (instruction.opcode == RETURN_CONST
+                            && counts.is_some_and(|(ordinary, _)| {
+                                (has_call_fallthrough && ordinary >= 2)
+                                    || (original_scope_exit && ordinary >= 1)
+                            })));
+                if instructions.next().is_none()
+                    && (backedge || unprotected_tail)
+                    && instruction.location == SourceLocation::NONE
+                {
+                    let (ordinary, native) = if backedge { (1, 2) } else { counts? };
+                    let mut expected = *instruction;
+                    if instruction.opcode == JUMP_FORWARD
+                        && let Operand::Forward(target) = instruction.operand()
+                        && self.graph.label_block(target)
+                            == order.get(positions[&block] + 1).copied()
+                    {
+                        // Redundant-jump cleanup changes only these two fields.
+                        // The late line pass must still see the repeated count
+                        // while this exact unlocated NOP survives in its array.
+                        legacy_nop(&mut expected);
+                    }
+                    Some((block, expected, ordinary, native))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Simulates 3.12's reachability walk over original instruction arrays.
+    ///
+    /// Exception range boundaries can split one native array into several Serc
+    /// blocks. Merge those fragments in a temporary graph, then restore the
+    /// authored SETUP edges that do not appear in the emitted instructions.
+    /// Return `None` when the retained provenance cannot establish this graph.
+    fn legacy_repeated_tails_with_setups(
+        &self,
+        original_arrays: &FxHashMap<BasicBlockId, usize>,
+    ) -> Option<Vec<(BasicBlockId, Instruction, usize, usize)>> {
+        let setups = &self.exception_owner_provenance.setups;
+        let captured = &self.exception_owner_provenance.legacy_native_setup_targets;
+        let targets = captured.iter().copied().collect::<FxHashMap<_, _>>();
+        let entries = setups
+            .iter()
+            .map(|(entry, _)| *entry)
+            .collect::<FxHashSet<_>>();
+        let handlers = targets.values().copied().collect::<FxHashSet<_>>();
+        // Native 3.12 inserts one implicit generator SETUP before the entry RESUME.
+        let fallback_handlers = self
+            .exception_regions
+            .iter()
+            .filter(|region| region.is_scope_fallback)
+            .map(|region| region.target)
+            .collect::<FxHashSet<_>>();
+        if fallback_handlers.len() > 1 {
+            return None;
+        }
+        let wrapper = if let Some(&handler) = fallback_handlers.iter().next() {
+            let mut matches = captured.iter().filter(|(_, target)| *target == handler);
+            let (entry, _) = *matches.next()?;
+            if matches.next().is_some() {
+                return None;
+            }
+            Some(entry)
+        } else {
+            None
+        };
+        if setups.is_empty()
+            || targets.len() != captured.len()
+            || entries.len() != setups.len()
+            || targets.len() != setups.len()
+            || setups.iter().any(|(entry, _)| !targets.contains_key(entry))
+            || self
+                .exception_regions
+                .iter()
+                .any(|region| !handlers.contains(&region.target))
+        {
+            return None;
+        }
+
+        let mut groups: Vec<Vec<BasicBlockId>> = Vec::new();
+        let mut seen_arrays = FxHashSet::default();
+        let mut previous = None;
+        for &block in self.graph.order() {
+            let array = *original_arrays.get(&block)?;
+            if previous != Some(array) {
+                if !seen_arrays.insert(array) {
+                    return None;
+                }
+                groups.push(Vec::new());
+                previous = Some(array);
+            }
+            let index = groups.len() - 1;
+            groups[index].push(block);
+        }
+        if groups.is_empty() {
+            return Some(Vec::new());
+        }
+        // Native removes initially empty arrays before this traversal, but an
+        // array emptied by folding can still participate. The retained array
+        // identity alone does not distinguish those cases.
+        if groups.iter().any(|fragments| {
+            fragments
+                .iter()
+                .all(|block| self.graph[*block].last_instruction().is_none())
+        }) {
+            return None;
+        }
+
+        // A branch into the middle of a group would require a native array
+        // boundary that the captured array identities do not establish.
+        let mut entry_labels = FxHashMap::default();
+        for (index, fragments) in groups.iter().enumerate() {
+            for item in fragments
+                .iter()
+                .flat_map(|block| self.graph[*block].items())
+            {
+                match item {
+                    Item::Label(label) => {
+                        entry_labels.insert(*label, index);
+                    }
+                    Item::Instruction(_) => break,
+                }
+            }
+        }
+        let label_group = |label| entry_labels.get(&label).copied();
+        let handler_groups = handlers
+            .iter()
+            .map(|&label| label_group(label))
+            .collect::<Option<FxHashSet<_>>>()?;
+        let group_instructions = |index: usize| {
+            groups[index]
+                .iter()
+                .flat_map(|block| self.graph[*block].items())
+                .filter_map(|item| match item {
+                    Item::Instruction(instruction) => Some(instruction),
+                    Item::Label(_) => None,
+                })
+        };
+        if let Some(entry) = wrapper {
+            let handler = targets[&entry];
+            let entry_group = label_group(entry)?;
+            let handler_group = label_group(handler)?;
+            // Serc emits the startup instructions early, whereas native 3.12
+            // inserts them only after reachability. The original SETUP and
+            // RESUME must therefore map to the immediately following array.
+            if entry_group != 1
+                || handler_groups.contains(&0)
+                || handler_groups.contains(&entry_group)
+                || !self.exception_regions.iter().any(|region| {
+                    region.is_scope_fallback && region.start == entry && region.target == handler
+                })
+            {
+                return None;
+            }
+            let prefix = group_instructions(0).collect::<Vec<_>>();
+            let [before @ .., generator, pop] = prefix.as_slice() else {
+                return None;
+            };
+            if generator.opcode != RETURN_GENERATOR
+                || pop.opcode != POP_TOP
+                || generator.operand() != Operand::Value(0)
+                || pop.operand() != Operand::Value(0)
+                || before.iter().enumerate().any(|(index, instruction)| {
+                    instruction.opcode != MAKE_CELL
+                        && !(index == 0 && instruction.opcode == COPY_FREE_VARS)
+                })
+                || !group_instructions(entry_group)
+                    .next()
+                    .is_some_and(|instruction| {
+                        instruction.opcode == RESUME && instruction.operand() == Operand::Value(0)
+                    })
+            {
+                return None;
+            }
+            let cleanup = group_instructions(handler_group).collect::<Vec<_>>();
+            if !matches!(cleanup.as_slice(), [call, reraise]
+                if call.opcode == CALL_INTRINSIC_1 && call.operand() == Operand::Value(3)
+                    && reraise.opcode == RERAISE && reraise.operand() == Operand::Value(1))
+                || self.graph.iter_items().any(|item| {
+                    let Item::Instruction(instruction) = item else { return false; };
+                    match instruction.operand() {
+                        Operand::Forward(label) | Operand::Backward(label) => {
+                            matches!(label_group(label), Some(group) if group == 0 || group == entry_group || group == handler_group)
+                        }
+                        _ => false,
+                    }
+                })
+            {
+                return None;
+            }
+        }
+        let mut setup_edges = vec![Vec::new(); groups.len()];
+        let mut entry_groups = FxHashSet::default();
+        for &(entry, _) in setups {
+            let position = label_group(entry)?;
+            if !entry_groups.insert(position) {
+                return None;
+            }
+            let target = label_group(targets[&entry])?;
+            // The handler's cleanup SETUP is its first instruction. A body
+            // SETUP instead precedes its entry label in the preceding array.
+            let owner = if Some(entry) == wrapper || handler_groups.contains(&position) {
+                position
+            } else if self
+                .exception_owner_provenance
+                .ordinary_await_cleanups
+                .iter()
+                .any(|region| region.start == entry && region.target == targets[&entry])
+            {
+                // SEND ends its native array. The following ordinary-await
+                // SETUP starts the fallthrough array, before YIELD_VALUE.
+                let previous = position.checked_sub(1)?;
+                let send = group_instructions(previous).next_back()?;
+                let first = group_instructions(position).next()?;
+                if send.opcode != SEND
+                    || first.opcode != YIELD_VALUE
+                    || !self
+                        .exception_owner_provenance
+                        .ordinary_await_ends
+                        .iter()
+                        .any(|await_end| {
+                            await_end.send == *send
+                                && await_end.cleanup.first() == Some(&Item::Label(targets[&entry]))
+                                && send.operand() == Operand::Forward(await_end.entry)
+                        })
+                {
+                    return None;
+                }
+                position
+            } else if let Some(origin) = self
+                .exception_owner_provenance
+                .legacy_protocol_await_setups
+                .iter()
+                .find(|origin| origin.yielded == entry)
+            {
+                // ADD_YIELD_FROM uses the same virtual SETUP for manager protocol
+                // awaits, but these must not acquire ordinary-await owner facts.
+                let previous = position.checked_sub(1)?;
+                let cleanup_group = label_group(origin.cleanup)?;
+                let exit_group = label_group(origin.exit)?;
+                let body = group_instructions(position).collect::<Vec<_>>();
+                let mut regions = self
+                    .exception_regions
+                    .iter()
+                    .filter(|region| region.start == entry && region.target == origin.cleanup);
+                let region = regions.next()?;
+                let end_block = self.graph.label_block(region.end)?;
+                if regions.next().is_some()
+                    || region.is_scope_fallback
+                    || region.preserve_lasti
+                    || region.end != origin.yielded_end
+                    || !groups[position].contains(&end_block)
+                    || self.graph[end_block]
+                        .items()
+                        .iter()
+                        .find_map(|item| match item {
+                            Item::Instruction(instruction) => Some(instruction),
+                            Item::Label(_) => None,
+                        })
+                        != body.get(1).copied()
+                    || self
+                        .exception_owner_provenance
+                        .legacy_protocol_await_setups
+                        .iter()
+                        .filter(|candidate| candidate.yielded == entry)
+                        .count()
+                        != 1
+                    || origin.cleanup != targets[&entry]
+                    || label_group(origin.send) != Some(previous)
+                    || cleanup_group != position + 1
+                    || exit_group != cleanup_group + 1
+                    || !group_instructions(previous)
+                        .next_back()
+                        .is_some_and(|send| {
+                            send.opcode == SEND && send.operand() == Operand::Forward(origin.exit)
+                        })
+                    || !matches!(body.as_slice(), [yielded, resume, back]
+                        if yielded.opcode == YIELD_VALUE
+                            && resume.opcode == RESUME
+                            && resume.operand() == Operand::Value(ResumeLocation::AFTER_AWAIT.argument())
+                            && back.opcode == JUMP_BACKWARD_NO_INTERRUPT
+                            && back.operand() == Operand::Backward(origin.send))
+                    || !matches!(group_instructions(cleanup_group).collect::<Vec<_>>().as_slice(), [cleanup]
+                        if cleanup.opcode == CLEANUP_THROW && cleanup.operand() == Operand::Value(0))
+                    || !group_instructions(exit_group).next().is_some_and(|end| {
+                        end.opcode == END_SEND && end.operand() == Operand::Value(0)
+                    })
+                {
+                    return None;
+                }
+                position
+            } else {
+                let owner = position.checked_sub(1)?;
+                let last = group_instructions(owner).next_back();
+                if last.is_some_and(|instruction| {
+                    is_unconditional_jump(instruction.opcode)
+                        || matches!(
+                            instruction.operand(),
+                            Operand::Forward(_) | Operand::Backward(_)
+                        )
+                        || crate::target::is_scope_exit_for(self.python_version, instruction.opcode)
+                }) {
+                    return None;
+                }
+                owner
+            };
+            if Some(entry) == wrapper {
+                setup_edges[owner].insert(0, target);
+            } else {
+                setup_edges[owner].push(target);
+            }
+        }
+
+        let mut edges = vec![Vec::new(); groups.len()];
+        for (index, successors) in edges.iter_mut().enumerate() {
+            let instructions = group_instructions(index).collect::<Vec<_>>();
+            if instructions
+                .iter()
+                .take(instructions.len().saturating_sub(1))
+                .any(|instruction| {
+                    matches!(
+                        instruction.operand(),
+                        Operand::Forward(_) | Operand::Backward(_)
+                    ) || crate::target::is_scope_exit_for(self.python_version, instruction.opcode)
+                })
+            {
+                return None;
+            }
+            let falls_through = instructions.last().is_none_or(|instruction| {
+                !is_unconditional_jump(instruction.opcode)
+                    && !crate::target::is_scope_exit_for(self.python_version, instruction.opcode)
+            });
+            if falls_through && index + 1 < groups.len() {
+                successors.push(index + 1);
+            }
+            // CPython queues fallthrough first, then scans SETUP and jump
+            // instructions in array order. SETUP in a handler precedes its
+            // terminal jump; a body SETUP belongs to a non-branching array.
+            successors.extend(setup_edges[index].iter().copied());
+            if let Some(instruction) = instructions.last() {
+                match instruction.operand() {
+                    Operand::Forward(label) | Operand::Backward(label) => {
+                        successors.push(label_group(label)?);
+                    }
+                    Operand::Value(_) | Operand::Deferred(_) => {}
+                }
+            }
+        }
+
+        let mut visited = vec![false; groups.len()];
+        let mut repeated_successors = vec![false; groups.len()];
+        let mut predecessor_counts = vec![(0, 0); groups.len()];
+        let mut pending = vec![0];
+        // Duplicate pending entries can multiply through a graph. Decline an
+        // unbounded traversal rather than slowing compilation pathologically.
+        let mut budget = groups.len().saturating_mul(16).max(64);
+        while let Some(index) = pending.pop() {
+            if budget == 0 {
+                return None;
+            }
+            budget -= 1;
+            let repeated = visited[index];
+            visited[index] = true;
+            for &successor in &edges[index] {
+                let (ordinary, native) = &mut predecessor_counts[successor];
+                *native += 1;
+                if !repeated {
+                    *ordinary += 1;
+                }
+                repeated_successors[successor] |= repeated;
+                if !visited[successor] {
+                    pending.push(successor);
+                }
+            }
+        }
+
+        let block_positions = self
+            .graph
+            .order()
+            .iter()
+            .enumerate()
+            .map(|(index, &block)| (block, index))
+            .collect::<FxHashMap<_, _>>();
+        let position = |label| {
+            self.graph
+                .label_block(label)
+                .and_then(|block| block_positions.get(&block).copied())
+        };
+        let mut tails = Vec::new();
+        for (index, fragments) in groups.iter().enumerate() {
+            if !repeated_successors[index] {
+                continue;
+            }
+            let mut instructions = fragments.iter().flat_map(|block| {
+                self.graph[*block]
+                    .items()
+                    .iter()
+                    .filter_map(move |item| match item {
+                        Item::Instruction(instruction) => Some((*block, instruction)),
+                        Item::Label(_) => None,
+                    })
+            });
+            let Some((block, instruction)) = instructions.next() else {
+                continue;
+            };
+            // Completed SETUP regions do not own a later original scope footer.
+            // Its repeated count still prevents the final call's line donation.
+            let original_scope_exit = fragments.iter().any(|block| {
+                self.graph[*block].items().iter().any(|item| {
+                    matches!(item, Item::Label(label)
+                        if self.original_scope_exit_labels.contains(label))
+                })
+            });
+            // Completed SETUPs and the implicit wrapper leave a forward join or
+            // scope footer's repeated count unchanged. Reject surviving explicit
+            // owners; the wrapper's prologue and SETUP target were checked above.
+            let has_only_scope_owner = || {
+                self.exception_regions.iter().all(|region| {
+                    if region.is_scope_fallback {
+                        return true;
+                    }
+                    let (Some(start), Some(end)) = (position(region.start), position(region.end))
+                    else {
+                        return false;
+                    };
+                    start <= end && !(start..end).contains(&block_positions[&block])
+                })
+            };
+            // An erased branch can retain its repeated incoming count inside a
+            // manager too. Its redundant jump must stay within every original
+            // region and reach a located runtime record, not a cleanup boundary.
+            let forward_join_keeps_owners = || {
+                let Operand::Forward(target) = instruction.operand() else {
+                    return false;
+                };
+                let Some(target_block) = self.graph.label_block(target) else {
+                    return false;
+                };
+                if label_group(target) != Some(index + 1)
+                    || instruction.exception_policy() != super::super::ExceptionPolicy::default()
+                    || !self.graph[target_block]
+                        .items()
+                        .iter()
+                        .find_map(|item| match item {
+                            Item::Instruction(instruction) => Some(instruction),
+                            Item::Label(_) => None,
+                        })
+                        .is_some_and(|next| {
+                            next.location.line >= 0
+                                && next.opcode != NOP
+                                && next.exception_policy()
+                                    == super::super::ExceptionPolicy::default()
+                                && !next.fusion_policy.is_converted_pop_block()
+                        })
+                {
+                    return false;
+                }
+                let source = block_positions[&block];
+                let target = block_positions[&target_block];
+                self.exception_regions.iter().all(|region| {
+                    let (Some(start), Some(end)) = (position(region.start), position(region.end))
+                    else {
+                        return false;
+                    };
+                    start <= end && (start..end).contains(&source) == (start..end).contains(&target)
+                })
+            };
+            if instructions.next().is_none()
+                && (matches!(
+                    instruction.opcode,
+                    JUMP_BACKWARD | JUMP_BACKWARD_NO_INTERRUPT
+                ) || (instruction.opcode == JUMP_FORWARD
+                    && (wrapper.is_none()
+                        || has_only_scope_owner()
+                        || forward_join_keeps_owners()))
+                    || (instruction.opcode == RETURN_CONST
+                        && original_scope_exit
+                        && (wrapper.is_none() || has_only_scope_owner())))
+                && instruction.location == SourceLocation::NONE
+            {
+                let mut expected = *instruction;
+                let counts = if matches!(instruction.opcode, JUMP_FORWARD | RETURN_CONST) {
+                    if instruction.opcode == JUMP_FORWARD
+                        && let Operand::Forward(target) = instruction.operand()
+                        && label_group(target) == Some(index + 1)
+                    {
+                        // Native removes this jump after reachability. Its exact
+                        // unlocated NOP still needs the original incoming count.
+                        legacy_nop(&mut expected);
+                    }
+                    predecessor_counts[index]
+                } else {
+                    (1, 2)
+                };
+                tails.push((block, expected, counts.0, counts.1));
+            }
+        }
+        Some(tails)
     }
 
     fn legacy_predecessors(&self) -> FxHashMap<BasicBlockId, usize> {
@@ -3269,6 +4013,622 @@ mod finally_capture_seed_tests {
                     .visit_legacy_seed_captures_mut(|instruction| {
                         assert_eq!(instruction.legacy_initial_jump_width(), None);
                     });
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod protected_repeated_backedge_tests {
+    use super::*;
+    use crate::assembler::Assembler;
+    use crate::target::opcodes::{POP_JUMP_IF_FALSE, RERAISE};
+
+    #[test]
+    fn generator_backedge_requires_original_wrapper_and_prologue() {
+        for case in 0..9 {
+            let label = Label::from_u32;
+            let (
+                entry,
+                body,
+                handler,
+                failed,
+                cleanup,
+                loop_head,
+                second,
+                backedge,
+                exit,
+                handler_success,
+                wrapper,
+                stop_handler,
+            ) = (
+                label(0),
+                label(1),
+                label(2),
+                label(3),
+                label(4),
+                label(5),
+                label(6),
+                label(7),
+                label(8),
+                label(9),
+                label(10),
+                label(11),
+            );
+            let normal = |opcode, argument| {
+                Instruction::new(
+                    opcode,
+                    Operand::Value(argument),
+                    SourceLocation::NONE,
+                    Some(0),
+                )
+            };
+            let branch = |target| {
+                Instruction::new(
+                    POP_JUMP_IF_FALSE,
+                    Operand::Forward(target),
+                    SourceLocation::NONE,
+                    Some(0),
+                )
+            };
+            let jump = |target| {
+                Instruction::new(
+                    JUMP_FORWARD,
+                    Operand::Forward(target),
+                    SourceLocation::NONE,
+                    Some(0),
+                )
+            };
+            let mut items = Vec::new();
+            if case == 7 {
+                items.extend([
+                    Item::Instruction(normal(COPY_FREE_VARS, 1)),
+                    Item::Instruction(normal(MAKE_CELL, 0)),
+                ]);
+            }
+            items.extend([
+                Item::Instruction(normal(if case == 3 { NOP } else { RETURN_GENERATOR }, 0)),
+                Item::Instruction(normal(POP_TOP, 0)),
+                Item::Label(wrapper),
+                Item::Instruction(normal(if case == 4 { NOP } else { RESUME }, 0)),
+                Item::Label(entry),
+                Item::Instruction(normal(NOP, 0)),
+                Item::Label(body),
+                Item::Instruction(normal(NOP, 0)),
+                Item::Instruction(jump(loop_head)),
+                Item::Label(handler),
+                Item::Instruction(branch(failed)),
+                Item::Label(handler_success),
+                Item::Instruction(jump(loop_head)),
+                Item::Label(failed),
+                Item::Instruction(normal(RERAISE, 0)),
+                Item::Label(cleanup),
+                Item::Instruction(normal(RERAISE, 0)),
+                Item::Label(loop_head),
+                Item::Instruction(branch(second)),
+                Item::Label(second),
+                Item::Instruction(Instruction::new(
+                    POP_JUMP_IF_FALSE,
+                    Operand::Backward(loop_head),
+                    SourceLocation::NONE,
+                    Some(0),
+                )),
+                Item::Label(backedge),
+                Item::Instruction(Instruction::new(
+                    JUMP_BACKWARD,
+                    Operand::Backward(loop_head),
+                    SourceLocation::NONE,
+                    Some(0),
+                )),
+                Item::Label(exit),
+                Item::Instruction(if case == 5 {
+                    jump(stop_handler)
+                } else {
+                    normal(RETURN_VALUE, 0)
+                }),
+                Item::Label(stop_handler),
+                Item::Instruction(normal(CALL_INTRINSIC_1, if case == 2 { 5 } else { 3 })),
+                Item::Instruction(normal(RERAISE, 1)),
+            ]);
+            let mut assembler = Assembler::from_linear_items(items);
+            assembler.python_version = PythonVersion::Py312;
+            assembler.next_label = 12;
+            assembler.add_exception_region(body, handler, handler, 0, false);
+            assembler.add_exception_region(handler, failed, cleanup, 1, true);
+            assembler.add_stopiteration_exception_region_with_depth(
+                if case == 8 { entry } else { wrapper },
+                stop_handler,
+                stop_handler,
+                0,
+            );
+            assembler.record_exception_setup(body, false);
+            assembler.record_legacy_native_setup_target(body, handler);
+            assembler.record_exception_setup(handler, false);
+            assembler.record_legacy_native_setup_target(handler, cleanup);
+            assembler.record_exception_setup(wrapper, false);
+            if case != 1 {
+                assembler.record_legacy_native_setup_target(wrapper, stop_handler);
+            }
+            if case == 6 {
+                assembler.record_legacy_native_setup_target(wrapper, stop_handler);
+            }
+            let pipeline = assembler.into_optimization_pipeline();
+            let arrays = pipeline.legacy_instruction_arrays();
+            let result = pipeline.legacy_repeated_tails_with_setups(&arrays);
+            if case == 0 || case == 7 {
+                assert_eq!(
+                    result.unwrap()[0].0,
+                    pipeline.graph.label_block(backedge).unwrap(),
+                    "case {case}"
+                );
+            } else {
+                assert!(result.is_none(), "case {case}");
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_visits_follow_body_and_handler_setup_edges() {
+        for case in 0..5 {
+            let entry = Label::from_u32(0);
+            let body = Label::from_u32(1);
+            let handler = Label::from_u32(2);
+            let failed = Label::from_u32(3);
+            let cleanup = Label::from_u32(4);
+            let loop_head = Label::from_u32(5);
+            let second = Label::from_u32(6);
+            let backedge = Label::from_u32(7);
+            let exit = Label::from_u32(8);
+            let handler_success = Label::from_u32(9);
+            let normal =
+                |opcode| Instruction::new(opcode, Operand::Value(0), SourceLocation::NONE, Some(0));
+            let branch = |target| {
+                Instruction::new(
+                    POP_JUMP_IF_FALSE,
+                    Operand::Forward(target),
+                    SourceLocation::NONE,
+                    Some(0),
+                )
+            };
+            let jump = |target| {
+                Instruction::new(
+                    JUMP_FORWARD,
+                    Operand::Forward(target),
+                    SourceLocation::NONE,
+                    Some(0),
+                )
+            };
+            let mut assembler = Assembler::from_linear_items(vec![
+                Item::Label(entry),
+                Item::Instruction(normal(NOP)),
+                Item::Label(body),
+                Item::Instruction(normal(NOP)),
+                Item::Instruction(jump(loop_head)),
+                Item::Label(handler),
+                Item::Instruction(branch(failed)),
+                Item::Label(handler_success),
+                Item::Instruction(jump(loop_head)),
+                Item::Label(failed),
+                Item::Instruction(normal(RERAISE)),
+                Item::Label(cleanup),
+                Item::Instruction(normal(RERAISE)),
+                Item::Label(loop_head),
+                Item::Instruction(branch(if case == 1 { exit } else { second })),
+                Item::Label(second),
+                Item::Instruction(Instruction::new(
+                    POP_JUMP_IF_FALSE,
+                    Operand::Backward(loop_head),
+                    SourceLocation::NONE,
+                    Some(0),
+                )),
+                Item::Label(backedge),
+                Item::Instruction(Instruction::new(
+                    JUMP_BACKWARD,
+                    Operand::Backward(loop_head),
+                    SourceLocation::NONE,
+                    Some(0),
+                )),
+                Item::Label(exit),
+                Item::Instruction(normal(RETURN_VALUE)),
+            ]);
+            assembler.python_version = PythonVersion::Py312;
+            assembler.next_label = 10;
+            assembler.add_exception_region(body, handler, handler, 0, false);
+            assembler.add_exception_region(handler, failed, cleanup, 1, true);
+            assembler.record_exception_setup(body, false);
+            assembler.record_legacy_native_setup_target(body, handler);
+            assembler.record_exception_setup(handler, false);
+            if case != 2 {
+                assembler.record_legacy_native_setup_target(handler, cleanup);
+            }
+            if case == 3 {
+                assembler.record_legacy_native_setup_target(handler, cleanup);
+            }
+            let mut pipeline = assembler.into_optimization_pipeline();
+            let arrays = pipeline.legacy_instruction_arrays();
+            if case == 4 {
+                let block = pipeline.graph.label_block(entry).unwrap();
+                let instruction = pipeline.graph[block]
+                    .items()
+                    .iter()
+                    .position(|item| matches!(item, Item::Instruction(_)))
+                    .unwrap();
+                pipeline.graph.remove_item_at(block, instruction);
+            }
+            let found = pipeline.legacy_repeated_tails_with_setups(&arrays);
+            match case {
+                0 => assert_eq!(
+                    found.unwrap()[0].0,
+                    pipeline.graph.label_block(backedge).unwrap()
+                ),
+                1 => assert!(found.unwrap().is_empty()),
+                _ => assert!(found.is_none()),
+            }
+        }
+    }
+
+    #[test]
+    fn scope_wrapper_tails_require_completed_explicit_regions() {
+        use crate::target::operands::{ResumeLocation, UnaryIntrinsic};
+
+        for (forward, case) in [false, true]
+            .into_iter()
+            .flat_map(|forward| (0..12).map(move |case| (forward, case)))
+        {
+            let [
+                wrapper,
+                body,
+                handler,
+                first,
+                second,
+                call,
+                footer,
+                continuation,
+                stop,
+            ] = std::array::from_fn(|index| Label::from_u32(u32::try_from(index).unwrap()));
+            let normal = |opcode, argument| {
+                Instruction::new(
+                    opcode,
+                    Operand::Value(argument),
+                    SourceLocation::NONE,
+                    Some(0),
+                )
+            };
+            let jump = |opcode, target| {
+                Instruction::new(
+                    opcode,
+                    Operand::Forward(target),
+                    SourceLocation::NONE,
+                    Some(0),
+                )
+            };
+            let mut assembler = Assembler::from_linear_items(vec![
+                Item::Instruction(normal(RETURN_GENERATOR, 0)),
+                Item::Instruction(normal(POP_TOP, 0)),
+                Item::Label(wrapper),
+                Item::Instruction(normal(RESUME, ResumeLocation::AT_FUNC_START.argument())),
+                Item::Label(body),
+                Item::Instruction(normal(NOP, 0)),
+                Item::Instruction(jump(JUMP_FORWARD, first)),
+                Item::Label(handler),
+                Item::Instruction(normal(RERAISE, 0)),
+                Item::Label(first),
+                Item::Instruction(jump(POP_JUMP_IF_FALSE, second)),
+                Item::Label(second),
+                Item::Instruction(jump(POP_JUMP_IF_FALSE, footer)),
+                Item::Label(call),
+                Item::Instruction(normal(CALL, 0)),
+                Item::Instruction(normal(POP_TOP, 0)),
+                Item::Label(footer),
+                Item::Instruction(if forward {
+                    jump(JUMP_FORWARD, continuation)
+                } else {
+                    normal(RETURN_CONST, 0)
+                }),
+                Item::Label(continuation),
+                Item::Instruction(normal(RETURN_CONST, 0)),
+                Item::Label(stop),
+                Item::Instruction(normal(
+                    CALL_INTRINSIC_1,
+                    UnaryIntrinsic::STOPITERATION_ERROR.argument(),
+                )),
+                Item::Instruction(normal(RERAISE, 1)),
+            ]);
+            assembler.python_version = PythonVersion::Py312;
+            assembler.next_label = 9;
+            assembler.add_exception_region(body, handler, handler, 0, false);
+            assembler.add_stopiteration_exception_region_with_depth(wrapper, stop, stop, 0);
+            assembler.record_exception_setup(body, false);
+            assembler.record_legacy_native_setup_target(body, handler);
+            assembler.record_exception_setup(wrapper, false);
+            assembler.record_legacy_native_setup_target(wrapper, stop);
+            if case != 6 {
+                assembler.record_original_scope_exit(footer);
+            }
+            let mut pipeline = assembler.into_optimization_pipeline();
+            let arrays = pipeline.legacy_instruction_arrays();
+            if case >= 8 {
+                let continuation_block = pipeline.graph.label_block(continuation).unwrap();
+                let next = pipeline
+                    .graph
+                    .instructions_mut(continuation_block)
+                    .next()
+                    .unwrap();
+                next.location = SourceLocation::new(10, 10, 4, 12);
+                if case == 11 {
+                    next.set_exception_policy(super::super::super::ExceptionPolicy::EXCLUDE_ALWAYS);
+                }
+                pipeline.exception_regions[0].end = stop;
+            }
+            match case {
+                1 => pipeline.exception_regions[0].end = footer,
+                2 => pipeline.exception_regions[0].end = stop,
+                3 => {
+                    pipeline.exception_regions[0].start = footer;
+                    pipeline.exception_regions[0].end = stop;
+                }
+                4 => pipeline.exception_regions[0].end = Label::from_u32(99),
+                5 => {
+                    pipeline.exception_regions[0].start = stop;
+                    pipeline.exception_regions[0].end = first;
+                }
+                7 => pipeline
+                    .exception_owner_provenance
+                    .legacy_native_setup_targets
+                    .clear(),
+                9 => pipeline.exception_regions[0].end = continuation,
+                10 => pipeline
+                    .exception_regions
+                    .push(crate::assembler::ExceptionRegion {
+                        start: continuation,
+                        end: stop,
+                        ..pipeline.exception_regions[0]
+                    }),
+                _ => {}
+            }
+            let found = pipeline.legacy_repeated_tails_with_setups(&arrays);
+            let retained = found.is_some_and(|tails| {
+                tails.iter().any(|(block, _, ordinary, native)| {
+                    Some(*block) == pipeline.graph.label_block(footer) && native > ordinary
+                })
+            });
+            assert_eq!(
+                retained,
+                case <= 1 || (forward && matches!(case, 6 | 8)),
+                "forward {forward}, case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn await_setup_requires_original_send_fallthrough() {
+        use crate::assembler::exception_owners::OrdinaryAwaitEnd;
+        use crate::target::opcodes::{CLEANUP_THROW, END_SEND};
+        use crate::target::operands::ResumeLocation;
+
+        for (protocol, case) in (0..7)
+            .map(|case| (false, case))
+            .chain((0..13).map(|case| (true, case)))
+        {
+            let [
+                send_label,
+                yielded,
+                yielded_end,
+                cleanup,
+                end,
+                first,
+                second,
+                backedge,
+                exit,
+            ] = std::array::from_fn(|index| Label::from_u32(u32::try_from(index).unwrap()));
+            let normal = |opcode, value| {
+                Instruction::new(opcode, Operand::Value(value), SourceLocation::NONE, Some(0))
+            };
+            let forward = |opcode, target| {
+                Instruction::new(
+                    opcode,
+                    Operand::Forward(target),
+                    SourceLocation::NONE,
+                    Some(0),
+                )
+            };
+            let backward = |opcode, target| {
+                Instruction::new(
+                    opcode,
+                    Operand::Backward(target),
+                    SourceLocation::NONE,
+                    Some(0),
+                )
+            };
+            let send = forward(SEND, end);
+            let end_send = normal(END_SEND, 0);
+            let cleanup_instruction = normal(if case == 9 { NOP } else { CLEANUP_THROW }, 0);
+            let mut items = vec![
+                Item::Label(send_label),
+                Item::Instruction(send),
+                Item::Label(yielded),
+                Item::Instruction(normal(if case == 4 { NOP } else { YIELD_VALUE }, 1)),
+                Item::Label(yielded_end),
+                Item::Instruction(normal(
+                    RESUME,
+                    if case == 10 {
+                        ResumeLocation::AFTER_YIELD_FROM.argument()
+                    } else {
+                        ResumeLocation::AFTER_AWAIT.argument()
+                    },
+                )),
+                Item::Instruction(backward(JUMP_BACKWARD_NO_INTERRUPT, send_label)),
+                Item::Label(cleanup),
+                Item::Instruction(cleanup_instruction),
+                Item::Label(end),
+                Item::Instruction(end_send),
+                Item::Label(first),
+                Item::Instruction(forward(POP_JUMP_IF_FALSE, second)),
+                Item::Label(second),
+                Item::Instruction(forward(POP_JUMP_IF_FALSE, exit)),
+                Item::Label(backedge),
+                Item::Instruction(backward(JUMP_BACKWARD, first)),
+                Item::Label(exit),
+                Item::Instruction(normal(RETURN_CONST, 0)),
+            ];
+            if case == 12 {
+                let first_index = items
+                    .iter()
+                    .position(|item| *item == Item::Label(first))
+                    .unwrap();
+                items.insert(
+                    first_index + 1,
+                    Item::Instruction(normal(RESUME, ResumeLocation::AFTER_AWAIT.argument())),
+                );
+            }
+            let mut assembler = Assembler::from_linear_items(items);
+            let region_end = if case == 12 { first } else { yielded_end };
+            assembler.python_version = PythonVersion::Py312;
+            assembler.next_label = 9;
+            assembler.add_exception_region(yielded, region_end, cleanup, 0, false);
+            assembler.record_exception_setup(yielded, false);
+            if case != 1 {
+                assembler.record_legacy_native_setup_target(yielded, cleanup);
+            }
+            if case == 2 {
+                assembler.record_legacy_native_setup_target(yielded, cleanup);
+            }
+            if protocol {
+                if case != 3 {
+                    assembler.record_legacy_protocol_await_setup(
+                        yielded,
+                        if case == 7 { end } else { region_end },
+                        if case == 6 { exit } else { cleanup },
+                        send_label,
+                        if case == 5 { exit } else { end },
+                    );
+                }
+                if case == 8 {
+                    assembler.exception_regions[0].preserve_lasti = true;
+                }
+                if case == 11 {
+                    assembler.record_legacy_protocol_await_setup(
+                        yielded,
+                        yielded_end,
+                        cleanup,
+                        send_label,
+                        end,
+                    );
+                }
+            } else {
+                if case != 3 {
+                    assembler
+                        .exception_owner_provenance
+                        .ordinary_await_cleanups
+                        .push(assembler.exception_regions[0]);
+                }
+                assembler
+                    .exception_owner_provenance
+                    .ordinary_await_ends
+                    .push(OrdinaryAwaitEnd {
+                        send: if case == 5 { forward(SEND, exit) } else { send },
+                        entry: end,
+                        end_send,
+                        cleanup: vec![
+                            Item::Label(if case == 6 { exit } else { cleanup }),
+                            Item::Instruction(cleanup_instruction),
+                        ],
+                        bridge: None,
+                    });
+            }
+            let pipeline = assembler.into_optimization_pipeline();
+            let arrays = pipeline.legacy_instruction_arrays();
+            if case == 12 {
+                let actual = pipeline.graph.label_block(yielded_end).unwrap();
+                let unrelated = pipeline.graph.label_block(first).unwrap();
+                assert_ne!(arrays[&actual], arrays[&unrelated]);
+                let first_instruction = |block| {
+                    pipeline.graph[block]
+                        .items()
+                        .iter()
+                        .find_map(|item| match item {
+                            Item::Instruction(instruction) => Some(instruction),
+                            Item::Label(_) => None,
+                        })
+                };
+                assert_eq!(first_instruction(actual), first_instruction(unrelated));
+            }
+            let found = pipeline.legacy_repeated_tails_with_setups(&arrays);
+            if case == 0 {
+                assert!(found.unwrap().iter().any(|(block, _, ordinary, native)| {
+                    *block == pipeline.graph.label_block(backedge).unwrap()
+                        && *ordinary == 1
+                        && *native == 2
+                }));
+            } else {
+                assert!(found.is_none(), "protocol {protocol}, case {case}");
+            }
+        }
+    }
+
+    #[test]
+    fn protected_prefix_requires_authored_targets_and_no_reentry() {
+        for case in 0..7 {
+            let start = Label::from_u32(0);
+            let second = Label::from_u32(1);
+            let backedge = Label::from_u32(2);
+            let end = Label::from_u32(3);
+            let handler = Label::from_u32(4);
+            let branch =
+                |target| Instruction::new(POP_JUMP_IF_FALSE, target, SourceLocation::NONE, Some(0));
+            let jump = |target| {
+                Instruction::new(
+                    JUMP_BACKWARD,
+                    Operand::Backward(target),
+                    SourceLocation::NONE,
+                    Some(0),
+                )
+            };
+            let mut assembler = Assembler::from_linear_items(vec![
+                Item::Label(start),
+                Item::Instruction(branch(Operand::Forward(second))),
+                Item::Label(second),
+                Item::Instruction(branch(Operand::Backward(start))),
+                Item::Label(backedge),
+                Item::Instruction(jump(start)),
+                Item::Label(end),
+                Item::Instruction(Instruction::new(
+                    RETURN_VALUE,
+                    Operand::Value(0),
+                    SourceLocation::NONE,
+                    Some(0),
+                )),
+                Item::Label(handler),
+                Item::Instruction(if case == 5 {
+                    jump(start)
+                } else {
+                    Instruction::new(RERAISE, Operand::Value(0), SourceLocation::NONE, Some(0))
+                }),
+            ]);
+            assembler.python_version = PythonVersion::Py312;
+            assembler.next_label = 5;
+            assembler.add_exception_region(start, end, handler, 0, false);
+            assembler.record_exception_setup(start, false);
+            if case != 1 {
+                let target = match case {
+                    2 => Label::from_u32(900),
+                    4 => second,
+                    _ => handler,
+                };
+                assembler.record_legacy_native_setup_target(start, target);
+            }
+            if case == 3 {
+                assembler.record_legacy_native_setup_target(start, handler);
+            }
+            if case == 6 {
+                assembler.record_exception_setup(start, false);
+            }
+            let pipeline = assembler.into_optimization_pipeline();
+            let arrays = pipeline.legacy_instruction_arrays();
+            let found = pipeline.legacy_repeated_tail_predecessors(&arrays);
+            assert_eq!(found.len(), usize::from(case == 0), "case {case}");
+            if case == 0 {
+                assert_eq!(found[0].0, pipeline.graph.label_block(backedge).unwrap());
             }
         }
     }

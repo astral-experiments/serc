@@ -24,10 +24,85 @@ use super::constant::{
     constant_slice_with_literals, explicit_surrogate_string, fold_constant,
     fold_constant_for_version, fold_constant_with_profile, is_literal_constant, literal_constant,
 };
-use super::scope::{ModulePlan, NameId, ScopeArena};
+use super::scope::{ModulePlan, NameId, ScopeArena, parameter_default_expressions};
 use super::statement::function_body_contains_yield;
 use super::symbol::mangle_name;
 use super::{CachedSourceLine, Compiler};
+
+/// Finds assertion expressions that give a function coroutine flags in CPython 3.12–3.13,
+/// even when `-O` or `-OO` removes the assertion. Nested bodies do not contribute, but
+/// lambda defaults and a generator expression's first iterable belong to this scope.
+///
+/// ```python
+/// def f():
+///     assert await task()
+/// ```
+pub(super) fn function_has_elided_coroutine_assertion(body: &[Stmt]) -> bool {
+    #[derive(Default)]
+    struct Detector {
+        found: bool,
+        in_assertion: bool,
+    }
+
+    impl<'ast> Visitor<'ast> for Detector {
+        fn visit_stmt(&mut self, statement: &'ast Stmt) {
+            if self.found {
+                return;
+            }
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_stmt(statement));
+            }
+            match statement {
+                Stmt::FunctionDef(_) | Stmt::ClassDef(_) => (),
+                Stmt::Assert(_) => {
+                    self.in_assertion = true;
+                    walk_stmt(self, statement);
+                    self.in_assertion = false;
+                }
+                _ => walk_stmt(self, statement),
+            }
+        }
+
+        fn visit_expr(&mut self, expression: &'ast Expr) {
+            if !self.in_assertion || self.found {
+                return;
+            }
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_expr(expression));
+            }
+            match expression {
+                Expr::Await(_) => self.found = true,
+                Expr::ListComp(comp) if comp.generators.iter().any(|item| item.is_async) => {
+                    self.found = true;
+                }
+                Expr::SetComp(comp) if comp.generators.iter().any(|item| item.is_async) => {
+                    self.found = true;
+                }
+                Expr::DictComp(comp) if comp.generators.iter().any(|item| item.is_async) => {
+                    self.found = true;
+                }
+                Expr::Generator(comp) => {
+                    // Only the first iterable belongs to the enclosing scope.
+                    if let Some(generator) = comp.generators.first() {
+                        self.visit_expr(&generator.iter);
+                    }
+                }
+                Expr::Lambda(lambda) => {
+                    if let Some(parameters) = &lambda.parameters {
+                        for default in parameter_default_expressions(parameters) {
+                            self.visit_expr(default);
+                        }
+                    }
+                }
+                _ => walk_expr(self, expression),
+            }
+        }
+    }
+
+    let mut detector = Detector::default();
+    detector.visit_body(body);
+    detector.found
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum StringConstantOrigin {
@@ -130,9 +205,14 @@ pub(super) struct CompilationContext<'source> {
     pub(super) optimized_locations: FxHashMap<TextRange, super::optimization::OptimizedLocation>,
     pub(super) scopes: ScopeArena,
     original_generator_functions: Option<FxHashSet<TextRange>>,
+    original_legacy_coroutine_functions: FxHashSet<TextRange>,
     pub(super) module_contains_yield: bool,
     finally_bodies: FxHashMap<TextRange, &'source [Stmt]>,
     constant_string_origins: FxHashMap<Cow<'source, str>, Cell<StringConstantOrigin>>,
+    // Dotted imports intern every dot-delimited prefix during parsing. Keep the
+    // complete spellings indexed; materialize only prefixes used as constants.
+    dotted_import_names: Vec<String>,
+    dotted_constant_origins: RefCell<FxHashMap<String, StringConstantOrigin>>,
     // Class qualified-name and synthesized character identity depend on the first cache admission,
     // even when that constant or the defining class is later removed as unreachable.
     constant_origins: Option<RefCell<ConstantOrigins>>,
@@ -227,6 +307,12 @@ impl<'source> CompilationContext<'source> {
         let mut static_attribute_names = FxHashSet::default();
         let mut has_percent_replacement = false;
         let mut finally_bodies = FxHashMap::default();
+        let mut dotted_import_names = std::mem::take(&mut source_analysis.dotted_import_names)
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        dotted_import_names.sort_unstable();
+        dotted_import_names.dedup();
         let (constant_string_origins, requires_empty_bytes_cache_trace) = source_analysis.finish(
             &mut generated_mangled_strings,
             &mut requires_interning_trace,
@@ -260,9 +346,12 @@ impl<'source> CompilationContext<'source> {
             optimized_locations: FxHashMap::default(),
             scopes,
             original_generator_functions: None,
+            original_legacy_coroutine_functions: FxHashSet::default(),
             module_contains_yield: false,
             finally_bodies,
             constant_string_origins,
+            dotted_import_names,
+            dotted_constant_origins: RefCell::default(),
             constant_origins,
             interned_metadata_tuples,
             static_attribute_names,
@@ -276,19 +365,34 @@ impl<'source> CompilationContext<'source> {
         }
     }
 
+    pub(super) fn is_elided_statement(&self, statement: &Stmt) -> bool {
+        matches!(
+            self.optimized_locations.get(&statement.range()),
+            Some(super::optimization::OptimizedLocation::Elided)
+        )
+    }
+
     /// Preserve symbol-table and suspension facts established before assertion removal.
     pub(super) fn preserve_unoptimized_scopes(&mut self, body: &Suite) {
         struct GeneratorCollector {
             ranges: FxHashSet<TextRange>,
+            coroutines: FxHashSet<TextRange>,
             eager_annotations: bool,
+            legacy_coroutines: bool,
         }
 
         impl<'ast> Visitor<'ast> for GeneratorCollector {
             fn visit_stmt(&mut self, statement: &'ast Stmt) {
-                if let Stmt::FunctionDef(function) = statement
-                    && function_body_contains_yield(&function.body, self.eager_annotations)
-                {
-                    self.ranges.insert(function.range);
+                if let Stmt::FunctionDef(function) = statement {
+                    if function_body_contains_yield(&function.body, self.eager_annotations) {
+                        self.ranges.insert(function.range);
+                    }
+                    if self.legacy_coroutines
+                        && !function.is_async
+                        && function_has_elided_coroutine_assertion(&function.body)
+                    {
+                        self.coroutines.insert(function.range);
+                    }
                 }
                 walk_stmt(self, statement);
             }
@@ -301,8 +405,44 @@ impl<'source> CompilationContext<'source> {
             }
         }
 
-        let mut original_scopes =
-            ScopeArena::analyze_with_optimized_assertions(body, self.python_version);
+        let mut original_source = SourceAnalysis::new(self.python_version, 0);
+        let mut original_scopes = ScopeArena::analyze_with_optimized_assertions(
+            body,
+            self.python_version,
+            &mut original_source,
+        );
+        // Parsing interns identifiers even when a later optimization removes their
+        // expressions. Preserve those raw names, but retain all lowering and cache
+        // facts from the optimized tree and do not mark literal objects canonical.
+        self.dotted_import_names.extend(
+            original_source
+                .dotted_import_names
+                .iter()
+                .map(|name| (*name).to_owned()),
+        );
+        self.dotted_import_names.sort_unstable();
+        self.dotted_import_names.dedup();
+        original_source.generated_mangled_strings.retain(|name| {
+            !original_source
+                .raw_private_identifiers
+                .contains(name.as_str())
+        });
+        // The retained names are used only for membership.
+        for name in original_source.origins.into_keys() {
+            if !original_source
+                .generated_mangled_strings
+                .contains(name.as_ref())
+            {
+                self.generated_mangled_strings.remove(name.as_ref());
+                if !name.is_ascii() && self.interned_metadata_tuples.is_none() {
+                    self.interned_metadata_tuples = Some(RefCell::default());
+                }
+                if !self.constant_string_origins.contains_key(name.as_ref()) {
+                    self.constant_string_origins
+                        .insert(Cow::Owned(name.into_owned()), Cell::default());
+                }
+            }
+        }
         original_scopes.retain_lowered_comprehension_locals(&self.scopes);
         self.scopes = original_scopes;
         let eager_annotations = self.python_version <= crate::PythonVersion::Py313
@@ -311,10 +451,20 @@ impl<'source> CompilationContext<'source> {
         self.module_contains_yield = function_body_contains_yield(body, eager_annotations);
         let mut collector = GeneratorCollector {
             ranges: FxHashSet::default(),
+            coroutines: FxHashSet::default(),
             eager_annotations,
+            legacy_coroutines: self.python_version <= crate::PythonVersion::Py313
+                && (self.source.contains("await") || self.source.contains("async")),
         };
         collector.visit_body(body);
         self.original_generator_functions = Some(collector.ranges);
+        self.original_legacy_coroutine_functions = collector.coroutines;
+    }
+
+    /// Legacy symbol tables retain coroutine flags from assertions removed by optimization.
+    pub(super) fn function_has_elided_coroutine(&self, definition: &StmtFunctionDef) -> bool {
+        self.original_legacy_coroutine_functions
+            .contains(&definition.range)
     }
 
     /// Use the original function body when optimization has removed a suspension expression.
@@ -375,18 +525,28 @@ impl<'source> CompilationContext<'source> {
         }
     }
 
+    fn dotted_import_interns(&self, value: &str) -> bool {
+        dotted_name_prefix_is_interned(&self.dotted_import_names, value)
+    }
+
     /// Records the first object admitted to the compilation-wide constant cache for an
     /// parser-interned name used as a constant. Later equal constants reuse that object's identity,
     /// even when the first load is removed by control-flow optimization.
     pub(super) fn record_constant_string_origin(&self, value: &str, interned: bool) {
-        if let Some(origin) = self.constant_string_origins.get(value)
-            && origin.get() == StringConstantOrigin::Unrecorded
-        {
-            origin.set(if interned {
-                StringConstantOrigin::Interned
-            } else {
-                StringConstantOrigin::Uninterned
-            });
+        let admitted = if interned {
+            StringConstantOrigin::Interned
+        } else {
+            StringConstantOrigin::Uninterned
+        };
+        if let Some(origin) = self.constant_string_origins.get(value) {
+            if origin.get() == StringConstantOrigin::Unrecorded {
+                origin.set(admitted);
+            }
+        } else if self.dotted_import_interns(value) {
+            self.dotted_constant_origins
+                .borrow_mut()
+                .entry(value.to_owned())
+                .or_insert(admitted);
         }
     }
 
@@ -394,6 +554,8 @@ impl<'source> CompilationContext<'source> {
         self.constant_string_origins
             .get(value)
             .is_some_and(|origin| origin.get() == StringConstantOrigin::Interned)
+            || self.dotted_constant_origins.borrow().get(value)
+                == Some(&StringConstantOrigin::Interned)
     }
 
     pub(super) fn record_identifier_constant_origin(&self, raw: &str, mangled: &str) {
@@ -410,7 +572,7 @@ impl<'source> CompilationContext<'source> {
     }
 
     fn record_interned_constant_string_origins(&self, constant: &Constant, interned: bool) {
-        if self.constant_string_origins.is_empty() {
+        if self.constant_string_origins.is_empty() && self.dotted_import_names.is_empty() {
             return;
         }
         match constant {
@@ -598,7 +760,9 @@ impl<'source> CompilationContext<'source> {
     }
 
     pub(super) fn has_tracked_string_origins(&self) -> bool {
-        !self.constant_string_origins.is_empty() || self.tracks_constant_origins()
+        !self.constant_string_origins.is_empty()
+            || !self.dotted_import_names.is_empty()
+            || self.tracks_constant_origins()
     }
 
     pub(super) fn tracks_constant_origins(&self) -> bool {
@@ -626,11 +790,12 @@ impl<'source> CompilationContext<'source> {
             || origins.interned_qualified_names.contains(value);
         match origins.strings.entry(value.to_string()) {
             std::collections::hash_map::Entry::Vacant(entry) => {
-                // A dotted import interns its complete spelling while parsing. In 3.13,
-                // code construction reuses that object for the qualified-name metadata,
+                // A dotted import interns its spelling while parsing. In Python 3.13
+                // and later, code construction can reuse it for qualified-name metadata,
                 // leaving the class's newly cached scalar constant distinct.
                 let canonical = self.python_version == crate::PythonVersion::Py312
                     || (!self.constant_string_origins.contains_key(value)
+                        && !self.dotted_import_interns(value)
                         && !metadata_already_interned);
                 entry.insert(canonical);
                 Some(canonical)
@@ -689,8 +854,33 @@ impl<'source> CompilationContext<'source> {
                 canonical.insert(value.into_owned());
             }
         }
+        #[expect(
+            clippy::iter_over_hash_type,
+            reason = "Both provenance sets are only queried for membership."
+        )]
+        for (value, origin) in context.dotted_constant_origins.take() {
+            if origin == StringConstantOrigin::Interned {
+                canonical.insert(value.clone());
+            }
+            if has_frozenset_constants {
+                identifiers.insert(value);
+            }
+        }
         (identifiers, canonical)
     }
+}
+
+/// Checks whether `value` is a proper dot-delimited prefix of a name in the sorted index.
+/// Complete spellings are tracked separately; searching this index avoids allocating every prefix.
+fn dotted_name_prefix_is_interned(names: &[String], value: &str) -> bool {
+    let index = names.partition_point(|name| match name.strip_prefix(value) {
+        Some(tail) => tail < ".",
+        None => name.as_str() < value,
+    });
+    names.get(index).is_some_and(|name| {
+        name.strip_prefix(value)
+            .is_some_and(|tail| tail.starts_with('.'))
+    })
 }
 
 /// Tests for the ASCII dunder substring without constructing a generic string searcher.
@@ -719,6 +909,7 @@ pub(super) struct SourceAnalysis<'ast> {
     python_version: crate::PythonVersion,
     finally_bodies: FxHashMap<TextRange, &'ast [Stmt]>,
     origins: FxHashMap<Cow<'ast, str>, Cell<StringConstantOrigin>>,
+    dotted_import_names: Vec<&'ast str>,
     // Source-only identifiers still enter `origins` directly, in their original visitation order.
     expression_origin_names: Vec<ExpressionOriginNames>,
     private_name: Option<String>,
@@ -777,6 +968,18 @@ impl<'ast> SourceAnalysis<'ast> {
     fn record_raw_name(&mut self, name: &'ast str) {
         self.origins.entry(Cow::Borrowed(name)).or_default();
         self.record_raw_name_effects(name);
+    }
+
+    /// Records parser-interned import names, including prefixes of imports later optimized away.
+    /// Prefixes stay implicit in the full spelling to avoid quadratic storage for long imports.
+    fn record_dotted_name(&mut self, name: &'ast str) {
+        if name.contains('.') {
+            self.dotted_import_names.push(name);
+        }
+        self.origins.entry(Cow::Borrowed(name)).or_default();
+        for component in name.split('.') {
+            self.record_raw_name(component);
+        }
     }
 
     #[inline]
@@ -844,9 +1047,7 @@ impl<'ast> SourceAnalysis<'ast> {
             }
             Stmt::ImportFrom(import) => {
                 if let Some(module) = &import.module {
-                    for component in module.as_str().split('.') {
-                        self.record_raw_name(component);
-                    }
+                    self.record_dotted_name(module.as_str());
                 }
             }
             Stmt::Global(declaration) => {
@@ -1014,12 +1215,7 @@ impl<'ast> SourceAnalysis<'ast> {
     }
 
     pub(super) fn observe_alias(&mut self, alias: &'ast ruff_python_ast::Alias) {
-        self.origins
-            .entry(Cow::Borrowed(alias.name.as_str()))
-            .or_default();
-        for component in alias.name.as_str().split('.') {
-            self.record_raw_name(component);
-        }
+        self.record_dotted_name(alias.name.as_str());
         if let Some(name) = &alias.asname {
             self.record_raw_name(name.as_str());
         }
@@ -2887,6 +3083,28 @@ mod tests {
     use std::fmt::Write;
 
     use super::*;
+
+    #[test]
+    fn dotted_name_prefix_index_respects_component_boundaries() {
+        let mut names = ["a.b0", "a.b.c", "a.b!", "a.b", "a.bc.d", "é.x.y", "zz.z"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        for query in [
+            "", "a", "a.b", "a.bc", "a.b!", "a.b0", "a.c", "é", "é.x", "zz.z",
+        ] {
+            let expected = names.iter().any(|name| {
+                name.strip_prefix(query)
+                    .is_some_and(|tail| tail.starts_with('.'))
+            });
+            assert_eq!(
+                dotted_name_prefix_is_interned(&names, query),
+                expected,
+                "{query}"
+            );
+        }
+    }
 
     #[test]
     fn source_aware_atomic_folding_preserves_literal_values_and_surrogates() {

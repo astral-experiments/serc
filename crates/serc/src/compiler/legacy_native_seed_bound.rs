@@ -2,7 +2,8 @@
 //!
 //! Count source labels S, true jumps J, and scope exits E before dead-code removal.
 //! K bounds jumps with an unlabeled successor. Usually K = J; explicit suspension
-//! helper backedges and synchronous For backedges already have labeled successors.
+//! helper backedges, synchronous For backedges, and synchronous With cleanup jumps
+//! already have labeled successors.
 //! There are at most U = K + E + 1 original unlabeled blocks and B = S + U blocks.
 //! Empty-block repair and cold placement label at most U original blocks. Cold
 //! placement adds at most C = min(J, floor(B / 2)) bridges: each cold-to-warm
@@ -195,9 +196,16 @@ impl<'ast> Counter<'ast> {
                 self.suite(&statement.orelse)?;
             }
             Stmt::With(statement) => {
-                let (labels, jumps) = if statement.is_async { (15, 9) } else { (6, 3) };
                 for item in &statement.items {
-                    self.counts.add(labels, jumps, 2);
+                    if statement.is_async {
+                        self.counts.add(15, 9, 2);
+                    } else {
+                        // The normal exit jump is followed by the final label;
+                        // the suppression helper's jump by the cleanup label.
+                        // Only the conditional suppression jump has an unlabeled
+                        // successor (RERAISE), even after abrupt body exits.
+                        self.counts.add_with_unlabeled_successors(6, 3, 1, 2);
+                    }
                     self.expression(&item.context_expr)?;
                     self.optional(item.optional_vars.as_deref())?;
                 }
@@ -638,6 +646,51 @@ mod tests {
             panic!("expected one function");
         };
         assert!(!certifies(&function.body));
+    }
+
+    #[test]
+    fn synchronous_manager_successors_preserve_the_strict_label_bound() {
+        let managers = std::iter::repeat_n("manager()", 13)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let source = format!(
+            "async def f(flag):\n    await first()\n    await second()\n    value = (left if flag else middle) if flag else right\n    with {managers}:\n        await work()\n    if flag:\n        yes()\n    else:\n        no()\n"
+        );
+        let budget = counts(&source).unwrap();
+        assert_eq!(
+            budget,
+            Counts {
+                labels: 95,
+                jumps: 51,
+                unlabeled_jump_successors: 22,
+                exits: 29,
+            },
+        );
+        assert_eq!(budget.max_label(), 249);
+        // Source generation still visits unreachable exits, and 256 is excluded.
+        for (extra_exits, expected) in [(6, true), (7, false)] {
+            let source = format!("{source}{}", "    raise Error\n".repeat(extra_exits));
+            let parsed = parse_module(&source).unwrap();
+            let Stmt::FunctionDef(function) = &parsed.suite()[0] else {
+                panic!();
+            };
+            assert_eq!(certifies(&function.body), expected);
+        }
+    }
+
+    #[test]
+    fn synchronous_manager_successors_are_counted_in_every_finally_copy() {
+        assert_eq!(
+            counts(
+                "def f():\n    try:\n        return payload\n    finally:\n        with manager():\n            work()\n"
+            ),
+            Some(Counts {
+                labels: 24,
+                jumps: 10,
+                unlabeled_jump_successors: 4,
+                exits: 12,
+            }),
+        );
     }
 
     #[test]

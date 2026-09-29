@@ -1434,6 +1434,18 @@ impl Assembler {
         self.location = location;
     }
 
+    /// Certifies an original scope footer without changing its block boundaries.
+    pub(crate) fn record_original_scope_exit(&mut self, label: Label) {
+        self.original_scope_exit_labels.insert(label);
+    }
+
+    /// Certifies the current authored join without introducing a new boundary.
+    pub(crate) fn record_current_original_scope_exit(&mut self) {
+        if let Some(&Item::Label(label)) = self.linear_items().last() {
+            self.record_original_scope_exit(label);
+        }
+    }
+
     /// Restores an unlocated Boolean exit while retaining any early-folded location fallback.
     pub(crate) fn prepare_loop_tail_discard(&mut self, preserve_folded_location: bool) {
         let instruction = self.required_last_instruction_mut("preparing a loop-tail discard");
@@ -1521,6 +1533,17 @@ impl Assembler {
                 Item::Label(_) => None,
             })
             .unwrap_or(false)
+    }
+
+    /// Records an authored Pass NOP before the graph can rewrite or copy it.
+    pub(crate) fn record_original_pass_nop(&mut self) {
+        if self.python_version >= crate::PythonVersion::Py314 {
+            let instruction = *self.required_last_instruction_mut("recording an authored Pass");
+            debug_assert_eq!(instruction.opcode, NOP);
+            self.exception_owner_provenance
+                .original_pass_nops
+                .push(instruction);
+        }
     }
 
     /// Whether an adjacent record already supplies a trailing NOP's line in its array.
@@ -3993,70 +4016,75 @@ impl Assembler {
         count
     }
 
-    /// Certifies a single comprehension restore followed by its result assignment.
-    pub(crate) fn current_original_block_is_single_comprehension_assignment(&self) -> bool {
-        let [
-            ..,
-            Item::Label(entry),
-            Item::Instruction(swap),
-            Item::Instruction(restore),
-            Item::Instruction(store),
-        ] = self.linear_items()
-        else {
-            return false;
-        };
-        swap.opcode == SWAP
-            && swap.operand() == Operand::Value(2)
-            && restore.opcode == STORE_FAST
-            && restore.local_policy.may_store_null()
-            && store.opcode == STORE_FAST
-            && !store.local_policy.may_store_null()
-            && restore.operand() != store.operand()
-            && self
-                .exception_owner_provenance
-                .original_comprehension_normal_restores
-                .get(entry)
-                .is_some_and(|original| original.as_slice() == [*swap, *restore])
-            && self
-                .exception_owner_provenance
-                .original_comprehension_normal_exits
-                .iter()
-                .any(|(target, jump)| {
-                    target == entry
-                        && jump.opcode == JUMP_FORWARD
-                        && jump.operand() == Operand::Forward(*entry)
-                })
-            && [swap, restore, store].into_iter().all(|instruction| {
-                instruction.pre_fold_extra_instructions() == 0
-                    && !instruction.jump_policy.borrow_empty_block()
-                    && instruction.no_location_policy.borrow_fallthrough()
-                        == BorrowFallthrough::Reachable
-            })
-    }
-
-    /// Captures the original assignment donor before its comprehension restore is exchanged.
-    pub(crate) fn record_comprehension_assignment_exit(&mut self, exit: Label) {
-        if !self.current_original_block_is_single_comprehension_assignment() {
-            return;
-        }
+    /// Captures a comprehension's local restores and result store before static swaps.
+    ///
+    /// Every restored local and the destination must differ. The returned labels retain
+    /// their original order so later passes can match the complete assignment block.
+    fn current_original_comprehension_assignment(&self) -> Option<(Vec<Label>, Vec<Instruction>)> {
         let items = self.linear_items();
-        let [
-            ..,
-            Item::Label(_),
-            Item::Instruction(swap),
-            Item::Instruction(restore),
-            Item::Instruction(store),
-        ] = items
-        else {
-            unreachable!("certified comprehension assignment array");
+        let entry_index = items
+            .iter()
+            .rposition(|item| matches!(item, Item::Label(_)))?;
+        let Item::Label(entry) = items[entry_index] else {
+            unreachable!();
         };
-        let instructions = [*swap, *restore, *store];
+        let instructions = items[entry_index + 1..]
+            .iter()
+            .map(|item| match item {
+                Item::Instruction(instruction) => Some(*instruction),
+                Item::Label(_) => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let [swap, restores @ .., store] = instructions.as_slice() else {
+            return None;
+        };
+        let mut locals = FxHashSet::default();
+        if restores.is_empty()
+            || swap.opcode != SWAP
+            || swap.operand() != Operand::Value(u32::try_from(restores.len() + 1).ok()?)
+            || store.opcode != STORE_FAST
+            || store.local_policy.may_store_null()
+            || restores.iter().any(|restore| {
+                restore.opcode != STORE_FAST || !restore.local_policy.may_store_null()
+            })
+            || !restores.iter().chain([store]).all(|instruction| {
+                matches!(instruction.operand(), Operand::Value(local) if locals.insert(local))
+            })
+            || !self.exception_owner_provenance.original_comprehension_normal_restores
+                .get(&entry)
+                .is_some_and(|original| original.as_slice() == &instructions[..instructions.len() - 1])
+            || !self.exception_owner_provenance.original_comprehension_normal_exits
+                .iter().any(|(target, jump)| {
+                    *target == entry && jump.opcode == JUMP_FORWARD
+                        && jump.operand() == Operand::Forward(entry)
+                })
+            || instructions.iter().any(|instruction| {
+                instruction.pre_fold_extra_instructions() != 0
+                    || instruction.jump_policy.borrow_empty_block()
+                    || instruction.no_location_policy.borrow_fallthrough()
+                        != BorrowFallthrough::Reachable
+            })
+        {
+            return None;
+        }
         // The cold cleanup's end can share the normal entry's original offset.
         // Retain that entire emitted label prefix, including its exact order.
-        let mut entries = trailing_labels(&items[..items.len() - 3]).collect::<Vec<_>>();
+        let mut entries = trailing_labels(&items[..=entry_index]).collect::<Vec<_>>();
         entries.reverse();
-        self.comprehension_assignment_exits
-            .insert(exit, (entries, instructions));
+        Some((entries, instructions))
+    }
+
+    /// Certifies a single comprehension restore followed by its result assignment.
+    pub(crate) fn current_original_block_is_single_comprehension_assignment(&self) -> bool {
+        self.current_original_comprehension_assignment()
+            .is_some_and(|(_, instructions)| instructions.len() == 3)
+    }
+
+    /// Captures the original assignment donor before its comprehension restores are exchanged.
+    pub(crate) fn record_comprehension_assignment_exit(&mut self, exit: Label) {
+        if let Some(original) = self.current_original_comprehension_assignment() {
+            self.comprehension_assignment_exits.insert(exit, original);
+        }
     }
 
     /// Certifies that the current empty join follows its captured comprehension assignment.
@@ -8120,6 +8148,81 @@ impl Assembler {
             // and its emitted predecessors before allowing retained return-copy slots.
             self.record_original_empty_join(emitted);
         }
+    }
+
+    /// Preserves CPython's exit-copy budget for nested branches within a match case.
+    ///
+    /// All matching predecessors must retain their original instruction slots; a
+    /// compacted `pass` or cleanup in any arm prevents recording the entire case.
+    pub(crate) fn preserve_nested_match_exit_copy_budget(&mut self, emitted: EmittedJump) {
+        let success_index = usize::try_from(emitted.instruction().item_index)
+            .expect("emitted instruction index should fit in usize");
+        let items = self.linear_items();
+        let Item::Instruction(success) = items[success_index] else {
+            return;
+        };
+        let Operand::Forward(exit) = success.operand() else {
+            return;
+        };
+        if !success.jump_policy.is_original_match_success() {
+            return;
+        }
+        let mut labels = FxHashMap::default();
+        let mut next_instruction = success_index;
+        for (index, item) in items[..success_index].iter().enumerate().rev() {
+            match item {
+                Item::Label(label) => {
+                    labels.insert(*label, next_instruction);
+                }
+                Item::Instruction(_) => next_instruction = index,
+            }
+        }
+        let mut sources = Vec::new();
+        for (index, item) in items[..success_index].iter().enumerate() {
+            let Item::Instruction(source) = item else {
+                continue;
+            };
+            let Operand::Forward(join_label) = source.operand() else {
+                continue;
+            };
+            let Some(&join_index) = labels.get(&join_label) else {
+                continue;
+            };
+            let Item::Instruction(join) = items[join_index] else {
+                continue;
+            };
+            let Operand::Forward(success_label) = join.operand() else {
+                continue;
+            };
+            if source.opcode != JUMP_FORWARD
+                || join.opcode != JUMP_FORWARD
+                || index >= join_index
+                || join_index >= success_index
+                || labels.get(&success_label) != Some(&success_index)
+                || !join.jump_policy.is_original_empty_join()
+            {
+                continue;
+            }
+            if ![source, &join, &success].iter().all(|record| {
+                record.depth_after() == Some(0)
+                    && record.exception_policy() == ExceptionPolicy::default()
+                    && record.pre_fold_extra_instructions() == 0
+                    && record.local_policy.hidden_exception_owner_slots() == 0
+                    && !record.fusion_policy.is_authored_break()
+                    && !record.fusion_policy.is_converted_pop_block()
+            }) {
+                return;
+            }
+            if let Some(entry) = items[..index].iter().rev().find_map(|item| match item {
+                Item::Label(label) => Some(*label),
+                Item::Instruction(_) => None,
+            }) {
+                sources.push((entry, *source, success_label, exit));
+            }
+        }
+        self.exception_owner_provenance
+            .nested_match_exit_copy_origins
+            .extend(sources);
     }
 
     pub(crate) fn preserve_inlined_jump_nop(&mut self, emitted: EmittedJump) {
@@ -15500,6 +15603,20 @@ impl Assembler {
             .insert(label);
     }
 
+    /// Records the first directly evaluated name in an authored if-test.
+    pub(crate) fn record_original_initial_name_if_location(&mut self, location: SourceLocation) {
+        self.exception_owner_provenance
+            .original_initial_name_if_locations
+            .insert(location);
+    }
+
+    /// Records a direct authored while-name test.
+    pub(crate) fn record_original_name_while_location(&mut self, location: SourceLocation) {
+        self.exception_owner_provenance
+            .original_name_while_locations
+            .insert(location);
+    }
+
     /// Records an original array boundary reached by a primitive source condition.
     pub(crate) fn record_original_primitive_condition_boundary(&mut self, target: Label) {
         let condition = *self.last_jump_instruction_mut("recording an original condition boundary");
@@ -15726,6 +15843,53 @@ impl Assembler {
             .push((label, nop_location));
     }
 
+    /// Records a 3.12 SETUP target before exception ranges can be split or copied.
+    pub(crate) fn record_legacy_native_setup_target(&mut self, entry: Label, handler: Label) {
+        if self.python_version == crate::PythonVersion::Py312 {
+            self.exception_owner_provenance
+                .legacy_native_setup_targets
+                .push((entry, handler));
+        }
+    }
+
+    /// Records protocol-await labels without treating the await as ordinary source work.
+    pub(crate) fn record_legacy_protocol_await_setup(
+        &mut self,
+        yielded: Label,
+        yielded_end: Label,
+        cleanup: Label,
+        send: Label,
+        exit: Label,
+    ) {
+        if self.python_version == crate::PythonVersion::Py312 {
+            let mut regions = self
+                .exception_regions
+                .iter()
+                .filter(|region| region.start == yielded && region.target == cleanup);
+            let Some(region) = regions.next() else {
+                return;
+            };
+            if regions.next().is_some()
+                || region.end != yielded_end
+                || region.is_scope_fallback
+                || region.preserve_lasti
+                || !matches!(region.priority, ExceptionRegionPriority::OriginalRange(start, end)
+                    if start == yielded && end == yielded_end)
+            {
+                return;
+            }
+            self.exception_owner_provenance
+                .legacy_protocol_await_setups
+                .push(exception_owners::LegacyProtocolAwaitSetup {
+                    yielded,
+                    yielded_end,
+                    cleanup,
+                    send,
+                    exit,
+                });
+        }
+    }
+
     /// Retains the authored handler identity of an ordinary try's original SETUP.
     pub(crate) fn record_ordinary_try_exception_setup(
         &mut self,
@@ -15734,6 +15898,7 @@ impl Assembler {
         handler: Label,
     ) {
         self.record_exception_setup(label, retained_nop);
+        self.record_legacy_native_setup_target(label, handler);
         self.exception_owner_provenance
             .ordinary_try_setups
             .insert(label, handler);

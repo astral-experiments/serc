@@ -1555,6 +1555,12 @@ impl Compiler<'_> {
                         if self.legacy_compiler.is_some() && self.register_literals {
                             self.constants.push(Constant::Int(0));
                             self.constants.push(Constant::None);
+                        } else if self.python_version == PythonVersion::Py314
+                            && self.register_literals
+                        {
+                            // Import emits None as its from-list before the unreachable
+                            // branch is removed. A later use keeps that cache position.
+                            self.constants.push(Constant::None);
                         }
                         for alias in &import.names {
                             let imported = alias.name.as_str();
@@ -1591,10 +1597,13 @@ impl Compiler<'_> {
                                 self.string_origin_constants.push((names, true));
                             }
                         }
-                        if let Some(module) = &import.module {
-                            self.names.push((module.as_str().to_string(), true));
-                        }
+                        let module = import.module.as_ref().map_or("", |name| name.as_str());
+                        self.names.push((module.to_string(), true));
                         for alias in &import.names {
+                            if alias.name.as_str() == "*" {
+                                // IMPORT_STAR has no IMPORT_FROM or local binding name.
+                                continue;
+                            }
                             self.names.push((alias.name.as_str().to_string(), true));
                             let bound = alias.asname.as_ref().unwrap_or(&alias.name);
                             self.names.push((bound.as_str().to_string(), false));

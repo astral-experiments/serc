@@ -31,6 +31,7 @@ use crate::{CompileError, PythonVersion};
 
 use super::constant::{DeferredConstantTarget, OutputState, fold_constant, literal_constant};
 use super::definition::clean_doc;
+use super::expression::early_condition_truthiness;
 use super::scope::{
     LoweringFunctionPlan, NameId, NameInterner, NameSet, ScopeId,
     collect_conditional_simple_annotations, collect_simple_annotations, has_annotations,
@@ -193,6 +194,8 @@ pub(super) struct CodeUnit {
     positional_only_arg_count: u32,
     keyword_only_arg_count: u32,
     pub(super) flags: u32,
+    /// A synchronous function marked as a coroutine by an assertion removed under `-O`.
+    pub(super) legacy_sync_coroutine: bool,
     pub(super) first_line_number: u32,
     pub(super) annotation_thunk: bool,
 }
@@ -928,18 +931,55 @@ impl<'source> Compiler<'source> {
         self.compile_scope_suite(body, add_implicit_return, has_docstring)?;
         let add_implicit_return =
             add_implicit_return && !self.control.statements.emitted_fallthrough_return;
-        if add_implicit_return
-            && body.last().is_some_and(|statement| {
+        // Elided statements must not hide the assignment that owns the implicit
+        // return's location before static store reordering and fusion.
+        let terminal_statement = body.last();
+        let is_elided_statement = |statement: &Stmt| {
+            matches!(statement, Stmt::Global(global) if global.names.is_empty())
+                && self.context.is_elided_statement(statement)
+        };
+        let annotated_comprehension_store = |statement: &Stmt| {
+            if self.context.python_version >= PythonVersion::Py314
+                && let Stmt::AnnAssign(assignment) = statement
+                && matches!(assignment.target.as_ref(), Expr::Name(_))
+                && matches!(
+                    assignment.value.as_deref(),
+                    Some(Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_))
+                )
+            {
+                // Function-local annotations emit no code after the result store.
+                // Its span remains the return donor when comprehension restores move.
+                Some(assignment.target.range())
+            } else {
+                None
+            }
+        };
+        let return_location_statement = if self.context.python_version >= PythonVersion::Py314
+            && terminal_statement.is_some_and(is_elided_statement)
+        {
+            body.iter()
+                .rev()
+                .find(|statement| !is_elided_statement(statement))
+                .filter(|statement| {
+                    matches!(statement, Stmt::Assign(_))
+                        || annotated_comprehension_store(statement).is_some()
+                })
+                .or(terminal_statement)
+        } else {
+            terminal_statement
+        };
+        let return_range = return_location_statement.and_then(|statement| {
+            annotated_comprehension_store(statement).or_else(|| {
                 terminal_statement_uses_implicit_return_location(
                     statement,
                     self.context.python_version,
                     false,
                 )
+                .then(|| implicit_return_range(&self, statement))
             })
-        {
-            self.assembler.set_location(
-                self.source_location(implicit_return_range(&self, body.last().unwrap())),
-            );
+        });
+        if add_implicit_return && let Some(range) = return_range {
+            self.assembler.set_location(self.source_location(range));
         } else if self.assembler.instruction_count() > body_start {
             self.assembler.set_location(SourceLocation::NONE);
         } else if let Some(statement @ Stmt::Pass(_)) = body.last() {
@@ -949,10 +989,31 @@ impl<'source> Compiler<'source> {
         // Native 3.12's StopIteration wrapper appends an unlocated return even
         // after a terminating source suite, separating its final source joins
         // from the handler. Keep the suite's location selection above unchanged.
+        // A retained dead If join likewise needs its original nonempty footer
+        // until native-label capture and unreachable-code removal finish.
         let add_implicit_return = add_implicit_return
             || (self.context.python_version == PythonVersion::Py312
-                && self.control.generators.generator_region_start.is_some()
+                && (self.control.generators.generator_region_start.is_some()
+                    || self.control.statements.retained_native_if_join)
                 && !self.control.statements.emitted_fallthrough_return);
+        if self.context.python_version == PythonVersion::Py312
+            && add_implicit_return
+            && self.assembler.location() == SourceLocation::NONE
+            && terminal_statement.is_some_and(is_elided_statement)
+            && let Some(Stmt::If(conditional)) = body
+                .iter()
+                .rev()
+                .find(|statement| !is_elided_statement(statement))
+            && early_condition_truthiness(&conditional.test).is_none()
+            && conditional.body.iter().all(is_elided_statement)
+            && matches!(conditional.elif_else_clauses.as_slice(), [clause]
+                if clause.test.is_none() && clause.body.iter().all(is_elided_statement))
+        {
+            // General If lowering leaves its original end label here when both
+            // arms and the suffix are erased. Keep that shared footer until
+            // native repeated predecessor counts decide which returns survive.
+            self.assembler.record_current_original_scope_exit();
+        }
         self.finish_inner(add_implicit_return)
     }
 
@@ -1004,9 +1065,13 @@ impl<'source> Compiler<'source> {
         self.output.qualified_name_is_canonical = self
             .context
             .record_class_qualified_name(&self.unit.qualified_name);
+        // A parser-interned dotted name can leave the class constant distinct from
+        // its interned code metadata; preserve the cache admission recorded above.
         self.context.record_constant_string_origin(
             &self.unit.qualified_name,
-            self.has_deferred_annotations() || self.unit.qualified_name == self.unit.name,
+            (self.has_deferred_annotations()
+                && self.output.qualified_name_is_canonical != Some(false))
+                || self.unit.qualified_name == self.unit.name,
         );
         let qualified_name =
             self.add_constant(Constant::String(self.unit.qualified_name.clone()))?;
@@ -1247,6 +1312,8 @@ impl<'source> Compiler<'source> {
         if let Some(start) = self.control.generators.generator_region_start {
             self.assembler.record_exception_setup(start, false);
             let handler = self.assembler.label();
+            self.assembler
+                .record_legacy_native_setup_target(start, handler);
             self.bind_native_source_label(
                 super::legacy_native_labels::NativeRole::StopIterationHandler,
                 handler,
@@ -1628,6 +1695,7 @@ impl CodeUnit {
             positional_only_arg_count: spec.positional_only_arg_count,
             keyword_only_arg_count: spec.keyword_only_arg_count,
             flags: spec.flags,
+            legacy_sync_coroutine: false,
             first_line_number: spec.first_line_number,
             annotation_thunk: false,
         }
