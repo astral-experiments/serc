@@ -985,6 +985,42 @@ impl Assembler {
         items
     }
 
+    /// Finds the last recorded exception-owner block boundary in an emitted item prefix.
+    /// Labels do not have to be authored source boundaries.
+    fn last_block_boundary(&self, items: &[Item]) -> Option<Label> {
+        items.iter().rev().find_map(|item| match item {
+            Item::Label(label)
+                if self
+                    .exception_owner_provenance
+                    .block_boundaries
+                    .contains(label) =>
+            {
+                Some(*label)
+            }
+            _ => None,
+        })
+    }
+
+    /// Finds the last label recorded as both a source and exception-owner block boundary.
+    /// Either kind of boundary alone cannot certify this entry.
+    fn last_source_block_boundary(&self, items: &[Item]) -> Option<Label> {
+        items.iter().rev().find_map(|item| match item {
+            Item::Label(label)
+                if self
+                    .exception_owner_provenance
+                    .source_boundaries
+                    .contains(label)
+                    && self
+                        .exception_owner_provenance
+                        .block_boundaries
+                        .contains(label) =>
+            {
+                Some(*label)
+            }
+            _ => None,
+        })
+    }
+
     pub(crate) fn reserve_items(&mut self, additional: usize) {
         let UnoptimizedCode::Linear(items) = &mut self.code else {
             panic!("linear instructions are unavailable after constant reachability analysis");
@@ -11270,21 +11306,7 @@ impl Assembler {
         {
             return;
         }
-        let Some(entry) = items[..*swap_item]
-            .iter()
-            .rev()
-            .find_map(|item| match item {
-                Item::Label(label)
-                    if self
-                        .exception_owner_provenance
-                        .block_boundaries
-                        .contains(label) =>
-                {
-                    Some(*label)
-                }
-                _ => None,
-            })
-        else {
+        let Some(entry) = self.last_block_boundary(&items[..*swap_item]) else {
             return;
         };
         self.exception_owner_provenance
@@ -11571,25 +11593,7 @@ impl Assembler {
         {
             return;
         }
-        let Some(entry) = items[..return_item]
-            .iter()
-            .rev()
-            .find_map(|item| match item {
-                Item::Label(label)
-                    if self
-                        .exception_owner_provenance
-                        .source_boundaries
-                        .contains(label)
-                        && self
-                            .exception_owner_provenance
-                            .block_boundaries
-                            .contains(label) =>
-                {
-                    Some(*label)
-                }
-                _ => None,
-            })
-        else {
+        let Some(entry) = self.last_source_block_boundary(&items[..return_item]) else {
             return;
         };
         self.exception_owner_provenance
@@ -11734,21 +11738,7 @@ impl Assembler {
         {
             return;
         }
-        let Some(entry) = items[..first_pop_item]
-            .iter()
-            .rev()
-            .find_map(|item| match item {
-                Item::Label(label)
-                    if self
-                        .exception_owner_provenance
-                        .block_boundaries
-                        .contains(label) =>
-                {
-                    Some(*label)
-                }
-                _ => None,
-            })
-        else {
+        let Some(entry) = self.last_block_boundary(&items[..first_pop_item]) else {
             return;
         };
         let records = [pops[0], pops[1], *load];
@@ -11842,25 +11832,7 @@ impl Assembler {
         {
             return;
         }
-        let Some(entry) = items[..return_item]
-            .iter()
-            .rev()
-            .find_map(|item| match item {
-                Item::Label(label)
-                    if self
-                        .exception_owner_provenance
-                        .source_boundaries
-                        .contains(label)
-                        && self
-                            .exception_owner_provenance
-                            .block_boundaries
-                            .contains(label) =>
-                {
-                    Some(*label)
-                }
-                _ => None,
-            })
-        else {
+        let Some(entry) = self.last_source_block_boundary(&items[..return_item]) else {
             return;
         };
         let origin = exception_owners::CopiedReturnCallPrefix {
@@ -11956,25 +11928,7 @@ impl Assembler {
         {
             return;
         }
-        let Some(entry) = items[..return_item]
-            .iter()
-            .rev()
-            .find_map(|item| match item {
-                Item::Label(label)
-                    if self
-                        .exception_owner_provenance
-                        .source_boundaries
-                        .contains(label)
-                        && self
-                            .exception_owner_provenance
-                            .block_boundaries
-                            .contains(label) =>
-                {
-                    Some(*label)
-                }
-                _ => None,
-            })
-        else {
+        let Some(entry) = self.last_source_block_boundary(&items[..return_item]) else {
             return;
         };
         let origin = exception_owners::CopiedReturnAttributeTruthPrefix {
@@ -14419,17 +14373,7 @@ impl Assembler {
     /// Captures the two original NULL POP records around a saved handler return value.
     pub(crate) fn record_named_handler_pop_pair(&mut self, start: usize) {
         let items = self.linear_items();
-        let Some(entry) = items[..start].iter().rev().find_map(|item| match item {
-            Item::Label(label)
-                if self
-                    .exception_owner_provenance
-                    .block_boundaries
-                    .contains(label) =>
-            {
-                Some(*label)
-            }
-            _ => None,
-        }) else {
+        let Some(entry) = self.last_block_boundary(&items[..start]) else {
             return;
         };
         let original = items[start..].to_vec();
@@ -14829,21 +14773,7 @@ impl Assembler {
         {
             return;
         }
-        let Some(entry) = items[..return_item]
-            .iter()
-            .rev()
-            .find_map(|item| match item {
-                Item::Label(label)
-                    if self
-                        .exception_owner_provenance
-                        .block_boundaries
-                        .contains(label) =>
-                {
-                    Some(*label)
-                }
-                _ => None,
-            })
-        else {
+        let Some(entry) = self.last_block_boundary(&items[..return_item]) else {
             return;
         };
         if !self
@@ -14929,17 +14859,7 @@ impl Assembler {
         if start == first_pop_item {
             return;
         }
-        let Some(entry) = items[..start].iter().rev().find_map(|item| match item {
-            Item::Label(label)
-                if self
-                    .exception_owner_provenance
-                    .block_boundaries
-                    .contains(label) =>
-            {
-                Some(*label)
-            }
-            _ => None,
-        }) else {
+        let Some(entry) = self.last_block_boundary(&items[..start]) else {
             return;
         };
         // The already captured handler pair authenticates this original return array.
