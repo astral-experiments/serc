@@ -1,17 +1,6 @@
-use std::process::Command;
-
-use serc::{CompileError, CompileOptions, PythonVersion, compile_with_options};
+use serc::{CompileError, CompileOptions, compile_with_options};
 
 use crate::common;
-
-fn python(version: PythonVersion) -> Command {
-    match version {
-        PythonVersion::Py312 => common::python_312_command(),
-        PythonVersion::Py313 => common::python_313_command(),
-        PythonVersion::Py314 => common::python_3145_command(),
-        PythonVersion::Py315 => common::python_315_command(),
-    }
-}
 
 #[test]
 fn rejects_transfers_leaving_except_star_before_discarding_code() {
@@ -33,14 +22,9 @@ fn rejects_transfers_leaving_except_star_before_discarding_code() {
             format!("try: pass\nexcept* Exception:\n    while condition:\n        try: pass\n        except* Exception: {transfer}\n"),
         ]);
     }
-    for version in [
-        PythonVersion::Py312,
-        PythonVersion::Py313,
-        PythonVersion::Py314,
-        PythonVersion::Py315,
-    ] {
+    for version in common::PYTHON_VERSIONS {
         for source in &sources {
-            let native = python(version)
+            let native = common::python_command(version)
                 .args([
                     "-c",
                     "import sys; compile(sys.argv[1], 'except_star.py', 'exec')",
@@ -105,18 +89,13 @@ fn except_star_boundaries_preserve_valid_code_and_nested_scope_diagnostics() {
             format!("while condition:\n    try: pass\n    except Exception: {transfer}\n"),
         ]);
     }
-    for version in [
-        PythonVersion::Py312,
-        PythonVersion::Py313,
-        PythonVersion::Py314,
-        PythonVersion::Py315,
-    ] {
+    for version in common::PYTHON_VERSIONS {
         let options = CompileOptions {
             python_version: version,
             ..CompileOptions::default()
         };
         for source in &sources {
-            let native = python(version)
+            let native = common::python_command(version)
                 .args([
                     "-c",
                     "import sys; compile(sys.argv[1], 'except_star.py', 'exec')",
@@ -146,7 +125,7 @@ fn except_star_boundaries_preserve_valid_code_and_nested_scope_diagnostics() {
                 "'continue' not properly in loop",
             ),
         ] {
-            let native = python(version)
+            let native = common::python_command(version)
                 .args([
                     "-c",
                     "import sys; compile(sys.argv[1], 'except_star.py', 'exec')",
@@ -169,12 +148,7 @@ fn except_star_boundaries_preserve_valid_code_and_nested_scope_diagnostics() {
 
 #[test]
 fn invalid_return_expressions_precede_except_star_transfer_errors() {
-    for version in [
-        PythonVersion::Py312,
-        PythonVersion::Py313,
-        PythonVersion::Py314,
-        PythonVersion::Py315,
-    ] {
+    for version in common::PYTHON_VERSIONS {
         for (expression, native_message, expected_message) in [
             (
                 "*values",
@@ -189,7 +163,7 @@ fn invalid_return_expressions_precede_except_star_transfer_errors() {
         ] {
             let source =
                 format!("def f():\n    try: pass\n    except* Exception: return {expression}\n");
-            let native = python(version)
+            let native = common::python_command(version)
                 .args([
                     "-c",
                     "import sys; compile(sys.argv[1], 'except_star.py', 'exec')",

@@ -149,12 +149,7 @@ fn nesting_error_points_to_the_first_delimiter_over_the_limit() {
 fn nesting_limit_matches_each_supported_python_version() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("versions.py");
-    for (version, python) in [
-        ("3.12", common::python_312_command as fn() -> Command),
-        ("3.13", common::python_313_command),
-        ("3.14", common::python_3145_command),
-        ("3.15", common::python_315_command),
-    ] {
+    for version in common::PYTHON_VERSIONS {
         for (n, fstring) in [(200, false), (201, false), (199, true), (200, true)] {
             let expression = deep_expression(n);
             let source = if fstring {
@@ -163,7 +158,7 @@ fn nesting_limit_matches_each_supported_python_version() {
                 format!("x={expression}\n")
             };
             std::fs::write(&path, &source).unwrap();
-            let native = python()
+            let native = common::python_command(version)
                 .args([
                     "-c",
                     "import sys; compile(open(sys.argv[1], 'rb').read(), sys.argv[1], 'exec')",
@@ -172,7 +167,8 @@ fn nesting_limit_matches_each_supported_python_version() {
                 .output()
                 .unwrap();
             let compiled = Command::new(env!("CARGO_BIN_EXE_serc"))
-                .args(["compile", "--check", "--quiet", "--python-version", version])
+                .args(["compile", "--check", "--quiet", "--python-version"])
+                .arg(version.to_string())
                 .arg(&path)
                 .output()
                 .unwrap();
@@ -198,19 +194,14 @@ fn nesting_limit_matches_each_supported_python_version() {
 fn template_string_nesting_depends_on_the_target_version() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("template.py");
-    for (version, python) in [
-        ("3.12", common::python_312_command as fn() -> Command),
-        ("3.13", common::python_313_command),
-        ("3.14", common::python_3145_command),
-        ("3.15", common::python_315_command),
-    ] {
+    for version in common::PYTHON_VERSIONS {
         for prefix in ["t", "T", "tr", "rT"] {
             for source in [
                 format!("x={prefix}\"{{{}}}\"\n", deep_expression(200)),
                 format!("x={prefix}\"literal\"\ny={}\n", deep_expression(201)),
             ] {
                 std::fs::write(&path, &source).unwrap();
-                let native = python()
+                let native = common::python_command(version)
                     .args([
                         "-c",
                         "import sys; compile(open(sys.argv[1], 'rb').read(), sys.argv[1], 'exec')",
@@ -219,7 +210,8 @@ fn template_string_nesting_depends_on_the_target_version() {
                     .output()
                     .unwrap();
                 let compiled = Command::new(env!("CARGO_BIN_EXE_serc"))
-                    .args(["compile", "--check", "--quiet", "--python-version", version])
+                    .args(["compile", "--check", "--quiet", "--python-version"])
+                    .arg(version.to_string())
                     .arg(&path)
                     .output()
                     .unwrap();

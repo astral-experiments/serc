@@ -95,23 +95,13 @@ except SyntaxError as error:
 else:
     raise AssertionError('expected a syntax error')
 ";
-    for version in [
-        PythonVersion::Py312,
-        PythonVersion::Py313,
-        PythonVersion::Py314,
-        PythonVersion::Py315,
-    ] {
+    for version in common::PYTHON_VERSIONS {
         let options = CompileOptions {
             python_version: version,
             ..CompileOptions::default()
         };
         for (source, expected) in &cases {
-            let mut python = match version {
-                PythonVersion::Py312 => common::python_312_command(),
-                PythonVersion::Py313 => common::python_313_command(),
-                PythonVersion::Py314 => common::python_3145_command(),
-                PythonVersion::Py315 => common::python_315_command(),
-            };
+            let mut python = common::python_command(version);
             let output = python.args(["-c", oracle, source]).output().unwrap();
             assert!(output.status.success(), "{version}: {source}: {output:?}");
             let output = String::from_utf8(output.stdout).unwrap();
@@ -327,12 +317,7 @@ except SyntaxError as error:
     raise SystemExit(1)
 sys.stdout.buffer.write(marshal.dumps(code))
 ";
-    for version in [
-        PythonVersion::Py312,
-        PythonVersion::Py313,
-        PythonVersion::Py314,
-        PythonVersion::Py315,
-    ] {
+    for version in common::PYTHON_VERSIONS {
         let options = CompileOptions {
             python_version: version,
             ..CompileOptions::default()
@@ -350,12 +335,7 @@ sys.stdout.buffer.write(marshal.dumps(code))
                     .filter(|_| version < PythonVersion::Py314),
             )
         {
-            let mut python = match version {
-                PythonVersion::Py312 => common::python_312_command(),
-                PythonVersion::Py313 => common::python_313_command(),
-                PythonVersion::Py314 => common::python_3145_command(),
-                PythonVersion::Py315 => common::python_315_command(),
-            };
+            let mut python = common::python_command(version);
             let native = python
                 .args(["-c", oracle, source])
                 .arg(&path)

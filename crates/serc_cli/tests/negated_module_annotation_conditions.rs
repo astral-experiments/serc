@@ -1,6 +1,6 @@
 mod common;
 
-use serc::{CompileOptions, PythonVersion, compile_bytes_with_options, compile_with_options};
+use serc::{CompileOptions, compile_bytes_with_options, compile_with_options};
 
 #[test]
 fn negated_constant_condition_before_module_annotations_matches_cpython() {
@@ -41,20 +41,10 @@ fn negated_constant_condition_before_module_annotations_matches_cpython() {
     let source_path = directory.path().join("negated_conditional_annotations.py");
     let filename = source_path.to_string_lossy();
     let mut mismatches = Vec::new();
-    for version in [
-        PythonVersion::Py312,
-        PythonVersion::Py313,
-        PythonVersion::Py314,
-        PythonVersion::Py315,
-    ] {
+    for version in common::PYTHON_VERSIONS {
         for source in cases {
             fs_err::write(&source_path, source).unwrap();
-            let mut native = match version {
-                PythonVersion::Py312 => common::python_312_command(),
-                PythonVersion::Py313 => common::python_313_command(),
-                PythonVersion::Py314 => common::python_3145_command(),
-                PythonVersion::Py315 => common::python_315_command(),
-            };
+            let mut native = common::python_command(version);
             let native = native
                 .args([
                     "-c",

@@ -2,22 +2,6 @@ use serc::{CompileError, CompileOptions, PythonVersion, compile_with_options};
 
 use crate::common;
 
-fn oracle(version: PythonVersion) -> std::process::Command {
-    match version {
-        PythonVersion::Py312 => common::python_312_command(),
-        PythonVersion::Py313 => common::python_313_command(),
-        PythonVersion::Py314 => common::python_3145_command(),
-        PythonVersion::Py315 => common::python_315_command(),
-    }
-}
-
-const VERSIONS: [PythonVersion; 4] = [
-    PythonVersion::Py312,
-    PythonVersion::Py313,
-    PythonVersion::Py314,
-    PythonVersion::Py315,
-];
-
 #[test]
 fn rejects_async_generator_value_returns_from_eager_nested_headers() {
     let header_cases = [
@@ -38,7 +22,7 @@ fn rejects_async_generator_value_returns_from_eager_nested_headers() {
         "async def f():\n    class C((yield 1)): pass\n    try: pass\n    except* Exception: return 1\n",
         "async def f():\n    class C((yield 1)): pass\n    return 1\n    break\n",
     ];
-    for version in VERSIONS {
+    for version in common::PYTHON_VERSIONS {
         let mut cases = header_cases.to_vec();
         if version < PythonVersion::Py314 {
             cases.extend([
@@ -47,7 +31,7 @@ fn rejects_async_generator_value_returns_from_eager_nested_headers() {
             ]);
         }
         for source in cases {
-            let native = oracle(version)
+            let native = common::python_command(version)
                 .args([
                     "-c",
                     "import sys; compile(sys.argv[1], 'async_generator_return.py', 'exec')",
@@ -92,13 +76,13 @@ fn async_generator_return_checks_preserve_independent_scopes_and_bare_returns() 
         "async def f():\n    def g(x: (lambda: (yield 1))): pass\n    return 1\n",
         "from __future__ import annotations\nasync def f():\n    def g(x: (lambda: (yield 1))): pass\n    return 1\n",
     ];
-    for version in VERSIONS {
+    for version in common::PYTHON_VERSIONS {
         for source in cases {
             let directory = tempfile::tempdir().unwrap();
             let source_path = directory.path().join("async_generator_return.py");
             let pyc_path = directory.path().join("async_generator_return.pyc");
             fs_err::write(&source_path, source).unwrap();
-            let native = oracle(version)
+            let native = common::python_command(version)
                 .args([
                     "-c",
                     "import py_compile, sys; py_compile.compile(sys.argv[1], cfile=sys.argv[2], doraise=True)",
@@ -137,7 +121,7 @@ fn async_generator_return_checks_preserve_independent_scopes_and_bare_returns() 
 
 #[test]
 fn async_generator_return_checks_preserve_prior_scope_errors() {
-    for version in VERSIONS {
+    for version in common::PYTHON_VERSIONS {
         let mut cases = vec![
             (
                 "async def f():\n    class C((yield 1)): pass\n    break\n    return 1\n",
@@ -159,7 +143,7 @@ fn async_generator_return_checks_preserve_prior_scope_errors() {
             ));
         }
         for (source, scope) in cases {
-            let native = oracle(version)
+            let native = common::python_command(version)
                 .args([
                     "-c",
                     "import sys; compile(sys.argv[1], 'async_generator_return.py', 'exec')",

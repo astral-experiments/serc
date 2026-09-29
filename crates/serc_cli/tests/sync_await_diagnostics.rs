@@ -1,18 +1,6 @@
 mod common;
 
-use serc::{
-    CompileError, CompileOptions, PythonVersion, compile_bytes_with_options, compile_with_options,
-};
-
-fn byte_offset(source: &str, line: usize, column: usize) -> usize {
-    source
-        .split_inclusive('\n')
-        .take(line - 1)
-        .map(str::len)
-        .sum::<usize>()
-        + column
-        - 1
-}
+use serc::{CompileOptions, compile_bytes_with_options, compile_with_options};
 
 #[test]
 fn await_outside_async_function_matches_python() {
@@ -30,67 +18,15 @@ fn await_outside_async_function_matches_python() {
         "class C:\n    await g()\n",
         "def f():\n    class C:\n        await g()\n",
     ];
-    let oracle = r"
-import sys
-try:
-    compile(sys.argv[1], 'case.py', 'exec', dont_inherit=True)
-except SyntaxError as error:
-    print(error.msg)
-    print(error.lineno, error.offset, error.end_lineno, error.end_offset)
-else:
-    raise AssertionError('expected a syntax error')
-";
-    for version in [
-        PythonVersion::Py312,
-        PythonVersion::Py313,
-        PythonVersion::Py314,
-        PythonVersion::Py315,
-    ] {
+    for version in common::PYTHON_VERSIONS {
         let options = CompileOptions {
             python_version: version,
             ..CompileOptions::default()
         };
         for source in sources {
-            let mut python = match version {
-                PythonVersion::Py312 => common::python_312_command(),
-                PythonVersion::Py313 => common::python_313_command(),
-                PythonVersion::Py314 => common::python_3145_command(),
-                PythonVersion::Py315 => common::python_315_command(),
-            };
-            let output = python.args(["-c", oracle, source]).output().unwrap();
-            assert!(output.status.success(), "{version}: {source:?}: {output:?}");
-            let output = String::from_utf8(output.stdout).unwrap();
-            let mut lines = output.lines();
-            let message = lines.next().unwrap();
-            let positions: Vec<usize> = lines
-                .next()
-                .unwrap()
-                .split_whitespace()
-                .map(|value| value.parse().unwrap())
-                .collect();
-            let expected = (
-                byte_offset(source, positions[0], positions[1]),
-                byte_offset(source, positions[2], positions[3]),
-            );
-            for result in [
-                compile_with_options(source, "case.py", &options),
-                compile_bytes_with_options(source.as_bytes(), "case.py", &options),
-            ] {
-                let error = result.unwrap_err();
-                let CompileError::InvalidSyntax {
-                    message: actual, ..
-                } = &error
-                else {
-                    panic!("{version}: {source:?}: expected syntax error, got {error}");
-                };
-                assert_eq!(actual, message, "{version}: {source:?}");
-                let range = error.range().unwrap();
-                assert_eq!(
-                    (range.start().to_usize(), range.end().to_usize()),
-                    expected,
-                    "{version}: {source:?}"
-                );
-            }
+            let diagnostic = common::diagnostics::syntax_diagnostic(version, source);
+            let expected = diagnostic.byte_range(source);
+            diagnostic.assert_syntax_error(source, &options, expected);
         }
         for source in [
             "async def f():\n    await g()\n",
