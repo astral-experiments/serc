@@ -100,4 +100,4 @@ instead of the full outcome baseline. Snapshot identity and update instructions
 live in the [corpus guide](../corpora/README.md).
 
 Earlier Python-wrapper and holdout measurements are recorded in
-[the measurement archive](../corpora/results/current.json).
+[the measurement archive](https://github.com/astral-sh/serc/blob/1a2f5de33774fd70406a91963b2d33aea64a3aba/corpora/results/current.json).
