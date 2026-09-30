@@ -33,6 +33,7 @@ pub(super) trait MarshalVisitor<'a> {
     fn code(&mut self, code: &'a CodeObject, reference_mode: ReferenceMode) -> bool;
     fn code_bytes(&mut self, code: &'a CodeObject);
     fn constants(&mut self, values: &'a [Constant], reference_mode: ReferenceMode) -> bool;
+    /// Visits the constants tuple with access to its cached hash before descending into members.
     fn code_constants(&mut self, code: &'a CodeObject) -> bool {
         self.constants(&code.constants, ReferenceMode::IfShared)
     }
@@ -49,6 +50,7 @@ pub(super) trait MarshalVisitor<'a> {
     }
     fn first_line(&mut self, value: u32);
     fn bytes(&mut self, value: &'a [u8]);
+    /// Visits table bytes with an optional marshal-key hash; scalar identity rules still apply.
     fn bytes_with_hash(&mut self, value: &'a [u8], _hash: Option<u64>) {
         self.bytes(value);
     }

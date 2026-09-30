@@ -986,7 +986,8 @@ pub(super) fn constants_tuple_key(values: &[Constant]) -> ObjectKey<'_> {
     }
 }
 
-/// Cache only value keys: cloning a nested code object changes its identity and hash.
+/// Hashes a finalized constants tuple for reuse after moving or cloning its code object.
+/// Empty tuples need no hash; code descendants prevent caching because cloning changes their keys.
 pub(crate) fn constants_tuple_hash(values: &[Constant]) -> Option<u64> {
     fn has_code(value: &Constant) -> bool {
         match value {

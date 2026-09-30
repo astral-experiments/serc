@@ -2486,6 +2486,8 @@ struct GraphVisitor<'graph, 'code> {
 }
 
 impl<'code> GraphVisitor<'_, 'code> {
+    /// Records the constants tuple, using a cached value hash when available.
+    /// Root and code-bearing tuples retain unique identities; string tuples may alias metadata.
     fn constants_with_hash(&mut self, values: &'code [Constant], hash: Option<u64>) -> bool {
         let root_constants = std::mem::take(&mut self.root_constants);
         if values.is_empty() {
@@ -2494,7 +2496,6 @@ impl<'code> GraphVisitor<'_, 'code> {
                 .record_cached_value(OccurrenceKind::Constants, CachedObject::EmptyTuple);
         }
         let key = constants_tuple_key(values);
-        // Code-containing tuples are unique; all-string tuples can alias metadata.
         if matches!(&key, ObjectKey::ConstantTuple(_))
             && (root_constants
                 || values

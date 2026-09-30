@@ -79,13 +79,9 @@ fn cached_constants_tuple_hashes_preserve_marshal_and_pyc_after_cloning() {
                 compile_with_options(workload.source, workload.filename, &options).unwrap();
             let mut fallback = module.clone();
             clear_hashes(&mut fallback.code);
-            assert_eq!(module.marshal(), fallback.marshal(), "{}", workload.id);
-            assert_eq!(
-                module.clone().marshal(),
-                fallback.marshal(),
-                "{}",
-                workload.id
-            );
+            let expected = fallback.marshal();
+            assert_eq!(module.marshal(), expected, "{}", workload.id);
+            assert_eq!(module.clone().marshal(), expected, "{}", workload.id);
             assert_eq!(
                 module.to_timestamp_pyc(0, 0),
                 fallback.to_timestamp_pyc(0, 0),

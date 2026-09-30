@@ -31,7 +31,8 @@ fn proves_shallow_nesting(source: &str) -> bool {
                 if interpolated && triple {
                     return false;
                 }
-                index += if triple { 3 } else { 1 };
+                let width = if triple { 3 } else { 1 };
+                index += width;
                 let mut field_depth = 0_usize;
                 let mut opening_count = 0;
                 loop {
@@ -44,7 +45,7 @@ fn proves_shallow_nesting(source: &str) -> bool {
                         if field_depth != 0 {
                             return false;
                         }
-                        index += if triple { 3 } else { 1 };
+                        index += width;
                         break;
                     }
                     if !triple && matches!(current, b'\n' | b'\r') {
@@ -116,6 +117,7 @@ pub(crate) fn validate(
     validate_with_fast_scan::<true>(source, options, version)
 }
 
+/// Validates nesting with an optional byte-scan proof; tests disable it to check lexer parity.
 fn validate_with_fast_scan<const FAST_SCAN: bool>(
     source: &str,
     options: &ParseOptions,
