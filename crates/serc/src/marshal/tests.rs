@@ -13,6 +13,86 @@ use super::key::{
 use super::plan::{MarshalVisitor, ObjectId, ReferenceMode, traverse_code};
 
 #[test]
+fn graph_summaries_preserve_benchmark_and_cloned_streams() {
+    for workload in serc_fixtures::COMPILE_MICRO_WORKLOADS
+        .iter()
+        .chain(serc_fixtures::MARSHAL_MICRO_WORKLOADS)
+        .chain(serc_fixtures::COMPOSITE_WORKLOADS)
+        .chain(serc_fixtures::LARGE_WORKLOADS)
+    {
+        let module = crate::compile(workload.source, workload.filename).unwrap();
+        let mut fallback = module.clone();
+        fallback.code.marshal_provenance.marshal_graph_summary = None;
+        assert_eq!(module.marshal(), fallback.marshal(), "{}", workload.id);
+        assert_eq!(
+            module.clone().marshal(),
+            fallback.marshal(),
+            "{} clone",
+            workload.id
+        );
+        assert_eq!(
+            module.to_timestamp_pyc(123, 456),
+            fallback.to_timestamp_pyc(123, 456),
+            "{} pyc",
+            workload.id
+        );
+        if workload.id == "large_dataset" {
+            assert!(
+                module
+                    .code
+                    .marshal_provenance
+                    .marshal_graph_summary
+                    .unwrap()
+                    .no_supplemental_interns
+            );
+            assert!(
+                module
+                    .code
+                    .marshal_provenance
+                    .metadata_alias_scan_unnecessary
+            );
+            assert!(
+                !module
+                    .code
+                    .marshal_provenance
+                    .subtree_has_frozenset_constants
+            );
+        }
+    }
+}
+
+#[test]
+fn graph_summary_keeps_nested_qualified_name_origin_analysis() {
+    for python_version in [
+        crate::PythonVersion::Py312,
+        crate::PythonVersion::Py313,
+        crate::PythonVersion::Py314,
+        crate::PythonVersion::Py315,
+    ] {
+        let module = crate::compile_with_options(
+            "def outer():\n    class Inner:\n        pass\n    return Inner\n",
+            "nested_class.py",
+            &crate::CompileOptions {
+                python_version,
+                ..crate::CompileOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            !module
+                .code
+                .marshal_provenance
+                .marshal_graph_summary
+                .unwrap()
+                .no_supplemental_interns
+        );
+        let mut fallback = module.clone();
+        fallback.code.marshal_provenance.marshal_graph_summary = None;
+        assert_eq!(module.marshal(), fallback.marshal(), "{python_version}");
+    }
+}
+
+#[test]
 fn cached_constant_tuple_hashes_preserve_cloned_benchmark_streams() {
     fn clear_hashes(code: &mut CodeObject) {
         code.marshal_provenance.constants_tuple_hash = None;
@@ -725,6 +805,56 @@ fn frozenset_free_provenance_walk_preserves_nested_interns_and_qualified_names()
     let graph = ObjectGraph::for_code(&hinted);
     assert!(graph.is_interned("méthode"));
     assert!(graph.is_interned("Nested"));
+}
+
+#[test]
+fn canonical_and_supplemental_interns_preserve_the_same_stream() {
+    let mut child = code_object(vec![Constant::String("σχήμα".to_string())]);
+    child
+        .marshal_provenance
+        .explicitly_interned_strings
+        .insert("σχήμα".to_string());
+    let mut canonical = code_object(vec![
+        Constant::String("méthode".to_string()),
+        Constant::Code(Box::new(child)),
+    ]);
+    canonical
+        .marshal_provenance
+        .canonical_constant_strings
+        .insert("méthode".to_string());
+    let mut supplemental = canonical.clone();
+    supplemental
+        .marshal_provenance
+        .canonical_constant_strings
+        .clear();
+    supplemental
+        .marshal_provenance
+        .explicitly_interned_strings
+        .insert("méthode".to_string());
+
+    for python_version in [
+        crate::PythonVersion::Py312,
+        crate::PythonVersion::Py313,
+        crate::PythonVersion::Py314,
+        crate::PythonVersion::Py315,
+    ] {
+        assert_eq!(
+            super::writer::encode_code_with_options(
+                &canonical,
+                python_version,
+                &crate::InitialInternState::default()
+            ),
+            super::writer::encode_code_with_options(
+                &supplemental,
+                python_version,
+                &crate::InitialInternState::default()
+            ),
+            "{python_version}"
+        );
+    }
+    let graph = ObjectGraph::for_code(&canonical);
+    assert!(graph.is_interned("méthode"));
+    assert!(graph.is_interned("σχήμα"));
 }
 
 #[test]

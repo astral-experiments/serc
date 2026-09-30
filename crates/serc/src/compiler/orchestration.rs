@@ -1598,6 +1598,7 @@ impl<'source> Compiler<'source> {
                 metadata_tuple_properties: Some(metadata_tuple_properties),
                 constants_tuple_hash,
                 marshal_occurrence_bound: Some(marshal_occurrence_bound),
+                marshal_graph_summary: None,
                 table_hashes: None,
                 subtree_has_frozenset_constants: self.output.has_frozenset_constants,
                 metadata_alias_scan_unnecessary: false,
@@ -1617,6 +1618,7 @@ impl<'source> Compiler<'source> {
             code.marshal_provenance.metadata_alias_scan_unnecessary =
                 metadata_alias_scan_unnecessary(&code);
         }
+        code.marshal_provenance.marshal_graph_summary = crate::marshal::code_graph_summary(&code);
         Ok(code)
     }
 
