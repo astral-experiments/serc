@@ -5,14 +5,31 @@ and committed lockfile.
 
 ## Criterion
 
-The `compile` and `marshal` groups measure fixed workloads through Serc's public
-API:
+The benchmark groups measure fixed workloads through Serc's public API:
+
+| Group | Timed work | Per-iteration setup and cleanup |
+| --- | --- | --- |
+| `compile` | Compile source into a fresh module | Module cleanup is outside timing |
+| `marshal_once` | Marshal a newly compiled module exactly once | Compilation and module/output cleanup are outside timing |
+| `compile_pyc` | Compile source, encode one timestamp PYC in memory, and drop the module/output | All work is timed; no disk I/O |
+
+`marshal_once` compiles a fresh module during batch setup for every iteration,
+including warmup. It does not reuse or clone a previously serialized module.
+This makes first-serialization preparation visible even if an implementation
+caches work for subsequent calls. `compile_pyc` also measures preparation moved
+into compilation, and includes cleanup costs that phase-isolated measurements
+exclude. It covers all compile and marshal workloads, including the large fixture.
+
+`marshal_once` replaces the old `marshal` group with a new name because the
+per-iteration lifecycle changed. Establish a new CodSpeed baseline for this group;
+historical repeated-module results measure a different operation.
 
 ```console
 CARGO_INCREMENTAL=0 cargo bench --locked --profile profiling -p serc_benchmark --bench compiler --no-default-features --features benchmarks
 ```
 
-Append `-- compile` or `-- marshal` to filter, `-- --save-baseline main` to save
+Append `-- compile/`, `-- marshal_once/`, or `-- compile_pyc/` to filter by group,
+`-- --save-baseline main` to save
 a baseline, or `-- --baseline main` to compare against it. Other Criterion
 options follow `--`.
 
@@ -33,7 +50,10 @@ discovery and reads outside timing. It supports three phases:
 | ----------------- | -------------------------------- |
 | `compiler_core`   | Compile source into code objects |
 | `compile_marshal` | Compile and marshal              |
-| `marshal_only`    | Marshal precompiled code objects |
+| `marshal_only`    | Marshal retained, precompiled code objects |
+
+The corpus example's `marshal_only` phase reuses modules across samples.
+Use `compile_marshal` to compare the usual compile-once/serialize-once workflow.
 
 ```console
 cargo run --locked --profile profiling -p serc --example benchmark_cpython_corpus -- \
