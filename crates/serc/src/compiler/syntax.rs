@@ -1603,12 +1603,25 @@ fn invalid_call_keyword(
     arguments: &ast::Arguments,
     forbid_debug: bool,
 ) -> Option<(&str, TextRange)> {
-    if arguments.keywords.len() < 2 {
-        return arguments.keywords.first().and_then(|keyword| {
-            keyword.arg.as_ref().and_then(|name| {
-                (forbid_debug && name == "__debug__").then_some((name.as_str(), keyword.range))
-            })
-        });
+    // Ordinary calls have only a few keywords. Check them in the same diagnostic
+    // order without allocating a table; retain the indexed walk for long calls.
+    if arguments.keywords.len() <= 8 {
+        for (index, keyword) in arguments.keywords.iter().enumerate() {
+            let Some(name) = &keyword.arg else {
+                continue;
+            };
+            if forbid_debug && name == "__debug__" {
+                return Some((name.as_str(), keyword.range));
+            }
+            if let Some(next) = arguments.keywords[index + 1..].iter().find(|next| {
+                next.arg
+                    .as_ref()
+                    .is_some_and(|next| next.as_str() == name.as_str())
+            }) {
+                return Some((name.as_str(), next.range));
+            }
+        }
+        return None;
     }
     let mut seen = FxHashMap::default();
     let mut repeated = None;
@@ -2027,10 +2040,6 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
     }
 
     fn visit_expr(&mut self, expression: &'ast Expr) {
-        if crate::stack_growth_required() {
-            return crate::grow_stack(|| self.visit_expr(expression));
-        }
-
         if FUTURE_ONLY {
             return;
         }
@@ -2051,6 +2060,9 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
             | Expr::NoneLiteral(_)
             | Expr::EllipsisLiteral(_) => return,
             Expr::Attribute(attribute) => {
+                if crate::stack_growth_required() {
+                    return crate::grow_stack(|| self.visit_expr(expression));
+                }
                 self.check_debug_write(attribute.attr.as_str(), attribute.ctx, attribute.range);
                 let mut base = attribute.value.as_ref();
                 while let Expr::Attribute(attribute) = base {
@@ -2060,6 +2072,9 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
                 return;
             }
             _ => {}
+        }
+        if crate::stack_growth_required() {
+            return crate::grow_stack(|| self.visit_expr(expression));
         }
         if self.error.borrow().is_some() {
             return;
@@ -2802,6 +2817,63 @@ mod tests {
         PythonVersion::Py314,
         PythonVersion::Py315,
     ];
+
+    #[test]
+    fn small_keyword_checks_preserve_indexed_diagnostic_order() {
+        fn check(keywords: &[&str]) {
+            let source = format!("f({})", keywords.join(", "));
+            let parsed = parse_module(&source).unwrap();
+            let ruff_python_ast::Stmt::Expr(statement) = &parsed.syntax().body[0] else {
+                unreachable!();
+            };
+            let ruff_python_ast::Expr::Call(call) = statement.value.as_ref() else {
+                unreachable!();
+            };
+            for forbid_debug in [false, true] {
+                let mut seen = rustc_hash::FxHashMap::default();
+                let mut expected = None;
+                for keyword in call.arguments.keywords.iter().rev() {
+                    if let Some(name) = &keyword.arg {
+                        let next = seen.insert(name.as_str(), keyword.range);
+                        if forbid_debug && name == "__debug__" {
+                            expected = Some((name.as_str(), keyword.range));
+                        } else if let Some(range) = next {
+                            expected = Some((name.as_str(), range));
+                        }
+                    }
+                }
+                assert_eq!(
+                    super::invalid_call_keyword(&call.arguments, forbid_debug),
+                    expected,
+                    "{source}, forbid_debug={forbid_debug}"
+                );
+            }
+        }
+
+        const KEYWORDS: [&str; 4] = ["a=1", "b=2", "__debug__=3", "**values"];
+        for len in 0..=5_u32 {
+            for mut pattern in 0..4_usize.pow(len) {
+                let keywords = (0..len)
+                    .map(|_| {
+                        let keyword = KEYWORDS[pattern % KEYWORDS.len()];
+                        pattern /= KEYWORDS.len();
+                        keyword
+                    })
+                    .collect::<Vec<_>>();
+                check(&keywords);
+            }
+        }
+        for len in [8, 9, 24] {
+            for offset in 0..KEYWORDS.len() {
+                check(
+                    &(0..len)
+                        .map(|index| KEYWORDS[(index + offset) % KEYWORDS.len()])
+                        .collect::<Vec<_>>(),
+                );
+            }
+        }
+        check(&["α=1", "beta=2", "α=3"]);
+    }
 
     #[test]
     fn optimized_assertions_keep_symbol_table_errors() {
