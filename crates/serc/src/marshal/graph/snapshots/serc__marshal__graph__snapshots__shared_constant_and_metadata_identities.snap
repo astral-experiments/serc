@@ -2,26 +2,26 @@
 source: crates/serc/src/marshal/graph/snapshots.rs
 expression: snapshot
 ---
-object 0: shared=false cached=false interned=false
-object 1: shared=false cached=false interned=false
-object 2: shared=false cached=false interned=false
-object 3: shared=true cached=true interned=true
-object 4: shared=false cached=false interned=false
-object 5: shared=false cached=false interned=false
-object 6: shared=false cached=false interned=false
-object 7: shared=true cached=false interned=false
-object 8: shared=true cached=true interned=false
-object 9: shared=false cached=false interned=false
-object 10: shared=false cached=true interned=true
-object 11: shared=false cached=false interned=false
-object 12: shared=true cached=true interned=true
-object 13: shared=true cached=true interned=true
-object 14: shared=false cached=false interned=false
-object 15: shared=true cached=true interned=false
-object 16: shared=false cached=false interned=false
-object 17: shared=false cached=true interned=true
-object 18: shared=true cached=true interned=true
-object 19: shared=false cached=false interned=false
+object 0: reference_required=false interned=false
+object 1: reference_required=false interned=false
+object 2: reference_required=false interned=false
+object 3: reference_required=true interned=true
+object 4: reference_required=false interned=false
+object 5: reference_required=false interned=false
+object 6: reference_required=false interned=false
+object 7: reference_required=true interned=false
+object 8: reference_required=true interned=false
+object 9: reference_required=false interned=false
+object 10: reference_required=true interned=true
+object 11: reference_required=false interned=false
+object 12: reference_required=true interned=true
+object 13: reference_required=true interned=true
+object 14: reference_required=false interned=false
+object 15: reference_required=true interned=false
+object 16: reference_required=false interned=false
+object 17: reference_required=true interned=true
+object 18: reference_required=true interned=true
+object 19: reference_required=false interned=false
 visit 0: Code -> object 0
 visit 1: CodeBytes -> object 1
 visit 2: Constants -> object 2

@@ -23,8 +23,8 @@ use super::plan::{MarshalVisitor, ObjectId, ReferenceId, ReferenceMode, traverse
 
 #[derive(Debug)]
 pub(super) struct Object {
-    shared: bool,
-    cached: bool,
+    // Cached objects and repeated values both require references in IfShared mode.
+    reference_required: bool,
     interned: bool,
     reference: Option<ReferenceId>,
 }
@@ -43,7 +43,7 @@ impl Object {
         mode: ReferenceMode,
         reference_count: &mut usize,
     ) -> ObjectReference {
-        if mode == ReferenceMode::IfShared && !self.shared && !self.cached {
+        if mode == ReferenceMode::IfShared && !self.reference_required {
             return ObjectReference::Unshared;
         }
         if let Some(index) = self.reference {
@@ -565,11 +565,15 @@ impl<'a> ObjectGraph<'a> {
         first
     }
 
-    #[inline]
+    #[expect(
+        clippy::inline_always,
+        reason = "keep repeated dense metadata visits in the traversal loop"
+    )]
+    #[inline(always)]
     fn record_metadata_string(
         &mut self,
         kind: OccurrenceKind,
-        value: &'a str,
+        value: impl FnOnce() -> &'a str,
         metadata_id: Option<MetadataId>,
     ) -> bool {
         let slot_index = metadata_id.map(MetadataId::index);
@@ -577,19 +581,52 @@ impl<'a> ObjectGraph<'a> {
             .and_then(|index| self.metadata_slots.get(index).copied())
             .flatten()
         {
-            debug_assert_eq!(
-                self.interned_strings.get(value),
-                Some(&id),
-                "metadata ID must identify one string"
-            );
-            self.objects_by_id[id].shared = true;
+            #[cfg(debug_assertions)]
+            {
+                let value = value();
+                debug_assert_eq!(
+                    if self.cache_scalars
+                        && let Some(character) = CachedObject::character(value)
+                    {
+                        self.cached_scalar_ids
+                            .as_ref()
+                            .and_then(|slots| slots[character.scalar_index(self.python_version)])
+                    } else {
+                        self.interned_strings.get(value).copied()
+                    },
+                    Some(id),
+                    "metadata ID must identify one string"
+                );
+            }
+            debug_assert!(self.objects_by_id[id].reference_required);
             self.occurrences.push(Occurrence { object: id, kind });
             return false;
         }
 
-        // Seed the ordinary value table even for hinted strings: an equal interned constant can
+        self.record_new_metadata_string(kind, value(), slot_index)
+    }
+
+    #[expect(
+        clippy::inline_always,
+        reason = "merge first-seen metadata handling into its caller"
+    )]
+    #[inline(always)]
+    fn record_new_metadata_string(
+        &mut self,
+        kind: OccurrenceKind,
+        value: &'a str,
+        slot_index: Option<usize>,
+    ) -> bool {
+        // Seed the value or character table even for hinted strings: an equal constant can
         // be traversed before or after this metadata and must retain the same object identity.
-        let (id, first) = self.interned_string(value);
+        // Resolve a repeated metadata ID before classifying its spelling again.
+        let (id, first) = if self.cache_scalars
+            && let Some(character) = CachedObject::character(value)
+        {
+            self.record_cached(character)
+        } else {
+            self.interned_string(value)
+        };
         if let Some(slot) = slot_index.and_then(|index| self.metadata_slots.get_mut(index)) {
             *slot = Some(id);
         }
@@ -601,7 +638,7 @@ impl<'a> ObjectGraph<'a> {
         let (id, first) = self.record_object(ObjectKey::SurrogateFilename(value).into());
         if self.python_version >= PythonVersion::Py313 {
             let object = &mut self.objects_by_id[id];
-            object.cached = true;
+            object.reference_required = true;
             object.interned = true;
         }
         self.occurrences.push(Occurrence {
@@ -611,19 +648,22 @@ impl<'a> ObjectGraph<'a> {
         first
     }
 
+    #[expect(
+        clippy::inline_always,
+        reason = "keep interned-string entry updates in the traversal loop"
+    )]
+    #[inline(always)]
     fn interned_string(&mut self, value: &'a str) -> (ObjectId, bool) {
         match self.interned_strings.entry(value) {
             Entry::Occupied(entry) => {
                 let id = *entry.get();
-                self.objects_by_id[id].shared = true;
                 (id, false)
             }
             Entry::Vacant(entry) => {
                 let next_id = self.objects_by_id.next_index();
                 entry.insert(next_id);
                 self.objects_by_id.push(Object {
-                    shared: false,
-                    cached: true,
+                    reference_required: true,
                     interned: true,
                     reference: None,
                 });
@@ -632,6 +672,11 @@ impl<'a> ObjectGraph<'a> {
         }
     }
 
+    #[expect(
+        clippy::inline_always,
+        reason = "specialize scalar cache slots at constant visits"
+    )]
+    #[inline(always)]
     fn record_cached_value(&mut self, kind: OccurrenceKind, cached: CachedObject) -> bool {
         let (id, first) = self.record_cached(cached);
         self.occurrences.push(Occurrence { object: id, kind });
@@ -679,14 +724,18 @@ impl<'a> ObjectGraph<'a> {
 
         let id = self.objects_by_id.next_index();
         self.objects_by_id.push(Object {
-            shared: false,
-            cached: false,
+            reference_required: false,
             interned: false,
             reference: None,
         });
         id
     }
 
+    #[expect(
+        clippy::inline_always,
+        reason = "specialize scalar cache slots at constant visits"
+    )]
+    #[inline(always)]
     fn record_cached(&mut self, cached: CachedObject) -> (ObjectId, bool) {
         let empty_slot = match cached {
             CachedObject::EmptyBytes => Some(&mut self.cached_empty_bytes),
@@ -695,13 +744,11 @@ impl<'a> ObjectGraph<'a> {
         };
         if let Some(slot) = empty_slot {
             if let Some(id) = *slot {
-                self.objects_by_id[id].shared = true;
                 return (id, false);
             }
             let id = self.objects_by_id.next_index();
             self.objects_by_id.push(Object {
-                shared: false,
-                cached: true,
+                reference_required: true,
                 interned: false,
                 reference: None,
             });
@@ -713,14 +760,12 @@ impl<'a> ObjectGraph<'a> {
             vec![None; cached_scalar_slots(self.python_version)].into_boxed_slice()
         })[cached.scalar_index(self.python_version)];
         if let Some(id) = *slot {
-            self.objects_by_id[id].shared = true;
             return (id, false);
         }
 
         let id = self.objects_by_id.next_index();
         self.objects_by_id.push(Object {
-            shared: false,
-            cached: true,
+            reference_required: true,
             interned: matches!(cached, CachedObject::Character(_)),
             reference: None,
         });
@@ -728,7 +773,11 @@ impl<'a> ObjectGraph<'a> {
         (id, true)
     }
 
-    #[inline]
+    #[expect(
+        clippy::inline_always,
+        reason = "specialize key variants and cache eligibility at each record site"
+    )]
+    #[inline(always)]
     fn record_object(&mut self, key: HashedObjectKey<'a>) -> (ObjectId, bool) {
         // The key already owns its value hash. Use it directly for lookup and growth, retaining
         // full key equality and assigning object IDs solely in traversal order.
@@ -740,7 +789,7 @@ impl<'a> ObjectGraph<'a> {
             HashedEntry::Occupied(entry) => {
                 let id = entry.get().1;
                 // Cache eligibility was fixed by this same stored key when first inserted.
-                self.objects_by_id[id].shared = true;
+                self.objects_by_id[id].reference_required = true;
                 (id, false)
             }
             HashedEntry::Vacant(entry) => {
@@ -748,8 +797,7 @@ impl<'a> ObjectGraph<'a> {
                 let cached = Self::is_cached(key.key(), self.python_version);
                 entry.insert((key, next_id));
                 self.objects_by_id.push(Object {
-                    shared: false,
-                    cached,
+                    reference_required: cached,
                     interned: false,
                     reference: None,
                 });
@@ -769,7 +817,7 @@ impl<'a> ObjectGraph<'a> {
         if force_reference
             || self
                 .object_id(HashedObjectKey::from(*key))
-                .is_some_and(|id| self.objects_by_id[id].shared)
+                .is_some_and(|id| self.objects_by_id[id].reference_required)
             || matches!(
                 key,
                 ObjectKey::String(value)
@@ -798,7 +846,7 @@ impl<'a> ObjectGraph<'a> {
 
     pub(super) fn is_shared_object(&self, id: ObjectId) -> bool {
         let object = &self.objects_by_id[id];
-        object.shared || object.cached
+        object.reference_required
     }
 
     pub(super) fn python_version(&self) -> PythonVersion {
@@ -2666,17 +2714,33 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
         }
     }
 
-    #[inline]
+    #[expect(
+        clippy::inline_always,
+        reason = "keep repeated dense metadata visits in the traversal loop"
+    )]
+    #[inline(always)]
     fn metadata_string(&mut self, value: &'code str, metadata_id: Option<MetadataId>) {
-        let first = if self.graph.cache_scalars
-            && let Some(character) = CachedObject::character(value)
-        {
-            self.graph
-                .record_cached_value(OccurrenceKind::MetadataString, character)
-        } else {
-            self.graph
-                .record_metadata_string(OccurrenceKind::MetadataString, value, metadata_id)
-        };
+        let first = self.graph.record_metadata_string(
+            OccurrenceKind::MetadataString,
+            || value,
+            metadata_id,
+        );
+        if first {
+            self.graph.estimate_long_payload(value.len());
+        }
+    }
+
+    #[expect(
+        clippy::inline_always,
+        reason = "decode metadata names only on their first dense visit"
+    )]
+    #[inline(always)]
+    fn metadata_name(&mut self, value: &'code Name, metadata_id: Option<MetadataId>) {
+        let first = self.graph.record_metadata_string(
+            OccurrenceKind::MetadataString,
+            || value.as_str(),
+            metadata_id,
+        );
         if first {
             self.graph.estimate_long_payload(value.len());
         }
@@ -2773,7 +2837,11 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
         }
     }
 
-    #[inline]
+    #[expect(
+        clippy::inline_always,
+        reason = "specialize scalar dispatch inside the shared constant traversal"
+    )]
+    #[inline(always)]
     fn constant(&mut self, value: &'code Constant, _reference_mode: ReferenceMode) -> bool {
         if let Constant::FrozenSet(values) = value {
             self.graph.needs_reference_sorting |=
@@ -2981,14 +3049,12 @@ mod wire_reference_tests {
     #[test]
     fn object_references_preserve_forcing_and_the_full_reference_index() {
         let mut unique = Object {
-            shared: false,
-            cached: false,
+            reference_required: false,
             interned: false,
             reference: None,
         };
         let mut cached = Object {
-            shared: false,
-            cached: true,
+            reference_required: true,
             interned: false,
             reference: None,
         };

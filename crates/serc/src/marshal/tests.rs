@@ -385,6 +385,19 @@ fn occurrence_cursor_rejects_over_consumption() {
 }
 
 #[test]
+fn occurrence_cursor_preserves_position_after_a_kind_mismatch() {
+    let code = code_object(Vec::new());
+    let graph = ObjectGraph::for_code(&code);
+    let expected = graph.occurrence_cursor().consume(OccurrenceKind::Code);
+    let mut cursor = graph.occurrence_cursor();
+    let mismatch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cursor.consume(OccurrenceKind::Bytes);
+    }));
+    assert!(mismatch.is_err());
+    assert_eq!(cursor.consume(OccurrenceKind::Code), expected);
+}
+
+#[test]
 #[should_panic(expected = "marshal writer consumed 0 of")]
 fn occurrence_cursor_rejects_under_consumption() {
     let code = code_object(Vec::new());
@@ -952,6 +965,60 @@ fn rejects_mismatched_metadata_id_lengths() {
     let mut code = code_object(Vec::new());
     code.names.push("untracked".into());
     ObjectGraph::for_code(&code);
+}
+
+#[test]
+fn dense_character_metadata_preserves_scalar_aliases_across_targets() {
+    fn clear_metadata_slots(code: &mut CodeObject) {
+        code.marshal_provenance.metadata_ids.domain_len = u32::MAX;
+        for value in &mut code.constants {
+            if let Constant::Code(child) = value {
+                clear_metadata_slots(child);
+            }
+        }
+    }
+
+    fn constant_count(code: &CodeObject) -> usize {
+        code.constants.len()
+            + code
+                .constants
+                .iter()
+                .map(|value| match value {
+                    Constant::Code(child) => constant_count(child),
+                    _ => 0,
+                })
+                .sum::<usize>()
+    }
+
+    let source = "x = 'x'\né = 'é'\ndef f(x, é):\n    def g(x):\n        return 'é', 'x', x, é\n    return g(x)\n";
+    for python_version in [
+        crate::PythonVersion::Py312,
+        crate::PythonVersion::Py313,
+        crate::PythonVersion::Py314,
+        crate::PythonVersion::Py315,
+    ] {
+        let options = crate::CompileOptions {
+            python_version,
+            ..crate::CompileOptions::default()
+        };
+        for total_constants in [31, 32] {
+            let mut hinted = crate::compile_with_options(source, "é", &options).unwrap();
+            // Cross the scalar-cache threshold while retaining nested metadata and constants.
+            let child_constants = constant_count(&hinted.code) - hinted.code.constants.len();
+            hinted
+                .code
+                .constants
+                .resize(total_constants - child_constants, Constant::None);
+            let mut fallback = hinted.clone();
+            clear_metadata_slots(&mut fallback.code);
+            assert_eq!(hinted.marshal(), fallback.marshal(), "{python_version:?}");
+            assert_eq!(
+                hinted.to_timestamp_pyc(0, 0),
+                fallback.to_timestamp_pyc(0, 0),
+                "{python_version:?}"
+            );
+        }
+    }
 }
 
 #[test]
