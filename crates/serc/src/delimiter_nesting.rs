@@ -11,17 +11,23 @@ pub(crate) fn validate(
     options: &ParseOptions,
     version: PythonVersion,
 ) -> Result<(), CompileError> {
+    validate_with_fast_check::<true>(source, options, version)
+}
+
+fn validate_with_fast_check<const FAST: bool>(
+    source: &str,
+    options: &ParseOptions,
+    version: PythonVersion,
+) -> Result<(), CompileError> {
     const MAX_NESTING: usize = 200;
 
     // Most files cannot exceed the limit even if every opening character were a
     // delimiter. Avoid lexing them twice, especially during batch compilation.
-    if source
-        .bytes()
-        .filter(|byte| matches!(byte, b'(' | b'[' | b'{'))
-        .take(MAX_NESTING + 1)
-        .count()
-        <= MAX_NESTING
-    {
+    if opening_count_is_bounded(source.as_bytes(), MAX_NESTING) {
+        return Ok(());
+    }
+
+    if FAST && nesting_is_bounded(source, MAX_NESTING) {
         return Ok(());
     }
 
@@ -114,6 +120,102 @@ pub(crate) fn validate(
     }
 }
 
+#[inline]
+fn opening_count_is_bounded(bytes: &[u8], maximum: usize) -> bool {
+    bytes
+        .iter()
+        .filter(|byte| matches!(byte, b'(' | b'[' | b'{'))
+        .take(maximum + 1)
+        .count()
+        <= maximum
+}
+
+/// Certifies the nesting limit for ordinary strings and comments without lexing identifiers.
+/// Unrecognized suffixes use the full lexer unless even their raw openings fit the limit.
+fn nesting_is_bounded(source: &str, maximum: usize) -> bool {
+    let bytes = source.as_bytes();
+    let mut closing = [0_u8; 200];
+    let mut depth = 0;
+    let mut index = 0;
+    while let Some(&byte) = bytes.get(index) {
+        match byte {
+            b'(' | b'[' | b'{' => {
+                if depth == maximum {
+                    return false;
+                }
+                closing[depth] = match byte {
+                    b'(' => b')',
+                    b'[' => b']',
+                    _ => b'}',
+                };
+                depth += 1;
+            }
+            b')' | b']' | b'}' => {
+                if depth == 0 || closing[depth - 1] != byte {
+                    // The full lexer stops at the first unmatched delimiter too.
+                    return true;
+                }
+                depth -= 1;
+            }
+            b'#' => {
+                while bytes
+                    .get(index)
+                    .is_some_and(|byte| !matches!(byte, b'\n' | b'\r'))
+                {
+                    index += 1;
+                }
+                continue;
+            }
+            b'\'' | b'"' => {
+                if index > 0
+                    && (bytes[index - 1].is_ascii_alphanumeric()
+                        || bytes[index - 1] == b'_'
+                        || !bytes[index - 1].is_ascii())
+                {
+                    // Every remaining lexer opening needs a source opening byte,
+                    // just as in the whole-file guard. This also bounds interpolation.
+                    return opening_count_is_bounded(&bytes[index..], maximum - depth);
+                }
+                let triple =
+                    bytes.get(index + 1) == Some(&byte) && bytes.get(index + 2) == Some(&byte);
+                let width = if triple { 3 } else { 1 };
+                index += width;
+                while let Some(&character) = bytes.get(index) {
+                    if character == b'\\' {
+                        // A CRLF escape is one continued line, like a lone CR or LF.
+                        index += if bytes.get(index + 1) == Some(&b'\r')
+                            && bytes.get(index + 2) == Some(&b'\n')
+                        {
+                            3
+                        } else {
+                            2
+                        };
+                    } else if character == byte
+                        && (!triple
+                            || (bytes.get(index + 1) == Some(&byte)
+                                && bytes.get(index + 2) == Some(&byte)))
+                    {
+                        index += width;
+                        break;
+                    } else if !triple && matches!(character, b'\n' | b'\r') {
+                        // An unclosed ordinary string stops the nesting validator.
+                        return true;
+                    } else {
+                        index += 1;
+                    }
+                }
+                continue;
+            }
+            b'\\' => {
+                return opening_count_is_bounded(&bytes[index..], maximum - depth);
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    true
+}
+
 enum EarlierIndentation {
     Error(CompileError),
     Defer,
@@ -182,4 +284,92 @@ pub(crate) fn invalid_number_suffix(source: &str, range: TextRange) -> bool {
                 .is_none_or(|c| c.is_ascii() && !c.is_ascii_alphanumeric() && c != '_')
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{nesting_is_bounded, validate_with_fast_check};
+    use crate::PythonVersion;
+    use ruff_python_parser::{Mode, ParseOptions};
+
+    #[test]
+    fn bounded_scan_preserves_lexer_diagnostics() {
+        let options = ParseOptions::from(Mode::Module);
+        for version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            for depth in [0, 1, 199, 200, 201, 202] {
+                let expression = format!("{}0{}", "(".repeat(depth), ")".repeat(depth));
+                for prefix in [
+                    "",
+                    "# ([(\n",
+                    "value = ",
+                    "if True:\n    ",
+                    "0xg\n",
+                    "yield, 0\n",
+                    "value = 'unterminated\n",
+                    "value = '''unterminated\n",
+                    "value = \"escaped\\\"([({})])\"\n",
+                    "value = '\\\n'\n",
+                    "value = '\\\r\ncontinued'\n",
+                    "value = '''([{\\\"\n}])'''\n",
+                    "value = r'([{}])'\n",
+                    "value = f'{(0)}'\n",
+                    "value = t'{(0)}'\n",
+                    "value = rf'{(0)}'\n",
+                    "value = \"\"\"([{\n}])\"\"\"\n",
+                    ")\n",
+                    "[)\n",
+                    "value = 1 \\\n  + 2\n",
+                ] {
+                    let source = format!("{prefix}{expression}\n{}\n", "# ()".repeat(201));
+                    assert_eq!(
+                        validate_with_fast_check::<true>(&source, &options, version),
+                        validate_with_fast_check::<false>(&source, &options, version),
+                        "{version:?}: {source:?}",
+                    );
+                    let source = format!("{}\n{prefix}{expression}\n", "# ()".repeat(201));
+                    assert_eq!(
+                        validate_with_fast_check::<true>(&source, &options, version),
+                        validate_with_fast_check::<false>(&source, &options, version),
+                        "suffix bound {version:?}: {source:?}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_scan_requires_fallback_for_unbounded_suffixes_and_excess_nesting() {
+        for source in [
+            "f'{value}'",
+            "t'{value}'",
+            "r'value'",
+            "rf'{value}'",
+            "x \\\n + y",
+        ] {
+            assert!(nesting_is_bounded(source, 200), "{source:?}");
+            let source = format!("{source}{}", "(".repeat(201));
+            assert!(!nesting_is_bounded(&source, 200), "{source:?}");
+        }
+        assert!(nesting_is_bounded(
+            &format!("{}0{}", "(".repeat(200), ")".repeat(200)),
+            200
+        ));
+        assert!(!nesting_is_bounded(
+            &format!("{}0{}", "(".repeat(201), ")".repeat(201)),
+            200
+        ));
+        assert!(nesting_is_bounded(
+            &format!("{}\n0", "# (".repeat(300)),
+            200
+        ));
+        assert!(nesting_is_bounded(
+            &format!("'{}'", "([{)]}".repeat(300)),
+            200
+        ));
+    }
 }

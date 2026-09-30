@@ -982,6 +982,27 @@ pub(super) fn constants_tuple_key(values: &[Constant]) -> ObjectKey<'_> {
     }
 }
 
+/// Only value-bearing descendants can retain their hash when a compiled module is cloned.
+pub(crate) fn constants_tuple_hash(values: &[Constant]) -> Option<u64> {
+    fn contains_code(value: &Constant) -> bool {
+        match value {
+            Constant::Code(_) => true,
+            Constant::Tuple(values) | Constant::FrozenSet(values) => {
+                values.iter().any(contains_code)
+            }
+            Constant::Slice { lower, upper, step } => {
+                contains_code(lower) || contains_code(upper) || contains_code(step)
+            }
+            _ => false,
+        }
+    }
+    if values.is_empty() || values.iter().any(contains_code) {
+        None
+    } else {
+        Some(HashedObjectKey::from(constants_tuple_key(values)).hash)
+    }
+}
+
 pub(super) fn strings_tuple_key(values: &[String]) -> ObjectKey<'_> {
     if values.is_empty() {
         ObjectKey::EmptyTuple

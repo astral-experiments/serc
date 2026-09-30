@@ -33,6 +33,9 @@ pub(super) trait MarshalVisitor<'a> {
     fn code(&mut self, code: &'a CodeObject, reference_mode: ReferenceMode) -> bool;
     fn code_bytes(&mut self, code: &'a CodeObject);
     fn constants(&mut self, values: &'a [Constant], reference_mode: ReferenceMode) -> bool;
+    fn code_constants(&mut self, code: &'a CodeObject) -> bool {
+        self.constants(&code.constants, ReferenceMode::IfShared)
+    }
     fn names(&mut self, code: &'a CodeObject) -> bool;
     fn locals(&mut self, code: &'a CodeObject) -> bool;
     fn local_kinds(&mut self, code: &'a CodeObject);
@@ -81,7 +84,11 @@ pub(super) fn traverse_code_with_mode<'a, V>(
         return;
     }
     visitor.code_bytes(code);
-    traverse_constants(&code.constants, ReferenceMode::IfShared, visitor);
+    if visitor.code_constants(code) {
+        for value in &code.constants {
+            traverse_constant(value, ReferenceMode::IfShared, visitor);
+        }
+    }
     let metadata_ids = V::USES_METADATA_IDS.then_some(&code.marshal_provenance.metadata_ids);
     if visitor.names(code) {
         traverse_metadata_strings(

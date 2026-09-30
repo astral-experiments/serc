@@ -220,6 +220,7 @@ pub(super) struct ObjectGraph<'a> {
     cached_scalar_ids: Option<Box<[Option<ObjectId>]>>,
     cache_scalars: bool,
     preallocated_interned_strings: bool,
+    preallocated_traversal: bool,
     uncached_percent_constant: bool,
     fresh_empty_bytes_constant: bool,
     needs_reference_sorting: bool,
@@ -229,6 +230,38 @@ pub(super) struct ObjectGraph<'a> {
     estimated_payload_bytes: usize,
     #[cfg(debug_assertions)]
     unique_objects: FxHashSet<HashedObjectKey<'a>>,
+}
+
+/// Counts the unpruned traversal. Sharing can only reduce the number of visited nodes.
+/// Compiled children already carry their subtree bound, avoiding repeated code-tree walks.
+pub(crate) fn code_occurrence_bound(constants: &[Constant], names: usize, locals: usize) -> usize {
+    fn constant_bound(value: &Constant) -> usize {
+        match value {
+            Constant::Code(code) => code
+                .marshal_provenance
+                .marshal_occurrence_bound
+                .unwrap_or_else(|| {
+                    code_occurrence_bound(&code.constants, code.names.len(), code.locals.len())
+                }),
+            Constant::Tuple(values) | Constant::FrozenSet(values) => {
+                values.iter().fold(1_usize, |count, value| {
+                    count.saturating_add(constant_bound(value))
+                })
+            }
+            Constant::Slice { lower, upper, step } => [lower, upper, step]
+                .into_iter()
+                .fold(1_usize, |count, value| {
+                    count.saturating_add(constant_bound(value))
+                }),
+            _ => 1,
+        }
+    }
+    constants.iter().fold(
+        names
+            .saturating_add(locals)
+            .saturating_add(CODE_OBJECT_CHILDREN + 1),
+        |count, value| count.saturating_add(constant_bound(value)),
+    )
 }
 
 #[derive(Clone, Debug, Default)]
@@ -356,8 +389,16 @@ impl<'a> ObjectGraph<'a> {
         if let Some(capacity) = interned_capacity {
             interned_strings.reserve(capacity);
         }
+        let traversal_capacity = sort_graph
+            .map(|graph| (graph.objects_by_id.len(), graph.occurrences.len()))
+            .or_else(|| {
+                code.marshal_provenance
+                    .marshal_occurrence_bound
+                    .map(|bound| (bound, bound))
+            });
         let mut graph = Self {
             python_version,
+            preallocated_traversal: traversal_capacity.is_some(),
             aliases,
             cache_scalars: code.constants.len() >= MIN_CACHED_SCALAR_CONSTANTS,
             preallocated_interned_strings: interned_capacity.is_some(),
@@ -367,6 +408,10 @@ impl<'a> ObjectGraph<'a> {
             metadata_slots,
             ..Self::default()
         };
+        if let Some((objects, occurrences)) = traversal_capacity {
+            graph.objects_by_id.raw.reserve(objects);
+            graph.occurrences.reserve(occurrences);
+        }
         traverse_code(
             code,
             &mut GraphVisitor {
@@ -469,11 +514,13 @@ impl<'a> ObjectGraph<'a> {
         if !self.preallocated_interned_strings {
             self.interned_strings.reserve(interned_strings);
         }
-        self.objects_by_id
-            .raw
-            .reserve(estimated_descendants.saturating_add(1));
-        self.occurrences
-            .reserve(estimated_descendants.saturating_add(1));
+        if !self.preallocated_traversal {
+            self.objects_by_id
+                .raw
+                .reserve(estimated_descendants.saturating_add(1));
+            self.occurrences
+                .reserve(estimated_descendants.saturating_add(1));
+        }
         self.estimated_payload_bytes = self
             .estimated_payload_bytes
             .saturating_add(code.bytecode.len())
@@ -504,6 +551,7 @@ impl<'a> ObjectGraph<'a> {
         first
     }
 
+    #[inline]
     fn record_metadata_string(
         &mut self,
         kind: OccurrenceKind,
@@ -666,6 +714,7 @@ impl<'a> ObjectGraph<'a> {
         (id, true)
     }
 
+    #[inline]
     fn record_object(&mut self, key: HashedObjectKey<'a>) -> (ObjectId, bool) {
         match self.objects.entry(key) {
             Entry::Occupied(entry) => {
@@ -2472,6 +2521,37 @@ struct GraphVisitor<'graph, 'code> {
     root_constants: bool,
 }
 
+impl<'code> GraphVisitor<'_, 'code> {
+    #[inline]
+    fn record_constants(&mut self, values: &'code [Constant], hash: Option<u64>) -> bool {
+        let root_constants = std::mem::take(&mut self.root_constants);
+        if values.is_empty() {
+            return self
+                .graph
+                .record_cached_value(OccurrenceKind::Constants, CachedObject::EmptyTuple);
+        }
+        let key = constants_tuple_key(values);
+        // The root cannot equal a descendant; all-string roots retain value lookup
+        // because they can alias metadata tuples. Code-bearing tuples are unique.
+        if matches!(&key, ObjectKey::ConstantTuple(_))
+            && (root_constants
+                || values
+                    .iter()
+                    .any(|value| matches!(value, Constant::Code(_))))
+        {
+            self.graph
+                .record_unique_value(OccurrenceKind::Constants, key)
+        } else if let Some(hash) = hash {
+            self.graph.record_hashed(
+                OccurrenceKind::Constants,
+                HashedObjectKey::with_hash(key, hash),
+            )
+        } else {
+            self.graph.record_keyed(OccurrenceKind::Constants, key)
+        }
+    }
+}
+
 impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
     const USES_METADATA_IDS: bool = true;
 
@@ -2494,28 +2574,15 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
 
     #[inline]
     fn constants(&mut self, values: &'code [Constant], _reference_mode: ReferenceMode) -> bool {
-        let root_constants = std::mem::take(&mut self.root_constants);
-        if values.is_empty() {
-            return self
-                .graph
-                .record_cached_value(OccurrenceKind::Constants, CachedObject::EmptyTuple);
-        }
-        let key = constants_tuple_key(values);
-        // The root constant tuple cannot equal one of its own descendants. Only all-string
-        // roots can alias a metadata tuple, and those retain their ordinary value lookup.
-        if matches!(&key, ObjectKey::ConstantTuple(_))
-            && (root_constants
-                || values
-                    .iter()
-                    .any(|value| matches!(value, Constant::Code(_))))
-        {
-            self.graph
-                .record_unique_value(OccurrenceKind::Constants, key)
-        } else {
-            // The key has already scanned every member of an all-string tuple. It cannot own
-            // code, and equal literal and metadata tuples must share the same value lookup.
-            self.graph.record_keyed(OccurrenceKind::Constants, key)
-        }
+        self.record_constants(values, None)
+    }
+
+    #[inline]
+    fn code_constants(&mut self, code: &'code CodeObject) -> bool {
+        self.record_constants(
+            &code.constants,
+            code.marshal_provenance.constants_tuple_hash,
+        )
     }
 
     #[inline]
