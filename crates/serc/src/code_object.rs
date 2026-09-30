@@ -291,6 +291,8 @@ pub(crate) struct MarshalProvenance {
     pub(crate) generated_mangled_strings: FxHashSet<String>,
     /// Strings whose first compiler-cache object was already interned.
     pub(crate) canonical_constant_strings: FxHashSet<String>,
+    /// The root's canonical set includes every explicit string from child compiler units.
+    pub(crate) canonical_constant_strings_complete: bool,
     /// The class-body constant loaded into `__qualname__`, when present.
     pub(crate) qualified_name_constant_index: Option<u32>,
     /// Qualified-name ownership recorded before discarded constants are pruned.
@@ -308,12 +310,21 @@ pub(crate) struct MarshalProvenance {
     pub(crate) table_hashes: Option<[u64; 2]>,
     /// Unpruned traversal size for reserving marshal occurrences and object flags.
     pub(crate) marshal_occurrence_bound: Option<usize>,
+    /// Whole-tree capacity and a proof that no child needs supplemental string-origin analysis.
+    pub(crate) marshal_graph_summary: Option<MarshalGraphSummary>,
     /// Whether this code tree can contain a frozenset constant.
     pub(crate) subtree_has_frozenset_constants: bool,
     /// Whether no surviving constant tuple can share a non-identifier string with code metadata.
     pub(crate) metadata_alias_scan_unnecessary: bool,
     /// Whether the constant cache first admitted a fresh empty bytes object.
     pub(crate) fresh_empty_bytes_constant: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MarshalGraphSummary {
+    pub(crate) objects: usize,
+    pub(crate) constants: usize,
+    pub(crate) no_supplemental_interns: bool,
 }
 
 #[derive(Clone, Copy, Debug)]

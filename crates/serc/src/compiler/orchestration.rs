@@ -1591,6 +1591,7 @@ impl<'source> Compiler<'source> {
                     FxHashSet::default()
                 },
                 canonical_constant_strings,
+                canonical_constant_strings_complete: matches!(self.unit.scope, Scope::Module),
                 qualified_name_constant_index: self.output.qualified_name_constant_index,
                 qualified_name_is_canonical: self.output.qualified_name_is_canonical,
                 uncached_percent_constant: self.context.has_uncached_percent_constant(),
@@ -1599,6 +1600,7 @@ impl<'source> Compiler<'source> {
                 metadata_tuple_properties: Some(metadata_tuple_properties),
                 constants_tuple_hash,
                 marshal_occurrence_bound: Some(marshal_occurrence_bound),
+                marshal_graph_summary: None,
                 table_hashes: None,
                 subtree_has_frozenset_constants: self.output.has_frozenset_constants,
                 metadata_alias_scan_unnecessary: false,
@@ -1623,6 +1625,7 @@ impl<'source> Compiler<'source> {
                 std::mem::take(&mut context.scopes.names).into_marshal_lookup(),
             ));
         }
+        code.marshal_provenance.marshal_graph_summary = crate::marshal::code_graph_summary(&code);
         Ok(code)
     }
 

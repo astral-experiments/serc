@@ -8,7 +8,7 @@ use smallvec::SmallVec;
 
 use crate::code_object::{
     CodeFilename, CodeInterningSummary, CodeObject, CompilationInterningEvent, Constant,
-    MetadataId, MetadataName as Name,
+    MarshalGraphSummary, MetadataId, MetadataName as Name,
 };
 use crate::target::{is_preinterned_string_for, small_int_bounds_for};
 use crate::{CompileError, InitialInternState, PythonVersion};
@@ -274,9 +274,26 @@ struct GraphAliases {
 }
 
 struct GraphPreprocessing<'a> {
-    explicitly_interned: FxHashSet<&'a str>,
+    explicitly_interned: ExplicitlyInterned<'a>,
     recreated_frozensets: FxHashSet<usize>,
     capacity: GraphCapacity,
+}
+
+/// Canonical origins already live in the compiled module. Only child-specific and qualified-name
+/// additions need a new set; both sources are queried by spelling, never by iteration order.
+struct ExplicitlyInterned<'a> {
+    canonical: &'a FxHashSet<String>,
+    supplemental: FxHashSet<&'a str>,
+}
+
+impl ExplicitlyInterned<'_> {
+    fn is_empty(&self) -> bool {
+        self.canonical.is_empty() && self.supplemental.is_empty()
+    }
+
+    fn contains(&self, value: &str) -> bool {
+        self.canonical.contains(value) || self.supplemental.contains(value)
+    }
 }
 
 #[derive(Default)]
@@ -304,12 +321,61 @@ impl GraphCapacity {
     }
 }
 
+/// Compiled children already carry their complete bounds. A missing child summary keeps
+/// hand-built code on the ordinary preprocessing path.
+pub(crate) fn code_graph_summary(code: &CodeObject) -> Option<MarshalGraphSummary> {
+    let mut capacity = GraphCapacity::default();
+    capacity.record(code);
+    let mut no_supplemental_interns = qualified_name_constant_requiring_origin(code).is_none()
+        && code
+            .marshal_provenance
+            .explicitly_interned_strings
+            .iter()
+            .all(|value| should_intern(value));
+    for value in &code.constants {
+        if let Constant::Code(child) = value {
+            let child = child.marshal_provenance.marshal_graph_summary?;
+            capacity.objects = capacity.objects.saturating_add(child.objects);
+            capacity.constants = capacity.constants.saturating_add(child.constants);
+            no_supplemental_interns &= child.no_supplemental_interns;
+        }
+    }
+    Some(MarshalGraphSummary {
+        objects: capacity.objects,
+        constants: capacity.constants,
+        no_supplemental_interns,
+    })
+}
+
 impl<'a> GraphPreprocessing<'a> {
     fn for_code(
         code: &'a CodeObject,
         python_version: PythonVersion,
         initial_intern_state: &InitialInternState,
     ) -> (Self, GraphAliases) {
+        if python_version != PythonVersion::Py312
+            && !code.marshal_provenance.subtree_has_frozenset_constants
+            && code.marshal_provenance.metadata_alias_scan_unnecessary
+            && let Some(summary) = code.marshal_provenance.marshal_graph_summary
+            && summary.no_supplemental_interns
+            && let Some(bound) = code.marshal_provenance.marshal_occurrence_bound
+        {
+            return (
+                Self {
+                    explicitly_interned: ExplicitlyInterned {
+                        canonical: &code.marshal_provenance.canonical_constant_strings,
+                        supplemental: FxHashSet::default(),
+                    },
+                    recreated_frozensets: FxHashSet::default(),
+                    capacity: GraphCapacity {
+                        objects: summary.objects,
+                        constants: summary.constants,
+                        occurrences: bound,
+                    },
+                },
+                GraphAliases::default(),
+            );
+        }
         let mut explicitly_interned = FxHashSet::default();
         let mut metadata_tuples = FxHashSet::default();
         let needs_metadata_alias_scan = !code.marshal_provenance.metadata_alias_scan_unnecessary;
@@ -345,7 +411,10 @@ impl<'a> GraphPreprocessing<'a> {
         };
         (
             Self {
-                explicitly_interned,
+                explicitly_interned: ExplicitlyInterned {
+                    canonical: &code.marshal_provenance.canonical_constant_strings,
+                    supplemental: explicitly_interned,
+                },
                 recreated_frozensets,
                 capacity,
             },
@@ -1092,17 +1161,14 @@ fn collect_explicitly_interned<'a>(
 ) -> (FrozensetRecreationNeed, GraphCapacity) {
     // Identifier objects can enter the compilation-wide constant cache before an equal
     // ordinary string. Preserve that recorded origin when sharing constant and metadata strings.
-    values.extend(
-        code.marshal_provenance
-            .canonical_constant_strings
-            .iter()
-            .map(String::as_str),
-    );
     let mut qualified_names = QualifiedNameConstants {
         track: python_version != PythonVersion::Py312,
         ..QualifiedNameConstants::default()
     };
     let mut capacity = GraphCapacity::default();
+    // Compiler root origins are immutable after first admission. Every explicit child string
+    // was admitted with an Interned origin, so it is already in the root's canonical set.
+    let collect_explicit_strings = !code.marshal_provenance.canonical_constant_strings_complete;
     let frozenset_recreation_need = if !code.marshal_provenance.subtree_has_frozenset_constants {
         collect_interning_provenance_without_frozensets(
             code,
@@ -1111,6 +1177,7 @@ fn collect_explicitly_interned<'a>(
             needs_metadata_alias_scan,
             &mut qualified_names,
             &mut capacity,
+            collect_explicit_strings,
         );
         FrozensetRecreationNeed::None
     } else {
@@ -1122,6 +1189,7 @@ fn collect_explicitly_interned<'a>(
             needs_metadata_alias_scan,
             &mut qualified_names,
             &mut capacity,
+            collect_explicit_strings,
         )
     };
     if qualified_names.origins.is_empty() {
@@ -1176,17 +1244,21 @@ fn collect_interning_provenance_without_frozensets<'a>(
     needs_metadata_alias_scan: bool,
     qualified_names: &mut QualifiedNameConstants<'a>,
     capacity: &mut GraphCapacity,
+    collect_explicit_strings: bool,
 ) {
     capacity.record(code);
     if needs_metadata_alias_scan {
         collect_metadata_tuple_keys(code, metadata_tuples);
     }
-    values.extend(
-        code.marshal_provenance
-            .explicitly_interned_strings
-            .iter()
-            .map(String::as_str),
-    );
+    if collect_explicit_strings {
+        values.extend(
+            code.marshal_provenance
+                .explicitly_interned_strings
+                .iter()
+                .map(String::as_str)
+                .filter(|value| !should_intern(value)),
+        );
+    }
     qualified_names.record(code);
     for constant in &code.constants {
         if let Constant::Code(code) = constant {
@@ -1197,6 +1269,7 @@ fn collect_interning_provenance_without_frozensets<'a>(
                 needs_metadata_alias_scan,
                 qualified_names,
                 capacity,
+                collect_explicit_strings,
             );
         }
     }
@@ -1210,17 +1283,21 @@ fn collect_interning_provenance<'a>(
     needs_metadata_alias_scan: bool,
     qualified_names: &mut QualifiedNameConstants<'a>,
     capacity: &mut GraphCapacity,
+    collect_explicit_strings: bool,
 ) -> FrozensetRecreationNeed {
     capacity.record(code);
     if needs_metadata_alias_scan {
         collect_metadata_tuple_keys(code, metadata_tuples);
     }
-    values.extend(
-        code.marshal_provenance
-            .explicitly_interned_strings
-            .iter()
-            .map(String::as_str),
-    );
+    if collect_explicit_strings {
+        values.extend(
+            code.marshal_provenance
+                .explicitly_interned_strings
+                .iter()
+                .map(String::as_str)
+                .filter(|value| !should_intern(value)),
+        );
+    }
     qualified_names.record(code);
     // Reuse the provenance walk to classify frozenset recreation for code trees that can contain
     // one (and for hand-built objects without a conservative compiler hint).
@@ -1235,6 +1312,7 @@ fn collect_interning_provenance<'a>(
                 needs_metadata_alias_scan,
                 qualified_names,
                 capacity,
+                collect_explicit_strings,
             );
             frozenset_recreation_need = frozenset_recreation_need.max(recreation_need);
         } else if frozenset_recreation_need != FrozensetRecreationNeed::IdentifierDependent {
@@ -2657,7 +2735,7 @@ fn intern_constant_string<'a>(
 
 struct GraphVisitor<'graph, 'code> {
     graph: &'graph mut ObjectGraph<'code>,
-    explicitly_interned: Option<&'graph FxHashSet<&'code str>>,
+    explicitly_interned: Option<&'graph ExplicitlyInterned<'code>>,
     recreated_frozensets: Option<&'graph FxHashSet<usize>>,
     sort_graph: Option<&'graph ObjectGraph<'code>>,
     root_constants: bool,
