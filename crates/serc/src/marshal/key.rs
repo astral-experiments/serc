@@ -82,6 +82,10 @@ impl<'a> HashedObjectKey<'a> {
         &self.key
     }
 
+    pub(super) const fn hash(&self) -> u64 {
+        self.hash
+    }
+
     pub(super) fn with_hash(key: ObjectKey<'a>, hash: u64) -> Self {
         debug_assert_eq!(Self::new(key).hash, hash, "marshal key hash");
         Self { key, hash }
@@ -980,6 +984,29 @@ pub(super) fn constants_tuple_key(values: &[Constant]) -> ObjectKey<'_> {
     } else {
         ObjectKey::ConstantTuple(ConstantTupleKey(values))
     }
+}
+
+/// Hashes a finalized constants tuple for reuse after moving or cloning its code object.
+/// Empty tuples need no hash; code descendants prevent caching because cloning changes their keys.
+pub(crate) fn constants_tuple_hash(values: &[Constant]) -> Option<u64> {
+    fn has_code(value: &Constant) -> bool {
+        match value {
+            Constant::Code(_) => true,
+            Constant::Tuple(values) | Constant::FrozenSet(values) => values.iter().any(has_code),
+            Constant::Slice { lower, upper, step } => {
+                has_code(lower) || has_code(upper) || has_code(step)
+            }
+            _ => false,
+        }
+    }
+    if values.is_empty() || values.iter().any(has_code) {
+        return None;
+    }
+    Some(HashedObjectKey::from(constants_tuple_key(values)).hash)
+}
+
+pub(crate) fn bytes_hash(value: &[u8]) -> u64 {
+    HashedObjectKey::from(ObjectKey::Bytes(value)).hash
 }
 
 pub(super) fn strings_tuple_key(values: &[String]) -> ObjectKey<'_> {
