@@ -31,7 +31,9 @@ fn compiler(criterion: &mut Criterion) {
     }
 
     group.finish();
+}
 
+fn marshal(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("marshal");
 
     for workload in MARSHAL_MICRO_WORKLOADS
@@ -39,13 +41,17 @@ fn compiler(criterion: &mut Criterion) {
         .chain(COMPOSITE_WORKLOADS)
         .chain(LARGE_WORKLOADS)
     {
-        let module = serc::compile(workload.source, workload.filename).unwrap();
-
         group.throughput(Throughput::Bytes(workload.source.len() as u64));
         group.bench_function(workload.id, |bencher| {
             bencher.iter_batched(
-                || (),
-                |()| black_box(&module).marshal(),
+                // A freshly compiled module has no serialization work left over from warmup
+                // or earlier iterations. Cloning could preserve a future shared cache.
+                || serc::compile(workload.source, workload.filename).unwrap(),
+                |module| {
+                    let output = black_box(&module).marshal();
+                    // Keep cleanup outside timing when isolating the serialization phase.
+                    (module, output)
+                },
                 BatchSize::LargeInput,
             );
         });
@@ -54,5 +60,30 @@ fn compiler(criterion: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, compiler);
+fn compile_pyc(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("compile_pyc");
+    for workload in COMPILE_MICRO_WORKLOADS
+        .iter()
+        .chain(MARSHAL_MICRO_WORKLOADS)
+        .chain(COMPOSITE_WORKLOADS)
+        .chain(LARGE_WORKLOADS)
+    {
+        let source_size = u32::try_from(workload.source.len())
+            .expect("benchmark source must fit in a PYC source-size field");
+        group.throughput(Throughput::Bytes(workload.source.len() as u64));
+        group.bench_function(workload.id, |bencher| {
+            bencher.iter(|| {
+                let module =
+                    serc::compile(black_box(workload.source), black_box(workload.filename))
+                        .unwrap();
+                // Include encoding and both drops in this one-shot workflow. The PYC stays
+                // in memory so disk I/O does not hide compiler or serializer changes.
+                black_box(module.to_timestamp_pyc(0, source_size));
+            });
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, compiler, marshal, compile_pyc);
 criterion_main!(benches);
