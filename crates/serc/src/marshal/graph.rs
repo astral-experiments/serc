@@ -2569,9 +2569,9 @@ impl<'code> GraphVisitor<'_, 'code> {
         let key = constants_tuple_key(values);
         if matches!(&key, ObjectKey::ConstantTuple(_))
             && (root_constants
-                || values
-                    .iter()
-                    .any(|value| matches!(value, Constant::Code(_))))
+                // A cached value hash already proves there are no code descendants.
+                || (hash.is_none()
+                    && values.iter().any(|value| matches!(value, Constant::Code(_)))))
         {
             self.graph
                 .record_unique_value(OccurrenceKind::Constants, key)
