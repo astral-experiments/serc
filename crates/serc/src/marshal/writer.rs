@@ -1,4 +1,4 @@
-use crate::code_object::{CodeFilename, CodeObject, Constant, MetadataId};
+use crate::code_object::{CodeFilename, CodeObject, Constant, MetadataId, MetadataName};
 use crate::{InitialInternState, PythonVersion};
 
 use super::graph::{ObjectGraph, ObjectReference, Occurrence, OccurrenceCursor, OccurrenceKind};
@@ -133,7 +133,7 @@ struct Writer<'output, 'graph, 'code> {
     graph: &'graph mut ObjectGraph<'code>,
     output: &'output mut Vec<u8>,
     reference_count: usize,
-    occurrences: OccurrenceCursor<Vec<Occurrence>>,
+    occurrences: OccurrenceCursor<std::vec::IntoIter<Occurrence>>,
     frozen_set_order_index: usize,
 }
 
@@ -590,6 +590,22 @@ impl<'code> MarshalVisitor<'code> for Writer<'_, '_, 'code> {
     fn metadata_string(&mut self, value: &'code str, _metadata_id: Option<MetadataId>) {
         let object = self.next_object(OccurrenceKind::MetadataString);
         self.interned_string_with_object(object, value);
+    }
+
+    #[inline]
+    fn metadata_name(&mut self, value: &'code MetadataName, _metadata_id: Option<MetadataId>) {
+        let object = self.next_object(OccurrenceKind::MetadataString);
+        let object = self.graph.object_for_writing(object);
+        debug_assert!(object.is_interned(), "marshal metadata must be interned");
+        let reference =
+            object.reference_for_write(ReferenceMode::Forced, &mut self.reference_count);
+        match reference {
+            ObjectReference::Existing(index) => self.byte_and_long(TYPE_REF, index.as_u32()),
+            ObjectReference::New => self.string_payload::<true>(value.as_str(), FLAG_REF),
+            ObjectReference::Unshared => {
+                unreachable!("forced marshal reference cannot be unshared")
+            }
+        }
     }
 
     fn code_filename(&mut self, code: &'code CodeObject, _metadata_id: Option<MetadataId>) {

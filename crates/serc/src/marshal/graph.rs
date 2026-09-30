@@ -89,32 +89,30 @@ const _: [(); 8] = [(); std::mem::size_of::<Occurrence>()];
 #[derive(Debug)]
 pub(super) struct OccurrenceCursor<T> {
     occurrences: T,
-    next: usize,
+    count: usize,
 }
 
-impl<T: AsRef<[Occurrence]>> OccurrenceCursor<T> {
+impl<T: ExactSizeIterator<Item = Occurrence>> OccurrenceCursor<T> {
     #[inline]
     pub(super) fn consume(&mut self, expected: OccurrenceKind) -> ObjectId {
-        let index = self.next;
-        let occurrences = self.occurrences.as_ref();
-        let Some(occurrence) = occurrences.get(index).copied() else {
-            missing_occurrence(index, expected, occurrences.len());
+        let Some(occurrence) = self.occurrences.next() else {
+            missing_occurrence(self.count, expected, self.count);
         };
         if occurrence.kind != expected {
+            let index = self.count - self.occurrences.len() - 1;
             mismatched_occurrence(index, expected, occurrence.kind);
         }
-        self.next += 1;
         occurrence.object
     }
 
     pub(super) fn finish(self) {
-        let occurrences = self.occurrences.as_ref();
+        let remaining = self.occurrences.len();
         assert_eq!(
-            self.next,
-            occurrences.len(),
+            remaining,
+            0,
             "marshal writer consumed {} of {} recorded occurrences",
-            self.next,
-            occurrences.len()
+            self.count - remaining,
+            self.count
         );
     }
 }
@@ -841,18 +839,20 @@ impl<'a> ObjectGraph<'a> {
     }
 
     #[cfg(test)]
-    pub(super) fn occurrence_cursor(&self) -> OccurrenceCursor<&[Occurrence]> {
+    pub(super) fn occurrence_cursor(
+        &self,
+    ) -> OccurrenceCursor<std::iter::Copied<std::slice::Iter<'_, Occurrence>>> {
         OccurrenceCursor {
-            occurrences: &self.occurrences,
-            next: 0,
+            occurrences: self.occurrences.iter().copied(),
+            count: self.occurrences.len(),
         }
     }
 
     /// Separates the read-only occurrence stream before the writer mutates object references.
-    pub(super) fn take_occurrences(&mut self) -> OccurrenceCursor<Vec<Occurrence>> {
+    pub(super) fn take_occurrences(&mut self) -> OccurrenceCursor<std::vec::IntoIter<Occurrence>> {
         OccurrenceCursor {
-            occurrences: std::mem::take(&mut self.occurrences),
-            next: 0,
+            count: self.occurrences.len(),
+            occurrences: std::mem::take(&mut self.occurrences).into_iter(),
         }
     }
 
@@ -2683,6 +2683,28 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
     }
 
     #[inline]
+    fn metadata_name(&mut self, value: &'code Name, metadata_id: Option<MetadataId>) {
+        // Repeated metadata IDs need no spelling lookup or scalar classification.
+        if let Some(id) = metadata_id
+            .and_then(|id| self.graph.metadata_slots.get(id.index()).copied())
+            .flatten()
+        {
+            debug_assert_eq!(
+                self.graph.interned_strings.get(value.as_str()),
+                Some(&id),
+                "metadata ID must identify one string"
+            );
+            self.graph.objects_by_id[id].shared = true;
+            self.graph.occurrences.push(Occurrence {
+                object: id,
+                kind: OccurrenceKind::MetadataString,
+            });
+        } else {
+            self.metadata_string(value.as_str(), metadata_id);
+        }
+    }
+
+    #[inline]
     fn first_line(&mut self, _value: u32) {}
 
     fn code_filename(&mut self, code: &'code CodeObject, metadata_id: Option<MetadataId>) {
@@ -2976,7 +2998,35 @@ mod snapshots;
 
 #[cfg(test)]
 mod wire_reference_tests {
-    use super::{Object, ObjectReference, ReferenceMode};
+    use super::{
+        Object, ObjectId, ObjectReference, Occurrence, OccurrenceCursor, OccurrenceKind,
+        ReferenceMode,
+    };
+
+    #[test]
+    fn occurrence_iterators_keep_kind_and_completeness_checks() {
+        let occurrence = Occurrence {
+            object: ObjectId::from_usize(7),
+            kind: OccurrenceKind::Bytes,
+        };
+        let cursor = || OccurrenceCursor {
+            occurrences: vec![occurrence].into_iter(),
+            count: 1,
+        };
+        let mut complete = cursor();
+        assert_eq!(complete.consume(OccurrenceKind::Bytes), occurrence.object);
+        complete.finish();
+        assert!(std::panic::catch_unwind(|| cursor().finish()).is_err());
+        assert!(std::panic::catch_unwind(|| cursor().consume(OccurrenceKind::Code)).is_err());
+        assert!(
+            std::panic::catch_unwind(|| {
+                let mut exhausted = cursor();
+                exhausted.consume(OccurrenceKind::Bytes);
+                exhausted.consume(OccurrenceKind::Bytes);
+            })
+            .is_err()
+        );
+    }
 
     #[test]
     fn object_references_preserve_forcing_and_the_full_reference_index() {

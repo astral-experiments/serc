@@ -460,7 +460,11 @@ impl<'a> StringTupleKey<'a> {
 
 impl PartialEq for StringTupleKey<'_> {
     fn eq(&self, other: &Self) -> bool {
-        self.iter().eq(other.iter())
+        match (self.0, other.0) {
+            (StringTupleKind::Names(left), StringTupleKind::Names(right)) => left == right,
+            (StringTupleKind::Strings(left), StringTupleKind::Strings(right)) => left == right,
+            _ => self.iter().eq(other.iter()),
+        }
     }
 }
 
@@ -489,6 +493,78 @@ impl PartialOrd for StringTupleKey<'_> {
 impl Ord for StringTupleKey<'_> {
     fn cmp(&self, other: &Self) -> Ordering {
         self.iter().cmp(other.iter())
+    }
+}
+
+#[cfg(test)]
+mod tuple_identity_tests {
+    use super::*;
+
+    #[test]
+    fn string_tuple_identity_is_independent_of_storage_representation() {
+        let spellings: &[&[&str]] = &[
+            &[],
+            &["a"],
+            &["a", "a"],
+            &["a", "b"],
+            &["z"],
+            &["sixteen_byte_key", "a_long_heap_allocated_name"],
+            &["é", "a_long_heap_allocated_name"],
+        ];
+        let strings = spellings
+            .iter()
+            .map(|values| {
+                values
+                    .iter()
+                    .map(|value| (*value).to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let names = spellings
+            .iter()
+            .map(|values| {
+                values
+                    .iter()
+                    .map(|value| Name::new(value))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let constants = strings
+            .iter()
+            .map(|values| {
+                values
+                    .iter()
+                    .cloned()
+                    .map(Constant::String)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        for (left_index, left) in spellings.iter().enumerate() {
+            let left_keys = [
+                StringTupleKey::strings(&strings[left_index]),
+                StringTupleKey::names(&names[left_index]),
+                StringTupleKey::constants(&constants[left_index]),
+            ];
+            for (right_index, right) in spellings.iter().enumerate() {
+                let right_keys = [
+                    StringTupleKey::strings(&strings[right_index]),
+                    StringTupleKey::names(&names[right_index]),
+                    StringTupleKey::constants(&constants[right_index]),
+                ];
+                for left_key in left_keys {
+                    for right_key in right_keys {
+                        assert_eq!(left_key == right_key, left == right);
+                        assert_eq!(left_key.cmp(&right_key), left.cmp(right));
+                        if left == right {
+                            assert_eq!(
+                                HashedObjectKey::from(ObjectKey::StringTuple(left_key)).hash,
+                                HashedObjectKey::from(ObjectKey::StringTuple(right_key)).hash,
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
