@@ -4,6 +4,8 @@ use ruff_text_size::TextRange;
 
 use crate::{CompileError, PythonVersion, indentation, yield_syntax};
 
+const MAX_NESTING: usize = 200;
+
 /// Reuse a successfully parsed token stream to prove the nesting limit was not exceeded.
 /// Malformed input retains the independent tokenizer's diagnostic precedence. Legacy targets
 /// also retain that tokenizer because their template-string rules differ from Ruff's.
@@ -14,7 +16,7 @@ pub(crate) fn validate_parsed(
     parsed: &ruff_python_parser::Parsed<ruff_python_ast::ModModule>,
 ) -> Result<(), CompileError> {
     if version >= PythonVersion::Py314 && parsed.errors().is_empty() {
-        if parsed.tokens().len() <= 200 {
+        if parsed.tokens().len() <= MAX_NESTING {
             return Ok(());
         }
         let mut depth = 0_usize;
@@ -26,7 +28,7 @@ pub(crate) fn validate_parsed(
                 }
                 _ => {}
             }
-            depth > 200
+            depth > MAX_NESTING
         });
         if !exceeds_limit {
             return Ok(());
@@ -42,8 +44,6 @@ pub(crate) fn validate(
     options: &ParseOptions,
     version: PythonVersion,
 ) -> Result<(), CompileError> {
-    const MAX_NESTING: usize = 200;
-
     // Most files cannot exceed the limit even if every opening character were a
     // delimiter. Avoid lexing them twice, especially during batch compilation.
     if source

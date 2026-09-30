@@ -253,9 +253,9 @@ struct GraphCapacity {
 }
 
 impl GraphCapacity {
+    /// Adds this code object's direct children to the whole-tree allocation estimate.
+    /// Container descendants can exceed the estimate, so collections must still support growth.
     fn record(&mut self, code: &CodeObject) {
-        // Reuse the provenance walk to size the whole code tree before recording it. Container
-        // constants can add descendants beyond this estimate; the collections still grow normally.
         self.objects = self
             .objects
             .saturating_add(code.constants.len().saturating_add(5));
@@ -2557,6 +2557,8 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
         }
     }
 
+    /// Reuses value hashes without merging a root tuple with its descendants.
+    /// All-string roots keep value lookup because they can alias metadata tuples.
     fn code_constants(&mut self, code: &'code CodeObject) -> bool {
         if let Some(hash) = code.marshal_provenance.constants_tuple_hash {
             let root_constants = std::mem::take(&mut self.root_constants);

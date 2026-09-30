@@ -341,17 +341,17 @@ fn precomputed_metadata_hashes_match_borrowed_tuples_from_either_source() {
     }
 }
 
-#[test]
-fn constant_tuple_hashes_preserve_sharing_after_cloning() {
-    fn remove_hashes(code: &mut CodeObject) {
-        code.marshal_provenance.constants_tuple_hash = None;
-        for constant in &mut code.constants {
-            if let Constant::Code(child) = constant {
-                remove_hashes(child);
-            }
+fn remove_constant_tuple_hashes(code: &mut CodeObject) {
+    code.marshal_provenance.constants_tuple_hash = None;
+    for constant in &mut code.constants {
+        if let Constant::Code(child) = constant {
+            remove_constant_tuple_hashes(child);
         }
     }
+}
 
+#[test]
+fn constant_tuple_hashes_preserve_sharing_after_cloning() {
     let source = "\
 marker = ('méthode',)
 def first():
@@ -375,7 +375,7 @@ def membership(value):
         };
         let module = crate::compile_with_options(source, "constant_hints.py", &options).unwrap();
         let mut fallback = module.clone();
-        remove_hashes(&mut fallback.code);
+        remove_constant_tuple_hashes(&mut fallback.code);
         assert_eq!(module.marshal(), fallback.marshal());
         assert_eq!(module.marshal(), module.clone().marshal());
         assert_eq!(
@@ -390,15 +390,6 @@ def membership(value):
 
 #[test]
 fn benchmark_constant_tuple_hashes_match_uncached_marshal() {
-    fn remove_hashes(code: &mut CodeObject) {
-        code.marshal_provenance.constants_tuple_hash = None;
-        for constant in &mut code.constants {
-            if let Constant::Code(child) = constant {
-                remove_hashes(child);
-            }
-        }
-    }
-
     for workload in serc_fixtures::COMPILE_MICRO_WORKLOADS
         .iter()
         .chain(serc_fixtures::MARSHAL_MICRO_WORKLOADS)
@@ -407,7 +398,7 @@ fn benchmark_constant_tuple_hashes_match_uncached_marshal() {
     {
         let module = crate::compile(workload.source, workload.filename).unwrap();
         let mut fallback = module.clone();
-        remove_hashes(&mut fallback.code);
+        remove_constant_tuple_hashes(&mut fallback.code);
         assert_eq!(module.marshal(), fallback.marshal(), "{}", workload.id);
     }
 }

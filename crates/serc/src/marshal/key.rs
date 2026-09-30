@@ -986,7 +986,8 @@ pub(super) fn constants_tuple_key(values: &[Constant]) -> ObjectKey<'_> {
     }
 }
 
-/// Value-only constant tuples keep their hash when code objects are moved or cloned.
+/// Hashes a finalized constants tuple for reuse after moving or cloning its code object.
+/// Empty tuples need no hash; code descendants prevent caching because cloning changes their keys.
 pub(crate) fn constants_tuple_hash(values: &[Constant]) -> Option<u64> {
     fn contains_code(value: &Constant) -> bool {
         match value {
