@@ -300,8 +300,10 @@ pub(crate) struct MarshalProvenance {
     pub(crate) metadata_ids: MarshalMetadataIds,
     /// Value properties computed for the emitted metadata; absent for hand-built code objects.
     pub(crate) metadata_tuple_properties: Option<MarshalMetadataTupleProperties>,
-    /// Relocation-independent constant-tuple hash; absent when descendants contain code.
+    /// Hash of a constants tuple whose key survives cloning; code identities are excluded.
     pub(crate) constants_tuple_hash: Option<u64>,
+    /// Value hashes of the immutable line and exception tables, in wire order.
+    pub(crate) table_hashes: Option<[u64; 2]>,
     /// Unpruned traversal size for reserving marshal occurrences and object flags.
     pub(crate) marshal_occurrence_bound: Option<usize>,
     /// Whether this code tree can contain a frozenset constant.

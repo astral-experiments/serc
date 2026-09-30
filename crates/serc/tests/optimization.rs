@@ -5698,6 +5698,25 @@ fn default_options_preserve_unoptimized_behavior() {
 fn optimized_deep_expression_traversal_and_cleanup() {
     const CHILD_ENV: &str = "SERC_TEST_OPTIMIZED_DEEP_EXPRESSIONS";
     if std::env::var_os(CHILD_ENV).is_some() {
+        // Exercise direct destruction at the short-expression boundary and guarded destruction
+        // of longer chains, both with ample stack and with a caller that must grow its stack.
+        for terms in [126, 127, 128, 129, 2_048] {
+            let expression = std::iter::repeat_n("x", terms)
+                .collect::<Vec<_>>()
+                .join("+");
+            let source = format!("result = {expression}\n");
+            let expected = compile(&source, "cleanup_boundary.py").unwrap().marshal();
+            for stack_size in [128 * 1024, 8 * 1024 * 1024] {
+                let source = source.clone();
+                let actual = std::thread::Builder::new()
+                    .stack_size(stack_size)
+                    .spawn(move || compile(&source, "cleanup_boundary.py").unwrap().marshal())
+                    .unwrap()
+                    .join()
+                    .unwrap();
+                assert_eq!(actual, expected);
+            }
+        }
         let expression = std::iter::repeat_n("value", 2_048)
             .collect::<Vec<_>>()
             .join(" + ");
