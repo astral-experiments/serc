@@ -19,7 +19,7 @@ use super::v5::{
     TYPE_STRING, TYPE_TRUE, TYPE_TUPLE, TYPE_UNICODE,
 };
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(super) enum ObjectKey<'a> {
     // Scalar and immutable-container keys use Python value equality.
     None,
@@ -62,6 +62,49 @@ pub(super) enum ObjectKey<'a> {
     FreshEmptyBytes,
 }
 
+impl Hash for ObjectKey<'_> {
+    #[expect(
+        clippy::inline_always,
+        reason = "specialize hashing for statically known marshal key variants"
+    )]
+    #[inline(always)]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Self::None | Self::Ellipsis | Self::EmptyTuple | Self::FreshEmptyBytes => {}
+            Self::Bool(value) => value.hash(state),
+            Self::Int(value) | Self::Float(value) => value.hash(state),
+            Self::SignedInt(value) => value.hash(state),
+            Self::BigInt(negative, digits) => {
+                negative.hash(state);
+                digits.hash(state);
+            }
+            Self::NonReflexive(value) => value.hash(state),
+            Self::Complex(real, imag) => {
+                real.hash(state);
+                imag.hash(state);
+            }
+            Self::ConstantString(value) | Self::String(value) | Self::Filename(value) => {
+                value.hash(state);
+            }
+            Self::SurrogateFilename(value) | Self::SurrogateString(value) | Self::Bytes(value) => {
+                value.hash(state);
+            }
+            Self::ConstantTuple(value) => value.hash(state),
+            Self::FrozenSet(value) => value.hash(state),
+            Self::StringTuple(value) => value.hash(state),
+            Self::AnnotationLocals(value)
+            | Self::UninternedMetadata(value)
+            | Self::SliceMember(value)
+            | Self::RecreatedFrozenSet(value)
+            | Self::Code(value)
+            | Self::CodeBytes(value)
+            | Self::LocalKinds(value) => value.hash(state),
+            Self::Slice(value) => value.hash(state),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct HashedObjectKey<'a> {
     key: ObjectKey<'a>,
@@ -69,6 +112,11 @@ pub(super) struct HashedObjectKey<'a> {
 }
 
 impl<'a> HashedObjectKey<'a> {
+    #[expect(
+        clippy::inline_always,
+        reason = "specialize precomputed key hashes at traversal call sites"
+    )]
+    #[inline(always)]
     fn new(key: ObjectKey<'a>) -> Self {
         let mut hasher = FxHasher::default();
         key.hash(&mut hasher);
@@ -1163,5 +1211,141 @@ mod intern_tests {
         }
         assert!(!is_cached_character(""));
         assert!(!is_cached_character("éa"));
+    }
+}
+
+#[cfg(test)]
+mod key_hash_tests {
+    use super::{
+        Constant, ConstantTupleKey, FrozenSetKey, FxHasher, Hash, Hasher, NonReflexiveKey,
+        ObjectKey, SliceKey, StringTupleKey,
+    };
+    use std::hash::DefaultHasher;
+
+    // Retain the original compiler-derived implementation as an independent hash-stream oracle.
+    #[derive(Hash)]
+    enum DerivedObjectKey<'a> {
+        None,
+        Bool(bool),
+        Ellipsis,
+        Int(u64),
+        SignedInt(i64),
+        BigInt(bool, &'a [u16]),
+        NonReflexive(NonReflexiveKey),
+        Float(u64),
+        Complex(u64, u64),
+        ConstantString(&'a str),
+        String(&'a str),
+        Filename(&'a str),
+        SurrogateFilename(&'a [u8]),
+        UninternedMetadata(usize),
+        SurrogateString(&'a [u8]),
+        Bytes(&'a [u8]),
+        ConstantTuple(ConstantTupleKey<'a>),
+        FrozenSet(FrozenSetKey<'a>),
+        StringTuple(StringTupleKey<'a>),
+        AnnotationLocals(usize),
+        EmptyTuple,
+        Slice(SliceKey<'a>),
+        SliceMember(usize),
+        RecreatedFrozenSet(usize),
+        Code(usize),
+        CodeBytes(usize),
+        LocalKinds(usize),
+        FreshEmptyBytes,
+    }
+
+    impl<'a> From<ObjectKey<'a>> for DerivedObjectKey<'a> {
+        fn from(key: ObjectKey<'a>) -> Self {
+            match key {
+                ObjectKey::None => Self::None,
+                ObjectKey::Bool(value0) => Self::Bool(value0),
+                ObjectKey::Ellipsis => Self::Ellipsis,
+                ObjectKey::Int(value0) => Self::Int(value0),
+                ObjectKey::SignedInt(value0) => Self::SignedInt(value0),
+                ObjectKey::BigInt(value0, value1) => Self::BigInt(value0, value1),
+                ObjectKey::NonReflexive(value0) => Self::NonReflexive(value0),
+                ObjectKey::Float(value0) => Self::Float(value0),
+                ObjectKey::Complex(value0, value1) => Self::Complex(value0, value1),
+                ObjectKey::ConstantString(value0) => Self::ConstantString(value0),
+                ObjectKey::String(value0) => Self::String(value0),
+                ObjectKey::Filename(value0) => Self::Filename(value0),
+                ObjectKey::SurrogateFilename(value0) => Self::SurrogateFilename(value0),
+                ObjectKey::UninternedMetadata(value0) => Self::UninternedMetadata(value0),
+                ObjectKey::SurrogateString(value0) => Self::SurrogateString(value0),
+                ObjectKey::Bytes(value0) => Self::Bytes(value0),
+                ObjectKey::ConstantTuple(value0) => Self::ConstantTuple(value0),
+                ObjectKey::FrozenSet(value0) => Self::FrozenSet(value0),
+                ObjectKey::StringTuple(value0) => Self::StringTuple(value0),
+                ObjectKey::AnnotationLocals(value0) => Self::AnnotationLocals(value0),
+                ObjectKey::EmptyTuple => Self::EmptyTuple,
+                ObjectKey::Slice(value0) => Self::Slice(value0),
+                ObjectKey::SliceMember(value0) => Self::SliceMember(value0),
+                ObjectKey::RecreatedFrozenSet(value0) => Self::RecreatedFrozenSet(value0),
+                ObjectKey::Code(value0) => Self::Code(value0),
+                ObjectKey::CodeBytes(value0) => Self::CodeBytes(value0),
+                ObjectKey::LocalKinds(value0) => Self::LocalKinds(value0),
+                ObjectKey::FreshEmptyBytes => Self::FreshEmptyBytes,
+            }
+        }
+    }
+
+    fn hash_with<H: Hasher + Default>(value: &impl Hash) -> u64 {
+        let mut hasher = H::default();
+        value.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    #[test]
+    fn preserves_derived_hash_stream_for_every_variant() {
+        let constants = [Constant::Int(17), Constant::Bool(true)];
+        let strings = [String::from("name"), String::from("other")];
+        let keys = [
+            ObjectKey::None,
+            ObjectKey::Bool(true),
+            ObjectKey::Ellipsis,
+            ObjectKey::Int(17),
+            ObjectKey::SignedInt(-17),
+            ObjectKey::BigInt(true, &[1, 2, 3]),
+            ObjectKey::NonReflexive(NonReflexiveKey::Source(17)),
+            ObjectKey::Float(1.25_f64.to_bits()),
+            ObjectKey::Complex(1.25_f64.to_bits(), (-3.0_f64).to_bits()),
+            ObjectKey::ConstantString("name"),
+            ObjectKey::String("name"),
+            ObjectKey::Filename("file.py"),
+            ObjectKey::SurrogateFilename(&[0xed, 0xa0, 0x80]),
+            ObjectKey::UninternedMetadata(17),
+            ObjectKey::SurrogateString(&[0xed, 0xa0, 0x80]),
+            ObjectKey::Bytes(&[1, 2, 3]),
+            ObjectKey::ConstantTuple(ConstantTupleKey(&constants)),
+            ObjectKey::FrozenSet(FrozenSetKey(&constants)),
+            ObjectKey::StringTuple(StringTupleKey::strings(&strings)),
+            ObjectKey::AnnotationLocals(17),
+            ObjectKey::EmptyTuple,
+            ObjectKey::Slice(SliceKey {
+                lower: &constants[0],
+                upper: &constants[1],
+                step: &Constant::None,
+            }),
+            ObjectKey::SliceMember(17),
+            ObjectKey::RecreatedFrozenSet(17),
+            ObjectKey::Code(17),
+            ObjectKey::CodeBytes(17),
+            ObjectKey::LocalKinds(17),
+            ObjectKey::FreshEmptyBytes,
+        ];
+        for key in keys {
+            let derived = DerivedObjectKey::from(key);
+            assert_eq!(
+                hash_with::<FxHasher>(&key),
+                hash_with::<FxHasher>(&derived),
+                "{key:?}"
+            );
+            assert_eq!(
+                hash_with::<DefaultHasher>(&key),
+                hash_with::<DefaultHasher>(&derived),
+                "{key:?}"
+            );
+        }
     }
 }

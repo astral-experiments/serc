@@ -549,10 +549,20 @@ impl<'a> ObjectGraph<'a> {
         self.estimated_payload_bytes = self.estimated_payload_bytes.saturating_add(length);
     }
 
+    #[expect(
+        clippy::inline_always,
+        reason = "avoid copying keys through graph recording wrappers"
+    )]
+    #[inline(always)]
     fn record_keyed(&mut self, kind: OccurrenceKind, key: ObjectKey<'a>) -> bool {
         self.record_hashed(kind, key.into())
     }
 
+    #[expect(
+        clippy::inline_always,
+        reason = "avoid copying keys through graph recording wrappers"
+    )]
+    #[inline(always)]
     fn record_hashed(&mut self, kind: OccurrenceKind, key: HashedObjectKey<'a>) -> bool {
         let (id, first) = self.record_object(key);
         self.occurrences.push(Occurrence { object: id, kind });
@@ -611,6 +621,7 @@ impl<'a> ObjectGraph<'a> {
         first
     }
 
+    #[inline]
     fn interned_string(&mut self, value: &'a str) -> (ObjectId, bool) {
         match self.interned_strings.entry(value) {
             Entry::Occupied(entry) => {
@@ -632,6 +643,11 @@ impl<'a> ObjectGraph<'a> {
         }
     }
 
+    #[expect(
+        clippy::inline_always,
+        reason = "specialize cached-object recording for known scalar variants"
+    )]
+    #[inline(always)]
     fn record_cached_value(&mut self, kind: OccurrenceKind, cached: CachedObject) -> bool {
         let (id, first) = self.record_cached(cached);
         self.occurrences.push(Occurrence { object: id, kind });
@@ -687,6 +703,11 @@ impl<'a> ObjectGraph<'a> {
         id
     }
 
+    #[expect(
+        clippy::inline_always,
+        reason = "specialize cached-object recording for known scalar variants"
+    )]
+    #[inline(always)]
     fn record_cached(&mut self, cached: CachedObject) -> (ObjectId, bool) {
         let empty_slot = match cached {
             CachedObject::EmptyBytes => Some(&mut self.cached_empty_bytes),
@@ -984,11 +1005,13 @@ fn collect_explicitly_interned<'a>(
 ) -> (FrozensetRecreationNeed, GraphCapacity) {
     // Identifier objects can enter the compilation-wide constant cache before an equal
     // ordinary string. Preserve that recorded origin when sharing constant and metadata strings.
+    // Scalar traversal and sorting already recognize automatically interned spellings.
     values.extend(
         code.marshal_provenance
             .canonical_constant_strings
             .iter()
-            .map(String::as_str),
+            .map(String::as_str)
+            .filter(|value| !should_intern(value)),
     );
     let mut qualified_names = QualifiedNameConstants {
         track: python_version != PythonVersion::Py312,
@@ -1077,7 +1100,8 @@ fn collect_interning_provenance_without_frozensets<'a>(
         code.marshal_provenance
             .explicitly_interned_strings
             .iter()
-            .map(String::as_str),
+            .map(String::as_str)
+            .filter(|value| !should_intern(value)),
     );
     qualified_names.record(code);
     for constant in &code.constants {
@@ -1111,7 +1135,8 @@ fn collect_interning_provenance<'a>(
         code.marshal_provenance
             .explicitly_interned_strings
             .iter()
-            .map(String::as_str),
+            .map(String::as_str)
+            .filter(|value| !should_intern(value)),
     );
     qualified_names.record(code);
     // Reuse the provenance walk to classify frozenset recreation for code trees that can contain
@@ -2666,7 +2691,11 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
         }
     }
 
-    #[inline]
+    #[expect(
+        clippy::inline_always,
+        reason = "specialize metadata recording for compiler-owned IDs"
+    )]
+    #[inline(always)]
     fn metadata_string(&mut self, value: &'code str, metadata_id: Option<MetadataId>) {
         let first = if self.graph.cache_scalars
             && let Some(character) = CachedObject::character(value)
