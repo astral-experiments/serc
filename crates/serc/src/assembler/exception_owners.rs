@@ -33,6 +33,49 @@ pub(super) struct LegacyProtocolAwaitSetup {
     pub(super) exit: Label,
 }
 
+/// Keeps empty provenance shared until lowering records an original CFG fact.
+#[derive(Debug, Default)]
+pub(super) struct ExceptionOwnerProvenanceStorage(Option<Box<ExceptionOwnerProvenance>>);
+
+impl ExceptionOwnerProvenanceStorage {
+    pub(super) fn as_mut(&mut self) -> Option<&mut ExceptionOwnerProvenance> {
+        self.0.as_deref_mut()
+    }
+}
+
+impl std::ops::Deref for ExceptionOwnerProvenanceStorage {
+    type Target = ExceptionOwnerProvenance;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        static EMPTY: std::sync::LazyLock<ExceptionOwnerProvenance> =
+            std::sync::LazyLock::new(ExceptionOwnerProvenance::default);
+        match &self.0 {
+            Some(provenance) => provenance,
+            None => &EMPTY,
+        }
+    }
+}
+
+impl std::ops::DerefMut for ExceptionOwnerProvenanceStorage {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.get_or_insert_with(Box::default)
+    }
+}
+
+impl From<Box<ExceptionOwnerProvenance>> for ExceptionOwnerProvenanceStorage {
+    fn from(provenance: Box<ExceptionOwnerProvenance>) -> Self {
+        Self(Some(provenance))
+    }
+}
+
+impl From<ExceptionOwnerProvenanceStorage> for Box<ExceptionOwnerProvenance> {
+    fn from(provenance: ExceptionOwnerProvenanceStorage) -> Self {
+        provenance.0.unwrap_or_default()
+    }
+}
+
 /// Original CFG facts that cannot be recovered from split exception ranges or optimized jumps.
 #[derive(Debug, Default)]
 pub(super) struct ExceptionOwnerProvenance {
@@ -12815,6 +12858,34 @@ mod tests {
     use super::ExceptionOwnerTail;
 
     #[test]
+    fn empty_provenance_is_shared_and_mutation_is_private() {
+        use super::{ExceptionOwnerProvenance, ExceptionOwnerProvenanceStorage};
+        use crate::assembler::Label;
+
+        let mut first = ExceptionOwnerProvenanceStorage::default();
+        let second = ExceptionOwnerProvenanceStorage::default();
+        assert!(std::ptr::eq(
+            std::ptr::from_ref(&*first),
+            std::ptr::from_ref(&*second)
+        ));
+        assert!(first.as_mut().is_none());
+        first.setups.push((Label::from_u32(7), None));
+        assert!(second.setups.is_empty());
+        let before = std::ptr::from_ref::<ExceptionOwnerProvenance>(&first);
+        first.setups.push((Label::from_u32(8), None));
+        assert_eq!(
+            before,
+            std::ptr::from_ref::<ExceptionOwnerProvenance>(&first)
+        );
+        let boxed: Box<ExceptionOwnerProvenance> = first.into();
+        assert_eq!(
+            boxed.setups,
+            [(Label::from_u32(7), None), (Label::from_u32(8), None)]
+        );
+        assert!(std::ptr::eq(before, std::ptr::from_ref(&*boxed)));
+    }
+
+    #[test]
     fn single_dynamic_owner_admission_scan_matches_both_original_gates() {
         use super::{
             ExceptionOwnerProvenance, NamedHandlerTruthPrefix, UncompactedConditionalArray,
@@ -12961,7 +13032,7 @@ mod tests {
                                         Item::Instruction(candidate),
                                     ],
                                     exception_regions: Vec::new(),
-                                    exception_owner_provenance: Box::new(provenance),
+                                    exception_owner_provenance: Box::new(provenance).into(),
                                     preserved_block_boundaries: rustc_hash::FxHashSet::default(),
                                     removed_max_depth: None,
                                     next_label: 1,
@@ -13494,7 +13565,8 @@ mod tests {
             exception_owner_provenance: Box::new(ExceptionOwnerProvenance {
                 threaded_condition_origins: vec![(origin, successor)],
                 ..ExceptionOwnerProvenance::default()
-            }),
+            })
+            .into(),
             preserved_block_boundaries: rustc_hash::FxHashSet::default(),
             removed_max_depth: None,
             next_label: 2,
@@ -13757,7 +13829,8 @@ mod tests {
                     source_boundaries: [start].into_iter().collect(),
                     block_boundaries: [start].into_iter().collect(),
                     ..ExceptionOwnerProvenance::default()
-                }),
+                })
+                .into(),
                 preserved_block_boundaries: rustc_hash::FxHashSet::default(),
                 removed_max_depth: None,
                 next_label: 2,
@@ -13975,7 +14048,8 @@ mod tests {
                 exception_owner_provenance: Box::new(ExceptionOwnerProvenance {
                     setups: vec![(setup, Some(location))],
                     ..ExceptionOwnerProvenance::default()
-                }),
+                })
+                .into(),
                 preserved_block_boundaries: rustc_hash::FxHashSet::default(),
                 removed_max_depth: None,
                 next_label: 5,
@@ -14116,7 +14190,7 @@ mod tests {
                 legacy_uniform_jump_seed: false,
                 items: pipeline.graph.into_items(),
                 exception_regions: pipeline.exception_regions,
-                exception_owner_provenance: pipeline.exception_owner_provenance,
+                exception_owner_provenance: pipeline.exception_owner_provenance.into(),
                 preserved_block_boundaries: pipeline.preserved_block_boundaries,
                 removed_max_depth: None,
                 next_label: pipeline.next_label,
@@ -14308,7 +14382,8 @@ mod tests {
                         entry_prefix: Some(vec![Item::Label(Label::from_u32(0))]),
                     }],
                     ..ExceptionOwnerProvenance::default()
-                }),
+                })
+                .into(),
                 preserved_block_boundaries: rustc_hash::FxHashSet::default(),
                 removed_max_depth: None,
                 next_label: 11,
@@ -14576,7 +14651,8 @@ mod tests {
                         entry_prefix: Some(source_prefix),
                     }],
                     ..ExceptionOwnerProvenance::default()
-                }),
+                })
+                .into(),
                 preserved_block_boundaries: rustc_hash::FxHashSet::default(),
                 removed_max_depth: None,
                 next_label: 12,
@@ -14785,7 +14861,8 @@ mod tests {
                         entry_prefix: Some(vec![Item::Label(Label::from_u32(0))]),
                     }],
                     ..ExceptionOwnerProvenance::default()
-                }),
+                })
+                .into(),
                 preserved_block_boundaries: rustc_hash::FxHashSet::default(),
                 removed_max_depth: None,
                 next_label: 10,
@@ -15136,7 +15213,8 @@ mod tests {
                         borrow_join: None,
                     }],
                     ..ExceptionOwnerProvenance::default()
-                }),
+                })
+                .into(),
                 preserved_block_boundaries: rustc_hash::FxHashSet::default(),
                 removed_max_depth: None,
                 next_label: 6,
@@ -15303,7 +15381,8 @@ mod tests {
                         incoming: vec![plain(JUMP_FORWARD, Operand::Forward(entry))],
                     }],
                     ..ExceptionOwnerProvenance::default()
-                }),
+                })
+                .into(),
                 preserved_block_boundaries: rustc_hash::FxHashSet::default(),
                 removed_max_depth: None,
                 next_label: 5,
@@ -15531,7 +15610,7 @@ mod tests {
                 python_version: crate::PythonVersion::Py314,
                 legacy_uniform_jump_seed: false,
                 items,
-                exception_owner_provenance: Box::new(provenance),
+                exception_owner_provenance: Box::new(provenance).into(),
                 exception_regions: vec![],
                 preserved_block_boundaries: rustc_hash::FxHashSet::default(),
                 removed_max_depth: None,
@@ -15903,7 +15982,7 @@ mod tests {
                 python_version: crate::PythonVersion::Py314,
                 legacy_uniform_jump_seed: false,
                 items,
-                exception_owner_provenance: Box::new(provenance),
+                exception_owner_provenance: Box::new(provenance).into(),
                 exception_regions: vec![],
                 preserved_block_boundaries: rustc_hash::FxHashSet::default(),
                 removed_max_depth: None,
@@ -16064,7 +16143,7 @@ mod tests {
                 python_version: crate::PythonVersion::Py314,
                 legacy_uniform_jump_seed: false,
                 items,
-                exception_owner_provenance: Box::new(provenance),
+                exception_owner_provenance: Box::new(provenance).into(),
                 exception_regions: vec![],
                 preserved_block_boundaries: rustc_hash::FxHashSet::default(),
                 removed_max_depth: None,
@@ -16206,7 +16285,7 @@ mod tests {
                 python_version: crate::PythonVersion::Py314,
                 legacy_uniform_jump_seed: false,
                 items,
-                exception_owner_provenance: Box::new(provenance),
+                exception_owner_provenance: Box::new(provenance).into(),
                 exception_regions: vec![],
                 preserved_block_boundaries: rustc_hash::FxHashSet::default(),
                 removed_max_depth: None,
@@ -16387,7 +16466,7 @@ mod tests {
                 legacy_uniform_jump_seed: false,
                 items,
                 exception_regions: regions,
-                exception_owner_provenance: Box::new(provenance),
+                exception_owner_provenance: Box::new(provenance).into(),
                 preserved_block_boundaries: rustc_hash::FxHashSet::default(),
                 removed_max_depth: None,
                 next_label: 8,
@@ -16827,7 +16906,8 @@ mod tests {
                     removed_pop_block_boundaries: [Label::from_u32(7)].into_iter().collect(),
                     removed_pop_block_widths: [(Label::from_u32(7), 1)].into_iter().collect(),
                     ..ExceptionOwnerProvenance::default()
-                }),
+                })
+                .into(),
                 preserved_block_boundaries: rustc_hash::FxHashSet::default(),
                 removed_max_depth: None,
                 next_label: 15,
@@ -17239,7 +17319,7 @@ mod tests {
                     python_version: crate::PythonVersion::Py314,
                     legacy_uniform_jump_seed: false,
                     items,
-                    exception_owner_provenance: Box::new(provenance),
+                    exception_owner_provenance: Box::new(provenance).into(),
                     exception_regions,
                     preserved_block_boundaries: rustc_hash::FxHashSet::default(),
                     removed_max_depth: None,

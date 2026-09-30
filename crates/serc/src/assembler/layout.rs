@@ -1344,7 +1344,8 @@ mod tests {
             legacy_uniform_jump_seed: false,
             items,
             exception_regions,
-            exception_owner_provenance: Box::default(),
+            exception_owner_provenance:
+                crate::assembler::exception_owners::ExceptionOwnerProvenanceStorage::default(),
             preserved_block_boundaries: FxHashSet::default(),
             removed_max_depth: None,
             next_label: 0,

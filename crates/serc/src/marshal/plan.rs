@@ -134,7 +134,11 @@ where
 /// Visits metadata tuple members in order.
 ///
 /// Compiler-owned IDs follow the same order and length as the metadata tuple.
-#[inline]
+#[expect(
+    clippy::inline_always,
+    reason = "select metadata ID traversal once for the graph and payload visitors"
+)]
+#[inline(always)]
 fn traverse_metadata_strings<'a, V>(
     values: &'a [Name],
     metadata_ids: Option<&[MetadataId]>,
@@ -154,8 +158,30 @@ fn traverse_metadata_strings<'a, V>(
     }
 }
 
-#[inline]
+#[expect(
+    clippy::inline_always,
+    reason = "dispatch scalar constants in the caller without inlining recursive containers"
+)]
+#[inline(always)]
 fn traverse_constant<'a, V>(value: &'a Constant, reference_mode: ReferenceMode, visitor: &mut V)
+where
+    V: MarshalVisitor<'a>,
+{
+    match value {
+        Constant::Tuple(_)
+        | Constant::Code(_)
+        | Constant::FrozenSet(_)
+        | Constant::Slice { .. } => {
+            traverse_container(value, reference_mode, visitor);
+        }
+        _ => {
+            visitor.constant(value, reference_mode);
+        }
+    }
+}
+
+#[inline(never)]
+fn traverse_container<'a, V>(value: &'a Constant, reference_mode: ReferenceMode, visitor: &mut V)
 where
     V: MarshalVisitor<'a>,
 {
@@ -178,9 +204,7 @@ where
                 traverse_slice_member(step, visitor);
             }
         }
-        _ => {
-            visitor.constant(value, reference_mode);
-        }
+        _ => unreachable!("scalar constants are visited directly"),
     }
 }
 

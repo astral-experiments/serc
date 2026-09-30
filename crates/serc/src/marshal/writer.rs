@@ -215,6 +215,11 @@ impl Writer<'_, '_, '_> {
         }
     }
 
+    #[expect(
+        clippy::inline_always,
+        reason = "specialize reference mode and byte payload emission at structural call sites"
+    )]
+    #[inline(always)]
     fn bytes_with_object(&mut self, object: ObjectId, value: &[u8], reference_mode: ReferenceMode) {
         let Some(flag) = self.begin_object(object, reference_mode) else {
             return;
@@ -245,6 +250,11 @@ impl Writer<'_, '_, '_> {
         }
     }
 
+    #[expect(
+        clippy::inline_always,
+        reason = "keep forced metadata references with the occurrence traversal"
+    )]
+    #[inline(always)]
     fn interned_string_with_object(&mut self, object: ObjectId, value: &str) {
         let object = self.graph.object_for_writing(object);
         debug_assert!(object.is_interned(), "marshal metadata must be interned");
@@ -335,6 +345,11 @@ impl Writer<'_, '_, '_> {
         self.output.extend_from_slice(value);
     }
 
+    #[expect(
+        clippy::inline_always,
+        reason = "specialize tuple reference mode and header width at structural call sites"
+    )]
+    #[inline(always)]
     fn tuple_header(
         &mut self,
         object: ObjectId,
@@ -356,6 +371,11 @@ impl Writer<'_, '_, '_> {
         true
     }
 
+    #[expect(
+        clippy::inline_always,
+        reason = "specialize constant payloads after scalar and container dispatch"
+    )]
+    #[inline(always)]
     fn write_constant_value(
         &mut self,
         value: &Constant,
@@ -586,7 +606,11 @@ impl<'code> MarshalVisitor<'code> for Writer<'_, '_, 'code> {
         self.bytes_with_object(object, &code.local_kinds, ReferenceMode::IfShared);
     }
 
-    #[inline]
+    #[expect(
+        clippy::inline_always,
+        reason = "keep occurrence consumption and forced references inside metadata traversal"
+    )]
+    #[inline(always)]
     fn metadata_string(&mut self, value: &'code str, _metadata_id: Option<MetadataId>) {
         let object = self.next_object(OccurrenceKind::MetadataString);
         self.interned_string_with_object(object, value);

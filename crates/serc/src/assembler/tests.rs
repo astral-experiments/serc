@@ -1899,7 +1899,8 @@ fn fused_final_artifacts_preserve_cache_extended_argument_location_and_depth_sem
             )),
         ],
         exception_regions: Vec::new(),
-        exception_owner_provenance: Box::default(),
+        exception_owner_provenance:
+            crate::assembler::exception_owners::ExceptionOwnerProvenanceStorage::default(),
         preserved_block_boundaries: rustc_hash::FxHashSet::default(),
         removed_max_depth: None,
         next_label: 1,
@@ -1984,7 +1985,8 @@ fn unextended_final_artifacts_preserve_jump_cache_location_and_depth_semantics()
             )),
         ],
         exception_regions: Vec::new(),
-        exception_owner_provenance: Box::default(),
+        exception_owner_provenance:
+            crate::assembler::exception_owners::ExceptionOwnerProvenanceStorage::default(),
         preserved_block_boundaries: rustc_hash::FxHashSet::default(),
         removed_max_depth: None,
         next_label: 1,
@@ -6921,7 +6923,8 @@ fn retained_setup_nop_identity_survives_consecutive_labels_without_aliasing_remo
                     setup_nop_boundaries: [start, end].into_iter().collect(),
                     ..Default::default()
                 },
-            ),
+            )
+            .into(),
             preserved_block_boundaries: rustc_hash::FxHashSet::default(),
             removed_max_depth: None,
             next_label: 4,

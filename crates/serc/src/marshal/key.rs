@@ -460,7 +460,21 @@ impl<'a> StringTupleKey<'a> {
 
 impl PartialEq for StringTupleKey<'_> {
     fn eq(&self, other: &Self) -> bool {
-        self.iter().eq(other.iter())
+        // Metadata tuples normally compare with another tuple of the same kind.
+        // Keep the kind dispatch outside the member loop; mixed sources still
+        // compare their string values so literal tuples can alias metadata.
+        match (self.0, other.0) {
+            (StringTupleKind::Names(left), StringTupleKind::Names(right)) => left == right,
+            (StringTupleKind::Strings(left), StringTupleKind::Strings(right)) => left == right,
+            (StringTupleKind::Constants(left), StringTupleKind::Constants(right)) => {
+                left.len() == right.len()
+                    && left
+                        .iter()
+                        .map(constant_string)
+                        .eq(right.iter().map(constant_string))
+            }
+            _ => self.iter().eq(other.iter()),
+        }
     }
 }
 
@@ -468,14 +482,26 @@ impl Eq for StringTupleKey<'_> {}
 
 impl Hash for StringTupleKey<'_> {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        let length = match self.0 {
-            StringTupleKind::Constants(values) => values.len(),
-            StringTupleKind::Strings(values) => values.len(),
-            StringTupleKind::Names(values) => values.len(),
-        };
-        length.hash(state);
-        for value in self.iter() {
-            value.hash(state);
+        fn hash_strings<'a, H: Hasher>(
+            values: impl ExactSizeIterator<Item = &'a str>,
+            state: &mut H,
+        ) {
+            values.len().hash(state);
+            for value in values {
+                value.hash(state);
+            }
+        }
+
+        match self.0 {
+            StringTupleKind::Constants(values) => {
+                hash_strings(values.iter().map(constant_string), state);
+            }
+            StringTupleKind::Strings(values) => {
+                hash_strings(values.iter().map(String::as_str), state);
+            }
+            StringTupleKind::Names(values) => {
+                hash_strings(values.iter().map(Name::as_str), state);
+            }
         }
     }
 }

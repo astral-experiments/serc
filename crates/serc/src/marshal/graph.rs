@@ -549,10 +549,20 @@ impl<'a> ObjectGraph<'a> {
         self.estimated_payload_bytes = self.estimated_payload_bytes.saturating_add(length);
     }
 
+    #[expect(
+        clippy::inline_always,
+        reason = "specialize value hashing for each structural marshal object kind"
+    )]
+    #[inline(always)]
     fn record_keyed(&mut self, kind: OccurrenceKind, key: ObjectKey<'a>) -> bool {
         self.record_hashed(kind, key.into())
     }
 
+    #[expect(
+        clippy::inline_always,
+        reason = "specialize keyed object recording for structural tuples and table bytes"
+    )]
+    #[inline(always)]
     fn record_hashed(&mut self, kind: OccurrenceKind, key: HashedObjectKey<'a>) -> bool {
         let (id, first) = self.record_object(key);
         self.occurrences.push(Occurrence { object: id, kind });
@@ -565,7 +575,11 @@ impl<'a> ObjectGraph<'a> {
         first
     }
 
-    #[inline]
+    #[expect(
+        clippy::inline_always,
+        reason = "specialize dense metadata lookup for hinted and unhinted traversals"
+    )]
+    #[inline(always)]
     fn record_metadata_string(
         &mut self,
         kind: OccurrenceKind,
@@ -611,6 +625,11 @@ impl<'a> ObjectGraph<'a> {
         first
     }
 
+    #[expect(
+        clippy::inline_always,
+        reason = "keep string-table lookup with the metadata and constant recording paths"
+    )]
+    #[inline(always)]
     fn interned_string(&mut self, value: &'a str) -> (ObjectId, bool) {
         match self.interned_strings.entry(value) {
             Entry::Occupied(entry) => {
@@ -632,6 +651,11 @@ impl<'a> ObjectGraph<'a> {
         }
     }
 
+    #[expect(
+        clippy::inline_always,
+        reason = "resolve empty and scalar cache slots at their recording call sites"
+    )]
+    #[inline(always)]
     fn record_cached_value(&mut self, kind: OccurrenceKind, cached: CachedObject) -> bool {
         let (id, first) = self.record_cached(cached);
         self.occurrences.push(Occurrence { object: id, kind });
@@ -687,6 +711,11 @@ impl<'a> ObjectGraph<'a> {
         id
     }
 
+    #[expect(
+        clippy::inline_always,
+        reason = "specialize empty and scalar cache lookup for each cached object kind"
+    )]
+    #[inline(always)]
     fn record_cached(&mut self, cached: CachedObject) -> (ObjectId, bool) {
         let empty_slot = match cached {
             CachedObject::EmptyBytes => Some(&mut self.cached_empty_bytes),
@@ -728,7 +757,11 @@ impl<'a> ObjectGraph<'a> {
         (id, true)
     }
 
-    #[inline]
+    #[expect(
+        clippy::inline_always,
+        reason = "specialize marshal key lookup for each recorded object kind"
+    )]
+    #[inline(always)]
     fn record_object(&mut self, key: HashedObjectKey<'a>) -> (ObjectId, bool) {
         // The key already owns its value hash. Use it directly for lookup and growth, retaining
         // full key equality and assigning object IDs solely in traversal order.
@@ -2558,7 +2591,11 @@ struct GraphVisitor<'graph, 'code> {
 impl<'code> GraphVisitor<'_, 'code> {
     /// Records the constants tuple, using a cached value hash when available.
     /// Root and code-bearing tuples retain unique identities; string tuples may alias metadata.
-    #[inline]
+    #[expect(
+        clippy::inline_always,
+        reason = "specialize hinted code constants and ordinary constant tuple recording"
+    )]
+    #[inline(always)]
     fn constants_with_hash(&mut self, values: &'code [Constant], hash: Option<u64>) -> bool {
         let root_constants = std::mem::take(&mut self.root_constants);
         if values.is_empty() {
@@ -2666,7 +2703,11 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
         }
     }
 
-    #[inline]
+    #[expect(
+        clippy::inline_always,
+        reason = "keep dense metadata slot lookup inside the metadata traversal"
+    )]
+    #[inline(always)]
     fn metadata_string(&mut self, value: &'code str, metadata_id: Option<MetadataId>) {
         let first = if self.graph.cache_scalars
             && let Some(character) = CachedObject::character(value)
@@ -2773,7 +2814,11 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
         }
     }
 
-    #[inline]
+    #[expect(
+        clippy::inline_always,
+        reason = "specialize constant recording after scalar and container dispatch"
+    )]
+    #[inline(always)]
     fn constant(&mut self, value: &'code Constant, _reference_mode: ReferenceMode) -> bool {
         if let Constant::FrozenSet(values) = value {
             self.graph.needs_reference_sorting |=
