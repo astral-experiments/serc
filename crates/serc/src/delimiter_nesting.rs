@@ -37,15 +37,43 @@ pub(crate) fn validate_parsed(
     validate(source, options, version)
 }
 
-/// Prove shallow nesting without tokenizing identifiers and numbers a second time.
-/// Ambiguous or malformed strings use the tokenizer below, preserving error priority.
+#[inline]
+fn opening_count_is_bounded(bytes: &[u8], maximum: usize) -> bool {
+    bytes
+        .iter()
+        .filter(|byte| matches!(byte, b'(' | b'[' | b'{'))
+        .take(maximum + 1)
+        .count()
+        <= maximum
+}
+
+/// Certifies the nesting limit for ordinary strings and comments without lexing identifiers.
+/// Unrecognized suffixes use the full lexer unless even their raw openings fit the limit.
 fn proves_shallow_nesting(source: &str) -> bool {
     let bytes = source.as_bytes();
-    let mut stack = [0; MAX_NESTING];
+    let mut closing = [0_u8; MAX_NESTING];
     let mut depth = 0;
     let mut index = 0;
     while let Some(&byte) = bytes.get(index) {
         match byte {
+            b'(' | b'[' | b'{' => {
+                if depth == MAX_NESTING {
+                    return false;
+                }
+                closing[depth] = match byte {
+                    b'(' => b')',
+                    b'[' => b']',
+                    _ => b'}',
+                };
+                depth += 1;
+            }
+            b')' | b']' | b'}' => {
+                if depth == 0 || closing[depth - 1] != byte {
+                    // The full lexer stops at the first unmatched delimiter too.
+                    return true;
+                }
+                depth -= 1;
+            }
             b'#' => {
                 while bytes
                     .get(index)
@@ -53,84 +81,51 @@ fn proves_shallow_nesting(source: &str) -> bool {
                 {
                     index += 1;
                 }
+                continue;
             }
             b'\'' | b'"' => {
-                let interpolated = bytes[index.saturating_sub(2)..index]
-                    .iter()
-                    .any(|byte| matches!(byte, b'f' | b'F' | b't' | b'T'));
-                let triple = bytes.get(index..index + 3) == Some(&[byte; 3]);
-                if interpolated && triple {
-                    return false;
+                if index > 0
+                    && (bytes[index - 1].is_ascii_alphanumeric()
+                        || bytes[index - 1] == b'_'
+                        || !bytes[index - 1].is_ascii())
+                {
+                    // Every remaining lexer opening needs a source opening byte,
+                    // just as in the whole-file guard. This also bounds interpolation.
+                    return opening_count_is_bounded(&bytes[index..], MAX_NESTING - depth);
                 }
+                let triple =
+                    bytes.get(index + 1) == Some(&byte) && bytes.get(index + 2) == Some(&byte);
                 let width = if triple { 3 } else { 1 };
                 index += width;
-                let mut field_depth = 0_usize;
-                let mut opening_count = 0;
-                loop {
-                    let Some(&current) = bytes.get(index) else {
-                        return false;
-                    };
-                    if current == byte
-                        && (!triple || bytes.get(index..index + 3) == Some(&[byte; 3]))
+                while let Some(&character) = bytes.get(index) {
+                    if character == b'\\' {
+                        // A CRLF escape is one continued line, like a lone CR or LF.
+                        index += if bytes.get(index + 1) == Some(&b'\r')
+                            && bytes.get(index + 2) == Some(&b'\n')
+                        {
+                            3
+                        } else {
+                            2
+                        };
+                    } else if character == byte
+                        && (!triple
+                            || (bytes.get(index + 1) == Some(&byte)
+                                && bytes.get(index + 2) == Some(&byte)))
                     {
-                        if field_depth != 0 {
-                            return false;
-                        }
                         index += width;
                         break;
-                    }
-                    if !triple && matches!(current, b'\n' | b'\r') {
-                        return false;
-                    }
-                    if interpolated {
-                        // Quoted expressions, comments, and escapes need the full f-string lexer.
-                        if matches!(current, b'\'' | b'"' | b'\\' | b'#') {
-                            return false;
-                        }
-                        if matches!(current, b'(' | b'[' | b'{') {
-                            opening_count += 1;
-                            if depth + opening_count > MAX_NESTING {
-                                return false;
-                            }
-                        }
-                        if current == b'{' {
-                            field_depth += 1;
-                        } else if current == b'}' {
-                            let Some(remaining) = field_depth.checked_sub(1) else {
-                                return false;
-                            };
-                            field_depth = remaining;
-                        }
-                    } else if current == b'\\' {
-                        // Raw and ordinary strings both escape quotes for tokenization.
+                    } else if !triple && matches!(character, b'\n' | b'\r') {
+                        // An unclosed ordinary string stops the nesting validator.
+                        return true;
+                    } else {
                         index += 1;
-                        if bytes.get(index).is_none() {
-                            return false;
-                        }
                     }
-                    index += 1;
                 }
                 continue;
             }
-            b'(' | b'[' | b'{' => {
-                if depth == MAX_NESTING {
-                    return false;
-                }
-                stack[depth] = byte;
-                depth += 1;
+            b'\\' => {
+                return opening_count_is_bounded(&bytes[index..], MAX_NESTING - depth);
             }
-            b')' | b']' | b'}' => {
-                if depth == 0
-                    || !matches!(
-                        (stack[depth - 1], byte),
-                        (b'(', b')') | (b'[', b']') | (b'{', b'}')
-                    )
-                {
-                    return false;
-                }
-                depth -= 1;
-            }
-            b'\\' => return false,
             _ => {}
         }
         index += 1;
@@ -156,15 +151,10 @@ fn validate_with_fast_scan<const FAST_SCAN: bool>(
 ) -> Result<(), CompileError> {
     // Most files cannot exceed the limit even if every opening character were a
     // delimiter. Avoid lexing them twice, especially during batch compilation.
-    if source
-        .bytes()
-        .filter(|byte| matches!(byte, b'(' | b'[' | b'{'))
-        .take(MAX_NESTING + 1)
-        .count()
-        <= MAX_NESTING
-    {
+    if opening_count_is_bounded(source.as_bytes(), MAX_NESTING) {
         return Ok(());
     }
+
     if FAST_SCAN && proves_shallow_nesting(source) {
         return Ok(());
     }
@@ -333,6 +323,84 @@ mod tests {
     use super::{MAX_NESTING, proves_shallow_nesting, validate_parsed, validate_with_fast_scan};
     use crate::PythonVersion;
     use ruff_python_parser::{Mode, ParseOptions};
+
+    #[test]
+    fn bounded_scan_preserves_lexer_diagnostics() {
+        let options = ParseOptions::from(Mode::Module);
+        for version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            for depth in [0, 1, 199, 200, 201, 202] {
+                let expression = format!("{}0{}", "(".repeat(depth), ")".repeat(depth));
+                for prefix in [
+                    "",
+                    "# ([(\n",
+                    "value = ",
+                    "if True:\n    ",
+                    "0xg\n",
+                    "yield, 0\n",
+                    "value = 'unterminated\n",
+                    "value = '''unterminated\n",
+                    "value = \"escaped\\\"([({})])\"\n",
+                    "value = '\\\n'\n",
+                    "value = '\\\r\ncontinued'\n",
+                    "value = '''([{\\\"\n}])'''\n",
+                    "value = r'([{}])'\n",
+                    "value = f'{(0)}'\n",
+                    "value = t'{(0)}'\n",
+                    "value = rf'{(0)}'\n",
+                    "value = \"\"\"([{\n}])\"\"\"\n",
+                    ")\n",
+                    "[)\n",
+                    "value = 1 \\\n  + 2\n",
+                ] {
+                    for source in [
+                        format!("{prefix}{expression}\n{}\n", "# ()".repeat(201)),
+                        format!("{}\n{prefix}{expression}\n", "# ()".repeat(201)),
+                    ] {
+                        assert_eq!(
+                            validate_with_fast_scan::<true>(&source, &options, version),
+                            validate_with_fast_scan::<false>(&source, &options, version),
+                            "{version:?}: {source:?}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_scan_requires_fallback_for_unbounded_suffixes_and_excess_nesting() {
+        for source in [
+            "f'{value}'",
+            "t'{value}'",
+            "r'value'",
+            "rf'{value}'",
+            "x \\\n + y",
+        ] {
+            assert!(proves_shallow_nesting(source), "{source:?}");
+            let source = format!("{source}{}", "(".repeat(201));
+            assert!(!proves_shallow_nesting(&source), "{source:?}");
+        }
+        assert!(proves_shallow_nesting(&format!(
+            "{}0{}",
+            "(".repeat(200),
+            ")".repeat(200)
+        )));
+        assert!(!proves_shallow_nesting(&format!(
+            "{}0{}",
+            "(".repeat(201),
+            ")".repeat(201)
+        )));
+        assert!(proves_shallow_nesting(&format!("{}\n0", "# (".repeat(300))));
+        assert!(proves_shallow_nesting(&format!(
+            "'{}'",
+            "([{)]}".repeat(300)
+        )));
+    }
 
     #[test]
     fn parsed_nesting_proof_preserves_tokenizer_diagnostics() {

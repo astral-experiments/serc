@@ -9,7 +9,7 @@ mod writer;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use graph::validate_initial_intern_state;
+pub(crate) use graph::{code_occurrence_bound, validate_initial_intern_state};
 pub(crate) use key::{bytes_hash, constants_tuple_hash, metadata_tuple_properties};
 #[cfg(test)]
 pub(crate) use writer::encode_code;

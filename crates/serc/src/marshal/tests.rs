@@ -12,6 +12,77 @@ use super::key::{
 };
 use super::plan::{MarshalVisitor, ObjectId, ReferenceMode, traverse_code};
 
+#[test]
+fn cached_constant_tuple_hashes_preserve_cloned_benchmark_streams() {
+    fn clear_hashes(code: &mut CodeObject) {
+        code.marshal_provenance.constants_tuple_hash = None;
+        code.marshal_provenance.marshal_occurrence_bound = None;
+        for value in &mut code.constants {
+            if let Constant::Code(child) = value {
+                clear_hashes(child);
+            }
+        }
+    }
+
+    fn check(module: &crate::CompiledModule, label: &str) {
+        let cloned = module.clone();
+        let mut uncached = module.clone();
+        clear_hashes(&mut uncached.code);
+        let expected = uncached.marshal();
+        assert_eq!(module.marshal(), expected, "{label}");
+        assert_eq!(cloned.marshal(), expected, "{label}");
+    }
+
+    for workload in serc_fixtures::COMPILE_MICRO_WORKLOADS
+        .iter()
+        .chain(serc_fixtures::MARSHAL_MICRO_WORKLOADS)
+        .chain(serc_fixtures::COMPOSITE_WORKLOADS)
+        .chain(serc_fixtures::LARGE_WORKLOADS)
+    {
+        check(
+            &crate::compile(workload.source, workload.filename).unwrap(),
+            workload.id,
+        );
+    }
+    // NaN keys use allocation identity; cloning must preserve their cached hashes.
+    for python_version in [
+        crate::PythonVersion::Py312,
+        crate::PythonVersion::Py313,
+        crate::PythonVersion::Py314,
+        crate::PythonVersion::Py315,
+    ] {
+        check(
+            &crate::compile_with_options(
+                "def result():\n    return (1e1000 - 1e1000, (1e1000 - 1e1000,))\n",
+                "non_reflexive.py",
+                &crate::CompileOptions {
+                    python_version,
+                    ..crate::CompileOptions::default()
+                },
+            )
+            .unwrap(),
+            "non-reflexive constants",
+        );
+    }
+}
+
+#[test]
+fn code_identity_descendants_cannot_cache_a_constant_tuple_hash() {
+    let child = Constant::Code(Box::new(code_object(Vec::new())));
+    for value in [
+        child.clone(),
+        Constant::Tuple(vec![child.clone()]),
+        Constant::FrozenSet(vec![child.clone()]),
+        Constant::Slice {
+            lower: Box::new(Constant::None),
+            upper: Box::new(child),
+            step: Box::new(Constant::None),
+        },
+    ] {
+        assert_eq!(super::key::constants_tuple_hash(&[value]), None);
+    }
+}
+
 fn code_object(constants: Vec<Constant>) -> CodeObject {
     CodeObject {
         arg_count: 0,

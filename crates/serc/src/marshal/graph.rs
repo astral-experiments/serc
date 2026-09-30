@@ -232,6 +232,38 @@ pub(super) struct ObjectGraph<'a> {
     unique_objects: FxHashSet<HashedObjectKey<'a>>,
 }
 
+/// Counts the unpruned traversal. Sharing can only reduce the number of visited nodes.
+/// Compiled children already carry their subtree bound, avoiding repeated code-tree walks.
+pub(crate) fn code_occurrence_bound(constants: &[Constant], names: usize, locals: usize) -> usize {
+    fn constant_bound(value: &Constant) -> usize {
+        match value {
+            Constant::Code(code) => code
+                .marshal_provenance
+                .marshal_occurrence_bound
+                .unwrap_or_else(|| {
+                    code_occurrence_bound(&code.constants, code.names.len(), code.locals.len())
+                }),
+            Constant::Tuple(values) | Constant::FrozenSet(values) => {
+                values.iter().fold(1_usize, |count, value| {
+                    count.saturating_add(constant_bound(value))
+                })
+            }
+            Constant::Slice { lower, upper, step } => [lower, upper, step]
+                .into_iter()
+                .fold(1_usize, |count, value| {
+                    count.saturating_add(constant_bound(value))
+                }),
+            _ => 1,
+        }
+    }
+    constants.iter().fold(
+        names
+            .saturating_add(locals)
+            .saturating_add(CODE_OBJECT_CHILDREN + 1),
+        |count, value| count.saturating_add(constant_bound(value)),
+    )
+}
+
 #[derive(Clone, Debug, Default)]
 struct GraphAliases {
     metadata_constants: FxHashSet<usize>,
@@ -384,14 +416,23 @@ impl<'a> ObjectGraph<'a> {
         if let Some(capacity) = interned_capacity {
             interned_strings.reserve(capacity);
         }
+        let traversal_capacity = sort_graph
+            .map(|graph| (graph.objects_by_id.len(), graph.occurrences.len()))
+            .or_else(|| {
+                code.marshal_provenance
+                    .marshal_occurrence_bound
+                    .map(|bound| (bound, bound))
+            })
+            .unwrap_or((
+                preprocessing.capacity.occurrences,
+                preprocessing.capacity.occurrences,
+            ));
         // A sorting replay has already discovered the exact number of keyed objects.
         let objects = HashTable::with_capacity(
             sort_graph.map_or(preprocessing.capacity.objects, |graph| graph.objects.len()),
         );
         let mut objects_by_id = IndexVec::default();
-        objects_by_id
-            .raw
-            .reserve(preprocessing.capacity.occurrences);
+        objects_by_id.raw.reserve(traversal_capacity.0);
         let mut graph = Self {
             python_version,
             aliases,
@@ -400,7 +441,7 @@ impl<'a> ObjectGraph<'a> {
             interned_strings,
             objects,
             objects_by_id,
-            occurrences: Vec::with_capacity(preprocessing.capacity.occurrences),
+            occurrences: Vec::with_capacity(traversal_capacity.1),
             uncached_percent_constant: code.marshal_provenance.uncached_percent_constant,
             fresh_empty_bytes_constant: code.marshal_provenance.fresh_empty_bytes_constant,
             metadata_slots,
@@ -524,6 +565,7 @@ impl<'a> ObjectGraph<'a> {
         first
     }
 
+    #[inline]
     fn record_metadata_string(
         &mut self,
         kind: OccurrenceKind,
@@ -686,6 +728,7 @@ impl<'a> ObjectGraph<'a> {
         (id, true)
     }
 
+    #[inline]
     fn record_object(&mut self, key: HashedObjectKey<'a>) -> (ObjectId, bool) {
         // The key already owns its value hash. Use it directly for lookup and growth, retaining
         // full key equality and assigning object IDs solely in traversal order.
@@ -2515,6 +2558,7 @@ struct GraphVisitor<'graph, 'code> {
 impl<'code> GraphVisitor<'_, 'code> {
     /// Records the constants tuple, using a cached value hash when available.
     /// Root and code-bearing tuples retain unique identities; string tuples may alias metadata.
+    #[inline]
     fn constants_with_hash(&mut self, values: &'code [Constant], hash: Option<u64>) -> bool {
         let root_constants = std::mem::take(&mut self.root_constants);
         if values.is_empty() {
