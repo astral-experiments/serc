@@ -7,31 +7,32 @@ and committed lockfile.
 
 The benchmark groups measure fixed workloads through Serc's public API:
 
-| Group | Timed work | Per-iteration setup and cleanup |
-| --- | --- | --- |
-| `compile` | Compile source into a fresh module | Module cleanup is outside timing |
-| `marshal_once` | Marshal a newly compiled module exactly once | Compilation and module/output cleanup are outside timing |
-| `compile_pyc` | Compile source, encode one timestamp PYC in memory, and drop the module/output | All work is timed; no disk I/O |
+| Group         | Timed work                                                                     | Per-iteration setup and cleanup                          |
+| ------------- | ------------------------------------------------------------------------------ | -------------------------------------------------------- |
+| `compile`     | Compile source into a fresh module                                             | Module cleanup is outside timing                         |
+| `marshal`     | Marshal a newly compiled module exactly once                                   | Compilation and module/output cleanup are outside timing |
+| `compile_pyc` | Compile source, encode one timestamp PYC in memory, and drop the module/output | All work is timed; no disk I/O                           |
 
-`marshal_once` compiles a fresh module during batch setup for every iteration,
+`marshal` compiles a fresh module during batch setup for every iteration,
 including warmup. It does not reuse or clone a previously serialized module.
 This makes first-serialization preparation visible even if an implementation
 caches work for subsequent calls. `compile_pyc` also measures preparation moved
 into compilation, and includes cleanup costs that phase-isolated measurements
-exclude. It covers all compile and marshal workloads, including the large fixture.
+exclude. It covers all compile and marshal workloads, including the large
+fixture.
 
-`marshal_once` replaces the old `marshal` group with a new name because the
-per-iteration lifecycle changed. Establish a new CodSpeed baseline for this group;
-historical repeated-module results measure a different operation.
+The `marshal` group's per-iteration lifecycle has changed. Its first CodSpeed
+comparison against the old benchmark is not directly comparable; establish a new
+baseline after this change. Historical repeated-module results measure a
+different operation.
 
 ```console
 CARGO_INCREMENTAL=0 cargo bench --locked --profile profiling -p serc_benchmark --bench compiler --no-default-features --features benchmarks
 ```
 
-Append `-- compile/`, `-- marshal_once/`, or `-- compile_pyc/` to filter by group,
-`-- --save-baseline main` to save
-a baseline, or `-- --baseline main` to compare against it. Other Criterion
-options follow `--`.
+Append `-- compile/`, `-- marshal/`, or `-- compile_pyc/` to filter by group,
+`-- --save-baseline main` to save a baseline, or `-- --baseline main` to compare
+against it. Other Criterion options follow `--`.
 
 ## CodSpeed simulation
 
@@ -46,14 +47,14 @@ cargo codspeed run -m simulation -p serc_benchmark --bench compiler
 The corpus benchmark uses one long-lived process per engine, with source
 discovery and reads outside timing. It supports three phases:
 
-| `--phase`         | Timed work                       |
-| ----------------- | -------------------------------- |
-| `compiler_core`   | Compile source into code objects |
-| `compile_marshal` | Compile and marshal              |
+| `--phase`         | Timed work                                 |
+| ----------------- | ------------------------------------------ |
+| `compiler_core`   | Compile source into code objects           |
+| `compile_marshal` | Compile and marshal                        |
 | `marshal_only`    | Marshal retained, precompiled code objects |
 
-The corpus example's `marshal_only` phase reuses modules across samples.
-Use `compile_marshal` to compare the usual compile-once/serialize-once workflow.
+The corpus example's `marshal_only` phase reuses modules across samples. Use
+`compile_marshal` to compare the usual compile-once/serialize-once workflow.
 
 ```console
 cargo run --locked --profile profiling -p serc --example benchmark_cpython_corpus -- \

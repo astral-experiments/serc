@@ -33,8 +33,8 @@ fn compiler(criterion: &mut Criterion) {
     group.finish();
 }
 
-fn marshal_once(criterion: &mut Criterion) {
-    let mut group = criterion.benchmark_group("marshal_once");
+fn marshal(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("marshal");
 
     for workload in MARSHAL_MICRO_WORKLOADS
         .iter()
@@ -85,5 +85,5 @@ fn compile_pyc(criterion: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, compiler, marshal_once, compile_pyc);
+criterion_group!(benches, compiler, marshal, compile_pyc);
 criterion_main!(benches);
