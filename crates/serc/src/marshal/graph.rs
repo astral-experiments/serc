@@ -241,6 +241,32 @@ struct GraphAliases {
 struct GraphPreprocessing<'a> {
     explicitly_interned: FxHashSet<&'a str>,
     recreated_frozensets: FxHashSet<usize>,
+    capacity: GraphCapacity,
+}
+
+#[derive(Default)]
+struct GraphCapacity {
+    objects: usize,
+    occurrences: usize,
+    constants: usize,
+}
+
+impl GraphCapacity {
+    /// Adds this code object's direct children to the whole-tree allocation estimate.
+    /// Container descendants can exceed the estimate, so collections must still support growth.
+    fn record(&mut self, code: &CodeObject) {
+        self.objects = self
+            .objects
+            .saturating_add(code.constants.len().saturating_add(5));
+        self.constants = self.constants.saturating_add(code.constants.len());
+        self.occurrences = self.occurrences.saturating_add(
+            code.constants
+                .len()
+                .saturating_add(code.names.len())
+                .saturating_add(code.locals.len())
+                .saturating_add(CODE_OBJECT_CHILDREN + 1),
+        );
+    }
 }
 
 impl<'a> GraphPreprocessing<'a> {
@@ -257,7 +283,7 @@ impl<'a> GraphPreprocessing<'a> {
                 metadata_tuples.insert(strings_tuple_key(values).into());
             }
         }
-        let frozenset_recreation_need = collect_explicitly_interned(
+        let (frozenset_recreation_need, capacity) = collect_explicitly_interned(
             code,
             python_version,
             initial_intern_state,
@@ -286,6 +312,7 @@ impl<'a> GraphPreprocessing<'a> {
             Self {
                 explicitly_interned,
                 recreated_frozensets,
+                capacity,
             },
             aliases,
         )
@@ -357,12 +384,23 @@ impl<'a> ObjectGraph<'a> {
         if let Some(capacity) = interned_capacity {
             interned_strings.reserve(capacity);
         }
+        // A sorting replay has already discovered the exact number of keyed objects.
+        let objects = HashTable::with_capacity(
+            sort_graph.map_or(preprocessing.capacity.objects, |graph| graph.objects.len()),
+        );
+        let mut objects_by_id = IndexVec::default();
+        objects_by_id
+            .raw
+            .reserve(preprocessing.capacity.occurrences);
         let mut graph = Self {
             python_version,
             aliases,
-            cache_scalars: code.constants.len() >= MIN_CACHED_SCALAR_CONSTANTS,
+            cache_scalars: preprocessing.capacity.constants >= MIN_CACHED_SCALAR_CONSTANTS,
             preallocated_interned_strings: interned_capacity.is_some(),
             interned_strings,
+            objects,
+            objects_by_id,
+            occurrences: Vec::with_capacity(preprocessing.capacity.occurrences),
             uncached_percent_constant: code.marshal_provenance.uncached_percent_constant,
             fresh_empty_bytes_constant: code.marshal_provenance.fresh_empty_bytes_constant,
             metadata_slots,
@@ -448,34 +486,14 @@ impl<'a> ObjectGraph<'a> {
     }
 
     fn reserve_for_code(&mut self, code: &CodeObject) {
-        // Every code object contributes ten object-bearing structural children, plus at most one
-        // object for each direct constant, name, and local. Leave geometric headroom for
-        // descendants of container constants; nested code objects refine the estimate when they
-        // are visited.
-        let direct_children = code
-            .constants
-            .len()
-            .saturating_add(code.names.len())
-            .saturating_add(code.locals.len())
-            .saturating_add(CODE_OBJECT_CHILDREN);
-        let estimated_descendants = direct_children.saturating_mul(2);
         let interned_strings = code
             .names
             .len()
             .saturating_add(code.locals.len())
             .saturating_add(3);
-        self.objects.reserve(
-            estimated_descendants.saturating_sub(interned_strings),
-            |(key, _)| key.hash(),
-        );
         if !self.preallocated_interned_strings {
             self.interned_strings.reserve(interned_strings);
         }
-        self.objects_by_id
-            .raw
-            .reserve(estimated_descendants.saturating_add(1));
-        self.occurrences
-            .reserve(estimated_descendants.saturating_add(1));
         self.estimated_payload_bytes = self
             .estimated_payload_bytes
             .saturating_add(code.bytecode.len())
@@ -920,7 +938,7 @@ fn collect_explicitly_interned<'a>(
     values: &mut FxHashSet<&'a str>,
     metadata_tuples: &mut FxHashSet<HashedObjectKey<'a>>,
     needs_metadata_alias_scan: bool,
-) -> FrozensetRecreationNeed {
+) -> (FrozensetRecreationNeed, GraphCapacity) {
     // Identifier objects can enter the compilation-wide constant cache before an equal
     // ordinary string. Preserve that recorded origin when sharing constant and metadata strings.
     values.extend(
@@ -933,6 +951,7 @@ fn collect_explicitly_interned<'a>(
         track: python_version != PythonVersion::Py312,
         ..QualifiedNameConstants::default()
     };
+    let mut capacity = GraphCapacity::default();
     let frozenset_recreation_need = if !code.marshal_provenance.subtree_has_frozenset_constants {
         collect_interning_provenance_without_frozensets(
             code,
@@ -940,6 +959,7 @@ fn collect_explicitly_interned<'a>(
             metadata_tuples,
             needs_metadata_alias_scan,
             &mut qualified_names,
+            &mut capacity,
         );
         FrozensetRecreationNeed::None
     } else {
@@ -950,10 +970,11 @@ fn collect_explicitly_interned<'a>(
             metadata_tuples,
             needs_metadata_alias_scan,
             &mut qualified_names,
+            &mut capacity,
         )
     };
     if qualified_names.origins.is_empty() {
-        return frozenset_recreation_need;
+        return (frozenset_recreation_need, capacity);
     }
 
     // A class body normally loads the same qualified-name object that becomes its interned code
@@ -983,7 +1004,7 @@ fn collect_explicitly_interned<'a>(
                 .then_some(value)
             }),
     );
-    frozenset_recreation_need
+    (frozenset_recreation_need, capacity)
 }
 
 /// Names already interned by their scalar value do not require qualified-name origin analysis.
@@ -1003,7 +1024,9 @@ fn collect_interning_provenance_without_frozensets<'a>(
     metadata_tuples: &mut FxHashSet<HashedObjectKey<'a>>,
     needs_metadata_alias_scan: bool,
     qualified_names: &mut QualifiedNameConstants<'a>,
+    capacity: &mut GraphCapacity,
 ) {
+    capacity.record(code);
     if needs_metadata_alias_scan {
         collect_metadata_tuple_keys(code, metadata_tuples);
     }
@@ -1022,6 +1045,7 @@ fn collect_interning_provenance_without_frozensets<'a>(
                 metadata_tuples,
                 needs_metadata_alias_scan,
                 qualified_names,
+                capacity,
             );
         }
     }
@@ -1034,7 +1058,9 @@ fn collect_interning_provenance<'a>(
     metadata_tuples: &mut FxHashSet<HashedObjectKey<'a>>,
     needs_metadata_alias_scan: bool,
     qualified_names: &mut QualifiedNameConstants<'a>,
+    capacity: &mut GraphCapacity,
 ) -> FrozensetRecreationNeed {
+    capacity.record(code);
     if needs_metadata_alias_scan {
         collect_metadata_tuple_keys(code, metadata_tuples);
     }
@@ -1057,6 +1083,7 @@ fn collect_interning_provenance<'a>(
                 metadata_tuples,
                 needs_metadata_alias_scan,
                 qualified_names,
+                capacity,
             );
             frozenset_recreation_need = frozenset_recreation_need.max(recreation_need);
         } else if frozenset_recreation_need != FrozensetRecreationNeed::IdentifierDependent {

@@ -6,6 +6,37 @@ use crate::{CompileError, PythonVersion, indentation, yield_syntax};
 
 const MAX_NESTING: usize = 200;
 
+/// Reuse a successfully parsed token stream to prove the nesting limit was not exceeded.
+/// Malformed input retains the independent tokenizer's diagnostic precedence. Legacy targets
+/// also retain that tokenizer because their template-string rules differ from Ruff's.
+pub(crate) fn validate_parsed(
+    source: &str,
+    options: &ParseOptions,
+    version: PythonVersion,
+    parsed: &ruff_python_parser::Parsed<ruff_python_ast::ModModule>,
+) -> Result<(), CompileError> {
+    if version >= PythonVersion::Py314 && parsed.errors().is_empty() {
+        if parsed.tokens().len() <= MAX_NESTING {
+            return Ok(());
+        }
+        let mut depth = 0_usize;
+        let exceeds_limit = parsed.tokens().iter().any(|token| {
+            match token.kind() {
+                TokenKind::Lpar | TokenKind::Lsqb | TokenKind::Lbrace => depth += 1,
+                TokenKind::Rpar | TokenKind::Rsqb | TokenKind::Rbrace => {
+                    depth = depth.saturating_sub(1);
+                }
+                _ => {}
+            }
+            depth > MAX_NESTING
+        });
+        if !exceeds_limit {
+            return Ok(());
+        }
+    }
+    validate(source, options, version)
+}
+
 /// Prove shallow nesting without tokenizing identifiers and numbers a second time.
 /// Ambiguous or malformed strings use the tokenizer below, preserving error priority.
 fn proves_shallow_nesting(source: &str) -> bool {
@@ -299,9 +330,45 @@ pub(crate) fn invalid_number_suffix(source: &str, range: TextRange) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_NESTING, proves_shallow_nesting, validate_with_fast_scan};
+    use super::{MAX_NESTING, proves_shallow_nesting, validate_parsed, validate_with_fast_scan};
     use crate::PythonVersion;
     use ruff_python_parser::{Mode, ParseOptions};
+
+    #[test]
+    fn parsed_nesting_proof_preserves_tokenizer_diagnostics() {
+        let deep = format!("{}0{}", "(".repeat(201), ")".repeat(201));
+        for source in [
+            "x = f'{(value)}'".to_owned(),
+            "x = t'{(value)}'".to_owned(),
+            "x = f'{f\"{value}\"}'".to_owned(),
+            "x = '\"([{' # (".to_owned(),
+            format!("x = {deep}"),
+            format!("x = f'{{{deep}}}'"),
+            format!("x = t'{{{deep}}}'"),
+            format!("x = '\n{deep}"),
+            format!("return +\nx = {deep}"),
+            format!(" x = 1\nx = {deep}"),
+            format!("x = 1invalid\ny = {deep}"),
+            format!("x = 0b12\ny = {deep}"),
+            format!("x = $\ny = {deep}"),
+        ] {
+            for version in [PythonVersion::Py314, PythonVersion::Py315] {
+                let target = match version {
+                    PythonVersion::Py314 => ruff_python_ast::PythonVersion::PY314,
+                    _ => ruff_python_ast::PythonVersion::PY315,
+                };
+                let options = ParseOptions::from(Mode::Module).with_target_version(target);
+                let parsed = ruff_python_parser::parse_unchecked(&source, options.clone())
+                    .try_into_module()
+                    .unwrap();
+                assert_eq!(
+                    validate_with_fast_scan::<false>(&source, &options, version),
+                    validate_parsed(&source, &options, version, &parsed),
+                    "{version:?}: {source}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn shallow_scan_agrees_with_lexer_at_nesting_and_string_boundaries() {
