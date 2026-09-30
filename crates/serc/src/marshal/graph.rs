@@ -232,38 +232,6 @@ pub(super) struct ObjectGraph<'a> {
     unique_objects: FxHashSet<HashedObjectKey<'a>>,
 }
 
-/// Counts the unpruned traversal. Sharing can only reduce the number of visited nodes.
-/// Compiled children already carry their subtree bound, avoiding repeated code-tree walks.
-pub(crate) fn code_occurrence_bound(constants: &[Constant], names: usize, locals: usize) -> usize {
-    fn constant_bound(value: &Constant) -> usize {
-        match value {
-            Constant::Code(code) => code
-                .marshal_provenance
-                .marshal_occurrence_bound
-                .unwrap_or_else(|| {
-                    code_occurrence_bound(&code.constants, code.names.len(), code.locals.len())
-                }),
-            Constant::Tuple(values) | Constant::FrozenSet(values) => {
-                values.iter().fold(1_usize, |count, value| {
-                    count.saturating_add(constant_bound(value))
-                })
-            }
-            Constant::Slice { lower, upper, step } => [lower, upper, step]
-                .into_iter()
-                .fold(1_usize, |count, value| {
-                    count.saturating_add(constant_bound(value))
-                }),
-            _ => 1,
-        }
-    }
-    constants.iter().fold(
-        names
-            .saturating_add(locals)
-            .saturating_add(CODE_OBJECT_CHILDREN + 1),
-        |count, value| count.saturating_add(constant_bound(value)),
-    )
-}
-
 #[derive(Clone, Debug, Default)]
 struct GraphAliases {
     metadata_constants: FxHashSet<usize>,
@@ -406,23 +374,13 @@ impl<'a> ObjectGraph<'a> {
         // A sorting replay already knows the exact number of strings its first graph discovered.
         let interned_capacity = sort_graph
             .map(|graph| graph.interned_strings.len())
-            .or_else(|| {
-                code.marshal_provenance
-                    .metadata_tuple_properties
-                    .as_ref()
-                    .and(metadata_domain)
-            });
+            .or(metadata_domain);
         let mut interned_strings = FxHashMap::default();
         if let Some(capacity) = interned_capacity {
             interned_strings.reserve(capacity);
         }
         let traversal_capacity = sort_graph
             .map(|graph| (graph.objects_by_id.len(), graph.occurrences.len()))
-            .or_else(|| {
-                code.marshal_provenance
-                    .marshal_occurrence_bound
-                    .map(|bound| (bound, bound))
-            })
             .unwrap_or((
                 preprocessing.capacity.occurrences,
                 preprocessing.capacity.occurrences,
@@ -944,33 +902,11 @@ fn collect_metadata_tuple_keys<'a>(
     code: &'a CodeObject,
     keys: &mut FxHashSet<HashedObjectKey<'a>>,
 ) {
-    if let Some(properties) = code.marshal_provenance.metadata_tuple_properties {
-        if !properties.names.automatically_interned {
-            keys.insert(HashedObjectKey::with_hash(
-                names_tuple_key(&code.names),
-                properties.names.hash,
-            ));
-        }
-        if !properties.locals.automatically_interned {
-            keys.insert(hashed_locals_tuple_key(code, properties.locals.hash));
-        }
-    } else {
-        if code.names.iter().any(|value| !should_intern(value)) {
-            keys.insert(names_tuple_key(&code.names).into());
-        }
-        if code.locals.iter().any(|value| !should_intern(value)) {
-            keys.insert(locals_tuple_key(code).into());
-        }
+    if code.names.iter().any(|value| !should_intern(value)) {
+        keys.insert(names_tuple_key(&code.names).into());
     }
-}
-
-fn hashed_locals_tuple_key(code: &CodeObject, hash: u64) -> HashedObjectKey<'_> {
-    let key = locals_tuple_key(code);
-    if matches!(&key, ObjectKey::AnnotationLocals(_)) {
-        // Fresh annotation locals use the code object's eventual address, not their values.
-        key.into()
-    } else {
-        HashedObjectKey::with_hash(key, hash)
+    if code.locals.iter().any(|value| !should_intern(value)) {
+        keys.insert(locals_tuple_key(code).into());
     }
 }
 
@@ -2555,37 +2491,6 @@ struct GraphVisitor<'graph, 'code> {
     root_constants: bool,
 }
 
-impl<'code> GraphVisitor<'_, 'code> {
-    /// Records the constants tuple, using a cached value hash when available.
-    /// Root and code-bearing tuples retain unique identities; string tuples may alias metadata.
-    #[inline]
-    fn constants_with_hash(&mut self, values: &'code [Constant], hash: Option<u64>) -> bool {
-        let root_constants = std::mem::take(&mut self.root_constants);
-        if values.is_empty() {
-            return self
-                .graph
-                .record_cached_value(OccurrenceKind::Constants, CachedObject::EmptyTuple);
-        }
-        let key = constants_tuple_key(values);
-        if matches!(&key, ObjectKey::ConstantTuple(_))
-            && (root_constants
-                || values
-                    .iter()
-                    .any(|value| matches!(value, Constant::Code(_))))
-        {
-            self.graph
-                .record_unique_value(OccurrenceKind::Constants, key)
-        } else if let Some(hash) = hash {
-            self.graph.record_hashed(
-                OccurrenceKind::Constants,
-                HashedObjectKey::with_hash(key, hash),
-            )
-        } else {
-            self.graph.record_keyed(OccurrenceKind::Constants, key)
-        }
-    }
-}
-
 impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
     const USES_METADATA_IDS: bool = true;
 
@@ -2608,15 +2513,24 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
 
     #[inline]
     fn constants(&mut self, values: &'code [Constant], _reference_mode: ReferenceMode) -> bool {
-        self.constants_with_hash(values, None)
-    }
-
-    #[inline]
-    fn code_constants(&mut self, code: &'code CodeObject) -> bool {
-        self.constants_with_hash(
-            &code.constants,
-            code.marshal_provenance.constants_tuple_hash,
-        )
+        let root_constants = std::mem::take(&mut self.root_constants);
+        if values.is_empty() {
+            return self
+                .graph
+                .record_cached_value(OccurrenceKind::Constants, CachedObject::EmptyTuple);
+        }
+        let key = constants_tuple_key(values);
+        if matches!(&key, ObjectKey::ConstantTuple(_))
+            && (root_constants
+                || values
+                    .iter()
+                    .any(|value| matches!(value, Constant::Code(_))))
+        {
+            self.graph
+                .record_unique_value(OccurrenceKind::Constants, key)
+        } else {
+            self.graph.record_keyed(OccurrenceKind::Constants, key)
+        }
     }
 
     #[inline]
@@ -2624,11 +2538,6 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
         if code.names.is_empty() {
             self.graph
                 .record_cached_value(OccurrenceKind::Strings, CachedObject::EmptyTuple)
-        } else if let Some(properties) = code.marshal_provenance.metadata_tuple_properties {
-            self.graph.record_hashed(
-                OccurrenceKind::Strings,
-                HashedObjectKey::with_hash(names_tuple_key(&code.names), properties.names.hash),
-            )
         } else {
             self.graph
                 .record_keyed(OccurrenceKind::Strings, names_tuple_key(&code.names))
@@ -2645,11 +2554,6 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
         let key = locals_tuple_key(code);
         if matches!(&key, ObjectKey::AnnotationLocals(_)) {
             self.graph.record_unique_value(OccurrenceKind::Locals, key)
-        } else if let Some(properties) = code.marshal_provenance.metadata_tuple_properties {
-            self.graph.record_hashed(
-                OccurrenceKind::Locals,
-                HashedObjectKey::with_hash(key, properties.locals.hash),
-            )
         } else {
             self.graph.record_keyed(OccurrenceKind::Locals, key)
         }
@@ -2753,23 +2657,6 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
     fn bytes(&mut self, value: &'code [u8]) {
         if self.graph.record_bytes(OccurrenceKind::Bytes, value) {
             self.graph.estimate_payload(value.len());
-        }
-    }
-
-    #[inline]
-    fn bytes_with_hash(&mut self, value: &'code [u8], hash: Option<u64>) {
-        // Empty and single-byte values retain the ordinary scalar cache and identity rules.
-        if value.len() > 1
-            && let Some(hash) = hash
-        {
-            if self.graph.record_hashed(
-                OccurrenceKind::Bytes,
-                HashedObjectKey::with_hash(ObjectKey::Bytes(value), hash),
-            ) {
-                self.graph.estimate_payload(value.len());
-            }
-        } else {
-            self.bytes(value);
         }
     }
 

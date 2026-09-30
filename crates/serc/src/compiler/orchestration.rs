@@ -1538,25 +1538,7 @@ impl<'source> Compiler<'source> {
             } else {
                 (FxHashSet::default(), FxHashSet::default())
             };
-        let metadata_tuple_properties =
-            crate::marshal::metadata_tuple_properties(&self.output.names, &output_locals);
         let constants = self.output.constants.into_values();
-        // The root's non-string constant tuple is recorded as unique, so its hash
-        // would never be used. All-string roots can still alias metadata tuples.
-        let constants_tuple_hash = if matches!(self.unit.scope, Scope::Module)
-            && !constants
-                .iter()
-                .all(|value| matches!(value, Constant::String(_)))
-        {
-            None
-        } else {
-            crate::marshal::constants_tuple_hash(&constants)
-        };
-        let marshal_occurrence_bound = crate::marshal::code_occurrence_bound(
-            &constants,
-            self.output.names.len(),
-            output_locals.len(),
-        );
         let mut code = CodeObject {
             arg_count: self.unit.arg_count,
             positional_only_arg_count: self.unit.positional_only_arg_count,
@@ -1595,19 +1577,11 @@ impl<'source> Compiler<'source> {
                 qualified_name_is_canonical: self.output.qualified_name_is_canonical,
                 uncached_percent_constant: self.context.has_uncached_percent_constant(),
                 metadata_ids,
-                metadata_tuple_properties: Some(metadata_tuple_properties),
-                constants_tuple_hash,
-                marshal_occurrence_bound: Some(marshal_occurrence_bound),
-                table_hashes: None,
                 subtree_has_frozenset_constants: self.output.has_frozenset_constants,
                 metadata_alias_scan_unnecessary: false,
                 fresh_empty_bytes_constant: self.context.fresh_empty_bytes_constant(),
             },
         };
-        code.marshal_provenance.table_hashes = Some([
-            crate::marshal::bytes_hash(&code.line_table),
-            crate::marshal::bytes_hash(&code.exception_table),
-        ]);
         code.validate()?;
         code.marshal_provenance.assembly_order = self.context.record_code_assembly(&code);
         if matches!(self.unit.scope, Scope::Module) {

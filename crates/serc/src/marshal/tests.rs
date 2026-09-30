@@ -7,30 +7,16 @@ use super::encode_code;
 use super::graph::{ObjectGraph, OccurrenceKind};
 use super::key::{
     HashedObjectKey, ObjectKey, code_bytes_key, code_key, constant_key, constant_sort_key,
-    constants_tuple_key, local_kinds_key, locals_tuple_key, metadata_tuple_properties,
-    names_tuple_key, slice_member_uses_identity, strings_tuple_key,
+    constants_tuple_key, local_kinds_key, locals_tuple_key, names_tuple_key, should_intern,
+    slice_member_uses_identity, strings_tuple_key,
 };
 use super::plan::{MarshalVisitor, ObjectId, ReferenceMode, traverse_code};
 
 #[test]
-fn cached_constant_tuple_hashes_preserve_cloned_benchmark_streams() {
-    fn clear_hashes(code: &mut CodeObject) {
-        code.marshal_provenance.constants_tuple_hash = None;
-        code.marshal_provenance.marshal_occurrence_bound = None;
-        for value in &mut code.constants {
-            if let Constant::Code(child) = value {
-                clear_hashes(child);
-            }
-        }
-    }
-
+fn cloned_modules_preserve_benchmark_marshal_streams() {
     fn check(module: &crate::CompiledModule, label: &str) {
         let cloned = module.clone();
-        let mut uncached = module.clone();
-        clear_hashes(&mut uncached.code);
-        let expected = uncached.marshal();
-        assert_eq!(module.marshal(), expected, "{label}");
-        assert_eq!(cloned.marshal(), expected, "{label}");
+        assert_eq!(cloned.marshal(), module.marshal(), "{label}");
     }
 
     for workload in serc_fixtures::COMPILE_MICRO_WORKLOADS
@@ -44,7 +30,7 @@ fn cached_constant_tuple_hashes_preserve_cloned_benchmark_streams() {
             workload.id,
         );
     }
-    // NaN keys use allocation identity; cloning must preserve their cached hashes.
+    // NaN keys use allocation identity; cloning must preserve their sharing behavior.
     for python_version in [
         crate::PythonVersion::Py312,
         crate::PythonVersion::Py313,
@@ -63,23 +49,6 @@ fn cached_constant_tuple_hashes_preserve_cloned_benchmark_streams() {
             .unwrap(),
             "non-reflexive constants",
         );
-    }
-}
-
-#[test]
-fn code_identity_descendants_cannot_cache_a_constant_tuple_hash() {
-    let child = Constant::Code(Box::new(code_object(Vec::new())));
-    for value in [
-        child.clone(),
-        Constant::Tuple(vec![child.clone()]),
-        Constant::FrozenSet(vec![child.clone()]),
-        Constant::Slice {
-            lower: Box::new(Constant::None),
-            upper: Box::new(child),
-            step: Box::new(Constant::None),
-        },
-    ] {
-        assert_eq!(super::key::constants_tuple_hash(&[value]), None);
     }
 }
 
@@ -114,18 +83,8 @@ fn code_object(constants: Vec<Constant>) -> CodeObject {
 }
 
 #[test]
-fn cached_constants_tuple_hashes_preserve_marshal_and_pyc_after_cloning() {
+fn cloned_modules_preserve_marshal_and_pyc_across_targets() {
     use crate::{CompileOptions, PythonVersion, compile_with_options};
-
-    fn clear_hashes(code: &mut CodeObject) {
-        code.marshal_provenance.constants_tuple_hash = None;
-        code.marshal_provenance.table_hashes = None;
-        for value in &mut code.constants {
-            if let Constant::Code(child) = value {
-                clear_hashes(child);
-            }
-        }
-    }
 
     for python_version in [
         PythonVersion::Py312,
@@ -148,14 +107,11 @@ fn cached_constants_tuple_hashes_preserve_marshal_and_pyc_after_cloning() {
             }
             let module =
                 compile_with_options(workload.source, workload.filename, &options).unwrap();
-            let mut fallback = module.clone();
-            clear_hashes(&mut fallback.code);
-            let expected = fallback.marshal();
-            assert_eq!(module.marshal(), expected, "{}", workload.id);
-            assert_eq!(module.clone().marshal(), expected, "{}", workload.id);
+            let cloned = module.clone();
+            assert_eq!(module.marshal(), cloned.marshal(), "{}", workload.id);
             assert_eq!(
                 module.to_timestamp_pyc(0, 0),
-                fallback.to_timestamp_pyc(0, 0),
+                cloned.to_timestamp_pyc(0, 0),
                 "{}",
                 workload.id,
             );
@@ -437,42 +393,23 @@ fn uses_cpython_reference_cache_boundaries() {
 }
 
 #[test]
-fn precomputed_metadata_hashes_match_borrowed_tuples_from_either_source() {
+fn metadata_tuple_hashes_match_borrowed_constant_tuples() {
     let names = ["value", "méthode", ".0", "é"].map(Name::new);
     let locals = ["ascii_name", "A09", "_"].map(Name::new);
-    let properties = metadata_tuple_properties(&names, &locals);
-    assert!(!properties.names.automatically_interned);
-    assert!(properties.locals.automatically_interned);
-
-    for (values, properties) in [
-        (names.as_slice(), properties.names),
-        (locals.as_slice(), properties.locals),
-        (&[], metadata_tuple_properties(&[], &[]).names),
-    ] {
+    for values in [names.as_slice(), locals.as_slice(), &[]] {
         let constants = values
             .iter()
             .map(|value| Constant::String(value.to_string()))
             .collect::<Vec<_>>();
-        let hinted = HashedObjectKey::with_hash(names_tuple_key(values), properties.hash);
-        assert_eq!(hinted, HashedObjectKey::from(names_tuple_key(values)));
         assert_eq!(
-            hinted,
+            HashedObjectKey::from(names_tuple_key(values)),
             HashedObjectKey::from(constants_tuple_key(&constants))
         );
     }
 }
 
-fn remove_constant_tuple_hashes(code: &mut CodeObject) {
-    code.marshal_provenance.constants_tuple_hash = None;
-    for constant in &mut code.constants {
-        if let Constant::Code(child) = constant {
-            remove_constant_tuple_hashes(child);
-        }
-    }
-}
-
 #[test]
-fn constant_tuple_hashes_preserve_sharing_after_cloning() {
+fn cloned_modules_preserve_constant_and_metadata_sharing() {
     let source = "\
 marker = ('méthode',)
 def first():
@@ -494,51 +431,25 @@ def membership(value):
             python_version,
             ..crate::CompileOptions::default()
         };
-        let module = crate::compile_with_options(source, "constant_hints.py", &options).unwrap();
-        let mut fallback = module.clone();
-        remove_constant_tuple_hashes(&mut fallback.code);
-        assert_eq!(module.marshal(), fallback.marshal());
-        assert_eq!(module.marshal(), module.clone().marshal());
-        assert_eq!(
-            module.to_timestamp_pyc(0, 0),
-            fallback.to_timestamp_pyc(0, 0)
-        );
-    }
-
-    let nested_code = Constant::Tuple(vec![Constant::Code(Box::new(code_object(vec![])))]);
-    assert!(super::key::constants_tuple_hash(&[nested_code]).is_none());
-}
-
-#[test]
-fn benchmark_constant_tuple_hashes_match_uncached_marshal() {
-    for workload in serc_fixtures::COMPILE_MICRO_WORKLOADS
-        .iter()
-        .chain(serc_fixtures::MARSHAL_MICRO_WORKLOADS)
-        .chain(serc_fixtures::COMPOSITE_WORKLOADS)
-        .chain(serc_fixtures::LARGE_WORKLOADS)
-    {
-        let module = crate::compile(workload.source, workload.filename).unwrap();
-        let mut fallback = module.clone();
-        remove_constant_tuple_hashes(&mut fallback.code);
-        assert_eq!(module.marshal(), fallback.marshal(), "{}", workload.id);
+        let module = crate::compile_with_options(source, "constant_sharing.py", &options).unwrap();
+        let cloned = module.clone();
+        assert_eq!(module.marshal(), cloned.marshal());
+        assert_eq!(module.to_timestamp_pyc(0, 0), cloned.to_timestamp_pyc(0, 0));
     }
 }
 
 #[test]
-fn compiled_metadata_hashes_and_interning_flags_match_uncached_marshal() {
-    fn remove_properties(code: &mut CodeObject, observed: &mut [bool; 4]) {
-        let properties = code
-            .marshal_provenance
-            .metadata_tuple_properties
-            .take()
-            .unwrap();
-        observed[0] |= properties.names.automatically_interned;
-        observed[1] |= !properties.names.automatically_interned;
-        observed[2] |= !properties.locals.automatically_interned;
+fn dense_and_hashed_metadata_lookups_preserve_marshal_streams() {
+    fn use_hashed_metadata(code: &mut CodeObject, observed: &mut [bool; 4]) {
+        observed[0] |= code.names.iter().all(|value| should_intern(value));
+        observed[1] |= code.names.iter().any(|value| !should_intern(value));
+        observed[2] |= code.locals.iter().any(|value| !should_intern(value));
         observed[3] |= code.marshal_provenance.locals_identity == LocalsIdentity::Fresh;
+        // An oversized domain uses the ordinary string lookup instead of dense metadata slots.
+        code.marshal_provenance.metadata_ids.domain_len = u32::MAX;
         for constant in &mut code.constants {
             if let Constant::Code(child) = constant {
-                remove_properties(child, observed);
+                use_hashed_metadata(child, observed);
             }
         }
     }
@@ -563,10 +474,10 @@ class Annotated:
             python_version,
             ..crate::CompileOptions::default()
         };
-        let module = crate::compile_with_options(source, "metadata_hints.py", &options).unwrap();
+        let module = crate::compile_with_options(source, "metadata_lookup.py", &options).unwrap();
         let mut fallback = module.clone();
         let mut observed = [false; 4];
-        remove_properties(&mut fallback.code, &mut observed);
+        use_hashed_metadata(&mut fallback.code, &mut observed);
         assert_eq!(observed[..3], [true; 3]);
         if python_version >= crate::PythonVersion::Py314 {
             assert!(
@@ -1071,8 +982,7 @@ fn short_and_long_compiler_names_keep_marshaled_metadata_identity() {
         format!("{:?}", child.locals),
         format!("{:?}", ["short", long_local])
     );
-    child.marshal_provenance.metadata_tuple_properties = None;
-    fallback.marshal_provenance.metadata_tuple_properties = None;
+    fallback.marshal_provenance.metadata_ids.domain_len = u32::MAX;
     assert_eq!(encode_code(&fallback), expected);
 }
 
@@ -1208,10 +1118,7 @@ fn borrowed_set_and_slice_keys_keep_canonical_hashes_without_drop_glue() {
             }
             _ => unreachable!(),
         }
-        assert_eq!(
-            HashedObjectKey::from(key),
-            HashedObjectKey::with_hash(key, expected.finish())
-        );
+        assert_eq!(HashedObjectKey::from(key).hash(), expected.finish());
     }
 }
 

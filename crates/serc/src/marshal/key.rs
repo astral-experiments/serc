@@ -7,8 +7,7 @@ use smallvec::SmallVec;
 
 use crate::PythonVersion;
 use crate::code_object::{
-    CodeObject, Constant, LocalsIdentity, MarshalMetadataTupleProperties,
-    MarshalStringTupleProperties, MetadataName as Name, NonReflexiveKey,
+    CodeObject, Constant, LocalsIdentity, MetadataName as Name, NonReflexiveKey,
 };
 use crate::target::small_int_bounds_for;
 
@@ -84,11 +83,6 @@ impl<'a> HashedObjectKey<'a> {
 
     pub(super) const fn hash(&self) -> u64 {
         self.hash
-    }
-
-    pub(super) fn with_hash(key: ObjectKey<'a>, hash: u64) -> Self {
-        debug_assert_eq!(Self::new(key).hash, hash, "marshal key hash");
-        Self { key, hash }
     }
 }
 
@@ -986,29 +980,6 @@ pub(super) fn constants_tuple_key(values: &[Constant]) -> ObjectKey<'_> {
     }
 }
 
-/// Hashes a finalized constants tuple for reuse after moving or cloning its code object.
-/// Empty tuples need no hash; code descendants prevent caching because cloning changes their keys.
-pub(crate) fn constants_tuple_hash(values: &[Constant]) -> Option<u64> {
-    fn has_code(value: &Constant) -> bool {
-        match value {
-            Constant::Code(_) => true,
-            Constant::Tuple(values) | Constant::FrozenSet(values) => values.iter().any(has_code),
-            Constant::Slice { lower, upper, step } => {
-                has_code(lower) || has_code(upper) || has_code(step)
-            }
-            _ => false,
-        }
-    }
-    if values.is_empty() || values.iter().any(has_code) {
-        return None;
-    }
-    Some(HashedObjectKey::from(constants_tuple_key(values)).hash)
-}
-
-pub(crate) fn bytes_hash(value: &[u8]) -> u64 {
-    HashedObjectKey::from(ObjectKey::Bytes(value)).hash
-}
-
 pub(super) fn strings_tuple_key(values: &[String]) -> ObjectKey<'_> {
     if values.is_empty() {
         ObjectKey::EmptyTuple
@@ -1033,43 +1004,6 @@ pub(super) fn locals_tuple_key(code: &CodeObject) -> ObjectKey<'_> {
             LocalsIdentity::ByValue => names_tuple_key(&code.locals),
             LocalsIdentity::Fresh => ObjectKey::AnnotationLocals(std::ptr::from_ref(code).addr()),
         }
-    }
-}
-
-/// Precomputes the value-only metadata work shared by all marshal graph traversals.
-pub(crate) fn metadata_tuple_properties(
-    names: &[Name],
-    locals: &[Name],
-) -> MarshalMetadataTupleProperties {
-    fn strings(values: &[Name]) -> MarshalStringTupleProperties {
-        let key = names_tuple_key(values);
-        if values.is_empty() {
-            return MarshalStringTupleProperties {
-                hash: HashedObjectKey::from(key).hash,
-                automatically_interned: true,
-            };
-        }
-        // Match the derived ObjectKey::StringTuple hash and StringTupleKey's value hash while
-        // classifying the same strings. The borrowed key remains the equality check on lookup.
-        let mut hasher = FxHasher::default();
-        std::mem::discriminant(&key).hash(&mut hasher);
-        values.len().hash(&mut hasher);
-        let mut automatically_interned = true;
-        for value in values {
-            value.as_str().hash(&mut hasher);
-            automatically_interned = automatically_interned && should_intern(value);
-        }
-        let hash = hasher.finish();
-        debug_assert_eq!(HashedObjectKey::from(key).hash, hash, "metadata tuple hash");
-        MarshalStringTupleProperties {
-            hash,
-            automatically_interned,
-        }
-    }
-
-    MarshalMetadataTupleProperties {
-        names: strings(names),
-        locals: strings(locals),
     }
 }
 

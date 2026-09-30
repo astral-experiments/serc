@@ -33,10 +33,6 @@ pub(super) trait MarshalVisitor<'a> {
     fn code(&mut self, code: &'a CodeObject, reference_mode: ReferenceMode) -> bool;
     fn code_bytes(&mut self, code: &'a CodeObject);
     fn constants(&mut self, values: &'a [Constant], reference_mode: ReferenceMode) -> bool;
-    /// Visits the constants tuple with access to its cached hash before descending into members.
-    fn code_constants(&mut self, code: &'a CodeObject) -> bool {
-        self.constants(&code.constants, ReferenceMode::IfShared)
-    }
     fn names(&mut self, code: &'a CodeObject) -> bool;
     fn locals(&mut self, code: &'a CodeObject) -> bool;
     fn local_kinds(&mut self, code: &'a CodeObject);
@@ -50,10 +46,6 @@ pub(super) trait MarshalVisitor<'a> {
     }
     fn first_line(&mut self, value: u32);
     fn bytes(&mut self, value: &'a [u8]);
-    /// Visits table bytes with an optional marshal-key hash; scalar identity rules still apply.
-    fn bytes_with_hash(&mut self, value: &'a [u8], _hash: Option<u64>) {
-        self.bytes(value);
-    }
     fn constant(&mut self, value: &'a Constant, reference_mode: ReferenceMode) -> bool;
     fn slice_member(&mut self, value: &'a Constant);
     fn cached_slice_string(&mut self, value: &'a Constant) {
@@ -89,7 +81,7 @@ pub(super) fn traverse_code_with_mode<'a, V>(
         return;
     }
     visitor.code_bytes(code);
-    if visitor.code_constants(code) {
+    if visitor.constants(&code.constants, ReferenceMode::IfShared) {
         for value in &code.constants {
             traverse_constant(value, ReferenceMode::IfShared, visitor);
         }
@@ -114,9 +106,8 @@ pub(super) fn traverse_code_with_mode<'a, V>(
     visitor.code_name(code, metadata_ids.and_then(|ids| ids.name));
     visitor.code_qualified_name(code, metadata_ids.and_then(|ids| ids.qualified_name));
     visitor.first_line(code.first_line_number);
-    let hashes = code.marshal_provenance.table_hashes;
-    visitor.bytes_with_hash(&code.line_table, hashes.map(|hashes| hashes[0]));
-    visitor.bytes_with_hash(&code.exception_table, hashes.map(|hashes| hashes[1]));
+    visitor.bytes(&code.line_table);
+    visitor.bytes(&code.exception_table);
 }
 
 #[inline]
