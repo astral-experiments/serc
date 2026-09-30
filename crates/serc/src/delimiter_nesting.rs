@@ -4,6 +4,108 @@ use ruff_text_size::TextRange;
 
 use crate::{CompileError, PythonVersion, indentation, yield_syntax};
 
+const MAX_NESTING: usize = 200;
+
+/// Prove shallow nesting without tokenizing identifiers and numbers a second time.
+/// Ambiguous or malformed strings use the tokenizer below, preserving error priority.
+fn proves_shallow_nesting(source: &str) -> bool {
+    let bytes = source.as_bytes();
+    let mut stack = [0; MAX_NESTING];
+    let mut depth = 0;
+    let mut index = 0;
+    while let Some(&byte) = bytes.get(index) {
+        match byte {
+            b'#' => {
+                while bytes
+                    .get(index)
+                    .is_some_and(|byte| !matches!(byte, b'\n' | b'\r'))
+                {
+                    index += 1;
+                }
+            }
+            b'\'' | b'"' => {
+                let interpolated = bytes[index.saturating_sub(2)..index]
+                    .iter()
+                    .any(|byte| matches!(byte, b'f' | b'F' | b't' | b'T'));
+                let triple = bytes.get(index..index + 3) == Some(&[byte; 3]);
+                if interpolated && triple {
+                    return false;
+                }
+                index += if triple { 3 } else { 1 };
+                let mut field_depth = 0_usize;
+                let mut opening_count = 0;
+                loop {
+                    let Some(&current) = bytes.get(index) else {
+                        return false;
+                    };
+                    if current == byte
+                        && (!triple || bytes.get(index..index + 3) == Some(&[byte; 3]))
+                    {
+                        if field_depth != 0 {
+                            return false;
+                        }
+                        index += if triple { 3 } else { 1 };
+                        break;
+                    }
+                    if !triple && matches!(current, b'\n' | b'\r') {
+                        return false;
+                    }
+                    if interpolated {
+                        // Quoted expressions, comments, and escapes need the full f-string lexer.
+                        if matches!(current, b'\'' | b'"' | b'\\' | b'#') {
+                            return false;
+                        }
+                        if matches!(current, b'(' | b'[' | b'{') {
+                            opening_count += 1;
+                            if depth + opening_count > MAX_NESTING {
+                                return false;
+                            }
+                        }
+                        if current == b'{' {
+                            field_depth += 1;
+                        } else if current == b'}' {
+                            let Some(remaining) = field_depth.checked_sub(1) else {
+                                return false;
+                            };
+                            field_depth = remaining;
+                        }
+                    } else if current == b'\\' {
+                        // Raw and ordinary strings both escape quotes for tokenization.
+                        index += 1;
+                        if bytes.get(index).is_none() {
+                            return false;
+                        }
+                    }
+                    index += 1;
+                }
+                continue;
+            }
+            b'(' | b'[' | b'{' => {
+                if depth == MAX_NESTING {
+                    return false;
+                }
+                stack[depth] = byte;
+                depth += 1;
+            }
+            b')' | b']' | b'}' => {
+                if depth == 0
+                    || !matches!(
+                        (stack[depth - 1], byte),
+                        (b'(', b')') | (b'[', b']') | (b'{', b'}')
+                    )
+                {
+                    return false;
+                }
+                depth -= 1;
+            }
+            b'\\' => return false,
+            _ => {}
+        }
+        index += 1;
+    }
+    true
+}
+
 /// CPython's tokenizer rejects the 201st simultaneously open delimiter. Replacement
 /// fields in interpolated strings share the same nesting limit as ordinary expressions.
 pub(crate) fn validate(
@@ -11,8 +113,14 @@ pub(crate) fn validate(
     options: &ParseOptions,
     version: PythonVersion,
 ) -> Result<(), CompileError> {
-    const MAX_NESTING: usize = 200;
+    validate_with_fast_scan::<true>(source, options, version)
+}
 
+fn validate_with_fast_scan<const FAST_SCAN: bool>(
+    source: &str,
+    options: &ParseOptions,
+    version: PythonVersion,
+) -> Result<(), CompileError> {
     // Most files cannot exceed the limit even if every opening character were a
     // delimiter. Avoid lexing them twice, especially during batch compilation.
     if source
@@ -22,6 +130,9 @@ pub(crate) fn validate(
         .count()
         <= MAX_NESTING
     {
+        return Ok(());
+    }
+    if FAST_SCAN && proves_shallow_nesting(source) {
         return Ok(());
     }
 
@@ -182,4 +293,77 @@ pub(crate) fn invalid_number_suffix(source: &str, range: TextRange) -> bool {
                 .is_none_or(|c| c.is_ascii() && !c.is_ascii_alphanumeric() && c != '_')
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_NESTING, proves_shallow_nesting, validate_with_fast_scan};
+    use crate::PythonVersion;
+    use ruff_python_parser::{Mode, ParseOptions};
+
+    #[test]
+    fn shallow_scan_agrees_with_lexer_at_nesting_and_string_boundaries() {
+        let options = ParseOptions::from(Mode::Module);
+        let prelude = "value = (1, 2)\n".repeat(MAX_NESTING + 1);
+        for version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            for newline in ["\n", "\r", "\r\n"] {
+                let source = format!(
+                    "# ignored opening brackets ({newline}{}1{}",
+                    "(".repeat(MAX_NESTING + 1),
+                    ")".repeat(MAX_NESTING + 1),
+                );
+                assert_eq!(
+                    validate_with_fast_scan::<true>(&source, &options, version),
+                    validate_with_fast_scan::<false>(&source, &options, version),
+                    "{version}: comment ending in {newline:?}",
+                );
+            }
+            for string in [
+                "'plain (['",
+                "r'escaped\\\'([quote'",
+                "b\"escaped\\\" ([quote\"",
+                "'''triple\n([\"quoted\"'''",
+                "\"\"\"triple\n(['quoted'\"\"\"",
+                "f'item {i + 1}'",
+                "fr'item {i + 1}'",
+                "rf'item {i + 1}'",
+                "F'item {i + 1}'",
+                "t'item {i + 1}'",
+                "f'{{literal}} {i:{width}}'",
+                "f'{\"(quoted)\"}'",
+                "f'{f\"{i}\"}'",
+                "f'''{i\n# } ( [\n}'''",
+                "'unterminated",
+                "f'{unterminated'",
+                "'''unterminated",
+            ] {
+                for depth in [0, MAX_NESTING - 1, MAX_NESTING, MAX_NESTING + 1] {
+                    let source = format!(
+                        "{prelude}{}{}{}\n",
+                        "(".repeat(depth),
+                        string,
+                        ")".repeat(depth)
+                    );
+                    assert_eq!(
+                        validate_with_fast_scan::<true>(&source, &options, version),
+                        validate_with_fast_scan::<false>(&source, &options, version),
+                        "{version}: {string:?} at depth {depth}",
+                    );
+                }
+            }
+        }
+        assert!(proves_shallow_nesting(&prelude));
+        assert!(proves_shallow_nesting("x = f\"Item {i+1}\"\n"));
+        assert!(proves_shallow_nesting(&format!(
+            "# {}\nx = '{}'\n",
+            "(".repeat(1000),
+            "[".repeat(1000),
+        )));
+        assert!(!proves_shallow_nesting(&"(".repeat(MAX_NESTING + 1)));
+    }
 }

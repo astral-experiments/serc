@@ -2,6 +2,7 @@ use ruff_index::IndexVec;
 
 use std::collections::hash_map::Entry;
 
+use hashbrown::{HashTable, hash_table::Entry as HashedEntry};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
@@ -211,7 +212,7 @@ impl CachedObject {
 #[derive(Debug, Default)]
 pub(super) struct ObjectGraph<'a> {
     python_version: PythonVersion,
-    objects: FxHashMap<HashedObjectKey<'a>, ObjectId>,
+    objects: HashTable<(HashedObjectKey<'a>, ObjectId)>,
     interned_strings: FxHashMap<&'a str, ObjectId>,
     aliases: GraphAliases,
     metadata_slots: Box<[Option<ObjectId>]>,
@@ -424,8 +425,8 @@ impl<'a> ObjectGraph<'a> {
             {
                 return (true, true);
             }
-            if let Some(id) = self.objects.get(&ObjectKey::ConstantString(value).into()) {
-                return (self.is_shared_object(*id), false);
+            if let Some(id) = self.object_id(ObjectKey::ConstantString(value).into()) {
+                return (self.is_shared_object(id), false);
             }
             return (
                 true,
@@ -441,9 +442,8 @@ impl<'a> ObjectGraph<'a> {
         };
         let shared = Self::is_cached(&key, self.python_version)
             || self
-                .objects
-                .get(&key.into())
-                .is_some_and(|id| self.is_shared_object(*id));
+                .object_id(key.into())
+                .is_some_and(|id| self.is_shared_object(id));
         (shared, false)
     }
 
@@ -464,8 +464,10 @@ impl<'a> ObjectGraph<'a> {
             .len()
             .saturating_add(code.locals.len())
             .saturating_add(3);
-        self.objects
-            .reserve(estimated_descendants.saturating_sub(interned_strings));
+        self.objects.reserve(
+            estimated_descendants.saturating_sub(interned_strings),
+            |(key, _)| key.hash(),
+        );
         if !self.preallocated_interned_strings {
             self.interned_strings.reserve(interned_strings);
         }
@@ -667,17 +669,23 @@ impl<'a> ObjectGraph<'a> {
     }
 
     fn record_object(&mut self, key: HashedObjectKey<'a>) -> (ObjectId, bool) {
-        match self.objects.entry(key) {
-            Entry::Occupied(entry) => {
-                let id = *entry.get();
+        // The key already owns its value hash. Use it directly for lookup and growth, retaining
+        // full key equality and assigning object IDs solely in traversal order.
+        match self.objects.entry(
+            key.hash(),
+            |(stored, _)| *stored == key,
+            |(stored, _)| stored.hash(),
+        ) {
+            HashedEntry::Occupied(entry) => {
+                let id = entry.get().1;
                 // Cache eligibility was fixed by this same stored key when first inserted.
                 self.objects_by_id[id].shared = true;
                 (id, false)
             }
-            Entry::Vacant(entry) => {
+            HashedEntry::Vacant(entry) => {
                 let next_id = self.objects_by_id.next_index();
-                let cached = Self::is_cached(entry.key().key(), self.python_version);
-                entry.insert(next_id);
+                let cached = Self::is_cached(key.key(), self.python_version);
+                entry.insert((key, next_id));
                 self.objects_by_id.push(Object {
                     shared: false,
                     cached,
@@ -689,13 +697,18 @@ impl<'a> ObjectGraph<'a> {
         }
     }
 
+    fn object_id(&self, key: HashedObjectKey<'a>) -> Option<ObjectId> {
+        self.objects
+            .find(key.hash(), |(stored, _)| *stored == key)
+            .map(|(_, id)| *id)
+    }
+
     #[cfg(test)]
     pub(super) fn is_shared(&self, key: &ObjectKey<'a>, force_reference: bool) -> bool {
         if force_reference
             || self
-                .objects
-                .get(&HashedObjectKey::from(*key))
-                .is_some_and(|id| self.objects_by_id[*id].shared)
+                .object_id(HashedObjectKey::from(*key))
+                .is_some_and(|id| self.objects_by_id[id].shared)
             || matches!(
                 key,
                 ObjectKey::String(value)
@@ -2472,6 +2485,35 @@ struct GraphVisitor<'graph, 'code> {
     root_constants: bool,
 }
 
+impl<'code> GraphVisitor<'_, 'code> {
+    fn constants_with_hash(&mut self, values: &'code [Constant], hash: Option<u64>) -> bool {
+        let root_constants = std::mem::take(&mut self.root_constants);
+        if values.is_empty() {
+            return self
+                .graph
+                .record_cached_value(OccurrenceKind::Constants, CachedObject::EmptyTuple);
+        }
+        let key = constants_tuple_key(values);
+        // Code-containing tuples are unique; all-string tuples can alias metadata.
+        if matches!(&key, ObjectKey::ConstantTuple(_))
+            && (root_constants
+                || values
+                    .iter()
+                    .any(|value| matches!(value, Constant::Code(_))))
+        {
+            self.graph
+                .record_unique_value(OccurrenceKind::Constants, key)
+        } else if let Some(hash) = hash {
+            self.graph.record_hashed(
+                OccurrenceKind::Constants,
+                HashedObjectKey::with_hash(key, hash),
+            )
+        } else {
+            self.graph.record_keyed(OccurrenceKind::Constants, key)
+        }
+    }
+}
+
 impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
     const USES_METADATA_IDS: bool = true;
 
@@ -2494,28 +2536,15 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
 
     #[inline]
     fn constants(&mut self, values: &'code [Constant], _reference_mode: ReferenceMode) -> bool {
-        let root_constants = std::mem::take(&mut self.root_constants);
-        if values.is_empty() {
-            return self
-                .graph
-                .record_cached_value(OccurrenceKind::Constants, CachedObject::EmptyTuple);
-        }
-        let key = constants_tuple_key(values);
-        // The root constant tuple cannot equal one of its own descendants. Only all-string
-        // roots can alias a metadata tuple, and those retain their ordinary value lookup.
-        if matches!(&key, ObjectKey::ConstantTuple(_))
-            && (root_constants
-                || values
-                    .iter()
-                    .any(|value| matches!(value, Constant::Code(_))))
-        {
-            self.graph
-                .record_unique_value(OccurrenceKind::Constants, key)
-        } else {
-            // The key has already scanned every member of an all-string tuple. It cannot own
-            // code, and equal literal and metadata tuples must share the same value lookup.
-            self.graph.record_keyed(OccurrenceKind::Constants, key)
-        }
+        self.constants_with_hash(values, None)
+    }
+
+    #[inline]
+    fn code_constants(&mut self, code: &'code CodeObject) -> bool {
+        self.constants_with_hash(
+            &code.constants,
+            code.marshal_provenance.constants_tuple_hash,
+        )
     }
 
     #[inline]
@@ -2652,6 +2681,23 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
     fn bytes(&mut self, value: &'code [u8]) {
         if self.graph.record_bytes(OccurrenceKind::Bytes, value) {
             self.graph.estimate_payload(value.len());
+        }
+    }
+
+    #[inline]
+    fn bytes_with_hash(&mut self, value: &'code [u8], hash: Option<u64>) {
+        // Empty and single-byte values retain the ordinary scalar cache and identity rules.
+        if value.len() > 1
+            && let Some(hash) = hash
+        {
+            if self.graph.record_hashed(
+                OccurrenceKind::Bytes,
+                HashedObjectKey::with_hash(ObjectKey::Bytes(value), hash),
+            ) {
+                self.graph.estimate_payload(value.len());
+            }
+        } else {
+            self.bytes(value);
         }
     }
 

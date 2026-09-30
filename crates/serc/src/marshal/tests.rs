@@ -43,6 +43,60 @@ fn code_object(constants: Vec<Constant>) -> CodeObject {
 }
 
 #[test]
+fn cached_constants_tuple_hashes_preserve_marshal_and_pyc_after_cloning() {
+    use crate::{CompileOptions, PythonVersion, compile_with_options};
+
+    fn clear_hashes(code: &mut CodeObject) {
+        code.marshal_provenance.constants_tuple_hash = None;
+        code.marshal_provenance.table_hashes = None;
+        for value in &mut code.constants {
+            if let Constant::Code(child) = value {
+                clear_hashes(child);
+            }
+        }
+    }
+
+    for python_version in [
+        PythonVersion::Py312,
+        PythonVersion::Py313,
+        PythonVersion::Py314,
+        PythonVersion::Py315,
+    ] {
+        let options = CompileOptions {
+            python_version,
+            ..CompileOptions::default()
+        };
+        for workload in serc_fixtures::MARSHAL_MICRO_WORKLOADS
+            .iter()
+            .chain(serc_fixtures::COMPOSITE_WORKLOADS)
+            .chain(serc_fixtures::LARGE_WORKLOADS)
+        {
+            // The annotation fixture uses type parameter defaults introduced in 3.13.
+            if python_version == PythonVersion::Py312 && workload.id == "annotation_scopes" {
+                continue;
+            }
+            let module =
+                compile_with_options(workload.source, workload.filename, &options).unwrap();
+            let mut fallback = module.clone();
+            clear_hashes(&mut fallback.code);
+            assert_eq!(module.marshal(), fallback.marshal(), "{}", workload.id);
+            assert_eq!(
+                module.clone().marshal(),
+                fallback.marshal(),
+                "{}",
+                workload.id
+            );
+            assert_eq!(
+                module.to_timestamp_pyc(0, 0),
+                fallback.to_timestamp_pyc(0, 0),
+                "{}",
+                workload.id,
+            );
+        }
+    }
+}
+
+#[test]
 fn partial_intern_state_checks_unrecorded_class_qualified_names() {
     use crate::{
         CompileError, CompileOptions, InitialInternState, OptimizationLevel, PythonVersion,
