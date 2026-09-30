@@ -39,6 +39,8 @@ use self::{
     symbol::SymbolState,
 };
 
+pub(crate) use scope::MarshalNameLookup;
+
 const SUPPORTED_FUTURE_FLAGS: u32 = CO_FUTURE_BARRY_AS_BDFL | CO_FUTURE_ANNOTATIONS;
 const SHADOWED_SUPER_SENTINEL: &str = "\0shadowed super";
 // CPython's flowgraph optimizer folds constant sequences only up to

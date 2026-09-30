@@ -298,6 +298,8 @@ pub(crate) struct MarshalProvenance {
     /// Whether `%` first entered the compiler cache as a fresh `PyUnicode_Replace` result.
     pub(crate) uncached_percent_constant: bool,
     pub(crate) metadata_ids: MarshalMetadataIds,
+    /// The root's immutable compiler name index, shared by cloned modules.
+    pub(crate) metadata_name_lookup: Option<Arc<crate::compiler::MarshalNameLookup>>,
     /// Value properties computed for the emitted metadata; absent for hand-built code objects.
     pub(crate) metadata_tuple_properties: Option<MarshalMetadataTupleProperties>,
     /// Hash of a constants tuple whose key survives cloning; code identities are excluded.

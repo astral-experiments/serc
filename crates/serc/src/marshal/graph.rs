@@ -216,6 +216,7 @@ pub(super) struct ObjectGraph<'a> {
     interned_strings: FxHashMap<&'a str, ObjectId>,
     aliases: GraphAliases,
     metadata_slots: Box<[Option<ObjectId>]>,
+    metadata_name_lookup: Option<&'a crate::compiler::MarshalNameLookup>,
     cached_empty_bytes: Option<ObjectId>,
     cached_empty_tuple: Option<ObjectId>,
     // Common integers avoid both hashing and allocation of the full scalar cache.
@@ -447,6 +448,7 @@ impl<'a> ObjectGraph<'a> {
             uncached_percent_constant: code.marshal_provenance.uncached_percent_constant,
             fresh_empty_bytes_constant: code.marshal_provenance.fresh_empty_bytes_constant,
             metadata_slots,
+            metadata_name_lookup: code.marshal_provenance.metadata_name_lookup.as_deref(),
             ..Self::default()
         };
         traverse_code(
@@ -511,7 +513,7 @@ impl<'a> ObjectGraph<'a> {
             }
             return (
                 true,
-                should_intern(value) || self.interned_strings.contains_key(value.as_str()),
+                should_intern(value) || self.interned_string_id(value).is_some(),
             );
         }
         let key = if self.fresh_empty_bytes_constant
@@ -594,7 +596,7 @@ impl<'a> ObjectGraph<'a> {
                             .as_ref()
                             .and_then(|slots| slots[character.scalar_index(self.python_version)])
                     } else {
-                        self.interned_strings.get(value).copied()
+                        self.interned_string_id(value)
                     },
                     Some(id),
                     "metadata ID must identify one string"
@@ -619,6 +621,29 @@ impl<'a> ObjectGraph<'a> {
         value: &'a str,
         slot_index: Option<usize>,
     ) -> bool {
+        // The retained compiler index gives every spelling one ID, including equal constants
+        // visited before this metadata. Only IDs in that immutable index bypass value hashing;
+        // the extra filename slot and hand-built code objects still seed the ordinary map.
+        if !(self.cache_scalars && CachedObject::character(value).is_some())
+            && let Some(index) = slot_index
+            && self
+                .metadata_name_lookup
+                .is_some_and(|lookup| index < lookup.len())
+            && index < self.metadata_slots.len()
+        {
+            debug_assert_eq!(
+                self.metadata_name_lookup
+                    .and_then(|lookup| lookup.get(value))
+                    .map(MetadataId::index),
+                Some(index),
+                "metadata ID must identify one string"
+            );
+            let id = self.new_interned_string();
+            self.metadata_slots[index] = Some(id);
+            self.occurrences.push(Occurrence { object: id, kind });
+            return true;
+        }
+
         // Seed the value or character table even for hinted strings: an equal constant can
         // be traversed before or after this metadata and must retain the same object identity.
         // Resolve a repeated metadata ID before classifying its spelling again.
@@ -651,6 +676,20 @@ impl<'a> ObjectGraph<'a> {
     }
 
     fn interned_string(&mut self, value: &'a str) -> (ObjectId, bool) {
+        if let Some(index) = self
+            .metadata_name_lookup
+            .and_then(|lookup| lookup.get(value))
+            .map(MetadataId::index)
+            .filter(|index| *index < self.metadata_slots.len())
+        {
+            if let Some(id) = self.metadata_slots[index] {
+                self.objects_by_id[id].reference_required = true;
+                return (id, false);
+            }
+            let id = self.new_interned_string();
+            self.metadata_slots[index] = Some(id);
+            return (id, true);
+        }
         match self.interned_strings.entry(value) {
             Entry::Occupied(entry) => {
                 let id = *entry.get();
@@ -668,6 +707,23 @@ impl<'a> ObjectGraph<'a> {
                 (next_id, true)
             }
         }
+    }
+
+    fn new_interned_string(&mut self) -> ObjectId {
+        let id = self.objects_by_id.next_index();
+        self.objects_by_id.push(Object {
+            reference_required: true,
+            interned: true,
+            reference: None,
+        });
+        id
+    }
+
+    fn interned_string_id(&self, value: &str) -> Option<ObjectId> {
+        self.metadata_name_lookup
+            .and_then(|lookup| lookup.get(value))
+            .and_then(|id| self.metadata_slots.get(id.index()).copied().flatten())
+            .or_else(|| self.interned_strings.get(value).copied())
     }
 
     fn record_cached_value(&mut self, kind: OccurrenceKind, cached: CachedObject) -> bool {
@@ -809,9 +865,8 @@ impl<'a> ObjectGraph<'a> {
                 key,
                 ObjectKey::String(value)
                     if self
-                        .interned_strings
-                        .get(*value)
-                        .is_some_and(|id| self.is_shared_object(*id))
+                        .interned_string_id(value)
+                        .is_some_and(|id| self.is_shared_object(id))
             )
         {
             return true;
@@ -862,6 +917,19 @@ impl<'a> ObjectGraph<'a> {
     pub(super) fn keyed_object_count(&self) -> usize {
         self.objects.len()
             + self.interned_strings.len()
+            + self.metadata_name_lookup.map_or(0, |lookup| {
+                self.metadata_slots
+                    .iter()
+                    .take(lookup.len())
+                    .filter(|id| {
+                        id.is_some_and(|id| {
+                            self.cached_scalar_ids
+                                .as_deref()
+                                .is_none_or(|slots| !slots.contains(&Some(id)))
+                        })
+                    })
+                    .count()
+            })
             + usize::from(self.cached_empty_bytes.is_some())
             + usize::from(self.cached_empty_tuple.is_some())
             + self
@@ -913,7 +981,7 @@ impl<'a> ObjectGraph<'a> {
         {
             return true;
         }
-        self.interned_strings.contains_key(value)
+        self.interned_string_id(value).is_some()
     }
 }
 

@@ -288,6 +288,35 @@ pub(super) struct NameInterner {
     short_names: ShortNameCache,
 }
 
+/// The immutable value-to-ID index retained after lowering finishes.
+/// Unlike the compiler's short-name cache, this lookup has no interior mutation.
+#[derive(Debug)]
+pub(crate) struct MarshalNameLookup {
+    seed_names: &'static [&'static str],
+    names: Vec<Name>,
+    reverse: HashTable<NameId>,
+}
+
+impl MarshalNameLookup {
+    pub(crate) fn len(&self) -> usize {
+        self.seed_names.len() + self.names.len()
+    }
+
+    pub(crate) fn get(&self, name: &str) -> Option<crate::code_object::MetadataId> {
+        if !self.seed_names.is_empty()
+            && let Some(id) = NameInterner::seed_id(name)
+        {
+            return Some(id.into());
+        }
+        self.reverse
+            .find(NameInterner::hash(name), |id| {
+                self.names[id.index() - self.seed_names.len()] == name
+            })
+            .copied()
+            .map(Into::into)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ShortNameKey {
     packed: u64,
@@ -560,6 +589,14 @@ impl FromIterator<NameId> for NameSet {
 }
 
 impl NameInterner {
+    pub(super) fn into_marshal_lookup(self) -> MarshalNameLookup {
+        MarshalNameLookup {
+            seed_names: self.seed_names,
+            names: self.names,
+            reverse: self.reverse,
+        }
+    }
+
     fn seeded() -> Self {
         Self {
             seed_names: &SCOPE_SEED_NAMES,

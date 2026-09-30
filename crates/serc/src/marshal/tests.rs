@@ -3035,3 +3035,59 @@ fn dense_character_metadata_preserves_scalar_aliases_across_targets() {
         }
     }
 }
+
+#[test]
+fn retained_name_lookup_preserves_value_sharing_and_cloned_streams() {
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    fn check(module: &crate::CompiledModule) {
+        let mut ordinary = module.clone();
+        ordinary.code.marshal_provenance.metadata_name_lookup = None;
+        let expected = ordinary.marshal();
+        assert_eq!(module.marshal(), expected);
+        assert_eq!(module.clone().marshal(), expected);
+        assert_eq!(module.marshal(), expected);
+        assert_eq!(
+            module.to_timestamp_pyc(123, 456),
+            ordinary.to_timestamp_pyc(123, 456)
+        );
+    }
+
+    for workload in serc_fixtures::COMPILE_MICRO_WORKLOADS
+        .iter()
+        .chain(serc_fixtures::MARSHAL_MICRO_WORKLOADS)
+        .chain(serc_fixtures::COMPOSITE_WORKLOADS)
+        .chain(serc_fixtures::LARGE_WORKLOADS)
+    {
+        check(&crate::compile(workload.source, workload.filename).unwrap());
+    }
+    for python_version in [
+        crate::PythonVersion::Py312,
+        crate::PythonVersion::Py313,
+        crate::PythonVersion::Py314,
+        crate::PythonVersion::Py315,
+    ] {
+        let options = crate::CompileOptions {
+            python_version,
+            ..crate::CompileOptions::default()
+        };
+        // Equal strings appear both before and after metadata, as cached characters, in
+        // frozensets and metadata-aliasing tuples, and as the caller's filename.
+        for filename in ["result", "<module>", "__name__", "ordinary.py", "é"] {
+            for source in [
+                "before = ('result', 'é', '__name__', 'ordinary.py')\n\
+                 def result(é):\n    return ('result', 'é', '__name__', 'ordinary.py')\n\
+                 after = 'result' in {'result', 'é', '__name__', 'ordinary.py'}\n",
+                // Repeated containers, scalar caches and identity-bearing NaNs exercise
+                // sharing and reference order, including 3.15's unreferenced PYC root.
+                "before = ('result', 'é', '__name__', 'ordinary.py', b'', b'a', 257, -0.0)\n\
+                 def result(é):\n    return ('result', 'é', '__name__', 'ordinary.py', b'', b'a', 257, -0.0)\n\
+                 after = ('result', 'é', '__name__', 'ordinary.py', b'', b'a', 257, -0.0)\n\
+                 nan = (1e1000 - 1e1000, (1e1000 - 1e1000,))\n",
+            ] {
+                check(&crate::compile_with_options(source, filename, &options).unwrap());
+            }
+        }
+    }
+    assert_send_sync::<crate::CompiledModule>();
+}
