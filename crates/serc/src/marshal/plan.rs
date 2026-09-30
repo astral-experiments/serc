@@ -41,6 +41,9 @@ pub(super) trait MarshalVisitor<'a> {
     fn locals(&mut self, code: &'a CodeObject) -> bool;
     fn local_kinds(&mut self, code: &'a CodeObject);
     fn metadata_string(&mut self, value: &'a str, metadata_id: Option<MetadataId>);
+    fn metadata_name(&mut self, value: &'a Name, metadata_id: Option<MetadataId>) {
+        self.metadata_string(value.as_str(), metadata_id);
+    }
     fn code_filename(&mut self, code: &'a CodeObject, metadata_id: Option<MetadataId>);
     fn code_name(&mut self, code: &'a CodeObject, metadata_id: Option<MetadataId>) {
         self.metadata_string(&code.name, metadata_id);
@@ -145,11 +148,11 @@ fn traverse_metadata_strings<'a, V>(
     if let Some(metadata_ids) = metadata_ids {
         assert_eq!(metadata_ids.len(), values.len(), "metadata ID tuple length");
         for (value, metadata_id) in values.iter().zip(metadata_ids) {
-            visitor.metadata_string(value, Some(*metadata_id));
+            visitor.metadata_name(value, Some(*metadata_id));
         }
     } else {
         for value in values {
-            visitor.metadata_string(value, None);
+            visitor.metadata_name(value, None);
         }
     }
 }

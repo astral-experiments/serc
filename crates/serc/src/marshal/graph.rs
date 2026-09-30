@@ -218,6 +218,8 @@ pub(super) struct ObjectGraph<'a> {
     metadata_slots: Box<[Option<ObjectId>]>,
     cached_empty_bytes: Option<ObjectId>,
     cached_empty_tuple: Option<ObjectId>,
+    // Common integers avoid both hashing and allocation of the full scalar cache.
+    cached_inline_integers: [Option<ObjectId>; 16],
     cached_scalar_ids: Option<Box<[Option<ObjectId>]>>,
     cache_scalars: bool,
     preallocated_interned_strings: bool,
@@ -688,12 +690,13 @@ impl<'a> ObjectGraph<'a> {
     }
 
     fn record_cached(&mut self, cached: CachedObject) -> (ObjectId, bool) {
-        let empty_slot = match cached {
+        let direct_slot = match cached {
             CachedObject::EmptyBytes => Some(&mut self.cached_empty_bytes),
             CachedObject::EmptyTuple => Some(&mut self.cached_empty_tuple),
+            CachedObject::Int(value) => self.cached_inline_integers.get_mut(usize::from(value)),
             _ => None,
         };
-        if let Some(slot) = empty_slot {
+        if let Some(slot) = direct_slot {
             if let Some(id) = *slot {
                 self.objects_by_id[id].shared = true;
                 return (id, false);
@@ -829,6 +832,11 @@ impl<'a> ObjectGraph<'a> {
             + self.interned_strings.len()
             + usize::from(self.cached_empty_bytes.is_some())
             + usize::from(self.cached_empty_tuple.is_some())
+            + self
+                .cached_inline_integers
+                .iter()
+                .filter(|id| id.is_some())
+                .count()
             + self
                 .cached_scalar_ids
                 .as_deref()
@@ -2667,6 +2675,30 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
     }
 
     #[inline]
+    fn metadata_name(&mut self, value: &'code Name, metadata_id: Option<MetadataId>) {
+        // In the value-table domain, repeated IDs need no unpacking of the name's storage.
+        // Scalar caching retains its separate character route through metadata_string.
+        if !self.graph.cache_scalars
+            && let Some(id) = metadata_id
+                .and_then(|id| self.graph.metadata_slots.get(id.index()).copied())
+                .flatten()
+        {
+            debug_assert_eq!(
+                self.graph.interned_strings.get(value.as_str()),
+                Some(&id),
+                "metadata ID must identify one string"
+            );
+            self.graph.objects_by_id[id].shared = true;
+            self.graph.occurrences.push(Occurrence {
+                object: id,
+                kind: OccurrenceKind::MetadataString,
+            });
+            return;
+        }
+        self.metadata_string(value.as_str(), metadata_id);
+    }
+
+    #[inline]
     fn metadata_string(&mut self, value: &'code str, metadata_id: Option<MetadataId>) {
         let first = if self.graph.cache_scalars
             && let Some(character) = CachedObject::character(value)
@@ -2852,7 +2884,8 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
                 )
             }
             Constant::Int(value)
-                if self.graph.cache_scalars
+                if (self.graph.cache_scalars
+                    || *value < self.graph.cached_inline_integers.len() as u64)
                     && *value
                         <= small_int_bounds_for(self.graph.python_version)
                             .1
@@ -3018,5 +3051,72 @@ mod wire_reference_tests {
             ObjectReference::Existing(index) if index.as_u32() == u32::MAX - 1
         ));
         assert_eq!(next_reference, u32::MAX as usize);
+    }
+}
+
+#[cfg(test)]
+mod integer_cache_tests {
+    use super::{CachedObject, ObjectGraph, ObjectKey};
+    use crate::PythonVersion;
+
+    #[test]
+    fn indexed_integers_preserve_hashed_identity_and_reference_flags() {
+        for python_version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            let mut indexed = ObjectGraph {
+                python_version,
+                ..ObjectGraph::default()
+            };
+            let mut hashed = ObjectGraph {
+                python_version,
+                ..ObjectGraph::default()
+            };
+            for key in [
+                ObjectKey::Int(0),
+                ObjectKey::Int(15),
+                ObjectKey::Int(16),
+                ObjectKey::Int(255),
+                ObjectKey::Int(256),
+                ObjectKey::SignedInt(-5),
+                ObjectKey::SignedInt(0),
+                ObjectKey::SignedInt(1),
+                ObjectKey::Int(1),
+                ObjectKey::SignedInt(15),
+                ObjectKey::Int(15),
+                ObjectKey::SignedInt(1),
+                ObjectKey::Int(16),
+                ObjectKey::Int(0),
+            ] {
+                let actual = if let Some(cached) = CachedObject::for_key(&key, python_version) {
+                    indexed.record_cached(cached)
+                } else {
+                    indexed.record_object(key.into())
+                };
+                assert_eq!(
+                    actual,
+                    hashed.record_object(key.into()),
+                    "{python_version}: {key:?}"
+                );
+            }
+            let flags = |graph: &ObjectGraph<'_>| {
+                graph
+                    .objects_by_id
+                    .iter()
+                    .map(|object| {
+                        (
+                            object.shared,
+                            object.cached,
+                            object.interned,
+                            object.reference,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(flags(&indexed), flags(&hashed), "{python_version}");
+        }
     }
 }

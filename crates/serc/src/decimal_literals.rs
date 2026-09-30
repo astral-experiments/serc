@@ -15,7 +15,7 @@ pub(crate) fn validate(
     unsupported: &[UnsupportedSyntaxError],
     max_digits: u32,
 ) -> Result<(), CompileError> {
-    if max_digits == 0 {
+    if max_digits == 0 || source.len() <= max_digits as usize {
         return Ok(());
     }
     let max_digits = max_digits as usize;
