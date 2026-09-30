@@ -460,7 +460,15 @@ impl<'a> StringTupleKey<'a> {
 
 impl PartialEq for StringTupleKey<'_> {
     fn eq(&self, other: &Self) -> bool {
-        self.iter().eq(other.iter())
+        match (self.0, other.0) {
+            (StringTupleKind::Names(left), StringTupleKind::Names(right)) => left == right,
+            (StringTupleKind::Strings(left), StringTupleKind::Strings(right)) => left == right,
+            _ => {
+                let left = self.iter();
+                let right = other.iter();
+                left.len() == right.len() && left.eq(right)
+            }
+        }
     }
 }
 
@@ -474,8 +482,22 @@ impl Hash for StringTupleKey<'_> {
             StringTupleKind::Names(values) => values.len(),
         };
         length.hash(state);
-        for value in self.iter() {
-            value.hash(state);
+        match self.0 {
+            StringTupleKind::Constants(values) => {
+                for value in values {
+                    constant_string(value).hash(state);
+                }
+            }
+            StringTupleKind::Strings(values) => {
+                for value in values {
+                    value.as_str().hash(state);
+                }
+            }
+            StringTupleKind::Names(values) => {
+                for value in values {
+                    value.as_str().hash(state);
+                }
+            }
         }
     }
 }

@@ -577,19 +577,46 @@ impl<'a> ObjectGraph<'a> {
             .and_then(|index| self.metadata_slots.get(index).copied())
             .flatten()
         {
-            debug_assert_eq!(
-                self.interned_strings.get(value),
-                Some(&id),
-                "metadata ID must identify one string"
-            );
+            #[cfg(debug_assertions)]
+            {
+                let recorded = if self.cache_scalars
+                    && let Some(character) = CachedObject::character(value)
+                {
+                    self.cached_scalar_ids.as_ref().and_then(|slots| {
+                        slots[character.scalar_index(self.python_version)].as_ref()
+                    })
+                } else {
+                    self.interned_strings.get(value)
+                };
+                debug_assert_eq!(recorded, Some(&id), "metadata ID must identify one string");
+            }
             self.objects_by_id[id].shared = true;
             self.occurrences.push(Occurrence { object: id, kind });
             return false;
         }
 
+        self.record_new_metadata_string(kind, value, slot_index)
+    }
+
+    /// Keep hashing and cache admission outside the common dense-ID lookup.
+    #[inline(never)]
+    fn record_new_metadata_string(
+        &mut self,
+        kind: OccurrenceKind,
+        value: &'a str,
+        slot_index: Option<usize>,
+    ) -> bool {
         // Seed the ordinary value table even for hinted strings: an equal interned constant can
         // be traversed before or after this metadata and must retain the same object identity.
-        let (id, first) = self.interned_string(value);
+        // Characters retain their scalar-cache identity, and also seed their metadata ID so later
+        // metadata occurrences can use the same dense lookup as longer strings.
+        let (id, first) = if self.cache_scalars
+            && let Some(character) = CachedObject::character(value)
+        {
+            self.record_cached(character)
+        } else {
+            self.interned_string(value)
+        };
         if let Some(slot) = slot_index.and_then(|index| self.metadata_slots.get_mut(index)) {
             *slot = Some(id);
         }
@@ -984,11 +1011,15 @@ fn collect_explicitly_interned<'a>(
 ) -> (FrozensetRecreationNeed, GraphCapacity) {
     // Identifier objects can enter the compilation-wide constant cache before an equal
     // ordinary string. Preserve that recorded origin when sharing constant and metadata strings.
+    // Automatically interned strings need no set entry: the graph checks should_intern first.
+    // This only filters the wire-graph lookup set, retaining all compilation provenance used to
+    // replay interning and resolve frozenset recreation.
     values.extend(
         code.marshal_provenance
             .canonical_constant_strings
             .iter()
-            .map(String::as_str),
+            .map(String::as_str)
+            .filter(|value| !should_intern(value)),
     );
     let mut qualified_names = QualifiedNameConstants {
         track: python_version != PythonVersion::Py312,
@@ -1077,7 +1108,8 @@ fn collect_interning_provenance_without_frozensets<'a>(
         code.marshal_provenance
             .explicitly_interned_strings
             .iter()
-            .map(String::as_str),
+            .map(String::as_str)
+            .filter(|value| !should_intern(value)),
     );
     qualified_names.record(code);
     for constant in &code.constants {
@@ -1111,7 +1143,8 @@ fn collect_interning_provenance<'a>(
         code.marshal_provenance
             .explicitly_interned_strings
             .iter()
-            .map(String::as_str),
+            .map(String::as_str)
+            .filter(|value| !should_intern(value)),
     );
     qualified_names.record(code);
     // Reuse the provenance walk to classify frozenset recreation for code trees that can contain
@@ -2668,15 +2701,9 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
 
     #[inline]
     fn metadata_string(&mut self, value: &'code str, metadata_id: Option<MetadataId>) {
-        let first = if self.graph.cache_scalars
-            && let Some(character) = CachedObject::character(value)
-        {
+        let first =
             self.graph
-                .record_cached_value(OccurrenceKind::MetadataString, character)
-        } else {
-            self.graph
-                .record_metadata_string(OccurrenceKind::MetadataString, value, metadata_id)
-        };
+                .record_metadata_string(OccurrenceKind::MetadataString, value, metadata_id);
         if first {
             self.graph.estimate_long_payload(value.len());
         }

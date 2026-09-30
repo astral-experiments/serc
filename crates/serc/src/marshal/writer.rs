@@ -245,6 +245,7 @@ impl Writer<'_, '_, '_> {
         }
     }
 
+    #[inline]
     fn interned_string_with_object(&mut self, object: ObjectId, value: &str) {
         let object = self.graph.object_for_writing(object);
         debug_assert!(object.is_interned(), "marshal metadata must be interned");
@@ -252,11 +253,17 @@ impl Writer<'_, '_, '_> {
             object.reference_for_write(ReferenceMode::Forced, &mut self.reference_count);
         match reference {
             ObjectReference::Existing(index) => self.byte_and_long(TYPE_REF, index.as_u32()),
-            ObjectReference::New => self.string_payload::<true>(value, FLAG_REF),
+            ObjectReference::New => self.new_interned_string_payload(value),
             ObjectReference::Unshared => {
                 unreachable!("forced marshal reference cannot be unshared")
             }
         }
+    }
+
+    /// Repeated metadata normally writes a reference; keep first-occurrence encoding separate.
+    #[inline(never)]
+    fn new_interned_string_payload(&mut self, value: &str) {
+        self.string_payload::<true>(value, FLAG_REF);
     }
 
     #[inline]

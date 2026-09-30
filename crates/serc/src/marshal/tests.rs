@@ -886,6 +886,45 @@ class Namespace:
 }
 
 #[test]
+fn dense_character_metadata_preserves_scalar_identity() {
+    let mut hinted = code_object(
+        (0..32)
+            .map(Constant::Int)
+            .chain([Constant::String("x".into()), Constant::String("é".into())])
+            .collect(),
+    );
+    hinted.names = vec!["x".into(), "é".into(), "x".into()];
+    hinted.locals = vec!["é".into(), "x".into()];
+    hinted.local_kinds = vec![1, 1];
+    hinted.marshal_provenance.metadata_ids = MarshalMetadataIds {
+        domain_len: 3,
+        names: vec![
+            MetadataId::from_u32(0),
+            MetadataId::from_u32(1),
+            MetadataId::from_u32(0),
+        ],
+        locals: vec![MetadataId::from_u32(1), MetadataId::from_u32(0)],
+        filename: MetadataId::from_u32(2),
+        name: None,
+        qualified_name: None,
+    };
+    let mut fallback = hinted.clone();
+    fallback.marshal_provenance.metadata_ids.domain_len = u32::MAX;
+    for python_version in [
+        crate::PythonVersion::Py312,
+        crate::PythonVersion::Py313,
+        crate::PythonVersion::Py314,
+        crate::PythonVersion::Py315,
+    ] {
+        let initial = crate::InitialInternState::default();
+        assert_eq!(
+            super::encode_code_with_options(&hinted, python_version, &initial),
+            super::encode_code_with_options(&fallback, python_version, &initial),
+        );
+    }
+}
+
+#[test]
 fn dense_metadata_ids_preserve_nested_and_constant_string_identity() {
     let mut nested = code_object(vec![Constant::String("shared_before".to_string())]);
     nested.names = vec!["shared_after".into(), "nested_only".into()];
