@@ -87,34 +87,33 @@ pub(super) struct Occurrence {
 const _: [(); 8] = [(); std::mem::size_of::<Occurrence>()];
 
 #[derive(Debug)]
-pub(super) struct OccurrenceCursor<T> {
-    occurrences: T,
-    next: usize,
+pub(super) struct OccurrenceCursor<T: Iterator<Item = Occurrence>> {
+    occurrences: std::iter::Peekable<T>,
+    count: usize,
 }
 
-impl<T: AsRef<[Occurrence]>> OccurrenceCursor<T> {
+impl<T: ExactSizeIterator<Item = Occurrence>> OccurrenceCursor<T> {
     #[inline]
     pub(super) fn consume(&mut self, expected: OccurrenceKind) -> ObjectId {
-        let index = self.next;
-        let occurrences = self.occurrences.as_ref();
-        let Some(occurrence) = occurrences.get(index).copied() else {
-            missing_occurrence(index, expected, occurrences.len());
+        let Some(occurrence) = self.occurrences.peek().copied() else {
+            missing_occurrence(self.count, expected, self.count);
         };
         if occurrence.kind != expected {
+            let index = self.count - self.occurrences.len();
             mismatched_occurrence(index, expected, occurrence.kind);
         }
-        self.next += 1;
+        let _ = self.occurrences.next();
         occurrence.object
     }
 
     pub(super) fn finish(self) {
-        let occurrences = self.occurrences.as_ref();
+        let remaining = self.occurrences.len();
         assert_eq!(
-            self.next,
-            occurrences.len(),
+            remaining,
+            0,
             "marshal writer consumed {} of {} recorded occurrences",
-            self.next,
-            occurrences.len()
+            self.count - remaining,
+            self.count
         );
     }
 }
@@ -1018,18 +1017,20 @@ impl<'a> ObjectGraph<'a> {
     }
 
     #[cfg(test)]
-    pub(super) fn occurrence_cursor(&self) -> OccurrenceCursor<&[Occurrence]> {
+    pub(super) fn occurrence_cursor(
+        &self,
+    ) -> OccurrenceCursor<std::iter::Copied<std::slice::Iter<'_, Occurrence>>> {
         OccurrenceCursor {
-            occurrences: &self.occurrences,
-            next: 0,
+            occurrences: self.occurrences.iter().copied().peekable(),
+            count: self.occurrences.len(),
         }
     }
 
     /// Separates the read-only occurrence stream before the writer mutates object references.
-    pub(super) fn take_occurrences(&mut self) -> OccurrenceCursor<Vec<Occurrence>> {
+    pub(super) fn take_occurrences(&mut self) -> OccurrenceCursor<std::vec::IntoIter<Occurrence>> {
         OccurrenceCursor {
-            occurrences: std::mem::take(&mut self.occurrences),
-            next: 0,
+            count: self.occurrences.len(),
+            occurrences: std::mem::take(&mut self.occurrences).into_iter().peekable(),
         }
     }
 
@@ -3253,7 +3254,35 @@ mod snapshots;
 
 #[cfg(test)]
 mod wire_reference_tests {
-    use super::{Object, ObjectReference, ReferenceMode};
+    use super::{
+        Object, ObjectId, ObjectReference, Occurrence, OccurrenceCursor, OccurrenceKind,
+        ReferenceMode,
+    };
+
+    #[test]
+    fn occurrence_iterators_keep_kind_and_completeness_checks() {
+        let occurrence = Occurrence {
+            object: ObjectId::from_usize(7),
+            kind: OccurrenceKind::Bytes,
+        };
+        let cursor = || OccurrenceCursor {
+            occurrences: vec![occurrence].into_iter().peekable(),
+            count: 1,
+        };
+        let mut complete = cursor();
+        assert_eq!(complete.consume(OccurrenceKind::Bytes), occurrence.object);
+        complete.finish();
+        assert!(std::panic::catch_unwind(|| cursor().finish()).is_err());
+        assert!(std::panic::catch_unwind(|| cursor().consume(OccurrenceKind::Code)).is_err());
+        assert!(
+            std::panic::catch_unwind(|| {
+                let mut exhausted = cursor();
+                exhausted.consume(OccurrenceKind::Bytes);
+                exhausted.consume(OccurrenceKind::Bytes);
+            })
+            .is_err()
+        );
+    }
 
     #[test]
     fn object_references_preserve_forcing_and_the_full_reference_index() {

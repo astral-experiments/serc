@@ -3328,3 +3328,16 @@ fn cached_character_metadata_ids_match_value_lookups() {
         assert_eq!(module.marshal(), fallback.marshal(), "{}", workload.id);
     }
 }
+
+#[test]
+fn occurrence_cursor_preserves_position_after_a_kind_mismatch() {
+    let code = code_object(Vec::new());
+    let graph = ObjectGraph::for_code(&code);
+    let expected = graph.occurrence_cursor().consume(OccurrenceKind::Code);
+    let mut cursor = graph.occurrence_cursor();
+    let mismatch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cursor.consume(OccurrenceKind::Bytes);
+    }));
+    assert!(mismatch.is_err());
+    assert_eq!(cursor.consume(OccurrenceKind::Code), expected);
+}
