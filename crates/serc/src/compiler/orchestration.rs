@@ -1595,6 +1595,7 @@ impl<'source> Compiler<'source> {
                 qualified_name_is_canonical: self.output.qualified_name_is_canonical,
                 uncached_percent_constant: self.context.has_uncached_percent_constant(),
                 metadata_ids,
+                metadata_name_lookup: None,
                 metadata_tuple_properties: Some(metadata_tuple_properties),
                 constants_tuple_hash,
                 marshal_occurrence_bound: Some(marshal_occurrence_bound),
@@ -1616,6 +1617,11 @@ impl<'source> Compiler<'source> {
                 self.context.take_interned_metadata_tuples();
             code.marshal_provenance.metadata_alias_scan_unnecessary =
                 metadata_alias_scan_unnecessary(&code);
+            let context = Rc::get_mut(&mut self.context)
+                .expect("completed module exclusively owns its compilation context");
+            code.marshal_provenance.metadata_name_lookup = Some(std::sync::Arc::new(
+                std::mem::take(&mut context.scopes.names).into_marshal_lookup(),
+            ));
         }
         Ok(code)
     }

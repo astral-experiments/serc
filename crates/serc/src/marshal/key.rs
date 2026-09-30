@@ -117,12 +117,13 @@ pub(super) struct ConstantTupleKey<'a>(&'a [Constant]);
 
 impl PartialEq for ConstantTupleKey<'_> {
     fn eq(&self, other: &Self) -> bool {
-        self.0.len() == other.0.len()
-            && self
-                .0
-                .iter()
-                .zip(other.0)
-                .all(|(left, right)| constants_equal(left, right))
+        std::ptr::eq(self.0, other.0)
+            || (self.0.len() == other.0.len()
+                && self
+                    .0
+                    .iter()
+                    .zip(other.0)
+                    .all(|(left, right)| constants_equal(left, right)))
     }
 }
 
@@ -460,7 +461,44 @@ impl<'a> StringTupleKey<'a> {
 
 impl PartialEq for StringTupleKey<'_> {
     fn eq(&self, other: &Self) -> bool {
-        self.iter().eq(other.iter())
+        // Select the storage representation once, rather than dispatching both iterators for
+        // every string. All combinations still compare complete spelling sequences.
+        match (self.0, other.0) {
+            (StringTupleKind::Names(left), StringTupleKind::Names(right)) => left == right,
+            (StringTupleKind::Strings(left), StringTupleKind::Strings(right)) => left == right,
+            (StringTupleKind::Constants(left), StringTupleKind::Constants(right)) => {
+                std::ptr::eq(left, right)
+                    || (left.len() == right.len()
+                        && left
+                            .iter()
+                            .zip(right)
+                            .all(|(left, right)| constant_string(left) == constant_string(right)))
+            }
+            (StringTupleKind::Constants(constants), StringTupleKind::Names(names))
+            | (StringTupleKind::Names(names), StringTupleKind::Constants(constants)) => {
+                constants.len() == names.len()
+                    && constants
+                        .iter()
+                        .zip(names)
+                        .all(|(constant, name)| constant_string(constant) == name.as_str())
+            }
+            (StringTupleKind::Constants(constants), StringTupleKind::Strings(strings))
+            | (StringTupleKind::Strings(strings), StringTupleKind::Constants(constants)) => {
+                constants.len() == strings.len()
+                    && constants
+                        .iter()
+                        .zip(strings)
+                        .all(|(constant, string)| constant_string(constant) == string)
+            }
+            (StringTupleKind::Names(names), StringTupleKind::Strings(strings))
+            | (StringTupleKind::Strings(strings), StringTupleKind::Names(names)) => {
+                names.len() == strings.len()
+                    && names
+                        .iter()
+                        .zip(strings)
+                        .all(|(name, string)| name == string)
+            }
+        }
     }
 }
 
