@@ -2,8 +2,7 @@ use ruff_index::IndexVec;
 
 use std::collections::hash_map::Entry;
 
-use hashbrown::HashTable;
-use hashbrown::hash_table::Entry as TableEntry;
+use hashbrown::{HashTable, hash_table::Entry as HashedEntry};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
@@ -688,18 +687,20 @@ impl<'a> ObjectGraph<'a> {
     }
 
     fn record_object(&mut self, key: HashedObjectKey<'a>) -> (ObjectId, bool) {
+        // The key already owns its value hash. Use it directly for lookup and growth, retaining
+        // full key equality and assigning object IDs solely in traversal order.
         match self.objects.entry(
             key.hash(),
             |(stored, _)| *stored == key,
             |(stored, _)| stored.hash(),
         ) {
-            TableEntry::Occupied(entry) => {
+            HashedEntry::Occupied(entry) => {
                 let id = entry.get().1;
                 // Cache eligibility was fixed by this same stored key when first inserted.
                 self.objects_by_id[id].shared = true;
                 (id, false)
             }
-            TableEntry::Vacant(entry) => {
+            HashedEntry::Vacant(entry) => {
                 let next_id = self.objects_by_id.next_index();
                 let cached = Self::is_cached(key.key(), self.python_version);
                 entry.insert((key, next_id));
@@ -2511,6 +2512,36 @@ struct GraphVisitor<'graph, 'code> {
     root_constants: bool,
 }
 
+impl<'code> GraphVisitor<'_, 'code> {
+    /// Records the constants tuple, using a cached value hash when available.
+    /// Root and code-bearing tuples retain unique identities; string tuples may alias metadata.
+    fn constants_with_hash(&mut self, values: &'code [Constant], hash: Option<u64>) -> bool {
+        let root_constants = std::mem::take(&mut self.root_constants);
+        if values.is_empty() {
+            return self
+                .graph
+                .record_cached_value(OccurrenceKind::Constants, CachedObject::EmptyTuple);
+        }
+        let key = constants_tuple_key(values);
+        if matches!(&key, ObjectKey::ConstantTuple(_))
+            && (root_constants
+                || values
+                    .iter()
+                    .any(|value| matches!(value, Constant::Code(_))))
+        {
+            self.graph
+                .record_unique_value(OccurrenceKind::Constants, key)
+        } else if let Some(hash) = hash {
+            self.graph.record_hashed(
+                OccurrenceKind::Constants,
+                HashedObjectKey::with_hash(key, hash),
+            )
+        } else {
+            self.graph.record_keyed(OccurrenceKind::Constants, key)
+        }
+    }
+}
+
 impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
     const USES_METADATA_IDS: bool = true;
 
@@ -2533,48 +2564,15 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
 
     #[inline]
     fn constants(&mut self, values: &'code [Constant], _reference_mode: ReferenceMode) -> bool {
-        let root_constants = std::mem::take(&mut self.root_constants);
-        if values.is_empty() {
-            return self
-                .graph
-                .record_cached_value(OccurrenceKind::Constants, CachedObject::EmptyTuple);
-        }
-        let key = constants_tuple_key(values);
-        // The root constant tuple cannot equal one of its own descendants. Only all-string
-        // roots can alias a metadata tuple, and those retain their ordinary value lookup.
-        if matches!(&key, ObjectKey::ConstantTuple(_))
-            && (root_constants
-                || values
-                    .iter()
-                    .any(|value| matches!(value, Constant::Code(_))))
-        {
-            self.graph
-                .record_unique_value(OccurrenceKind::Constants, key)
-        } else {
-            // The key has already scanned every member of an all-string tuple. It cannot own
-            // code, and equal literal and metadata tuples must share the same value lookup.
-            self.graph.record_keyed(OccurrenceKind::Constants, key)
-        }
+        self.constants_with_hash(values, None)
     }
 
-    /// Reuses value hashes without merging a root tuple with its descendants.
-    /// All-string roots keep value lookup because they can alias metadata tuples.
+    #[inline]
     fn code_constants(&mut self, code: &'code CodeObject) -> bool {
-        if let Some(hash) = code.marshal_provenance.constants_tuple_hash {
-            let root_constants = std::mem::take(&mut self.root_constants);
-            let key = constants_tuple_key(&code.constants);
-            if root_constants && matches!(key, ObjectKey::ConstantTuple(_)) {
-                self.graph
-                    .record_unique_value(OccurrenceKind::Constants, key)
-            } else {
-                self.graph.record_hashed(
-                    OccurrenceKind::Constants,
-                    HashedObjectKey::with_hash(key, hash),
-                )
-            }
-        } else {
-            self.constants(&code.constants, ReferenceMode::IfShared)
-        }
+        self.constants_with_hash(
+            &code.constants,
+            code.marshal_provenance.constants_tuple_hash,
+        )
     }
 
     #[inline]
@@ -2711,6 +2709,23 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
     fn bytes(&mut self, value: &'code [u8]) {
         if self.graph.record_bytes(OccurrenceKind::Bytes, value) {
             self.graph.estimate_payload(value.len());
+        }
+    }
+
+    #[inline]
+    fn bytes_with_hash(&mut self, value: &'code [u8], hash: Option<u64>) {
+        // Empty and single-byte values retain the ordinary scalar cache and identity rules.
+        if value.len() > 1
+            && let Some(hash) = hash
+        {
+            if self.graph.record_hashed(
+                OccurrenceKind::Bytes,
+                HashedObjectKey::with_hash(ObjectKey::Bytes(value), hash),
+            ) {
+                self.graph.estimate_payload(value.len());
+            }
+        } else {
+            self.bytes(value);
         }
     }
 

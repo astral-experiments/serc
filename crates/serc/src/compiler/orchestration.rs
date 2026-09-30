@@ -1588,11 +1588,16 @@ impl<'source> Compiler<'source> {
                 metadata_ids,
                 metadata_tuple_properties: Some(metadata_tuple_properties),
                 constants_tuple_hash,
+                table_hashes: None,
                 subtree_has_frozenset_constants: self.output.has_frozenset_constants,
                 metadata_alias_scan_unnecessary: false,
                 fresh_empty_bytes_constant: self.context.fresh_empty_bytes_constant(),
             },
         };
+        code.marshal_provenance.table_hashes = Some([
+            crate::marshal::bytes_hash(&code.line_table),
+            crate::marshal::bytes_hash(&code.exception_table),
+        ]);
         code.validate()?;
         code.marshal_provenance.assembly_order = self.context.record_code_assembly(&code);
         if matches!(self.unit.scope, Scope::Module) {
