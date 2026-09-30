@@ -23,8 +23,8 @@ use super::plan::{MarshalVisitor, ObjectId, ReferenceId, ReferenceMode, traverse
 
 #[derive(Debug)]
 pub(super) struct Object {
-    shared: bool,
-    cached: bool,
+    // Cached objects and repeated values both require references in IfShared mode.
+    reference_required: bool,
     interned: bool,
     reference: Option<ReferenceId>,
 }
@@ -43,7 +43,7 @@ impl Object {
         mode: ReferenceMode,
         reference_count: &mut usize,
     ) -> ObjectReference {
-        if mode == ReferenceMode::IfShared && !self.shared && !self.cached {
+        if mode == ReferenceMode::IfShared && !self.reference_required {
             return ObjectReference::Unshared;
         }
         if let Some(index) = self.reference {
@@ -218,6 +218,8 @@ pub(super) struct ObjectGraph<'a> {
     metadata_slots: Box<[Option<ObjectId>]>,
     cached_empty_bytes: Option<ObjectId>,
     cached_empty_tuple: Option<ObjectId>,
+    // Common integers avoid both hashing and allocation of the full scalar cache.
+    cached_inline_integers: [Option<ObjectId>; 16],
     cached_scalar_ids: Option<Box<[Option<ObjectId>]>>,
     cache_scalars: bool,
     preallocated_interned_strings: bool,
@@ -582,7 +584,7 @@ impl<'a> ObjectGraph<'a> {
                 Some(&id),
                 "metadata ID must identify one string"
             );
-            self.objects_by_id[id].shared = true;
+            self.objects_by_id[id].reference_required = true;
             self.occurrences.push(Occurrence { object: id, kind });
             return false;
         }
@@ -601,7 +603,7 @@ impl<'a> ObjectGraph<'a> {
         let (id, first) = self.record_object(ObjectKey::SurrogateFilename(value).into());
         if self.python_version >= PythonVersion::Py313 {
             let object = &mut self.objects_by_id[id];
-            object.cached = true;
+            object.reference_required = true;
             object.interned = true;
         }
         self.occurrences.push(Occurrence {
@@ -615,15 +617,14 @@ impl<'a> ObjectGraph<'a> {
         match self.interned_strings.entry(value) {
             Entry::Occupied(entry) => {
                 let id = *entry.get();
-                self.objects_by_id[id].shared = true;
+                self.objects_by_id[id].reference_required = true;
                 (id, false)
             }
             Entry::Vacant(entry) => {
                 let next_id = self.objects_by_id.next_index();
                 entry.insert(next_id);
                 self.objects_by_id.push(Object {
-                    shared: false,
-                    cached: true,
+                    reference_required: true,
                     interned: true,
                     reference: None,
                 });
@@ -679,8 +680,7 @@ impl<'a> ObjectGraph<'a> {
 
         let id = self.objects_by_id.next_index();
         self.objects_by_id.push(Object {
-            shared: false,
-            cached: false,
+            reference_required: false,
             interned: false,
             reference: None,
         });
@@ -688,20 +688,20 @@ impl<'a> ObjectGraph<'a> {
     }
 
     fn record_cached(&mut self, cached: CachedObject) -> (ObjectId, bool) {
-        let empty_slot = match cached {
+        let direct_slot = match cached {
             CachedObject::EmptyBytes => Some(&mut self.cached_empty_bytes),
             CachedObject::EmptyTuple => Some(&mut self.cached_empty_tuple),
+            CachedObject::Int(value) => self.cached_inline_integers.get_mut(usize::from(value)),
             _ => None,
         };
-        if let Some(slot) = empty_slot {
+        if let Some(slot) = direct_slot {
             if let Some(id) = *slot {
-                self.objects_by_id[id].shared = true;
+                self.objects_by_id[id].reference_required = true;
                 return (id, false);
             }
             let id = self.objects_by_id.next_index();
             self.objects_by_id.push(Object {
-                shared: false,
-                cached: true,
+                reference_required: true,
                 interned: false,
                 reference: None,
             });
@@ -713,14 +713,13 @@ impl<'a> ObjectGraph<'a> {
             vec![None; cached_scalar_slots(self.python_version)].into_boxed_slice()
         })[cached.scalar_index(self.python_version)];
         if let Some(id) = *slot {
-            self.objects_by_id[id].shared = true;
+            self.objects_by_id[id].reference_required = true;
             return (id, false);
         }
 
         let id = self.objects_by_id.next_index();
         self.objects_by_id.push(Object {
-            shared: false,
-            cached: true,
+            reference_required: true,
             interned: matches!(cached, CachedObject::Character(_)),
             reference: None,
         });
@@ -740,7 +739,7 @@ impl<'a> ObjectGraph<'a> {
             HashedEntry::Occupied(entry) => {
                 let id = entry.get().1;
                 // Cache eligibility was fixed by this same stored key when first inserted.
-                self.objects_by_id[id].shared = true;
+                self.objects_by_id[id].reference_required = true;
                 (id, false)
             }
             HashedEntry::Vacant(entry) => {
@@ -748,8 +747,7 @@ impl<'a> ObjectGraph<'a> {
                 let cached = Self::is_cached(key.key(), self.python_version);
                 entry.insert((key, next_id));
                 self.objects_by_id.push(Object {
-                    shared: false,
-                    cached,
+                    reference_required: cached,
                     interned: false,
                     reference: None,
                 });
@@ -769,7 +767,7 @@ impl<'a> ObjectGraph<'a> {
         if force_reference
             || self
                 .object_id(HashedObjectKey::from(*key))
-                .is_some_and(|id| self.objects_by_id[id].shared)
+                .is_some_and(|id| self.objects_by_id[id].reference_required)
             || matches!(
                 key,
                 ObjectKey::String(value)
@@ -798,7 +796,7 @@ impl<'a> ObjectGraph<'a> {
 
     pub(super) fn is_shared_object(&self, id: ObjectId) -> bool {
         let object = &self.objects_by_id[id];
-        object.shared || object.cached
+        object.reference_required
     }
 
     pub(super) fn python_version(&self) -> PythonVersion {
@@ -829,6 +827,11 @@ impl<'a> ObjectGraph<'a> {
             + self.interned_strings.len()
             + usize::from(self.cached_empty_bytes.is_some())
             + usize::from(self.cached_empty_tuple.is_some())
+            + self
+                .cached_inline_integers
+                .iter()
+                .filter(|id| id.is_some())
+                .count()
             + self
                 .cached_scalar_ids
                 .as_deref()
@@ -2852,7 +2855,8 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
                 )
             }
             Constant::Int(value)
-                if self.graph.cache_scalars
+                if (self.graph.cache_scalars
+                    || *value < self.graph.cached_inline_integers.len() as u64)
                     && *value
                         <= small_int_bounds_for(self.graph.python_version)
                             .1
@@ -2981,14 +2985,12 @@ mod wire_reference_tests {
     #[test]
     fn object_references_preserve_forcing_and_the_full_reference_index() {
         let mut unique = Object {
-            shared: false,
-            cached: false,
+            reference_required: false,
             interned: false,
             reference: None,
         };
         let mut cached = Object {
-            shared: false,
-            cached: true,
+            reference_required: true,
             interned: false,
             reference: None,
         };
@@ -3018,5 +3020,65 @@ mod wire_reference_tests {
             ObjectReference::Existing(index) if index.as_u32() == u32::MAX - 1
         ));
         assert_eq!(next_reference, u32::MAX as usize);
+    }
+}
+
+#[cfg(test)]
+mod integer_cache_tests {
+    use super::{CachedObject, ObjectGraph, ObjectKey};
+    use crate::PythonVersion;
+
+    #[test]
+    fn indexed_integers_preserve_hashed_identity_and_reference_flags() {
+        for python_version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            let mut indexed = ObjectGraph {
+                python_version,
+                ..ObjectGraph::default()
+            };
+            let mut hashed = ObjectGraph {
+                python_version,
+                ..ObjectGraph::default()
+            };
+            for key in [
+                ObjectKey::Int(0),
+                ObjectKey::Int(15),
+                ObjectKey::Int(16),
+                ObjectKey::Int(255),
+                ObjectKey::Int(256),
+                ObjectKey::SignedInt(-5),
+                ObjectKey::SignedInt(0),
+                ObjectKey::SignedInt(1),
+                ObjectKey::Int(1),
+                ObjectKey::SignedInt(15),
+                ObjectKey::Int(15),
+                ObjectKey::SignedInt(1),
+                ObjectKey::Int(16),
+                ObjectKey::Int(0),
+            ] {
+                let actual = if let Some(cached) = CachedObject::for_key(&key, python_version) {
+                    indexed.record_cached(cached)
+                } else {
+                    indexed.record_object(key.into())
+                };
+                assert_eq!(
+                    actual,
+                    hashed.record_object(key.into()),
+                    "{python_version}: {key:?}"
+                );
+            }
+            let flags = |graph: &ObjectGraph<'_>| {
+                graph
+                    .objects_by_id
+                    .iter()
+                    .map(|object| (object.reference_required, object.interned, object.reference))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(flags(&indexed), flags(&hashed), "{python_version}");
+        }
     }
 }
