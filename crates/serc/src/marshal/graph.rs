@@ -209,16 +209,43 @@ impl CachedObject {
     }
 }
 
+/// A lookup can remember a shared-state update because discovery never clears that flag.
+#[derive(Clone, Copy, Debug)]
+struct CachedObjectId {
+    id: ObjectId,
+    marked_shared: bool,
+}
+
+impl CachedObjectId {
+    #[inline]
+    fn new(id: ObjectId, marked_shared: bool) -> Self {
+        Self { id, marked_shared }
+    }
+
+    #[inline]
+    fn mark_shared(&mut self, objects: &mut IndexVec<ObjectId, Object>) {
+        if !self.marked_shared {
+            objects[self.id].shared = true;
+            self.marked_shared = true;
+        }
+    }
+}
+
+#[cfg(target_pointer_width = "64")]
+const _: [(); 40] = [(); std::mem::size_of::<(HashedObjectKey<'_>, CachedObjectId)>()];
+#[cfg(target_pointer_width = "64")]
+const _: [(); 24] = [(); std::mem::size_of::<(&str, CachedObjectId)>()];
+
 #[derive(Debug, Default)]
 pub(super) struct ObjectGraph<'a> {
     python_version: PythonVersion,
-    objects: HashTable<(HashedObjectKey<'a>, ObjectId)>,
-    interned_strings: FxHashMap<&'a str, ObjectId>,
+    objects: HashTable<(HashedObjectKey<'a>, CachedObjectId)>,
+    interned_strings: FxHashMap<&'a str, CachedObjectId>,
     aliases: GraphAliases,
-    metadata_slots: Box<[Option<ObjectId>]>,
-    cached_empty_bytes: Option<ObjectId>,
-    cached_empty_tuple: Option<ObjectId>,
-    cached_scalar_ids: Option<Box<[Option<ObjectId>]>>,
+    metadata_slots: Box<[Option<CachedObjectId>]>,
+    cached_empty_bytes: Option<CachedObjectId>,
+    cached_empty_tuple: Option<CachedObjectId>,
+    cached_scalar_ids: Option<Box<[Option<CachedObjectId>]>>,
     cache_scalars: bool,
     preallocated_interned_strings: bool,
     uncached_percent_constant: bool,
@@ -553,6 +580,11 @@ impl<'a> ObjectGraph<'a> {
         self.record_hashed(kind, key.into())
     }
 
+    #[expect(
+        clippy::inline_always,
+        reason = "specialize marshal lookup for the caller's key kind"
+    )]
+    #[inline(always)]
     fn record_hashed(&mut self, kind: OccurrenceKind, key: HashedObjectKey<'a>) -> bool {
         let (id, first) = self.record_object(key);
         self.occurrences.push(Occurrence { object: id, kind });
@@ -565,33 +597,37 @@ impl<'a> ObjectGraph<'a> {
         first
     }
 
-    #[inline]
+    #[expect(
+        clippy::inline_always,
+        reason = "specialize dense metadata IDs in tuple traversal"
+    )]
+    #[inline(always)]
     fn record_metadata_string(
         &mut self,
         kind: OccurrenceKind,
         value: &'a str,
         metadata_id: Option<MetadataId>,
     ) -> bool {
-        let slot_index = metadata_id.map(MetadataId::index);
-        if let Some(id) = slot_index
-            .and_then(|index| self.metadata_slots.get(index).copied())
-            .flatten()
-        {
+        let mut slot = metadata_id.and_then(|id| self.metadata_slots.get_mut(id.index()));
+        if let Some(Some(cached)) = slot.as_deref_mut() {
             debug_assert_eq!(
-                self.interned_strings.get(value),
-                Some(&id),
+                self.interned_strings.get(value).map(|cached| cached.id),
+                Some(cached.id),
                 "metadata ID must identify one string"
             );
-            self.objects_by_id[id].shared = true;
-            self.occurrences.push(Occurrence { object: id, kind });
+            cached.mark_shared(&mut self.objects_by_id);
+            self.occurrences.push(Occurrence {
+                object: cached.id,
+                kind,
+            });
             return false;
         }
 
-        // Seed the ordinary value table even for hinted strings: an equal interned constant can
-        // be traversed before or after this metadata and must retain the same object identity.
-        let (id, first) = self.interned_string(value);
-        if let Some(slot) = slot_index.and_then(|index| self.metadata_slots.get_mut(index)) {
-            *slot = Some(id);
+        // Seed the value table to preserve aliases with equal interned constants.
+        let (id, first) =
+            Self::interned_string_in(&mut self.interned_strings, &mut self.objects_by_id, value);
+        if let Some(slot) = slot {
+            *slot = Some(CachedObjectId::new(id, !first));
         }
         self.occurrences.push(Occurrence { object: id, kind });
         first
@@ -611,17 +647,27 @@ impl<'a> ObjectGraph<'a> {
         first
     }
 
+    #[inline]
     fn interned_string(&mut self, value: &'a str) -> (ObjectId, bool) {
-        match self.interned_strings.entry(value) {
-            Entry::Occupied(entry) => {
-                let id = *entry.get();
-                self.objects_by_id[id].shared = true;
-                (id, false)
+        Self::interned_string_in(&mut self.interned_strings, &mut self.objects_by_id, value)
+    }
+
+    #[inline]
+    fn interned_string_in(
+        strings: &mut FxHashMap<&'a str, CachedObjectId>,
+        objects: &mut IndexVec<ObjectId, Object>,
+        value: &'a str,
+    ) -> (ObjectId, bool) {
+        match strings.entry(value) {
+            Entry::Occupied(mut entry) => {
+                let cached = entry.get_mut();
+                cached.mark_shared(objects);
+                (cached.id, false)
             }
             Entry::Vacant(entry) => {
-                let next_id = self.objects_by_id.next_index();
-                entry.insert(next_id);
-                self.objects_by_id.push(Object {
+                let next_id = objects.next_index();
+                entry.insert(CachedObjectId::new(next_id, false));
+                objects.push(Object {
                     shared: false,
                     cached: true,
                     interned: true,
@@ -632,6 +678,7 @@ impl<'a> ObjectGraph<'a> {
         }
     }
 
+    #[inline]
     fn record_cached_value(&mut self, kind: OccurrenceKind, cached: CachedObject) -> bool {
         let (id, first) = self.record_cached(cached);
         self.occurrences.push(Occurrence { object: id, kind });
@@ -654,6 +701,7 @@ impl<'a> ObjectGraph<'a> {
         }
     }
 
+    #[inline]
     fn record_unique_value(&mut self, kind: OccurrenceKind, key: ObjectKey<'a>) -> bool {
         let id = self.record_unique(key);
         self.occurrences.push(Occurrence { object: id, kind });
@@ -687,6 +735,7 @@ impl<'a> ObjectGraph<'a> {
         id
     }
 
+    #[inline]
     fn record_cached(&mut self, cached: CachedObject) -> (ObjectId, bool) {
         let empty_slot = match cached {
             CachedObject::EmptyBytes => Some(&mut self.cached_empty_bytes),
@@ -694,9 +743,9 @@ impl<'a> ObjectGraph<'a> {
             _ => None,
         };
         if let Some(slot) = empty_slot {
-            if let Some(id) = *slot {
-                self.objects_by_id[id].shared = true;
-                return (id, false);
+            if let Some(cached) = slot {
+                cached.mark_shared(&mut self.objects_by_id);
+                return (cached.id, false);
             }
             let id = self.objects_by_id.next_index();
             self.objects_by_id.push(Object {
@@ -705,16 +754,16 @@ impl<'a> ObjectGraph<'a> {
                 interned: false,
                 reference: None,
             });
-            *slot = Some(id);
+            *slot = Some(CachedObjectId::new(id, false));
             return (id, true);
         }
 
         let slot = &mut self.cached_scalar_ids.get_or_insert_with(|| {
             vec![None; cached_scalar_slots(self.python_version)].into_boxed_slice()
         })[cached.scalar_index(self.python_version)];
-        if let Some(id) = *slot {
-            self.objects_by_id[id].shared = true;
-            return (id, false);
+        if let Some(cached) = slot {
+            cached.mark_shared(&mut self.objects_by_id);
+            return (cached.id, false);
         }
 
         let id = self.objects_by_id.next_index();
@@ -724,11 +773,15 @@ impl<'a> ObjectGraph<'a> {
             interned: matches!(cached, CachedObject::Character(_)),
             reference: None,
         });
-        *slot = Some(id);
+        *slot = Some(CachedObjectId::new(id, false));
         (id, true)
     }
 
-    #[inline]
+    #[expect(
+        clippy::inline_always,
+        reason = "specialize marshal lookup for the caller's key kind"
+    )]
+    #[inline(always)]
     fn record_object(&mut self, key: HashedObjectKey<'a>) -> (ObjectId, bool) {
         // The key already owns its value hash. Use it directly for lookup and growth, retaining
         // full key equality and assigning object IDs solely in traversal order.
@@ -737,16 +790,15 @@ impl<'a> ObjectGraph<'a> {
             |(stored, _)| *stored == key,
             |(stored, _)| stored.hash(),
         ) {
-            HashedEntry::Occupied(entry) => {
-                let id = entry.get().1;
-                // Cache eligibility was fixed by this same stored key when first inserted.
-                self.objects_by_id[id].shared = true;
-                (id, false)
+            HashedEntry::Occupied(mut entry) => {
+                let cached = &mut entry.get_mut().1;
+                cached.mark_shared(&mut self.objects_by_id);
+                (cached.id, false)
             }
             HashedEntry::Vacant(entry) => {
                 let next_id = self.objects_by_id.next_index();
                 let cached = Self::is_cached(key.key(), self.python_version);
-                entry.insert((key, next_id));
+                entry.insert((key, CachedObjectId::new(next_id, false)));
                 self.objects_by_id.push(Object {
                     shared: false,
                     cached,
@@ -761,7 +813,7 @@ impl<'a> ObjectGraph<'a> {
     fn object_id(&self, key: HashedObjectKey<'a>) -> Option<ObjectId> {
         self.objects
             .find(key.hash(), |(stored, _)| *stored == key)
-            .map(|(_, id)| *id)
+            .map(|(_, cached)| cached.id)
     }
 
     #[cfg(test)]
@@ -776,7 +828,7 @@ impl<'a> ObjectGraph<'a> {
                     if self
                         .interned_strings
                         .get(*value)
-                        .is_some_and(|id| self.is_shared_object(*id))
+                        .is_some_and(|cached| self.is_shared_object(cached.id))
             )
         {
             return true;
@@ -886,7 +938,7 @@ fn collect_metadata_aliased_constants<'a>(
     keys: &FxHashSet<HashedObjectKey<'a>>,
 ) -> FxHashSet<usize> {
     fn constants<'a>(
-        values: &'a [Constant],
+        values: &'a Vec<Constant>,
         keys: &FxHashSet<HashedObjectKey<'a>>,
         interned: &mut FxHashSet<usize>,
     ) {
@@ -984,11 +1036,13 @@ fn collect_explicitly_interned<'a>(
 ) -> (FrozensetRecreationNeed, GraphCapacity) {
     // Identifier objects can enter the compilation-wide constant cache before an equal
     // ordinary string. Preserve that recorded origin when sharing constant and metadata strings.
+    // Automatically interned values are recognized directly by the graph visitor.
     values.extend(
         code.marshal_provenance
             .canonical_constant_strings
             .iter()
-            .map(String::as_str),
+            .map(String::as_str)
+            .filter(|value| !should_intern(value)),
     );
     let mut qualified_names = QualifiedNameConstants {
         track: python_version != PythonVersion::Py312,
@@ -1077,7 +1131,8 @@ fn collect_interning_provenance_without_frozensets<'a>(
         code.marshal_provenance
             .explicitly_interned_strings
             .iter()
-            .map(String::as_str),
+            .map(String::as_str)
+            .filter(|value| !should_intern(value)),
     );
     qualified_names.record(code);
     for constant in &code.constants {
@@ -1111,7 +1166,8 @@ fn collect_interning_provenance<'a>(
         code.marshal_provenance
             .explicitly_interned_strings
             .iter()
-            .map(String::as_str),
+            .map(String::as_str)
+            .filter(|value| !should_intern(value)),
     );
     qualified_names.record(code);
     // Reuse the provenance walk to classify frozenset recreation for code trees that can contain
@@ -1568,7 +1624,7 @@ fn frozenset_intern_dependencies(
     }
 
     fn count_tuple<'a>(
-        constants: &'a [Constant],
+        constants: &'a Vec<Constant>,
         inside_frozenset: bool,
         share_tuple_slots: bool,
         owners: &mut FxHashMap<HashedObjectKey<'a>, Owners<'a>>,
@@ -2559,7 +2615,7 @@ impl<'code> GraphVisitor<'_, 'code> {
     /// Records the constants tuple, using a cached value hash when available.
     /// Root and code-bearing tuples retain unique identities; string tuples may alias metadata.
     #[inline]
-    fn constants_with_hash(&mut self, values: &'code [Constant], hash: Option<u64>) -> bool {
+    fn constants_with_hash(&mut self, values: &'code Vec<Constant>, hash: Option<u64>) -> bool {
         let root_constants = std::mem::take(&mut self.root_constants);
         if values.is_empty() {
             return self
@@ -2607,7 +2663,7 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
     }
 
     #[inline]
-    fn constants(&mut self, values: &'code [Constant], _reference_mode: ReferenceMode) -> bool {
+    fn constants(&mut self, values: &'code Vec<Constant>, _reference_mode: ReferenceMode) -> bool {
         self.constants_with_hash(values, None)
     }
 
@@ -2666,7 +2722,11 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
         }
     }
 
-    #[inline]
+    #[expect(
+        clippy::inline_always,
+        reason = "specialize dense metadata IDs in tuple traversal"
+    )]
+    #[inline(always)]
     fn metadata_string(&mut self, value: &'code str, metadata_id: Option<MetadataId>) {
         let first = if self.graph.cache_scalars
             && let Some(character) = CachedObject::character(value)

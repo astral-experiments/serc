@@ -79,7 +79,7 @@ fn code_identity_descendants_cannot_cache_a_constant_tuple_hash() {
             step: Box::new(Constant::None),
         },
     ] {
-        assert_eq!(super::key::constants_tuple_hash(&[value]), None);
+        assert_eq!(super::key::constants_tuple_hash(&vec![value]), None);
     }
 }
 
@@ -438,16 +438,17 @@ fn uses_cpython_reference_cache_boundaries() {
 
 #[test]
 fn precomputed_metadata_hashes_match_borrowed_tuples_from_either_source() {
-    let names = ["value", "méthode", ".0", "é"].map(Name::new);
-    let locals = ["ascii_name", "A09", "_"].map(Name::new);
+    let names = ["value", "méthode", ".0", "é"].map(Name::new).to_vec();
+    let locals = ["ascii_name", "A09", "_"].map(Name::new).to_vec();
+    let empty = Vec::new();
     let properties = metadata_tuple_properties(&names, &locals);
     assert!(!properties.names.automatically_interned);
     assert!(properties.locals.automatically_interned);
 
     for (values, properties) in [
-        (names.as_slice(), properties.names),
-        (locals.as_slice(), properties.locals),
-        (&[], metadata_tuple_properties(&[], &[]).names),
+        (&names, properties.names),
+        (&locals, properties.locals),
+        (&empty, metadata_tuple_properties(&empty, &empty).names),
     ] {
         let constants = values
             .iter()
@@ -506,7 +507,7 @@ def membership(value):
     }
 
     let nested_code = Constant::Tuple(vec![Constant::Code(Box::new(code_object(vec![])))]);
-    assert!(super::key::constants_tuple_hash(&[nested_code]).is_none());
+    assert!(super::key::constants_tuple_hash(&vec![nested_code]).is_none());
 }
 
 #[test]
@@ -581,6 +582,82 @@ class Annotated:
             "{python_version}"
         );
     }
+}
+
+#[test]
+fn cached_latin1_metadata_keeps_unicode_tags_with_ascii_hints() {
+    fn clear_properties(code: &mut CodeObject) {
+        code.marshal_provenance.metadata_tuple_properties = None;
+        for constant in &mut code.constants {
+            if let Constant::Code(child) = constant {
+                clear_properties(child);
+            }
+        }
+    }
+
+    let source = "é = 1\nÿ = é\ndef child(é, ÿ):\n    return é, ÿ\n";
+    for python_version in [
+        crate::PythonVersion::Py312,
+        crate::PythonVersion::Py313,
+        crate::PythonVersion::Py314,
+        crate::PythonVersion::Py315,
+    ] {
+        let module = crate::compile_with_options(
+            source,
+            "latin1_metadata.py",
+            &crate::CompileOptions {
+                python_version,
+                ..crate::CompileOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            module
+                .code
+                .marshal_provenance
+                .metadata_tuple_properties
+                .unwrap()
+                .names
+                .automatically_interned
+        );
+        let mut fallback = module.clone();
+        clear_properties(&mut fallback.code);
+        let encoded = module.marshal();
+        assert_eq!(encoded, fallback.marshal(), "{python_version}");
+        let unicode = [
+            super::v5::TYPE_INTERNED | super::v5::FLAG_REF,
+            2,
+            0,
+            0,
+            0,
+            0xc3,
+            0xa9,
+        ];
+        assert!(
+            encoded.windows(unicode.len()).any(|bytes| bytes == unicode),
+            "{python_version}"
+        );
+        assert_eq!(
+            module.to_timestamp_pyc(123, 456),
+            fallback.to_timestamp_pyc(123, 456),
+            "{python_version}"
+        );
+    }
+}
+
+#[test]
+fn repeated_uncached_tuple_keeps_shared_identity() {
+    let values = vec![Constant::Int(500), Constant::String("ordinary text".into())];
+    let key = constants_tuple_key(&values);
+    let mut graph = ObjectGraph::default();
+    assert!(graph.record(key));
+    assert!(!graph.is_shared(&key, false));
+    for _ in 0..8 {
+        assert!(!graph.record(key));
+        assert!(graph.is_shared(&key, false));
+    }
+    assert_eq!(graph.object_count(), 1);
+    assert_eq!(graph.hashed_object_count(), 1);
 }
 
 #[test]
@@ -1021,11 +1098,18 @@ fn borrowed_string_tuple_keys_compare_across_sources() {
     ];
     let strings = ["alpha".to_string(), "beta".to_string(), long.to_string()];
     let names = ["alpha", "beta", long].map(Name::new);
-    let keys = [0..1, 0..2, 1..2, 2..3].map(|range| {
+    let sources = [0..1, 0..2, 1..2, 2..3].map(|range| {
+        (
+            constants[range.clone()].to_vec(),
+            strings[range.clone()].to_vec(),
+            names[range].to_vec(),
+        )
+    });
+    let keys = sources.each_ref().map(|(constants, strings, names)| {
         [
-            constants_tuple_key(&constants[range.clone()]),
-            strings_tuple_key(&strings[range.clone()]),
-            names_tuple_key(&names[range]),
+            constants_tuple_key(constants),
+            strings_tuple_key(strings),
+            names_tuple_key(names),
         ]
     });
     for (left_index, left_keys) in keys.iter().enumerate() {
@@ -1669,11 +1753,11 @@ impl<'a> MarshalVisitor<'a> for RecordingVisitor<'a> {
 
     fn code_bytes(&mut self, _code: &'a CodeObject) {}
 
-    fn constants(&mut self, values: &'a [Constant], reference_mode: ReferenceMode) -> bool {
+    fn constants(&mut self, values: &'a Vec<Constant>, reference_mode: ReferenceMode) -> bool {
         self.push(RecordedValue::Constants(values), reference_mode);
         !self
             .pruned
-            .is_some_and(|pruned| std::ptr::eq(pruned, values))
+            .is_some_and(|pruned| std::ptr::eq(pruned, values.as_slice()))
     }
 
     fn names(&mut self, _code: &'a CodeObject) -> bool {

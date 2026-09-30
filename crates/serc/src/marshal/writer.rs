@@ -1,4 +1,4 @@
-use crate::code_object::{CodeFilename, CodeObject, Constant, MetadataId};
+use crate::code_object::{CodeFilename, CodeObject, Constant, MetadataId, MetadataName};
 use crate::{InitialInternState, PythonVersion};
 
 use super::graph::{ObjectGraph, ObjectReference, Occurrence, OccurrenceCursor, OccurrenceKind};
@@ -215,6 +215,7 @@ impl Writer<'_, '_, '_> {
         }
     }
 
+    #[inline]
     fn bytes_with_object(&mut self, object: ObjectId, value: &[u8], reference_mode: ReferenceMode) {
         let Some(flag) = self.begin_object(object, reference_mode) else {
             return;
@@ -245,14 +246,42 @@ impl Writer<'_, '_, '_> {
         }
     }
 
+    #[expect(
+        clippy::inline_always,
+        reason = "specialize metadata reference writes in tuple traversal"
+    )]
+    #[inline(always)]
     fn interned_string_with_object(&mut self, object: ObjectId, value: &str) {
+        self.interned_string_with_hint(object, value, false);
+    }
+
+    #[expect(
+        clippy::inline_always,
+        reason = "specialize metadata reference writes in tuple traversal"
+    )]
+    #[inline(always)]
+    fn interned_string_with_hint(
+        &mut self,
+        object: ObjectId,
+        value: &str,
+        automatically_interned: bool,
+    ) {
         let object = self.graph.object_for_writing(object);
         debug_assert!(object.is_interned(), "marshal metadata must be interned");
         let reference =
             object.reference_for_write(ReferenceMode::Forced, &mut self.reference_count);
         match reference {
             ObjectReference::Existing(index) => self.byte_and_long(TYPE_REF, index.as_u32()),
-            ObjectReference::New => self.string_payload::<true>(value, FLAG_REF),
+            ObjectReference::New => {
+                // Automatically interned multi-byte spellings are ASCII identifiers, except
+                // for CPython's cached Latin-1 characters (two UTF-8 bytes).
+                let ascii = if automatically_interned {
+                    value.len() != 2 || value.as_bytes()[0].is_ascii()
+                } else {
+                    value.is_ascii()
+                };
+                self.string_payload_with_ascii::<true>(value, FLAG_REF, ascii);
+            }
             ObjectReference::Unshared => {
                 unreachable!("forced marshal reference cannot be unshared")
             }
@@ -261,8 +290,18 @@ impl Writer<'_, '_, '_> {
 
     #[inline]
     fn string_payload<const INTERNED: bool>(&mut self, value: &str, flag: u8) {
-        let bytes = value.as_bytes();
         let ascii = value.is_ascii();
+        self.string_payload_with_ascii::<INTERNED>(value, flag, ascii);
+    }
+
+    #[inline]
+    fn string_payload_with_ascii<const INTERNED: bool>(
+        &mut self,
+        value: &str,
+        flag: u8,
+        ascii: bool,
+    ) {
+        let bytes = value.as_bytes();
         if ascii && bytes.len() < 256 {
             self.output.extend_from_slice(&[
                 if INTERNED {
@@ -335,6 +374,7 @@ impl Writer<'_, '_, '_> {
         self.output.extend_from_slice(value);
     }
 
+    #[inline]
     fn tuple_header(
         &mut self,
         object: ObjectId,
@@ -563,7 +603,7 @@ impl<'code> MarshalVisitor<'code> for Writer<'_, '_, 'code> {
     }
 
     #[inline]
-    fn constants(&mut self, values: &'code [Constant], reference_mode: ReferenceMode) -> bool {
+    fn constants(&mut self, values: &'code Vec<Constant>, reference_mode: ReferenceMode) -> bool {
         let object = self.next_object(OccurrenceKind::Constants);
         self.tuple_header(object, values.len(), reference_mode)
     }
@@ -590,6 +630,26 @@ impl<'code> MarshalVisitor<'code> for Writer<'_, '_, 'code> {
     fn metadata_string(&mut self, value: &'code str, _metadata_id: Option<MetadataId>) {
         let object = self.next_object(OccurrenceKind::MetadataString);
         self.interned_string_with_object(object, value);
+    }
+
+    #[inline]
+    fn metadata_strings(
+        &mut self,
+        values: &'code [MetadataName],
+        metadata_ids: Option<&[MetadataId]>,
+        automatically_interned: bool,
+    ) {
+        debug_assert!(
+            metadata_ids.is_none(),
+            "writer does not consume metadata IDs"
+        );
+        debug_assert!(
+            !automatically_interned || values.iter().all(|value| super::key::should_intern(value))
+        );
+        for value in values {
+            let object = self.next_object(OccurrenceKind::MetadataString);
+            self.interned_string_with_hint(object, value, automatically_interned);
+        }
     }
 
     fn code_filename(&mut self, code: &'code CodeObject, _metadata_id: Option<MetadataId>) {
