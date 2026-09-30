@@ -28,8 +28,9 @@ fn cached_constant_tuple_hashes_preserve_cloned_benchmark_streams() {
         let cloned = module.clone();
         let mut uncached = module.clone();
         clear_hashes(&mut uncached.code);
-        assert_eq!(module.marshal(), uncached.marshal(), "{label}");
-        assert_eq!(cloned.marshal(), uncached.marshal(), "{label}");
+        let expected = uncached.marshal();
+        assert_eq!(module.marshal(), expected, "{label}");
+        assert_eq!(cloned.marshal(), expected, "{label}");
     }
 
     for workload in serc_fixtures::COMPILE_MICRO_WORKLOADS

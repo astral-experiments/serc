@@ -4,6 +4,8 @@ use ruff_text_size::TextRange;
 
 use crate::{CompileError, PythonVersion, indentation, yield_syntax};
 
+const MAX_NESTING: usize = 200;
+
 /// CPython's tokenizer rejects the 201st simultaneously open delimiter. Replacement
 /// fields in interpolated strings share the same nesting limit as ordinary expressions.
 pub(crate) fn validate(
@@ -14,20 +16,19 @@ pub(crate) fn validate(
     validate_with_fast_check::<true>(source, options, version)
 }
 
+/// Validates nesting with an optional byte-scan proof; tests disable it to check lexer parity.
 fn validate_with_fast_check<const FAST: bool>(
     source: &str,
     options: &ParseOptions,
     version: PythonVersion,
 ) -> Result<(), CompileError> {
-    const MAX_NESTING: usize = 200;
-
     // Most files cannot exceed the limit even if every opening character were a
     // delimiter. Avoid lexing them twice, especially during batch compilation.
     if opening_count_is_bounded(source.as_bytes(), MAX_NESTING) {
         return Ok(());
     }
 
-    if FAST && nesting_is_bounded(source, MAX_NESTING) {
+    if FAST && nesting_is_bounded(source) {
         return Ok(());
     }
 
@@ -132,15 +133,15 @@ fn opening_count_is_bounded(bytes: &[u8], maximum: usize) -> bool {
 
 /// Certifies the nesting limit for ordinary strings and comments without lexing identifiers.
 /// Unrecognized suffixes use the full lexer unless even their raw openings fit the limit.
-fn nesting_is_bounded(source: &str, maximum: usize) -> bool {
+fn nesting_is_bounded(source: &str) -> bool {
     let bytes = source.as_bytes();
-    let mut closing = [0_u8; 200];
+    let mut closing = [0_u8; MAX_NESTING];
     let mut depth = 0;
     let mut index = 0;
     while let Some(&byte) = bytes.get(index) {
         match byte {
             b'(' | b'[' | b'{' => {
-                if depth == maximum {
+                if depth == MAX_NESTING {
                     return false;
                 }
                 closing[depth] = match byte {
@@ -174,7 +175,7 @@ fn nesting_is_bounded(source: &str, maximum: usize) -> bool {
                 {
                     // Every remaining lexer opening needs a source opening byte,
                     // just as in the whole-file guard. This also bounds interpolation.
-                    return opening_count_is_bounded(&bytes[index..], maximum - depth);
+                    return opening_count_is_bounded(&bytes[index..], MAX_NESTING - depth);
                 }
                 let triple =
                     bytes.get(index + 1) == Some(&byte) && bytes.get(index + 2) == Some(&byte);
@@ -207,7 +208,7 @@ fn nesting_is_bounded(source: &str, maximum: usize) -> bool {
                 continue;
             }
             b'\\' => {
-                return opening_count_is_bounded(&bytes[index..], maximum - depth);
+                return opening_count_is_bounded(&bytes[index..], MAX_NESTING - depth);
             }
             _ => {}
         }
@@ -325,18 +326,16 @@ mod tests {
                     "[)\n",
                     "value = 1 \\\n  + 2\n",
                 ] {
-                    let source = format!("{prefix}{expression}\n{}\n", "# ()".repeat(201));
-                    assert_eq!(
-                        validate_with_fast_check::<true>(&source, &options, version),
-                        validate_with_fast_check::<false>(&source, &options, version),
-                        "{version:?}: {source:?}",
-                    );
-                    let source = format!("{}\n{prefix}{expression}\n", "# ()".repeat(201));
-                    assert_eq!(
-                        validate_with_fast_check::<true>(&source, &options, version),
-                        validate_with_fast_check::<false>(&source, &options, version),
-                        "suffix bound {version:?}: {source:?}",
-                    );
+                    for source in [
+                        format!("{prefix}{expression}\n{}\n", "# ()".repeat(201)),
+                        format!("{}\n{prefix}{expression}\n", "# ()".repeat(201)),
+                    ] {
+                        assert_eq!(
+                            validate_with_fast_check::<true>(&source, &options, version),
+                            validate_with_fast_check::<false>(&source, &options, version),
+                            "{version:?}: {source:?}",
+                        );
+                    }
                 }
             }
         }
@@ -351,25 +350,21 @@ mod tests {
             "rf'{value}'",
             "x \\\n + y",
         ] {
-            assert!(nesting_is_bounded(source, 200), "{source:?}");
+            assert!(nesting_is_bounded(source), "{source:?}");
             let source = format!("{source}{}", "(".repeat(201));
-            assert!(!nesting_is_bounded(&source, 200), "{source:?}");
+            assert!(!nesting_is_bounded(&source), "{source:?}");
         }
-        assert!(nesting_is_bounded(
-            &format!("{}0{}", "(".repeat(200), ")".repeat(200)),
-            200
-        ));
-        assert!(!nesting_is_bounded(
-            &format!("{}0{}", "(".repeat(201), ")".repeat(201)),
-            200
-        ));
-        assert!(nesting_is_bounded(
-            &format!("{}\n0", "# (".repeat(300)),
-            200
-        ));
-        assert!(nesting_is_bounded(
-            &format!("'{}'", "([{)]}".repeat(300)),
-            200
-        ));
+        assert!(nesting_is_bounded(&format!(
+            "{}0{}",
+            "(".repeat(200),
+            ")".repeat(200)
+        )));
+        assert!(!nesting_is_bounded(&format!(
+            "{}0{}",
+            "(".repeat(201),
+            ")".repeat(201)
+        )));
+        assert!(nesting_is_bounded(&format!("{}\n0", "# (".repeat(300))));
+        assert!(nesting_is_bounded(&format!("'{}'", "([{)]}".repeat(300))));
     }
 }
