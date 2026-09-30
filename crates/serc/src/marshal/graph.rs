@@ -549,23 +549,42 @@ impl<'a> ObjectGraph<'a> {
         self.estimated_payload_bytes = self.estimated_payload_bytes.saturating_add(length);
     }
 
+    #[expect(
+        clippy::inline_always,
+        reason = "specialize occurrence kinds and cached-object variants at graph traversal call sites"
+    )]
+    #[inline(always)]
     fn record_keyed(&mut self, kind: OccurrenceKind, key: ObjectKey<'a>) -> bool {
         self.record_hashed(kind, key.into())
     }
 
+    #[expect(
+        clippy::inline_always,
+        reason = "specialize occurrence kinds and cached-object variants at graph traversal call sites"
+    )]
+    #[inline(always)]
     fn record_hashed(&mut self, kind: OccurrenceKind, key: HashedObjectKey<'a>) -> bool {
         let (id, first) = self.record_object(key);
         self.occurrences.push(Occurrence { object: id, kind });
         first
     }
 
+    #[expect(
+        clippy::inline_always,
+        reason = "specialize occurrence kinds and cached-object variants at graph traversal call sites"
+    )]
+    #[inline(always)]
     fn record_interned_string(&mut self, kind: OccurrenceKind, value: &'a str) -> bool {
         let (id, first) = self.interned_string(value);
         self.occurrences.push(Occurrence { object: id, kind });
         first
     }
 
-    #[inline]
+    #[expect(
+        clippy::inline_always,
+        reason = "specialize occurrence kinds and cached-object variants at graph traversal call sites"
+    )]
+    #[inline(always)]
     fn record_metadata_string(
         &mut self,
         kind: OccurrenceKind,
@@ -611,6 +630,11 @@ impl<'a> ObjectGraph<'a> {
         first
     }
 
+    #[expect(
+        clippy::inline_always,
+        reason = "specialize occurrence kinds and cached-object variants at graph traversal call sites"
+    )]
+    #[inline(always)]
     fn interned_string(&mut self, value: &'a str) -> (ObjectId, bool) {
         match self.interned_strings.entry(value) {
             Entry::Occupied(entry) => {
@@ -632,6 +656,11 @@ impl<'a> ObjectGraph<'a> {
         }
     }
 
+    #[expect(
+        clippy::inline_always,
+        reason = "specialize occurrence kinds and cached-object variants at graph traversal call sites"
+    )]
+    #[inline(always)]
     fn record_cached_value(&mut self, kind: OccurrenceKind, cached: CachedObject) -> bool {
         let (id, first) = self.record_cached(cached);
         self.occurrences.push(Occurrence { object: id, kind });
@@ -641,6 +670,11 @@ impl<'a> ObjectGraph<'a> {
     /// Records bytes using the compilation's empty-byte identity and optional single-byte cache.
     /// The occurrence kind distinguishes structural bytes from constant visits without splitting
     /// their shared object identity.
+    #[expect(
+        clippy::inline_always,
+        reason = "specialize occurrence kinds and cached-object variants at graph traversal call sites"
+    )]
+    #[inline(always)]
     fn record_bytes(&mut self, kind: OccurrenceKind, value: &'a [u8]) -> bool {
         match value {
             [] if self.fresh_empty_bytes_constant => {
@@ -654,6 +688,11 @@ impl<'a> ObjectGraph<'a> {
         }
     }
 
+    #[expect(
+        clippy::inline_always,
+        reason = "specialize occurrence kinds and cached-object variants at graph traversal call sites"
+    )]
+    #[inline(always)]
     fn record_unique_value(&mut self, kind: OccurrenceKind, key: ObjectKey<'a>) -> bool {
         let id = self.record_unique(key);
         self.occurrences.push(Occurrence { object: id, kind });
@@ -670,6 +709,11 @@ impl<'a> ObjectGraph<'a> {
     }
 
     /// Records an identity-bearing object that is structurally owned by a unique parent.
+    #[expect(
+        clippy::inline_always,
+        reason = "specialize occurrence kinds and cached-object variants at graph traversal call sites"
+    )]
+    #[inline(always)]
     fn record_unique(&mut self, _key: ObjectKey<'a>) -> ObjectId {
         #[cfg(debug_assertions)]
         debug_assert!(
@@ -687,6 +731,11 @@ impl<'a> ObjectGraph<'a> {
         id
     }
 
+    #[expect(
+        clippy::inline_always,
+        reason = "specialize occurrence kinds and cached-object variants at graph traversal call sites"
+    )]
+    #[inline(always)]
     fn record_cached(&mut self, cached: CachedObject) -> (ObjectId, bool) {
         let empty_slot = match cached {
             CachedObject::EmptyBytes => Some(&mut self.cached_empty_bytes),
@@ -995,6 +1044,9 @@ fn collect_explicitly_interned<'a>(
         ..QualifiedNameConstants::default()
     };
     let mut capacity = GraphCapacity::default();
+    // Compiler root origins are immutable after first admission. Every explicit child string
+    // was admitted with an Interned origin, so it is already in the root's canonical set.
+    let collect_explicit_strings = !code.marshal_provenance.canonical_constant_strings_complete;
     let frozenset_recreation_need = if !code.marshal_provenance.subtree_has_frozenset_constants {
         collect_interning_provenance_without_frozensets(
             code,
@@ -1003,6 +1055,7 @@ fn collect_explicitly_interned<'a>(
             needs_metadata_alias_scan,
             &mut qualified_names,
             &mut capacity,
+            collect_explicit_strings,
         );
         FrozensetRecreationNeed::None
     } else {
@@ -1014,6 +1067,7 @@ fn collect_explicitly_interned<'a>(
             needs_metadata_alias_scan,
             &mut qualified_names,
             &mut capacity,
+            collect_explicit_strings,
         )
     };
     if qualified_names.origins.is_empty() {
@@ -1068,17 +1122,20 @@ fn collect_interning_provenance_without_frozensets<'a>(
     needs_metadata_alias_scan: bool,
     qualified_names: &mut QualifiedNameConstants<'a>,
     capacity: &mut GraphCapacity,
+    collect_explicit_strings: bool,
 ) {
     capacity.record(code);
     if needs_metadata_alias_scan {
         collect_metadata_tuple_keys(code, metadata_tuples);
     }
-    values.extend(
-        code.marshal_provenance
-            .explicitly_interned_strings
-            .iter()
-            .map(String::as_str),
-    );
+    if collect_explicit_strings {
+        values.extend(
+            code.marshal_provenance
+                .explicitly_interned_strings
+                .iter()
+                .map(String::as_str),
+        );
+    }
     qualified_names.record(code);
     for constant in &code.constants {
         if let Constant::Code(code) = constant {
@@ -1089,6 +1146,7 @@ fn collect_interning_provenance_without_frozensets<'a>(
                 needs_metadata_alias_scan,
                 qualified_names,
                 capacity,
+                collect_explicit_strings,
             );
         }
     }
@@ -1102,17 +1160,20 @@ fn collect_interning_provenance<'a>(
     needs_metadata_alias_scan: bool,
     qualified_names: &mut QualifiedNameConstants<'a>,
     capacity: &mut GraphCapacity,
+    collect_explicit_strings: bool,
 ) -> FrozensetRecreationNeed {
     capacity.record(code);
     if needs_metadata_alias_scan {
         collect_metadata_tuple_keys(code, metadata_tuples);
     }
-    values.extend(
-        code.marshal_provenance
-            .explicitly_interned_strings
-            .iter()
-            .map(String::as_str),
-    );
+    if collect_explicit_strings {
+        values.extend(
+            code.marshal_provenance
+                .explicitly_interned_strings
+                .iter()
+                .map(String::as_str),
+        );
+    }
     qualified_names.record(code);
     // Reuse the provenance walk to classify frozenset recreation for code trees that can contain
     // one (and for hand-built objects without a conservative compiler hint).
@@ -1127,6 +1188,7 @@ fn collect_interning_provenance<'a>(
                 needs_metadata_alias_scan,
                 qualified_names,
                 capacity,
+                collect_explicit_strings,
             );
             frozenset_recreation_need = frozenset_recreation_need.max(recreation_need);
         } else if frozenset_recreation_need != FrozensetRecreationNeed::IdentifierDependent {
@@ -2569,9 +2631,9 @@ impl<'code> GraphVisitor<'_, 'code> {
         let key = constants_tuple_key(values);
         if matches!(&key, ObjectKey::ConstantTuple(_))
             && (root_constants
-                || values
-                    .iter()
-                    .any(|value| matches!(value, Constant::Code(_))))
+                // A cached value hash already proves there are no code descendants.
+                || (hash.is_none()
+                    && values.iter().any(|value| matches!(value, Constant::Code(_)))))
         {
             self.graph
                 .record_unique_value(OccurrenceKind::Constants, key)

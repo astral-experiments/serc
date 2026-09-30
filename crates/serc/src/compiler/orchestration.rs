@@ -1591,6 +1591,7 @@ impl<'source> Compiler<'source> {
                     FxHashSet::default()
                 },
                 canonical_constant_strings,
+                canonical_constant_strings_complete: matches!(self.unit.scope, Scope::Module),
                 qualified_name_constant_index: self.output.qualified_name_constant_index,
                 qualified_name_is_canonical: self.output.qualified_name_is_canonical,
                 uncached_percent_constant: self.context.has_uncached_percent_constant(),

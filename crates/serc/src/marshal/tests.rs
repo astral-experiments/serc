@@ -13,6 +13,57 @@ use super::key::{
 use super::plan::{MarshalVisitor, ObjectId, ReferenceMode, traverse_code};
 
 #[test]
+fn complete_canonical_strings_preserve_fallback_streams() {
+    fn check(mut module: crate::CompiledModule, label: &str) {
+        assert!(
+            module
+                .code
+                .marshal_provenance
+                .canonical_constant_strings_complete
+        );
+        let expected = module.marshal();
+        let expected_pyc = module.to_timestamp_pyc(0, 0);
+        let cloned = module.clone();
+        assert_eq!(cloned.marshal(), expected, "cloned {label}");
+        module
+            .code
+            .marshal_provenance
+            .canonical_constant_strings_complete = false;
+        assert_eq!(module.marshal(), expected, "fallback {label}");
+        assert_eq!(module.to_timestamp_pyc(0, 0), expected_pyc, "PYC {label}");
+    }
+
+    for workload in serc_fixtures::COMPILE_MICRO_WORKLOADS
+        .iter()
+        .chain(serc_fixtures::MARSHAL_MICRO_WORKLOADS)
+        .chain(serc_fixtures::COMPOSITE_WORKLOADS)
+        .chain(serc_fixtures::LARGE_WORKLOADS)
+    {
+        check(
+            crate::compile(workload.source, workload.filename).unwrap(),
+            workload.id,
+        );
+    }
+
+    let source = "def call(**kwargs): pass\ncall(alpha=1, é=2)\ndef child():\n    return call(beta=3, é=4)\nif False:\n    def discarded():\n        return call(alpha=5, é=6)\nkeys = frozenset({'alpha', 'é'})\n";
+    for python_version in [
+        crate::PythonVersion::Py312,
+        crate::PythonVersion::Py313,
+        crate::PythonVersion::Py314,
+        crate::PythonVersion::Py315,
+    ] {
+        let options = crate::CompileOptions {
+            python_version,
+            ..crate::CompileOptions::default()
+        };
+        check(
+            crate::compile_with_options(source, "interned.py", &options).unwrap(),
+            "nested keywords",
+        );
+    }
+}
+
+#[test]
 fn cached_constant_tuple_hashes_preserve_cloned_benchmark_streams() {
     fn clear_hashes(code: &mut CodeObject) {
         code.marshal_provenance.constants_tuple_hash = None;

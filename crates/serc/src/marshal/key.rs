@@ -460,7 +460,38 @@ impl<'a> StringTupleKey<'a> {
 
 impl PartialEq for StringTupleKey<'_> {
     fn eq(&self, other: &Self) -> bool {
-        self.iter().eq(other.iter())
+        fn equal<'a>(
+            left: impl ExactSizeIterator<Item = &'a str>,
+            right: impl ExactSizeIterator<Item = &'a str>,
+        ) -> bool {
+            left.len() == right.len() && left.eq(right)
+        }
+
+        // Select the backing storage once, rather than at every member comparison.
+        // All representations still compare by spelling, including across domains.
+        match (self.0, other.0) {
+            (StringTupleKind::Names(left), StringTupleKind::Names(right)) => left == right,
+            (StringTupleKind::Strings(left), StringTupleKind::Strings(right)) => left == right,
+            (StringTupleKind::Constants(left), StringTupleKind::Constants(right)) => equal(
+                left.iter().map(constant_string),
+                right.iter().map(constant_string),
+            ),
+            (StringTupleKind::Constants(constants), StringTupleKind::Strings(strings))
+            | (StringTupleKind::Strings(strings), StringTupleKind::Constants(constants)) => equal(
+                constants.iter().map(constant_string),
+                strings.iter().map(String::as_str),
+            ),
+            (StringTupleKind::Constants(constants), StringTupleKind::Names(names))
+            | (StringTupleKind::Names(names), StringTupleKind::Constants(constants)) => equal(
+                constants.iter().map(constant_string),
+                names.iter().map(Name::as_str),
+            ),
+            (StringTupleKind::Strings(strings), StringTupleKind::Names(names))
+            | (StringTupleKind::Names(names), StringTupleKind::Strings(strings)) => equal(
+                strings.iter().map(String::as_str),
+                names.iter().map(Name::as_str),
+            ),
+        }
     }
 }
 
@@ -474,8 +505,22 @@ impl Hash for StringTupleKey<'_> {
             StringTupleKind::Names(values) => values.len(),
         };
         length.hash(state);
-        for value in self.iter() {
-            value.hash(state);
+        match self.0 {
+            StringTupleKind::Constants(values) => {
+                for value in values {
+                    constant_string(value).hash(state);
+                }
+            }
+            StringTupleKind::Strings(values) => {
+                for value in values {
+                    value.as_str().hash(state);
+                }
+            }
+            StringTupleKind::Names(values) => {
+                for value in values {
+                    value.as_str().hash(state);
+                }
+            }
         }
     }
 }

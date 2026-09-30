@@ -291,6 +291,8 @@ pub(crate) struct MarshalProvenance {
     pub(crate) generated_mangled_strings: FxHashSet<String>,
     /// Strings whose first compiler-cache object was already interned.
     pub(crate) canonical_constant_strings: FxHashSet<String>,
+    /// The root's canonical set includes every explicit string from child compiler units.
+    pub(crate) canonical_constant_strings_complete: bool,
     /// The class-body constant loaded into `__qualname__`, when present.
     pub(crate) qualified_name_constant_index: Option<u32>,
     /// Qualified-name ownership recorded before discarded constants are pruned.

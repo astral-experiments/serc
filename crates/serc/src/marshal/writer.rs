@@ -147,6 +147,11 @@ impl Writer<'_, '_, '_> {
         );
     }
 
+    #[expect(
+        clippy::inline_always,
+        reason = "specialize structural-object reference modes and occurrence checks during writing"
+    )]
+    #[inline(always)]
     fn next_object(&mut self, kind: OccurrenceKind) -> ObjectId {
         self.occurrences.consume(kind)
     }
@@ -215,6 +220,11 @@ impl Writer<'_, '_, '_> {
         }
     }
 
+    #[expect(
+        clippy::inline_always,
+        reason = "specialize structural-object reference modes and occurrence checks during writing"
+    )]
+    #[inline(always)]
     fn bytes_with_object(&mut self, object: ObjectId, value: &[u8], reference_mode: ReferenceMode) {
         let Some(flag) = self.begin_object(object, reference_mode) else {
             return;
@@ -245,6 +255,11 @@ impl Writer<'_, '_, '_> {
         }
     }
 
+    #[expect(
+        clippy::inline_always,
+        reason = "specialize structural-object reference modes and occurrence checks during writing"
+    )]
+    #[inline(always)]
     fn interned_string_with_object(&mut self, object: ObjectId, value: &str) {
         let object = self.graph.object_for_writing(object);
         debug_assert!(object.is_interned(), "marshal metadata must be interned");
@@ -294,6 +309,11 @@ impl Writer<'_, '_, '_> {
         self.output.extend_from_slice(bytes);
     }
 
+    #[expect(
+        clippy::inline_always,
+        reason = "specialize structural-object reference modes and occurrence checks during writing"
+    )]
+    #[inline(always)]
     fn code_metadata_string(&mut self, value: &str) {
         let object = self.next_object(OccurrenceKind::MetadataString);
         if self.graph.python_version() == PythonVersion::Py312 {
@@ -335,6 +355,11 @@ impl Writer<'_, '_, '_> {
         self.output.extend_from_slice(value);
     }
 
+    #[expect(
+        clippy::inline_always,
+        reason = "specialize structural-object reference modes and occurrence checks during writing"
+    )]
+    #[inline(always)]
     fn tuple_header(
         &mut self,
         object: ObjectId,
