@@ -55,6 +55,53 @@ pub(super) trait MarshalVisitor<'a> {
         self.bytes(value);
     }
     fn constant(&mut self, value: &'a Constant, reference_mode: ReferenceMode) -> bool;
+
+    // Typed scalar callbacks let the graph and writer use the traversal's existing dispatch.
+    // Default visitors retain the complete constant callback and reference-mode contract.
+    fn none_constant(&mut self, value: &'a Constant, mode: ReferenceMode) {
+        self.constant(value, mode);
+    }
+    fn bool_constant(&mut self, value: &'a Constant, _boolean: bool, mode: ReferenceMode) {
+        self.constant(value, mode);
+    }
+    fn ellipsis_constant(&mut self, value: &'a Constant, mode: ReferenceMode) {
+        self.constant(value, mode);
+    }
+    fn integer_constant(
+        &mut self,
+        value: &'a Constant,
+        _integer: u64,
+        mode: ReferenceMode,
+    ) -> bool {
+        self.constant(value, mode)
+    }
+    fn string_constant(
+        &mut self,
+        value: &'a Constant,
+        _string: &'a String,
+        mode: ReferenceMode,
+    ) -> bool {
+        self.constant(value, mode)
+    }
+    fn signed_integer_constant(
+        &mut self,
+        value: &'a Constant,
+        _integer: i64,
+        mode: ReferenceMode,
+    ) -> bool {
+        self.constant(value, mode)
+    }
+    fn float_constant(&mut self, value: &'a Constant, _float: f64, mode: ReferenceMode) -> bool {
+        self.constant(value, mode)
+    }
+    fn bytes_constant(
+        &mut self,
+        value: &'a Constant,
+        _bytes: &'a [u8],
+        mode: ReferenceMode,
+    ) -> bool {
+        self.constant(value, mode)
+    }
     fn slice_member(&mut self, value: &'a Constant);
     fn cached_slice_string(&mut self, value: &'a Constant) {
         self.constant(value, ReferenceMode::IfShared);
@@ -160,6 +207,25 @@ where
     V: MarshalVisitor<'a>,
 {
     match value {
+        Constant::None => visitor.none_constant(value, reference_mode),
+        Constant::Bool(boolean) => visitor.bool_constant(value, *boolean, reference_mode),
+        Constant::Ellipsis => visitor.ellipsis_constant(value, reference_mode),
+        Constant::Int(integer) => {
+            visitor.integer_constant(value, *integer, reference_mode);
+        }
+        Constant::String(string) => {
+            visitor.string_constant(value, string, reference_mode);
+        }
+
+        Constant::SignedInt(integer) => {
+            visitor.signed_integer_constant(value, *integer, reference_mode);
+        }
+        Constant::Float(float) => {
+            visitor.float_constant(value, *float, reference_mode);
+        }
+        Constant::Bytes(bytes) => {
+            visitor.bytes_constant(value, bytes, reference_mode);
+        }
         Constant::Tuple(values) => traverse_constants(values, reference_mode, visitor),
         Constant::Code(code) => {
             traverse_code_with_mode(code, ReferenceMode::IfShared, visitor);

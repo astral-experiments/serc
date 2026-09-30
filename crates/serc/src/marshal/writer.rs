@@ -215,6 +215,7 @@ impl Writer<'_, '_, '_> {
         }
     }
 
+    #[inline]
     fn bytes_with_object(&mut self, object: ObjectId, value: &[u8], reference_mode: ReferenceMode) {
         let Some(flag) = self.begin_object(object, reference_mode) else {
             return;
@@ -226,6 +227,7 @@ impl Writer<'_, '_, '_> {
         self.output.extend_from_slice(value);
     }
 
+    #[inline]
     fn string_with_object(&mut self, object: ObjectId, value: &str, reference_mode: ReferenceMode) {
         let object = self.graph.object_for_writing(object);
         let interned = object.is_interned();
@@ -245,6 +247,7 @@ impl Writer<'_, '_, '_> {
         }
     }
 
+    #[inline]
     fn interned_string_with_object(&mut self, object: ObjectId, value: &str) {
         let object = self.graph.object_for_writing(object);
         debug_assert!(object.is_interned(), "marshal metadata must be interned");
@@ -294,6 +297,7 @@ impl Writer<'_, '_, '_> {
         self.output.extend_from_slice(bytes);
     }
 
+    #[inline]
     fn code_metadata_string(&mut self, value: &str) {
         let object = self.next_object(OccurrenceKind::MetadataString);
         if self.graph.python_version() == PythonVersion::Py312 {
@@ -460,6 +464,7 @@ impl Writer<'_, '_, '_> {
         }
     }
 
+    #[inline]
     fn integer(&mut self, object: ObjectId, value: u64, reference_mode: ReferenceMode) {
         let Some(flag) = self.begin_object(object, reference_mode) else {
             return;
@@ -472,6 +477,7 @@ impl Writer<'_, '_, '_> {
         self.long_integer(flag, value, false);
     }
 
+    #[inline]
     fn signed_integer(&mut self, object: ObjectId, value: i64, reference_mode: ReferenceMode) {
         let Some(flag) = self.begin_object(object, reference_mode) else {
             return;
@@ -544,6 +550,79 @@ impl<'code> MarshalVisitor<'code> for Writer<'_, '_, 'code> {
         let index = self.frozen_set_order_index;
         self.frozen_set_order_index += 1;
         self.graph.frozen_set_members(values, index)
+    }
+
+    #[inline]
+    fn none_constant(&mut self, _value: &'code Constant, _mode: ReferenceMode) {
+        self.byte(TYPE_NONE);
+    }
+
+    #[inline]
+    fn bool_constant(&mut self, _value: &'code Constant, boolean: bool, _mode: ReferenceMode) {
+        self.byte(if boolean { TYPE_TRUE } else { TYPE_FALSE });
+    }
+
+    #[inline]
+    fn ellipsis_constant(&mut self, _value: &'code Constant, _mode: ReferenceMode) {
+        self.byte(TYPE_ELLIPSIS);
+    }
+
+    #[inline]
+    fn integer_constant(
+        &mut self,
+        _value: &'code Constant,
+        integer: u64,
+        mode: ReferenceMode,
+    ) -> bool {
+        let object = self.next_object(OccurrenceKind::Constant);
+        self.integer(object, integer, mode);
+        true
+    }
+
+    #[inline]
+    fn string_constant(
+        &mut self,
+        _value: &'code Constant,
+        string: &'code String,
+        mode: ReferenceMode,
+    ) -> bool {
+        let object = self.next_object(OccurrenceKind::Constant);
+        self.string_with_object(object, string, mode);
+        true
+    }
+
+    #[inline]
+    fn signed_integer_constant(
+        &mut self,
+        _value: &'code Constant,
+        integer: i64,
+        mode: ReferenceMode,
+    ) -> bool {
+        let object = self.next_object(OccurrenceKind::Constant);
+        self.signed_integer(object, integer, mode);
+        true
+    }
+
+    #[inline]
+    fn float_constant(&mut self, _value: &'code Constant, float: f64, mode: ReferenceMode) -> bool {
+        let object = self.next_object(OccurrenceKind::Constant);
+        let Some(flag) = self.begin_object(object, mode) else {
+            return false;
+        };
+        self.byte_and_float(TYPE_BINARY_FLOAT | flag, float);
+        true
+    }
+
+    #[inline]
+    fn bytes_constant(
+        &mut self,
+        _value: &'code Constant,
+        bytes: &'code [u8],
+        mode: ReferenceMode,
+    ) -> bool {
+        let object = self.next_object(OccurrenceKind::Constant);
+        self.bytes_with_object(object, bytes, mode);
+        true
     }
 
     #[inline]
