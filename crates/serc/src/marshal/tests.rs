@@ -1045,6 +1045,143 @@ fn borrowed_string_tuple_keys_compare_across_sources() {
 }
 
 #[test]
+fn container_hashes_match_uncached_streams_and_are_discarded_by_clones() {
+    fn compare(module: crate::CompiledModule, label: &str) -> bool {
+        let enabled = !module.code.marshal_provenance.constant_hashes.is_empty();
+        let mut cloned = module.clone();
+        assert!(cloned.code.marshal_provenance.constant_hashes.is_empty());
+        let expected = cloned.marshal();
+        assert_eq!(module.marshal(), expected, "{label}");
+        assert_eq!(
+            module.to_timestamp_pyc(42, 100),
+            cloned.to_timestamp_pyc(42, 100)
+        );
+        drop(module);
+        // Repeated clones must not regain an address-keyed hint after the original is freed.
+        for _ in 0..8 {
+            let successor = cloned.clone();
+            drop(cloned);
+            cloned = successor;
+            assert!(cloned.code.marshal_provenance.constant_hashes.is_empty());
+            assert_eq!(cloned.marshal(), expected, "cloned {label}");
+        }
+        enabled
+    }
+
+    let mut enabled = 0;
+    for workload in serc_fixtures::MARSHAL_MICRO_WORKLOADS
+        .iter()
+        .chain(serc_fixtures::COMPOSITE_WORKLOADS)
+        .chain(serc_fixtures::LARGE_WORKLOADS)
+    {
+        enabled += usize::from(compare(
+            crate::compile(workload.source, workload.filename).unwrap(),
+            workload.id,
+        ));
+    }
+    assert!(enabled > 0);
+
+    for python_version in [
+        crate::PythonVersion::Py312,
+        crate::PythonVersion::Py313,
+        crate::PythonVersion::Py314,
+        crate::PythonVersion::Py315,
+    ] {
+        for workload in serc_fixtures::MARSHAL_MICRO_WORKLOADS {
+            compare(
+                crate::compile_with_options(
+                    workload.source,
+                    workload.filename,
+                    &crate::CompileOptions {
+                        python_version,
+                        ..crate::CompileOptions::default()
+                    },
+                )
+                .unwrap(),
+                workload.id,
+            );
+        }
+    }
+
+    let mut code = code_object(vec![
+        Constant::Tuple(vec![Constant::Int(1000), Constant::String("café".into())]),
+        Constant::FrozenSet(vec![Constant::Int(2), Constant::Int(1)]),
+        Constant::FrozenSet(vec![Constant::FrozenSet(vec![
+            Constant::Int(1),
+            Constant::Int(2),
+        ])]),
+        Constant::Slice {
+            lower: Box::new(Constant::Int(1000)),
+            upper: Box::new(Constant::String("upper".into())),
+            step: Box::new(Constant::None),
+        },
+    ]);
+    code.marshal_provenance.constant_hashes = super::constant_hashes_for_code(&code);
+    assert!(!code.marshal_provenance.constant_hashes.is_empty());
+    assert_eq!(encode_code(&code), encode_code(&code.clone()));
+}
+
+#[test]
+fn metadata_name_domain_matches_value_lookup_after_cloning() {
+    use std::fmt::Write;
+
+    use serc_fixtures::{COMPOSITE_WORKLOADS, LARGE_WORKLOADS, MARSHAL_MICRO_WORKLOADS};
+
+    fn compare(source: &str, filename: &str) -> bool {
+        let module = crate::compile(source, filename).unwrap();
+        let enabled = module
+            .code
+            .marshal_provenance
+            .metadata_name_domain
+            .is_some();
+        let mut fallback = module.clone();
+        fallback.code.marshal_provenance.metadata_name_domain = None;
+        let cloned = module.clone();
+        assert_eq!(module.marshal(), fallback.marshal(), "{filename}");
+        assert_eq!(
+            module.to_timestamp_pyc(42, 100),
+            fallback.to_timestamp_pyc(42, 100),
+            "PYC {filename}",
+        );
+        drop(module);
+        assert_eq!(cloned.marshal(), fallback.marshal(), "cloned {filename}");
+        enabled
+    }
+
+    let mut enabled = 0;
+    for workload in MARSHAL_MICRO_WORKLOADS
+        .iter()
+        .chain(COMPOSITE_WORKLOADS)
+        .chain(LARGE_WORKLOADS)
+    {
+        let uses_domain = compare(workload.source, workload.filename);
+        if workload.id == "large_dataset" {
+            assert!(
+                uses_domain,
+                "exercise the large benchmark's metadata domain"
+            );
+        }
+        enabled += usize::from(uses_domain);
+    }
+    assert!(enabled > 0, "exercise the compiled metadata domain");
+
+    let mut source = String::new();
+    for index in 0..96 {
+        writeln!(source, "name_{index} = {index}").unwrap();
+    }
+    source.push_str("café = 'value'\naliases = ('café',)\nstandalone = 'café'\nidentifier = 'shared_metadata'\ndef shared_metadata(café, parameter_with_a_long_metadata_spelling):\n    return café, identifier, 'shared_metadata', 'café', ('café',)\ndef lookup():\n    return café\n");
+    source.push_str("def membership(x):\n    return x in ('café', 'shared_metadata', ('café',))\n");
+    for filename in [
+        "shared_metadata",
+        "café",
+        "parameter_with_a_long_metadata_spelling",
+        "two words filename.py",
+    ] {
+        assert!(compare(&source, filename));
+    }
+}
+
+#[test]
 fn short_and_long_compiler_names_keep_marshaled_metadata_identity() {
     fn assert_send_and_sync<T: Send + Sync>() {}
 

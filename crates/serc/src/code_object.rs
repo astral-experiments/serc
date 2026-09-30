@@ -205,6 +205,24 @@ pub(crate) struct MarshalMetadataIds {
     pub(crate) qualified_name: Option<MetadataId>,
 }
 
+/// Immutable value-to-ID lookup for the compiler's complete metadata name domain.
+/// The graph still assigns object and reference IDs in wire order.
+#[derive(Debug)]
+pub(crate) struct MarshalMetadataNameDomain {
+    pub(crate) names: crate::compiler::FrozenNameInterner,
+    pub(crate) filename: CodeFilename,
+    pub(crate) domain_len: u32,
+}
+
+impl MarshalMetadataNameDomain {
+    pub(crate) fn get(&self, value: &str) -> Option<MetadataId> {
+        self.names.get(value).or_else(|| {
+            (self.filename.as_utf8() == Some(value))
+                .then(|| MetadataId::from_u32(self.domain_len - 1))
+        })
+    }
+}
+
 /// A constant-cache admission or real code assembly in compilation order.
 #[derive(Clone, Debug)]
 pub(crate) enum CompilationInterningEvent {
@@ -298,10 +316,12 @@ pub(crate) struct MarshalProvenance {
     /// Whether `%` first entered the compiler cache as a fresh `PyUnicode_Replace` result.
     pub(crate) uncached_percent_constant: bool,
     pub(crate) metadata_ids: MarshalMetadataIds,
+    pub(crate) metadata_name_domain: Option<Arc<MarshalMetadataNameDomain>>,
     /// Value properties computed for the emitted metadata; absent for hand-built code objects.
     pub(crate) metadata_tuple_properties: Option<MarshalMetadataTupleProperties>,
     /// Hash of a constants tuple whose key survives cloning; code identities are excluded.
     pub(crate) constants_tuple_hash: Option<u64>,
+    pub(crate) constant_hashes: crate::marshal::ConstantHashes,
     /// Value hashes of the immutable line and exception tables, in wire order.
     pub(crate) table_hashes: Option<[u64; 2]>,
     /// Unpruned traversal size for reserving marshal occurrences and object flags.

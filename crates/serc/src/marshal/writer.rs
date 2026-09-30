@@ -215,6 +215,11 @@ impl Writer<'_, '_, '_> {
         }
     }
 
+    #[expect(
+        clippy::inline_always,
+        reason = "specialize reference registration at forced bytecode and conditional table call sites"
+    )]
+    #[inline(always)]
     fn bytes_with_object(&mut self, object: ObjectId, value: &[u8], reference_mode: ReferenceMode) {
         let Some(flag) = self.begin_object(object, reference_mode) else {
             return;
@@ -245,6 +250,7 @@ impl Writer<'_, '_, '_> {
         }
     }
 
+    #[inline]
     fn interned_string_with_object(&mut self, object: ObjectId, value: &str) {
         let object = self.graph.object_for_writing(object);
         debug_assert!(object.is_interned(), "marshal metadata must be interned");

@@ -23,6 +23,7 @@ mod native_profile;
 pub(crate) mod optimization;
 mod orchestration;
 mod scope;
+pub(crate) use scope::FrozenNameInterner;
 mod source;
 mod statement;
 mod symbol;

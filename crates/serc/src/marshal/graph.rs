@@ -8,16 +8,16 @@ use smallvec::SmallVec;
 
 use crate::code_object::{
     CodeFilename, CodeInterningSummary, CodeObject, CompilationInterningEvent, Constant,
-    MetadataId, MetadataName as Name,
+    MarshalMetadataNameDomain, MetadataId, MetadataName as Name,
 };
 use crate::target::{is_preinterned_string_for, small_int_bounds_for};
 use crate::{CompileError, InitialInternState, PythonVersion};
 
 use super::key::{
-    FrozenSetMembers, HashedObjectKey, ObjectKey, code_bytes_key, code_key, constant_key,
-    constants_tuple_key, frozen_set_members_in_wire_order, frozen_set_members_with_properties,
-    is_cached_character, local_kinds_key, locals_tuple_key, names_tuple_key, should_intern,
-    strings_tuple_key,
+    ConstantHashes, FrozenSetMembers, HashedObjectKey, ObjectKey, code_bytes_key, code_key,
+    constant_key, constants_tuple_key, frozen_set_members_in_wire_order,
+    frozen_set_members_with_properties, is_cached_character, local_kinds_key, locals_tuple_key,
+    names_tuple_key, should_intern, strings_tuple_key,
 };
 use super::plan::{MarshalVisitor, ObjectId, ReferenceId, ReferenceMode, traverse_code};
 
@@ -214,6 +214,8 @@ pub(super) struct ObjectGraph<'a> {
     python_version: PythonVersion,
     objects: HashTable<(HashedObjectKey<'a>, ObjectId)>,
     interned_strings: FxHashMap<&'a str, ObjectId>,
+    metadata_name_domain: Option<&'a MarshalMetadataNameDomain>,
+    constant_hashes: Option<&'a ConstantHashes>,
     aliases: GraphAliases,
     metadata_slots: Box<[Option<ObjectId>]>,
     cached_empty_bytes: Option<ObjectId>,
@@ -401,6 +403,14 @@ impl<'a> ObjectGraph<'a> {
         let metadata_slots = metadata_domain
             .map(|len| vec![None; len].into_boxed_slice())
             .unwrap_or_default();
+        let metadata_name_domain = code
+            .marshal_provenance
+            .metadata_name_domain
+            .as_deref()
+            .filter(|domain| {
+                python_version == PythonVersion::Py314
+                    && metadata_domain == usize::try_from(domain.domain_len).ok()
+            });
         // The compiler's metadata domain spans every nested code object. Reserving that map once
         // avoids repeated growth from recounting the same local and metadata spellings per code.
         // A sorting replay already knows the exact number of strings its first graph discovered.
@@ -413,7 +423,7 @@ impl<'a> ObjectGraph<'a> {
                     .and(metadata_domain)
             });
         let mut interned_strings = FxHashMap::default();
-        if let Some(capacity) = interned_capacity {
+        if let Some(capacity) = interned_capacity.filter(|_| metadata_name_domain.is_none()) {
             interned_strings.reserve(capacity);
         }
         let traversal_capacity = sort_graph
@@ -437,8 +447,12 @@ impl<'a> ObjectGraph<'a> {
             python_version,
             aliases,
             cache_scalars: preprocessing.capacity.constants >= MIN_CACHED_SCALAR_CONSTANTS,
-            preallocated_interned_strings: interned_capacity.is_some(),
+            preallocated_interned_strings: interned_capacity.is_some()
+                || metadata_name_domain.is_some(),
             interned_strings,
+            metadata_name_domain,
+            constant_hashes: (!code.marshal_provenance.constant_hashes.is_empty())
+                .then_some(&code.marshal_provenance.constant_hashes),
             objects,
             objects_by_id,
             occurrences: Vec::with_capacity(traversal_capacity.1),
@@ -509,7 +523,7 @@ impl<'a> ObjectGraph<'a> {
             }
             return (
                 true,
-                should_intern(value) || self.interned_strings.contains_key(value.as_str()),
+                should_intern(value) || self.interned_object_id(value).is_some(),
             );
         }
         let key = if self.fresh_empty_bytes_constant
@@ -549,10 +563,19 @@ impl<'a> ObjectGraph<'a> {
         self.estimated_payload_bytes = self.estimated_payload_bytes.saturating_add(length);
     }
 
+    #[inline]
     fn record_keyed(&mut self, kind: OccurrenceKind, key: ObjectKey<'a>) -> bool {
+        if let Some(hash) = self.constant_hashes.and_then(|hashes| hashes.get(&key)) {
+            return self.record_hashed(kind, HashedObjectKey::with_hash(key, hash));
+        }
         self.record_hashed(kind, key.into())
     }
 
+    #[expect(
+        clippy::inline_always,
+        reason = "specialize cache eligibility for known structural object keys"
+    )]
+    #[inline(always)]
     fn record_hashed(&mut self, kind: OccurrenceKind, key: HashedObjectKey<'a>) -> bool {
         let (id, first) = self.record_object(key);
         self.occurrences.push(Occurrence { object: id, kind });
@@ -572,6 +595,18 @@ impl<'a> ObjectGraph<'a> {
         value: &'a str,
         metadata_id: Option<MetadataId>,
     ) -> bool {
+        if let Some(domain) = self.metadata_name_domain
+            && let Some(metadata_id) = metadata_id
+        {
+            debug_assert_eq!(
+                domain.get(value),
+                Some(metadata_id),
+                "metadata ID must identify one string"
+            );
+            let (id, first) = self.interned_metadata_id(metadata_id);
+            self.occurrences.push(Occurrence { object: id, kind });
+            return first;
+        }
         let slot_index = metadata_id.map(MetadataId::index);
         if let Some(id) = slot_index
             .and_then(|index| self.metadata_slots.get(index).copied())
@@ -612,6 +647,12 @@ impl<'a> ObjectGraph<'a> {
     }
 
     fn interned_string(&mut self, value: &'a str) -> (ObjectId, bool) {
+        if let Some(metadata_id) = self
+            .metadata_name_domain
+            .and_then(|domain| domain.get(value))
+        {
+            return self.interned_metadata_id(metadata_id);
+        }
         match self.interned_strings.entry(value) {
             Entry::Occupied(entry) => {
                 let id = *entry.get();
@@ -632,6 +673,32 @@ impl<'a> ObjectGraph<'a> {
         }
     }
 
+    #[inline]
+    fn interned_metadata_id(&mut self, metadata_id: MetadataId) -> (ObjectId, bool) {
+        let slot = &mut self.metadata_slots[metadata_id.index()];
+        if let Some(id) = *slot {
+            self.objects_by_id[id].shared = true;
+            return (id, false);
+        }
+        let id = self.objects_by_id.next_index();
+        self.objects_by_id.push(Object {
+            shared: false,
+            cached: true,
+            interned: true,
+            reference: None,
+        });
+        *slot = Some(id);
+        (id, true)
+    }
+
+    fn interned_object_id(&self, value: &str) -> Option<ObjectId> {
+        self.metadata_name_domain
+            .and_then(|domain| domain.get(value))
+            .and_then(|id| self.metadata_slots[id.index()])
+            .or_else(|| self.interned_strings.get(value).copied())
+    }
+
+    #[inline]
     fn record_cached_value(&mut self, kind: OccurrenceKind, cached: CachedObject) -> bool {
         let (id, first) = self.record_cached(cached);
         self.occurrences.push(Occurrence { object: id, kind });
@@ -654,6 +721,7 @@ impl<'a> ObjectGraph<'a> {
         }
     }
 
+    #[inline]
     fn record_unique_value(&mut self, kind: OccurrenceKind, key: ObjectKey<'a>) -> bool {
         let id = self.record_unique(key);
         self.occurrences.push(Occurrence { object: id, kind });
@@ -687,6 +755,11 @@ impl<'a> ObjectGraph<'a> {
         id
     }
 
+    #[expect(
+        clippy::inline_always,
+        reason = "specialize empty objects and scalar slots for known cache kinds"
+    )]
+    #[inline(always)]
     fn record_cached(&mut self, cached: CachedObject) -> (ObjectId, bool) {
         let empty_slot = match cached {
             CachedObject::EmptyBytes => Some(&mut self.cached_empty_bytes),
@@ -773,10 +846,8 @@ impl<'a> ObjectGraph<'a> {
             || matches!(
                 key,
                 ObjectKey::String(value)
-                    if self
-                        .interned_strings
-                        .get(*value)
-                        .is_some_and(|id| self.is_shared_object(*id))
+                    if self.interned_object_id(value)
+                        .is_some_and(|id| self.is_shared_object(id))
             )
         {
             return true;
@@ -827,6 +898,11 @@ impl<'a> ObjectGraph<'a> {
     pub(super) fn keyed_object_count(&self) -> usize {
         self.objects.len()
             + self.interned_strings.len()
+            + if self.metadata_name_domain.is_some() {
+                self.metadata_slots.iter().filter(|id| id.is_some()).count()
+            } else {
+                0
+            }
             + usize::from(self.cached_empty_bytes.is_some())
             + usize::from(self.cached_empty_tuple.is_some())
             + self
@@ -873,7 +949,7 @@ impl<'a> ObjectGraph<'a> {
         {
             return true;
         }
-        self.interned_strings.contains_key(value)
+        self.interned_object_id(value).is_some()
     }
 }
 

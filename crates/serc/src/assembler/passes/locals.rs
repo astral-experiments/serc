@@ -1704,14 +1704,18 @@ pub(in crate::assembler) fn optimize_linear_assertion_load_fast(
                     requires_stack_analysis |= instruction.local_policy.strict_owned_load()
                         || instruction.local_policy.force_owned_load();
                 }
-                has_local_mutation |= matches!(
-                    instruction.opcode,
-                    DELETE_FAST
-                        | LOAD_FAST_AND_CLEAR
-                        | STORE_FAST
-                        | STORE_FAST_LOAD_FAST
-                        | STORE_FAST_STORE_FAST
-                );
+                // Mutations before the first candidate cannot invalidate a reference
+                // produced later. Stores after a candidate still need stack analysis:
+                // transferring that reference into another local can require ownership.
+                has_local_mutation |= !candidates.is_empty()
+                    && matches!(
+                        instruction.opcode,
+                        DELETE_FAST
+                            | LOAD_FAST_AND_CLEAR
+                            | STORE_FAST
+                            | STORE_FAST_LOAD_FAST
+                            | STORE_FAST_STORE_FAST
+                    );
                 let ends_block = !matches!(instruction.operand(), Operand::Value(_))
                     || ends_scope(instruction.opcode)
                     || instruction.opcode == NOT_TAKEN
@@ -4427,14 +4431,15 @@ impl OptimizationPipeline {
                     requires_stack_analysis |= instruction.local_policy.strict_owned_load()
                         || instruction.local_policy.force_owned_load();
                 }
-                has_local_mutation |= matches!(
-                    instruction.opcode,
-                    DELETE_FAST
-                        | LOAD_FAST_AND_CLEAR
-                        | STORE_FAST
-                        | STORE_FAST_LOAD_FAST
-                        | STORE_FAST_STORE_FAST
-                );
+                has_local_mutation |= !candidates.is_empty()
+                    && matches!(
+                        instruction.opcode,
+                        DELETE_FAST
+                            | LOAD_FAST_AND_CLEAR
+                            | STORE_FAST
+                            | STORE_FAST_LOAD_FAST
+                            | STORE_FAST_STORE_FAST
+                    );
             }
             if reachable
                 .as_ref()
@@ -5592,6 +5597,42 @@ mod tests {
                 ],
                 "blocked: {blocked}",
             );
+        }
+    }
+
+    #[test]
+    fn initialization_before_candidates_matches_stack_borrow_analysis() {
+        use crate::target::opcodes::{DELETE_FAST, LOAD_FAST_AND_CLEAR, STORE_FAST};
+
+        for local in [0, 1, 15, 63, 64, 65_536] {
+            for mutation in [STORE_FAST, DELETE_FAST, LOAD_FAST_AND_CLEAR] {
+                let mut items = Vec::new();
+                if mutation == STORE_FAST {
+                    items.push(borrow_instruction(LOAD_CONST, Operand::Value(0), 1));
+                }
+                items.push(borrow_instruction(
+                    mutation,
+                    Operand::Value(local),
+                    u32::from(mutation == LOAD_FAST_AND_CLEAR),
+                ));
+                if mutation == LOAD_FAST_AND_CLEAR {
+                    items.push(borrow_instruction(POP_TOP, Operand::Value(0), 0));
+                }
+                items.push(borrow_instruction(LOAD_FAST, Operand::Value(local), 1));
+                items.push(borrow_instruction(RETURN_VALUE, Operand::Value(0), 0));
+
+                let mut direct = items.clone();
+                let mut linear = items.clone();
+                let mut generic = items;
+                general_borrow::<true>(&mut direct, &FxHashSet::default());
+                super::optimize_linear_assertion_load_fast(
+                    crate::PythonVersion::Py314,
+                    &mut linear,
+                );
+                general_borrow::<false>(&mut generic, &FxHashSet::default());
+                assert_eq!(direct, generic, "{mutation:?}, local {local}");
+                assert_eq!(linear, generic, "linear {mutation:?}, local {local}");
+            }
         }
     }
 

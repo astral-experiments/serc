@@ -24,7 +24,14 @@ impl LayoutAssembler {
         labels: &mut [Option<u32>],
         first_line_number: u32,
     ) -> Result<Option<FinalArtifacts>, CompileError> {
-        if self.items.len() > usize::from(u8::MAX) {
+        // Large straight-line scopes still have no symbolic jump widths to converge.
+        // The emission loop below checks every value operand before using a one-byte argument.
+        if self.items.len() > usize::from(u8::MAX)
+            && self.items.iter().any(|item| {
+                matches!(item, Item::Instruction(instruction)
+                    if !matches!(instruction.operand(), Operand::Value(_)))
+            })
+        {
             return Ok(None);
         }
         debug_assert_eq!(self.python_version, crate::PythonVersion::Py314);
@@ -1352,6 +1359,61 @@ mod tests {
         }
     }
 
+    #[test]
+    fn large_straight_line_layout_matches_general_encoding() {
+        use crate::target::opcodes::{LOAD_CONST, LOAD_GLOBAL, POP_TOP, RETURN_VALUE};
+
+        let location = SourceLocation::new(1, 1, 0, 8);
+        for operand in [0, 255, 256] {
+            let mut items = Vec::new();
+            for index in 0..300 {
+                let opcode = if index % 2 == 0 {
+                    LOAD_GLOBAL
+                } else {
+                    LOAD_CONST
+                };
+                items.push(Item::Instruction(Instruction::new(
+                    opcode,
+                    Operand::Value(operand),
+                    location,
+                    Some(1),
+                )));
+                items.push(Item::Instruction(Instruction::new(
+                    POP_TOP,
+                    Operand::Value(0),
+                    location,
+                    Some(0),
+                )));
+            }
+            items.push(Item::Instruction(Instruction::new(
+                RETURN_VALUE,
+                Operand::Value(0),
+                SourceLocation::NONE,
+                Some(0),
+            )));
+            let assembler = layout(items, Vec::new());
+            let small = assembler.encode_small_final_artifacts(&mut [], 1).unwrap();
+            if operand == 256 {
+                assert!(small.is_none());
+            } else {
+                let code_units = assembler.items.iter().fold(0, |count, item| match item {
+                    Item::Instruction(instruction) => {
+                        count
+                            + 1
+                            + u32::from(instruction.opcode.caches_for(assembler.python_version))
+                    }
+                    Item::Label(_) => count,
+                });
+                assert_eq!(
+                    small,
+                    assembler
+                        .encode_unextended_final_artifacts(&[], code_units, 1)
+                        .unwrap()
+                );
+            }
+        }
+    }
+
     fn region(
         start: u32,
         end: u32,
@@ -1527,8 +1589,18 @@ mod tests {
             );
 
             assembler.exception_regions.clear();
-            assert_eq!(assembler.unextended_exception_table(&missing).unwrap(), []);
-            assert_eq!(assembler.exception_table(&zeros, &missing).unwrap(), []);
+            assert!(
+                assembler
+                    .unextended_exception_table(&missing)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                assembler
+                    .exception_table(&zeros, &missing)
+                    .unwrap()
+                    .is_empty()
+            );
         }
     }
 

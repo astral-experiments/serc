@@ -14,6 +14,7 @@ use ruff_text_size::{Ranged, TextSize};
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use smallvec::SmallVec;
 
+use crate::code_object::{CodeFilename, MarshalMetadataNameDomain, MetadataId};
 use crate::target::code_flags::{CO_FUTURE_ANNOTATIONS, CO_FUTURE_BARRY_AS_BDFL};
 use crate::{CompileError, PythonVersion};
 
@@ -286,6 +287,33 @@ pub(super) struct NameInterner {
     names: Vec<Name>,
     reverse: HashTable<NameId>,
     short_names: ShortNameCache,
+}
+
+/// The immutable part of the name interner, retained after module compilation.
+#[derive(Debug)]
+pub(crate) struct FrozenNameInterner {
+    seed_names: &'static [&'static str],
+    names: Vec<Name>,
+    reverse: HashTable<NameId>,
+}
+
+impl FrozenNameInterner {
+    pub(crate) fn get(&self, name: &str) -> Option<MetadataId> {
+        if !self.seed_names.is_empty()
+            && let Some(id) = NameInterner::seed_id(name)
+        {
+            return Some(MetadataId::from(id));
+        }
+        if self.reverse.is_empty() {
+            return None;
+        }
+        self.reverse
+            .find(NameInterner::hash(name), |id| {
+                self.names[id.index() - self.seed_names.len()] == name
+            })
+            .copied()
+            .map(MetadataId::from)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -697,6 +725,22 @@ impl NameInterner {
 
     pub(super) fn len(&self) -> usize {
         self.seed_names.len() + self.names.len()
+    }
+
+    pub(super) fn into_marshal_metadata_name_domain(
+        self,
+        filename: CodeFilename,
+        domain_len: u32,
+    ) -> MarshalMetadataNameDomain {
+        MarshalMetadataNameDomain {
+            names: FrozenNameInterner {
+                seed_names: self.seed_names,
+                names: self.names,
+                reverse: self.reverse,
+            },
+            filename,
+            domain_len,
+        }
     }
 
     pub(super) fn insert_lexical(&self, names: &mut Vec<NameId>, id: NameId) {

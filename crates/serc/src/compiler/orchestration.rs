@@ -1,6 +1,7 @@
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use ruff_python_ast::token::Tokens;
 use ruff_python_ast::{Expr, Stmt, Suite};
@@ -1479,7 +1480,12 @@ impl<'source> Compiler<'source> {
                 .ok_or_else(|| CompileError::Internal("too many marshal metadata names".into()))?,
             names: std::mem::take(&mut self.output.name_ids),
             locals: local_ids,
-            filename: MetadataId::from_u32(filename_id),
+            filename: self
+                .context
+                .filename
+                .as_utf8()
+                .and_then(|filename| interner.get(filename))
+                .map_or_else(|| MetadataId::from_u32(filename_id), MetadataId::from),
             name: interner.get(&self.unit.name).map(MetadataId::from),
             qualified_name: interner
                 .get(&self.unit.qualified_name)
@@ -1595,8 +1601,10 @@ impl<'source> Compiler<'source> {
                 qualified_name_is_canonical: self.output.qualified_name_is_canonical,
                 uncached_percent_constant: self.context.has_uncached_percent_constant(),
                 metadata_ids,
+                metadata_name_domain: None,
                 metadata_tuple_properties: Some(metadata_tuple_properties),
                 constants_tuple_hash,
+                constant_hashes: crate::marshal::ConstantHashes::default(),
                 marshal_occurrence_bound: Some(marshal_occurrence_bound),
                 table_hashes: None,
                 subtree_has_frozenset_constants: self.output.has_frozenset_constants,
@@ -1611,6 +1619,22 @@ impl<'source> Compiler<'source> {
         code.validate()?;
         code.marshal_provenance.assembly_order = self.context.record_code_assembly(&code);
         if matches!(self.unit.scope, Scope::Module) {
+            code.marshal_provenance.constant_hashes =
+                crate::marshal::constant_hashes_for_code(&code);
+            // Small domains cost less to populate during serialization. Larger immutable
+            // domains let first-time metadata visits use the same IDs as string constants.
+            if self.context.python_version == PythonVersion::Py314
+                && (64..=(1 << 20)).contains(&code.marshal_provenance.metadata_ids.domain_len)
+            {
+                let context = Rc::get_mut(&mut self.context)
+                    .expect("finished module compiler must own its context");
+                let names = std::mem::take(&mut context.scopes.names);
+                code.marshal_provenance.metadata_name_domain =
+                    Some(Arc::new(names.into_marshal_metadata_name_domain(
+                        code.filename.clone(),
+                        code.marshal_provenance.metadata_ids.domain_len,
+                    )));
+            }
             code.marshal_provenance.interning_events = self.context.take_interning_events();
             code.marshal_provenance.interned_metadata_tuples =
                 self.context.take_interned_metadata_tuples();
