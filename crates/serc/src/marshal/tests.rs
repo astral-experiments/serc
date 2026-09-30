@@ -453,12 +453,24 @@ fn precomputed_metadata_hashes_match_borrowed_tuples_from_either_source() {
             .iter()
             .map(|value| Constant::String(value.to_string()))
             .collect::<Vec<_>>();
+        let strings = values.iter().map(ToString::to_string).collect::<Vec<_>>();
         let hinted = HashedObjectKey::with_hash(names_tuple_key(values), properties.hash);
         assert_eq!(hinted, HashedObjectKey::from(names_tuple_key(values)));
         assert_eq!(
             hinted,
             HashedObjectKey::from(constants_tuple_key(&constants))
         );
+        assert_eq!(hinted, HashedObjectKey::from(strings_tuple_key(&strings)));
+        for key in [
+            names_tuple_key(values),
+            constants_tuple_key(&constants),
+            strings_tuple_key(&strings),
+        ] {
+            assert_eq!(key, key);
+            if !values.is_empty() {
+                assert_ne!(key, names_tuple_key(&values[..values.len() - 1]));
+            }
+        }
     }
 }
 

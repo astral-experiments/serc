@@ -117,12 +117,13 @@ pub(super) struct ConstantTupleKey<'a>(&'a [Constant]);
 
 impl PartialEq for ConstantTupleKey<'_> {
     fn eq(&self, other: &Self) -> bool {
-        self.0.len() == other.0.len()
-            && self
-                .0
-                .iter()
-                .zip(other.0)
-                .all(|(left, right)| constants_equal(left, right))
+        std::ptr::eq(self.0, other.0)
+            || (self.0.len() == other.0.len()
+                && self
+                    .0
+                    .iter()
+                    .zip(other.0)
+                    .all(|(left, right)| constants_equal(left, right)))
     }
 }
 
@@ -460,7 +461,21 @@ impl<'a> StringTupleKey<'a> {
 
 impl PartialEq for StringTupleKey<'_> {
     fn eq(&self, other: &Self) -> bool {
-        self.iter().eq(other.iter())
+        // Dispatch once for equal representations, keeping the cross-representation
+        // comparison that lets literal and metadata tuples share object identity.
+        match (self.0, other.0) {
+            (StringTupleKind::Constants(left), StringTupleKind::Constants(right)) => {
+                std::ptr::eq(left, right)
+                    || (left.len() == right.len()
+                        && left
+                            .iter()
+                            .map(constant_string)
+                            .eq(right.iter().map(constant_string)))
+            }
+            (StringTupleKind::Strings(left), StringTupleKind::Strings(right)) => left == right,
+            (StringTupleKind::Names(left), StringTupleKind::Names(right)) => left == right,
+            _ => self.iter().eq(other.iter()),
+        }
     }
 }
 
@@ -468,14 +483,25 @@ impl Eq for StringTupleKey<'_> {}
 
 impl Hash for StringTupleKey<'_> {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        let length = match self.0 {
-            StringTupleKind::Constants(values) => values.len(),
-            StringTupleKind::Strings(values) => values.len(),
-            StringTupleKind::Names(values) => values.len(),
-        };
-        length.hash(state);
-        for value in self.iter() {
-            value.hash(state);
+        match self.0 {
+            StringTupleKind::Constants(values) => {
+                values.len().hash(state);
+                for value in values {
+                    constant_string(value).hash(state);
+                }
+            }
+            StringTupleKind::Strings(values) => {
+                values.len().hash(state);
+                for value in values {
+                    value.as_str().hash(state);
+                }
+            }
+            StringTupleKind::Names(values) => {
+                values.len().hash(state);
+                for value in values {
+                    value.as_str().hash(state);
+                }
+            }
         }
     }
 }
