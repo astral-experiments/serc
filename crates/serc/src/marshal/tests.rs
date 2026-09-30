@@ -342,6 +342,77 @@ fn precomputed_metadata_hashes_match_borrowed_tuples_from_either_source() {
 }
 
 #[test]
+fn constant_tuple_hashes_preserve_sharing_after_cloning() {
+    fn remove_hashes(code: &mut CodeObject) {
+        code.marshal_provenance.constants_tuple_hash = None;
+        for constant in &mut code.constants {
+            if let Constant::Code(child) = constant {
+                remove_hashes(child);
+            }
+        }
+    }
+
+    let source = "\
+marker = ('méthode',)
+def first():
+    return None, (1, -1, -0.0, 2j), 'méthode'
+def second():
+    return None, (1, -1, -0.0, 2j), 'méthode'
+def lookup():
+    return méthode
+def membership(value):
+    return value in {(1, 2), (3, 4)}
+";
+    for python_version in [
+        crate::PythonVersion::Py312,
+        crate::PythonVersion::Py313,
+        crate::PythonVersion::Py314,
+        crate::PythonVersion::Py315,
+    ] {
+        let options = crate::CompileOptions {
+            python_version,
+            ..crate::CompileOptions::default()
+        };
+        let module = crate::compile_with_options(source, "constant_hints.py", &options).unwrap();
+        let mut fallback = module.clone();
+        remove_hashes(&mut fallback.code);
+        assert_eq!(module.marshal(), fallback.marshal());
+        assert_eq!(module.marshal(), module.clone().marshal());
+        assert_eq!(
+            module.to_timestamp_pyc(0, 0),
+            fallback.to_timestamp_pyc(0, 0)
+        );
+    }
+
+    let nested_code = Constant::Tuple(vec![Constant::Code(Box::new(code_object(vec![])))]);
+    assert!(super::key::constants_tuple_hash(&[nested_code]).is_none());
+}
+
+#[test]
+fn benchmark_constant_tuple_hashes_match_uncached_marshal() {
+    fn remove_hashes(code: &mut CodeObject) {
+        code.marshal_provenance.constants_tuple_hash = None;
+        for constant in &mut code.constants {
+            if let Constant::Code(child) = constant {
+                remove_hashes(child);
+            }
+        }
+    }
+
+    for workload in serc_fixtures::COMPILE_MICRO_WORKLOADS
+        .iter()
+        .chain(serc_fixtures::MARSHAL_MICRO_WORKLOADS)
+        .chain(serc_fixtures::COMPOSITE_WORKLOADS)
+        .chain(serc_fixtures::LARGE_WORKLOADS)
+    {
+        let module = crate::compile(workload.source, workload.filename).unwrap();
+        let mut fallback = module.clone();
+        remove_hashes(&mut fallback.code);
+        assert_eq!(module.marshal(), fallback.marshal(), "{}", workload.id);
+    }
+}
+
+#[test]
 fn compiled_metadata_hashes_and_interning_flags_match_uncached_marshal() {
     fn remove_properties(code: &mut CodeObject, observed: &mut [bool; 4]) {
         let properties = code

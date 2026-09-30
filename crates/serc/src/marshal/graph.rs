@@ -2,6 +2,8 @@ use ruff_index::IndexVec;
 
 use std::collections::hash_map::Entry;
 
+use hashbrown::HashTable;
+use hashbrown::hash_table::Entry as TableEntry;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
@@ -211,7 +213,7 @@ impl CachedObject {
 #[derive(Debug, Default)]
 pub(super) struct ObjectGraph<'a> {
     python_version: PythonVersion,
-    objects: FxHashMap<HashedObjectKey<'a>, ObjectId>,
+    objects: HashTable<(HashedObjectKey<'a>, ObjectId)>,
     interned_strings: FxHashMap<&'a str, ObjectId>,
     aliases: GraphAliases,
     metadata_slots: Box<[Option<ObjectId>]>,
@@ -240,6 +242,32 @@ struct GraphAliases {
 struct GraphPreprocessing<'a> {
     explicitly_interned: FxHashSet<&'a str>,
     recreated_frozensets: FxHashSet<usize>,
+    capacity: GraphCapacity,
+}
+
+#[derive(Default)]
+struct GraphCapacity {
+    objects: usize,
+    occurrences: usize,
+    constants: usize,
+}
+
+impl GraphCapacity {
+    fn record(&mut self, code: &CodeObject) {
+        // Reuse the provenance walk to size the whole code tree before recording it. Container
+        // constants can add descendants beyond this estimate; the collections still grow normally.
+        self.objects = self
+            .objects
+            .saturating_add(code.constants.len().saturating_add(5));
+        self.constants = self.constants.saturating_add(code.constants.len());
+        self.occurrences = self.occurrences.saturating_add(
+            code.constants
+                .len()
+                .saturating_add(code.names.len())
+                .saturating_add(code.locals.len())
+                .saturating_add(CODE_OBJECT_CHILDREN + 1),
+        );
+    }
 }
 
 impl<'a> GraphPreprocessing<'a> {
@@ -256,7 +284,7 @@ impl<'a> GraphPreprocessing<'a> {
                 metadata_tuples.insert(strings_tuple_key(values).into());
             }
         }
-        let frozenset_recreation_need = collect_explicitly_interned(
+        let (frozenset_recreation_need, capacity) = collect_explicitly_interned(
             code,
             python_version,
             initial_intern_state,
@@ -285,6 +313,7 @@ impl<'a> GraphPreprocessing<'a> {
             Self {
                 explicitly_interned,
                 recreated_frozensets,
+                capacity,
             },
             aliases,
         )
@@ -356,12 +385,23 @@ impl<'a> ObjectGraph<'a> {
         if let Some(capacity) = interned_capacity {
             interned_strings.reserve(capacity);
         }
+        // A sorting replay has already discovered the exact number of keyed objects.
+        let objects = HashTable::with_capacity(
+            sort_graph.map_or(preprocessing.capacity.objects, |graph| graph.objects.len()),
+        );
+        let mut objects_by_id = IndexVec::default();
+        objects_by_id
+            .raw
+            .reserve(preprocessing.capacity.occurrences);
         let mut graph = Self {
             python_version,
             aliases,
-            cache_scalars: code.constants.len() >= MIN_CACHED_SCALAR_CONSTANTS,
+            cache_scalars: preprocessing.capacity.constants >= MIN_CACHED_SCALAR_CONSTANTS,
             preallocated_interned_strings: interned_capacity.is_some(),
             interned_strings,
+            objects,
+            objects_by_id,
+            occurrences: Vec::with_capacity(preprocessing.capacity.occurrences),
             uncached_percent_constant: code.marshal_provenance.uncached_percent_constant,
             fresh_empty_bytes_constant: code.marshal_provenance.fresh_empty_bytes_constant,
             metadata_slots,
@@ -424,8 +464,8 @@ impl<'a> ObjectGraph<'a> {
             {
                 return (true, true);
             }
-            if let Some(id) = self.objects.get(&ObjectKey::ConstantString(value).into()) {
-                return (self.is_shared_object(*id), false);
+            if let Some(id) = self.object_id(ObjectKey::ConstantString(value).into()) {
+                return (self.is_shared_object(id), false);
             }
             return (
                 true,
@@ -441,39 +481,20 @@ impl<'a> ObjectGraph<'a> {
         };
         let shared = Self::is_cached(&key, self.python_version)
             || self
-                .objects
-                .get(&key.into())
-                .is_some_and(|id| self.is_shared_object(*id));
+                .object_id(key.into())
+                .is_some_and(|id| self.is_shared_object(id));
         (shared, false)
     }
 
     fn reserve_for_code(&mut self, code: &CodeObject) {
-        // Every code object contributes ten object-bearing structural children, plus at most one
-        // object for each direct constant, name, and local. Leave geometric headroom for
-        // descendants of container constants; nested code objects refine the estimate when they
-        // are visited.
-        let direct_children = code
-            .constants
-            .len()
-            .saturating_add(code.names.len())
-            .saturating_add(code.locals.len())
-            .saturating_add(CODE_OBJECT_CHILDREN);
-        let estimated_descendants = direct_children.saturating_mul(2);
         let interned_strings = code
             .names
             .len()
             .saturating_add(code.locals.len())
             .saturating_add(3);
-        self.objects
-            .reserve(estimated_descendants.saturating_sub(interned_strings));
         if !self.preallocated_interned_strings {
             self.interned_strings.reserve(interned_strings);
         }
-        self.objects_by_id
-            .raw
-            .reserve(estimated_descendants.saturating_add(1));
-        self.occurrences
-            .reserve(estimated_descendants.saturating_add(1));
         self.estimated_payload_bytes = self
             .estimated_payload_bytes
             .saturating_add(code.bytecode.len())
@@ -667,17 +688,21 @@ impl<'a> ObjectGraph<'a> {
     }
 
     fn record_object(&mut self, key: HashedObjectKey<'a>) -> (ObjectId, bool) {
-        match self.objects.entry(key) {
-            Entry::Occupied(entry) => {
-                let id = *entry.get();
+        match self.objects.entry(
+            key.hash(),
+            |(stored, _)| *stored == key,
+            |(stored, _)| stored.hash(),
+        ) {
+            TableEntry::Occupied(entry) => {
+                let id = entry.get().1;
                 // Cache eligibility was fixed by this same stored key when first inserted.
                 self.objects_by_id[id].shared = true;
                 (id, false)
             }
-            Entry::Vacant(entry) => {
+            TableEntry::Vacant(entry) => {
                 let next_id = self.objects_by_id.next_index();
-                let cached = Self::is_cached(entry.key().key(), self.python_version);
-                entry.insert(next_id);
+                let cached = Self::is_cached(key.key(), self.python_version);
+                entry.insert((key, next_id));
                 self.objects_by_id.push(Object {
                     shared: false,
                     cached,
@@ -689,13 +714,18 @@ impl<'a> ObjectGraph<'a> {
         }
     }
 
+    fn object_id(&self, key: HashedObjectKey<'a>) -> Option<ObjectId> {
+        self.objects
+            .find(key.hash(), |(stored, _)| *stored == key)
+            .map(|(_, id)| *id)
+    }
+
     #[cfg(test)]
     pub(super) fn is_shared(&self, key: &ObjectKey<'a>, force_reference: bool) -> bool {
         if force_reference
             || self
-                .objects
-                .get(&HashedObjectKey::from(*key))
-                .is_some_and(|id| self.objects_by_id[*id].shared)
+                .object_id(HashedObjectKey::from(*key))
+                .is_some_and(|id| self.objects_by_id[id].shared)
             || matches!(
                 key,
                 ObjectKey::String(value)
@@ -907,7 +937,7 @@ fn collect_explicitly_interned<'a>(
     values: &mut FxHashSet<&'a str>,
     metadata_tuples: &mut FxHashSet<HashedObjectKey<'a>>,
     needs_metadata_alias_scan: bool,
-) -> FrozensetRecreationNeed {
+) -> (FrozensetRecreationNeed, GraphCapacity) {
     // Identifier objects can enter the compilation-wide constant cache before an equal
     // ordinary string. Preserve that recorded origin when sharing constant and metadata strings.
     values.extend(
@@ -920,6 +950,7 @@ fn collect_explicitly_interned<'a>(
         track: python_version != PythonVersion::Py312,
         ..QualifiedNameConstants::default()
     };
+    let mut capacity = GraphCapacity::default();
     let frozenset_recreation_need = if !code.marshal_provenance.subtree_has_frozenset_constants {
         collect_interning_provenance_without_frozensets(
             code,
@@ -927,6 +958,7 @@ fn collect_explicitly_interned<'a>(
             metadata_tuples,
             needs_metadata_alias_scan,
             &mut qualified_names,
+            &mut capacity,
         );
         FrozensetRecreationNeed::None
     } else {
@@ -937,10 +969,11 @@ fn collect_explicitly_interned<'a>(
             metadata_tuples,
             needs_metadata_alias_scan,
             &mut qualified_names,
+            &mut capacity,
         )
     };
     if qualified_names.origins.is_empty() {
-        return frozenset_recreation_need;
+        return (frozenset_recreation_need, capacity);
     }
 
     // A class body normally loads the same qualified-name object that becomes its interned code
@@ -970,7 +1003,7 @@ fn collect_explicitly_interned<'a>(
                 .then_some(value)
             }),
     );
-    frozenset_recreation_need
+    (frozenset_recreation_need, capacity)
 }
 
 /// Names already interned by their scalar value do not require qualified-name origin analysis.
@@ -990,7 +1023,9 @@ fn collect_interning_provenance_without_frozensets<'a>(
     metadata_tuples: &mut FxHashSet<HashedObjectKey<'a>>,
     needs_metadata_alias_scan: bool,
     qualified_names: &mut QualifiedNameConstants<'a>,
+    capacity: &mut GraphCapacity,
 ) {
+    capacity.record(code);
     if needs_metadata_alias_scan {
         collect_metadata_tuple_keys(code, metadata_tuples);
     }
@@ -1009,6 +1044,7 @@ fn collect_interning_provenance_without_frozensets<'a>(
                 metadata_tuples,
                 needs_metadata_alias_scan,
                 qualified_names,
+                capacity,
             );
         }
     }
@@ -1021,7 +1057,9 @@ fn collect_interning_provenance<'a>(
     metadata_tuples: &mut FxHashSet<HashedObjectKey<'a>>,
     needs_metadata_alias_scan: bool,
     qualified_names: &mut QualifiedNameConstants<'a>,
+    capacity: &mut GraphCapacity,
 ) -> FrozensetRecreationNeed {
+    capacity.record(code);
     if needs_metadata_alias_scan {
         collect_metadata_tuple_keys(code, metadata_tuples);
     }
@@ -1044,6 +1082,7 @@ fn collect_interning_provenance<'a>(
                 metadata_tuples,
                 needs_metadata_alias_scan,
                 qualified_names,
+                capacity,
             );
             frozenset_recreation_need = frozenset_recreation_need.max(recreation_need);
         } else if frozenset_recreation_need != FrozensetRecreationNeed::IdentifierDependent {
@@ -2515,6 +2554,24 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
             // The key has already scanned every member of an all-string tuple. It cannot own
             // code, and equal literal and metadata tuples must share the same value lookup.
             self.graph.record_keyed(OccurrenceKind::Constants, key)
+        }
+    }
+
+    fn code_constants(&mut self, code: &'code CodeObject) -> bool {
+        if let Some(hash) = code.marshal_provenance.constants_tuple_hash {
+            let root_constants = std::mem::take(&mut self.root_constants);
+            let key = constants_tuple_key(&code.constants);
+            if root_constants && matches!(key, ObjectKey::ConstantTuple(_)) {
+                self.graph
+                    .record_unique_value(OccurrenceKind::Constants, key)
+            } else {
+                self.graph.record_hashed(
+                    OccurrenceKind::Constants,
+                    HashedObjectKey::with_hash(key, hash),
+                )
+            }
+        } else {
+            self.constants(&code.constants, ReferenceMode::IfShared)
         }
     }
 

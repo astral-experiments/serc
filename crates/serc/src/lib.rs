@@ -653,10 +653,32 @@ impl Drop for ParsedModule {
     fn drop(&mut self) {
         use ruff_python_ast::visitor::transformer::{Transformer, walk_expr};
 
-        struct ClearExpressions;
+        struct ClearExpressions {
+            shallow_drop: bool,
+        }
 
         impl Transformer for ClearExpressions {
             fn visit_expr(&self, expression: &mut ruff_python_ast::Expr) {
+                // Leaves cannot recurse during destruction. Let their parent drop them instead
+                // of checking the stack and replacing every scalar with another scalar.
+                if matches!(
+                    expression,
+                    ruff_python_ast::Expr::Name(_)
+                        | ruff_python_ast::Expr::NumberLiteral(_)
+                        | ruff_python_ast::Expr::StringLiteral(_)
+                        | ruff_python_ast::Expr::BytesLiteral(_)
+                        | ruff_python_ast::Expr::BooleanLiteral(_)
+                        | ruff_python_ast::Expr::NoneLiteral(_)
+                        | ruff_python_ast::Expr::EllipsisLiteral(_)
+                ) {
+                    return;
+                }
+                // A short source range bounds the depth of an unmodified, successfully parsed
+                // expression. With a full stack segment available it can be dropped directly;
+                // long chains and callers near their stack limit retain guarded dismantling.
+                if self.shallow_drop && expression.range().len() <= TextSize::new(256) {
+                    return;
+                }
                 stacker::maybe_grow(STACK_RED_ZONE, STACK_SEGMENT_SIZE, || {
                     walk_expr(self, expression);
                     // Its children have already been cleared, so replacing the node does not
@@ -669,8 +691,11 @@ impl Drop for ParsedModule {
         }
 
         if let Some(parsed) = self.0.take() {
+            let shallow_drop = parsed.errors().is_empty()
+                && stacker::remaining_stack()
+                    .is_some_and(|remaining| remaining >= STACK_SEGMENT_SIZE);
             let mut suite = parsed.into_suite();
-            ClearExpressions.visit_body(&mut suite);
+            ClearExpressions { shallow_drop }.visit_body(&mut suite);
         }
     }
 }
@@ -751,7 +776,9 @@ fn compile_normalized(
         .with_target_version(target_version);
     let may_depend_on_decimal_parse =
         parse_int_max_str_digits.is_none() && may_depend_on_decimal_parse(source);
-    if let Err(error) = delimiter_nesting::validate(source, &parse_options, options.python_version)
+    if options.python_version <= PythonVersion::Py313
+        && let Err(error) =
+            delimiter_nesting::validate(source, &parse_options, options.python_version)
     {
         return Err(if may_depend_on_decimal_parse {
             unknown_decimal_parse()
@@ -764,6 +791,22 @@ fn compile_normalized(
         .ok_or_else(|| CompileError::Internal("parser did not return a module".to_string()))?;
     let parsed = ParsedModule(Some(parsed));
     let parsed = parsed.0.as_ref().expect("parsed module is present");
+    // Ruff grows its parser stack for deeply nested expressions. Successful modern parses can
+    // reuse its tokens; malformed input still uses the independent tokenizer before diagnostics.
+    if options.python_version >= PythonVersion::Py314
+        && let Err(error) = delimiter_nesting::validate_parsed(
+            source,
+            &parse_options,
+            options.python_version,
+            parsed,
+        )
+    {
+        return Err(if may_depend_on_decimal_parse {
+            unknown_decimal_parse()
+        } else {
+            error
+        });
+    }
     let parse_error = parsed.errors().first();
     if let Some(range) = indentation::first_excess(parsed.tokens())
         && parse_error.is_none_or(|error| range.start() <= error.location.start())

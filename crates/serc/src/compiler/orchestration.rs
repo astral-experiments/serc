@@ -1540,6 +1540,14 @@ impl<'source> Compiler<'source> {
             };
         let metadata_tuple_properties =
             crate::marshal::metadata_tuple_properties(&self.output.names, &output_locals);
+        let constants = self.output.constants.into_values();
+        // A module's mixed constants tuple is unique in its own graph, so hashing it would
+        // only add compilation work. Child code units can share their value-only tuples.
+        let constants_tuple_hash = if matches!(self.unit.scope, Scope::Module) {
+            None
+        } else {
+            crate::marshal::constants_tuple_hash(&constants)
+        };
         let mut code = CodeObject {
             arg_count: self.unit.arg_count,
             positional_only_arg_count: self.unit.positional_only_arg_count,
@@ -1547,7 +1555,7 @@ impl<'source> Compiler<'source> {
             stack_size,
             flags: self.unit.flags,
             bytecode,
-            constants: self.output.constants.into_values(),
+            constants,
             names: self.output.names,
             locals: output_locals,
             local_kinds,
@@ -1579,6 +1587,7 @@ impl<'source> Compiler<'source> {
                 uncached_percent_constant: self.context.has_uncached_percent_constant(),
                 metadata_ids,
                 metadata_tuple_properties: Some(metadata_tuple_properties),
+                constants_tuple_hash,
                 subtree_has_frozenset_constants: self.output.has_frozenset_constants,
                 metadata_alias_scan_unnecessary: false,
                 fresh_empty_bytes_constant: self.context.fresh_empty_bytes_constant(),
