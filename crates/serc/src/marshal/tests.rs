@@ -3272,3 +3272,59 @@ fn complete_canonical_strings_preserve_fallback_streams() {
         );
     }
 }
+
+#[test]
+fn cached_character_metadata_ids_match_value_lookups() {
+    fn clear_ids(code: &mut CodeObject) {
+        // Keep the compiler's valid ID arrays, but disable allocation of the dense lookup domain.
+        code.marshal_provenance.metadata_ids.domain_len = u32::MAX;
+        for value in &mut code.constants {
+            if let Constant::Code(child) = value {
+                clear_ids(child);
+            }
+        }
+    }
+
+    let integers = (0..64)
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let source = format!(
+        "values = ({integers})\na = 'a'\né = 'é'\ndef a(é):\n    return é, 'a', 'é'\ndef é(a):\n    return a, 'é', 'a'\n"
+    );
+    for python_version in [
+        crate::PythonVersion::Py312,
+        crate::PythonVersion::Py313,
+        crate::PythonVersion::Py314,
+        crate::PythonVersion::Py315,
+    ] {
+        let module = crate::compile_with_options(
+            &source,
+            "é",
+            &crate::CompileOptions {
+                python_version,
+                ..crate::CompileOptions::default()
+            },
+        )
+        .unwrap();
+        let mut fallback = module.clone();
+        clear_ids(&mut fallback.code);
+        assert_eq!(module.marshal(), fallback.marshal(), "{python_version}");
+        assert_eq!(
+            module.to_timestamp_pyc(123, 456),
+            fallback.to_timestamp_pyc(123, 456),
+            "{python_version}"
+        );
+    }
+    for workload in serc_fixtures::COMPILE_MICRO_WORKLOADS
+        .iter()
+        .chain(serc_fixtures::MARSHAL_MICRO_WORKLOADS)
+        .chain(serc_fixtures::COMPOSITE_WORKLOADS)
+        .chain(serc_fixtures::LARGE_WORKLOADS)
+    {
+        let module = crate::compile(workload.source, workload.filename).unwrap();
+        let mut fallback = module.clone();
+        clear_ids(&mut fallback.code);
+        assert_eq!(module.marshal(), fallback.marshal(), "{}", workload.id);
+    }
+}

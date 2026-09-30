@@ -2976,6 +2976,125 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
     }
 
     #[inline]
+    fn none_constant(&mut self, _value: &'code Constant, _mode: ReferenceMode) {}
+
+    #[inline]
+    fn bool_constant(&mut self, _value: &'code Constant, _boolean: bool, _mode: ReferenceMode) {}
+
+    #[inline]
+    fn ellipsis_constant(&mut self, _value: &'code Constant, _mode: ReferenceMode) {}
+
+    #[inline]
+    fn integer_constant(
+        &mut self,
+        _value: &'code Constant,
+        integer: u64,
+        _mode: ReferenceMode,
+    ) -> bool {
+        if (self.graph.cache_scalars || integer < self.graph.cached_inline_integers.len() as u64)
+            && integer
+                <= small_int_bounds_for(self.graph.python_version)
+                    .1
+                    .cast_unsigned()
+        {
+            self.graph.record_cached_value(
+                OccurrenceKind::Constant,
+                CachedObject::Int(u16::try_from(integer).expect("cached int fits")),
+            )
+        } else {
+            self.graph
+                .record_keyed(OccurrenceKind::Constant, ObjectKey::Int(integer))
+        }
+    }
+
+    #[inline]
+    fn string_constant(
+        &mut self,
+        _constant: &'code Constant,
+        value: &'code String,
+        _mode: ReferenceMode,
+    ) -> bool {
+        if self.graph.uncached_percent_constant && value == "%" {
+            return self
+                .graph
+                .record_keyed(OccurrenceKind::Constant, ObjectKey::ConstantString(value));
+        }
+        if self.graph.cache_scalars
+            && let Some(character) = CachedObject::character(value)
+        {
+            return self
+                .graph
+                .record_cached_value(OccurrenceKind::Constant, character);
+        }
+        let interned = should_intern(value)
+            || self
+                .graph
+                .aliases
+                .metadata_constants
+                .contains(&std::ptr::from_ref(value).addr())
+            || self
+                .explicitly_interned
+                .is_some_and(|values| values.contains(value.as_str()));
+        let first = if interned {
+            self.graph
+                .record_interned_string(OccurrenceKind::Constant, value)
+        } else {
+            self.graph
+                .record_keyed(OccurrenceKind::Constant, ObjectKey::ConstantString(value))
+        };
+        if first {
+            self.graph.estimate_long_payload(value.len());
+        }
+        first
+    }
+
+    #[inline]
+    fn signed_integer_constant(
+        &mut self,
+        _value: &'code Constant,
+        integer: i64,
+        _mode: ReferenceMode,
+    ) -> bool {
+        let (minimum, maximum) = small_int_bounds_for(self.graph.python_version);
+        if self.graph.cache_scalars && (minimum..=maximum).contains(&integer) {
+            self.graph.record_cached_value(
+                OccurrenceKind::Constant,
+                CachedObject::SignedInt(
+                    u16::try_from(integer - minimum).expect("cached signed int index fits"),
+                ),
+            )
+        } else {
+            self.graph
+                .record_keyed(OccurrenceKind::Constant, ObjectKey::SignedInt(integer))
+        }
+    }
+
+    #[inline]
+    fn float_constant(
+        &mut self,
+        _value: &'code Constant,
+        float: f64,
+        _mode: ReferenceMode,
+    ) -> bool {
+        self.graph
+            .record_keyed(OccurrenceKind::Constant, ObjectKey::Float(float.to_bits()))
+    }
+
+    #[inline]
+    fn bytes_constant(
+        &mut self,
+        _constant: &'code Constant,
+        value: &'code [u8],
+        _mode: ReferenceMode,
+    ) -> bool {
+        let first = self.graph.record_bytes(OccurrenceKind::Constant, value);
+        if first {
+            self.graph.estimate_long_payload(value.len());
+        }
+        first
+    }
+
+    #[inline]
     fn constant(&mut self, value: &'code Constant, _reference_mode: ReferenceMode) -> bool {
         if let Constant::FrozenSet(values) = value {
             self.graph.needs_reference_sorting |=
@@ -3008,40 +3127,7 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
             Constant::Tuple(_) | Constant::Code(_) => {
                 unreachable!("tuple and code constants have dedicated traversal methods")
             }
-            Constant::String(value) => {
-                if self.graph.uncached_percent_constant && value == "%" {
-                    return self
-                        .graph
-                        .record_keyed(OccurrenceKind::Constant, ObjectKey::ConstantString(value));
-                }
-                if self.graph.cache_scalars
-                    && let Some(character) = CachedObject::character(value)
-                {
-                    return self
-                        .graph
-                        .record_cached_value(OccurrenceKind::Constant, character);
-                }
-                let interned = should_intern(value)
-                    || self
-                        .graph
-                        .aliases
-                        .metadata_constants
-                        .contains(&std::ptr::from_ref(value).addr())
-                    || self
-                        .explicitly_interned
-                        .is_some_and(|values| values.contains(value.as_str()));
-                let first = if interned {
-                    self.graph
-                        .record_interned_string(OccurrenceKind::Constant, value)
-                } else {
-                    self.graph
-                        .record_keyed(OccurrenceKind::Constant, ObjectKey::ConstantString(value))
-                };
-                if first {
-                    self.graph.estimate_long_payload(value.len());
-                }
-                first
-            }
+            Constant::String(string) => self.string_constant(value, string, _reference_mode),
             Constant::FrozenSet(_)
                 if self
                     .recreated_frozensets
@@ -3053,19 +3139,7 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
                     ObjectKey::RecreatedFrozenSet(address),
                 )
             }
-            Constant::Int(value)
-                if (self.graph.cache_scalars
-                    || *value < self.graph.cached_inline_integers.len() as u64)
-                    && *value
-                        <= small_int_bounds_for(self.graph.python_version)
-                            .1
-                            .cast_unsigned() =>
-            {
-                self.graph.record_cached_value(
-                    OccurrenceKind::Constant,
-                    CachedObject::Int(u16::try_from(*value).expect("cached int fits")),
-                )
-            }
+            Constant::Int(integer) => self.integer_constant(value, *integer, _reference_mode),
             Constant::SignedInt(value)
                 if self.graph.cache_scalars && {
                     let (minimum, maximum) = small_int_bounds_for(self.graph.python_version);

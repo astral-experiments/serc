@@ -661,6 +661,79 @@ impl<'code> MarshalVisitor<'code> for Writer<'_, '_, 'code> {
     }
 
     #[inline]
+    fn none_constant(&mut self, _value: &'code Constant, _mode: ReferenceMode) {
+        self.byte(TYPE_NONE);
+    }
+
+    #[inline]
+    fn bool_constant(&mut self, _value: &'code Constant, boolean: bool, _mode: ReferenceMode) {
+        self.byte(if boolean { TYPE_TRUE } else { TYPE_FALSE });
+    }
+
+    #[inline]
+    fn ellipsis_constant(&mut self, _value: &'code Constant, _mode: ReferenceMode) {
+        self.byte(TYPE_ELLIPSIS);
+    }
+
+    #[inline]
+    fn integer_constant(
+        &mut self,
+        _value: &'code Constant,
+        integer: u64,
+        mode: ReferenceMode,
+    ) -> bool {
+        let object = self.next_object(OccurrenceKind::Constant);
+        self.integer(object, integer, mode);
+        true
+    }
+
+    #[inline]
+    fn string_constant(
+        &mut self,
+        _value: &'code Constant,
+        string: &'code String,
+        mode: ReferenceMode,
+    ) -> bool {
+        let object = self.next_object(OccurrenceKind::Constant);
+        self.string_with_object(object, string, mode);
+        true
+    }
+
+    #[inline]
+    fn signed_integer_constant(
+        &mut self,
+        _value: &'code Constant,
+        integer: i64,
+        mode: ReferenceMode,
+    ) -> bool {
+        let object = self.next_object(OccurrenceKind::Constant);
+        self.signed_integer(object, integer, mode);
+        true
+    }
+
+    #[inline]
+    fn float_constant(&mut self, _value: &'code Constant, float: f64, mode: ReferenceMode) -> bool {
+        let object = self.next_object(OccurrenceKind::Constant);
+        let Some(flag) = self.begin_object(object, mode) else {
+            return false;
+        };
+        self.byte_and_float(TYPE_BINARY_FLOAT | flag, float);
+        true
+    }
+
+    #[inline]
+    fn bytes_constant(
+        &mut self,
+        _value: &'code Constant,
+        bytes: &'code [u8],
+        mode: ReferenceMode,
+    ) -> bool {
+        let object = self.next_object(OccurrenceKind::Constant);
+        self.bytes_with_object(object, bytes, mode);
+        true
+    }
+
+    #[inline]
     fn constant(&mut self, value: &'code Constant, reference_mode: ReferenceMode) -> bool {
         self.write_constant_value(value, reference_mode, OccurrenceKind::Constant)
     }
