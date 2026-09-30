@@ -567,11 +567,15 @@ impl<'a> ObjectGraph<'a> {
         first
     }
 
-    #[inline]
+    #[expect(
+        clippy::inline_always,
+        reason = "keep repeated dense metadata visits in the traversal loop"
+    )]
+    #[inline(always)]
     fn record_metadata_string(
         &mut self,
         kind: OccurrenceKind,
-        value: &'a str,
+        value: impl FnOnce() -> &'a str,
         metadata_id: Option<MetadataId>,
     ) -> bool {
         let slot_index = metadata_id.map(MetadataId::index);
@@ -579,19 +583,52 @@ impl<'a> ObjectGraph<'a> {
             .and_then(|index| self.metadata_slots.get(index).copied())
             .flatten()
         {
-            debug_assert_eq!(
-                self.interned_strings.get(value),
-                Some(&id),
-                "metadata ID must identify one string"
-            );
-            self.objects_by_id[id].reference_required = true;
+            #[cfg(debug_assertions)]
+            {
+                let value = value();
+                debug_assert_eq!(
+                    if self.cache_scalars
+                        && let Some(character) = CachedObject::character(value)
+                    {
+                        self.cached_scalar_ids
+                            .as_ref()
+                            .and_then(|slots| slots[character.scalar_index(self.python_version)])
+                    } else {
+                        self.interned_strings.get(value).copied()
+                    },
+                    Some(id),
+                    "metadata ID must identify one string"
+                );
+            }
+            debug_assert!(self.objects_by_id[id].reference_required);
             self.occurrences.push(Occurrence { object: id, kind });
             return false;
         }
 
-        // Seed the ordinary value table even for hinted strings: an equal interned constant can
+        self.record_new_metadata_string(kind, value(), slot_index)
+    }
+
+    #[expect(
+        clippy::inline_always,
+        reason = "merge first-seen metadata handling into its caller"
+    )]
+    #[inline(always)]
+    fn record_new_metadata_string(
+        &mut self,
+        kind: OccurrenceKind,
+        value: &'a str,
+        slot_index: Option<usize>,
+    ) -> bool {
+        // Seed the value or character table even for hinted strings: an equal constant can
         // be traversed before or after this metadata and must retain the same object identity.
-        let (id, first) = self.interned_string(value);
+        // Resolve a repeated metadata ID before classifying its spelling again.
+        let (id, first) = if self.cache_scalars
+            && let Some(character) = CachedObject::character(value)
+        {
+            self.record_cached(character)
+        } else {
+            self.interned_string(value)
+        };
         if let Some(slot) = slot_index.and_then(|index| self.metadata_slots.get_mut(index)) {
             *slot = Some(id);
         }
@@ -2669,17 +2706,33 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
         }
     }
 
-    #[inline]
+    #[expect(
+        clippy::inline_always,
+        reason = "keep repeated dense metadata visits in the traversal loop"
+    )]
+    #[inline(always)]
     fn metadata_string(&mut self, value: &'code str, metadata_id: Option<MetadataId>) {
-        let first = if self.graph.cache_scalars
-            && let Some(character) = CachedObject::character(value)
-        {
-            self.graph
-                .record_cached_value(OccurrenceKind::MetadataString, character)
-        } else {
-            self.graph
-                .record_metadata_string(OccurrenceKind::MetadataString, value, metadata_id)
-        };
+        let first = self.graph.record_metadata_string(
+            OccurrenceKind::MetadataString,
+            || value,
+            metadata_id,
+        );
+        if first {
+            self.graph.estimate_long_payload(value.len());
+        }
+    }
+
+    #[expect(
+        clippy::inline_always,
+        reason = "decode metadata names only on their first dense visit"
+    )]
+    #[inline(always)]
+    fn metadata_name(&mut self, value: &'code Name, metadata_id: Option<MetadataId>) {
+        let first = self.graph.record_metadata_string(
+            OccurrenceKind::MetadataString,
+            || value.as_str(),
+            metadata_id,
+        );
         if first {
             self.graph.estimate_long_payload(value.len());
         }

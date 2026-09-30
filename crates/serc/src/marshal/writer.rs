@@ -1,4 +1,4 @@
-use crate::code_object::{CodeFilename, CodeObject, Constant, MetadataId};
+use crate::code_object::{CodeFilename, CodeObject, Constant, MetadataId, MetadataName};
 use crate::{InitialInternState, PythonVersion};
 
 use super::graph::{ObjectGraph, ObjectReference, Occurrence, OccurrenceCursor, OccurrenceKind};
@@ -245,14 +245,32 @@ impl Writer<'_, '_, '_> {
         }
     }
 
+    #[expect(
+        clippy::inline_always,
+        reason = "keep metadata reference resolution in the traversal loop"
+    )]
+    #[inline(always)]
     fn interned_string_with_object(&mut self, object: ObjectId, value: &str) {
+        self.interned_string_with_value(object, || value);
+    }
+
+    #[expect(
+        clippy::inline_always,
+        reason = "decode metadata names only when emitting their payload"
+    )]
+    #[inline(always)]
+    fn interned_string_with_value<'a>(
+        &mut self,
+        object: ObjectId,
+        value: impl FnOnce() -> &'a str,
+    ) {
         let object = self.graph.object_for_writing(object);
         debug_assert!(object.is_interned(), "marshal metadata must be interned");
         let reference =
             object.reference_for_write(ReferenceMode::Forced, &mut self.reference_count);
         match reference {
             ObjectReference::Existing(index) => self.byte_and_long(TYPE_REF, index.as_u32()),
-            ObjectReference::New => self.string_payload::<true>(value, FLAG_REF),
+            ObjectReference::New => self.string_payload::<true>(value(), FLAG_REF),
             ObjectReference::Unshared => {
                 unreachable!("forced marshal reference cannot be unshared")
             }
@@ -590,6 +608,12 @@ impl<'code> MarshalVisitor<'code> for Writer<'_, '_, 'code> {
     fn metadata_string(&mut self, value: &'code str, _metadata_id: Option<MetadataId>) {
         let object = self.next_object(OccurrenceKind::MetadataString);
         self.interned_string_with_object(object, value);
+    }
+
+    #[inline]
+    fn metadata_name(&mut self, value: &'code MetadataName, _metadata_id: Option<MetadataId>) {
+        let object = self.next_object(OccurrenceKind::MetadataString);
+        self.interned_string_with_value(object, || value.as_str());
     }
 
     fn code_filename(&mut self, code: &'code CodeObject, _metadata_id: Option<MetadataId>) {
