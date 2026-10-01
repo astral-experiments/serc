@@ -117,19 +117,33 @@ fn encode_code_with_mode(
     let mut output = Vec::with_capacity(prefix.len().saturating_add(graph.estimated_wire_size()));
     output.extend_from_slice(prefix);
     let occurrences = graph.take_occurrences();
-    let mut writer = Writer {
-        graph: &mut graph,
-        output: &mut output,
+    if python_version == PythonVersion::Py312 {
+        write_code::<true>(code, root_reference, &mut graph, &mut output, occurrences);
+    } else {
+        write_code::<false>(code, root_reference, &mut graph, &mut output, occurrences);
+    }
+    output
+}
+
+fn write_code<'code, const LEGACY: bool>(
+    code: &'code CodeObject,
+    root_reference: ReferenceMode,
+    graph: &mut ObjectGraph<'code>,
+    output: &mut Vec<u8>,
+    occurrences: OccurrenceCursor<Vec<Occurrence>>,
+) {
+    let mut writer = Writer::<LEGACY> {
+        graph,
+        output,
         reference_count: 0,
         occurrences,
         frozen_set_order_index: 0,
     };
     traverse_code_with_mode(code, root_reference, &mut writer);
     writer.finish();
-    output
 }
 
-struct Writer<'output, 'graph, 'code> {
+struct Writer<'output, 'graph, 'code, const LEGACY: bool> {
     graph: &'graph mut ObjectGraph<'code>,
     output: &'output mut Vec<u8>,
     reference_count: usize,
@@ -137,7 +151,7 @@ struct Writer<'output, 'graph, 'code> {
     frozen_set_order_index: usize,
 }
 
-impl Writer<'_, '_, '_> {
+impl<const LEGACY: bool> Writer<'_, '_, '_, LEGACY> {
     fn finish(self) {
         self.occurrences.finish();
         assert_eq!(
@@ -245,6 +259,7 @@ impl Writer<'_, '_, '_> {
         }
     }
 
+    #[inline]
     fn interned_string_with_object(&mut self, object: ObjectId, value: &str) {
         let object = self.graph.object_for_writing(object);
         debug_assert!(object.is_interned(), "marshal metadata must be interned");
@@ -294,9 +309,10 @@ impl Writer<'_, '_, '_> {
         self.output.extend_from_slice(bytes);
     }
 
+    #[inline]
     fn code_metadata_string(&mut self, value: &str) {
         let object = self.next_object(OccurrenceKind::MetadataString);
-        if self.graph.python_version() == PythonVersion::Py312 {
+        if LEGACY {
             // Qualified names and generic-parameter names can retain uninterned identities.
             self.string_with_object(object, value, ReferenceMode::IfShared);
         } else {
@@ -529,7 +545,7 @@ impl Writer<'_, '_, '_> {
     }
 }
 
-impl<'code> MarshalVisitor<'code> for Writer<'_, '_, 'code> {
+impl<'code, const LEGACY: bool> MarshalVisitor<'code> for Writer<'_, '_, 'code, LEGACY> {
     const USES_METADATA_IDS: bool = false;
 
     fn python_version(&self) -> PythonVersion {
@@ -593,7 +609,7 @@ impl<'code> MarshalVisitor<'code> for Writer<'_, '_, 'code> {
     }
 
     fn code_filename(&mut self, code: &'code CodeObject, _metadata_id: Option<MetadataId>) {
-        let legacy = self.graph.python_version() == PythonVersion::Py312;
+        let legacy = LEGACY;
         let object = self.next_object(OccurrenceKind::MetadataString);
         match &code.filename {
             CodeFilename::Utf8(filename) => {

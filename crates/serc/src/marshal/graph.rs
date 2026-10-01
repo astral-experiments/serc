@@ -577,9 +577,14 @@ impl<'a> ObjectGraph<'a> {
             .and_then(|index| self.metadata_slots.get(index).copied())
             .flatten()
         {
-            debug_assert_eq!(
-                self.interned_strings.get(value),
-                Some(&id),
+            debug_assert!(
+                self.interned_strings.get(value) == Some(&id)
+                    || (self.cache_scalars
+                        && CachedObject::character(value).is_some_and(|cached| {
+                            self.cached_scalar_ids.as_deref().is_some_and(|slots| {
+                                slots[cached.scalar_index(self.python_version)] == Some(id)
+                            })
+                        })),
                 "metadata ID must identify one string"
             );
             self.objects_by_id[id].shared = true;
@@ -589,7 +594,14 @@ impl<'a> ObjectGraph<'a> {
 
         // Seed the ordinary value table even for hinted strings: an equal interned constant can
         // be traversed before or after this metadata and must retain the same object identity.
-        let (id, first) = self.interned_string(value);
+        let (id, first) = if self.cache_scalars {
+            match CachedObject::character(value) {
+                Some(cached) => self.record_cached(cached),
+                None => self.interned_string(value),
+            }
+        } else {
+            self.interned_string(value)
+        };
         if let Some(slot) = slot_index.and_then(|index| self.metadata_slots.get_mut(index)) {
             *slot = Some(id);
         }
@@ -982,14 +994,36 @@ fn collect_explicitly_interned<'a>(
     metadata_tuples: &mut FxHashSet<HashedObjectKey<'a>>,
     needs_metadata_alias_scan: bool,
 ) -> (FrozensetRecreationNeed, GraphCapacity) {
-    // Identifier objects can enter the compilation-wide constant cache before an equal
-    // ordinary string. Preserve that recorded origin when sharing constant and metadata strings.
-    values.extend(
-        code.marshal_provenance
-            .canonical_constant_strings
-            .iter()
-            .map(String::as_str),
-    );
+    // Identifier objects can enter the compiler cache before an equal ordinary string.
+    // Their canonical origin matters only for spellings not already interned by the scalar rule.
+    if let Some(values_requiring_interning) = &code
+        .marshal_provenance
+        .canonical_strings_requiring_explicit_interning
+    {
+        values.extend(values_requiring_interning.iter().map(String::as_str));
+    } else {
+        values.extend(
+            code.marshal_provenance
+                .canonical_constant_strings
+                .iter()
+                .map(String::as_str)
+                .filter(|value| !should_intern(value)),
+        );
+    }
+    if !needs_metadata_alias_scan
+        && python_version >= PythonVersion::Py313
+        && let Some([objects, occurrences, constants]) =
+            code.marshal_provenance.simple_graph_capacity
+    {
+        return (
+            FrozensetRecreationNeed::None,
+            GraphCapacity {
+                objects,
+                occurrences,
+                constants,
+            },
+        );
+    }
     let mut qualified_names = QualifiedNameConstants {
         track: python_version != PythonVersion::Py312,
         ..QualifiedNameConstants::default()
@@ -1077,7 +1111,8 @@ fn collect_interning_provenance_without_frozensets<'a>(
         code.marshal_provenance
             .explicitly_interned_strings
             .iter()
-            .map(String::as_str),
+            .map(String::as_str)
+            .filter(|value| !should_intern(value)),
     );
     qualified_names.record(code);
     for constant in &code.constants {
@@ -1111,7 +1146,8 @@ fn collect_interning_provenance<'a>(
         code.marshal_provenance
             .explicitly_interned_strings
             .iter()
-            .map(String::as_str),
+            .map(String::as_str)
+            .filter(|value| !should_intern(value)),
     );
     qualified_names.record(code);
     // Reuse the provenance walk to classify frozenset recreation for code trees that can contain
@@ -2668,15 +2704,9 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
 
     #[inline]
     fn metadata_string(&mut self, value: &'code str, metadata_id: Option<MetadataId>) {
-        let first = if self.graph.cache_scalars
-            && let Some(character) = CachedObject::character(value)
-        {
+        let first =
             self.graph
-                .record_cached_value(OccurrenceKind::MetadataString, character)
-        } else {
-            self.graph
-                .record_metadata_string(OccurrenceKind::MetadataString, value, metadata_id)
-        };
+                .record_metadata_string(OccurrenceKind::MetadataString, value, metadata_id);
         if first {
             self.graph.estimate_long_payload(value.len());
         }

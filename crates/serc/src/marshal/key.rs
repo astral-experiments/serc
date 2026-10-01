@@ -460,7 +460,18 @@ impl<'a> StringTupleKey<'a> {
 
 impl PartialEq for StringTupleKey<'_> {
     fn eq(&self, other: &Self) -> bool {
-        self.iter().eq(other.iter())
+        match (self.0, other.0) {
+            (StringTupleKind::Names(left), StringTupleKind::Names(right)) => left == right,
+            (StringTupleKind::Strings(left), StringTupleKind::Strings(right)) => left == right,
+            (StringTupleKind::Constants(left), StringTupleKind::Constants(right)) => {
+                left.len() == right.len()
+                    && left
+                        .iter()
+                        .zip(right)
+                        .all(|(left, right)| constant_string(left) == constant_string(right))
+            }
+            _ => self.iter().eq(other.iter()),
+        }
     }
 }
 
@@ -1073,7 +1084,7 @@ pub(crate) fn metadata_tuple_properties(
     }
 }
 
-pub(super) fn should_intern(value: &str) -> bool {
+pub(crate) fn should_intern(value: &str) -> bool {
     if is_cached_character(value) {
         return true;
     }

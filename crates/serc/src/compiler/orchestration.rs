@@ -1557,6 +1557,34 @@ impl<'source> Compiler<'source> {
             self.output.names.len(),
             output_locals.len(),
         );
+        let simple_graph_capacity = (!self.output.has_frozenset_constants
+            && self
+                .output
+                .interned_constant_strings
+                .iter()
+                .all(|value| crate::marshal::should_intern(value))
+            && self.output.qualified_name_constant_index.is_none())
+        .then(|| {
+            let mut capacity = [
+                constants.len().saturating_add(5),
+                constants
+                    .len()
+                    .saturating_add(self.output.names.len())
+                    .saturating_add(output_locals.len())
+                    .saturating_add(11),
+                constants.len(),
+            ];
+            for constant in &constants {
+                if let Constant::Code(child) = constant {
+                    let child_capacity = child.marshal_provenance.simple_graph_capacity?;
+                    for (total, child) in capacity.iter_mut().zip(child_capacity) {
+                        *total = total.saturating_add(child);
+                    }
+                }
+            }
+            Some(capacity)
+        })
+        .flatten();
         let mut code = CodeObject {
             arg_count: self.unit.arg_count,
             positional_only_arg_count: self.unit.positional_only_arg_count,
@@ -1590,6 +1618,13 @@ impl<'source> Compiler<'source> {
                 } else {
                     FxHashSet::default()
                 },
+                canonical_strings_requiring_explicit_interning: Some(
+                    canonical_constant_strings
+                        .iter()
+                        .filter(|value| !crate::marshal::should_intern(value))
+                        .cloned()
+                        .collect(),
+                ),
                 canonical_constant_strings,
                 qualified_name_constant_index: self.output.qualified_name_constant_index,
                 qualified_name_is_canonical: self.output.qualified_name_is_canonical,
@@ -1598,6 +1633,7 @@ impl<'source> Compiler<'source> {
                 metadata_tuple_properties: Some(metadata_tuple_properties),
                 constants_tuple_hash,
                 marshal_occurrence_bound: Some(marshal_occurrence_bound),
+                simple_graph_capacity,
                 table_hashes: None,
                 subtree_has_frozenset_constants: self.output.has_frozenset_constants,
                 metadata_alias_scan_unnecessary: false,

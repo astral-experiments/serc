@@ -13,10 +13,52 @@ use super::key::{
 use super::plan::{MarshalVisitor, ObjectId, ReferenceMode, traverse_code};
 
 #[test]
+fn simple_graph_capacity_requires_only_automatic_interning() {
+    let module = crate::compile(
+        "def f():
+    return call(alpha=1, beta=2)
+",
+        "capacity.py",
+    )
+    .unwrap();
+    assert!(
+        module
+            .code
+            .marshal_provenance
+            .simple_graph_capacity
+            .is_some()
+    );
+    for source in [
+        "class C:
+    pass
+",
+        "def f():
+    return call(Ā=1)
+",
+        "def f(x):
+    return x in {1, 2, 3}
+",
+    ] {
+        let module = crate::compile(source, "capacity.py").unwrap();
+        assert!(
+            module
+                .code
+                .marshal_provenance
+                .simple_graph_capacity
+                .is_none(),
+            "{source}"
+        );
+    }
+}
+
+#[test]
 fn cached_constant_tuple_hashes_preserve_cloned_benchmark_streams() {
     fn clear_hashes(code: &mut CodeObject) {
         code.marshal_provenance.constants_tuple_hash = None;
         code.marshal_provenance.marshal_occurrence_bound = None;
+        code.marshal_provenance.simple_graph_capacity = None;
+        code.marshal_provenance
+            .canonical_strings_requiring_explicit_interning = None;
         for value in &mut code.constants {
             if let Constant::Code(child) = value {
                 clear_hashes(child);

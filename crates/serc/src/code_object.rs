@@ -291,6 +291,9 @@ pub(crate) struct MarshalProvenance {
     pub(crate) generated_mangled_strings: FxHashSet<String>,
     /// Strings whose first compiler-cache object was already interned.
     pub(crate) canonical_constant_strings: FxHashSet<String>,
+    /// Canonical spellings not covered by automatic scalar interning. The full provenance set
+    /// remains available for frozenset reconstruction; hand-built objects use the uncached path.
+    pub(crate) canonical_strings_requiring_explicit_interning: Option<Box<[String]>>,
     /// The class-body constant loaded into `__qualname__`, when present.
     pub(crate) qualified_name_constant_index: Option<u32>,
     /// Qualified-name ownership recorded before discarded constants are pruned.
@@ -306,6 +309,9 @@ pub(crate) struct MarshalProvenance {
     pub(crate) table_hashes: Option<[u64; 2]>,
     /// Unpruned traversal size for reserving marshal occurrences and object flags.
     pub(crate) marshal_occurrence_bound: Option<usize>,
+    /// Whole-tree allocation estimates when only automatic interning is needed.
+    /// Stores object, occurrence, and constant counts; absent for special interning origins.
+    pub(crate) simple_graph_capacity: Option<[usize; 3]>,
     /// Whether this code tree can contain a frozenset constant.
     pub(crate) subtree_has_frozenset_constants: bool,
     /// Whether no surviving constant tuple can share a non-identifier string with code metadata.
