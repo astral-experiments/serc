@@ -116,7 +116,7 @@ fn compile_command(command: CompileCommand) -> Result<ExitCode, String> {
     } else {
         command.paths
     };
-    let (paths, independent_sources) = discover_with_source_independence(&roots)?;
+    let paths = discover(&roots)?;
     let mut failures = 0_usize;
     // Code generation has three levels, but Python keeps every `-O` in the cache tag.
     let cache_optimization = command
@@ -145,30 +145,16 @@ fn compile_command(command: CompileCommand) -> Result<ExitCode, String> {
         jobs_for_inputs(command.jobs, paths.len()),
     );
     if jobs <= 1 {
-        let pipelined = if !command.check && paths.len() > 1 && independent_sources {
-            compile_with_writer(
-                &paths,
+        for path in &paths {
+            if let Err(message) = compile_path(
+                path,
+                command.check,
                 command.invalidation_mode,
                 &options,
                 cache_optimization,
-            )
-        } else {
-            None
-        };
-        if let Some(count) = pipelined {
-            failures = count;
-        } else {
-            for path in &paths {
-                if let Err(message) = compile_path(
-                    path,
-                    command.check,
-                    command.invalidation_mode,
-                    &options,
-                    cache_optimization,
-                ) {
-                    failures += 1;
-                    write_error(&message);
-                }
+            ) {
+                failures += 1;
+                write_error(&message);
             }
         }
     } else {
@@ -403,23 +389,13 @@ fn cache_directory_identity(directory: &Path) -> CacheDirectoryIdentity {
         .unwrap_or(CacheDirectoryIdentity::Unknown)
 }
 
-#[cfg(test)]
 fn discover(roots: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
-    discover_with_source_independence(roots).map(|(paths, _)| paths)
-}
-
-/// Ordinary .py files cannot be replaced by an earlier .pyc write. Symlinks and explicit
-/// non-.py inputs can refer to a preceding output and retain fully serial read/write order.
-fn discover_with_source_independence(roots: &[PathBuf]) -> Result<(Vec<PathBuf>, bool), String> {
     let mut paths = Vec::new();
-    let mut independent_sources = true;
 
     for root in roots {
         let metadata = fs_err::metadata(root)
             .map_err(|error| format!("failed to inspect {}: {error}", root.display()))?;
         if metadata.is_file() {
-            independent_sources &= has_python_suffix(root)
-                && fs_err::symlink_metadata(root).is_ok_and(|metadata| metadata.is_file());
             paths.push(root.clone());
             continue;
         }
@@ -441,7 +417,6 @@ fn discover_with_source_independence(roots: &[PathBuf]) -> Result<(Vec<PathBuf>,
                 || (entry.file_type().is_symlink() && entry.path().is_file()))
                 && has_python_suffix(entry.path())
             {
-                independent_sources &= entry.file_type().is_file();
                 paths.push(entry.into_path());
             }
         }
@@ -452,7 +427,7 @@ fn discover_with_source_independence(roots: &[PathBuf]) -> Result<(Vec<PathBuf>,
     if paths.is_empty() {
         return Err("no Python files found".to_string());
     }
-    Ok((paths, independent_sources))
+    Ok(paths)
 }
 
 fn has_python_suffix(path: &Path) -> bool {
@@ -488,34 +463,6 @@ fn compile_path_with_metadata(
     cache_optimization: usize,
     load_metadata: impl FnOnce(&Path) -> io::Result<std::fs::Metadata>,
 ) -> Result<(), String> {
-    if let Some(cache) = prepare_cache_with_metadata(
-        path,
-        check,
-        invalidation_mode,
-        options,
-        cache_optimization,
-        load_metadata,
-    )? {
-        cache.write()?;
-    }
-    Ok(())
-}
-
-struct PreparedCache {
-    path: PathBuf,
-    output: PathBuf,
-    pyc: Vec<u8>,
-    metadata: std::fs::Metadata,
-}
-
-fn prepare_cache_with_metadata(
-    path: &Path,
-    check: bool,
-    invalidation_mode: InvalidationMode,
-    options: &CompileOptions,
-    cache_optimization: usize,
-    load_metadata: impl FnOnce(&Path) -> io::Result<std::fs::Metadata>,
-) -> Result<Option<PreparedCache>, String> {
     // Snapshot timestamp-cache metadata before reading. If the path changes during compilation,
     // the resulting header describes the old state and cannot validate the new source as fresh.
     let metadata = (!check)
@@ -538,7 +485,7 @@ fn prepare_cache_with_metadata(
 
     let Some(metadata) = metadata else {
         black_box(module);
-        return Ok(None);
+        return Ok(());
     };
 
     let pyc = match invalidation_mode {
@@ -552,92 +499,28 @@ fn prepare_cache_with_metadata(
         InvalidationMode::UncheckedHash => module.to_hash_pyc(&source_bytes, false),
     };
     let output = cache_path(path, options.python_version, cache_optimization)?;
-    Ok(Some(PreparedCache {
-        path: path.to_owned(),
-        output,
-        pyc,
-        metadata,
-    }))
-}
 
-impl PreparedCache {
-    fn write(self) -> Result<(), String> {
-        let Self {
-            path,
-            output,
-            pyc,
-            metadata,
-        } = self;
-        let parent = output.parent().ok_or_else(|| {
-            format!(
-                "failed to determine the cache directory for {}",
-                path.display()
-            )
-        })?;
-        let mut temporary = if let Ok(temporary) = temporary_cache_file(parent, &metadata) {
-            temporary
-        } else {
-            fs_err::create_dir_all(parent)
-                .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
-            temporary_cache_file(parent, &metadata)
-                .map_err(|error| format!("failed to create a temporary cache file: {error}"))?
-        };
-        temporary
-            .write_all(&pyc)
-            .map_err(|error| format!("failed to write a temporary cache file: {error}"))?;
-        temporary
-            .persist(&output)
-            .map(|_| ())
-            .map_err(|error| format!("failed to replace {}: {error}", output.display()))
-    }
-}
-
-/// Overlap one compiler with one ordered cache writer. The bounded queue retains at most
-/// one waiting output, so whole-project bytecode is never accumulated in memory.
-/// No source is read until the optional worker starts; failure to spawn falls back to serial.
-fn compile_with_writer(
-    paths: &[PathBuf],
-    invalidation_mode: InvalidationMode,
-    options: &CompileOptions,
-    cache_optimization: usize,
-) -> Option<usize> {
-    std::thread::scope(|scope| {
-        let (sender, receiver) = std::sync::mpsc::sync_channel::<Result<PreparedCache, String>>(1);
-        let writer = std::thread::Builder::new()
-            .name("serc-cache-writer".to_string())
-            .spawn_scoped(scope, move || {
-                let mut failures = 0;
-                for result in receiver {
-                    if let Err(message) = result.and_then(PreparedCache::write) {
-                        failures += 1;
-                        write_error(&message);
-                    }
-                }
-                failures
-            })
-            .ok()?;
-        for path in paths {
-            let cache = prepare_cache_with_metadata(
-                path,
-                false,
-                invalidation_mode,
-                options,
-                cache_optimization,
-                |path| fs_err::metadata(path),
-            )
-            .map(|cache| cache.expect("cache writing is enabled"));
-            if sender.send(cache).is_err() {
-                // A writer panic closes the queue. Join below to propagate the original panic.
-                break;
-            }
-        }
-        drop(sender);
-        Some(
-            writer
-                .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+    let parent = output.parent().ok_or_else(|| {
+        format!(
+            "failed to determine the cache directory for {}",
+            path.display()
         )
-    })
+    })?;
+    let mut temporary = if let Ok(temporary) = temporary_cache_file(parent, &metadata) {
+        temporary
+    } else {
+        fs_err::create_dir_all(parent)
+            .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+        temporary_cache_file(parent, &metadata)
+            .map_err(|error| format!("failed to create a temporary cache file: {error}"))?
+    };
+    temporary
+        .write_all(&pyc)
+        .map_err(|error| format!("failed to write a temporary cache file: {error}"))?;
+    temporary
+        .persist(&output)
+        .map(|_| ())
+        .map_err(|error| format!("failed to replace {}: {error}", output.display()))
 }
 
 /// Reuse the timestamp snapshot as a size hint without querying the opened file again.
@@ -1143,14 +1026,7 @@ mod tests {
         fs_err::write(directory.path().join("ignored.txt"), "pass\n").unwrap();
         fs_err::write(nested.join("a.py"), "pass\n").unwrap();
 
-        let (paths, independent) =
-            super::discover_with_source_independence(&[directory.path().to_path_buf()]).unwrap();
-        assert!(independent);
-        assert!(
-            !super::discover_with_source_independence(&[directory.path().join("ignored.txt")])
-                .unwrap()
-                .1
-        );
+        let paths = discover(&[directory.path().to_path_buf()]).unwrap();
 
         assert_eq!(
             paths,
@@ -1184,14 +1060,9 @@ mod tests {
         fs_err::write(&target, "pass\n").unwrap();
         symlink(&target, &source).unwrap();
 
-        let (paths, independent) =
-            super::discover_with_source_independence(&[directory.path().to_path_buf()]).unwrap();
-        assert_eq!(paths.as_slice(), std::slice::from_ref(&source));
-        assert!(!independent);
-        assert!(
-            !super::discover_with_source_independence(&[source])
-                .unwrap()
-                .1
+        assert_eq!(
+            discover(&[directory.path().to_path_buf()]).unwrap(),
+            [source]
         );
     }
 }
