@@ -306,6 +306,8 @@ pub(crate) struct MarshalProvenance {
     pub(crate) metadata_tuple_properties: Option<MarshalMetadataTupleProperties>,
     /// Hash of a constants tuple whose key survives cloning; code identities are excluded.
     pub(crate) constants_tuple_hash: Option<u64>,
+    /// Allocation-keyed hashes are discarded when cloning the code tree.
+    pub(crate) constant_hashes: crate::marshal::ConstantHashes,
     /// Value hashes of the immutable line and exception tables, in wire order.
     pub(crate) table_hashes: Option<[u64; 2]>,
     /// Unpruned traversal size for reserving marshal occurrences and object flags.

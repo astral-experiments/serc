@@ -1599,6 +1599,7 @@ impl<'source> Compiler<'source> {
                 metadata_name_lookup: None,
                 metadata_tuple_properties: Some(metadata_tuple_properties),
                 constants_tuple_hash,
+                constant_hashes: crate::marshal::ConstantHashes::default(),
                 marshal_occurrence_bound: Some(marshal_occurrence_bound),
                 marshal_graph_summary: None,
                 table_hashes: None,
@@ -1614,6 +1615,8 @@ impl<'source> Compiler<'source> {
         code.validate()?;
         code.marshal_provenance.assembly_order = self.context.record_code_assembly(&code);
         if matches!(self.unit.scope, Scope::Module) {
+            code.marshal_provenance.constant_hashes =
+                crate::marshal::constant_hashes_for_code(&code);
             code.marshal_provenance.interning_events = self.context.take_interning_events();
             code.marshal_provenance.interned_metadata_tuples =
                 self.context.take_interned_metadata_tuples();

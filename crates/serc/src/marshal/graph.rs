@@ -215,6 +215,7 @@ pub(super) struct ObjectGraph<'a> {
     interned_strings: FxHashMap<&'a str, ObjectId>,
     aliases: GraphAliases,
     metadata_slots: Box<[Option<ObjectId>]>,
+    constant_hashes: Option<&'a super::key::ConstantHashes>,
     metadata_name_lookup: Option<&'a crate::compiler::MarshalNameLookup>,
     cached_empty_bytes: Option<ObjectId>,
     cached_empty_tuple: Option<ObjectId>,
@@ -516,6 +517,8 @@ impl<'a> ObjectGraph<'a> {
             uncached_percent_constant: code.marshal_provenance.uncached_percent_constant,
             fresh_empty_bytes_constant: code.marshal_provenance.fresh_empty_bytes_constant,
             metadata_slots,
+            constant_hashes: (!code.marshal_provenance.constant_hashes.is_empty())
+                .then_some(&code.marshal_provenance.constant_hashes),
             metadata_name_lookup: code.marshal_provenance.metadata_name_lookup.as_deref(),
             ..Self::default()
         };
@@ -621,7 +624,11 @@ impl<'a> ObjectGraph<'a> {
         self.estimated_payload_bytes = self.estimated_payload_bytes.saturating_add(length);
     }
 
+    #[inline]
     fn record_keyed(&mut self, kind: OccurrenceKind, key: ObjectKey<'a>) -> bool {
+        if let Some(hash) = self.constant_hashes.and_then(|hashes| hashes.get(&key)) {
+            return self.record_hashed(kind, HashedObjectKey::with_hash(key, hash));
+        }
         self.record_hashed(kind, key.into())
     }
 

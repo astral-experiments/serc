@@ -140,6 +140,96 @@ impl<'a> HashedObjectKey<'a> {
     }
 }
 
+/// Hashes for immutable constant containers at their finalized allocation addresses.
+/// A cloned code tree owns new allocations and deliberately discards these hints.
+#[derive(Default)]
+pub(crate) struct ConstantHashes(Option<Box<FxHashMap<(u8, usize), u64>>>);
+
+impl std::fmt::Debug for ConstantHashes {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConstantHashes")
+            .field(
+                "containers",
+                &self.0.as_ref().map_or(0, |hashes| hashes.len()),
+            )
+            .finish()
+    }
+}
+
+impl Clone for ConstantHashes {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl ConstantHashes {
+    pub(super) fn get(&self, key: &ObjectKey<'_>) -> Option<u64> {
+        self.0
+            .as_ref()?
+            .get(&container_hash_identity(key)?)
+            .copied()
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.0.is_none()
+    }
+}
+
+fn container_hash_identity(key: &ObjectKey<'_>) -> Option<(u8, usize)> {
+    match key {
+        ObjectKey::ConstantTuple(ConstantTupleKey(values)) => Some((0, values.as_ptr().addr())),
+        ObjectKey::FrozenSet(FrozenSetKey(values)) => Some((1, values.as_ptr().addr())),
+        ObjectKey::StringTuple(StringTupleKey(StringTupleKind::Constants(values))) => {
+            Some((2, values.as_ptr().addr()))
+        }
+        ObjectKey::Slice(SliceKey(value)) => Some((3, std::ptr::from_ref(*value).addr())),
+        _ => None,
+    }
+}
+
+pub(crate) fn constant_hashes_for_code(code: &CodeObject) -> ConstantHashes {
+    fn collect(value: &Constant, hashes: &mut FxHashMap<(u8, usize), u64>) {
+        match value {
+            Constant::Code(code) => {
+                for child in &code.constants {
+                    collect(child, hashes);
+                }
+            }
+            Constant::Tuple(values) | Constant::FrozenSet(values) => {
+                for child in values {
+                    collect(child, hashes);
+                }
+                // Empty allocations share a dangling address and need no expensive hash.
+                if values.is_empty() {
+                    return;
+                }
+                let key = constant_key(value);
+                hashes.insert(
+                    container_hash_identity(&key).expect("nonempty container has a cache identity"),
+                    HashedObjectKey::new(key).hash,
+                );
+            }
+            Constant::Slice { lower, upper, step } => {
+                for child in [lower, upper, step] {
+                    collect(child, hashes);
+                }
+                let key = constant_key(value);
+                hashes.insert(
+                    container_hash_identity(&key).expect("slice has a cache identity"),
+                    HashedObjectKey::new(key).hash,
+                );
+            }
+            _ => {}
+        }
+    }
+    let mut hashes = FxHashMap::default();
+    for value in &code.constants {
+        collect(value, &mut hashes);
+    }
+    ConstantHashes((hashes.len() >= 4).then(|| Box::new(hashes)))
+}
+
 impl<'a> From<ObjectKey<'a>> for HashedObjectKey<'a> {
     fn from(key: ObjectKey<'a>) -> Self {
         Self::new(key)

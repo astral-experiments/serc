@@ -3410,3 +3410,80 @@ fn cached_latin1_metadata_keeps_unicode_tags_with_ascii_hints() {
         );
     }
 }
+
+#[test]
+fn container_hashes_match_uncached_streams_and_are_discarded_by_clones() {
+    fn compare(module: crate::CompiledModule, label: &str) -> bool {
+        let enabled = !module.code.marshal_provenance.constant_hashes.is_empty();
+        let mut cloned = module.clone();
+        assert!(cloned.code.marshal_provenance.constant_hashes.is_empty());
+        let expected = cloned.marshal();
+        assert_eq!(module.marshal(), expected, "{label}");
+        assert_eq!(
+            module.to_timestamp_pyc(42, 100),
+            cloned.to_timestamp_pyc(42, 100)
+        );
+        drop(module);
+        // Repeated clones must not regain an address-keyed hint after the original is freed.
+        for _ in 0..8 {
+            let successor = cloned.clone();
+            drop(cloned);
+            cloned = successor;
+            assert!(cloned.code.marshal_provenance.constant_hashes.is_empty());
+            assert_eq!(cloned.marshal(), expected, "cloned {label}");
+        }
+        enabled
+    }
+
+    let mut enabled = 0;
+    for workload in serc_fixtures::MARSHAL_MICRO_WORKLOADS
+        .iter()
+        .chain(serc_fixtures::COMPOSITE_WORKLOADS)
+        .chain(serc_fixtures::LARGE_WORKLOADS)
+    {
+        enabled += usize::from(compare(
+            crate::compile(workload.source, workload.filename).unwrap(),
+            workload.id,
+        ));
+    }
+    assert!(enabled > 0);
+
+    for python_version in [
+        crate::PythonVersion::Py312,
+        crate::PythonVersion::Py313,
+        crate::PythonVersion::Py314,
+        crate::PythonVersion::Py315,
+    ] {
+        for workload in serc_fixtures::MARSHAL_MICRO_WORKLOADS {
+            compare(
+                crate::compile_with_options(
+                    workload.source,
+                    workload.filename,
+                    &crate::CompileOptions {
+                        python_version,
+                        ..crate::CompileOptions::default()
+                    },
+                )
+                .unwrap(),
+                workload.id,
+            );
+        }
+    }
+
+    let mut code = code_object(vec![
+        Constant::Tuple(vec![Constant::Int(1000), Constant::String("café".into())]),
+        Constant::FrozenSet(vec![Constant::Int(2), Constant::Int(1)]),
+        Constant::FrozenSet(vec![Constant::FrozenSet(vec![
+            Constant::Int(1),
+            Constant::Int(2),
+        ])]),
+        Constant::Slice {
+            lower: Box::new(Constant::Int(1000)),
+            upper: Box::new(Constant::String("upper".into())),
+            step: Box::new(Constant::None),
+        },
+    ]);
+    code.marshal_provenance.constant_hashes = super::constant_hashes_for_code(&code);
+    assert!(!code.marshal_provenance.constant_hashes.is_empty());
+    assert_eq!(encode_code(&code), encode_code(&code.clone()));
+}
