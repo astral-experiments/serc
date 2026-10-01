@@ -223,7 +223,10 @@ jobs:
     permissions:
       contents: read
     env:
-      <<: *rust-env
+      CARGO_INCREMENTAL: 0
+      CARGO_NET_RETRY: 10
+      CARGO_TERM_COLOR: always
+      RUSTUP_MAX_RETRIES: 10
       CARGO_PROFILE_TEST_DEBUG: 0
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
