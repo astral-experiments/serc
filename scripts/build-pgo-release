@@ -340,15 +340,22 @@ def main():
         expectations = run(
             [repo / "scripts/ruff-corpus-expectations", "3.14"]
         ).splitlines()
-        run(
-            [
-                training,
-                "--reference",
-                reference,
-                "--python-version",
-                "3.14",
-                *expectations,
-            ],
+
+        def compare_corpus(executable, env=None):
+            run(
+                [
+                    executable,
+                    "--reference",
+                    reference,
+                    "--python-version",
+                    "3.14",
+                    *expectations,
+                ],
+                env,
+            )
+
+        compare_corpus(
+            training,
             {
                 "RAYON_NUM_THREADS": "1",
                 "LLVM_PROFILE_FILE": str(raw / "ruff-%m-%p.profraw"),
@@ -369,6 +376,16 @@ def main():
             for jobs in (1, parallel_jobs):
                 compile_corpus(binary, jobs)
                 verify_bytecode(corpus, control_outputs)
+            # Validate the profile-use build too: the training comparator only
+            # checked the independently optimized profile-generation executable.
+            comparison = build(
+                "serc",
+                ["--example", "compare_cpython_corpus"],
+                output / "use-target",
+                f"-Cprofile-use={merged}",
+            )
+            compare_corpus(comparison)
+            manifest["optimized_ruff_compatibility"] = "passed"
             artifact = run_dir / binary.name
             shutil.copy2(binary, artifact)
             manifest.update({"binary": str(artifact), "binary_sha256": sha(artifact)})

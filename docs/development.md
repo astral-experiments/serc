@@ -40,7 +40,8 @@ Instrumented and final PGO builds must produce the same complete `.pyc` files as
 an independently built ordinary executable. The manifest also records per-file
 differences against CPython 3.14.5; those files remain in training. The separate
 pinned Ruff compatibility gate remains strict and supplies additional syntax
-coverage.
+coverage. The final profile-use build must also pass that gate before the recipe
+publishes its executable and marks the manifest complete.
 
 The executable, merged profile, and manifest are written under
 `target/pgo-release/run-*`. The manifest records commands, toolchains, project

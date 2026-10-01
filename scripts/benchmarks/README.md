@@ -53,3 +53,35 @@ SERC_PGO_PROFILE="$PWD/target/pgo-release/run-EXAMPLE/training.profdata" \
 
 The runner records the profile path and SHA-256 alongside the usual benchmark
 metadata. Unset `RUSTFLAGS` and `CARGO_ENCODED_RUSTFLAGS` when using PGO.
+
+## Compare two release builds
+
+Build and preserve both executables before measuring. Use a disposable project
+checkout: this harness recursively deletes its `__pycache__` directories before
+every process. It keeps OS filesystem caches warm and includes discovery, reads,
+compilation, first serialization, and cache writes in each elapsed time.
+
+```console
+python scripts/benchmarks/compare-releases.py \
+  /path/to/serc-baseline /path/to/serc-optimized /path/to/project \
+  target/benchmarks/results/release-comparison.json \
+  --baseline-revision BASELINE_COMMIT_SHA \
+  --python /path/to/python3.14.5 --cpus 2 --jobs 1 --warmups 5 --samples 50
+```
+
+Both binaries receive identical options: Python 3.14, optimization level 0,
+timestamp invalidation, and the requested worker count. Choose an available CPU
+or CPU list for `--cpus`. Each pair alternates baseline-first and optimized-first
+order. Cleanup and validation are outside timing. Every run must reproduce the
+baseline's complete output hashes, exit status, and diagnostics; `--python` also
+requires byte-for-byte agreement with the exact CPython 3.14.5 oracle.
+
+The JSON records every wall-clock and CPU-time sample, binary hashes, source and
+output manifest hashes, project revision, commands, mean, sample standard
+deviation, median, range, and a paired bootstrap 95% interval for the percentage
+reduction in mean elapsed time. Use a fresh measurement series after exploratory
+pilots, and compare existing Criterion workloads separately.
+
+For a checkout containing deliberately invalid test fixtures, explicitly supply
+`--expected-exit-code 1 --expected-output-count N`. The same diagnostics and all
+`N` successful outputs are still checked on every run.
