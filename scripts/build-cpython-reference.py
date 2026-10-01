@@ -29,7 +29,10 @@ def loaded_libpython(*, required: bool) -> Path | None:
             raise ValueError("Mapped libpython has a deleted or escaped path")
         info = path.stat()
         device = tuple(int(part, 16) for part in fields[3].split(":"))
-        if (os.major(info.st_dev), os.minor(info.st_dev)) != device or info.st_ino != int(fields[4]):
+        if (
+            os.major(info.st_dev),
+            os.minor(info.st_dev),
+        ) != device or info.st_ino != int(fields[4]):
             raise ValueError("Mapped libpython file identity changed")
         libraries[(info.st_dev, info.st_ino)] = path.resolve(strict=True)
     if not libraries and not required:
@@ -39,14 +42,16 @@ def loaded_libpython(*, required: bool) -> Path | None:
     return next(iter(libraries.values()))
 
 
-def reference_library(library_dir: Path, library_name: str) -> Path:
+def reference_library(
+    library_dir: Path, library_name: str, *, configured_prefix: Path
+) -> Path:
     if not library_name or Path(library_name).name != library_name:
         raise ValueError("Invalid CPython shared library filename")
     library = library_dir / library_name
-    relocated = not library_dir.exists()
+    prefix = Path(sys.base_prefix).resolve(strict=True)
+    relocated = configured_prefix.resolve() != prefix or not library_dir.exists()
     if relocated:
         # Relocated CI archives can retain their original build-time LIBDIR.
-        prefix = Path(sys.base_prefix).resolve(strict=True)
         library = prefix / "lib" / library_name
         if not library.resolve(strict=True).is_relative_to(prefix):
             raise ValueError("Relocated libpython escapes the interpreter prefix")
@@ -73,6 +78,7 @@ def main() -> None:
         library = reference_library(
             Path(sysconfig.get_config_var("LIBDIR")),
             sysconfig.get_config_var("LDLIBRARY"),
+            configured_prefix=Path(sysconfig.get_config_var("prefix")),
         )
     except (OSError, ValueError) as error:
         parser.error(str(error))

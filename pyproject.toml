@@ -67,6 +67,10 @@ extend-exclude = ["crates/serc/tests/fixtures", "crates/serc_fixtures/resources"
 "python/**/*.py" = "py38"
 "scripts/*release*.py" = "py311"
 
+[tool.ruff.format]
+# This auditor's exact source bytes are pinned by the startup ownership proof.
+exclude = ["crates/serc/scripts/audit_startup_owners.py"]
+
 [tool.ruff.lint]
 select = [
   "E",

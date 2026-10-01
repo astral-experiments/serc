@@ -536,12 +536,12 @@ def render_preinterned_lookup(
         if value and value not in preinterned_strings:
             supplemental.setdefault(prefix(value), []).append(value)
 
-    empty = str('' in preinterned_strings or '' in supplemental_strings).lower()
+    empty = str("" in preinterned_strings or "" in supplemental_strings).lower()
     if (
         not compiler_strings_on_linux
-        and '' in compiler_strings
-        and '' not in preinterned_strings
-        and '' not in startup_strings
+        and "" in compiler_strings
+        and "" not in preinterned_strings
+        and "" not in startup_strings
     ):
         empty = 'cfg!(not(target_os = "linux"))'
     lines = [
@@ -1256,7 +1256,9 @@ def render(sources: dict[str, str]) -> str:
             ]
         )
         lookup = render_preinterned_lookup(
-            preinterned_strings, (), tuple(compiler_interned_strings),
+            preinterned_strings,
+            (),
+            tuple(compiler_interned_strings),
             compiler_strings_on_linux=False,
         )
         lookup[0] = "fn is_preinterned_static_string(value: &str) -> bool {"
@@ -1544,7 +1546,7 @@ def check_numeric_authority() -> None:
         for match in raw_operand.finditer(source):
             # Inspect the suffix after matching the full numeric token. Putting
             # this exclusion in the regex could backtrack to a digit prefix.
-            if re.match(r"\s*=>", source[match.end():]):
+            if re.match(r"\s*=>", source[match.end() :]):
                 continue
             raise ValueError(
                 f"{relative} duplicates a numeric target operand near `{match.group(0)}`"

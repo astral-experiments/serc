@@ -218,7 +218,7 @@ class RenderPreinternedLookupTest(unittest.TestCase):
         native = generator.render_preinterned_lookup(
             *arguments, compiler_strings_on_linux=False
         )
-        self.assertIn('        [] => return true,', original)
+        self.assertIn("        [] => return true,", original)
         self.assertIn('        0x6c65 => return value == "left",', original)
         self.assertIn('        [] => return cfg!(not(target_os = "linux")),', native)
         self.assertIn(
@@ -227,7 +227,7 @@ class RenderPreinternedLookupTest(unittest.TestCase):
         )
         for lines in [original, native]:
             self.assertIn('        0x7265 => return value == "retained",', lines)
-            self.assertIn('        0x7374 => (0, 1),', lines)
+            self.assertIn("        0x7374 => (0, 1),", lines)
 
     def test_renders_exact_prefix_ranges_and_startup_candidates(self) -> None:
         self.assertEqual(
@@ -305,8 +305,17 @@ class TargetSelectionTest(unittest.TestCase):
         ).read_bytes()
         generator.validate_minimal_startup_profile(original, reference)
         for mutation in (
-            "source", "protocol", "legacy_protocol", "duplicate", "failed", "different_sets",
-            "single_read", "changed_output", "wrong_count", "wrong_thread_count", "wrong_build",
+            "source",
+            "protocol",
+            "legacy_protocol",
+            "duplicate",
+            "failed",
+            "different_sets",
+            "single_read",
+            "changed_output",
+            "wrong_count",
+            "wrong_thread_count",
+            "wrong_build",
         ):
             with self.subTest(mutation=mutation):
                 profile = json.loads(json.dumps(original))
@@ -413,15 +422,22 @@ class TargetSelectionTest(unittest.TestCase):
                 data = json.dumps(profile).encode()
                 with (
                     mock.patch.object(
-                        Path, "read_bytes", autospec=True,
-                        side_effect=lambda candidate: data if candidate == path else read_bytes(candidate),
+                        Path,
+                        "read_bytes",
+                        autospec=True,
+                        side_effect=lambda candidate, data=data: (
+                            data if candidate == path else read_bytes(candidate)
+                        ),
                     ),
                     mock.patch.object(
                         generator,
                         "STARTUP_314_SHA256",
                         hashlib.sha256(data).hexdigest(),
                     ),
-                    self.assertRaisesRegex(ValueError, "incomplete retained ownership|provenance is incomplete"),
+                    self.assertRaisesRegex(
+                        ValueError,
+                        "incomplete retained ownership|provenance is incomplete",
+                    ),
                 ):
                     generator.read_startup_strings()
 

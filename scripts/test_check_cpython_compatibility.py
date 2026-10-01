@@ -1,13 +1,15 @@
 """Check native reference routing without compiling the compatibility corpus."""
 
+from __future__ import annotations
+
 import json
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parent
 VERSIONS = ("3.12", "3.13", "3.14", "3.15")
@@ -25,13 +27,16 @@ class CompatibilityCommandTests(unittest.TestCase):
         self.pin_check = scripts / "check-ruff-pin"
         self.pin_check.write_text("#!/usr/bin/env bash\nexit 0\n")
         self.pin_check.chmod(0o755)
-        self.roots = [self.root / "vendor/ruff" / suffix for suffix in (
-            "crates/ty_python_semantic/resources/corpus",
-            "crates/ruff_python_parser/resources/valid",
-            "crates/ruff_python_parser/resources/inline/ok",
-            "crates/ruff_linter/resources/test/fixtures",
-            "crates/ruff_python_formatter/resources/test/fixtures",
-        )]
+        self.roots = [
+            self.root / "vendor/ruff" / suffix
+            for suffix in (
+                "crates/ty_python_semantic/resources/corpus",
+                "crates/ruff_python_parser/resources/valid",
+                "crates/ruff_python_parser/resources/inline/ok",
+                "crates/ruff_linter/resources/test/fixtures",
+                "crates/ruff_python_formatter/resources/test/fixtures",
+            )
+        ]
         for root in self.roots:
             root.mkdir(parents=True)
         executable = self.root / "cargo"
@@ -53,18 +58,33 @@ class CompatibilityCommandTests(unittest.TestCase):
 
     def invoke(self, *arguments, **environment):
         return subprocess.run(
-            ["bash", str(self.root / "scripts/check-cpython-compatibility"), *arguments],
-            env=self.environment | environment, capture_output=True, text=True, check=False,
+            [
+                "bash",
+                str(self.root / "scripts/check-cpython-compatibility"),
+                *arguments,
+            ],
+            env=self.environment | environment,
+            capture_output=True,
+            text=True,
+            check=False,
         )
 
     def comparison(self, *arguments, **environment):
         result = self.invoke(*arguments, **environment)
         self.assertEqual(result.returncode, 0, result.stderr)
         command = json.loads(result.stdout)
-        self.assertEqual(command[:7], [
-            "run", "--locked", "--manifest-path", str(self.root / "Cargo.toml"),
-            "-p", "serc", "--example",
-        ])
+        self.assertEqual(
+            command[:7],
+            [
+                "run",
+                "--locked",
+                "--manifest-path",
+                str(self.root / "Cargo.toml"),
+                "-p",
+                "serc",
+                "--example",
+            ],
+        )
         self.assertEqual(command[7:9], ["compare_cpython_corpus", "--"])
         self.assertEqual(command[-5:], list(map(str, self.roots)))
         return command[9:-5]
@@ -77,50 +97,82 @@ class CompatibilityCommandTests(unittest.TestCase):
     def built_comparison(self, *arguments, python, **environment):
         command = self.comparison(*arguments, **environment)
         self.assertEqual(command[0], "--reference")
-        self.assertEqual(json.loads(self.build_record.read_text()), [
-            str(python), "-I", "-S", str(self.root / "scripts/build-cpython-reference.py"),
-            "--output", command[1],
-        ])
-        self.assertFalse(Path(command[1]).parent.exists(), "temporary reference was not removed")
+        self.assertEqual(
+            json.loads(self.build_record.read_text()),
+            [
+                str(python),
+                "-I",
+                "-S",
+                str(self.root / "scripts/build-cpython-reference.py"),
+                "--output",
+                command[1],
+            ],
+        )
+        self.assertFalse(
+            Path(command[1]).parent.exists(), "temporary reference was not removed"
+        )
         return command[2:]
 
     def test_python_mode_builds_reference_and_preserves_every_expectation(self):
         for version in VERSIONS:
             with self.subTest(version=version):
                 self.assertEqual(
-                    self.built_comparison(str(self.python), version, python=self.python),
+                    self.built_comparison(
+                        str(self.python), version, python=self.python
+                    ),
                     ["--python-version", version, *self.expected(version)],
                 )
 
     def test_reference_mode_preserves_every_numeric_gate(self):
         for version in VERSIONS:
             with self.subTest(version=version):
-                expected = ["--reference", "/reference with spaces", "--python-version", version]
+                expected = [
+                    "--reference",
+                    "/reference with spaces",
+                    "--python-version",
+                    version,
+                ]
                 expected += self.expected(version)
-                self.assertEqual(self.comparison("--reference", "/reference with spaces", version,
-                                                 CPYTHON="/not/the/reference"), expected)
+                self.assertEqual(
+                    self.comparison(
+                        "--reference",
+                        "/reference with spaces",
+                        version,
+                        CPYTHON="/not/the/reference",
+                    ),
+                    expected,
+                )
                 self.assertFalse(self.build_record.exists())
 
     def test_py314_annotation_rejection_budget_is_strict_in_both_modes(self):
-        for arguments in ((str(self.python), "3.14"), ("--reference", "/reference", "3.14")):
+        for arguments in (
+            (str(self.python), "3.14"),
+            ("--reference", "/reference", "3.14"),
+        ):
             with self.subTest(arguments=arguments):
                 command = self.comparison(*arguments)
                 self.assertIn("matched-rejection=222", command)
                 self.assertIn("rejection-mismatch=0", command)
                 self.assertIn("byte-mismatch=0", command)
                 self.assertIn("compiler-failure=2", command)
-                for flag, value in (("--expected-files", "2470"),
-                                    ("--expected-exact", "2246"),
-                                    ("--expected-cpython-rejected", "224")):
+                for flag, value in (
+                    ("--expected-files", "2470"),
+                    ("--expected-exact", "2246"),
+                    ("--expected-cpython-rejected", "224"),
+                ):
                     self.assertEqual(command[command.index(flag) + 1], value)
 
     def test_default_python_target(self):
-        self.assertEqual(self.built_comparison(python=self.root / "python3.14")[:2],
-                         ["--python-version", "3.14"])
+        self.assertEqual(
+            self.built_comparison(python=self.root / "python3.14")[:2],
+            ["--python-version", "3.14"],
+        )
 
     def test_cpython_environment_is_preserved(self):
-        self.assertEqual(self.built_comparison(CPYTHON=str(self.python), python=self.python)[:2],
-                         ["--python-version", "3.14"])
+        self.assertEqual(
+            self.built_comparison(CPYTHON=str(self.python), python=self.python)[:2],
+            ["--python-version", "3.14"],
+        )
 
     def test_reference_build_failure_never_invokes_cargo(self):
         result = self.invoke(str(self.python), FAIL_REFERENCE_BUILD="1")
@@ -128,13 +180,20 @@ class CompatibilityCommandTests(unittest.TestCase):
         self.assertEqual(result.stdout, "")
 
     def test_default_reference_target(self):
-        self.assertEqual(self.comparison("--reference", "/reference")[:4],
-                         ["--reference", "/reference", "--python-version", "3.14"])
+        self.assertEqual(
+            self.comparison("--reference", "/reference")[:4],
+            ["--reference", "/reference", "--python-version", "3.14"],
+        )
 
     def test_bad_arguments_never_invoke_cargo(self):
-        for arguments in (("--reference",), ("--reference", ""),
-                          ("--reference", "--python"), ("--reference", "/ref", "3.14", "extra"),
-                          ("/python", "3.14", "extra"), ("--reference", "/ref", "3.11")):
+        for arguments in (
+            ("--reference",),
+            ("--reference", ""),
+            ("--reference", "--python"),
+            ("--reference", "/ref", "3.14", "extra"),
+            ("/python", "3.14", "extra"),
+            ("--reference", "/ref", "3.11"),
+        ):
             with self.subTest(arguments=arguments):
                 result = self.invoke(*arguments)
                 self.assertEqual(result.returncode, 2)

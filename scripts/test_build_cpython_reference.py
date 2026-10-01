@@ -1,13 +1,18 @@
 """Test reference-builder relocation without loading any fixture libraries."""
+
+from __future__ import annotations
+
 import importlib.util
 import os
-from pathlib import Path
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).parent
-spec = importlib.util.spec_from_file_location("reference_builder", ROOT / "build-cpython-reference.py")
+spec = importlib.util.spec_from_file_location(
+    "reference_builder", ROOT / "build-cpython-reference.py"
+)
 builder = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(builder)
 
@@ -24,10 +29,18 @@ class LibrarySelectionTests(unittest.TestCase):
         self.library.touch()
         self.addCleanup(mock.patch.stopall)
         mock.patch.object(builder.sys, "base_prefix", str(self.prefix)).start()
-        self.loaded = mock.patch.object(builder, "loaded_libpython", return_value=self.library).start()
+        self.loaded = mock.patch.object(
+            builder, "loaded_libpython", return_value=self.library
+        ).start()
 
-    def select(self, directory):
-        return builder.reference_library(directory, self.library.name)
+    def select(self, directory, *, configured_prefix=None):
+        return builder.reference_library(
+            directory,
+            self.library.name,
+            configured_prefix=(
+                self.prefix if configured_prefix is None else configured_prefix
+            ),
+        )
 
     def test_existing_configured_library_is_preserved(self):
         self.assertEqual(self.select(self.libdir), self.library)
@@ -53,6 +66,87 @@ class LibrarySelectionTests(unittest.TestCase):
         (configured / self.library.name).touch()
         with self.assertRaisesRegex(ValueError, "differs"):
             self.select(configured)
+
+    def test_relocated_prefix_ignores_unrelated_build_time_library(self):
+        original = self.root / "original"
+        configured = original / "lib"
+        configured.mkdir(parents=True)
+        (configured / self.library.name).touch()
+        self.assertEqual(
+            self.select(configured, configured_prefix=original), self.library
+        )
+        self.loaded.assert_called_once_with(required=True)
+
+    def test_relocated_prefix_ignores_existing_empty_build_time_directory(self):
+        original = self.root / "original"
+        configured = original / "lib"
+        configured.mkdir(parents=True)
+        self.assertEqual(
+            self.select(configured, configured_prefix=original), self.library
+        )
+        self.loaded.assert_called_once_with(required=True)
+
+    def test_configured_prefix_alias_is_not_relocation(self):
+        alias = self.root / "alias"
+        alias.symlink_to(self.prefix, target_is_directory=True)
+        self.assertEqual(
+            self.select(self.libdir, configured_prefix=alias), self.library
+        )
+        self.loaded.assert_called_once_with(required=False)
+
+    def test_relocated_prefix_rejects_a_different_loaded_library(self):
+        original = self.root / "original"
+        configured = original / "lib"
+        configured.mkdir(parents=True)
+        other = configured / self.library.name
+        other.touch()
+        self.loaded.return_value = other
+        with self.assertRaisesRegex(ValueError, "differs"):
+            self.select(configured, configured_prefix=original)
+        self.loaded.assert_called_once_with(required=True)
+
+    def test_relocated_prefix_requires_a_loaded_library(self):
+        original = self.root / "original"
+        configured = original / "lib"
+        configured.mkdir(parents=True)
+        self.loaded.side_effect = ValueError("Expected exactly one mapped library")
+        with self.assertRaisesRegex(ValueError, "exactly one"):
+            self.select(configured, configured_prefix=original)
+        self.loaded.assert_called_once_with(required=True)
+
+    def test_relocated_prefix_does_not_use_old_library_when_active_is_missing(self):
+        original = self.root / "original"
+        configured = original / "lib"
+        configured.mkdir(parents=True)
+        (configured / self.library.name).touch()
+        self.library.unlink()
+        with self.assertRaises(FileNotFoundError):
+            self.select(configured, configured_prefix=original)
+
+    def test_relocated_prefix_rejects_external_library_symlink(self):
+        original = self.root / "original"
+        configured = original / "lib"
+        configured.mkdir(parents=True)
+        other = configured / self.library.name
+        other.touch()
+        self.library.unlink()
+        self.library.symlink_to(other)
+        self.loaded.return_value = other
+        with self.assertRaisesRegex(ValueError, "escapes"):
+            self.select(configured, configured_prefix=original)
+
+    def test_relocated_prefix_accepts_internal_library_symlink(self):
+        original = self.root / "original"
+        configured = original / "lib"
+        configured.mkdir(parents=True)
+        actual = self.libdir / "libpython3.14.so.1.0"
+        self.library.rename(actual)
+        self.library.symlink_to(actual.name)
+        self.loaded.return_value = actual
+        self.assertEqual(
+            self.select(configured, configured_prefix=original), self.library
+        )
+        self.loaded.assert_called_once_with(required=True)
 
     def test_wrong_fallback_library_is_rejected(self):
         other = self.root / "other.so"
@@ -83,8 +177,13 @@ class LibrarySelectionTests(unittest.TestCase):
 
     def test_invalid_library_filenames_are_rejected(self):
         for name in ("", "../outside.so", "/outside.so"):
-            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "filename"):
-                builder.reference_library(self.libdir, name)
+            with (
+                self.subTest(name=name),
+                self.assertRaisesRegex(ValueError, "filename"),
+            ):
+                builder.reference_library(
+                    self.libdir, name, configured_prefix=self.prefix
+                )
 
 
 class LoadedLibraryTests(unittest.TestCase):
@@ -111,7 +210,11 @@ class LoadedLibraryTests(unittest.TestCase):
     def test_hardlink_aliases_share_one_file_identity(self):
         alias = self.root / "libpython3.14.so"
         os.link(self.library, alias)
-        self.assertTrue(self.resolve(self.mapping(self.library) + self.mapping(alias)).samefile(self.library))
+        self.assertTrue(
+            self.resolve(self.mapping(self.library) + self.mapping(alias)).samefile(
+                self.library
+            )
+        )
 
     def test_two_distinct_python_libraries_are_rejected(self):
         other = self.root / "libpython3.13.so"

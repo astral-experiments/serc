@@ -222,7 +222,9 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
-    env: *rust-env
+    env:
+      <<: *rust-env
+      CARGO_PROFILE_TEST_DEBUG: 0
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -233,6 +235,8 @@ jobs:
           "$SERC_TEST_PYTHON" scripts/build-cpython-reference.py --output "$RUNNER_TEMP/cpython-reference"
           echo "SERC_TEST_CPYTHON_REFERENCE=$RUNNER_TEMP/cpython-reference" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: test-no-debug
       - name: "Install Rust toolchain"
         run: rustup show
       - name: "Cargo test"
