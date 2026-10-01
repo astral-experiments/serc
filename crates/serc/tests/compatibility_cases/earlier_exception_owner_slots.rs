@@ -204,6 +204,90 @@ fn copied_call_return_none_marker_without_handler_control() {
     common::assert_matches_cpython_marshal(&source, "copied_call_return_none_without_handler.py");
 }
 
+#[test]
+fn copied_constant_return_after_async_manager_preserves_removed_try_slots() {
+    for return_value in ["", " None", " 1", " value"] {
+        for handler in ["", "    except Error:\n        pass\n"] {
+            for cleanup in ["finish(tags or {})", "self.finish(tags or {})"] {
+                let source = format!(
+                    "async def f(self, manager, tags, value):\n    try:\n        async with manager:\n            return{return_value}\n{handler}    finally:\n        {cleanup}\n"
+                );
+                common::assert_matches_cpython_marshal(
+                    &source,
+                    "copied_constant_return_after_async_manager.py",
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn copied_return_none_marker_reuses_owned_suffix_after_try_else() {
+    for call in [
+        "record(action)",
+        "logger().info('message', extra=details | {'key': str(key)})",
+        "logger().info('message', extra=details | {'key': normalize(str(key))})",
+    ] {
+        for condition in ["action is not None", "action is None"] {
+            let source = format!(
+                "async def f(value, enabled, action, details, key):\n    try:\n        if value is None:\n            if enabled:\n                try:\n                    prepare()\n                except Error:\n                    pass\n                else:\n                    {call}\n                    return action\n            else:\n                pass\n    finally:\n        if {condition}:\n            finish()\n"
+            );
+            common::assert_matches_cpython_marshal(
+                &source,
+                "copied_return_none_try_else_suffix.py",
+            );
+        }
+    }
+}
+
+#[test]
+fn cleanup_truth_marker_preserves_owner_after_guard_target_copy() {
+    for managers in ["trace('operation')", "trace('operation'), counter()"] {
+        for condition in ["tracker", "tracker and not self.disabled"] {
+            for work in ["prepare()", "self.prepare()"] {
+                let source = format!(
+                    "async def f(self, cached, enabled, tracker, item, tag):\n    with {managers}:\n        if cached is not None:\n            if enabled:\n                try:\n                    {work}\n                finally:\n                    if {condition}:\n                        tracker.record('done')\n            record(self.renderer, 'event', outcome='success', extra_tags=['hit', tag, 'source'], count=item.count())\n        elif self.conversation:\n            pass\n"
+                );
+                common::assert_matches_cpython_marshal(
+                    &source,
+                    "cleanup_truth_guard_target_copy.py",
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn copied_attribute_truth_marker_reuses_authored_return_cell() {
+    for calls in [3, 4, 5, 6] {
+        for value in ["None", "0"] {
+            let work = "        work()\n".repeat(calls);
+            let source = format!(
+                "def f(state):\n    try:\n{work}        return {value}\n    finally:\n        if state.enabled:\n            finish()\n"
+            );
+            common::assert_matches_cpython_marshal(
+                &source,
+                "copied_attribute_truth_return_cell.py",
+            );
+        }
+    }
+}
+
+#[test]
+fn copied_value_return_truth_marker_reuses_paired_pop_cells() {
+    for value in ["result, output", "output, result"] {
+        for condition in ["cleanup", "cleanup and resource is not None"] {
+            let source = format!(
+                "async def f(a, b, c, d, e, g, h, i, j, resource, k, l, enabled, m, n, o, cleanup, output, r, s, t, u):\n    try:\n        try:\n            pass\n        except Error as error:\n            if enabled:\n                return None\n        result = normalize(value.extract())\n        record(key, f'finished {{label}} in {{clock.now() - start:.2f}} seconds')\n        return {value}\n    except Cancelled:\n        pass\n    except Error as error:\n        pass\n    finally:\n        if {condition}:\n            pass\n"
+            );
+            common::assert_matches_cpython_marshal(
+                &source,
+                "copied_value_return_truth_pop_cells.py",
+            );
+        }
+    }
+}
+
 fn copied_call_return_none_source() -> &'static str {
     include_str!(
         "../fixtures/compatibility/earlier_exception_owner_slots/copied_call_return_none_marker_after_completed_async_manager/copied_call_return_none_after_async_manager.py"

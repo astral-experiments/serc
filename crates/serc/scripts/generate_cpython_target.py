@@ -151,17 +151,17 @@ CRATE_ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = CRATE_ROOT / "src" / "target" / "cpython_3_14_5.rs"
 MARSHAL_OUTPUT = CRATE_ROOT / "src" / "marshal" / "v5.rs"
 STARTUP_314_INPUT = "scripts/target_metadata/cpython_3_14_5_startup.json"
-STARTUP_314_SHA256 = "1c0a3051c44c5307327db0f331d259e65a7e648da1cb5b30a0b2f8d9ca059f02"
+STARTUP_314_SHA256 = "ef8dfed474b9e598687f6c50a2a9f3d335fa491f1b8e2a99ed37b0ecd8eb4481"
 STARTUP_315_INPUT = "scripts/target_metadata/cpython_3_15_0rc2_startup.json"
-STARTUP_315_SHA256 = "bec0bd2dedbe3b38ca68e446c67abf0f8d0f4793b551d9c7036acb0517765d63"
+STARTUP_315_SHA256 = "57c1d606a70991d3034184aae59352d3f3810194785b76a7e16b9adb9d066d63"
 LEGACY_STARTUP_INPUTS = {
     "3.12": (
         "scripts/target_metadata/cpython_3_12_14_startup.json",
-        "a360df44273c826ac83a1e20cd3f0651d916ec3904120c059e9288965c6b5b3f",
+        "5b019188909c2400637475650fb3d9f4f6b891c9c701a484be0bf989d1e8e44b",
     ),
     "3.13": (
         "scripts/target_metadata/cpython_3_13_15_startup.json",
-        "185f5860fdb6507fa3f8642c7919993fa6813b7d3a96c1cd4d5919a7f877a4ef",
+        "8304f6b6c8a3b1004ca1423686d2e856ec0309c3133ea91772daca87eb061124",
     ),
 }
 V4_INPUT_DIGESTS = {
@@ -233,6 +233,10 @@ def read_startup_strings() -> tuple[str, ...]:
         raise ValueError("startup profile strings are not unique, sorted and complete")
     if any(not isinstance(value, str) or value.startswith("/") for value in values):
         raise ValueError("startup profile contains an environment-specific path")
+    validate_minimal_startup_profile(
+        profile,
+        (CRATE_ROOT.parent.parent / "scripts/cpython-reference.c").read_bytes(),
+    )
     if TARGET_MINOR == "3.14":
         retention = profile["retention"]
         owners = retention["mortal_owners"]
@@ -277,6 +281,34 @@ def read_startup_strings() -> tuple[str, ...]:
                 "Python 3.14 startup ownership provenance checksum mismatch"
             )
     return tuple(values)
+
+
+def validate_minimal_startup_profile(profile: dict, reference_source: bytes) -> None:
+    """Bind native startup data to the reference and independent capture receipts."""
+    observations = profile.get("observations", [])
+    if (
+        profile.get("schema_version") != 2
+        or profile.get("reference_protocol") != "minimal-v2"
+        or profile.get("reference_source_sha256")
+        != hashlib.sha256(reference_source).hexdigest()
+        or profile.get("platform") != "linux"
+        or profile.get("architecture") != "x86_64"
+        or profile.get("gil_enabled") is not True
+        or profile.get("isolated") is not True
+        or profile.get("site_enabled") is not False
+        or len(observations) != 2
+        or len({row.get("receipt_sha256") for row in observations}) != 2
+        or any(
+            row.get("actual_exit") != 0
+            or row.get("thread_count") != 1
+            or row.get("two_complete_reads_equal") is not True
+            or row.get("observed_equals_unobserved") is not True
+            or row.get("canonical_sha256") != profile["canonical_snapshot_sha256"]
+            or row.get("entries") != profile["canonical_snapshot_entries"]
+            for row in observations
+        )
+    ):
+        raise ValueError("minimal reference startup provenance is incomplete")
 
 
 def select_target_version(version: str) -> None:
@@ -478,6 +510,8 @@ def render_preinterned_lookup(
     startup_strings: tuple[str, ...],
     compiler_strings: tuple[str, ...] = (),
     table_name: str = "PREINTERNED_STRINGS",
+    *,
+    compiler_strings_on_linux: bool = True,
 ) -> list[str]:
     def prefix(value: str) -> int:
         encoded = value.encode()
@@ -502,10 +536,18 @@ def render_preinterned_lookup(
         if value and value not in preinterned_strings:
             supplemental.setdefault(prefix(value), []).append(value)
 
+    empty = str('' in preinterned_strings or '' in supplemental_strings).lower()
+    if (
+        not compiler_strings_on_linux
+        and '' in compiler_strings
+        and '' not in preinterned_strings
+        and '' not in startup_strings
+    ):
+        empty = 'cfg!(not(target_os = "linux"))'
     lines = [
         "pub(crate) fn is_preinterned_string(value: &str) -> bool {",
         "    let prefix = match value.as_bytes() {",
-        f"        [] => return {str('' in preinterned_strings or '' in supplemental_strings).lower()},",
+        f"        [] => return {empty},",
         "        [first] => u16::from(*first) << 8,",
         "        [first, second, ..] => u16::from_be_bytes([*first, *second]),",
         "    };",
@@ -513,12 +555,19 @@ def render_preinterned_lookup(
     ]
     for key in sorted(ranges.keys() | supplemental.keys()):
         candidates = supplemental.get(key, [])
-        condition = " || ".join(
-            f"(cfg!(unix) && value == {rust_string_literal(value)})"
-            if value in UNIX_STARTUP_INTERNED_STRINGS
-            else f"value == {rust_string_literal(value)}"
-            for value in candidates
-        )
+        conditions = []
+        for value in candidates:
+            condition = f"value == {rust_string_literal(value)}"
+            if value in UNIX_STARTUP_INTERNED_STRINGS:
+                condition = f"(cfg!(unix) && {condition})"
+            if (
+                not compiler_strings_on_linux
+                and value in compiler_strings
+                and value not in startup_strings
+            ):
+                condition = f'cfg!(not(target_os = "linux")) && {condition}'
+            conditions.append(condition)
+        condition = " || ".join(conditions)
         if key not in ranges:
             lines.append(f"        0x{key:04x} => return {condition},")
             continue
@@ -1162,7 +1211,7 @@ def render(sources: dict[str, str]) -> str:
                 "// Use the canonical isolated Linux profile regardless of the Rust host architecture.",
                 '#[cfg(target_os = "linux")]',
                 "#[rustfmt::skip]",
-                "static LINUX_PREINTERNED_STRINGS: &[&str] = &[",
+                "pub(super) static LINUX_PREINTERNED_STRINGS: &[&str] = &[",
             ]
         )
         lines.extend(render_compact_rust_strings(linux_preinterned_strings))
@@ -1170,8 +1219,8 @@ def render(sources: dict[str, str]) -> str:
         lines.extend(
             render_preinterned_lookup(
                 linux_preinterned_strings,
-                STARTUP_INTERNED_STRINGS + UNIX_STARTUP_INTERNED_STRINGS,
-                tuple(compiler_interned_strings),
+                (),
+                (),
                 "LINUX_PREINTERNED_STRINGS",
             )
         )
@@ -1186,7 +1235,7 @@ def render(sources: dict[str, str]) -> str:
     else:
         lines.extend(
             [
-                "// Captured before the isolated compile() oracle parses any source.",
+                "// Captured before the isolated minimal C reference parses any source.",
                 "// Installation paths are supplied only through an explicit InitialInternState.",
                 "pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[",
             ]
@@ -1207,7 +1256,8 @@ def render(sources: dict[str, str]) -> str:
             ]
         )
         lookup = render_preinterned_lookup(
-            preinterned_strings, (), tuple(compiler_interned_strings)
+            preinterned_strings, (), tuple(compiler_interned_strings),
+            compiler_strings_on_linux=False,
         )
         lookup[0] = "fn is_preinterned_static_string(value: &str) -> bool {"
         lines.extend(lookup)
@@ -1491,7 +1541,11 @@ def check_numeric_authority() -> None:
         source = path.read_text()
         if re.search(r"Opcode::new\s*\(", source):
             raise ValueError(f"{relative} constructs Opcode outside the target module")
-        if match := raw_operand.search(source):
+        for match in raw_operand.finditer(source):
+            # Inspect the suffix after matching the full numeric token. Putting
+            # this exclusion in the regex could backtrack to a digit prefix.
+            if re.match(r"\s*=>", source[match.end():]):
+                continue
             raise ValueError(
                 f"{relative} duplicates a numeric target operand near `{match.group(0)}`"
             )

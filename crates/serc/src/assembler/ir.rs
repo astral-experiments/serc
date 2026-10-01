@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use ruff_index::newtype_index;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::block_graph::BlockGraph;
+use super::block_graph::{BasicBlockId, BlockGraph};
 use crate::PythonVersion;
 use crate::target::Opcode;
 
@@ -1625,6 +1625,15 @@ pub(super) struct DeferredBorrowEntry {
     pub(super) other_pending_targets: Vec<Label>,
 }
 
+/// An exact source edge awaiting its completed target's noncopyable prefix.
+#[derive(Debug)]
+pub(super) struct DeferredNoncopyableBorrowExit {
+    pub(super) source: EmittedJump,
+    pub(super) original: Instruction,
+    pub(super) empty_source_labels: Option<Vec<Label>>,
+    pub(super) short_await: Option<Box<super::short_await_borrows::ShortAwaitBorrowTarget>>,
+}
+
 #[derive(Debug)]
 pub(crate) struct Assembler {
     pub(super) python_version: PythonVersion,
@@ -1673,7 +1682,7 @@ pub(crate) struct Assembler {
     /// Normal edges whose following local return must prove its original copy width.
     pub(super) deferred_name_return_borrow_exits: Vec<super::NameReturnBorrowExit>,
     /// Source edges awaiting a located target larger than the native exit-copy budget.
-    pub(super) deferred_noncopyable_borrow_exits: Vec<(EmittedJump, Instruction)>,
+    pub(super) deferred_noncopyable_borrow_exits: Vec<DeferredNoncopyableBorrowExit>,
     /// Exact omitted ordinary-try POP slots in pending local-return targets.
     pub(super) name_return_pop_boundaries: FxHashSet<Label>,
     /// Ordinary-return `POP_BLOCK` records needed by the legacy CFG copy phases.
@@ -1699,6 +1708,9 @@ pub(crate) struct Assembler {
     pub(super) original_unlocated_cleanup_targets: FxHashSet<Label>,
     /// Exact source-certified named cleanup spans, used only during statement emission.
     pub(super) guarded_finally_handler_cleanup_origins: Vec<(usize, Vec<Item>)>,
+    /// Actual original recovery Barrier writes, used only during generator emission.
+    pub(super) generator_manager_recovery_sources: Vec<super::generator_manager_recovery::Source>,
+    pub(super) completed_for_manager: super::completed_for_manager::State,
     /// Unlocated Boolean discards with a fallback whose source instruction folded away.
     pub(super) original_unlocated_discard_targets: FxHashSet<Label>,
     /// Complete emitted conditional-finalizer arrays with a shared iterator discard.
@@ -1794,6 +1806,8 @@ pub(super) struct OptimizationPipeline {
     pub(super) borrow_pre_copy_jump_entries: FxHashMap<Label, Label>,
     /// Original forward jump-only routes eligible for intentional entry propagation.
     pub(super) borrow_threaded_jump_targets: FxHashMap<Label, Label>,
+    /// Exact named-handler source blocks carried through the initial borrow mark.
+    pub(super) initial_borrow_handler_cleanups: FxHashMap<BasicBlockId, Vec<Item>>,
     /// Full block snapshots keep threaded origins independent of hidden-slot packing.
     pub(super) borrow_threaded_jump_entries: ThreadedBorrowEntries,
     /// Separately certified authored breaks into original normal-finally cleanup.
@@ -1948,6 +1962,8 @@ impl Default for Assembler {
             original_scope_exit_labels: FxHashSet::default(),
             original_unlocated_cleanup_targets: FxHashSet::default(),
             guarded_finally_handler_cleanup_origins: Vec::new(),
+            generator_manager_recovery_sources: Vec::new(),
+            completed_for_manager: super::completed_for_manager::State::default(),
             original_unlocated_discard_targets: FxHashSet::default(),
             copied_finally_iterator_break_origins: Vec::new(),
             copied_finally_conjunction_break_origins: Vec::new(),

@@ -100,7 +100,7 @@ fn matches_cpython_frozenset_native_startup_string_identity() {
              def second(value):\n    'second docstring'\n    \
                  return value in {{'{member}', 'novel_marker'}}, 2\n"
         );
-        common::assert_matches_cpython_marshal(&source, "startup_interned_names.py");
+        common::assert_matches_cpython_startup_marshal(&source, "startup_interned_names.py");
     }
 }
 

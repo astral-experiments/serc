@@ -27,8 +27,8 @@ use crate::assembler::ir::{ThreadedBorrowEntries, ThreadedBorrowSnapshot};
 use crate::target::{
     is_conditional_jump, is_unconditional_jump,
     opcodes::{
-        CALL, CALL_KW, END_FOR, GET_AWAITABLE, GET_ITER, LOAD_GLOBAL, POP_JUMP_IF_FALSE,
-        POP_JUMP_IF_NONE, STORE_ATTR, TO_BOOL,
+        CALL, CALL_KW, END_FOR, GET_AWAITABLE, GET_ITER, LOAD_DEREF, LOAD_GLOBAL, LOAD_NAME,
+        POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE, PUSH_NULL, STORE_ATTR, TO_BOOL,
     },
 };
 
@@ -75,16 +75,19 @@ pub(in crate::assembler) struct BorrowEntryLabels<'a> {
     pub(super) original_boundaries: &'a FxHashSet<Label>,
     pub(super) pre_copy_jump_entries: &'a FxHashMap<Label, Label>,
     pub(super) authored_finally_break_entries: &'a AuthoredFinallyBreakEntries,
+    pub(super) retained_nop_finally_entries: &'a FxHashMap<Label, Label>,
 }
 
 /// An original direct source and its nonempty normal-finally destination.
 pub(super) struct RetainedFinallyOrigin {
     source_labels: Vec<Label>,
-    // Empty for a retained jump NOP; otherwise this complete prefix must survive
-    // unchanged after the ordinary jump disappears.
+    // Empty for a retained jump NOP; otherwise the complete original prefix must
+    // survive, allowing checked-load rewriting and exact local-pair fusion.
     source_prefix: Vec<Instruction>,
     // A recorded try-range end can split the physical graph without ending this array.
     source_exit_alias: Option<Label>,
+    // A live else suffix can follow that metadata-only range end in the same array.
+    source_suffix: Vec<Instruction>,
     // A conditional may enter the retained jump after an earlier empty original array.
     conditional_entry: Option<(Label, Instruction)>,
     // The setup-only source certificate also requires this original populated join.
@@ -589,10 +592,28 @@ impl OptimizationPipeline {
                 // Its leading exception aliases do not create another CPython block.
                 // Capture the complete span; the checks below require exactly one
                 // original boundary and a nonempty, straight-line surviving prefix.
-                let source_exit_alias = if let [Item::Label(alias)] = leading
+                let range_end_suffix = if self.python_version == crate::PythonVersion::Py314
+                    && let [Item::Label(alias), suffix @ ..] = leading
+                    && !suffix.is_empty()
+                {
+                    let mut regions = self.exception_regions.iter().filter(|region| region.end == *alias);
+                    regions.next().filter(|region| {
+                        regions.next().is_none()
+                            && !region.is_scope_fallback
+                            && !region.preserve_lasti
+                            && blocks[..block_index].iter().any(|items| {
+                                items.contains(&Item::Label(region.start))
+                            })
+                    }).map(|_| suffix)
+                } else {
+                    None
+                };
+                let source_exit_alias = if let Some(Item::Label(alias)) = leading.first()
                     && let Some(target) = jump.forward_target()
-                    && self.exception_owner_provenance.compound_try_owner_exits
-                        .iter().filter(|origin| **origin == (*alias, target)).count() == 1
+                    && (range_end_suffix.is_some()
+                        || (leading.len() == 1
+                            && self.exception_owner_provenance.compound_try_owner_exits
+                                .iter().filter(|origin| **origin == (*alias, target)).count() == 1))
                     && !self.exception_owner_provenance.block_boundaries.contains(alias)
                     && !self.exception_owner_provenance.source_boundaries.contains(alias)
                     && !self.preserved_block_boundaries.contains(alias)
@@ -619,6 +640,26 @@ impl OptimizationPipeline {
                 } else {
                     None
                 };
+                let mut source_suffix = Vec::new();
+                if source_exit_alias.is_some() && let Some(suffix) = range_end_suffix {
+                    // The exception end is only metadata. Every instruction on both
+                    // sides must survive; no empty, branching or copied suffix qualifies.
+                    for item in suffix {
+                        let Item::Instruction(instruction) = item else {
+                            return None;
+                        };
+                        if matches!(instruction.opcode, NOP | NOT_TAKEN)
+                            || !matches!(instruction.operand(), Operand::Value(_))
+                            || ends_scope(instruction.opcode)
+                            || instruction.jump_policy.borrow_empty_block()
+                            || instruction.no_location_policy.borrow_fallthrough()
+                                != BorrowFallthrough::Reachable
+                        {
+                            return None;
+                        }
+                        source_suffix.push(*instruction);
+                    }
+                }
                 let setup_source = setup_source
                     .filter(|_| source_exit_alias.is_some())
                     .or(direct_setup_source);
@@ -755,20 +796,80 @@ impl OptimizationPipeline {
                 } else {
                     None
                 };
+                // A preserved conditional-value join can be the start of this
+                // populated source array. Authenticate its authored incoming jump;
+                // replay below still requires every source instruction to survive.
+                let preserved_expression_source = if source_exit_alias.is_some()
+                    && !source_prefix.is_empty()
+                {
+                    let mut joins = self.exception_owner_provenance
+                        .original_if_expression_joins.iter().filter(|(join, _)| {
+                            source_labels.contains(join)
+                        });
+                    joins.next().and_then(|&(source, incoming)| {
+                        (joins.next().is_none()
+                            && self.exception_owner_provenance.source_boundaries.contains(&source)
+                            && self.preserved_block_boundaries.contains(&source)
+                            && incoming.opcode == crate::target::opcodes::JUMP_FORWARD
+                            && incoming.operand() == Operand::Forward(source)
+                            && !incoming.jump_policy.borrow_empty_block()
+                            && incoming.no_location_policy.borrow_fallthrough()
+                                == BorrowFallthrough::Reachable
+                            && self.graph.iter_items().filter(|item| {
+                                matches!(item, Item::Instruction(actual) if *actual == incoming)
+                            }).count() == 1)
+                        .then_some(source)
+                    })
+                } else {
+                    None
+                };
                 // A live condition can target the retained jump after an empty
-                // manager-end array. Keep that incoming edge separate: ordinary
-                // fallthrough through the earlier boundary is still disconnected.
+                // original array. Keep that incoming edge separate: ordinary
+                // fallthrough through an earlier boundary remains disconnected,
+                // even when its backedge only disappears during later copying.
                 let conditional_entry = if source_prefix.is_empty()
                     && source_exit_alias.is_none()
                     && setup_source.is_none()
+                    && jump.jump_policy.allows_borrow_threading_target()
                     && !jump.fusion_policy.is_authored_break()
-                    && source_labels.iter().filter(|label| {
-                        self.exception_owner_provenance.block_boundaries.contains(*label)
-                    }).count() > 1
+                    && source_labels.iter().any(|label| {
+                        self.exception_owner_provenance.block_boundaries.contains(label)
+                    })
                 {
                     let entry = source_labels.iter().rev().copied().find(|label| {
                         self.exception_owner_provenance.block_boundaries.contains(label)
                     })?;
+                    // A no-else loop's break end can alias its authored false exit.
+                    // Only break-only, non-source aliases may follow that array;
+                    // another authored boundary still denotes a distinct source.
+                    let entry = source_labels.iter().rposition(|label| {
+                        self.exception_owner_provenance.source_boundaries.contains(label)
+                            && self.exception_owner_provenance.block_boundaries.contains(label)
+                    }).filter(|&index| {
+                        source_labels[index + 1..].iter().all(|alias| {
+                            if !self.exception_owner_provenance.block_boundaries.contains(alias) {
+                                return true;
+                            }
+                            let mut incoming = self.graph.iter_items().filter_map(|item| {
+                                let Item::Instruction(instruction) = item else {
+                                    return None;
+                                };
+                                matches!(instruction.operand(), Operand::Forward(target) | Operand::Backward(target)
+                                    if target == *alias).then_some(instruction)
+                            }).peekable();
+                            incoming.peek().is_some() && incoming.all(|instruction| {
+                                instruction.opcode == crate::target::opcodes::JUMP_FORWARD
+                                    && instruction.operand() == Operand::Forward(*alias)
+                                    && instruction.fusion_policy.is_authored_break()
+                                    && instruction.jump_policy.retained_nop()
+                                        == crate::assembler::ir::RetainedJumpNop::DirectTarget
+                                    && instruction.location.line >= 0
+                                    && !instruction.jump_policy.borrow_empty_block()
+                                    && instruction.no_location_policy.borrow_fallthrough()
+                                        == BorrowFallthrough::Reachable
+                            })
+                        })
+                    }).map_or(entry, |index| source_labels[index]);
                     let mut incoming = self.graph.iter().filter_map(|(_, block)| {
                         let items = block.items();
                         let Item::Instruction(condition) = items.last()? else {
@@ -789,18 +890,17 @@ impl OptimizationPipeline {
                         })?;
                         Some((source, *condition))
                     });
-                    let entry = incoming.next()?;
-                    if incoming.next().is_some() {
-                        return None;
+                    match (incoming.next(), incoming.next()) {
+                        (Some(entry), None) => Some(entry),
+                        _ => None,
                     }
-                    Some(entry)
                 } else {
                     None
                 };
                 // Consecutive exception aliases may share one original array. Only
                 // the captured conditional can bypass earlier empty source arrays.
                 for (labels, preserved_source, setup_source, conditional_source) in [
-                    (&source_labels, preserved_else_source, setup_source, conditional_entry.is_some()),
+                    (&source_labels, preserved_else_source.or(preserved_expression_source), setup_source, conditional_entry.is_some()),
                     (&target_labels, None, None, false),
                 ] {
                     let expected_boundaries = usize::from(setup_source.is_none());
@@ -869,6 +969,7 @@ impl OptimizationPipeline {
                     source_labels,
                     source_prefix,
                     source_exit_alias,
+                    source_suffix,
                     conditional_entry,
                     setup_join,
                     target_labels,
@@ -922,9 +1023,7 @@ impl OptimizationPipeline {
                 let Some(Item::Instruction(actual)) = source_items.last() else {
                     continue;
                 };
-                if actual.opcode != expected.opcode
-                    || actual.operand() != expected.operand()
-                    || actual.location != expected.location
+                if *actual != expected
                     || actual.jump_policy.borrow_empty_block()
                     || actual.no_location_policy.borrow_fallthrough()
                         != BorrowFallthrough::Reachable
@@ -952,6 +1051,7 @@ impl OptimizationPipeline {
             };
             if let Some(Item::Label(alias)) =
                 start.checked_sub(1).and_then(|index| items.get(index))
+                && origin.conditional_entry.is_none()
             {
                 // Removing a preceding ordinary try's normal jump can leave its
                 // range-end alias beside this unchanged original source array.
@@ -996,6 +1096,8 @@ impl OptimizationPipeline {
                     || nop.jump_policy.retained_nop()
                         != crate::assembler::ir::RetainedJumpNop::DirectTarget
                     || nop.jump_policy.borrow_empty_block()
+                    || (origin.conditional_entry.is_some()
+                        && !nop.jump_policy.allows_borrow_threading_target())
                     || nop.no_location_policy.borrow_fallthrough() != BorrowFallthrough::Reachable
                 {
                     continue;
@@ -1005,25 +1107,14 @@ impl OptimizationPipeline {
                 // The source was not a jump-only original array. Require every
                 // original instruction before its erased jump, with no new labels,
                 // copied instructions, retained jump NOP, or intervening empty array.
-                let prefix_matches =
-                    origin
-                        .source_prefix
-                        .iter()
-                        .enumerate()
-                        .all(|(offset, expected)| {
-                            matches!(items.get(cursor + offset), Some(Item::Instruction(actual))
-                            if origin.source_exit_alias.is_none_or(|_| actual == expected)
-                                && actual.opcode == expected.opcode
-                                && actual.operand() == expected.operand()
-                                && actual.location == expected.location
-                                && !actual.jump_policy.borrow_empty_block()
-                                && actual.no_location_policy.borrow_fallthrough()
-                                    == BorrowFallthrough::Reachable)
-                        });
-                if !prefix_matches {
+                let Some(length) = retained_borrow_prefix_length(
+                    &origin.source_prefix,
+                    &items[cursor..],
+                    origin.source_exit_alias.is_some(),
+                ) else {
                     continue;
-                }
-                cursor += origin.source_prefix.len();
+                };
+                cursor += length;
             }
             if let Some(alias) = origin.source_exit_alias {
                 if !matches!(items.get(cursor), Some(Item::Label(actual)) if *actual == alias)
@@ -1044,6 +1135,12 @@ impl OptimizationPipeline {
                 }
                 cursor += 1;
             }
+            let Some(length) =
+                retained_borrow_prefix_length(&origin.source_suffix, &items[cursor..], true)
+            else {
+                continue;
+            };
+            cursor += length;
             // Exact adjacency excludes intervening empty arrays and newly merged labels.
             let target_start = cursor;
             let aliases_match = origin.target_labels.iter().enumerate().all(|(offset, label)| {
@@ -1056,7 +1153,9 @@ impl OptimizationPipeline {
             let Some(Item::Instruction(first)) = items.get(cursor) else {
                 continue;
             };
-            if first.opcode != origin.first_live.opcode
+            let same_first_opcode = first.opcode == origin.first_live.opcode
+                || (origin.first_live.opcode == LOAD_FAST && first.opcode == LOAD_FAST_CHECK);
+            if !same_first_opcode
                 || first.operand() != origin.first_live.operand()
                 || first.location != origin.first_live.location
                 || first.jump_policy.borrow_empty_block()
@@ -1079,6 +1178,48 @@ impl OptimizationPipeline {
         }
         entries
     }
+}
+
+/// Replays one populated source span without fusing across an exception-end alias.
+pub(super) fn retained_borrow_prefix_length(
+    prefix: &[Instruction],
+    items: &[Item],
+    strict: bool,
+) -> Option<usize> {
+    let mut prefix_offset = 0;
+    let mut cursor = 0;
+    while let Some(expected) = prefix.get(prefix_offset) {
+        let Item::Instruction(actual) = items.get(cursor)? else {
+            return None;
+        };
+        if actual.jump_policy.borrow_empty_block()
+            || actual.no_location_policy.borrow_fallthrough() != BorrowFallthrough::Reachable
+        {
+            return None;
+        }
+        // Only the same legal adjacent pair can reconstruct a fused source record.
+        let fused = prefix
+            .get(prefix_offset + 1)
+            .and_then(|second| fuse_pair(expected, second));
+        if fused.is_some_and(|fused| fused == *actual) {
+            prefix_offset += 2;
+        } else {
+            let mut expected = *expected;
+            if expected.opcode == LOAD_FAST && actual.opcode == LOAD_FAST_CHECK {
+                expected.opcode = LOAD_FAST_CHECK;
+            }
+            if (strict && *actual != expected)
+                || actual.opcode != expected.opcode
+                || actual.operand() != expected.operand()
+                || actual.location != expected.location
+            {
+                return None;
+            }
+            prefix_offset += 1;
+        }
+        cursor += 1;
+    }
+    Some(cursor)
 }
 
 /// Tracks which analysis markers will remain as physical instructions after borrowing.
@@ -2013,9 +2154,11 @@ impl OptimizationPipeline {
                         && instruction.jump_policy.allows_threading_target()
                         && instruction.jump_policy.allows_borrow_threading_target()
                         && !instruction.jump_policy.always_retains_nop()
-                        && !instruction.jump_policy.borrow_empty_block()
                         && let Some(target) = instruction.forward_target()
                     {
+                        // An empty fallthrough is still a real jump-only route.
+                        // Its incoming populated source must survive exact threading;
+                        // this does not make the original empty array traversable.
                         for label in &pending {
                             links.insert(*label, target);
                         }
@@ -3294,6 +3437,9 @@ impl OptimizationPipeline {
             return Vec::new();
         }
         self.record_borrow_finally_jump_sources();
+        self.admit_visited_independent_finally_entries();
+        self.admit_visited_retained_normal_finally_entries();
+        self.admit_visited_retained_store_finally_entries();
         let origins = self.capture_setup_finally_origins();
         let mut boundaries = self.preserved_block_boundaries.clone();
         boundaries.extend(self.borrow_unreachable_blocks.iter().copied());
@@ -3381,7 +3527,9 @@ impl OptimizationPipeline {
                             [_, load, jump] => {
                                 load.opcode == LOAD_FAST
                                     && load.value_argument().is_some()
-                                    && jump.opcode == POP_JUMP_IF_NONE
+                                    && (jump.opcode == POP_JUMP_IF_NONE
+                                        || (self.python_version == crate::PythonVersion::Py314
+                                            && jump.opcode == POP_JUMP_IF_NOT_NONE))
                                     && jump.forward_target().is_some()
                             }
                             _ => false,
@@ -3457,6 +3605,35 @@ impl OptimizationPipeline {
                                     && instruction.no_location_policy.borrow_fallthrough()
                                         == BorrowFallthrough::Reachable
                             });
+                        // Even one original callable load plus CALL/POP_TOP and the
+                        // constant return exceeds the four-slot early-copy budget.
+                        let discarded_call_constant_return = self.python_version
+                            == crate::PythonVersion::Py314
+                            && unsplit_reachable_array
+                            && matches!(instructions.as_slice(), [_, prefix @ .., call, pop, constant, return_]
+                                if prefix.first().is_some_and(|first| matches!(first.opcode,
+                                    LOAD_FAST | LOAD_GLOBAL | LOAD_DEREF | LOAD_NAME))
+                                    && prefix.iter().all(|instruction| {
+                                        (matches!(instruction.opcode,
+                                            LOAD_FAST | LOAD_GLOBAL | LOAD_DEREF | LOAD_NAME
+                                                | LOAD_CONST | LOAD_ATTR | PUSH_NULL)
+                                            // The specialized method load already existed before
+                                            // copying; only its certified same-line NOP was removed.
+                                            || (instruction.opcode == LOAD_SUPER_ATTR
+                                                && instruction.jump_policy.has_original_uniform_fold()
+                                                && instruction.local_policy.hidden_exception_owner_slots() == 1
+                                                && matches!(instruction.operand(), Operand::Value(argument)
+                                                    if argument & 1 != 0)))
+                                            && matches!(instruction.operand(), Operand::Value(_))
+                                    })
+                                    && call.opcode == CALL
+                                    && matches!(call.operand(), Operand::Value(_))
+                                    && pop.opcode == POP_TOP
+                                    && pop.operand() == Operand::Value(0)
+                                    && constant.opcode == LOAD_CONST
+                                    && matches!(constant.operand(), Operand::Value(_))
+                                    && return_.opcode == RETURN_VALUE
+                                    && return_.operand() == Operand::Value(0));
                         // Preserve any existing CALL witness before considering the
                         // other entry witnesses in the same original block.
                         let candidates = instructions
@@ -3498,13 +3675,14 @@ impl OptimizationPipeline {
                             // LOAD_FAST, LOAD_ATTR, CALL, POP_TOP, and the scope exit. The receiver
                             // load cannot form a fast-fast fusion with LOAD_ATTR. Small return calls
                             // lack POP_TOP and retain the existing empty-exit behavior.
-                            if scope_exit
-                                && !large_terminal_cleanup
-                                && !(live.first().is_some_and(|first| first.opcode == LOAD_FAST)
+                            if !(!scope_exit
+                                || large_terminal_cleanup
+                                || discarded_call_constant_return
+                                || (live.first().is_some_and(|first| first.opcode == LOAD_FAST)
                                     && live.get(1).is_some_and(|second| second.opcode == LOAD_ATTR)
                                     && instructions
                                         .get(index + 1)
-                                        .is_some_and(|next| next.opcode == POP_TOP))
+                                        .is_some_and(|next| next.opcode == POP_TOP)))
                             {
                                 continue;
                             }
@@ -3599,6 +3777,31 @@ impl OptimizationPipeline {
     /// consumed in the same basic block, is not stored into another local, and
     /// remains supported by the original local until it is consumed.
     #[cfg(test)]
+    pub(in crate::assembler) fn optimize_guarded_loop_test_borrows(
+        items: &mut [Item],
+        boundaries: &FxHashSet<Label>,
+    ) {
+        Self::optimize_load_fast(
+            items,
+            &[],
+            BorrowEntryLabels {
+                unreachable: &FxHashSet::default(),
+                loop_exits: &FxHashMap::default(),
+                finally_entries: &FxHashMap::default(),
+                finally_jump_sources: &FxHashMap::default(),
+                jump_entries: &FxHashSet::default(),
+                original_boundaries: boundaries,
+                pre_copy_jump_entries: &FxHashMap::default(),
+                authored_finally_break_entries: &FxHashMap::default(),
+                retained_nop_finally_entries: &FxHashMap::default(),
+            },
+            &FxHashSet::default(),
+            &FxHashSet::default(),
+            false,
+        );
+    }
+
+    #[cfg(test)]
     pub(in crate::assembler) fn optimize_load_fast(
         items: &mut [Item],
         exception_regions: &[ExceptionRegion],
@@ -3682,6 +3885,7 @@ impl OptimizationPipeline {
             original_boundaries: original_block_boundaries,
             pre_copy_jump_entries,
             authored_finally_break_entries,
+            retained_nop_finally_entries,
         } = entries;
 
         if !items.iter().any(|item| {
@@ -4055,7 +4259,27 @@ impl OptimizationPipeline {
                         && finally_jump_sources.get(block).copied().unwrap_or(false)
                         && jump_entry_blocks.get(block + 1).copied().unwrap_or(false)
                         && original_finally_entry;
-                    pending.push((block + 1, retained_finally_entry || erased_finally_entry));
+                    let retained_compound_entry = last.opcode == NOP
+                        && last.jump_policy.always_retains_nop()
+                        && last.no_location_policy.borrow_fallthrough()
+                            == BorrowFallthrough::RetainedNopReachable
+                        && finally_jump_sources.get(block).copied().unwrap_or(false)
+                        && jump_entry_blocks.get(block + 1).copied().unwrap_or(false)
+                        && items[blocks[block].clone()]
+                            .iter()
+                            .rev()
+                            .find_map(|item| match item {
+                                Item::Label(label) => Some(label),
+                                Item::Instruction(_) => None,
+                            })
+                            .and_then(|source| retained_nop_finally_entries.get(source))
+                            .is_some_and(|target| {
+                                label_blocks.get(target.index()).copied() == Some(block + 1)
+                            });
+                    pending.push((
+                        block + 1,
+                        retained_finally_entry || erased_finally_entry || retained_compound_entry,
+                    ));
                 }
                 // A removed normal edge can stop fallthrough at an empty CFG block,
                 // but a surviving threaded jump still reaches its explicit target.
@@ -4183,6 +4407,7 @@ impl OptimizationPipeline {
                     // Only aliases captured before label merging identify that entry.
                     // Calls, conditions, attribute stores and iterator setup are captured
                     // from the same original array; require their exact surviving witness.
+                    // Definite-assignment checks may change only a captured local's opcode.
                     let finally_entry = is_unconditional_jump(last.opcode)
                         // A zero-distance surrogate can represent an empty native
                         // block, so it cannot certify an independent entry.
@@ -4233,7 +4458,9 @@ impl OptimizationPipeline {
                                                     matches!(
                                                         call.opcode,
                                                         CALL | CALL_KW | GET_ITER | LOAD_FAST | STORE_ATTR
-                                                    ) && instruction.opcode == call.opcode
+                                                    ) && (instruction.opcode == call.opcode
+                                                        || (call.opcode == LOAD_FAST
+                                                            && instruction.opcode == LOAD_FAST_CHECK))
                                                         && instruction.operand()
                                                             == Operand::Value(call.argument)
                                                         && instruction.location == call.location
@@ -4368,7 +4595,9 @@ impl OptimizationPipeline {
                                                                     }
                                                                     at_target = false;
                                                                 }
-                                                                instruction.opcode == call.opcode
+                                                                (instruction.opcode == call.opcode
+                                                                    || (call.opcode == LOAD_FAST
+                                                                        && instruction.opcode == LOAD_FAST_CHECK))
                                                                     && instruction.operand()
                                                                         == Operand::Value(
                                                                             call.argument,
@@ -4775,6 +5004,7 @@ mod tests {
             original_boundaries: &empty_labels,
             pre_copy_jump_entries: &empty_entries,
             authored_finally_break_entries: &FxHashMap::default(),
+            retained_nop_finally_entries: &FxHashMap::default(),
         };
         super::OptimizationPipeline::optimize_load_fast_with_retained_entries_inner::<DIRECT, true>(
             crate::PythonVersion::Py314,
@@ -5748,6 +5978,7 @@ mod tests {
                                         original_boundaries: &boundaries,
                                         pre_copy_jump_entries: &entries,
                                         authored_finally_break_entries: &FxHashMap::default(),
+                                        retained_nop_finally_entries: &FxHashMap::default(),
                                     },
                                     &FxHashSet::default(),
                                     &FxHashSet::default(),
@@ -6013,6 +6244,7 @@ mod tests {
                         original_boundaries: &FxHashSet::default(),
                         pre_copy_jump_entries: &FxHashMap::default(),
                         authored_finally_break_entries: &FxHashMap::default(),
+                        retained_nop_finally_entries: &FxHashMap::default(),
                     },
                     &FxHashSet::default(),
                     &FxHashSet::default(),
@@ -6124,6 +6356,7 @@ mod tests {
                 original_boundaries: &FxHashSet::default(),
                 pre_copy_jump_entries: &FxHashMap::default(),
                 authored_finally_break_entries: &FxHashMap::default(),
+                retained_nop_finally_entries: &FxHashMap::default(),
             },
             &FxHashSet::default(),
             &FxHashSet::default(),
@@ -6401,6 +6634,7 @@ mod tests {
                 original_boundaries: boundaries,
                 pre_copy_jump_entries: entries,
                 authored_finally_break_entries: &FxHashMap::default(),
+                retained_nop_finally_entries: &FxHashMap::default(),
             },
             &FxHashSet::default(),
             &FxHashSet::default(),
@@ -6418,6 +6652,228 @@ mod tests {
                 _ => None,
             })
             .unwrap()
+    }
+
+    #[test]
+    fn original_empty_jump_routes_require_complete_ordered_edges() {
+        for change in [
+            "intact",
+            "empty source",
+            "missing first edge",
+            "missing second edge",
+            "cycle",
+            "wrong target",
+            "work before second edge",
+            "retained first edge",
+            "threading forbidden",
+            "borrow threading forbidden",
+        ] {
+            let mut pipeline = threaded_entry_fixture(true);
+            let mut items = pipeline.graph.into_items();
+            for item in &mut items {
+                if let Item::Instruction(jump) = item
+                    && jump.opcode == JUMP_FORWARD
+                    && matches!(jump.operand(), Operand::Forward(target)
+                        if matches!(target.as_u32(), 2 | 3))
+                {
+                    jump.jump_policy.mark_borrow_empty_block();
+                }
+            }
+            let first = items
+                .iter()
+                .position(|item| *item == Item::Label(Label::from_u32(1)))
+                .unwrap();
+            let second = items
+                .iter()
+                .position(|item| *item == Item::Label(Label::from_u32(3)))
+                .unwrap();
+            match change {
+                "empty source" => {
+                    items[1] = instruction(NOP, Operand::Value(0));
+                    items[2] = instruction(NOP, Operand::Value(0));
+                }
+                "missing first edge" => items[first + 1] = instruction(NOP, Operand::Value(0)),
+                "missing second edge" => items[second + 1] = instruction(NOP, Operand::Value(0)),
+                "cycle" => {
+                    let Item::Instruction(jump) = &mut items[second + 1] else {
+                        unreachable!();
+                    };
+                    jump.set_operand(Operand::Forward(Label::from_u32(1)));
+                }
+                "wrong target" => {
+                    let Item::Instruction(jump) = &mut items[first + 1] else {
+                        unreachable!();
+                    };
+                    jump.set_operand(Operand::Forward(Label::from_u32(4)));
+                }
+                "work before second edge" => {
+                    items.insert(second + 1, instruction(POP_TOP, Operand::Value(0)));
+                }
+                "retained first edge" | "threading forbidden" | "borrow threading forbidden" => {
+                    let Item::Instruction(jump) = &mut items[first + 1] else {
+                        unreachable!();
+                    };
+                    match change {
+                        "retained first edge" => jump.jump_policy.retain_nop(),
+                        "threading forbidden" => jump.jump_policy.prevent_threading_target(),
+                        _ => jump.jump_policy.prevent_borrow_threading_target(),
+                    }
+                }
+                _ => {}
+            }
+            pipeline.graph =
+                crate::assembler::block_graph::BlockGraph::from_items(items, &FxHashSet::default());
+            super::OptimizationPipeline::clear_initial_borrow_jump_entries(&mut pipeline.graph);
+            let routes = super::OptimizationPipeline::mark_initial_borrow_jump_entries(
+                &mut pipeline.graph,
+                &pipeline.exception_owner_provenance.block_boundaries,
+            );
+            assert_eq!(
+                routes.get(&Label::from_u32(1)) == Some(&Label::from_u32(2)),
+                matches!(change, "intact" | "empty source"),
+                "{change}"
+            );
+            let source = pipeline.graph.label_block(Label::from_u32(0)).unwrap();
+            let captured = pipeline.graph[source].items().iter().any(|item| {
+                matches!(item, Item::Instruction(jump)
+                    if jump.initial_borrow_jump_target() == Some(Label::from_u32(1)))
+            });
+            assert_eq!(
+                captured,
+                matches!(change, "intact" | "work before second edge"),
+                "{change}"
+            );
+            if change == "intact" {
+                assert_eq!(routes.get(&Label::from_u32(3)), Some(&Label::from_u32(2)));
+                assert_eq!(
+                    pipeline
+                        .graph
+                        .iter_items()
+                        .filter(|item| matches!(item, Item::Instruction(jump)
+                            if jump.jump_policy.borrow_empty_block()))
+                        .count(),
+                    2
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn populated_original_jump_crosses_empty_arrays_only_with_its_exact_route() {
+        for extra_hop in [false, true] {
+            for change in [
+                "intact",
+                "missing origin",
+                "missing route",
+                "wrong route",
+                "finally",
+                "finally alias before",
+                "finally alias after",
+                "forbidden first bridge",
+                "forbidden last bridge",
+            ] {
+                let mut pipeline = threaded_entry_fixture(extra_hop);
+                if matches!(change, "finally alias before" | "finally alias after") {
+                    let mut items = pipeline.graph.into_items();
+                    let at = items
+                        .iter()
+                        .position(|item| *item == Item::Label(Label::from_u32(2)))
+                        .unwrap();
+                    items.insert(
+                        at + usize::from(change == "finally alias after"),
+                        Item::Label(Label::from_u32(4)),
+                    );
+                    pipeline.graph = crate::assembler::block_graph::BlockGraph::from_items(
+                        items,
+                        &FxHashSet::default(),
+                    );
+                    pipeline
+                        .borrow_finally_entries
+                        .insert(Label::from_u32(4), None);
+                }
+                pipeline.graph.for_each_instruction_mut(|jump| {
+                    if jump.opcode == JUMP_FORWARD
+                        && matches!(jump.operand(), Operand::Forward(target)
+                            if matches!(target.as_u32(), 2 | 3))
+                    {
+                        jump.jump_policy.mark_borrow_empty_block();
+                        if (change == "forbidden first bridge"
+                            && jump.operand()
+                                == Operand::Forward(Label::from_u32(if extra_hop { 3 } else { 2 })))
+                            || (change == "forbidden last bridge"
+                                && jump.operand() == Operand::Forward(Label::from_u32(2)))
+                        {
+                            jump.jump_policy.prevent_borrow_threading_target();
+                        }
+                    }
+                });
+                super::OptimizationPipeline::clear_initial_borrow_jump_entries(&mut pipeline.graph);
+                pipeline.borrow_threaded_jump_targets =
+                    super::OptimizationPipeline::mark_initial_borrow_jump_entries(
+                        &mut pipeline.graph,
+                        &pipeline.exception_owner_provenance.block_boundaries,
+                    );
+                match change {
+                    "missing origin" => {
+                        super::OptimizationPipeline::clear_initial_borrow_jump_entries(
+                            &mut pipeline.graph,
+                        );
+                    }
+                    "missing route" => pipeline.borrow_threaded_jump_targets.clear(),
+                    "wrong route" => {
+                        pipeline
+                            .borrow_threaded_jump_targets
+                            .insert(Label::from_u32(1), Label::from_u32(4));
+                    }
+                    "finally" => {
+                        pipeline
+                            .borrow_finally_entries
+                            .insert(Label::from_u32(2), None);
+                    }
+                    _ => {}
+                }
+                assert!(pipeline.thread_forward_jumps());
+                let source = pipeline.graph.label_block(Label::from_u32(0)).unwrap();
+                let jump = pipeline.graph[source]
+                    .items()
+                    .iter()
+                    .find_map(|item| match item {
+                        Item::Instruction(jump) if jump.opcode == JUMP_FORWARD => Some(jump),
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(jump.operand(), Operand::Forward(Label::from_u32(2)));
+                assert_eq!(
+                    jump.no_location_policy.borrow_fallthrough(),
+                    if change == "intact" {
+                        BorrowFallthrough::Reachable
+                    } else {
+                        BorrowFallthrough::Barrier
+                    },
+                    "{extra_hop}: {change}",
+                );
+                let boundaries = pipeline.exception_owner_provenance.block_boundaries.clone();
+                let entries =
+                    super::OptimizationPipeline::take_pre_copy_borrow_entries_with_threaded(
+                        &mut pipeline.graph,
+                        &boundaries,
+                        &mut pipeline.borrow_threaded_jump_entries,
+                    );
+                assert_eq!(
+                    borrowed_cleanup_after_entries(
+                        pipeline.graph.into_items(),
+                        &entries,
+                        &boundaries
+                    ),
+                    if change == "intact" {
+                        LOAD_FAST_BORROW
+                    } else {
+                        LOAD_FAST
+                    },
+                    "{extra_hop}: {change}",
+                );
+            }
+        }
     }
 
     #[test]
@@ -6465,6 +6921,43 @@ mod tests {
             &pipeline.borrow_threaded_jump_entries,
         );
         assert_eq!(entries.get(&Label::from_u32(0)), Some(&Label::from_u32(2)));
+    }
+
+    #[test]
+    fn original_threaded_entry_requires_a_live_source_and_available_snapshot() {
+        for change in ["missing snapshot", "detached source", "dead source"] {
+            let mut pipeline = threaded_entry_fixture(true);
+            assert!(pipeline.thread_forward_jumps());
+            let boundaries = pipeline.exception_owner_provenance.block_boundaries.clone();
+            if change == "missing snapshot" {
+                pipeline.borrow_threaded_jump_entries.clear();
+            }
+            let entries = super::OptimizationPipeline::take_pre_copy_borrow_entries_with_threaded(
+                &mut pipeline.graph,
+                &boundaries,
+                &mut pipeline.borrow_threaded_jump_entries,
+            );
+            assert_eq!(entries.is_empty(), change == "missing snapshot");
+            let mut items = pipeline.graph.into_items();
+            match change {
+                "detached source" => items[0] = Item::Label(Label::from_u32(4)),
+                "dead source" => {
+                    items.splice(
+                        0..0,
+                        [
+                            instruction(LOAD_CONST, Operand::Value(0)),
+                            instruction(RETURN_VALUE, Operand::Value(0)),
+                        ],
+                    );
+                }
+                _ => {}
+            }
+            assert_eq!(
+                borrowed_cleanup_after_entries(items, &entries, &boundaries),
+                LOAD_FAST,
+                "{change}"
+            );
+        }
     }
 
     #[test]
@@ -6862,6 +7355,7 @@ mod tests {
                 original_boundaries: boundaries,
                 pre_copy_jump_entries: &FxHashMap::default(),
                 authored_finally_break_entries: entries,
+                retained_nop_finally_entries: &FxHashMap::default(),
             },
             &FxHashSet::default(),
             &FxHashSet::default(),
@@ -7018,6 +7512,7 @@ mod tests {
                     original_boundaries: &pipeline.exception_owner_provenance.block_boundaries,
                     pre_copy_jump_entries: &FxHashMap::default(),
                     authored_finally_break_entries: &entries,
+                    retained_nop_finally_entries: &FxHashMap::default(),
                 },
                 &pipeline.preserved_block_boundaries,
                 &pipeline.borrow_block_aliases,
@@ -7408,8 +7903,923 @@ mod retained_finally_origin_tests {
     }
 
     #[test]
+    fn checked_finally_conditions_keep_only_the_original_first_load_witness() {
+        use crate::target::opcodes::{POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE};
+
+        for jump_opcode in [POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE] {
+            check_finally_condition_first_load_witness(jump_opcode);
+        }
+    }
+
+    fn check_finally_condition_first_load_witness(jump_opcode: crate::target::Opcode) {
+        use crate::target::opcodes::{LOAD_ATTR, LOAD_FAST_CHECK};
+
+        for change in [
+            "unchanged",
+            "checked",
+            "different local",
+            "different location",
+            "later equal load",
+            "copied target",
+            "merged foreign target",
+            "unreachable source",
+        ] {
+            let source = Label::from_u32(0);
+            let cold = Label::from_u32(1);
+            let target = Label::from_u32(2);
+            let body = Label::from_u32(3);
+            let exit = Label::from_u32(4);
+            let foreign = Label::from_u32(5);
+            let mut pop_block =
+                Instruction::new(NOP, Operand::Value(0), SourceLocation::NONE, None);
+            pop_block.fusion_policy.mark_converted_pop_block();
+            let original = vec![
+                Item::Label(source),
+                instruction(JUMP_FORWARD, Operand::Forward(target)),
+                Item::Label(cold),
+                instruction(LOAD_CONST, Operand::Value(0)),
+                instruction(RETURN_VALUE, Operand::Value(0)),
+                Item::Label(target),
+                Item::Instruction(pop_block),
+                instruction(LOAD_FAST, Operand::Value(0)),
+                instruction(jump_opcode, Operand::Forward(exit)),
+                Item::Label(body),
+                instruction(LOAD_FAST, Operand::Value(0)),
+                instruction(LOAD_ATTR, Operand::Value(0)),
+                instruction(POP_TOP, Operand::Value(0)),
+                instruction(JUMP_FORWARD, Operand::Forward(exit)),
+                Item::Label(exit),
+                instruction(LOAD_CONST, Operand::Value(0)),
+                instruction(RETURN_VALUE, Operand::Value(0)),
+            ];
+            let mut assembler = Assembler::from_linear_items(original);
+            assembler.next_label = 6;
+            assembler.exception_owner_provenance.block_boundaries =
+                [source, cold, target, body, exit].into_iter().collect();
+            let mut pipeline = assembler.into_optimization_pipeline();
+            pipeline.python_version = crate::PythonVersion::Py314;
+            pipeline.borrow_finally_entries.insert(target, None);
+            pipeline.borrow_unreachable_blocks.insert(target);
+            pipeline.borrow_jump_entry_labels.insert(target);
+            pipeline.record_borrow_cleanup_calls();
+            let witness = pipeline.borrow_finally_entries[&target]
+                .unwrap_or_else(|| panic!("missing witness for {jump_opcode:?}: {change}"));
+            assert_eq!(witness.opcode, LOAD_FAST);
+            assert_eq!(witness.argument, 0);
+
+            let mut items = pipeline.graph.iter_items().copied().collect::<Vec<_>>();
+            let first = items
+                .iter()
+                .position(
+                    |item| matches!(item, Item::Instruction(value) if value.opcode == LOAD_FAST),
+                )
+                .unwrap();
+            let Item::Instruction(load) = &mut items[first] else {
+                unreachable!();
+            };
+            if change != "unchanged" {
+                load.opcode = LOAD_FAST_CHECK;
+            }
+            if change == "different local" {
+                load.set_operand(Operand::Value(1));
+            }
+            if change == "different location" {
+                load.location = SourceLocation::new(21, 21, 0, 8);
+            }
+            if change == "later equal load" {
+                items.splice(
+                    first..first,
+                    [
+                        instruction(LOAD_CONST, Operand::Value(0)),
+                        instruction(POP_TOP, Operand::Value(0)),
+                    ],
+                );
+            }
+            if change == "copied target" {
+                for item in &mut items {
+                    match item {
+                        Item::Label(label) if *label == target => *label = foreign,
+                        Item::Instruction(value) if value.operand() == Operand::Forward(target) => {
+                            value.set_operand(Operand::Forward(foreign));
+                        }
+                        _ => {}
+                    }
+                }
+                pipeline.borrow_unreachable_blocks.insert(foreign);
+                pipeline.borrow_jump_entry_labels.insert(foreign);
+            }
+            if change == "merged foreign target" {
+                items.insert(first - 1, Item::Label(foreign));
+                pipeline.borrow_unreachable_blocks.insert(foreign);
+                pipeline.borrow_jump_entry_labels.insert(foreign);
+            }
+            if change == "unreachable source" {
+                pipeline.borrow_finally_jump_sources.insert(source, false);
+            }
+            OptimizationPipeline::optimize_load_fast(
+                &mut items,
+                &[],
+                BorrowEntryLabels {
+                    unreachable: &pipeline.borrow_unreachable_blocks,
+                    loop_exits: &FxHashMap::default(),
+                    finally_entries: &pipeline.borrow_finally_entries,
+                    finally_jump_sources: &pipeline.borrow_finally_jump_sources,
+                    jump_entries: &pipeline.borrow_jump_entry_labels,
+                    original_boundaries: &pipeline.exception_owner_provenance.block_boundaries,
+                    pre_copy_jump_entries: &FxHashMap::default(),
+                    authored_finally_break_entries: &FxHashMap::default(),
+                    retained_nop_finally_entries: &FxHashMap::default(),
+                },
+                &FxHashSet::default(),
+                &FxHashSet::default(),
+                false,
+            );
+            let body_load = items
+                .iter()
+                .skip_while(|item| !matches!(item, Item::Label(label) if *label == body))
+                .find_map(|item| match item {
+                    Item::Instruction(value) => Some(value.opcode),
+                    Item::Label(_) => None,
+                })
+                .unwrap();
+            assert_eq!(
+                body_load,
+                if matches!(change, "unchanged" | "checked") {
+                    LOAD_FAST_BORROW
+                } else {
+                    LOAD_FAST
+                },
+                "{change}",
+            );
+            if change == "checked" {
+                assert!(
+                    matches!(items[first], Item::Instruction(value) if value.opcode == LOAD_FAST_CHECK)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn retained_finally_fused_prefixes_require_exact_original_pairs() {
+        use crate::target::opcodes::{
+            LOAD_FAST_LOAD_FAST, STORE_FAST, STORE_FAST_LOAD_FAST, STORE_FAST_STORE_FAST,
+        };
+
+        for with_alias in [false, true] {
+            for (first_opcode, second_opcode, fused_opcode) in [
+                (LOAD_FAST, LOAD_FAST, LOAD_FAST_LOAD_FAST),
+                (STORE_FAST, LOAD_FAST, STORE_FAST_LOAD_FAST),
+                (STORE_FAST, STORE_FAST, STORE_FAST_STORE_FAST),
+            ] {
+                for change in [
+                    "unchanged",
+                    "original first slot too large",
+                    "original second slot too large",
+                    "original different lines",
+                    "original first fusion barrier",
+                    "original second fusion barrier",
+                    "changed packed operand",
+                    "changed location",
+                    "changed depth",
+                    "changed fusion policy",
+                    "intervening label",
+                    "missing instruction",
+                    "extra instruction",
+                ] {
+                    let source = Label::from_u32(0);
+                    let alias = Label::from_u32(1);
+                    let cold = Label::from_u32(2);
+                    let target = Label::from_u32(3);
+                    let finally = Label::from_u32(4);
+                    let mut first = Instruction::new(
+                        first_opcode,
+                        Operand::Value(2),
+                        SourceLocation::new(10, 10, 0, 8),
+                        Some(1),
+                    );
+                    let mut second = Instruction::new(
+                        second_opcode,
+                        Operand::Value(3),
+                        SourceLocation::new(10, 10, 9, 17),
+                        Some(0),
+                    );
+                    match change {
+                        "original first slot too large" => first.set_operand(Operand::Value(16)),
+                        "original second slot too large" => second.set_operand(Operand::Value(16)),
+                        "original different lines" => {
+                            second.location = SourceLocation::new(11, 11, 0, 8);
+                        }
+                        "original first fusion barrier" => first.fusion_policy.prevent_with_next(),
+                        "original second fusion barrier" => {
+                            second.fusion_policy.prevent_with_previous();
+                        }
+                        _ => {}
+                    }
+                    let mut original = vec![
+                        Item::Label(source),
+                        instruction(LOAD_CONST, Operand::Value(0)),
+                        Item::Instruction(first),
+                        Item::Instruction(second),
+                        instruction(POP_TOP, Operand::Value(0)),
+                    ];
+                    if with_alias {
+                        original.push(Item::Label(alias));
+                    }
+                    original.push(instruction(JUMP_FORWARD, Operand::Forward(target)));
+                    let cold_items = [
+                        Item::Label(cold),
+                        instruction(LOAD_CONST, Operand::Value(0)),
+                        instruction(RETURN_VALUE, Operand::Value(0)),
+                    ];
+                    let cleanup = [
+                        Item::Label(target),
+                        Item::Label(finally),
+                        instruction(LOAD_FAST, Operand::Value(1)),
+                        instruction(POP_TOP, Operand::Value(0)),
+                        instruction(LOAD_CONST, Operand::Value(0)),
+                        instruction(RETURN_VALUE, Operand::Value(0)),
+                    ];
+                    original.extend(cold_items);
+                    original.extend(cleanup);
+                    let mut assembler = Assembler::from_linear_items(original);
+                    assembler.next_label = 6;
+                    assembler.exception_owner_provenance.block_boundaries =
+                        [source, cold, target].into_iter().collect();
+                    assembler
+                        .exception_owner_provenance
+                        .source_boundaries
+                        .insert(source);
+                    if with_alias {
+                        assembler
+                            .exception_owner_provenance
+                            .compound_try_owner_exits
+                            .push((alias, target));
+                    }
+                    let mut pipeline = assembler.into_optimization_pipeline();
+                    pipeline.borrow_finally_entries.insert(finally, None);
+                    pipeline.borrow_unreachable_blocks.insert(finally);
+                    pipeline.borrow_jump_entry_labels.insert(finally);
+                    let origins = pipeline.capture_retained_finally_origins();
+                    assert_eq!(origins.len(), 1, "{fused_opcode:?} {change} {with_alias}");
+                    let (Operand::Value(first_arg), Operand::Value(second_arg)) =
+                        (first.operand(), second.operand())
+                    else {
+                        unreachable!();
+                    };
+                    // Deliberately construct forbidden fusions too: replay must use
+                    // the optimizer's pair rules, not just recognize a packed opcode.
+                    let mut fused = Instruction::fused(
+                        fused_opcode,
+                        Operand::Value((first_arg << 4) | second_arg),
+                        first,
+                        second,
+                    );
+                    match change {
+                        "changed packed operand" => fused.set_operand(Operand::Value(0x24)),
+                        "changed location" => {
+                            fused.location = SourceLocation::new(12, 12, 0, 8);
+                        }
+                        "changed depth" => {
+                            fused = Instruction::fused(
+                                fused_opcode,
+                                fused.operand(),
+                                first,
+                                Instruction::new(
+                                    second.opcode,
+                                    second.operand(),
+                                    second.location,
+                                    Some(7),
+                                ),
+                            );
+                        }
+                        "changed fusion policy" => fused.fusion_policy.prevent_with_next(),
+                        _ => {}
+                    }
+                    let mut live = vec![
+                        Item::Label(source),
+                        instruction(LOAD_CONST, Operand::Value(0)),
+                    ];
+                    if change == "intervening label" {
+                        live.push(Item::Label(Label::from_u32(5)));
+                    }
+                    live.push(Item::Instruction(fused));
+                    if change != "missing instruction" {
+                        live.push(instruction(POP_TOP, Operand::Value(0)));
+                    }
+                    if change == "extra instruction" {
+                        live.push(instruction(POP_TOP, Operand::Value(0)));
+                    }
+                    if with_alias {
+                        live.push(Item::Label(alias));
+                    }
+                    live.extend(cleanup);
+                    live.extend(cold_items);
+                    pipeline.graph = BlockGraph::from_items(live, &FxHashSet::default());
+                    let retained = pipeline.retained_finally_entries(&origins);
+                    assert_eq!(
+                        retained
+                            .get(&if with_alias { alias } else { source })
+                            .copied(),
+                        (change == "unchanged").then_some(target),
+                        "{fused_opcode:?} {change} {with_alias}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn retained_finally_condition_bypasses_only_earlier_empty_arrays() {
+        use crate::assembler::BorrowFallthrough;
+        use crate::target::opcodes::POP_JUMP_IF_FALSE;
+
+        for change in [
+            "unchanged",
+            "multiple earlier aliases",
+            "missing condition",
+            "duplicate condition",
+            "original condition location",
+            "original source borrow boundary",
+            "later source borrow boundary",
+            "changed condition target",
+            "changed condition location",
+            "changed condition depth",
+            "condition barrier",
+            "source barrier",
+            "source location",
+            "target barrier",
+            "target local",
+            "target location",
+            "new source alias",
+            "new target alias",
+        ] {
+            let source = Label::from_u32(0);
+            let emptied = Label::from_u32(1);
+            let exit = Label::from_u32(2);
+            let cold = Label::from_u32(3);
+            let target = Label::from_u32(4);
+            let finally = Label::from_u32(5);
+            let body = Label::from_u32(6);
+            let foreign = Label::from_u32(7);
+            let location = SourceLocation::new(20, 20, 0, 8);
+            let mut condition =
+                Instruction::new(POP_JUMP_IF_FALSE, Operand::Forward(exit), location, Some(0));
+            if change == "original condition location" {
+                condition.location.column += 1;
+            }
+            let mut jump = Instruction::new(JUMP_FORWARD, Operand::Forward(target), location, None);
+            jump.jump_policy.retain_nop_for_direct_target();
+            if change == "original source borrow boundary" {
+                jump.jump_policy.prevent_borrow_threading_target();
+            }
+            let mut original = vec![
+                Item::Label(source),
+                instruction(LOAD_FAST, Operand::Value(1)),
+            ];
+            if change != "missing condition" {
+                original.push(Item::Instruction(condition));
+            }
+            if change == "duplicate condition" {
+                original.extend([Item::Label(foreign), Item::Instruction(condition)]);
+            }
+            original.extend([
+                Item::Label(body),
+                instruction(LOAD_CONST, Operand::Value(0)),
+                instruction(POP_TOP, Operand::Value(0)),
+                instruction(JUMP_FORWARD, Operand::Forward(emptied)),
+                Item::Label(emptied),
+                instruction(JUMP_BACKWARD_NO_INTERRUPT, Operand::Backward(source)),
+                Item::Label(exit),
+                Item::Instruction(jump),
+                Item::Label(cold),
+                instruction(LOAD_CONST, Operand::Value(0)),
+                instruction(RETURN_VALUE, Operand::Value(0)),
+                Item::Label(target),
+                Item::Label(finally),
+                instruction(LOAD_FAST, Operand::Value(0)),
+                instruction(POP_TOP, Operand::Value(0)),
+                instruction(LOAD_CONST, Operand::Value(0)),
+                instruction(RETURN_VALUE, Operand::Value(0)),
+            ]);
+            let mut assembler = Assembler::from_linear_items(original);
+            assembler.next_label = 8;
+            assembler.exception_owner_provenance.block_boundaries =
+                [source, emptied, exit, cold, target].into_iter().collect();
+            let mut pipeline = assembler.into_optimization_pipeline();
+            pipeline.borrow_finally_entries.insert(finally, None);
+            pipeline.borrow_unreachable_blocks.insert(finally);
+            pipeline.borrow_jump_entry_labels.insert(finally);
+            let origins = pipeline.capture_retained_finally_origins();
+            assert_eq!(origins.len(), 1, "{change}");
+            if change == "original source borrow boundary" {
+                assert!(origins[0].conditional_entry.is_none());
+            }
+
+            match change {
+                "changed condition target" => condition.set_operand(Operand::Forward(emptied)),
+                "changed condition location" => condition.location.column += 1,
+                "changed condition depth" => {
+                    condition = Instruction::new(
+                        condition.opcode,
+                        condition.operand(),
+                        condition.location,
+                        Some(1),
+                    );
+                }
+                "condition barrier" => condition
+                    .no_location_policy
+                    .set_borrow_fallthrough(BorrowFallthrough::Barrier),
+                _ => {}
+            }
+            jump.opcode = NOP;
+            jump.set_operand(Operand::Value(0));
+            if change == "later source borrow boundary" {
+                jump.jump_policy.prevent_borrow_threading_target();
+            }
+            if change == "source barrier" {
+                jump.no_location_policy
+                    .set_borrow_fallthrough(BorrowFallthrough::Barrier);
+            }
+            if change == "source location" {
+                jump.location.column += 1;
+            }
+            let mut first = Instruction::new(LOAD_FAST, Operand::Value(0), location, None);
+            if change == "target barrier" {
+                first
+                    .no_location_policy
+                    .set_borrow_fallthrough(BorrowFallthrough::Barrier);
+            }
+            if change == "target local" {
+                first.set_operand(Operand::Value(1));
+            }
+            if change == "target location" {
+                first.location.column += 1;
+            }
+            let mut live = vec![
+                Item::Label(source),
+                instruction(LOAD_FAST, Operand::Value(1)),
+                Item::Instruction(condition),
+                Item::Label(body),
+                instruction(LOAD_CONST, Operand::Value(0)),
+                instruction(POP_TOP, Operand::Value(0)),
+                instruction(JUMP_BACKWARD_NO_INTERRUPT, Operand::Backward(source)),
+            ];
+            if change == "multiple earlier aliases" {
+                live.push(Item::Label(foreign));
+            }
+            live.extend([Item::Label(emptied), Item::Label(exit)]);
+            if change == "new source alias" {
+                live.push(Item::Label(foreign));
+            }
+            live.push(Item::Instruction(jump));
+            if change == "new target alias" {
+                live.push(Item::Label(foreign));
+            }
+            live.extend([
+                Item::Label(target),
+                Item::Label(finally),
+                Item::Instruction(first),
+                instruction(POP_TOP, Operand::Value(0)),
+                instruction(LOAD_CONST, Operand::Value(0)),
+                instruction(RETURN_VALUE, Operand::Value(0)),
+                Item::Label(cold),
+                instruction(LOAD_CONST, Operand::Value(0)),
+                instruction(RETURN_VALUE, Operand::Value(0)),
+            ]);
+            pipeline.graph = BlockGraph::from_items(live, &pipeline.preserved_block_boundaries);
+            let retained = pipeline.retained_finally_entries(&origins);
+            assert_eq!(
+                retained.get(&source).copied(),
+                matches!(change, "unchanged" | "multiple earlier aliases").then_some(target),
+                "{change}",
+            );
+            assert!(!retained.contains_key(&emptied), "{change}");
+            assert!(!retained.contains_key(&exit), "{change}");
+        }
+    }
+
+    #[test]
+    fn retained_finally_condition_skips_only_authored_break_aliases() {
+        use crate::assembler::BorrowFallthrough;
+        use crate::target::opcodes::POP_JUMP_IF_FALSE;
+
+        for change in [
+            "unchanged",
+            "multiple breaks",
+            "missing break",
+            "ordinary jump",
+            "conditional jump",
+            "backward jump",
+            "unlocated break",
+            "break barrier",
+            "break empty block",
+            "mixed incoming edges",
+            "authored alias",
+            "preserved alias",
+            "missing authored source",
+            "duplicate condition",
+            "late missing alias",
+            "late new alias",
+        ] {
+            let source = Label::from_u32(0);
+            let body = Label::from_u32(1);
+            let exit = Label::from_u32(2);
+            let alias = Label::from_u32(3);
+            let cold = Label::from_u32(4);
+            let target = Label::from_u32(5);
+            let finally = Label::from_u32(6);
+            let foreign = Label::from_u32(7);
+            let location = SourceLocation::new(20, 20, 0, 8);
+            let condition =
+                Instruction::new(POP_JUMP_IF_FALSE, Operand::Forward(exit), location, Some(0));
+            let mut branch = Instruction::new(
+                JUMP_FORWARD,
+                Operand::Forward(alias),
+                SourceLocation::new(21, 21, 4, 9),
+                None,
+            );
+            if change != "ordinary jump" {
+                branch.fusion_policy.mark_authored_break();
+            }
+            branch.jump_policy.retain_nop_for_direct_target();
+            match change {
+                "conditional jump" => branch.opcode = POP_JUMP_IF_FALSE,
+                "backward jump" => {
+                    branch.opcode = JUMP_BACKWARD_NO_INTERRUPT;
+                    branch.set_operand(Operand::Backward(alias));
+                }
+                "unlocated break" => branch.location = SourceLocation::NONE,
+                "break barrier" => branch
+                    .no_location_policy
+                    .set_borrow_fallthrough(BorrowFallthrough::Barrier),
+                "break empty block" => branch.jump_policy.mark_borrow_empty_block(),
+                _ => {}
+            }
+            let mut jump = Instruction::new(JUMP_FORWARD, Operand::Forward(target), location, None);
+            jump.jump_policy.retain_nop_for_direct_target();
+            let mut original = vec![
+                Item::Label(source),
+                instruction(LOAD_FAST, Operand::Value(1)),
+                Item::Instruction(condition),
+                Item::Label(body),
+            ];
+            if change != "missing break" {
+                original.push(Item::Instruction(branch));
+            }
+            if matches!(change, "multiple breaks" | "mixed incoming edges") {
+                let second = if change == "multiple breaks" {
+                    Item::Instruction(branch)
+                } else {
+                    instruction(JUMP_FORWARD, Operand::Forward(alias))
+                };
+                original.extend([Item::Label(foreign), second]);
+            }
+            if change == "duplicate condition" {
+                original.extend([Item::Label(foreign), Item::Instruction(condition)]);
+            }
+            original.extend([
+                Item::Label(exit),
+                Item::Label(alias),
+                Item::Instruction(jump),
+                Item::Label(cold),
+                instruction(LOAD_CONST, Operand::Value(0)),
+                instruction(RETURN_VALUE, Operand::Value(0)),
+                Item::Label(target),
+                Item::Label(finally),
+                instruction(LOAD_FAST, Operand::Value(0)),
+                instruction(POP_TOP, Operand::Value(0)),
+                instruction(LOAD_CONST, Operand::Value(0)),
+                instruction(RETURN_VALUE, Operand::Value(0)),
+            ]);
+            let mut assembler = Assembler::from_linear_items(original);
+            assembler.next_label = 8;
+            assembler.exception_owner_provenance.block_boundaries =
+                [source, exit, alias, cold, target].into_iter().collect();
+            if change != "missing authored source" {
+                assembler
+                    .exception_owner_provenance
+                    .source_boundaries
+                    .insert(exit);
+            }
+            if change == "authored alias" {
+                assembler
+                    .exception_owner_provenance
+                    .source_boundaries
+                    .insert(alias);
+            }
+            if change == "preserved alias" {
+                assembler.preserved_block_boundaries.insert(alias);
+            }
+            let mut pipeline = assembler.into_optimization_pipeline();
+            pipeline.borrow_finally_entries.insert(finally, None);
+            pipeline.borrow_unreachable_blocks.insert(finally);
+            pipeline.borrow_jump_entry_labels.insert(finally);
+            let origins = pipeline.capture_retained_finally_origins();
+            let captured = matches!(
+                change,
+                "unchanged" | "multiple breaks" | "late missing alias" | "late new alias"
+            );
+            assert_eq!(origins.len(), usize::from(captured), "{change}");
+
+            jump.opcode = NOP;
+            jump.set_operand(Operand::Value(0));
+            let mut live = vec![
+                Item::Label(source),
+                instruction(LOAD_FAST, Operand::Value(1)),
+                Item::Instruction(condition),
+                Item::Label(body),
+                instruction(JUMP_FORWARD, Operand::Forward(target)),
+                Item::Label(exit),
+            ];
+            if change != "late missing alias" {
+                live.push(Item::Label(alias));
+            }
+            if change == "late new alias" {
+                live.push(Item::Label(foreign));
+            }
+            live.extend([
+                Item::Instruction(jump),
+                Item::Label(target),
+                Item::Label(finally),
+                instruction(LOAD_FAST, Operand::Value(0)),
+                instruction(POP_TOP, Operand::Value(0)),
+                instruction(LOAD_CONST, Operand::Value(0)),
+                instruction(RETURN_VALUE, Operand::Value(0)),
+                Item::Label(cold),
+                instruction(LOAD_CONST, Operand::Value(0)),
+                instruction(RETURN_VALUE, Operand::Value(0)),
+            ]);
+            pipeline.graph = BlockGraph::from_items(live, &pipeline.preserved_block_boundaries);
+            let retained = pipeline.retained_finally_entries(&origins);
+            assert_eq!(
+                retained.get(&source).copied(),
+                matches!(change, "unchanged" | "multiple breaks").then_some(target),
+                "{change}"
+            );
+            assert!(!retained.contains_key(&alias), "{change}");
+            assert!(!retained.contains_key(&exit), "{change}");
+        }
+    }
+
+    #[test]
+    fn retained_finally_range_end_replays_both_populated_source_spans() {
+        use super::{BorrowFallthrough, LOAD_FAST_CHECK, fuse_pair};
+
+        for change in [
+            "unchanged",
+            "checked prefix",
+            "checked suffix",
+            "fused suffix",
+            "missing region",
+            "duplicate region",
+            "fallback region",
+            "lasti region",
+            "late region start",
+            "source boundary",
+            "preserved alias",
+            "shared alias",
+            "empty prefix",
+            "prefix nop",
+            "suffix nop",
+            "suffix barrier",
+            "suffix return",
+            "changed prefix",
+            "changed suffix local",
+            "changed suffix location",
+            "changed suffix depth",
+            "late suffix barrier",
+            "missing suffix",
+            "extra suffix",
+            "missing alias",
+            "extra alias",
+            "cross alias fusion",
+            "changed target",
+            "late target barrier",
+        ] {
+            let source = Label::from_u32(0);
+            let alias = Label::from_u32(1);
+            let cold = Label::from_u32(2);
+            let target = Label::from_u32(3);
+            let finally = Label::from_u32(4);
+            let foreign = Label::from_u32(5);
+            let mut prefix = vec![
+                instruction(LOAD_FAST, Operand::Value(0)),
+                instruction(POP_TOP, Operand::Value(0)),
+            ];
+            let mut suffix = vec![
+                instruction(LOAD_FAST, Operand::Value(1)),
+                instruction(LOAD_FAST, Operand::Value(2)),
+                instruction(POP_TOP, Operand::Value(0)),
+                instruction(POP_TOP, Operand::Value(0)),
+            ];
+            match change {
+                "empty prefix" => prefix.clear(),
+                "prefix nop" => prefix[0] = instruction(NOP, Operand::Value(0)),
+                "suffix nop" => suffix[0] = instruction(NOP, Operand::Value(0)),
+                "suffix return" => suffix[0] = instruction(RETURN_VALUE, Operand::Value(0)),
+                "suffix barrier" => {
+                    let Item::Instruction(first) = &mut suffix[0] else {
+                        unreachable!()
+                    };
+                    first
+                        .no_location_policy
+                        .set_borrow_fallthrough(BorrowFallthrough::Barrier);
+                }
+                "cross alias fusion" => prefix[1] = instruction(LOAD_FAST, Operand::Value(3)),
+                _ => {}
+            }
+            let cleanup = vec![
+                Item::Label(target),
+                Item::Label(finally),
+                instruction(LOAD_FAST, Operand::Value(0)),
+                instruction(POP_TOP, Operand::Value(0)),
+                instruction(LOAD_CONST, Operand::Value(0)),
+                instruction(RETURN_VALUE, Operand::Value(0)),
+            ];
+            let cold_items = vec![
+                Item::Label(cold),
+                instruction(LOAD_CONST, Operand::Value(0)),
+                instruction(RETURN_VALUE, Operand::Value(0)),
+            ];
+            let mut original = vec![Item::Label(source)];
+            original.extend(prefix.iter().copied());
+            original.push(Item::Label(alias));
+            original.extend(suffix.iter().copied());
+            original.push(instruction(JUMP_FORWARD, Operand::Forward(target)));
+            original.extend(cold_items.iter().copied());
+            original.extend(cleanup.iter().copied());
+            if change == "shared alias" {
+                original.extend([
+                    Item::Label(foreign),
+                    instruction(JUMP_FORWARD, Operand::Forward(alias)),
+                ]);
+            }
+            let mut assembler = Assembler::from_linear_items(original);
+            assembler.next_label = 6;
+            assembler.exception_owner_provenance.block_boundaries =
+                [source, cold, target].into_iter().collect();
+            assembler
+                .exception_owner_provenance
+                .source_boundaries
+                .insert(source);
+            if change == "source boundary" {
+                assembler
+                    .exception_owner_provenance
+                    .source_boundaries
+                    .insert(alias);
+            }
+            if change == "preserved alias" {
+                assembler.preserved_block_boundaries.insert(alias);
+            }
+            if change != "missing region" {
+                assembler.add_exception_region(
+                    if change == "late region start" {
+                        cold
+                    } else {
+                        source
+                    },
+                    alias,
+                    cold,
+                    0,
+                    change == "lasti region",
+                );
+                if change == "duplicate region" {
+                    assembler.add_exception_region(source, alias, cold, 0, false);
+                }
+                if change == "fallback region" {
+                    assembler.exception_regions[0].is_scope_fallback = true;
+                }
+            }
+            let mut pipeline = assembler.into_optimization_pipeline();
+            pipeline.borrow_finally_entries.insert(finally, None);
+            pipeline.borrow_unreachable_blocks.insert(finally);
+            pipeline.borrow_jump_entry_labels.insert(finally);
+            let origins = pipeline.capture_retained_finally_origins();
+            if matches!(
+                change,
+                "missing region"
+                    | "duplicate region"
+                    | "fallback region"
+                    | "lasti region"
+                    | "late region start"
+                    | "source boundary"
+                    | "preserved alias"
+                    | "shared alias"
+                    | "empty prefix"
+                    | "prefix nop"
+                    | "suffix nop"
+                    | "suffix barrier"
+                    | "suffix return"
+            ) {
+                assert!(
+                    origins.iter().all(|origin| origin.source_suffix.is_empty()),
+                    "{change}"
+                );
+                continue;
+            }
+            assert_eq!(origins.len(), 1, "{change}");
+            assert_eq!(origins[0].source_suffix.len(), 4, "{change}");
+            let mut cleanup = cleanup;
+            match change {
+                "checked prefix" => {
+                    let Item::Instruction(first) = &mut prefix[0] else {
+                        unreachable!()
+                    };
+                    first.opcode = LOAD_FAST_CHECK;
+                }
+                "checked suffix" => {
+                    let Item::Instruction(first) = &mut suffix[0] else {
+                        unreachable!()
+                    };
+                    first.opcode = LOAD_FAST_CHECK;
+                }
+                "fused suffix" => {
+                    let (Item::Instruction(first), Item::Instruction(second)) =
+                        (suffix[0], suffix[1])
+                    else {
+                        unreachable!()
+                    };
+                    suffix.splice(
+                        ..2,
+                        [Item::Instruction(fuse_pair(&first, &second).unwrap())],
+                    );
+                }
+                "changed prefix" => prefix[0] = instruction(LOAD_FAST, Operand::Value(2)),
+                "changed suffix local" => suffix[0] = instruction(LOAD_FAST, Operand::Value(3)),
+                "changed suffix location" | "changed suffix depth" | "late suffix barrier" => {
+                    let Item::Instruction(first) = &mut suffix[0] else {
+                        unreachable!()
+                    };
+                    match change {
+                        "changed suffix location" => first.location.line += 1,
+                        "changed suffix depth" => {
+                            *first = Instruction::new(
+                                first.opcode,
+                                first.operand(),
+                                first.location,
+                                Some(1),
+                            );
+                        }
+                        _ => first
+                            .no_location_policy
+                            .set_borrow_fallthrough(BorrowFallthrough::Barrier),
+                    }
+                }
+                "missing suffix" => {
+                    suffix.pop();
+                }
+                "extra suffix" => suffix.push(instruction(POP_TOP, Operand::Value(0))),
+                "changed target" => cleanup[2] = instruction(LOAD_FAST, Operand::Value(3)),
+                "late target barrier" => {
+                    let Item::Instruction(first) = &mut cleanup[2] else {
+                        unreachable!()
+                    };
+                    first
+                        .no_location_policy
+                        .set_borrow_fallthrough(BorrowFallthrough::Barrier);
+                }
+                _ => {}
+            }
+            let mut live = vec![Item::Label(source)];
+            live.extend(prefix);
+            if change != "missing alias" {
+                live.push(Item::Label(alias));
+            }
+            if change == "extra alias" {
+                live.push(Item::Label(foreign));
+            }
+            if change == "cross alias fusion" {
+                let Item::Instruction(first) = live.remove(2) else {
+                    unreachable!()
+                };
+                let Item::Instruction(second) = suffix.remove(0) else {
+                    unreachable!()
+                };
+                live.insert(2, Item::Instruction(fuse_pair(&first, &second).unwrap()));
+            }
+            live.extend(suffix);
+            live.extend(cleanup);
+            live.extend(cold_items);
+            pipeline.graph = BlockGraph::from_items(live, &pipeline.preserved_block_boundaries);
+            let retained = pipeline.retained_finally_entries(&origins);
+            assert_eq!(
+                retained.get(&alias).copied(),
+                matches!(
+                    change,
+                    "unchanged" | "checked prefix" | "checked suffix" | "fused suffix"
+                )
+                .then_some(target),
+                "{change}"
+            );
+            assert!(!retained.contains_key(&source), "{change}");
+        }
+    }
+
+    #[test]
     fn retained_finally_source_aliases_require_one_surviving_original_array() {
-        use crate::target::opcodes::{CALL, POP_JUMP_IF_FALSE, PUSH_NULL, STORE_FAST};
+        use crate::target::opcodes::{
+            CALL, LOAD_FAST_CHECK, POP_JUMP_IF_FALSE, PUSH_NULL, STORE_FAST,
+        };
 
         for change in [
             "ordinary call",
@@ -7420,6 +8830,28 @@ mod retained_finally_origin_tests {
             "conditional source",
             "late boundary",
             "changed prefix",
+            "checked source",
+            "checked target",
+            "checked both",
+            "checked source different local",
+            "checked source different location",
+            "checked target different local",
+            "checked target different location",
+            "expression source",
+            "expression unrecorded",
+            "expression duplicate record",
+            "expression duplicate incoming",
+            "expression changed incoming operand",
+            "expression changed incoming location",
+            "expression changed incoming depth",
+            "expression incoming barrier",
+            "expression source barrier",
+            "expression target barrier",
+            "expression late source barrier",
+            "expression late target barrier",
+            "expression changed prefix",
+            "expression late boundary",
+            "expression foreign preserved alias",
         ] {
             let source = Label::from_u32(0);
             let alias = Label::from_u32(1);
@@ -7441,7 +8873,7 @@ mod retained_finally_origin_tests {
                     ],
                 );
             }
-            let cleanup = [
+            let mut cleanup = [
                 Item::Label(target),
                 Item::Label(finally),
                 instruction(LOAD_FAST, Operand::Value(1)),
@@ -7449,8 +8881,66 @@ mod retained_finally_origin_tests {
                 instruction(LOAD_CONST, Operand::Value(0)),
                 instruction(RETURN_VALUE, Operand::Value(0)),
             ];
+            for (name, item) in [
+                ("expression source barrier", &mut prefix[0]),
+                ("expression target barrier", &mut cleanup[2]),
+            ] {
+                if change == name {
+                    let Item::Instruction(instruction) = item else {
+                        unreachable!();
+                    };
+                    instruction
+                        .no_location_policy
+                        .set_borrow_fallthrough(crate::assembler::BorrowFallthrough::Barrier);
+                }
+            }
             let source_alias = Label::from_u32(5);
-            let mut original = vec![Item::Label(source_alias), Item::Label(source)];
+            let expression = change.starts_with("expression ");
+            let incoming = Instruction::new(
+                JUMP_FORWARD,
+                Operand::Forward(source),
+                SourceLocation::NONE,
+                Some(2),
+            );
+            let mut actual_incoming = incoming;
+            match change {
+                "expression changed incoming operand" => {
+                    actual_incoming.set_operand(Operand::Forward(source_alias));
+                }
+                "expression changed incoming location" => {
+                    actual_incoming.location = SourceLocation::new(21, 21, 0, 8);
+                }
+                "expression changed incoming depth" => {
+                    actual_incoming = Instruction::new(
+                        incoming.opcode,
+                        incoming.operand(),
+                        incoming.location,
+                        Some(3),
+                    );
+                }
+                "expression incoming barrier" => actual_incoming
+                    .no_location_policy
+                    .set_borrow_fallthrough(crate::assembler::BorrowFallthrough::Barrier),
+                _ => {}
+            }
+            let mut predecessor = if expression {
+                vec![
+                    Item::Label(Label::from_u32(6)),
+                    instruction(LOAD_CONST, Operand::Value(0)),
+                    Item::Instruction(actual_incoming),
+                ]
+            } else {
+                Vec::new()
+            };
+            if change == "expression duplicate incoming" {
+                predecessor.extend([
+                    Item::Label(Label::from_u32(7)),
+                    instruction(LOAD_CONST, Operand::Value(0)),
+                    Item::Instruction(actual_incoming),
+                ]);
+            }
+            let mut original = predecessor.clone();
+            original.extend([Item::Label(source_alias), Item::Label(source)]);
             original.extend(prefix.iter().copied());
             original.extend([
                 Item::Label(alias),
@@ -7470,7 +8960,7 @@ mod retained_finally_origin_tests {
             }
             original.extend(cleanup);
             let mut assembler = Assembler::from_linear_items(original);
-            assembler.next_label = 6;
+            assembler.next_label = 8;
             assembler.exception_owner_provenance.block_boundaries =
                 [source, cold, target].into_iter().collect();
             assembler
@@ -7496,12 +8986,42 @@ mod retained_finally_origin_tests {
             if change == "preserved exit boundary" {
                 assembler.preserved_block_boundaries.insert(alias);
             }
+            if expression {
+                assembler.preserved_block_boundaries.insert(source);
+                if change != "expression unrecorded" {
+                    assembler
+                        .exception_owner_provenance
+                        .original_if_expression_joins
+                        .push((source, incoming));
+                }
+                if change == "expression duplicate record" {
+                    assembler
+                        .exception_owner_provenance
+                        .original_if_expression_joins
+                        .push((source, incoming));
+                }
+                if change == "expression foreign preserved alias" {
+                    assembler.preserved_block_boundaries.insert(source_alias);
+                }
+            }
             let mut pipeline = assembler.into_optimization_pipeline();
             pipeline.borrow_finally_entries.insert(finally, None);
             pipeline.borrow_unreachable_blocks.insert(finally);
             pipeline.borrow_jump_entry_labels.insert(finally);
             let origins = pipeline.capture_retained_finally_origins();
-            let captured = matches!(change, "ordinary call" | "late boundary" | "changed prefix");
+            let checked = change.starts_with("checked ");
+            let captured = checked
+                || matches!(
+                    change,
+                    "ordinary call"
+                        | "late boundary"
+                        | "changed prefix"
+                        | "expression source"
+                        | "expression changed prefix"
+                        | "expression late boundary"
+                        | "expression late source barrier"
+                        | "expression late target barrier"
+                );
             assert_eq!(origins.len(), usize::from(captured), "{change}");
             if !captured {
                 continue;
@@ -7509,9 +9029,47 @@ mod retained_finally_origin_tests {
             assert_eq!(origins[0].source_exit_alias, Some(alias));
             // Remove only the original normal jump and move its cold neighbor.
             // The range-end alias and complete source array must still survive.
-            let mut live = vec![Item::Label(source_alias), Item::Label(source)];
-            if change == "changed prefix" {
+            let mut live = predecessor;
+            live.extend([Item::Label(source_alias), Item::Label(source)]);
+            if matches!(change, "changed prefix" | "expression changed prefix") {
                 *prefix.last_mut().unwrap() = instruction(STORE_FAST, Operand::Value(0));
+            }
+            if change.starts_with("checked source") || change == "checked both" {
+                let Item::Instruction(load) = &mut prefix[0] else {
+                    unreachable!();
+                };
+                load.opcode = LOAD_FAST_CHECK;
+                if change == "checked source different local" {
+                    load.set_operand(Operand::Value(1));
+                }
+                if change == "checked source different location" {
+                    load.location = SourceLocation::new(21, 21, 0, 8);
+                }
+            }
+            if change.starts_with("checked target") || change == "checked both" {
+                let Item::Instruction(load) = &mut cleanup[2] else {
+                    unreachable!();
+                };
+                load.opcode = LOAD_FAST_CHECK;
+                if change == "checked target different local" {
+                    load.set_operand(Operand::Value(0));
+                }
+                if change == "checked target different location" {
+                    load.location = SourceLocation::new(21, 21, 0, 8);
+                }
+            }
+            for (name, item) in [
+                ("expression late source barrier", &mut prefix[0]),
+                ("expression late target barrier", &mut cleanup[2]),
+            ] {
+                if change == name {
+                    let Item::Instruction(instruction) = item else {
+                        unreachable!();
+                    };
+                    instruction
+                        .no_location_policy
+                        .set_borrow_fallthrough(crate::assembler::BorrowFallthrough::Barrier);
+                }
             }
             live.extend(prefix);
             live.push(Item::Label(alias));
@@ -7521,14 +9079,22 @@ mod retained_finally_origin_tests {
                 instruction(LOAD_CONST, Operand::Value(0)),
                 instruction(RETURN_VALUE, Operand::Value(0)),
             ]);
-            if change == "late boundary" {
+            if matches!(change, "late boundary" | "expression late boundary") {
                 pipeline.preserved_block_boundaries.insert(alias);
             }
             pipeline.graph = BlockGraph::from_items(live, &pipeline.preserved_block_boundaries);
             let retained = pipeline.retained_finally_entries(&origins);
             assert_eq!(
                 retained.get(&alias).copied(),
-                (change == "ordinary call").then_some(target),
+                matches!(
+                    change,
+                    "ordinary call"
+                        | "checked source"
+                        | "checked target"
+                        | "checked both"
+                        | "expression source"
+                )
+                .then_some(target),
                 "{change}",
             );
         }
@@ -7659,6 +9225,7 @@ mod retained_finally_origin_tests {
                     original_boundaries: &pipeline.exception_owner_provenance.block_boundaries,
                     pre_copy_jump_entries: &FxHashMap::default(),
                     authored_finally_break_entries: &FxHashMap::default(),
+                    retained_nop_finally_entries: &FxHashMap::default(),
                 },
                 &FxHashSet::default(),
                 &FxHashSet::default(),
@@ -7742,6 +9309,7 @@ mod retained_finally_origin_tests {
                     original_boundaries: &FxHashSet::default(),
                     pre_copy_jump_entries: &FxHashMap::default(),
                     authored_finally_break_entries: &FxHashMap::default(),
+                    retained_nop_finally_entries: &FxHashMap::default(),
                 },
                 &boundaries,
                 &FxHashSet::default(),

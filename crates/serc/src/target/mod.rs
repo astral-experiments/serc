@@ -334,7 +334,7 @@ mod tests {
         ] {
             assert!(static_strings.windows(2).all(|pair| pair[0] < pair[1]));
             assert!(startup_strings.windows(2).all(|pair| pair[0] < pair[1]));
-            for value in static_strings.iter().chain(compiler_strings) {
+            for value in static_strings {
                 assert!(
                     is_preinterned_string_for(version, value),
                     "{version}: {value:?}"
@@ -343,7 +343,16 @@ mod tests {
             for value in startup_strings {
                 assert_eq!(
                     is_preinterned_string_for(version, value),
-                    cfg!(target_os = "linux")
+                    cfg!(target_os = "linux") || compiler_strings.contains(value)
+                );
+            }
+            for value in compiler_strings {
+                assert_eq!(
+                    is_preinterned_string_for(version, value),
+                    !cfg!(target_os = "linux")
+                        || static_strings.contains(value)
+                        || startup_strings.contains(value),
+                    "{version}: builtin compile() alias {value:?}"
                 );
             }
         }
@@ -392,14 +401,26 @@ mod tests {
                 .windows(2)
                 .all(|values| values[0] < values[1])
         );
-        for value in PREINTERNED_STRINGS.iter().chain(COMPILER_INTERNED_STRINGS) {
+        for value in PREINTERNED_STRINGS {
             assert!(
                 is_preinterned_string(value),
                 "missing generated string {value:?}"
             );
         }
         for value in super::cpython_3_15_0rc2::STARTUP_INTERNED_STRINGS {
-            assert_eq!(is_preinterned_string(value), cfg!(target_os = "linux"));
+            assert_eq!(
+                is_preinterned_string(value),
+                cfg!(target_os = "linux") || COMPILER_INTERNED_STRINGS.contains(value)
+            );
+        }
+        for value in COMPILER_INTERNED_STRINGS {
+            assert_eq!(
+                is_preinterned_string(value),
+                !cfg!(target_os = "linux")
+                    || PREINTERNED_STRINGS.contains(value)
+                    || super::cpython_3_15_0rc2::STARTUP_INTERNED_STRINGS.contains(value),
+                "compiler alias {value:?} must have a captured startup owner"
+            );
         }
         assert!(is_preinterned_string("__lazy_import__"));
         assert!(!is_preinterned_string("__serc_not_interned__"));
@@ -495,11 +516,19 @@ mod tests {
                 "missing startup string {value:?}"
             );
         }
-        assert_eq!(is_preinterned_string("pause"), cfg!(unix));
+        assert_eq!(
+            is_preinterned_string("pause"),
+            cfg!(all(unix, not(target_os = "linux")))
+        );
         for value in COMPILER_INTERNED_STRINGS {
-            assert!(
+            #[cfg(target_os = "linux")]
+            let expected = super::cpython_3_14_5::LINUX_PREINTERNED_STRINGS.contains(value);
+            #[cfg(not(target_os = "linux"))]
+            let expected = true;
+            assert_eq!(
                 is_preinterned_string(value),
-                "missing compiler-initialized string {value:?}"
+                expected,
+                "compiler alias {value:?} must have a captured startup owner"
             );
         }
         for value in [

@@ -41,3 +41,32 @@ def first_guard_control(values):
         );
     }
 }
+
+#[test]
+fn generator_condition_after_captured_comprehension_and_yield() {
+    for annotation in ["", " -> None"] {
+        for captured in ["values", "source, values"] {
+            for condition in ["state.ready()", "ready()"] {
+                let source = format!(
+                    "def sample():
+    source = data
+    values = {{item.value for item in source.items()}}
+
+    def captured(){annotation}:
+        return {captured}
+
+    state.callback = captured
+
+    try:
+        yield
+        if not {condition}:
+            pass
+    finally:
+        pass
+"
+                );
+                common::assert_matches_cpython_marshal(&source, "captured_yield_condition.py");
+            }
+        }
+    }
+}

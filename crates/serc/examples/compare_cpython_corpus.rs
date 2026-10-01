@@ -824,6 +824,7 @@ mod tests {
                 continue;
             };
             assert_reference_matches(Path::new(&reference), version);
+            eprintln!("minimal reference completed: {version}; levels=0,1,2");
         }
     }
 
@@ -832,10 +833,6 @@ mod tests {
         use serc::OptimizationLevel;
 
         super::verify_reference(reference, python_version).unwrap();
-        let options = CompileOptions {
-            python_version,
-            ..CompileOptions::default()
-        };
         let directory = tempfile::tempdir().unwrap();
         let sharing = concat!(
             "values = {'high', 'low', 'medium'}\n",
@@ -850,8 +847,74 @@ mod tests {
         for (name, source) in [
             ("module_only.py", b"pass\n".as_slice()),
             ("sharing.py", sharing.as_bytes()),
+            (
+                "minimal_ast_startup.py",
+                concat!(
+                    "def first(value):\n    return value in {'left', 'marker_732'}, 1\n",
+                    "def second(value):\n    return value in {'left', 'marker_732'}, 2\n",
+                )
+                .as_bytes(),
+            ),
+            (
+                "minimal_signal_startup.py",
+                concat!(
+                    "def first(value):\n    return value in {'pause', 'marker_732'}, 1\n",
+                    "def second(value):\n    return value in {'pause', 'marker_732'}, 2\n",
+                )
+                .as_bytes(),
+            ),
+            (
+                "minimal_ast_identifier.py",
+                concat!(
+                    "def metadata(value):\n    return value.left\n",
+                    "def first(value):\n    return value in {'left', 'marker_732'}, 1\n",
+                    "def second(value):\n    return value in {'left', 'marker_732'}, 2\n",
+                )
+                .as_bytes(),
+            ),
+            (
+                "minimal_signal_literal.py",
+                concat!(
+                    "def prior():\n    return 'pause'\n",
+                    "def first(value):\n    return value in {'pause', 'marker_732'}, 1\n",
+                    "def second(value):\n    return value in {'pause', 'marker_732'}, 2\n",
+                )
+                .as_bytes(),
+            ),
             ("optimized.py", optimized.as_bytes()),
             ("latin1.py", b"# coding: latin-1\nvalue = 'caf\xe9'\n"),
+            (
+                "retained_loop_constant_finally_owners.py",
+                include_bytes!("../tests/fixtures/retained_loop_constant_finally_owners.py"),
+            ),
+            (
+                "async_for_original_scope_footer.py",
+                include_bytes!("../tests/fixtures/async_for_original_scope_footer.py"),
+            ),
+            (
+                "manager_entry_conditional_owners.py",
+                include_bytes!("../tests/fixtures/manager_entry_conditional_owners.py"),
+            ),
+            (
+                "runtime_list_conditional_owners.py",
+                include_bytes!("../tests/fixtures/runtime_list_conditional_owners.py"),
+            ),
+            (
+                "erased_comprehension_branch_footers.py",
+                include_bytes!("../tests/fixtures/erased_comprehension_branch_footers.py"),
+            ),
+            (
+                "erased_module_cells.py",
+                include_bytes!("../tests/fixtures/erased_module_cells.py"),
+            ),
+            (
+                "copied_finally_scope_footer.py",
+                include_bytes!("../tests/fixtures/copied_finally_scope_footer.py"),
+            ),
+            (
+                "erased_debug.py",
+                b"if __debug__:\n    def function():\n        return 1\n",
+            ),
         ] {
             let path = directory.path().join(name);
             fs::write(&path, source).unwrap();
@@ -897,6 +960,45 @@ mod tests {
                 );
             }
         }
+        for (name, source, is_docstring) in [
+            ("surrogate_module.py", "'\\ud800'\n", true),
+            ("surrogate_class.py", "class C:\n    '\\udfff'\n", true),
+            ("surrogate_function.py", "def f():\n    '\\ud800'\n", true),
+            ("surrogate_literal.py", "value = '\\ud800'\n", false),
+            ("surrogate_late_string.py", "pass\n'\\udfff'\n", false),
+        ] {
+            let path = directory.path().join(name);
+            fs::write(&path, source).unwrap();
+            for optimization_level in [
+                OptimizationLevel::Zero,
+                OptimizationLevel::One,
+                OptimizationLevel::Two,
+            ] {
+                let options = CompileOptions {
+                    python_version,
+                    optimization_level,
+                    ..CompileOptions::default()
+                };
+                let expected = if is_docstring
+                    && python_version >= PythonVersion::Py313
+                    && optimization_level != OptimizationLevel::Two
+                {
+                    OutcomeKind::MatchedRejection
+                } else {
+                    OutcomeKind::Exact
+                };
+                let outcome = super::compare(&path, reference, &options, true);
+                assert_eq!(
+                    outcome.kind, expected,
+                    "{python_version} {name} -O{optimization_level}: {}",
+                    outcome.detail
+                );
+            }
+        }
+        let options = CompileOptions {
+            python_version,
+            ..CompileOptions::default()
+        };
         for (name, source) in [
             ("syntax.py", b"if:\n".as_slice()),
             ("nul.py", b"value = 1\0\n"),

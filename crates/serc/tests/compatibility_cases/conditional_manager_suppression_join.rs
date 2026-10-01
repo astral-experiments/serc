@@ -23,3 +23,35 @@ fn nested_raising_finally_keeps_manager_exit_marker() {
         }
     }
 }
+
+#[test]
+fn original_populated_manager_branches_keep_their_pop_record() {
+    for prefix in ["def", "async def"] {
+        for donor in [
+            "value = work()",
+            "box.total += value",
+            "value: int = work()",
+        ] {
+            for terminal in ["break", "return value"] {
+                for outer_try in [false, true] {
+                    let body = format!(
+                        "while ready():\n    with manager():\n        if flag:\n            {donor}\n        else:\n            {terminal}\n"
+                    );
+                    let body = if outer_try {
+                        format!(
+                            "try:\n    {}\nexcept ValueError:\n    recover()\n",
+                            body.trim_end().replace('\n', "\n    ")
+                        )
+                    } else {
+                        body
+                    };
+                    let source = format!(
+                        "{prefix} f(manager, ready, flag, work, value, box):\n    {}\n    finish(value)\n",
+                        body.trim_end().replace('\n', "\n    "),
+                    );
+                    common::assert_matches_cpython_marshal(&source, "populated_manager_branch.py");
+                }
+            }
+        }
+    }
+}

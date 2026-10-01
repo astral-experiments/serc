@@ -1,10 +1,13 @@
+use super::super::legacy_native_labels::WithAwait;
 use super::{
     CALL, Compiler, Constant, LOAD_CONST, Label, POP_TOP, SWAP, WithExitContext, WithState,
 };
 use crate::CompileError;
+use crate::assembler::{Assembler, CompletedManagerAwait, HeldAwaitSource};
+use ruff_text_size::TextRange;
 
 /// A manager exit and the state needed to close its protected region after copied cleanup.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct WithUnwind {
     pub(super) index: usize,
     pub(super) start: Label,
@@ -12,7 +15,63 @@ pub(super) struct WithUnwind {
     exclusion_count: usize,
 }
 
+/// The one manager exit actually emitted for this preserved return.
+pub(super) struct CompletedManagerUnwind {
+    returned: TextRange,
+    withs: WithState,
+    unwind: WithUnwind,
+    completion: CompletedManagerAwait,
+}
+
+struct RecordedWithUnwind {
+    unwinds: Vec<WithUnwind>,
+    completion: Option<CompletedManagerUnwind>,
+    copied_finally: Option<Vec<crate::assembler::CopiedFinallyManagerEvent>>,
+}
+
+impl CompletedManagerUnwind {
+    pub(super) fn has_frontier(
+        &self,
+        withs: &WithState,
+        returned: TextRange,
+        unwinds: &[WithUnwind],
+        assembler: &Assembler,
+        aliases: [Label; 2],
+        source: &HeldAwaitSource,
+    ) -> bool {
+        self.returned == returned
+            && &self.withs == withs
+            && unwinds == [self.unwind]
+            && assembler.completed_manager_await_has_frontier(&self.completion, aliases, source)
+    }
+}
+
 impl WithUnwind {
+    #[cfg(test)]
+    pub(super) fn test_origin(
+        index: usize,
+        start: Label,
+        exception_region_depth: usize,
+        exclusion_count: usize,
+    ) -> Self {
+        Self {
+            index,
+            start,
+            exception_region_depth,
+            exclusion_count,
+        }
+    }
+
+    pub(super) fn matches_original(self, index: usize, state: &WithState) -> bool {
+        self.index == index
+            && state.active_with_exits.get(index).is_some_and(|context| {
+                context.exception_region_depth == self.exception_region_depth
+            })
+            && state
+                .active_with_region_exclusions
+                .get(index)
+                .is_some_and(|exclusions| exclusions.len() == self.exclusion_count)
+    }
     pub(super) fn exits_exception_region(self, index: usize) -> bool {
         index >= self.exception_region_depth
     }
@@ -109,9 +168,65 @@ impl Compiler<'_> {
         preserve_tos: bool,
         origin: super::super::legacy_native_labels::WithAwait,
     ) -> Result<Vec<WithUnwind>, CompileError> {
+        self.emit_with_unwind_inner(from_depth, to_depth, preserve_tos, origin, false, false)
+            .map(|recorded| recorded.unwinds)
+    }
+
+    /// Retains a receipt from the real emitter without changing its instructions or policies.
+    pub(super) fn emit_with_unwind_and_completion(
+        &mut self,
+        from_depth: usize,
+        to_depth: usize,
+        preserve_tos: bool,
+        origin: WithAwait,
+    ) -> Result<(Vec<WithUnwind>, Option<CompletedManagerUnwind>), CompileError> {
+        self.emit_with_unwind_inner(from_depth, to_depth, preserve_tos, origin, true, false)
+            .map(|recorded| (recorded.unwinds, recorded.completion))
+    }
+
+    pub(super) fn emit_with_unwind_recorded(
+        &mut self,
+        from_depth: usize,
+        to_depth: usize,
+        preserve_tos: bool,
+        origin: WithAwait,
+        capture: bool,
+    ) -> Result<
+        (
+            Vec<WithUnwind>,
+            Option<Vec<crate::assembler::CopiedFinallyManagerEvent>>,
+        ),
+        CompileError,
+    > {
+        self.emit_with_unwind_inner(from_depth, to_depth, preserve_tos, origin, false, capture)
+            .map(|recorded| (recorded.unwinds, recorded.copied_finally))
+    }
+
+    fn emit_with_unwind_inner(
+        &mut self,
+        from_depth: usize,
+        to_depth: usize,
+        preserve_tos: bool,
+        origin: WithAwait,
+        capture_completion: bool,
+        capture_events: bool,
+    ) -> Result<RecordedWithUnwind, CompileError> {
+        let mut completion = None;
         let mut unwind_starts = Vec::with_capacity(to_depth - from_depth);
+        let mut events = capture_events.then(Vec::new);
         for index in (from_depth..to_depth).rev() {
+            let original_start = self.assembler.item_count();
             let context = self.control.withs.active_with_exits[index];
+            let original_withs = (capture_completion
+                && self.context.python_version == crate::PythonVersion::Py314
+                && from_depth == 0
+                && to_depth == 1
+                && preserve_tos
+                && context.is_async
+                && context.loop_depth == 1
+                && context.exception_region_depth == 3
+                && matches!(origin, WithAwait::Return(_)))
+            .then(|| self.control.withs.clone());
             let start = self.assembler.label();
             self.assembler.mark(start);
             unwind_starts.push(self.control.withs.begin_unwind(index, start));
@@ -132,7 +247,43 @@ impl Compiler<'_> {
                 self.compile_awaitable_on_stack_with_native_roles(2, roles)?;
             }
             self.emit(POP_TOP, 0, -1)?;
+            if let Some(withs) = original_withs
+                && withs == self.control.withs
+                && let WithAwait::Return(returned) = origin
+                && let Some(event) = self.assembler.capture_completed_manager_await(
+                    original_start,
+                    start,
+                    context.location,
+                    none,
+                    3,
+                )
+            {
+                completion = Some(CompletedManagerUnwind {
+                    returned,
+                    withs,
+                    unwind: *unwind_starts.last().unwrap(),
+                    completion: event,
+                });
+            }
+            if let Some(receipts) = &mut events {
+                if let Some(event) = self.assembler.capture_copied_finally_manager_event(
+                    original_start,
+                    start,
+                    none,
+                    context.is_async,
+                    context.location,
+                    &self.output,
+                ) {
+                    receipts.push(event);
+                } else {
+                    events = None;
+                }
+            }
         }
-        Ok(unwind_starts)
+        Ok(RecordedWithUnwind {
+            unwinds: unwind_starts,
+            completion,
+            copied_finally: events,
+        })
     }
 }

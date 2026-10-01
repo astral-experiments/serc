@@ -72,3 +72,43 @@ fn comprehension_cell_assignment_keeps_fresh_setup_marker_owner() {
         }
     }
 }
+
+#[test]
+fn retained_setup_fusion_slots_account_for_closure_prologues() {
+    for prologue in ["", "        super().f(value)\n"] {
+        for count in 6..=10 {
+            for condition in ["value", "check(value)", "isinstance(value, Kind)"] {
+                let stores = "        self.item = value\n".repeat(count);
+                let source = format!(
+                    "class C(Base):\n    def f(self, value):\n{prologue}{stores}        try:\n            self.value = value if {condition} else convert(value)\n        except ValueError as error:\n            raise Error() from error\n"
+                );
+                common::assert_matches_cpython_marshal(
+                    &source,
+                    "retained_setup_fusion_prologue.py",
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn removed_entry_setup_slots_keep_null_and_owned_guard_donors_distinct() {
+    for (scope, suffix) in [
+        ("def", ""),
+        ("async def", ""),
+        ("def", "    yield value\n"),
+        ("async def", "    yield value\n"),
+    ] {
+        for prefix in ["", "value = False\n", "work()\n"] {
+            for name in ["", " as error"] {
+                for condition in ["flag is None", "flag is not None", "flag is None or other"] {
+                    let prefix = common::indent(&common::indent(&common::indent(prefix)));
+                    let source = format!(
+                        "{scope} f(flag, other, value, manager):\n    with manager:\n        try:\n{prefix}            if {condition}:\n                work()\n            work()\n        except Error{name}:\n            recover()\n        finally:\n            cleanup()\n{suffix}"
+                    );
+                    common::assert_matches_cpython_marshal(&source, "entry_setup_guard_donors.py");
+                }
+            }
+        }
+    }
+}

@@ -22,6 +22,7 @@ mod linear;
 mod locals;
 mod normal_try_copies;
 mod normal_try_copy_plan;
+mod retained_finally_nops;
 mod swaps;
 
 #[cfg(any(test, debug_assertions))]
@@ -237,6 +238,10 @@ impl Assembler {
     pub(in crate::assembler) fn into_optimization_pipeline(mut self) -> OptimizationPipeline {
         self.prune_unused_loop_finally_region_boundaries();
         self.resolve_folded_condition_borrow_entries();
+        self.bind_copied_cleanup_ordinary_try_pops();
+        self.bind_unnamed_handler_break_owners();
+        self.seal_copied_async_finally_owners();
+        self.seal_retained_setup_truths();
         let (mut graph, initial_reachable) = match self.code {
             UnoptimizedCode::Linear(items) => (
                 BlockGraph::from_items(items, &rustc_hash::FxHashSet::default()),
@@ -493,6 +498,47 @@ impl Assembler {
                     };
                 }
             }
+            for origin in &mut self
+                .exception_owner_provenance
+                .copied_nested_try_manager_returns
+            {
+                origin.resolve_priorities(&label_positions);
+            }
+            for origin in &mut self
+                .exception_owner_provenance
+                .copied_cleanup_return_none_prefixes
+            {
+                if let Some(witness) = &mut origin.omitted_ordinary_try {
+                    witness.resolve_priorities(&label_positions);
+                }
+            }
+            self.exception_owner_provenance
+                .awaited_normal_finally_prefixes
+                .retain_mut(|origin| origin.resolve_priority(&label_positions));
+            self.exception_owner_provenance
+                .independent_finally_entries
+                .retain_mut(|origin| origin.resolve_priorities(&label_positions));
+            self.exception_owner_provenance
+                .retained_normal_finally_entries
+                .retain_mut(|origin| origin.resolve_priorities(&label_positions));
+            self.exception_owner_provenance
+                .retained_store_finally_entries
+                .retain_mut(|origin| origin.resolve_priorities(&label_positions));
+            self.exception_owner_provenance
+                .copied_async_finally_owners
+                .retain_mut(|origin| origin.resolve_priorities(&label_positions));
+            self.exception_owner_provenance
+                .retained_setup_truths
+                .retain_mut(|origin| origin.resolve_priorities(&label_positions));
+            self.exception_owner_provenance
+                .retargeted_normal_finally_prefixes
+                .retain_mut(|origin| origin.resolve_priority(&label_positions));
+            self.exception_owner_provenance
+                .folded_normal_finally_nops
+                .retain_mut(|origin| origin.resolve_priority(&label_positions));
+            self.exception_owner_provenance
+                .unnamed_handler_breaks
+                .retain_mut(|origin| origin.resolve_priorities(&label_positions));
         }
         #[cfg(test)]
         assert!(
@@ -502,6 +548,36 @@ impl Assembler {
                         if instruction.jump_target().is_some())
                 })
         );
+        let mut retained_entries = std::mem::take(
+            &mut self
+                .exception_owner_provenance
+                .retained_normal_finally_entries,
+        );
+        if !retained_entries.is_empty() {
+            let items = graph.copy_items();
+            retained_entries.retain_mut(|origin| {
+                origin.prepare_roles(&self.exception_owner_provenance, &items)
+            });
+            self.exception_owner_provenance
+                .retained_normal_finally_entries = retained_entries;
+        }
+        let mut store_entries = std::mem::take(
+            &mut self
+                .exception_owner_provenance
+                .retained_store_finally_entries,
+        );
+        if !store_entries.is_empty() {
+            let items = graph.copy_items();
+            store_entries.retain_mut(|origin| {
+                origin.prepare_roles(
+                    &self.exception_owner_provenance,
+                    &items,
+                    &self.exception_regions,
+                )
+            });
+        }
+        self.exception_owner_provenance
+            .retained_store_finally_entries = store_entries;
         if graph.features().has_jump() {
             for item in graph.iter_items() {
                 if let Item::Instruction(instruction) = item
@@ -559,6 +635,7 @@ impl Assembler {
             borrow_jump_entry_labels: self.borrow_jump_entry_labels,
             borrow_pre_copy_jump_entries: rustc_hash::FxHashMap::default(),
             borrow_threaded_jump_targets: rustc_hash::FxHashMap::default(),
+            initial_borrow_handler_cleanups: rustc_hash::FxHashMap::default(),
             borrow_threaded_jump_entries: rustc_hash::FxHashMap::default(),
             borrow_authored_finally_break_origins:
                 crate::assembler::ir::AuthoredFinallyBreakOrigins::default(),
@@ -613,6 +690,7 @@ impl OptimizationPipeline {
                 constants,
             );
         }
+        let shared_conditional_pops = self.capture_shared_conditional_try_pops();
         let local_nop_donors = self.capture_local_nop_donors();
         let reversed_store_exits = self.capture_reversed_store_exits();
         self.preserve_shared_original_manager_pop_locations();
@@ -620,6 +698,7 @@ impl OptimizationPipeline {
         let mut original_owners = FusionOwnerCertificates::capture_original_owners(&self);
         let retained_finally_origins = self.capture_retained_finally_origins();
         let setup_finally_origins = self.record_borrow_cleanup_calls_with_setups();
+        let mut retained_finally_nops = retained_finally_nops::RetainedFinallyNops::capture(&self);
         // Retain immediately after any pass that edits fusion-view inputs. A skipped pass or
         // one that reports no edits can reuse the checkpoint without hiding an invalidation.
         original_owners.retain_pipeline(&self);
@@ -635,13 +714,18 @@ impl OptimizationPipeline {
             );
         }
         if !self.borrow_jump_entry_labels.is_empty() {
+            let donor_marks = self.retargeted_finally_initial_borrow_candidates();
+            let handler_marks = self.named_handler_initial_borrow_candidates();
             self.borrow_threaded_jump_targets = Self::mark_initial_borrow_jump_entries(
                 &mut self.graph,
                 &self.exception_owner_provenance.block_boundaries,
             );
+            self.seal_retargeted_finally_initial_borrow_marks(donor_marks);
+            self.seal_named_handler_initial_borrow_marks(handler_marks);
             original_owners.retain_pipeline(&self);
         }
         self.record_original_jump_heads();
+        let mut guarded_loop_nops = super::guarded_loop_nops::GuardedLoopNops::capture(&self);
         self.capture_normal_try_break_pop_owners();
         original_owners.retain_pipeline(&self);
         self.prepare_original_conditional_jump_targets();
@@ -679,7 +763,20 @@ impl OptimizationPipeline {
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::OptimizeBooleanConversions)?;
         let threaded_normal_try_joins = self.capture_threaded_normal_try_joins();
-        let threaded_jumps = !assertion_side_exits && self.thread_forward_jumps();
+        let mut threaded_region_retargets = Vec::new();
+        let record_retained_finally_regions = retained_finally_nops
+            .before_region_rewrite(&self, retained_finally_nops::RegionStage::Threading);
+        let threaded_jumps = !assertion_side_exits
+            && if record_retained_finally_regions {
+                self.thread_forward_jumps_with_region_retargets(&mut threaded_region_retargets)
+            } else {
+                self.thread_forward_jumps()
+            };
+        retained_finally_nops.after_region_rewrite(
+            &self,
+            &threaded_region_retargets,
+            retained_finally_nops::RegionStage::Threading,
+        );
         self.borrow_threaded_jump_targets.clear();
         original_owners.retain_pipeline(&self);
         #[cfg(any(test, debug_assertions))]
@@ -694,7 +791,11 @@ impl OptimizationPipeline {
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::RemoveUnreachableAfterThreading)?;
         if !assertion_side_exits {
-            self.remove_redundant_forward_jumps(false);
+            self.remove_redundant_forward_jumps_with_finally_nops(
+                false,
+                &mut retained_finally_nops::RetainedFinallyNops::default(),
+                &mut guarded_loop_nops,
+            );
             original_owners.retain_pipeline(&self);
         }
         #[cfg(any(test, debug_assertions))]
@@ -718,15 +819,22 @@ impl OptimizationPipeline {
         self.validate_structure(AssemblerStage::ApplyStaticSwaps)?;
         let mut copied_exit_owner_retargets = Vec::new();
         let mut copied_exit_region_retargets = Vec::new();
+        let folded_normal_regions = self.retain_folded_normal_finally_nops(false);
+        retained_finally_nops
+            .before_region_rewrite(&self, retained_finally_nops::RegionStage::ExitCopy);
+        self.retain_named_finally_returns();
+        let mut named_finally_return_donations = Vec::new();
         let copied_entry_labels = if assertion_side_exits {
             self.propagate_assertion_exit_locations();
             Vec::new()
         } else {
+            guarded_loop_nops.observe_donation(&self, false);
             self.duplicate_exit_blocks_with_store_origins(
                 &original_location_absence,
                 (
                     &mut copied_exit_owner_retargets,
                     &mut copied_exit_region_retargets,
+                    &mut named_finally_return_donations,
                 ),
                 &reversed_store_exits,
                 &threaded_normal_try_joins,
@@ -736,7 +844,21 @@ impl OptimizationPipeline {
                     .map(|constants| &mut **constants as &mut dyn ConstantTable),
             )?
         };
+        guarded_loop_nops.observe_donation(&self, true);
+        retained_finally_nops.after_region_rewrite(
+            &self,
+            &copied_exit_region_retargets,
+            retained_finally_nops::RegionStage::ExitCopy,
+        );
+        self.transport_named_finally_return_donations(&named_finally_return_donations);
         self.replay_copied_comprehension_swaps(copied_comprehension_swaps);
+        self.replay_original_manager_pop_locations();
+        self.replay_shared_conditional_try_pops(shared_conditional_pops);
+        self.transport_folded_normal_finally_nops(
+            folded_normal_regions.as_deref(),
+            &copied_exit_region_retargets,
+            true,
+        );
         self.borrow_threaded_jump_entries.clear();
         self.borrow_authored_finally_break_origins =
             crate::assembler::ir::AuthoredFinallyBreakOrigins::default();
@@ -754,9 +876,75 @@ impl OptimizationPipeline {
             &copied_exit_owner_retargets,
             &copied_exit_region_retargets,
         );
+        if !copied_exit_owner_retargets.is_empty()
+            && self
+                .exception_owner_provenance
+                .copied_cleanup_return_none_prefixes
+                .iter()
+                .any(|origin| {
+                    origin.omitted_ordinary_try.is_some() || origin.named_iterator.is_some()
+                })
+        {
+            self.exception_owner_provenance
+                .retarget_copied_cleanup_ordinary_try_conditions(
+                    &copied_exit_owner_retargets,
+                    &self.graph.copy_items(),
+                );
+        }
         // Exit duplication changes this surviving conditional's target, not its
         // original array or the normal-finally comparison cells recorded within it.
+        if !self
+            .exception_owner_provenance
+            .unnamed_handler_breaks
+            .is_empty()
+        {
+            let items = self.graph.copy_items();
+            self.exception_owner_provenance
+                .unnamed_handler_breaks
+                .retain_mut(|origin| {
+                    origin.retarget_condition(&copied_exit_owner_retargets, &items)
+                });
+        }
         for (before, after) in &copied_exit_owner_retargets {
+            let primitive_origins = &mut self
+                .exception_owner_provenance
+                .original_primitive_condition_boundaries;
+            if primitive_origins
+                .iter()
+                .filter(|origin| **origin == *before)
+                .count()
+                == 1
+                && self
+                    .graph
+                    .iter_items()
+                    .filter(|item| matches!(item, Item::Instruction(record) if record == after))
+                    .count()
+                    == 1
+            {
+                for origin in primitive_origins {
+                    if *origin == *before {
+                        *origin = *after;
+                    }
+                }
+                // The named-break proof authenticates this same primitive origin
+                // independently of its cleanup array. Keep both witnesses in sync.
+                for origin in &mut self
+                    .exception_owner_provenance
+                    .copied_named_break_truth_prefixes
+                {
+                    if origin.original_condition == *before {
+                        origin.original_condition = *after;
+                    }
+                }
+            }
+            for prefix in &mut self
+                .exception_owner_provenance
+                .normal_finally_truth_prefixes
+            {
+                if prefix[3] == *before {
+                    prefix[3] = *after;
+                }
+            }
             for prefix in self
                 .exception_owner_provenance
                 .copied_shared_break_truth_prefixes
@@ -773,7 +961,7 @@ impl OptimizationPipeline {
                         && condition == before
                     {
                         // Preserve the actual copy pass's complete before/after record;
-                        // the original named-handler condition remains a separate witness.
+                        // the primitive witness is transported separately above.
                         *condition = *after;
                     }
                 }
@@ -806,8 +994,11 @@ impl OptimizationPipeline {
                     }
                 }
             }
-            for (_, _, condition) in
-                &mut self.exception_owner_provenance.normal_finally_none_prefixes
+            for (_, _, condition) in self
+                .exception_owner_provenance
+                .normal_finally_none_prefixes
+                .iter_mut()
+                .chain(&mut self.exception_owner_provenance.copied_finally_none_prefixes)
             {
                 if condition == before {
                     *condition = *after;
@@ -826,6 +1017,15 @@ impl OptimizationPipeline {
                     records[8] = *after;
                 }
             }
+            for (_, _, records) in &mut self
+                .exception_owner_provenance
+                .copied_handler_finalizer_none_prefixes
+            {
+                let condition = records.len() - 2;
+                if records[condition] == *before {
+                    records[condition] = *after;
+                }
+            }
             for records in &mut self
                 .exception_owner_provenance
                 .copied_iterator_attribute_none_prefixes
@@ -834,12 +1034,20 @@ impl OptimizationPipeline {
                     records[3] = *after;
                 }
             }
-            for (_, records) in &mut self
+            for origin in &mut self
                 .exception_owner_provenance
                 .copied_handler_return_none_prefixes
             {
-                if records[5] == *before {
-                    records[5] = *after;
+                if origin.condition == *before {
+                    origin.condition = *after;
+                }
+            }
+            for origin in &mut self
+                .exception_owner_provenance
+                .copied_nested_manager_returns
+            {
+                if origin.condition == *before {
+                    origin.condition = *after;
                 }
             }
             for origin in &mut self
@@ -896,6 +1104,14 @@ impl OptimizationPipeline {
             }
             for origin in &mut self
                 .exception_owner_provenance
+                .copied_handler_manager_returns
+            {
+                if origin.condition == *before {
+                    origin.condition = *after;
+                }
+            }
+            for origin in &mut self
+                .exception_owner_provenance
                 .copied_manager_return_none_prefixes
             {
                 if origin.condition == *before {
@@ -944,7 +1160,10 @@ impl OptimizationPipeline {
                 original_owners.retain_pipeline(&self);
             }
             if self.python_version == crate::PythonVersion::Py315 {
-                self.lower_common_constants(constants);
+                self.lower_common_constants_with_guarded_loop_nops(
+                    constants,
+                    &mut guarded_loop_nops,
+                );
                 original_owners.retain_pipeline(&self);
             }
         }
@@ -973,13 +1192,52 @@ impl OptimizationPipeline {
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::FuseSuperinstructions)?;
         let omitted_borrow_markers = if !assertion_side_exits {
+            let folded_normal_regions = self.retain_folded_normal_finally_nops(true);
             let mut owner_retargets = Vec::new();
+            let mut owner_groups = Vec::new();
+            let unnamed_break_regions = (!self
+                .exception_owner_provenance
+                .unnamed_handler_breaks
+                .is_empty())
+            .then(|| self.exception_regions.clone());
+            let retained_finally_retargets = retained_finally_nops
+                .before_region_rewrite(&self, retained_finally_nops::RegionStage::Cold);
             let omitted = self.push_cold_blocks_to_end(
+                (fusion_owners.has_manager_setup_certificates()
+                    || retained_finally_retargets
+                    || !self
+                        .exception_owner_provenance
+                        .unnamed_handler_breaks
+                        .is_empty()
+                    || !self
+                        .exception_owner_provenance
+                        .folded_normal_finally_nops
+                        .is_empty())
+                .then_some(&mut owner_retargets),
                 fusion_owners
                     .has_manager_setup_certificates()
-                    .then_some(&mut owner_retargets),
+                    .then_some(&mut owner_groups),
             );
-            fusion_owners.retain_after_cold_regions(&self, &owner_retargets);
+            fusion_owners.retain_after_cold_regions(&self, &owner_retargets, &owner_groups);
+            self.exception_owner_provenance
+                .unnamed_handler_breaks
+                .retain_mut(|origin| {
+                    origin.rebind_cold(
+                        unnamed_break_regions.as_deref().unwrap_or_default(),
+                        &owner_retargets,
+                        &self.exception_regions,
+                    )
+                });
+            self.transport_folded_normal_finally_nops(
+                folded_normal_regions.as_deref(),
+                &owner_retargets,
+                false,
+            );
+            retained_finally_nops.after_region_rewrite(
+                &self,
+                &owner_retargets,
+                retained_finally_nops::RegionStage::Cold,
+            );
             omitted
         } else {
             rustc_hash::FxHashSet::default()
@@ -1001,7 +1259,9 @@ impl OptimizationPipeline {
         }
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::RemoveRedundantSwapsBeforePops)?;
+        retained_finally_nops.observe_pop_cleanup(&self, false);
         let nop_cleanup = self.remove_redundant_nops();
+        retained_finally_nops.observe_pop_cleanup(&self, true);
         if nop_cleanup.may_have_changed {
             fusion_owners.retain_pipeline(&self);
         }
@@ -1009,7 +1269,11 @@ impl OptimizationPipeline {
         self.validate_structure(AssemblerStage::RemoveRedundantNops)?;
         if !assertion_side_exits {
             if nop_cleanup.has_forward_jump {
-                self.remove_redundant_forward_jumps(true);
+                self.remove_redundant_forward_jumps_with_finally_nops(
+                    true,
+                    &mut retained_finally_nops,
+                    &mut guarded_loop_nops,
+                );
                 fusion_owners.retain_pipeline(&self);
             }
             // Manager exits can expose a redundant POP_BLOCK after their jump disappears.
@@ -1023,12 +1287,16 @@ impl OptimizationPipeline {
             fusion_owners.retain_pipeline(&self);
         }
         let mut retained_finally_entries = self.retained_finally_entries(&retained_finally_origins);
+        retained_finally_nops.revalidate(&self);
+        guarded_loop_nops.revalidate(&self);
         let module_annotation_borrow_markers =
             control_flow::surviving_module_annotation_borrow_markers(
                 &self.graph,
                 &self.exception_owner_provenance.module_annotation_jump_nops,
             );
         let features = self.graph.features();
+        self.validate_copied_async_finally_graph();
+        self.validate_retained_setup_truth_graph();
         let mut items = self.graph.into_items();
         if !omitted_borrow_markers.is_empty() {
             // Analysis-only boundaries must not obstruct physical jump or NOP cleanup.
@@ -1071,6 +1339,25 @@ impl OptimizationPipeline {
         for (source, target) in setup_finally_entries {
             retained_finally_entries.entry(source).or_insert(target);
         }
+        let retained_nop_finally_entries = retained_finally_nops.entries(
+            &items,
+            &self.exception_regions,
+            &retained_finally_nops::HeadView {
+                provenance: &self.exception_owner_provenance,
+                preserved: &self.preserved_block_boundaries,
+                unreachable: &self.borrow_unreachable_blocks,
+                aliases: &self.borrow_block_aliases,
+                original_nops: &self.original_nop_targets,
+                jump_entries: &self.borrow_jump_entry_labels,
+                finally_entries: &self.borrow_finally_entries,
+                finally_jump_sources: &self.borrow_finally_jump_sources,
+            },
+        );
+        guarded_loop_nops.mark_before_borrow(
+            &mut items,
+            &self.borrow_block_aliases,
+            &self.borrow_finally_entries,
+        );
         if features.has_fast_load() {
             // These entries split only borrowed-reference analysis. They do not
             // change earlier CFG copying, NOP removal or exception ownership.
@@ -1151,6 +1438,15 @@ impl OptimizationPipeline {
                     }
                 }
             }
+            let mut retained_setup_origins =
+                std::mem::take(&mut self.exception_owner_provenance.retained_setup_truths);
+            let retained_setup_borrow =
+                super::retained_setup_truth::RetainedSetupTruth::before_borrow(
+                    &mut retained_setup_origins,
+                    &items,
+                    &self.exception_regions,
+                    &self.exception_owner_provenance,
+                );
             Self::optimize_load_fast_with_retained_entries(
                 self.python_version,
                 &mut items,
@@ -1164,12 +1460,21 @@ impl OptimizationPipeline {
                     original_boundaries: &self.exception_owner_provenance.block_boundaries,
                     pre_copy_jump_entries: &self.borrow_pre_copy_jump_entries,
                     authored_finally_break_entries: &self.borrow_authored_finally_break_entries,
+                    retained_nop_finally_entries: &retained_nop_finally_entries,
                 },
                 &borrow_boundaries,
                 &self.borrow_block_aliases,
                 assertion_side_exits,
                 &retained_finally_entries,
             );
+            super::retained_setup_truth::RetainedSetupTruth::after_borrow(
+                &mut retained_setup_origins,
+                &items,
+                &self.exception_regions,
+                &self.exception_owner_provenance,
+                &retained_setup_borrow,
+            );
+            self.exception_owner_provenance.retained_setup_truths = retained_setup_origins;
             for (prefix_index, record_index, index, before) in break_loads_before {
                 let mut expected = before;
                 expected.opcode = crate::target::opcodes::LOAD_FAST_BORROW;

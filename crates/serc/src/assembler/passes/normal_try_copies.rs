@@ -12,6 +12,10 @@ use super::super::{
 use super::normal_try_copy_plan::{OriginalNode, OriginalTail, PrefixSlot, plan_normal_try_copies};
 use crate::target::opcodes::{JUMP_BACKWARD, JUMP_FORWARD, NOP, POP_EXCEPT};
 
+#[cfg(test)]
+#[path = "normal_try_copies/pass_match_tests.rs"]
+mod pass_match_tests;
+
 /// Checks whether restored owners retain priority when a jump's exclusion is cleared.
 ///
 /// Unknown ranges or priorities are rejected. Existing regions win ties, so a tied
@@ -2358,11 +2362,54 @@ impl OptimizationPipeline {
                                         && !self.borrow_block_aliases.contains(label)))
                         },
                     );
+                let original_pass_match_success = original_fallthrough
+                    && !self
+                        .exception_owner_provenance
+                        .normal_try_class_pattern_donor_labels
+                        .contains_key(&entry)
+                    && instruction.jump_policy.is_original_match_success()
+                    && self
+                        .exception_owner_provenance
+                        .original_match_join_boundaries
+                        .contains(&label)
+                    && self
+                        .exception_owner_provenance
+                        .original_pass_match_successes
+                        .iter()
+                        .filter(|(condition, source)| {
+                            source.last() == Some(instruction)
+                                && self.graph[source_block]
+                                    .items()
+                                    .iter()
+                                    .copied()
+                                    .eq(source.iter().copied().map(Item::Instruction))
+                                && order
+                                    .iter()
+                                    .position(|block| *block == source_block)
+                                    .and_then(|index| index.checked_sub(1))
+                                    .is_some_and(|index| {
+                                        self.graph[order[index]].last_instruction()
+                                            == Some(condition)
+                                    })
+                                && self
+                                    .graph
+                                    .iter_items()
+                                    .filter(|item| {
+                                        **item == Item::Instruction(*condition)
+                                            || **item == Item::Instruction(*instruction)
+                                    })
+                                    .count()
+                                    == 2
+                        })
+                        .count()
+                        == 1;
                 if instruction.forward_target().is_none()
                     || (instruction.jump_policy.preserves_nop_after_threading()
-                        && !original_match_success_head)
+                        && !original_match_success_head
+                        && !original_pass_match_success)
                     || instruction.jump_policy.borrow_empty_block()
-                    || instruction.jump_policy.always_retains_nop()
+                    || (instruction.jump_policy.always_retains_nop()
+                        && !original_pass_match_success)
                     // An original unlocated eval-breaker head still needs separate
                     // predecessor copies. A preceding real instruction supplies its own line.
                     || (instruction.no_location_policy.is_artificial_eval_break()
@@ -3539,6 +3586,8 @@ impl OptimizationPipeline {
         // An unnamed handler's recorded original cleanup can connect two normal
         // try exits. Its omitted POP_BLOCK is already carried on POP_EXCEPT; keep
         // all three slots in the same closed schedule instead of threading around it.
+        // A direct constant return also needs its manager predecessors in that
+        // schedule before the unlocated cleanup grows beyond the small-exit limit.
         let mut handler_cleanup_joins = FxHashSet::default();
         let mut direct_handler_return_joins = FxHashSet::default();
         for &block in order {
@@ -3563,7 +3612,8 @@ impl OptimizationPipeline {
                 || !jump.jump_policy.inline_small_exit()
                 || !jump.no_location_policy.allows_block_inlining()
                 || jump.jump_policy.retains_nop_for(jump.operand())
-                || jump.jump_policy.is_interruptible()
+                || (jump.jump_policy.is_interruptible()
+                    && !matches!(returns.get(&target), Some(OriginalTail::ConstantReturn { .. })))
                 || pop.depth_after() != jump.depth_after()
                 || [pop, jump].iter().any(|instruction| {
                     instruction.location != SourceLocation::NONE
@@ -3574,7 +3624,7 @@ impl OptimizationPipeline {
                     .original_handler_cleanup_join_exits
                     .contains(&label)
                 || (!exits.contains_key(&target)
-                    && !matches!(returns.get(&target), Some(OriginalTail::LocalTupleReturn { .. })))
+                    && !matches!(returns.get(&target), Some(OriginalTail::LocalTupleReturn { .. } | OriginalTail::ConstantReturn { .. })))
                 || positions[&block] >= positions[&target]
                 || !items[..head_len].iter().any(|item| {
                     matches!(item, Item::Label(label)

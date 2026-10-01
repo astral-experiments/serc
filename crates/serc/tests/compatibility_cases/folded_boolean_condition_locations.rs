@@ -1,6 +1,29 @@
 use crate::common;
 
 #[test]
+fn preserves_folded_boolean_operand_constant_order() {
+    for expression in [
+        "None or 'second'",
+        "False or 'second'",
+        "True and 'second'",
+        "'' or 'second'",
+        "256 and 'second'",
+        "None or False or 'second'",
+    ] {
+        for prefix in ["", "    version = 'first'\n"] {
+            for suffix in [
+                "    yield value\n",
+                "    return None, False, True, '', 256, value\n",
+                "    return value\n",
+            ] {
+                let source = format!("def f():\n{prefix}    value = {expression}\n{suffix}");
+                common::assert_matches_cpython_marshal(&source, "folded_boolean_constants.py");
+            }
+        }
+    }
+}
+
+#[test]
 fn preserves_folded_boolean_condition_locations() {
     for condition in [
         "True and False and 1 and 2",

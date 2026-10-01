@@ -1,3 +1,5 @@
+use std::fmt::Write as _;
+
 use crate::common;
 
 #[test]
@@ -86,6 +88,74 @@ fn protected_copy_plans_include_predecessors_of_handler_cleanup_sources() {
 "
             );
             common::assert_matches_cpython_marshal(&source, "handler_cleanup_copy_order.py");
+        }
+    }
+}
+
+#[test]
+fn named_handler_original_cleanup_uses_surviving_store_location() {
+    for (filename, source) in [
+        (
+            "named_handler_reversed_store_pair.py",
+            r"async def sample(flag, work, report):
+    try:
+        await work()
+    except ValueError as error:
+        if flag:
+            report(error)
+            left, right = None, None
+        else:
+            report(error)
+            left, right = None, None
+    except Exception:
+        left, right = None, None
+    return left, right
+",
+        ),
+        (
+            "named_handler_forward_store_pair_control.py",
+            r"async def sample(flag, work, report):
+    try:
+        await work()
+    except ValueError as error:
+        if flag:
+            report(error)
+            left = right = None
+        else:
+            report(error)
+            left = right = None
+    except Exception:
+        left = right = None
+    return left, right
+",
+        ),
+        (
+            "named_handler_multiline_store_pair_control.py",
+            r"async def sample(flag, work, report):
+    try:
+        await work()
+    except ValueError as error:
+        if flag:
+            report(error)
+            (left,
+             right) = None, None
+        else:
+            report(error)
+            (left,
+             right) = None, None
+    except Exception:
+        left, right = None, None
+    return left, right
+",
+        ),
+    ] {
+        for additional_parameters in [0, 10, 11, 12] {
+            let mut parameters = String::new();
+            for index in 0..additional_parameters {
+                write!(parameters, ", p{index}").unwrap();
+            }
+            let source = source.replace("report):", &format!("report{parameters}):"));
+            common::assert_matches_cpython_marshal(&source, filename);
         }
     }
 }

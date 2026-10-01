@@ -246,6 +246,25 @@ impl ConstantTable for InterningConstantTable<'_, '_> {
         Ok(index)
     }
 
+    fn fold_binary_sequence(
+        &mut self,
+        left: Constant,
+        argument: u32,
+        right: Constant,
+    ) -> Result<Option<u32>, CompileError> {
+        let index = self.output.fold_binary_sequence(left, argument, right)?;
+        if let Some(index) = index {
+            if argument == crate::target::operands::BinaryOperation::MULTIPLY.argument()
+                && matches!(self.output.get(index), Constant::Bytes(value) if value.is_empty())
+            {
+                self.context.record_empty_bytes_origin(true);
+            }
+            self.context
+                .record_constant_string_origins(self.output.get(index), false);
+        }
+        Ok(index)
+    }
+
     fn len(&self) -> usize {
         self.output.len()
     }
@@ -702,17 +721,29 @@ impl<'source> Compiler<'source> {
             self.symbols.locals.push(annotation_name);
             self.symbols.cell_names.insert(annotation_name);
         }
-        let cell_only_comprehension_names = self
+        let elided_comprehension_cells = self
             .context
             .scopes
-            .elided_comprehension_cells(ScopeId::MODULE)
+            .elided_comprehension_cells(ScopeId::MODULE);
+        let synthetic_annotation_cell = self
+            .context
+            .scopes
+            .names
+            .get("__conditional_annotations__")
+            .filter(|name| !elided_comprehension_cells.contains(name));
+        let cell_only_comprehension_names = elided_comprehension_cells
             .iter()
             .copied()
             .filter(|name| !self.symbols.locals.contains(name))
             .collect::<Vec<_>>();
         self.symbols.locals.extend(cell_only_comprehension_names);
-        self.symbols.locals[self.symbols.fast_local_count..]
-            .sort_by_key(|&name| self.context.scopes.names.resolve(name));
+        // Ordinary cells precede synthetic annotation cells, even after their assertions vanish.
+        self.symbols.locals[self.symbols.fast_local_count..].sort_by_key(|&name| {
+            (
+                Some(name) == synthetic_annotation_cell,
+                self.context.scopes.names.resolve(name),
+            )
+        });
         self.assembler.set_location(SourceLocation::NONE);
         let comprehension_cells = self
             .symbols
@@ -1005,13 +1036,19 @@ impl<'source> Compiler<'source> {
                 .rev()
                 .find(|statement| !is_elided_statement(statement))
             && early_condition_truthiness(&conditional.test).is_none()
-            && conditional.body.iter().all(is_elided_statement)
-            && matches!(conditional.elif_else_clauses.as_slice(), [clause]
-                if clause.test.is_none() && clause.body.iter().all(is_elided_statement))
+            && ((conditional.body.iter().all(is_elided_statement)
+                && matches!(conditional.elif_else_clauses.as_slice(), [clause]
+                    if clause.test.is_none() && clause.body.iter().all(is_elided_statement)))
+                || self.has_shared_312_call_footer(conditional)
+                || self.has_shared_312_await_footer(conditional)
+                || self.has_shared_312_erased_else_footer(conditional)
+                || self.has_shared_312_raise_footer(conditional)
+                || self.has_shared_312_return_footer(conditional)
+                || self.has_shared_312_paired_call_footer(conditional))
         {
-            // General If lowering leaves its original end label here when both
-            // arms and the suffix are erased. Keep that shared footer until
-            // native repeated predecessor counts decide which returns survive.
+            // General If lowering leaves its original end label here when the
+            // suffix is erased. Keep its shared footer until native repeated counts
+            // decide which exits survive.
             self.assembler.record_current_original_scope_exit();
         }
         self.finish_inner(add_implicit_return)

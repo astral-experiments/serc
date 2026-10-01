@@ -1,7 +1,6 @@
 # CPython startup metadata
 
-These fixtures supplement generated static and compiler-initialized interned
-strings on Linux for the
+These fixtures supplement generated static interned strings on Linux for the
 [pinned CPython targets](../../README.md#updating-the-cpython-target). Each JSON
 file records its exact target, source or capture provenance, hashes, entry
 counts, and filtering rules. Other process states can be supplied through
@@ -9,39 +8,39 @@ counts, and filtering rules. Other process states can be supplied through
 
 | Target            | Commit                                     |                Supplemental strings |
 | ----------------- | ------------------------------------------ | ----------------------------------: |
-| CPython 3.12.14   | `2abcf904b8dac8c999d2b3aac76681abb333798a` |                               2,956 |
-| CPython 3.13.15   | `4061bc4c35f7c26f25264666d4ba083b93d2f6f9` |                               2,648 |
-| CPython 3.14.5    | `5607950ef232dad16d75c0cf53101d9649d89115` | 2,617 (captured startup supplement) |
-| CPython 3.15.0rc2 | `435c9e5a798c99653e3ab64ce29baed0e4f3dfee` |                               2,790 |
+| CPython 3.12.14   | `2abcf904b8dac8c999d2b3aac76681abb333798a` |                               2,899 |
+| CPython 3.13.15   | `4061bc4c35f7c26f25264666d4ba083b93d2f6f9` |                               2,569 |
+| CPython 3.14.5    | `5607950ef232dad16d75c0cf53101d9649d89115` | 2,537 (captured startup supplement) |
+| CPython 3.15.0rc2 | `435c9e5a798c99653e3ab64ce29baed0e4f3dfee` |                               2,652 |
 
 ## Python 3.14 canonical startup profile
 
 `cpython_3_14_5_startup.json` models the pinned CPython 3.14.5 Linux x86-64
-native build with the GIL enabled, `-I -S -X utf8`, and the neutral
-`marshal`/`sys` oracle recorded in the fixture. Its executable, installed
-runtime, headers, bootstrap script, environment, and empty source are bound by
+native build with the GIL enabled and the isolated minimal-v2 C reference, with
+UTF-8 mode, hash seed 0, and site and signal-handler initialization disabled.
+Its executable, installed runtime, headers, C source, environment, and empty source are bound by
 SHA-256. This is the declared default bootstrap, not automatic detection of any
 host interpreter or a claim about every Linux build. Different callers supply an
 explicit `InitialInternState`. The Rust host architecture does not identify the
 caller's interpreter; the reference remains the same across Linux hosts.
 
-The complete capture contains 1,034 static entries, 2,021 immortal dynamic
-entries, and 655 mortal dynamic entries. Every mortal entry has an independently
+The complete capture contains 1,034 static entries, 1,906 immortal dynamic
+entries, and 634 mortal dynamic entries. Every mortal entry has an independently
 retained owner: the audit follows strong references from interpreter roots and
 checks the actual canonical pointer, not merely an equal string. The fixture
 records each owner path, the exact layout and audit hashes, and the verified
 count. Roots include module and builtin-type dictionaries, AST and generic-type
-state, the suspended oracle frame, and the `posix` module's cached
+state when initialized, any suspended caller frames, and the `posix` module's cached
 `struct_rusage` name. Weak references, borrowed stack references, and temporary
 capture references are not accepted as owners.
 
 The default assumes this bootstrap remains unchanged throughout compilation; it
 does not model arbitrary caller mutations, import hooks, or warning callbacks.
 Absolute installation filenames are omitted and belong in explicit runtime
-profiles. After subtracting generated static and compiler-initialized strings
-and cached single characters, 2,617 strings supplement the default Linux lookup.
+profiles. After subtracting generated static strings and cached single
+characters, 2,537 strings supplement the default Linux lookup.
 This covers native startup families such as `_io`, `posix`, `_codecs`,
-`_signal`, `_thread`, `_weakref`, `sys`, and `time`, including builtin and
+`_thread`, `_weakref`, `sys`, and `time`, including builtin and
 extension type descriptors. The independently source-derived bootstrap
 supplement below remains an additional provenance check.
 
@@ -61,17 +60,19 @@ Given the saved artifacts from a verified capture, repeat the offline proof:
 
 ```sh
 python3 -I -B crates/serc/scripts/generate_startup_owner_layout.py --capture-dir /path/to/capture --cpython /path/to/cpython-3.14.5 --headers /path/to/installed/include/python3.14
-python3 -I -B crates/serc/scripts/audit_startup_owners.py --capture-dir /path/to/capture --python /path/to/captured/python3.14
+python3 -I -B crates/serc/scripts/audit_startup_owners.py --capture-dir /path/to/capture --native-capture /path/to/saved-native-capture
 ```
 
 The capture directory supplies `header-provenance.json` (installed and exact-tag
-header hashes), `layout.json` (intern-table layouts), `capture-receipt.json`
-(unchanged runtime and successful observation), and `neutral.metadata.json`
-(executable, snapshot, memory, and output hashes plus the stopped interpreter
-address). `neutral.canonical.json` records the sorted string codepoints and
-intern states; `neutral.addresses.json` maps canonical object addresses to those
-records. `neutral.memory/segments.json` lists sorted address ranges, filenames,
-and SHA-256 hashes for their saved bytes. The audit verifies these hashes,
+header hashes), `layout.json` (intern-table layouts), and `NATIVE-SOURCE.json`
+(bindings to the native capture and layout generation). The native capture's
+`COMPLETE.json` binds the unchanged reference and runtime, two equal table reads,
+one runtime thread, and equal observed/unobserved output. `canonical.json` records
+the sorted strings; `addresses.json` records canonical pointers and intern states.
+`MEMORY-COMPLETE.json` binds the saved memory observation, and
+`memory/REQUEST.json` binds the stopped interpreter address, loaded images, and
+`memory/segments.json` with sorted address ranges and saved-byte hashes.
+The audit verifies these hashes and the actual source, header, and binary files,
 follows only strong object edges, and writes `retained-owner-audit.json` with a
 named canonical owner for every mortal entry. These saved-memory inputs are
 local audit artifacts and are not needed by ordinary target generation.
@@ -84,8 +85,8 @@ local audit artifacts and are not needed by ordinary target generation.
 initialize before application code in the ordinary isolated Linux interpreter:
 `Python/import.c` initializes both importlib bootstraps, `Python/pylifecycle.c`
 initializes the codec registry, and `Python/codecs.c` imports `encodings`, which
-imports `aliases`. The supplement augments the existing static,
-compiler-initialized, and historical startup names; it does not replace them or
+imports `aliases`. Every member is also present in the captured minimal-C startup
+table; the supplement retains an independent source-derived check and does not
 assume caller imports such as `pathlib`.
 
 The generator reads only files from the exact release commit and compiles the
@@ -139,17 +140,28 @@ state.
 
 ## Captured startup supplements
 
-A replacement requires a verified capture from that target's isolated,
-default-GIL interpreter compiling empty input. Follow the fixture's
+A replacement requires verified captures from two fresh instances of that target's
+isolated, default-GIL minimal-v2 C reference compiling empty input. Follow the fixture's
 `capture_protocol` and pinned header layouts; read both intern tables externally
 without executing diagnostic Python code in the observed process. Require two
-complete reads to agree, unchanged executable bytes, and identical observed and
-unobserved marshal output. Never derive startup entries from corpus strings or
-another release.
+complete reads to agree within each process, identical canonical sets between
+processes, unchanged executable bytes, and identical observed and unobserved
+marshal output. The fixture binds the exact reference C source; changing it
+requires recapture. Never derive entries from corpus strings or another release.
 
-Subtract generated static/AST names and cached single-character strings. Exclude
-installation paths from these sorted, unique supplements; runtime-specific state
-can be supplied through `InitialInternState`. Corpus comparisons use the
+The capture stops at `Py_CompileStringObject`, after the reference creates its
+retained filename argument. Decode that `PyUnicode` argument externally using
+the pinned layout without assuming it is already interned. Startup optimization
+is fixed at zero; the same captured startup profile applies to all three source
+compilation optimization levels. Rebuild and qualify the reference on each
+worker against the same runtime profile; do not independently regenerate or
+combine startup fixtures from different worker environments.
+
+Subtract generated static names and cached single-character strings. Direct C
+compilation does not initialize builtin `compile()`'s AST classes; do not add or
+subtract those aliases unless they are independently present in the capture.
+Exclude installation paths from these sorted, unique supplements; runtime-specific
+state can be supplied through `InitialInternState`. Corpus comparisons use the
 [minimal reference](../../../../docs/compatibility.md#comparing-another-corpus).
 Update the fixture's pinned digest in
 [`generate_cpython_target.py`](../generate_cpython_target.py), then

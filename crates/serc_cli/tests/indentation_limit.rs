@@ -27,6 +27,56 @@ fn indentation_depth_matches_cpython() {
         .unwrap();
 }
 
+#[test]
+fn nested_suites_grow_a_small_stack_without_changing_output() {
+    let filename = "small_stack_suites.py";
+    let oracle = "import marshal, sys; code = compile(sys.argv[1], sys.argv[2], 'exec', dont_inherit=True, optimize=0); sys.stdout.buffer.write(marshal.dumps(code))";
+    for condition in ["True", "False", "flag"] {
+        let source = nested_source(99, " ").replace("if True:", &format!("if {condition}:"));
+        for version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            let mut python = match version {
+                PythonVersion::Py312 => common::python_312_command(),
+                PythonVersion::Py313 => common::python_313_command(),
+                PythonVersion::Py314 => common::python_3145_command(),
+                PythonVersion::Py315 => common::python_315_command(),
+            };
+            let native = python
+                .args(["-c", oracle, &source, filename])
+                .output()
+                .unwrap();
+            assert!(native.status.success(), "{version} {condition}: {native:?}");
+            let source = source.clone();
+            std::thread::Builder::new()
+                .name(format!("suites-{version}-{condition}"))
+                .stack_size(512 * 1024)
+                .spawn(move || {
+                    let options = CompileOptions {
+                        python_version: version,
+                        ..CompileOptions::default()
+                    };
+                    for compiled in [
+                        compile_with_options(&source, filename, &options),
+                        compile_bytes_with_options(source.as_bytes(), filename, &options),
+                    ] {
+                        assert_eq!(
+                            compiled.unwrap().marshal(),
+                            native.stdout,
+                            "{version} {condition}",
+                        );
+                    }
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+        }
+    }
+}
+
 fn check_indentation_depth() {
     let boundary = nested_source(99, " ");
     let cases = [

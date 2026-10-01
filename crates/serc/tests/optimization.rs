@@ -15,6 +15,4638 @@ use serc::{
 };
 
 #[test]
+fn split_line_nested_captures() {
+    for scope in ["def", "async def"] {
+        for guard in ["", " if ready"] {
+            let source = format!(
+                "{scope} sample(subject, ready):\n    match subject:\n        case {{\n            \"kind\": \"entry\",\n            \"body\": {{\"shape\": None, \"items\": [{{\"kind\": \"node\", \"value\": int(value)}}]}} as data,\n        }}{guard}:\n            return data, value\n    return None\n"
+            );
+            assert_matches_cpython(&source, "split_line_capture.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
+fn nested_mapping_capture_rotations() {
+    for scope in ["def", "async def"] {
+        for (pattern, values) in [
+            (
+                "{\"left\": int(left), \"right\": int(right)} as whole",
+                "whole, left, right",
+            ),
+            (
+                "{\"payload\": {\"items\": [*parts]} as payload}",
+                "payload, parts",
+            ),
+            (
+                "{\"payload\": {\"head\": head, \"items\": [*parts]} as payload}",
+                "head, payload, parts",
+            ),
+        ] {
+            for multiline in [false, true] {
+                let pattern = if multiline {
+                    pattern.replace(", ", ",\n            ")
+                } else {
+                    pattern.to_string()
+                };
+                for guard in ["", " if ready"] {
+                    let source = format!(
+                        "{scope} sample(subject, ready):\n    match subject:\n        case {pattern}{guard}:\n            return {values}\n    return None\n"
+                    );
+                    assert_matches_cpython(&source, "nested_mapping_capture.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn managed_first_arm_preserves_unlocated_else_call_footer() {
+    for scope in ["def", "async def"] {
+        for outer in ["flag", "value is not None"] {
+            for inner in ["ready", "value == state.first"] {
+                for first in [
+                    "        with manager(value):\n            operation(value)\n",
+                    "        with manager(value) as result:\n            operation(result)\n",
+                    "        with manager(value):\n            operation(value)\n        if ready:\n            assert value\n        else:\n            assert state.first\n        with manager(value):\n            finish(value)\n",
+                ] {
+                    for tail in ["", "    assert value\n"] {
+                        let source = format!(
+                            "{scope} sample(flag, ready, value, state):\n    if {outer}:\n{first}    else:\n        if {inner}:\n            assert state.ready\n        finish(value)\n{tail}"
+                        );
+                        assert_matches_cpython_versions(
+                            &source,
+                            "managed_first_arm_else_call.py",
+                            &LEVELS,
+                            &[PythonVersion::Py312],
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn loop_guard_prefix_preserves_original_scope_footer() {
+    for scope in ["def", "async def"] {
+        for guard in ["other", "value == 2"] {
+            for prefix in [
+                "assert value",
+                "value = other",
+                "work(value)",
+                "value = work(value)",
+                "value = await work(value)",
+            ] {
+                if scope == "def" && prefix.contains("await") {
+                    continue;
+                }
+                let source = format!(
+                    "{scope} sample(flag, other, value, state, items):\n    if flag:\n        assert value\n    if other:\n        for item, part in items:\n            {prefix}\n            assert value\n            if {guard}:\n                assert state.ready\n"
+                );
+                assert_matches_cpython_versions(
+                    &source,
+                    "loop_guard_prefix_footer.py",
+                    &LEVELS,
+                    &[PythonVersion::Py312],
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn erased_loop_guard_preserves_original_scope_footer() {
+    for scope in ["def", "async def"] {
+        for first in ["flag", "value == 1"] {
+            for guard in ["other", "value == 2"] {
+                for (target, iterator) in [("item", "items"), ("item, part", "state.items")] {
+                    let source = format!(
+                        "{scope} sample(flag, other, value, state, items):\n    if {first}:\n        assert value\n    if other:\n        for {target} in {iterator}:\n            if {guard}:\n                assert value\n"
+                    );
+                    assert_matches_cpython_versions(
+                        &source,
+                        "erased_loop_guard_footer.py",
+                        &LEVELS,
+                        &[PythonVersion::Py312],
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn terminal_elif_guard_preserves_unlocated_call_footer() {
+    for scope in ["def", "async def"] {
+        for first in ["flag", "value in {1, 2}"] {
+            for inner in ["other", "value in {3, 4}"] {
+                for last in ["ready", "value == 5"] {
+                    let source = format!(
+                        "{scope} sample(flag, other, ready, value, state):\n    if {first}:\n        state.finish(value)\n    elif other:\n        if {inner}:\n            assert value\n        if {last}:\n            state.finish(value)\n"
+                    );
+                    assert_matches_cpython_versions(
+                        &source,
+                        "terminal_elif_call_footer.py",
+                        &LEVELS,
+                        &[PythonVersion::Py312],
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn surviving_while_break_enters_nonempty_finally() {
+    for body in [
+        "while True:\n            if state.done or state.error:\n                break\n            pass",
+        "while state.active and ready(items):\n            if state.done or state.error:\n                break\n            pass",
+        "while True:\n            with manager:\n                if state.done:\n                    break\n            operation(items)",
+        "while state.active and ready(items):\n            if state.outer:\n                if state.done or state.error:\n                    break\n            operation(items)",
+    ] {
+        for cleanup in [
+            "cleanup(items)",
+            "try:\n            cleanup(items)\n        except Other:\n            recover(items)",
+            "with manager:\n            cleanup(items)",
+        ] {
+            let source = format!(
+                "def sample(items, state, manager):\n    try:\n        {body}\n    except Error as problem:\n        pass\n    finally:\n        {cleanup}\n"
+            );
+            assert_matches_cpython(&source, "surviving_break_cleanup.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
+fn erased_first_arm_preserves_unlocated_else_call_footer() {
+    for scope in ["def", "async def"] {
+        for outer in ["flag", "value == state.first"] {
+            for inner in ["ready", "value == state.second"] {
+                for tail in ["", "        assert value\n"] {
+                    let source = format!(
+                        "{scope} sample(flag, ready, value, state):\n    if {outer}:\n        assert value\n    else:\n        if {inner}:\n            assert state.ready\n        finish(value)\n{tail}"
+                    );
+                    assert_matches_cpython_versions(
+                        &source,
+                        "erased_first_arm_else_call.py",
+                        &LEVELS,
+                        &[PythonVersion::Py312],
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn erased_try_finally_arm_preserves_original_scope_footer() {
+    for scope in ["def", "async def"] {
+        for condition in [
+            "flag and (other or ready)",
+            "value == 1 and (other == 2 or ready)",
+        ] {
+            for cleanup in ["cleanup(value)", "state.cache.clear()"] {
+                for prefix in [
+                    "",
+                    "        prepare({item: item.value for item in items})\n",
+                ] {
+                    let work = if scope == "async def" {
+                        "await operation(value)"
+                    } else {
+                        "operation(value)"
+                    };
+                    for body in [
+                        String::new(),
+                        format!(
+                            "            {work}\n            value = next((item for item in items if item.ready))\n"
+                        ),
+                    ] {
+                        let source = format!(
+                            "{scope} sample(flag, other, ready, value, state, items):\n    if flag:\n        if other:\n            assert value\n    elif ready:\n        assert value\n    if {condition}:\n{prefix}        try:\n{body}            assert value is not None and value.ready\n        finally:\n            {cleanup}\n"
+                        );
+                        assert_matches_cpython_versions(
+                            &source,
+                            "erased_try_finally_footer.py",
+                            &LEVELS,
+                            &[PythonVersion::Py312],
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn nested_erased_elif_arms_preserve_original_scope_footer() {
+    for scope in ["def", "async def"] {
+        for outer in ["ready", "value == [state.first, state.second]"] {
+            for inner in ["other", "value == state.second"] {
+                for tail in ["", "    assert value\n"] {
+                    let source = format!(
+                        "{scope} sample(flag, other, ready, value, state):\n    if flag and value == state.first and ready:\n        assert value\n    elif flag:\n        assert value\n    if {outer}:\n        if value == state.first:\n            assert value\n        elif value == state.second:\n            if {inner}:\n                assert value\n            else:\n                assert value\n{tail}"
+                    );
+                    assert_matches_cpython_versions(
+                        &source,
+                        "nested_erased_elif_footer.py",
+                        &LEVELS,
+                        &[PythonVersion::Py312],
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn erased_binary_elif_arms_preserve_original_scope_footer() {
+    for scope in ["def", "async def"] {
+        for prefix in ["", "        value = operation(value)\n"] {
+            for tail in [
+                "",
+                "    elif extra:\n        operation(value)\n",
+                "    else:\n        raise Error\n",
+            ] {
+                let source = format!(
+                    "{scope} sample(flag, other, first, before, inner, extra, value):\n    if flag:\n        if first:\n            assert value\n    elif other:\n{prefix}        if before:\n            assert value\n        if inner:\n            assert value\n        else:\n            assert value\n{tail}"
+                );
+                assert_matches_cpython_versions(
+                    &source,
+                    "erased_elif_footer.py",
+                    &LEVELS,
+                    &[PythonVersion::Py312],
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn runtime_loop_break_preserves_nested_cleanup_borrowing() {
+    for condition in ["state.active", "state.active and ready(items)"] {
+        for guard in ["state.done", "state.done or state.error"] {
+            for handler in ["pass", "recover(problem)"] {
+                for cleanup in [
+                    "cleanup(items)",
+                    "try:\n            value = items\n        finally:\n            cleanup(items)",
+                ] {
+                    for handler_type in ["Error", "(Error, Other)", "errors.Error"] {
+                        let source = format!(
+                            "def sample(items, state):\n    try:\n        while {condition}:\n            if {guard}:\n                break\n            operation(items)\n    except {handler_type} as problem:\n        {handler}\n    finally:\n        {cleanup}\n"
+                        );
+                        assert_matches_cpython(&source, "runtime_break_cleanup.py", &LEVELS);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn erased_suffix_after_await_preserves_scope_footer() {
+    for prefix in [
+        "values = [item for item in items]",
+        "values = {item for item in items}",
+        "values = {item: item for item in items}",
+        "values = prepare(items)",
+    ] {
+        for awaited in ["operation(values)", "pending"] {
+            for suffix in [
+                "assert values\n",
+                "assert values\n        assert other\n",
+                "42\n",
+            ] {
+                let source = format!(
+                    "async def sample(flag, other, items, pending):\n    if other:\n        assert items\n    if flag:\n        {prefix}\n        await {awaited}\n        {suffix}"
+                );
+                assert_matches_cpython_versions(
+                    &source,
+                    "await_erased_suffix.py",
+                    &LEVELS,
+                    &[PythonVersion::Py312],
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn completed_comprehension_before_await_preserves_scope_footer() {
+    for prefix in [
+        "values = [item for item in items]",
+        "values = {item for item in items}",
+        "values = {item: item for item in items}",
+        "values = prepare(items)",
+    ] {
+        for awaited in ["operation(values)", "pending"] {
+            for guard in ["", "    if other:\n        assert items\n"] {
+                let source = format!(
+                    "async def sample(flag, other, items, pending):\n{guard}    if flag:\n        {prefix}\n        await {awaited}\n"
+                );
+                assert_matches_cpython_versions(
+                    &source,
+                    "comprehension_await_footer.py",
+                    &LEVELS,
+                    &[PythonVersion::Py312],
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn raising_guard_preserves_awaited_recovery_cleanup_entry() {
+    for handler in ["pass", "value = problem"] {
+        for work in ["value = await operation(items)", "await operation(items)"] {
+            for cleanup in ["await cleanup(items)", "cleanup(items)"] {
+                for recovery in ["Other", "(Other, RecoveryError)"] {
+                    let source = format!(
+                        "async def sample(items, state):\n    try:\n        if state.ready:\n            raise Error\n    except Error as problem:\n        {handler}\n    finally:\n        try:\n            {work}\n        except {recovery}:\n            value = None\n        {cleanup}\n    finish(items)\n"
+                    );
+                    assert_matches_cpython(&source, "awaited_recovery_cleanup.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn erased_manager_guard_chain_preserves_exit_predecessors() {
+    for scope in ["def", "async def"] {
+        for prefix in [
+            "",
+            "        assert value\n        value = operation(value)\n        assert other\n",
+        ] {
+            for alternate in [
+                "",
+                "        elif value is not None:\n            assert flag\n            assert other\n",
+                "        elif value is not None:\n            assert flag\n        else:\n            assert other\n",
+            ] {
+                let source = format!(
+                    "{scope} sample(flag, other, value, manager):\n    with manager:\n{prefix}        if other:\n            assert value\n{alternate}        if flag:\n            raise Error(value)\n"
+                );
+                assert_matches_cpython_versions(
+                    &source,
+                    "erased_manager_guard_chain.py",
+                    &LEVELS,
+                    &[PythonVersion::Py312],
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn erased_guard_before_raise_preserves_manager_exit() {
+    for scope in ["def", "async def"] {
+        for nested in [false, true] {
+            for prefix_test in ["other", "value == 1"] {
+                for final_test in ["flag", "value is None"] {
+                    let mut source = format!(
+                        "{scope} sample(flag, other, value, manager):\n    with manager:\n        if {prefix_test}:\n            assert value\n        if {final_test}:\n            raise RuntimeError('failed')\n"
+                    );
+                    if nested {
+                        source = format!(
+                            "def enclosing(flag, other, value, manager):\n{}",
+                            source
+                                .replace("sample(flag, other, value, manager)", "sample()")
+                                .lines()
+                                .fold(String::new(), |mut result, line| {
+                                    writeln!(result, "    {line}").unwrap();
+                                    result
+                                })
+                        );
+                    }
+                    assert_matches_cpython_versions(
+                        &source,
+                        "erased_manager_raise_exit.py",
+                        &LEVELS,
+                        &[PythonVersion::Py312],
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn protected_iterator_work_ignores_erased_assertions() {
+    for condition in ["flag", "flag == other"] {
+        for work in ["value = item", "value = item.field[0]", "consume(item)"] {
+            for (prefix, suffix) in [
+                ("assert item\n", ""),
+                ("", "assert other\n"),
+                ("assert item\n", "assert other\n"),
+            ] {
+                let mut source = format!(
+                    "def sample(items, flag, other):\n    try:\n        for item in items:\n            if {condition}:\n"
+                );
+                for line in format!("{prefix}{work}\n{suffix}").lines() {
+                    writeln!(source, "                {line}").unwrap();
+                }
+                source.push_str(
+                    "            else:\n                assert other\n    finally:\n        finish()\n",
+                );
+                assert_matches_cpython(&source, "protected_iterator_erased_work.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn protected_iterator_erased_join_preserves_handler_owner() {
+    for scope in ["def", "async def"] {
+        for handler in [
+            "    except Error as error:\n        recover(error)\n        raise\n",
+            "    except Error:\n        recover()\n",
+        ] {
+            for successor in [
+                "            consume(item)\n",
+                "            if other:\n                consume(item)\n",
+                "            with inner():\n                consume(item)\n",
+            ] {
+                let source = format!(
+                    "{scope} sample(items, flag, other):\n    try:\n        for item in items:\n            if flag:\n                assert other\n            else:\n                assert item\n{successor}{handler}    finally:\n        finish()\n"
+                );
+                assert_matches_cpython(&source, "protected_iterator_handler_join.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn protected_iterator_erased_join_preserves_conditional_successor() {
+    for scope in ["def", "async def"] {
+        for target in ["item", "(item, part)"] {
+            for guard in ["flag", "item is not None", "item.ready"] {
+                for successor in [
+                    "            if other:\n                consume(item)\n",
+                    "            with inner():\n                consume(item)\n",
+                ] {
+                    let source = format!(
+                        "{scope} sample(items, flag, other):\n    try:\n        for {target} in items:\n            if {guard}:\n                assert other\n            else:\n                assert item\n{successor}    finally:\n        finish()\n"
+                    );
+                    assert_matches_cpython(&source, "protected_iterator_join.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn conditional_prefix_preserves_guarded_finalizer_manager_exit() {
+    for guard in [
+        "flag",
+        "flag == 'ready'",
+        "predicate(flag)",
+        "not predicate(flag)",
+    ] {
+        for work in ["prepare()", "value = prepare()"] {
+            for cleanup in [
+                "            if predicate():\n                for item in items[:-1]:\n                    if not active(item):\n                        cleanup(item)\n            finish()\n",
+                "            finish()\n",
+            ] {
+                for suffix in ["assert other", "pass"] {
+                    let source = format!(
+                        "def sample(flag, other, items):\n    with manager():\n        if {guard}:\n            {work}\n        try:\n            consume()\n        finally:\n{cleanup}        {suffix}\n"
+                    );
+                    assert_matches_cpython(&source, "conditional_prefix_finalizer.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn comprehension_call_prefix_preserves_manager_exit() {
+    for comprehension in [
+        "[item for item in items if predicate(item)]",
+        "{part for item in items for part in item}",
+        "{item: transform(item) for item in items}",
+    ] {
+        for call in [
+            format!("prepare({comprehension})"),
+            format!("prepare(other, values={comprehension})"),
+            format!("worker.prepare(other, values={comprehension}, option=other)"),
+        ] {
+            for suffix in ["assert other", "pass"] {
+                let source = format!(
+                    "def sample(items, value, other):\n    with manager():\n        value = {call}\n        try:\n            assert value\n        finally:\n            cleanup()\n        {suffix}\n"
+                );
+                assert_matches_cpython(&source, "comprehension_call_prefix.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn completed_comprehension_prefix_preserves_manager_exit() {
+    for comprehension in [
+        "[item for item in items if predicate(item)]",
+        "{(part, item.field) for item in items for part in item.parts}",
+        "{part: item for item in items for part in item}",
+    ] {
+        for body in ["assert value", "observe(value)"] {
+            for suffix in ["assert other", "pass"] {
+                let source = format!(
+                    "def sample(items, value, other):\n    with manager():\n        value = {comprehension}\n        try:\n            {body}\n        finally:\n            cleanup()\n        {suffix}\n"
+                );
+                assert_matches_cpython(&source, "completed_comprehension_prefix.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn completed_try_finalizer_preserves_erased_branch_join() {
+    for scope in ["def", "async def"] {
+        for prefix in ["", "        if value:\n            prepare()\n"] {
+            for recovery in [
+                "        finally:\n            finish()\n            observe()\n",
+                "        except errors.Error:\n            recover()\n            observe()\n",
+                "        except Error:\n            recover()\n        finally:\n            finish()\n",
+            ] {
+                let source = format!(
+                    "{scope} sample(flag, value, other):\n    try:\n        assert value\n        if flag:\n            assert value\n        else:\n            assert other\n    finally:\n{prefix}        try:\n            cleanup()\n{recovery}"
+                );
+                assert_matches_cpython(&source, "completed_try_finalizer.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn attribute_finalizer_entry_preserves_erased_branch_join() {
+    for scope in ["def", "async def"] {
+        for value in ["other.field", "other.field.value", "prepare(other).field"] {
+            for continuation in ["", "        observe()\n"] {
+                for cleanup in [
+                    "        cleanup()\n",
+                    "        if value is not None:\n            cleanup()\n        finish()\n",
+                ] {
+                    let source = format!(
+                        "{scope} sample(flag, value, other):\n    try:\n        assert value\n        if flag:\n            assert value\n        else:\n            assert other\n{continuation}    finally:\n        value = {value}\n{cleanup}"
+                    );
+                    assert_matches_cpython(&source, "attribute_finalizer_entry.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn guarded_finalizer_loop_preserves_erased_branch_join() {
+    for scope in ["def", "async def"] {
+        for iterable in ["items", "prepare(items)", "value.items"] {
+            for work in ["consume(item)", "value = item"] {
+                for inside_guard in [false, true] {
+                    let finalizer = if inside_guard {
+                        format!(
+                            "        if value is not None:\n            value = None\n            for item in {iterable}:\n                {work}\n"
+                        )
+                    } else {
+                        format!(
+                            "        if value:\n            cleanup()\n        for item in {iterable}:\n            {work}\n"
+                        )
+                    };
+                    let source = format!(
+                        "{scope} sample(flag, value, other, items):\n    try:\n        assert value\n        if flag:\n            assert value\n        else:\n            assert other\n    finally:\n{finalizer}"
+                    );
+                    assert_matches_cpython(&source, "guarded_finalizer_loop.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn nested_guarded_finalizer_preserves_erased_branch_join() {
+    for (scope, cleanup) in [("def", "finish()"), ("async def", "await finish()")] {
+        for condition in ["flag", "not predicate(value)", "flag or other"] {
+            for work in ["cleanup()", "value = other"] {
+                for alternate in ["", "            else:\n                recover()\n"] {
+                    let source = format!(
+                        "{scope} sample(flag, value, other):\n    try:\n        assert value\n        if flag:\n            assert value\n        else:\n            assert other\n    finally:\n        if value is not None:\n            if {condition}:\n                {work}\n{alternate}            {cleanup}\n"
+                    );
+                    assert_matches_cpython(&source, "nested_guarded_finalizer.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn guarded_finalizer_store_preserves_erased_branch_join() {
+    for (scope, cleanup) in [("def", "cleanup()"), ("async def", "await cleanup()")] {
+        for target in ["value", "value.field", "value[0]", "left, right"] {
+            for expression in ["other", "prepare(other)"] {
+                let source = format!(
+                    "{scope} sample(flag, value, other):\n    try:\n        assert value\n        if flag == 'ready':\n            assert value\n        else:\n            assert other\n    finally:\n        if value is not None:\n            {target} = {expression}\n        {cleanup}\n"
+                );
+                assert_matches_cpython(&source, "guarded_finalizer_store.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn nested_manager_preserves_original_scope_footer() {
+    for scope in ["def", "async def"] {
+        for condition in ["other", "value in (1, 2)"] {
+            for manager in ["manager", "open_manager(value)"] {
+                for tail in [
+                    "",
+                    "    else:\n        value = operation(value)\n        with manager as item:\n            value = operation(item)\n            assert value\n",
+                ] {
+                    let source = format!(
+                        "{scope} sample(flag, other, value, manager):\n    if flag:\n        if other:\n            assert value\n        if {condition}:\n            with {manager}:\n                operation(value)\n{tail}"
+                    );
+                    assert_matches_cpython_versions(
+                        &source,
+                        "nested_manager_scope_footer.py",
+                        &LEVELS,
+                        &[PythonVersion::Py312],
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn completed_prefix_preserves_nested_iterator_footer() {
+    for scope in ["def", "async def"] {
+        for prefix in [
+            "            value = operation(value)\n",
+            "            for prior in items:\n                assert prior\n",
+            "            for prior in items:\n                value = operation(prior)\n                if value is None:\n                    assert prior\n                else:\n                    assert value\n                    operation(prior)\n",
+        ] {
+            for inner_else in ["", "        else:\n            assert value\n"] {
+                for outer_else in ["", "    else:\n        assert value\n"] {
+                    let source = format!(
+                        "{scope} sample(flag, other, value, items):\n    if not other:\n        assert value\n    if flag:\n        value = operation(value)\n        if other:\n{prefix}            for item in items:\n                assert item\n                operation(item)\n                finish(item)\n{inner_else}{outer_else}"
+                    );
+                    assert_matches_cpython_versions(
+                        &source,
+                        "completed_nested_iterator_footer.py",
+                        &LEVELS,
+                        &[PythonVersion::Py312],
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn nested_finally_guarded_recovery_preserves_conditional_call_borrowing() {
+    for body in [
+        "pass",
+        "if state is None:\n            return",
+        "if state is None:\n            return 1",
+    ] {
+        for inner in ["pass", "operation()", "await operation()"] {
+            for handler in [
+                "pass",
+                "raise",
+                "await recover()\n                    raise",
+            ] {
+                for cleanup in ["cleanup(items)", "cleanup(items if state else other)"] {
+                    let source = format!(
+                        "async def sample(items, state):\n    try:\n        {body}\n    finally:\n        try:\n            if state is not None:\n                try:\n                    {inner}\n                except Error:\n                    {handler}\n        except Other:\n            raise\n        finally:\n            {cleanup}\n"
+                    );
+                    assert_matches_cpython(&source, "nested_finally_guard.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn nested_iterator_erased_else_preserves_scope_footer() {
+    for scope in ["def", "async def"] {
+        for condition in ["flag", "flag is None", "not flag"] {
+            for body in ["operation(item)", "value = operation(item)"] {
+                for inner_else in ["", "        else:\n            assert value\n"] {
+                    for outer_else in ["", "    else:\n        assert value\n"] {
+                        let source = format!(
+                            "{scope} sample(flag, other, value, items):\n    if not other:\n        assert value\n    if {condition}:\n        if other:\n            for item in items:\n                assert item\n                {body}\n{inner_else}{outer_else}"
+                        );
+                        assert_matches_cpython_versions(
+                            &source,
+                            "nested_iterator_erased_else.py",
+                            &LEVELS,
+                            &[PythonVersion::Py312],
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn nested_live_iterator_preserves_original_return_footer() {
+    for scope in ["def", "async def"] {
+        for prefix in [
+            "",
+            "    if not other:\n        assert value\n",
+            "    if other:\n        assert value\n",
+        ] {
+            for body in [
+                "operation(item)",
+                "value = operation(item)",
+                "assert item\n                operation(item)",
+                "operation(item)\n                assert item",
+                "assert item\n                value = operation(item)\n                assert value",
+                "assert item\n                tools.check.equal(item.value, value)",
+            ] {
+                let source = format!(
+                    "{scope} sample(flag, other, value, items):\n{prefix}    if flag:\n        if other:\n            for item in items:\n                {body}\n"
+                );
+                assert_matches_cpython_versions(
+                    &source,
+                    "nested_live_iterator_footer.py",
+                    &LEVELS,
+                    &[PythonVersion::Py312],
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn erased_chained_boolean_preserves_scope_exit_order() {
+    for scope in ["def", "async def"] {
+        for condition in [
+            "left or lower < value < upper",
+            "left == 3 or lower < value < upper",
+            "values[0] == 3 or values[0] == values[1] > 0",
+            "left or lower < value < upper < last",
+            "left and lower < value < upper",
+            "lower < value < upper or left",
+        ] {
+            for tail in ["assert value", "pass"] {
+                let source = format!(
+                    "{scope} sample(left, lower, value, upper, last, values):\n    if {condition}:\n        {tail}\n"
+                );
+                assert_matches_cpython_versions(
+                    &source,
+                    "erased_chain_exit_order.py",
+                    &LEVELS,
+                    &[PythonVersion::Py312],
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn nested_erased_else_preserves_original_return_footer() {
+    for scope in ["def", "async def"] {
+        for outer in ["flag", "flag is None", "flag == 1"] {
+            for inner in ["other", "other is None", "other == 2"] {
+                for prefix in [
+                    "",
+                    "        if prior:\n            assert value\n",
+                    "        if prior:\n            assert value\n        else:\n            assert value\n",
+                    "        if prior:\n            assert value\n        else:\n            assert value\n        if prior:\n            assert value\n",
+                ] {
+                    let source = format!(
+                        "{scope} sample(flag, other, prior, value):\n    if {outer}:\n        assert value\n    else:\n{prefix}        if {inner}:\n            assert value\n        else:\n            assert operation(value)\n"
+                    );
+                    assert_matches_cpython(&source, "nested_erased_else_footer.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn async_comprehension_preserves_preceding_erased_loop_locations() {
+    assert_matches_cpython(
+        "async def sample(items, left, right, stream):\n    for item in items:\n        if left:\n            assert item\n        if right is not None:\n            assert operation(item)\n    values = [await convert(part) async for part in stream]\n",
+        "async_comprehension_loop_location.py",
+        &LEVELS,
+    );
+    for condition in ["right", "right is None", "right is not None"] {
+        for value in ["part", "await convert(part)"] {
+            for expression in [
+                format!("[{value} async for part in stream]"),
+                format!("{{{value} async for part in stream}}"),
+                format!("{{part: {value} async for part in stream}}"),
+            ] {
+                let source = format!(
+                    "async def sample(items, left, right, stream):\n    for item in items:\n        if left:\n            assert item\n        if {condition}:\n            assert operation(item)\n    values = {expression}\n"
+                );
+                assert_matches_cpython(&source, "async_comprehension_loop_location.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn nested_finally_preserves_runtime_loop_borrow_entry() {
+    for condition in ["state.ready", "not await operation(items)"] {
+        for inner in ["pass", "await operation()"] {
+            for handler in ["raise", "await recover()\n                    raise"] {
+                let source = format!(
+                    "async def sample(items, state):\n    try:\n        while {condition}:\n            pass\n        completed = True\n    except Error as problem:\n        if state.ready:\n            raise\n    finally:\n        try:\n            if state is not None:\n                try:\n                    {inner}\n                except RecoveryError:\n                    {handler}\n        except Other:\n            report(items)\n        finally:\n            cleanup(items if state else other)\n"
+                );
+                assert_matches_cpython(&source, "nested_finally_entry.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn async_iterator_return_else_preserves_finally_borrow_boundary() {
+    for yielded in ["", "            yield item\n"] {
+        for suffix in [
+            "",
+            "        operation()\n",
+            "        while True:\n            if state.ready:\n                break\n",
+        ] {
+            for cleanup in [
+                "result = cleanup(items)",
+                "result = getattr(items, 'finish', None)",
+            ] {
+                let source = format!(
+                    "async def sample(items, state):\n    try:\n        async for item in items:\n{yielded}            if state.ready:\n                break\n        else:\n            return\n{suffix}    finally:\n        {cleanup}\n"
+                );
+                assert_matches_cpython(&source, "iterator_finally_borrow.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn nested_terminal_recovery_preserves_borrow_boundary() {
+    for outer_name in ["", " as outer"] {
+        for inner_name in ["", " as inner"] {
+            let source = format!(
+                "async def sample(value):\n    try:\n        await work()\n    except RuntimeError{outer_name}:\n        try:\n            operation()\n        except ValueError{inner_name}:\n            try:\n                operation()\n            except KeyError:\n                raise\n            pass\n        else:\n            pass\n        pass\n    else:\n        pass\n    if value.flag:\n        pass\n"
+            );
+            let body = source.strip_prefix("async def sample(value):\n").unwrap();
+            for (prefix, indentation, suffix) in [
+                ("", "", ""),
+                (
+                    "    match value:\n        case [item]:\n",
+                    "        ",
+                    "        case _:\n            pass\n",
+                ),
+                (
+                    "    match value:\n        case item if ready:\n",
+                    "        ",
+                    "        case _:\n            pass\n",
+                ),
+                (
+                    "    try:\n        enclosing_operation()\n    except LookupError:\n",
+                    "    ",
+                    "",
+                ),
+                (
+                    "    try:\n        enclosing_operation()\n    except LookupError as enclosing:\n",
+                    "    ",
+                    "",
+                ),
+                (
+                    "    try:\n        enclosing_operation()\n    except* LookupError as enclosing:\n",
+                    "    ",
+                    "",
+                ),
+            ] {
+                let mut enclosed = format!("async def sample(value):\n{prefix}");
+                for line in body.lines() {
+                    writeln!(enclosed, "{indentation}{line}").unwrap();
+                }
+                enclosed.push_str(suffix);
+                assert_matches_cpython(&enclosed, "nested_recovery_borrow.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn nested_return_before_erased_assertions_preserves_original_footer() {
+    assert_matches_cpython(
+        "def sample(flag, outer, inner):\n    if flag:\n        assert flag\n    if outer:\n        if inner:\n            return\n        assert flag\n",
+        "nested_return_suffix.py",
+        &LEVELS,
+    );
+    for scope in ["def", "async def"] {
+        for prefix in ["", "    if flag:\n        assert flag\n"] {
+            for outer in ["outer", "not outer", "outer.value"] {
+                for returned in ["return", "return None"] {
+                    for assertion in ["assert flag", "assert operation(flag)"] {
+                        let source = format!(
+                            "{scope} sample(flag, outer, inner):\n{prefix}    if {outer}:\n        assert flag\n        if inner:\n            {returned}\n            {assertion}\n        {assertion}\n    {assertion}\n"
+                        );
+                        assert_matches_cpython(&source, "nested_return_suffix.py", &LEVELS);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn nested_terminal_return_preserves_original_footer() {
+    assert_matches_cpython(
+        "def sample(flag, outer, inner):\n    if flag:\n        assert flag\n    if outer:\n        if inner:\n            return\n",
+        "nested_return_footer.py",
+        &LEVELS,
+    );
+    for scope in ["def", "async def"] {
+        for prefix in ["", "    if flag:\n        assert flag\n"] {
+            for outer in ["outer", "not outer", "outer.value"] {
+                for inner in ["inner", "not inner", "inner == 3"] {
+                    for returned in ["return", "return None"] {
+                        let source = format!(
+                            "{scope} sample(flag, outer, inner):\n{prefix}    if {outer}:\n        if {inner}:\n            {returned}\n"
+                        );
+                        assert_matches_cpython(&source, "nested_return_footer.py", &LEVELS);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn handler_loop_else_keeps_original_borrow_boundary() {
+    for protected in ["pass", "operation()"] {
+        for normal in ["pass", "operation()"] {
+            for condition in ["finished()", "finished() < limit", "not finished()"] {
+                let source = format!(
+                    "def sample(value, limit):\n    try:\n        {protected}\n    except RuntimeError:\n        while True:\n            if {condition}:\n                break\n    else:\n        {normal}\n    if value is not None:\n        operation(value)\n"
+                );
+                assert_matches_cpython(&source, "handler_loop_else_borrow.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn terminal_subscript_iterator_keeps_return_location() {
+    assert_matches_cpython(
+        "async def sample(flag, items):\n    if flag:\n        assert await prepare()\n    if not flag:\n        for item in items.groups[0].values[1:]:\n            assert await operation(item)\n",
+        "terminal_subscript_return.py",
+        &LEVELS,
+    );
+    for scope in ["def", "async def"] {
+        for prefix in ["", "    if flag:\n        assert value\n"] {
+            for condition in ["flag", "not flag"] {
+                for iterator in [
+                    "items[0]",
+                    "items[1:]",
+                    "items[1:4]",
+                    "items[::2]",
+                    "items[index]",
+                    "items[index:end:step]",
+                    "items.groups[0].values[1:]",
+                ] {
+                    for body in ["assert item", "operation(item)"] {
+                        let source = format!(
+                            "{scope} sample(flag, value, items, index, end, step):\n{prefix}    if {condition}:\n        for item in {iterator}:\n            {body}\n"
+                        );
+                        assert_matches_cpython(&source, "terminal_subscript_iterator.py", &LEVELS);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn erased_prefix_before_terminal_iterator_keeps_return_location() {
+    assert_matches_cpython(
+        "async def sample(unused, value):\n    if value.kind == 'first':\n        assert operation(item, (1, 2, 3)) > 7\n    if value.kind == 'last':\n        for item in ((1, 2, 3), (4, 5, 6), (7, 8, 9)):\n            assert operation(value, item) > 7\n",
+        "terminal_iterator_return_nested_tuple.py",
+        &LEVELS,
+    );
+    for scope in ["def", "async def"] {
+        for prefix in [
+            "",
+            "    if other:\n        assert other\n",
+            "    if flag.name == 'first':\n        assert other\n",
+        ] {
+            for condition in ["flag", "flag.name == 'last'"] {
+                for iterator in [
+                    "items",
+                    "(1, 2, 3)",
+                    "((1, 2), (3, 4))",
+                    "[(1, 2), (3, 4)]",
+                    "(((1,),), ((2,),))",
+                    "((None, True, 'text'), (False, b'bytes', ...))",
+                ] {
+                    for body in ["assert item", "operation(item)"] {
+                        let source = format!(
+                            "{scope} sample(flag, other, items):\n{prefix}    if {condition}:\n        for item in {iterator}:\n            {body}\n"
+                        );
+                        assert_matches_cpython(&source, "terminal_iterator_return.py", &LEVELS);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn iterator_break_copies_small_literal_tuple_return() {
+    for (scope, iterator, prefix) in [
+        ("def", "for", ""),
+        ("def", "for", "    yield flag\n"),
+        ("async def", "for", ""),
+        ("async def", "async for", ""),
+    ] {
+        for value in ["()", "(1,)", "('value',)", "(None,)"] {
+            for preceding in [
+                "",
+                "    try:\n        prepare()\n    except Exception:\n        return ()\n",
+            ] {
+                let source = format!(
+                    "{scope} sample(values, flag):\n{prefix}{preceding}    {iterator} value in values:\n        if flag:\n            break\n        operation(value)\n    return {value}\n"
+                );
+                assert_matches_cpython(&source, "small_tuple_break.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn nested_or_match_exit_inherits_guard_location() {
+    for first in ["Item()", "[Item()]"] {
+        for guard in ["flag", "value is not None"] {
+            for value in ["value", "operation(value)"] {
+                let source = format!(
+                    "def sample(node, flag):\n    match node:\n        case Header():\n            match node:\n                case (\n                    First(item={first}, value=value)\n                    | Second(item=Item(), value=value)\n                ) if {guard}:\n                    return {value}\n        case Other():\n            return node\n    return None\n"
+                );
+                assert_matches_cpython(
+                    &source,
+                    &format!("nested_or_match_guard_{}.py", guard.len()),
+                    &LEVELS,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn nested_awaited_manager_finalizer_owner() {
+    for condition in ["started", "not started", "not started and ready(source)"] {
+        for cleanup in [
+            "reset()",
+            "state.reset(token)",
+            "resource.reset()",
+            "reset(token)",
+        ] {
+            let source = format!(
+                "async def sample(source, token, resource):\n    started = False\n    try:\n        try:\n            with manager():\n                started = True\n                return await source\n        finally:\n            {cleanup}\n    finally:\n        if {condition}:\n            finish()\n"
+            );
+            assert_matches_cpython(&source, "awaited_manager_finalizer.py", &LEVELS);
+        }
+        for handler in ["ValueError", "ValueError as error"] {
+            let source = format!(
+                "async def sample(source, token):\n    started = False\n    try:\n        try:\n            with manager():\n                started = True\n                try:\n                    return await source\n                except {handler}:\n                    raise\n        finally:\n            state.reset(token)\n    except LookupError:\n        raise\n    finally:\n        if {condition}:\n            finish()\n"
+            );
+            assert_matches_cpython(&source, "awaited_try_manager_finalizer.py", &LEVELS);
+        }
+    }
+    for cleanup in ["reset()", "reset(token)"] {
+        let source = format!(
+            "async def sample(source, token):\n    started = False\n    try:\n        try:\n            with manager():\n                started = True\n                try:\n                    return await source\n                except ValueError as error:\n                    raise\n        finally:\n            {cleanup}\n    except LookupError as error:\n        raise\n    finally:\n        if started is None:\n            finish()\n"
+        );
+        assert_matches_cpython(&source, "awaited_manager_none_control.py", &LEVELS);
+    }
+}
+
+#[test]
+fn nested_named_handler_return_truth_finalizer() {
+    for scope in ["def", "async def"] {
+        for handler in ["Exception", "Exception as error"] {
+            for expression in ["result", "operation(result)", "{'value': result}"] {
+                for condition in ["resource", "not resource"] {
+                    for body in ["pass", "finish(resource)"] {
+                        let source = format!(
+                            "{scope} sample(resource, result):\n    try:\n        operation()\n    except {handler}:\n        try:\n            operation()\n        except ValueError:\n            return {expression}\n    finally:\n        if {condition}:\n            {body}\n"
+                        );
+                        assert_matches_cpython(&source, "nested_named_handler_truth.py", &LEVELS);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn nested_manager_return_finalizer_owner() {
+    for managers in 1..=6 {
+        for expression in ["result", "operation(result)"] {
+            for (condition, body) in [
+                ("worker is not None", "pass"),
+                (
+                    "worker is not None and worker.poll() is None",
+                    "finish(worker)",
+                ),
+            ] {
+                let mut source =
+                    "def sample(manager, worker, result, flag):\n    try:\n".to_owned();
+                let mut indent = "        ".to_owned();
+                for index in 0..managers {
+                    writeln!(source, "{indent}with manager() as item{index}:").unwrap();
+                    indent.push_str("    ");
+                }
+                writeln!(source, "{indent}if flag:\n{indent}    operation()\n{indent}return {expression}\n    finally:\n        if {condition}:\n            {body}").unwrap();
+                assert_matches_cpython(&source, "nested_manager_finalizer.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn fused_stores_preserve_copied_handler_finally_marker_owner() {
+    for stores in 2..=5 {
+        for handler in ["Exception", "Exception as error"] {
+            for condition in [
+                "value is None",
+                "value is not None",
+                "value is not None and not done",
+            ] {
+                let mut assignments = String::new();
+                for index in 0..stores {
+                    writeln!(assignments, "            self.field{index} = value").unwrap();
+                }
+                let source = format!(
+                    "async def sample(self, items, flag):\n    for item in items:\n        value = None\n        done = False\n        try:\n            value = await acquire()\n{assignments}            done = True\n            return\n        except {handler}:\n            if flag:\n                raise\n        finally:\n            if {condition}:\n                await release(value)\n        await advance()\n"
+                );
+                assert_matches_cpython(&source, "fused_handler_finally_prefix.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn fused_stores_preserve_finally_none_marker_owner() {
+    for scope in ["def", "async def"] {
+        for stores in 2..=5 {
+            for condition in ["value is None", "value is not None"] {
+                let mut assignments = String::new();
+                for index in 0..stores {
+                    writeln!(assignments, "            self.field{index} = value").unwrap();
+                }
+                let source = format!(
+                    "{scope} sample(self, value, items):\n    for item in items:\n        try:\n{assignments}            return\n        finally:\n            if {condition}:\n                operation(value)\n"
+                );
+                assert_matches_cpython(&source, "fused_stores_finally_none.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn terminal_manager_try_break_retains_owner() {
+    assert_matches_cpython(
+        "def sample(manager):\n    try:\n        with manager:\n            try:\n                while True:\n                    try:\n                        operation()\n                        break\n                    except ValueError:\n                        continue\n            except Exception:\n                finish()\n                raise\n    except OSError:\n        raise ValueError() from None\n    finally:\n        finish()\n",
+        "terminal_manager_try_break_outer_finally.py",
+        &LEVELS,
+    );
+    for (scope, manager) in [
+        ("def", "with"),
+        ("async def", "with"),
+        ("async def", "async with"),
+    ] {
+        for condition in ["True", "flag"] {
+            for handler in ["Exception", "Exception as error"] {
+                for action in ["operation()", "value = 1"] {
+                    for nested in [false, true] {
+                        let body = if nested {
+                            format!(
+                                "                try:\n                    {action}\n                    break\n                except OtherError:\n                    continue\n"
+                            )
+                        } else {
+                            format!("                {action}\n                break\n")
+                        };
+                        let source = format!(
+                            "{scope} sample(manager, flag):\n    {manager} manager:\n        try:\n            while {condition}:\n{body}        except {handler}:\n            raise\n"
+                        );
+                        assert_matches_cpython(&source, "terminal_manager_try_break.py", &LEVELS);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn reraising_finally_preserves_coroutine_try_join() {
+    for condition in ["flag", "flag is not None"] {
+        for handler_prefix in ["", "                value = 1\n"] {
+            for exception in ["Error", "errors.Error"] {
+                for body in [
+                    "                operation()\n",
+                    "                async with manager():\n                    result = await operation()\n",
+                ] {
+                    for cleanup in ["cleanup()", "observe(value if flag else items)"] {
+                        let source = format!(
+                            "async def sample(flag, items):\n    if items:\n        observe()\n    try:\n        if {condition}:\n            try:\n{body}            except {exception}:\n{handler_prefix}                raise\n            finally:\n                try:\n                    {cleanup}\n                except Other:\n                    pass\n    except Outer:\n        failed = True\n    observe()\n"
+                        );
+                        assert_matches_cpython(&source, "reraising_finally_join.py", &LEVELS);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn completed_generator_prefix_preserves_normal_finalizer_exit() {
+    for generator in [
+        "(item for item in values)",
+        "(item.value for item in source(values) if item)",
+        "(item if other else value for item in values)",
+    ] {
+        for callable in ["observe", "sink.consume"] {
+            for prefix in ["prepare(value)", "prepared = prepare(value)"] {
+                for assertion in ["assert result", "assert all(result for item in values)"] {
+                    let source = format!(
+                        "def sample(manager, value, values, other):\n    with manager():\n        {callable}('tag', {generator})\n        {prefix}\n        try:\n            result = process(value)\n        finally:\n            cleanup(value)\n        {assertion}\n"
+                    );
+                    assert_matches_cpython(&source, "completed_generator_finalizer.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn nested_populated_conditions_preserve_original_joins() {
+    let indent = |body: &str| {
+        body.lines().fold(String::new(), |mut indented, line| {
+            writeln!(indented, "    {line}").unwrap();
+            indented
+        })
+    };
+    for condition in [
+        "other and flag",
+        "other or flag",
+        "(first or other) and (flag or not second)",
+    ] {
+        for depth in [1, 2] {
+            for prefix in ["", "if other:\n    total = update(values)\n"] {
+                for successor in [
+                    "observe(values)\n",
+                    "return values\n",
+                    "selected = values[flag]\nreturn selected\n",
+                ] {
+                    let mut branch = format!(
+                        "if second:\n    if other:\n        raise Error()\n    result = values\nelif {condition}:\n    result = values\nelse:\n    result = source(values)\n    result = result.value\n"
+                    );
+                    for _ in 0..depth {
+                        let arm =
+                            format!("total = measure(values)\n{prefix}result = finish(total)\n");
+                        branch = format!("if first:\n{}else:\n{}", indent(&arm), indent(&branch));
+                    }
+                    let body = format!(
+                        "if flag:\n{}else:\n    assert flag\n{successor}",
+                        indent(&branch)
+                    );
+                    let source = format!(
+                        "def sample(flag, other, first, second, values):\n{}",
+                        indent(&body)
+                    );
+                    assert_matches_cpython(&source, "nested_populated_join.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn completed_elif_arms_preserve_original_join() {
+    for prefix in [
+        "",
+        "            if other:\n                total = update(values)\n",
+        "            if other is None:\n                audit(total)\n",
+    ] {
+        for condition in [
+            "other",
+            "other and flag",
+            "other or flag",
+            "not other or flag",
+        ] {
+            for successor in [
+                "    observe(values)\n",
+                "    return values\n",
+                "    selected = values[flag]\n    return selected\n",
+            ] {
+                let source = format!(
+                    "def sample(flag, other, first, second, values):\n    if flag:\n        selected = values\n        if first:\n            assert first\n            total = measure(values)\n{prefix}            result = finish(total)\n        elif second:\n            assert second\n            if other:\n                raise Error()\n            result = values\n        elif {condition}:\n            result = values\n        else:\n            result = source(values)\n            result = result.value\n    else:\n        assert flag\n{successor}"
+                );
+                assert_matches_cpython(&source, "completed_elif_join.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn ordinary_completed_arms_preserve_erased_tail_joins() {
+    for value in [
+        "values",
+        "[item for item, ready in values if ready]",
+        "{item for item, ready in values if ready}",
+        "{item: ready for item, ready in values if ready}",
+        "tuple(item for item in values)",
+    ] {
+        for condition in ["other", "all(item > 0 for item in values)"] {
+            for assertion in ["assert count", "assert all(count for item in values)"] {
+                for successor in [
+                    "    observe(values)\n",
+                    "    return values\n",
+                    "    selected = values[flag]\n    return selected\n",
+                ] {
+                    let source = format!(
+                        "def sample(flag, other, values):\n    if flag:\n        size = measure(values)\n        assert size\n        if {condition}:\n            assert values\n        else:\n            items = {value}\n            count = measure(items) + 1\n            {assertion}\n    else:\n        assert flag\n{successor}"
+                    );
+                    assert_matches_cpython(&source, "ordinary_completed_arm_tail.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn enclosing_finalizers_preserve_nested_loop_joins() {
+    let indent = |body: &str| {
+        body.lines().fold(String::new(), |mut indented, line| {
+            writeln!(indented, "    {line}").unwrap();
+            indented
+        })
+    };
+    for (manager, nested_loop) in [
+        (Some("manager()"), false),
+        (Some("manager()"), true),
+        (Some("first_manager(), second_manager()"), true),
+        (None, false),
+    ] {
+        for condition in ["other", "entry[0] == other"] {
+            for successor in [
+                "observe(values)\n",
+                "for item in values:\n    assert item\n",
+                "for item, extra, last in values:\n    assert item\n",
+            ] {
+                let conditional = format!(
+                    "if flag:\n    assert entry\n    if {condition}:\n        assert flag\n    else:\n        assert other\nelse:\n    assert flag\n{successor}"
+                );
+                let mut body = format!("for entry in values:\n{}", indent(&conditional));
+                if nested_loop {
+                    body = format!("for row in values:\n{}", indent(&body));
+                }
+                body = format!("try:\n{}finally:\n    cleanup()\n", indent(&body));
+                if let Some(manager) = manager {
+                    body = format!("with {manager}:\n{}", indent(&body));
+                }
+                let source = format!("def sample(values, flag, other):\n{}", indent(&body));
+                assert_matches_cpython(&source, "nested_finally_loop_join.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn completed_coroutine_arms_preserve_erased_outer_join() {
+    for value in [
+        "first",
+        "first if other else second",
+        "left() if other is None else right()",
+        "(first if flag else second) if other else third()",
+    ] {
+        for assertion in ["assert value", "assert all(value for item in values)"] {
+            for guard in ["flag", "flag is None"] {
+                for suffix in [
+                    "    observe(values)\n",
+                    "    selected = values[flag]\n    return selected\n",
+                    "    return factory(values=values if other else None)\n",
+                ] {
+                    let source = format!(
+                        "async def sample(flag, other, first, second, values):\n    if {guard}:\n        if other:\n            assert values\n            observe(values)\n        else:\n            assert first\n            value = {value}\n            {assertion}\n    else:\n        assert flag\n{suffix}"
+                    );
+                    assert_matches_cpython(&source, "completed_coroutine_arm.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn completed_comprehensions_preserve_erased_conditional_joins() {
+    for scope in ["def", "async def"] {
+        for value in [
+            "[item.value for item in values]",
+            "{item.value for item in values}",
+            "{item.name: item.value for item in values}",
+        ] {
+            for guard in ["flag", "flag == 1"] {
+                for condition in ["other", "'key' in values"] {
+                    for suffix in [
+                        "    return values\n",
+                        "    observe(values)\n",
+                        "    selected = values[flag]\n    return selected\n",
+                        "    flag += 1\n",
+                        "    if other:\n        raise Error()\n",
+                        "    return factory(values=values if flag else None)\n",
+                    ] {
+                        let source = format!(
+                            "{scope} sample(flag, values, other):\n    if {guard}:\n        assert other\n        items = {value}\n        if {condition}:\n            assert items\n        else:\n            assert other\n    else:\n        assert flag\n{suffix}"
+                        );
+                        assert_matches_cpython(
+                            &source,
+                            "completed_comprehension_erased_join.py",
+                            &LEVELS,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn erased_try_else_retains_conditional_manager_exit() {
+    for managers in [
+        "manager()",
+        "manager() as chosen",
+        "first_manager(), second_manager(), third_manager()",
+    ] {
+        for condition in ["flag", "flag == first"] {
+            for (left, right) in [
+                ("first", "second"),
+                ("left()", "right()"),
+                (
+                    "factory(first, option=right())",
+                    "factory(second, option=left())",
+                ),
+            ] {
+                for assertions in [
+                    "            assert value\n",
+                    "            assert value\n            assert first\n",
+                ] {
+                    let source = format!(
+                        "def sample(flag, first, second):\n    with {managers}:\n        try:\n            if {condition}:\n                value = {left}\n            else:\n                value = {right}\n        except Error as error:\n            assert check(error)\n        else:\n{assertions}"
+                    );
+                    assert_matches_cpython(&source, "erased_try_else_manager.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn completed_erased_iterators_preserve_ordinary_conditional_joins() {
+    for scope in ["def", "async def"] {
+        for iterable in ["values", "(first, second)", "operation()"] {
+            for repeated in [false, true] {
+                for ternary in [false, true] {
+                    for condition in ["other", "other is None"] {
+                        for successor in [
+                            "    operation()\n",
+                            "    return first\n",
+                            "    if not flag:\n        assert other\n",
+                        ] {
+                            let stored = if ternary {
+                                "        value = first if other else second\n"
+                            } else {
+                                ""
+                            };
+                            let second = if repeated {
+                                format!(
+                                    "        for item in {iterable}:\n            assert item\n"
+                                )
+                            } else {
+                                String::new()
+                            };
+                            let source = format!(
+                                "{scope} sample(flag, other, values, first, second, operation):\n    if flag:\n        for item in {iterable}:\n            assert item\n{stored}{second}        if {condition}:\n            assert first\n        else:\n            assert other\n    else:\n        assert flag\n{successor}"
+                            );
+                            assert_matches_cpython(
+                                &source,
+                                &format!(
+                                    "completed_erased_iterator_{}_{}_{}_{}_{}_{}.py",
+                                    scope.len(),
+                                    iterable.len(),
+                                    repeated,
+                                    ternary,
+                                    condition.len(),
+                                    successor.len()
+                                ),
+                                &LEVELS,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn conditional_manager_contexts_preserve_erased_arm_continuations() {
+    for (scope, manager) in [
+        ("def", "with"),
+        ("async def", "with"),
+        ("async def", "async with"),
+    ] {
+        for callable in ["factory", "module.factory"] {
+            for value in [
+                "first if flag else second",
+                "(first if flag else second) if other else None",
+                "first if other else (second if flag else None)",
+                "operation() if other else operation()",
+                "first if other and flag else second",
+                "first if other is None else second",
+            ] {
+                for binding in ["", " as chosen"] {
+                    for stored_prefix in [false, true] {
+                        let prefix = if stored_prefix {
+                            format!("            value = {value}\n")
+                        } else {
+                            String::new()
+                        };
+                        let work = if scope == "def" {
+                            "operation()"
+                        } else {
+                            "await awaitable"
+                        };
+                        let source = format!(
+                            "{scope} sample(flag, other, first, second, operation, factory, module, awaitable):\n    try:\n        if other:\n            operation()\n        else:\n{prefix}            {manager} {callable}({value}){binding}:\n                {work}\n            if flag:\n                assert first\n            else:\n                assert other\n    finally:\n        operation()\n"
+                        );
+                        assert_matches_cpython(
+                            &source,
+                            &format!(
+                                "conditional_manager_{}_{}_{}_{}_{}_{}.py",
+                                scope.len(),
+                                manager.len(),
+                                callable.len(),
+                                value.len(),
+                                binding.len(),
+                                stored_prefix
+                            ),
+                            &LEVELS,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn completed_conditional_prefixes_preserve_ordinary_erased_joins() {
+    for scope in ["def", "async def"] {
+        for value in [
+            "first if other else second",
+            "(first if flag else second) if other else None",
+            "first if other else (second if flag else None)",
+            "operation() if other else operation()",
+            "first if other and flag else second",
+            "first if other is None else second",
+        ] {
+            for repeated in [false, true] {
+                for condition in ["other", "other is None"] {
+                    for successor in [
+                        "    operation(value)\n",
+                        "    result = first if flag else second\n    return result\n",
+                        "    return value\n",
+                    ] {
+                        let prefix = if repeated {
+                            format!("        second = {value}\n        assert second\n")
+                        } else {
+                            String::new()
+                        };
+                        let source = format!(
+                            "{scope} sample(flag, other, first, second, operation):\n    if flag:\n        value = {value}\n        assert value\n{prefix}        if {condition}:\n            assert first\n        else:\n            assert second\n    else:\n        assert flag\n{successor}"
+                        );
+                        assert_matches_cpython(
+                            &source,
+                            &format!(
+                                "conditional_prefix_{}_{}_{}_{}_{}.py",
+                                scope.len(),
+                                value.len(),
+                                repeated,
+                                condition.len(),
+                                successor.len()
+                            ),
+                            &LEVELS,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn generator_finalizer_calls_preserve_erased_arm_joins() {
+    for (scope, awaited) in [("def", ""), ("async def", ""), ("async def", "await ")] {
+        for callable in ["operation", "module.operation"] {
+            for starred in ["", "*"] {
+                for element in ["item", "module.operation(item)"] {
+                    for condition in ["flag", "flag is None"] {
+                        for store in ["", "value = "] {
+                            for nested in [false, true] {
+                                let protected = if nested {
+                                    format!(
+                                        "        if other:\n            operation()\n        else:\n            if {condition}:\n                assert items\n            else:\n                assert other\n"
+                                    )
+                                } else {
+                                    format!(
+                                        "        if {condition}:\n            assert items\n        else:\n            assert other\n"
+                                    )
+                                };
+                                let source = format!(
+                                    "{scope} sample(flag, other, module, operation, items):\n    try:\n{protected}    finally:\n        {store}{awaited}{callable}({starred}({element} for item in items))\n"
+                                );
+                                assert_matches_cpython(
+                                    &source,
+                                    &format!(
+                                        "generator_finalizer_{}_{}_{}_{}_{}_{}_{}_{}.py",
+                                        scope.len(),
+                                        awaited.len(),
+                                        callable.len(),
+                                        starred.len(),
+                                        element.len(),
+                                        condition.len(),
+                                        store.len(),
+                                        nested
+                                    ),
+                                    &LEVELS,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn completed_ternary_prefixes_preserve_nested_erased_arm_joins() {
+    for (scope, manager) in [
+        ("def", ""),
+        ("def", "with"),
+        ("async def", ""),
+        ("async def", "with"),
+        ("async def", "async with"),
+    ] {
+        for value in [
+            "first if other else second",
+            "(first if flag else second) if other else None",
+            "first if other else (second if flag else None)",
+            "operation() if other else operation()",
+            "first if other and flag else second",
+            "first if other is None else second",
+        ] {
+            for condition in ["flag", "flag is None"] {
+                for (cleanup, live_successor) in [
+                    ("finally:", false),
+                    ("finally:", true),
+                    ("except ValueError:", true),
+                ] {
+                    let managed = if manager.is_empty() {
+                        String::new()
+                    } else {
+                        let work = if scope == "def" {
+                            "operation()"
+                        } else {
+                            "await awaitable"
+                        };
+                        format!("            {manager} manager:\n                {work}\n")
+                    };
+                    let successor = if live_successor {
+                        "        operation()\n"
+                    } else {
+                        ""
+                    };
+                    let source = format!(
+                        "{scope} sample(flag, other, first, second, operation, manager, awaitable):\n    try:\n        if other:\n            operation()\n        else:\n            value = {value}\n{managed}            if {condition}:\n                assert value\n            else:\n                assert other\n{successor}    {cleanup}\n        operation()\n"
+                    );
+                    assert_matches_cpython(
+                        &source,
+                        &format!(
+                            "completed_ternary_prefix_{}_{}_{}_{}_{}_{}.py",
+                            scope.len(),
+                            manager.len(),
+                            value.len(),
+                            condition.len(),
+                            cleanup.len(),
+                            live_successor
+                        ),
+                        &LEVELS,
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn guarded_finalizer_managers_preserve_erased_arm_joins() {
+    for (scope, manager) in [
+        ("def", "with"),
+        ("async def", "with"),
+        ("async def", "async with"),
+    ] {
+        for work in ["operation()", "await operation()"] {
+            if scope == "def" && work.starts_with("await ") {
+                continue;
+            }
+            for context in ["manager", "operation()", "manager as value"] {
+                for guard in ["other", "other and operation()"] {
+                    for condition in ["flag", "flag is None"] {
+                        for placement in ["true", "false", "tail"] {
+                            let guarded = match placement {
+                                "true" => format!(
+                                    "        if {guard}:\n            {manager} {context}:\n                {work}\n        else:\n            operation()\n"
+                                ),
+                                "false" => format!(
+                                    "        if {guard}:\n            operation()\n        else:\n            {manager} {context}:\n                {work}\n"
+                                ),
+                                _ => format!(
+                                    "        if {guard}:\n            operation()\n        {manager} {context}:\n            {work}\n"
+                                ),
+                            };
+                            let source = format!(
+                                "{scope} sample(flag, other, operation, manager):\n    try:\n        value = operation()\n        if {condition}:\n            assert value\n        else:\n            assert other\n    finally:\n{guarded}"
+                            );
+                            assert_matches_cpython(
+                                &source,
+                                &format!(
+                                    "guarded_finalizer_manager_{}_{}_{}_{}_{}_{}_{}.py",
+                                    scope.len(),
+                                    manager.len(),
+                                    work.len(),
+                                    context.len(),
+                                    guard.len(),
+                                    condition.len(),
+                                    placement
+                                ),
+                                &LEVELS,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn short_circuit_finalizer_guards_preserve_erased_arm_joins() {
+    for scope in ["def", "async def"] {
+        for work in ["operation()", "await operation()"] {
+            if scope == "def" && work.starts_with("await ") {
+                continue;
+            }
+            for guard in [
+                "other",
+                "other and operation()",
+                "other or operation()",
+                "other is not None and not operation()",
+                "not (other or operation())",
+                "(other and flag) or operation()",
+            ] {
+                for condition in ["flag", "flag is None"] {
+                    for alternate in [false, true] {
+                        for nested in [false, true] {
+                            let protected = if nested {
+                                format!(
+                                    "        if other:\n            operation()\n        else:\n            if {condition}:\n                assert value\n            else:\n                assert other\n"
+                                )
+                            } else {
+                                format!(
+                                    "        if {condition}:\n            assert value\n        else:\n            assert other\n"
+                                )
+                            };
+                            let alternate = if alternate {
+                                format!(
+                                    "        elif flag and operation():\n            {work}\n        else:\n            operation()\n"
+                                )
+                            } else {
+                                String::new()
+                            };
+                            let source = format!(
+                                "{scope} sample(flag, other, operation):\n    try:\n        value = operation()\n{protected}    finally:\n        if {guard}:\n            {work}\n{alternate}        operation()\n"
+                            );
+                            assert_matches_cpython(
+                                &source,
+                                &format!(
+                                    "short_circuit_finalizer_{}_{}_{}_{}_{}_{}.py",
+                                    scope.len(),
+                                    work.len(),
+                                    guard.len(),
+                                    condition.len(),
+                                    alternate.len(),
+                                    nested
+                                ),
+                                &LEVELS,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn completed_manager_loops_preserve_nested_erased_arm_continuations() {
+    for (scope, manager) in [
+        ("def", "with"),
+        ("async def", "with"),
+        ("async def", "async with"),
+    ] {
+        for work in ["operation()", "await operation()", "await awaitable"] {
+            if scope == "def" && work.starts_with("await ") {
+                continue;
+            }
+            for loop_test in ["other", "operation(other) < 1"] {
+                for condition in ["flag", "flag is None"] {
+                    for (cleanup, live_successor) in [
+                        ("finally:", false),
+                        ("finally:", true),
+                        ("except ValueError:", true),
+                    ] {
+                        let successor = if live_successor {
+                            if scope == "def" {
+                                "        operation()\n"
+                            } else {
+                                "        await operation()\n"
+                            }
+                        } else {
+                            ""
+                        };
+                        let source = format!(
+                            "{scope} sample(flag, other, manager, operation, awaitable):\n    try:\n        if other:\n            operation()\n        else:\n            {manager} manager:\n                while {loop_test}:\n                    {work}\n            value = operation()\n            if {condition}:\n                assert value\n            else:\n                assert other\n{successor}    {cleanup}\n        operation()\n"
+                        );
+                        assert_matches_cpython(
+                            &source,
+                            &format!(
+                                "completed_manager_loop_{}_{}_{}_{}_{}_{}_{}.py",
+                                scope.len(),
+                                manager.len(),
+                                work.len(),
+                                loop_test.len(),
+                                condition.len(),
+                                cleanup.len(),
+                                successor.len()
+                            ),
+                            &LEVELS,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn coroutine_erased_boolean_arm_keeps_shared_iterator_exit() {
+    for scope in ["def", "async def"] {
+        for outer in ["flag", "flag in {1, 2}"] {
+            for condition in ["first or second", "first or second or third"] {
+                for prefix in ["", "    prepare()\n"] {
+                    for body in ["assert item", "assert item\n                assert other"] {
+                        let source = format!(
+                            "{scope} sample(items, flag, first, second, third, other):\n{prefix}    if {outer}:\n        for item in items:\n            if {condition}:\n                {body}\n"
+                        );
+                        assert_matches_cpython(
+                            &source,
+                            &format!(
+                                "erased_boolean_iterator_{}_{}_{}_{}_{}.py",
+                                scope.len(),
+                                outer.len(),
+                                condition.len(),
+                                prefix.len(),
+                                body.len()
+                            ),
+                            &LEVELS,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn completed_managers_preserve_nested_erased_arm_continuations() {
+    for (scope, manager) in [
+        ("def", "with"),
+        ("async def", "with"),
+        ("async def", "async with"),
+    ] {
+        for work in ["operation()", "await operation()", "await awaitable"] {
+            if scope == "def" && work.starts_with("await ") {
+                continue;
+            }
+            for context in ["manager", "operation(manager)"] {
+                for binding in ["", " as value"] {
+                    for condition in ["flag", "flag is None"] {
+                        for (cleanup, successor) in [
+                            ("finally:", ""),
+                            ("finally:", "        operation()\n"),
+                            ("except ValueError:", "        operation()\n"),
+                        ] {
+                            let source = format!(
+                                "{scope} sample(flag, other, manager, operation, awaitable):\n    try:\n        if other:\n            operation()\n        else:\n            operation()\n            {manager} {context}{binding}:\n                {work}\n            if {condition}:\n                assert other\n            else:\n                assert flag\n        assert manager\n{successor}    {cleanup}\n        operation()\n"
+                            );
+                            assert_matches_cpython(
+                                &source,
+                                &format!(
+                                    "completed_manager_continuation_{}_{}_{}_{}_{}_{}_{}_{}.py",
+                                    scope.len(),
+                                    manager.len(),
+                                    work.len(),
+                                    context.len(),
+                                    binding.len(),
+                                    condition.len(),
+                                    cleanup.len(),
+                                    successor.len()
+                                ),
+                                &LEVELS,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn protected_erased_arms_keep_joins_before_finalizer_assignments() {
+    for scope in ["def", "async def"] {
+        for value in [
+            "operation()",
+            "operation(flag)",
+            "await operation()",
+            "await awaitable",
+        ] {
+            if scope == "def" && value.starts_with("await ") {
+                continue;
+            }
+            for condition in ["flag", "flag is None"] {
+                for guarded in [false, true] {
+                    for prefix in ["", "        operation()\n"] {
+                        let assignment = if guarded {
+                            format!(
+                                "        if other:\n            value = {value}\n        else:\n            value = {value}\n"
+                            )
+                        } else {
+                            format!("        value = {value}\n")
+                        };
+                        let source = format!(
+                            "{scope} sample(flag, other, operation, awaitable):\n    try:\n        operation()\n        if {condition}:\n            assert other\n        else:\n            assert flag\n    finally:\n{prefix}{assignment}        operation(value)\n"
+                        );
+                        assert_matches_cpython(
+                            &source,
+                            &format!(
+                                "finalizer_assignment_entry_{}_{}_{}_{guarded}_{}.py",
+                                scope.len(),
+                                value.len(),
+                                condition.len(),
+                                prefix.len()
+                            ),
+                            &LEVELS,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn protected_erased_arms_keep_joins_before_finalizer_managers() {
+    for (scope, manager) in [
+        ("def", "with"),
+        ("async def", "with"),
+        ("async def", "async with"),
+    ] {
+        for context in ["manager", "operation(manager)"] {
+            for binding in ["", " as value"] {
+                for condition in ["flag", "flag is None"] {
+                    for prefix in ["", "        operation()\n"] {
+                        for suffix in ["", "        operation()\n"] {
+                            let source = format!(
+                                "{scope} sample(flag, manager, operation):\n    try:\n        operation()\n        if {condition}:\n            assert manager\n        else:\n            assert flag\n    finally:\n{prefix}        {manager} {context}{binding}:\n            operation()\n{suffix}"
+                            );
+                            assert_matches_cpython(
+                                &source,
+                                &format!(
+                                    "finalizer_manager_entry_{}_{}_{}_{}_{}_{}_{}.py",
+                                    scope.len(),
+                                    manager.len(),
+                                    context.len(),
+                                    binding.len(),
+                                    condition.len(),
+                                    prefix.len(),
+                                    suffix.len()
+                                ),
+                                &LEVELS,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn protected_nested_erased_arms_inherit_live_successors() {
+    for scope in ["def", "async def"] {
+        for protection in ["finally", "except", "none"] {
+            for depth in 1..=2 {
+                for prefix in ["", "value = operation()"] {
+                    for condition in ["flag", "flag is None"] {
+                        for successor in ["operation()", "await operation()", "await awaitable"] {
+                            if scope == "def" && successor.starts_with("await ") {
+                                continue;
+                            }
+                            let base = if protection == "none" {
+                                "    "
+                            } else {
+                                "        "
+                            };
+                            let mut source =
+                                format!("{scope} sample(flag, other, operation, awaitable):\n");
+                            if protection != "none" {
+                                source.push_str("    try:\n");
+                            }
+                            let mut indent = base.to_owned();
+                            for _ in 0..depth {
+                                writeln!(
+                                    source,
+                                    "{indent}if other:\n{indent}    operation()\n{indent}else:"
+                                )
+                                .unwrap();
+                                indent.push_str("    ");
+                            }
+                            if !prefix.is_empty() {
+                                writeln!(source, "{indent}{prefix}").unwrap();
+                            }
+                            writeln!(source, "{indent}if {condition}:\n{indent}    assert other\n{indent}else:\n{indent}    assert flag\n{base}{successor}").unwrap();
+                            if protection != "none" {
+                                let cleanup = if protection == "finally" {
+                                    "finally:"
+                                } else {
+                                    "except ValueError:"
+                                };
+                                writeln!(source, "    {cleanup}\n        operation()").unwrap();
+                            }
+                            assert_matches_cpython(
+                                &source,
+                                &format!(
+                                    "nested_live_successor_{}_{}_{}_{}_{}_{}.py",
+                                    scope.len(),
+                                    protection,
+                                    depth,
+                                    prefix.len(),
+                                    condition.len(),
+                                    successor.len()
+                                ),
+                                &LEVELS,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn completed_manager_arm_preserves_iterator_exit() {
+    for (scope, outer) in [
+        ("def", "with"),
+        ("async def", "with"),
+        ("async def", "async with"),
+    ] {
+        for condition in ["flag", "flag is None"] {
+            for body in ["operation()", "await operation()"] {
+                if scope == "def" && body.starts_with("await") {
+                    continue;
+                }
+                for binding in ["", " as value"] {
+                    for prefix in ["", "                    assert other\n"] {
+                        let source = format!(
+                            "{scope} sample(items, flag, other, context, operation):\n    {outer} context:\n        for item in items:\n            if {condition}:\n                with context{binding}:\n{prefix}                    {body}\n            else:\n                assert other\n"
+                        );
+                        assert_matches_cpython(&source, "completed_iterator_manager.py", &LEVELS);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn completed_generator_store_preserves_finally_iterator_exit() {
+    for scope in ["def", "async def"] {
+        for value in [
+            "sum(x * x for x in values)",
+            "operation(x for x in values if x)",
+            "operation.part(x if flag else other for x in values)",
+            "operation(sum(x * x for x in values))",
+        ] {
+            for prefix in ["", "                assert other\n"] {
+                for suffix in ["", "                assert flag\n"] {
+                    let source = format!(
+                        "{scope} sample(items, values, flag, other, operation):\n    try:\n        for item in items:\n            if flag:\n{prefix}                result = {value}\n{suffix}            else:\n                assert other\n    finally:\n        operation()\n"
+                    );
+                    assert_matches_cpython(&source, "generator_store_iterator.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn erased_iterator_arms_keep_enclosing_managers() {
+    for manager in ["with", "async with"] {
+        for managers in ["manager()", "manager(), other()"] {
+            for outer in [false, true] {
+                for test in ["flag", "left or right", "left == right"] {
+                    for assertion in ["assert value", "assert await operation()"] {
+                        let body = format!(
+                            "            for value in items:\n                if {test}:\n                    {assertion}\n                else:\n                    assert await other()\n"
+                        );
+                        let source = if outer {
+                            format!(
+                                "async def sample(items, flag, left, right):\n    {manager} {managers}:\n        try:\n{body}        finally:\n            await finish()\n"
+                            )
+                        } else {
+                            format!(
+                                "async def sample(items, flag, left, right):\n    try:\n        {manager} {managers}:\n{body}    finally:\n        await finish()\n"
+                            )
+                        };
+                        assert_matches_cpython(&source, "erased_managed_iterator.py", &LEVELS);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn enclosing_manager_preserves_normalized_finally_iterator_exit() {
+    for scope in ["def", "async def"] {
+        for managers in [
+            "manager()",
+            "manager(), other()",
+            "manager(), other(), third(), fourth()",
+        ] {
+            for test in ["flag", "left or right", "left == right"] {
+                for body in ["assert value", "operation()", "value = operation()"] {
+                    let source = format!(
+                        "{scope} sample(items, flag, left, right):\n    with {managers}:\n        try:\n            for value in items:\n                if {test}:\n                    {body}\n                else:\n                    assert other\n        finally:\n            if flag:\n                operation()\n"
+                    );
+                    assert_matches_cpython(&source, "managed_finally_iterator.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn coroutine_finally_iterator_erased_else_uses_normalized_backedge() {
+    for test in ["flag", "left or right", "left == right"] {
+        for body in ["assert value", "operation()", "value = operation()"] {
+            for cleanup in ["operation()", "await operation()"] {
+                let source = format!(
+                    "async def sample(items, flag, left, right):\n    try:\n        for value in items:\n            if {test}:\n                {body}\n            else:\n                assert other\n    finally:\n        {cleanup}\n"
+                );
+                assert_matches_cpython(&source, "finally_iterator_condition.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn resumable_manager_break_threads_scope_backedge() {
+    for (scope, work) in [("def", "yield value"), ("async def", "await operation()")] {
+        for outer in ["while True", "while flag"] {
+            for managers in ["first()", "first(), second()"] {
+                for handler in ["Error", "Error as error"] {
+                    let source = format!(
+                        "{scope} sample():\n    {outer}:\n        while True:\n            try:\n                with {managers}:\n                    {work}\n            except {handler}:\n                raise\n            else:\n                with third():\n                    operation()\n                break\n"
+                    );
+                    assert_matches_cpython(&source, "resumable_manager_break.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn protected_erased_arms_keep_joins_before_awaited_successors() {
+    for protection in ["finally", "except", "none"] {
+        for prefix in ["", "    await operation()\n"] {
+            for condition in ["flag", "flag is None"] {
+                for successor in [
+                    "operation()",
+                    "await operation()",
+                    "await operation(other or flag)",
+                    "await awaitable",
+                ] {
+                    let indent = if protection == "none" {
+                        "    "
+                    } else {
+                        "        "
+                    };
+                    let mut source =
+                        format!("async def sample(flag, other, operation, awaitable):\n{prefix}");
+                    if protection != "none" {
+                        source.push_str("    try:\n");
+                    }
+                    writeln!(source, "{indent}if {condition}:\n{indent}    assert other\n{indent}else:\n{indent}    assert flag\n{indent}{successor}").unwrap();
+                    if protection != "none" {
+                        let cleanup = if protection == "finally" {
+                            "finally:"
+                        } else {
+                            "except ValueError:"
+                        };
+                        writeln!(source, "    {cleanup}\n        operation()").unwrap();
+                    }
+                    assert_matches_cpython(
+                        &source,
+                        &format!(
+                            "protected_awaited_successor_{}_{}_{}_{}.py",
+                            protection,
+                            prefix.len(),
+                            condition.len(),
+                            successor.len()
+                        ),
+                        &LEVELS,
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn protected_async_manager_exits_keep_erased_arm_joins() {
+    for manager in ["with", "async with"] {
+        for prefix in ["operation()", "await operation()"] {
+            for condition in ["flag", "flag is None"] {
+                for suffix in [
+                    "",
+                    "            assert manager\n",
+                    "            operation()\n",
+                ] {
+                    for cleanup in ["operation()", "await operation()"] {
+                        let source = format!(
+                            "async def sample(flag, manager, operation):\n    try:\n        {manager} manager:\n            {prefix}\n            if {condition}:\n                assert manager\n            else:\n                assert flag\n{suffix}    finally:\n        {cleanup}\n"
+                        );
+                        assert_matches_cpython(
+                            &source,
+                            &format!(
+                                "protected_manager_exit_{}_{}_{}_{}_{}.py",
+                                manager.len(),
+                                prefix.len(),
+                                condition.len(),
+                                suffix.len(),
+                                cleanup.len()
+                            ),
+                            &LEVELS,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn retained_manager_preserves_handler_return_none_owner() {
+    for (scope, manager) in [
+        ("def", "with"),
+        ("async def", "with"),
+        ("async def", "async with"),
+    ] {
+        for (index, value) in [
+            "value",
+            "make(value)",
+            "(value, flag)",
+            "(value, make(flag))",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = format!(
+                "{scope} sample(manager, value, flag):\n    {manager} manager:\n        try:\n            operation()\n        except Exception:\n            return {value}\n        finally:\n            if value is not None:\n                finish(value)\n"
+            );
+            assert_matches_cpython(
+                &source,
+                &format!(
+                    "retained_handler_none_{}_{index}.py",
+                    manager.len() + scope.len()
+                ),
+                &LEVELS,
+            );
+        }
+    }
+}
+
+#[test]
+fn manager_try_else_break_threads_outer_backedge() {
+    for (scope, work) in [
+        ("def", "operation()"),
+        ("def", "yield value"),
+        ("async def", "await operation()"),
+    ] {
+        for outer in ["while True", "while flag", "for item in items"] {
+            for managers in ["first()", "first(), second()"] {
+                for handler in ["Error", "Error as error"] {
+                    let suffixes: &[&str] = if work == "operation()" {
+                        &["", "        operation()\n"]
+                    } else {
+                        &["        operation()\n"]
+                    };
+                    for suffix in suffixes {
+                        let source = format!(
+                            "{scope} sample():\n    {outer}:\n        while True:\n            try:\n                with {managers}:\n                    {work}\n            except {handler}:\n                raise\n            else:\n                with third():\n                    operation()\n                break\n{suffix}"
+                        );
+                        assert_matches_cpython(&source, "manager_try_else_break.py", &LEVELS);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn handler_manager_return_repeats_small_exit_copying() {
+    for scope in ["def", "async def"] {
+        for (managers, handler, guarded) in [
+            ("self.manager", "Exception", false),
+            ("self.manager", "Exception", true),
+            ("self.manager, other", "Exception", false),
+            ("self.manager, other", "Exception", true),
+            ("self.manager", "Exception as error", false),
+        ] {
+            for returned in ["True", "None", "'done'"] {
+                let body = if guarded {
+                    "                    if value is None:\n                        self.total += 1\n"
+                } else {
+                    "                    self.total += 1\n"
+                };
+                let source = format!(
+                    "class Sample(Base):\n    {scope} sample(self, unused):\n        try:\n            if predicate():\n                with {managers}:\n{body}        except {handler}:\n            with {managers}:\n                self.total += 1\n        return {returned}\n"
+                );
+                assert_matches_cpython(&source, "handler_manager_return.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn nested_finalizers_preserve_manager_suppression_return_copy() {
+    for (scope, operation) in [
+        ("def", "operation()"),
+        ("def", "yield value"),
+        ("async def", "await operation()"),
+    ] {
+        for outer in ["assert flag", "finish()", "return value"] {
+            for inner in ["assert flag", "finish()", "pass"] {
+                let source = format!(
+                    "{scope} sample(manager, value, flag):\n    try:\n        try:\n            with manager:\n                {operation}\n        finally:\n            {inner}\n    finally:\n        {outer}\n"
+                );
+                assert_matches_cpython_versions(
+                    &source,
+                    "nested_finally_manager.py",
+                    &LEVELS,
+                    &[PythonVersion::Py314, PythonVersion::Py315],
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn protected_erased_arms_keep_joins_before_iterator_successors() {
+    for scope in ["def", "async def"] {
+        for protection in ["finally", "except", "loop"] {
+            for iterator in ["items", "operation(items)"] {
+                for condition in ["flag", "flag is None"] {
+                    for body in ["assert other", "operation(other)"] {
+                        for suffix in ["", "operation()\n"] {
+                            let indent = if protection == "loop" {
+                                "            "
+                            } else {
+                                "        "
+                            };
+                            let mut source =
+                                format!("{scope} sample(flag, items, operation):\n    try:\n");
+                            if protection == "loop" {
+                                source.push_str("        for item in items:\n");
+                            }
+                            writeln!(source,
+                                "{indent}if {condition}:\n{indent}    assert items\n{indent}else:\n{indent}    assert flag\n{indent}for other in {iterator}:\n{indent}    {body}"
+                            ).unwrap();
+                            if !suffix.is_empty() {
+                                write!(source, "{indent}{suffix}").unwrap();
+                            }
+                            let cleanup = if protection == "except" {
+                                "except ValueError:"
+                            } else {
+                                "finally:"
+                            };
+                            writeln!(source, "    {cleanup}\n        operation()").unwrap();
+                            assert_matches_cpython(
+                                &source,
+                                &format!(
+                                    "protected_iterator_{}_{}_{}_{}_{}_{}.py",
+                                    scope.len(),
+                                    protection,
+                                    iterator.len(),
+                                    condition.len(),
+                                    body.len(),
+                                    suffix.len()
+                                ),
+                                &LEVELS,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn erased_normal_finally_arms_keep_conditional_returns() {
+    for (mode, (scope, entry)) in [
+        ("def", ""),
+        ("async def", ""),
+        ("async def", "    await operation()\n"),
+        ("def", "    yield operation()\n"),
+        ("async def", "    yield operation()\n"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for prefix in [
+            "",
+            "        operation()\n",
+            "        try:\n            operation()\n        finally:\n            operation()\n",
+        ] {
+            for condition in ["flag", "flag is None", "operation()"] {
+                for body in ["assert flag", "pass"] {
+                    for suffix in ["", "        assert value\n"] {
+                        let source = format!(
+                            "{scope} sample(flag, operation):\n{entry}    try:\n        operation()\n    finally:\n{prefix}        value = operation()\n        assert value\n        if {condition}:\n            {body}\n{suffix}"
+                        );
+                        assert_matches_cpython(
+                            &source,
+                            &format!(
+                                "erased_finally_arm_{mode}_{}_{}_{}_{}.py",
+                                prefix.len(),
+                                condition.len(),
+                                body.len(),
+                                suffix.len()
+                            ),
+                            &LEVELS,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn erased_coroutine_elif_chains_keep_each_return_donor() {
+    for prefix in ["", "    await operation()\n"] {
+        for compound in [false, true] {
+            for clauses in 1..=3 {
+                for suffix in ["", "        assert value\n"] {
+                    for otherwise in ["", "    else:\n        operation()\n"] {
+                        let mut source = format!(
+                            "async def sample(flag, other, value, operation):\n{prefix}    if flag:\n        value = operation()\n        assert value\n"
+                        );
+                        for index in 0..=clauses {
+                            let keyword = if index == 0 { "if" } else { "elif" };
+                            let condition = if compound && index < clauses {
+                                format!("other and value == {index}")
+                            } else {
+                                "other".to_owned()
+                            };
+                            writeln!(
+                                source,
+                                "        {keyword} {condition}:\n            assert value"
+                            )
+                            .unwrap();
+                        }
+                        source.push_str(suffix);
+                        source.push_str(otherwise);
+                        assert_matches_cpython(
+                            &source,
+                            &format!(
+                                "erased_coroutine_elifs_{}_{}_{}_{}_{}.py",
+                                prefix.len(),
+                                compound,
+                                clauses,
+                                suffix.len(),
+                                otherwise.len()
+                            ),
+                            &LEVELS,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn completed_coroutine_calls_keep_false_returns_before_erased_assertions() {
+    for prefix in ["", "    await operation()\n"] {
+        for awaited in ["", "await "] {
+            for argument in [
+                "",
+                "other or ''",
+                "left if other else right",
+                "dict(value=other or '')",
+            ] {
+                for condition in ["other", "other == 'ready'"] {
+                    for suffix in ["", "        assert other\n"] {
+                        for first in ["        operation()\n", "        assert flag\n"] {
+                            for swap in [false, true] {
+                                let completed = format!(
+                                    "        if {condition}:\n            {awaited}operation({argument})\n{suffix}"
+                                );
+                                let (first, second) = if swap {
+                                    (completed.as_str(), first)
+                                } else {
+                                    (first, completed.as_str())
+                                };
+                                let source = format!(
+                                    "async def sample(flag, other, left, right, operation):\n{prefix}    if flag:\n{first}    else:\n{second}"
+                                );
+                                assert_matches_cpython(
+                                    &source,
+                                    &format!(
+                                        "completed_coroutine_calls_{}_{}_{}_{}_{}_{}_{}.py",
+                                        prefix.len(),
+                                        awaited.len(),
+                                        argument.len(),
+                                        condition.len(),
+                                        suffix.len(),
+                                        first.len(),
+                                        swap
+                                    ),
+                                    &LEVELS,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn erased_nested_boolean_arms_preserve_resumable_footer_order() {
+    for (mode, (scope, prefix)) in [
+        ("def", ""),
+        ("async def", ""),
+        ("async def", "    await operation()\n"),
+        ("def", "    yield operation()\n"),
+        ("async def", "    yield operation()\n"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (condition_index, condition) in [
+            "outer is not None and (not flag or left != right)",
+            "outer and (flag or left)",
+            "outer and (flag or (left and right))",
+            "outer and ((flag and left) or right)",
+            "outer and (flag or left) and right",
+            "(outer and flag) or (left and right)",
+            "outer and (flag and left != right)",
+            "outer and not (flag and left != right)",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for (body_index, body) in ["assert outer", "pass", "operation()"]
+                .into_iter()
+                .enumerate()
+            {
+                let source = format!(
+                    "{scope} sample(outer, flag, left, right, operation):\n{prefix}    if {condition}:\n        {body}\n"
+                );
+                assert_matches_cpython(
+                    &source,
+                    &format!("nested_boolean_footer_{mode}_{condition_index}_{body_index}.py"),
+                    &LEVELS,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn normal_finally_loop_exit_preserves_manager_owner() {
+    for scope in ["def", "async def"] {
+        for managers in ["manager", "manager as first, other as second"] {
+            for condition in ["flag", "check()", "all(item.ready() for item in items)"] {
+                for surrounding in [false, true] {
+                    let body = if surrounding {
+                        "            operation()\n"
+                    } else {
+                        "            try:\n                operation()\n            except Error:\n                result = check() is None\n"
+                    };
+                    for suffix in ["", "            operation()\n"] {
+                        let source = format!(
+                            "{scope} sample(flag, items):\n    with {managers}:\n        try:\n{body}        finally:\n            while True:\n                if {condition}:\n                    break\n{suffix}"
+                        );
+                        if condition == "check()" {
+                            assert_matches_cpython(
+                                &source,
+                                "normal_finally_loop_owner.py",
+                                &LEVELS,
+                            );
+                        } else {
+                            assert_matches_cpython_versions(
+                                &source,
+                                "normal_finally_loop_owner.py",
+                                &LEVELS,
+                                &[PythonVersion::Py315],
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn conditional_finally_awaits_preserve_erased_assertion_exits() {
+    for prefix in [
+        "",
+        "    await operation()\n",
+        "    def capture():\n        return flag, items, operation\n",
+    ] {
+        for protected in [
+            "        await operation()\n",
+            "        if other:\n            await operation()\n",
+        ] {
+            for condition in ["flag", "flag is None"] {
+                for body in [
+                    "            await operation()\n",
+                    "            for item in items:\n                await operation(item)\n",
+                    "            await operation()\n            for item in items:\n                await operation(item)\n",
+                ] {
+                    for suffix in ["", "        assert flag\n"] {
+                        for otherwise in [
+                            "",
+                            "        else:\n            for item in items:\n                await operation(item)\n",
+                        ] {
+                            let source = format!(
+                                "async def sample(flag, other, items, operation):\n{prefix}    try:\n{protected}    finally:\n        if {condition}:\n{body}{otherwise}{suffix}"
+                            );
+                            assert_matches_cpython(
+                                &source,
+                                &format!(
+                                    "conditional_finally_awaits_{}_{}_{}_{}_{}_{}.py",
+                                    prefix.len(),
+                                    protected.len(),
+                                    condition.len(),
+                                    body.len(),
+                                    suffix.len(),
+                                    otherwise.len()
+                                ),
+                                &LEVELS,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn protected_forward_join_keeps_async_manager_continuation() {
+    for (scope, work) in [
+        ("def", "operation()"),
+        ("async def", "operation()"),
+        ("async def", "await operation()"),
+    ] {
+        for continuation in ["call", "with", "async with"] {
+            if scope == "def" && continuation == "async with" {
+                continue;
+            }
+            for prefix in ["", "            if flag:\n                assert False\n"] {
+                for extra_elif in [
+                    "",
+                    "            elif other == 1:\n                assert False\n",
+                ] {
+                    for live_else in [false, true] {
+                        for suffix in ["", "        operation()\n"] {
+                            let otherwise = if live_else {
+                                format!(
+                                    "            else:\n                with manager:\n                    {work}\n"
+                                )
+                            } else {
+                                String::new()
+                            };
+                            let following = if continuation == "call" {
+                                format!("            {work}\n")
+                            } else {
+                                format!(
+                                    "            {continuation} manager:\n                if flag:\n                    assert False\n"
+                                )
+                            };
+                            let source = format!(
+                                "{scope} sample(manager, operation, flag, other):\n    with manager:\n        try:\n{prefix}            if other is None:\n                assert False\n            elif flag:\n                assert False\n{extra_elif}{otherwise}{following}        finally:\n            {work}\n{suffix}"
+                            );
+                            let filename = format!(
+                                "forward_continuation_{scope}_{continuation}_{live_else}_{}_{}_{}.py",
+                                prefix.is_empty(),
+                                extra_elif.is_empty(),
+                                suffix.is_empty()
+                            );
+                            assert_matches_cpython(&source, &filename, &LEVELS);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn protected_forward_join_keeps_repeated_predecessors() {
+    for (scope, work) in [
+        ("def", "operation()"),
+        ("async def", "operation()"),
+        ("async def", "await operation()"),
+    ] {
+        for manager in ["with", "async with"] {
+            if scope == "def" && manager == "async with" {
+                continue;
+            }
+            for prefix in ["", "            if flag:\n                assert False\n"] {
+                for condition in ["other", "other is None", "other == 1"] {
+                    for managed in [false, true] {
+                        for suffix in ["", "        operation()\n"] {
+                            let body = if managed {
+                                format!(
+                                    "                with manager:\n                    {work}\n"
+                                )
+                            } else {
+                                format!("                {work}\n")
+                            };
+                            let source = format!(
+                                "{scope} sample(manager, operation, flag, other):\n    {manager} manager:\n        try:\n{prefix}            if {condition}:\n                assert False\n            else:\n{body}        finally:\n            {work}\n{suffix}"
+                            );
+                            let filename = format!(
+                                "protected_forward_{scope}_{manager}_{condition}_{managed}_{}_{}.py",
+                                prefix.is_empty(),
+                                suffix.is_empty()
+                            );
+                            assert_matches_cpython(&source, &filename, &LEVELS);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn nested_comparisons_preserve_erased_branch_scope_footer() {
+    for scope in ["def", "async def"] {
+        for prefix in ["", "    if flag:\n        assert False\n"] {
+            for outer in ["other", "other == 1", "other != 1"] {
+                for inner in [
+                    "value in items",
+                    "value not in items",
+                    "value == other",
+                    "value < other",
+                    "value.part in items.parts",
+                ] {
+                    for erased_prefix in ["", "        assert other\n"] {
+                        for suffix in ["", "    operation()\n"] {
+                            let source = format!(
+                                "{scope} sample(flag, other, value, items, operation):\n{prefix}    if {outer}:\n{erased_prefix}        if {inner}:\n            assert False\n        else:\n            assert False\n{suffix}"
+                            );
+                            let filename = format!(
+                                "nested_comparison_{scope}_{outer}_{inner}_{}_{}_{}.py",
+                                prefix.is_empty(),
+                                erased_prefix.is_empty(),
+                                suffix.is_empty()
+                            );
+                            assert_matches_cpython(&source, &filename, &LEVELS);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn coroutine_assignment_before_erased_else_keeps_original_scope_footer() {
+    for prefix in [
+        "",
+        "    if flag:\n        assert False\n",
+        "    if flag:\n        await operation()\n",
+    ] {
+        for condition in ["other", "not other", "other == 1"] {
+            for arm_prefix in [
+                "",
+                "        value = await operation()\n",
+                "        value = operation() if flag else other\n",
+            ] {
+                for value in [
+                    "operation()",
+                    "await operation()",
+                    "operation() if flag else other",
+                ] {
+                    for tail in ["", "        assert value\n"] {
+                        for suffix in ["", "    operation()\n"] {
+                            let source = format!(
+                                "async def sample(flag, other, operation):\n{prefix}    if {condition}:\n{arm_prefix}        value = {value}\n{tail}    else:\n        assert False\n{suffix}"
+                            );
+                            assert_matches_cpython(
+                                &source,
+                                "coroutine_assignment_footer.py",
+                                &LEVELS,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn synchronous_manager_guards_keep_original_scope_footer() {
+    for (scope, work) in [
+        ("def", "operation()"),
+        ("async def", "operation()"),
+        ("async def", "await operation()"),
+    ] {
+        for prefix in [
+            "",
+            "    if flag:\n        assert False\n",
+            "    if flag:\n        operation()\n",
+        ] {
+            for condition in ["other", "not other"] {
+                for managers in ["manager", "make_manager()", "manager, other_manager"] {
+                    for body in [
+                        format!("            {work}\n"),
+                        format!("            if flag:\n                {work}\n"),
+                    ] {
+                        for suffix in ["", "    operation()\n"] {
+                            let source = format!(
+                                "{scope} sample(flag, other, manager, other_manager, operation):\n{prefix}    if {condition}:\n        with {managers}:\n{body}{suffix}"
+                            );
+                            assert_matches_cpython(
+                                &source,
+                                "synchronous_manager_footer.py",
+                                &LEVELS,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn iterator_guard_prefixes_preserve_footer_before_erased_assertion() {
+    for prefix in [
+        "        assert False\n",
+        "        values = [item for item in items if item]\n        assert False\n",
+        "        if flag:\n            operation()\n",
+        "        with manager:\n            operation()\n",
+        "        try:\n            operation()\n        finally:\n            operation()\n",
+    ] {
+        for startup in [
+            "",
+            "    if flag:\n        assert False\n",
+            "    if flag:\n        operation()\n    else:\n        if other:\n            assert False\n",
+        ] {
+            for body in [
+                "            if flag:\n                assert False\n",
+                "            if flag:\n                assert False\n            else:\n                assert False\n",
+                "            operation(item)\n",
+            ] {
+                for suffix in ["    assert False\n", "    assert False\n    operation()\n"] {
+                    let source = format!(
+                        "def sample(flag, other, items, operation, manager):\n{startup}    if other:\n{prefix}        for item in items:\n{body}{suffix}"
+                    );
+                    assert_matches_cpython(&source, "iterator_guard_prefix_footer.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn erased_assertion_after_iterator_guard_keeps_scope_footer() {
+    for prefix in [
+        "",
+        "    if flag:\n        assert False\n",
+        "    operation()\n",
+    ] {
+        for iterator in ["items", "obj.items"] {
+            for body in [
+                "            assert False\n",
+                "            if flag:\n                assert False\n",
+                "            operation(item)\n",
+            ] {
+                for suffix in [
+                    "",
+                    "    assert False\n",
+                    "    assert False\n    operation()\n",
+                ] {
+                    let source = format!(
+                        "def sample(flag, other, items, obj, operation):\n{prefix}    if other:\n        for item in {iterator}:\n{body}{suffix}"
+                    );
+                    assert_matches_cpython(&source, "erased_iterator_guard_suffix.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn erased_assertion_after_iterator_guard_preserves_loop_exits() {
+    for prefix in ["", "    if flag:\n        assert False\n"] {
+        for body in [
+            "            if flag:\n                break\n",
+            "            if flag:\n                continue\n",
+            "            if flag:\n                return item\n",
+            "            operation(item)\n        else:\n            operation()\n",
+            "            try:\n                operation(item)\n            finally:\n                operation()\n",
+            "            with manager:\n                operation(item)\n",
+        ] {
+            for suffix in [
+                "",
+                "    assert False\n",
+                "    assert False\n    operation()\n",
+            ] {
+                let source = format!(
+                    "def sample(flag, other, items, operation, manager):\n{prefix}    if other:\n        for item in items:\n{body}{suffix}"
+                );
+                assert_matches_cpython(&source, "erased_iterator_guard_exits.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn erased_branch_preserves_nonadjacent_cleanup_jump_location() {
+    for (scope, startup, cleanup) in [
+        ("def", "", "cleanup()"),
+        ("async def", "", "cleanup()"),
+        ("async def", "", "await cleanup()"),
+        ("def", "    yield 0\n", "cleanup()"),
+        ("async def", "    yield 0\n", "cleanup()"),
+    ] {
+        for condition in ["flag", "flag is not None"] {
+            for prefix in ["assert False", "operation()"] {
+                for body in ["assert False", "pass"] {
+                    for alternative in ["operation()", "operation.method()"] {
+                        let source = format!(
+                            "{scope} sample(flag, other, operation, cleanup):\n{startup}    try:\n        if {condition}:\n            {prefix}\n        if other:\n            {body}\n        else:\n            {alternative}\n    finally:\n        {cleanup}\n"
+                        );
+                        assert_matches_cpython(&source, "nonadjacent_cleanup_jump.py", &LEVELS);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn erased_nested_call_tail_preserves_shared_scope_footer() {
+    for scope in ["def", "async def"] {
+        for condition in ["flag", "flag == 1"] {
+            for prefix in ["assert False", "operation()"] {
+                for work in ["operation()", "operation.method()"] {
+                    for tail in ["assert False", "pass"] {
+                        for suffix in ["", "    operation()\n"] {
+                            let source = format!(
+                                "{scope} sample(flag, other, operation):\n    if {condition}:\n        {prefix}\n    if other:\n        if {condition}:\n            {work}\n        {tail}\n{suffix}"
+                            );
+                            assert_matches_cpython(&source, "erased_nested_call_tail.py", &LEVELS);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn paired_coroutine_manager_returns_keep_locations_before_erased_assertions() {
+    for (mode, (scope, manager_await, other_await)) in [
+        ("def", "", ""),
+        ("async def", "", ""),
+        ("async def", "await ", ""),
+        ("async def", "", "await "),
+        ("async def", "await ", "await "),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for condition in ["inner", "inner is None"] {
+            for target in ["", " as resource"] {
+                for swap in [false, true] {
+                    for suffix in ["", "        assert outer\n"] {
+                        for argument in ["", "[operation(item) for item in items]"] {
+                            let prefix = if argument.is_empty() {
+                                String::new()
+                            } else {
+                                format!(
+                                    "        previous = {other_await}operation()\n        assert previous\n"
+                                )
+                            };
+                            let managed = format!(
+                                "            with manager(){target}:\n                {manager_await}operation()\n"
+                            );
+                            let other = format!(
+                                "            value = {other_await}operation({argument})\n            assert value\n"
+                            );
+                            let (first, second) = if swap {
+                                (&other, &managed)
+                            } else {
+                                (&managed, &other)
+                            };
+                            let source = format!(
+                                "{scope} sample(outer, inner, manager, operation, items):\n    if outer:\n{prefix}        if {condition}:\n{first}        else:\n{second}{suffix}"
+                            );
+                            assert_matches_cpython(
+                                &source,
+                                &format!(
+                                    "paired_manager_{mode}_{swap}_{}_{}_{}_{}.py",
+                                    condition == "inner",
+                                    target.is_empty(),
+                                    suffix.is_empty(),
+                                    argument.is_empty()
+                                ),
+                                &LEVELS,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn erased_finally_allows_manager_suppression_return_copy() {
+    for (scope, operation) in [
+        ("def", "operation()"),
+        ("def", "yield"),
+        ("async def", "await operation()"),
+        ("async def", "yield"),
+    ] {
+        for managers in ["manager", "manager as first, other as second"] {
+            for cleanup in ["assert flag", "pass", "if False:\n            operation()"] {
+                let source = format!(
+                    "{scope} sample():\n    try:\n        with {managers}:\n            {operation}\n    finally:\n        {cleanup}\n"
+                );
+                assert_matches_cpython_versions(
+                    &source,
+                    "erased_finally_manager.py",
+                    &LEVELS,
+                    &[PythonVersion::Py314, PythonVersion::Py315],
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn protected_conditional_store_raise_repeats_small_exit_copying() {
+    for (scope, entry) in [
+        ("def", "operation()"),
+        ("def", "yield"),
+        ("async def", "await operation()"),
+    ] {
+        for binding in ["", " as error"] {
+            for value in ["1", "value", "operation()"] {
+                let source = format!(
+                    "{scope} sample(value):\n    try:\n        {entry}\n    except Error{binding}:\n        result = {value} if 0 <= value < 10 else 2\n        raise\n"
+                );
+                assert_matches_cpython(&source, "protected_conditional_store_raise.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn paired_finally_returns_keep_locations_before_erased_assertions() {
+    for (scope, prefix) in [
+        ("def", ""),
+        ("async def", ""),
+        ("def", "    yield 0\n"),
+        ("async def", "    yield 0\n"),
+    ] {
+        for condition in ["flag", "flag is None"] {
+            for depth in 1..=3 {
+                for suffix in ["", "assert flag\n"] {
+                    let mut body = format!(
+                        "if {condition}:\n    operation.first()\nelse:\n    operation.other_branch()\n{suffix}"
+                    );
+                    for _ in 0..depth {
+                        let mut protected = String::from("try:\n    operation()\nfinally:\n");
+                        for line in body.lines() {
+                            writeln!(protected, "    {line}").unwrap();
+                        }
+                        body = protected;
+                    }
+                    let mut source = format!("{scope} sample(flag, operation):\n{prefix}");
+                    for line in body.lines() {
+                        writeln!(source, "    {line}").unwrap();
+                    }
+                    assert_matches_cpython(&source, "paired_finally_return_locations.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn paired_coroutine_returns_keep_locations_before_erased_assertions() {
+    for scope in ["def", "async def"] {
+        for condition in ["inner", "inner is None", "inner or outer"] {
+            for prefix in ["", "        value = operation()\n        assert value\n"] {
+                for first in ["", "            assert inner\n"] {
+                    for second in ["", "            assert outer\n"] {
+                        for suffix in ["", "        assert outer\n"] {
+                            let source = format!(
+                                "{scope} sample(outer, inner, operation):\n    if outer:\n        operation()\n    else:\n{prefix}        if {condition}:\n            operation.first()\n{first}        else:\n            operation.other_branch()\n{second}{suffix}"
+                            );
+                            assert_matches_cpython_versions(
+                                &source,
+                                "paired_coroutine_return_locations.py",
+                                &LEVELS,
+                                &[PythonVersion::Py313],
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn erased_assertions_inside_nested_coroutine_branches_preserve_exits() {
+    for scope in ["def", "async def"] {
+        let awaited = if scope == "async def" { "await " } else { "" };
+        for prefix in [
+            String::new(),
+            format!("        result = {awaited}operation()\n"),
+        ] {
+            for condition in ["other", "other and flag", "other or flag"] {
+                for body in [
+                    "            value = operation()\n            assert other\n",
+                    "            value = operation()\n            assert other\n            value = operation.value\n",
+                    "            value = list(item for item in items)\n            assert other\n            value = operation.value\n            assert flag\n",
+                ] {
+                    let source = format!(
+                        "{scope} sample(flag, other, operation, items):\n    if flag:\n        operation()\n    else:\n{prefix}        if {condition}:\n{body}        assert flag\n"
+                    );
+                    assert_matches_cpython_versions(
+                        &source,
+                        "nested_coroutine_erased_assertions.py",
+                        &LEVELS,
+                        &[PythonVersion::Py313],
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn copied_bare_return_preserves_finalizer_none_owner() {
+    for managers in ["manager", "manager, other"] {
+        for loop_body in [false, true] {
+            let (loop_header, indent) = if loop_body {
+                ("            while True:\n", "    ")
+            } else {
+                ("", "")
+            };
+            for leading_call in [false, true] {
+                let prefix = if leading_call {
+                    format!("                {indent}operation()\n")
+                } else {
+                    String::new()
+                };
+                for (condition_index, condition) in [
+                    "obj is not None",
+                    "obj is not None and obj.ready() is None",
+                    "obj is None or obj.ready() is not None",
+                    "obj.value",
+                    "not obj.value",
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let source = format!(
+                        "def sample(manager, other, obj, flag):\n    with {managers}:\n        try:\n{loop_header}            {indent}if flag:\n{prefix}                {indent}return\n            {indent}wait()\n        except BaseException:\n            raise\n        finally:\n            if {condition}:\n                notify()\n"
+                    );
+                    let filename = format!(
+                        "copied_bare_finalizer_none_{}_{loop_body}_{leading_call}_{condition_index}.py",
+                        managers.len()
+                    );
+                    assert_matches_cpython_versions(
+                        &source,
+                        &filename,
+                        &LEVELS,
+                        &[PythonVersion::Py314, PythonVersion::Py315],
+                    );
+                    if !loop_body && condition_index != 1 {
+                        let call_return = source.replace("return\n", "return produce(obj)\n");
+                        assert_matches_cpython_versions(
+                            &call_return,
+                            &format!("call_{filename}"),
+                            &LEVELS,
+                            &[PythonVersion::Py314, PythonVersion::Py315],
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn terminal_with_condition_after_recovery_preserves_fresh_owner() {
+    for condition in [
+        "obj.value",
+        "flag",
+        "predicate()",
+        "obj.value is None",
+        "flag and obj.value",
+    ] {
+        for body in ["pass", "operation()"] {
+            for cleanup in ["pass", "finish()"] {
+                for handler in [
+                    "",
+                    "    except (ValueError, TypeError) as error:\n        pass\n",
+                ] {
+                    let source = format!(
+                        "def sample(manager, obj, flag):\n    try:\n        with manager:\n            try:\n                {body}\n            except BaseException as error:\n                raise\n            if {condition}:\n                raise RuntimeError\n{handler}    finally:\n        {cleanup}\n"
+                    );
+                    assert_matches_cpython_versions(
+                        &source,
+                        "terminal_with_recovery.py",
+                        &LEVELS,
+                        &[PythonVersion::Py314, PythonVersion::Py315],
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn normal_finally_receiver_none_preserves_async_manager_owner() {
+    for asynchronous in [false, true] {
+        let (header, manager, awaited) = if asynchronous {
+            ("async def", "async with", "await ")
+        } else {
+            ("def", "with", "")
+        };
+        for receiver in ["obj.value", "obj.value()"] {
+            for comparison in ["is", "is not"] {
+                for captured in [false, true] {
+                    let closure = if captured {
+                        "    def retain():\n        return obj\n"
+                    } else {
+                        ""
+                    };
+                    let source = format!(
+                        "{header} sample(manager, obj):\n{closure}    {manager} manager:\n        try:\n            if {awaited}obj.run():\n                raise RuntimeError\n        finally:\n            if {receiver} {comparison} None:\n                {awaited}obj.wait()\n"
+                    );
+                    assert_matches_cpython_versions(
+                        &source,
+                        "normal_finally_receiver_none.py",
+                        &LEVELS,
+                        &[PythonVersion::Py314, PythonVersion::Py315],
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn protected_conditional_await_keeps_exits_before_erased_assertions() {
+    for prefix in ["", "    await operation()\n"] {
+        for condition in [
+            "flag",
+            "flag and other",
+            "flag or other",
+            "flag and not (other and third)",
+        ] {
+            for assigned in ["", "value = "] {
+                for suffix in ["", "        assert flag\n"] {
+                    let source = format!(
+                        "async def sample(flag, other, third, operation):\n{prefix}    try:\n        if {condition}:\n            {assigned}await operation()\n{suffix}    except RuntimeError:\n        raise\n"
+                    );
+                    assert_matches_cpython_versions(
+                        &source,
+                        "protected_conditional_await.py",
+                        &LEVELS,
+                        &[PythonVersion::Py313],
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn nested_coroutine_guards_preserve_erased_tail_footer() {
+    for scope in ["def", "async def"] {
+        for outer in [
+            "flag",
+            "flag and other",
+            "flag or other",
+            "flag is None and other == 1",
+        ] {
+            for inner in ["if other", "if other == 1"] {
+                for work in ["value = 1", "operation()"] {
+                    for tail in ["assert False", "pass"] {
+                        for suffix in ["", "    operation()\n"] {
+                            let source = format!(
+                                "{scope} sample(flag, other, operation):\n    if {outer}:\n        {inner}:\n            {work}\n        {tail}\n{suffix}"
+                            );
+                            assert_matches_cpython(&source, "nested_coroutine_footer.py", &LEVELS);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn nested_coroutine_loops_preserve_erased_tail_footer_312() {
+    for scope in ["def", "async def"] {
+        for outer in ["flag", "flag and other"] {
+            for work in ["value = 1", "operation()"] {
+                for tail in ["assert False", "pass"] {
+                    for suffix in ["", "    operation()\n"] {
+                        let source = format!(
+                            "{scope} sample(flag, other, operation):\n    if {outer}:\n        while other:\n            {work}\n        {tail}\n{suffix}"
+                        );
+                        assert_matches_cpython_versions(
+                            &source,
+                            "nested_coroutine_loop_footer.py",
+                            &LEVELS,
+                            &[PythonVersion::Py312],
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn pruned_annotation_constants_preserve_repeated_return_witnesses() {
+    for scope in ["def", "async def"] {
+        for future in ["", "from __future__ import annotations\n"] {
+            for docstring in ["", "    \"\"\"Summary.\"\"\"\n"] {
+                for annotation in ["", " -> object"] {
+                    let source = format!(
+                        "{future}{scope} sample(flag, other):\n{docstring}    def nested(){annotation}:\n        pass\n    if flag:\n        if other:\n            assert False\n    elif other:\n        assert False\n    if flag:\n        assert False\n    else:\n        assert False\n"
+                    );
+                    assert_matches_cpython(&source, "pruned_return_witness.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn nested_call_guards_preserve_shared_scope_footer() {
+    for scope in ["def", "async def"] {
+        for prefix in ["", "    with manager:\n        operation()\n"] {
+            for (condition, inner) in [("flag", "other"), ("flag is None", "other == 'value'")] {
+                for erased in ["assert False", "operation()"] {
+                    for suffix in ["", "    operation()\n"] {
+                        let source = format!(
+                            "{scope} sample(manager, flag, other, operation):\n{prefix}    if {condition}:\n        operation()\n    else:\n        if other:\n            {erased}\n        if {inner}:\n            operation()\n{suffix}"
+                        );
+                        assert_matches_cpython(&source, "nested_call_footer.py", &LEVELS);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn local_annotated_conditional_stores_preserve_branch_exit_copying() {
+    for scope in ["def", "async def"] {
+        for annotation in ["", ": object"] {
+            for suffix in ["", "        assert value\n"] {
+                let source = format!(
+                    "{scope} sample(inner, flag):\n    if inner:\n        value{annotation} = 1 if flag else 2\n{suffix}    else:\n        assert flag\n"
+                );
+                assert_matches_cpython(&source, "annotated_conditional_store.py", &LEVELS);
+            }
+        }
+    }
+    let source = "async def sample(outer, inner, flag, operation):\n    await operation()\n    if outer is None:\n        assert flag\n    else:\n        if inner:\n            value: object = (\n                1 if flag else 2\n            )\n            assert value\n        else:\n            assert flag\n";
+    assert_matches_cpython(source, "nested_annotated_conditional_store.py", &LEVELS);
+}
+
+#[test]
+fn iterator_try_return_counts_original_pop_block() {
+    for scope in ["def", "async def"] {
+        for value in [
+            "0 <= operation(value) <= 10",
+            "first if flag else second",
+            "first or second",
+            "value",
+            "False",
+        ] {
+            let source = format!(
+                "{scope} sample(items, operation, flag, first, second):\n\
+                 \x20   for value in items:\n\
+                 \x20       try:\n\
+                 \x20           return {value}\n\
+                 \x20       except ValueError:\n\
+                 \x20           return False\n\
+                 \x20   return False\n"
+            );
+            assert_matches_cpython(&source, "iterator_try_return.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
+fn normal_finally_conditional_entry_preserves_nested_setup_marker() {
+    for (name, body) in [
+        ("assert", "assert condition"),
+        ("assert_not", "assert not condition"),
+        ("assert_message", "assert condition, 'missing'"),
+        (
+            "assert_multiple",
+            "assert condition\n            assert other",
+        ),
+        (
+            "raise",
+            "if not condition:\n                raise RuntimeError",
+        ),
+        ("call", "operation()"),
+    ] {
+        let source = format!(
+            "def sample(manager, obj, condition, other):\n    with manager:\n        try:\n            {body}\n        finally:\n            try:\n                if obj.value:\n                    operation()\n            finally:\n                if obj.value:\n                    operation()\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            &format!("normal_finally_conditional_{name}.py"),
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
+fn normal_finally_method_none_owner_preserves_cell_receiver() {
+    let source = "def sample():\n    with manager:\n        try:\n            pass\n        except RuntimeError:\n            pass\n        obj = make([1, 2, a(), 3, b(), c(), d(), e(), f()], x=g, y=h)\n        def retain():\n            return obj\n        try:\n            result = obj.wait()\n        finally:\n            if obj.poll() is None:\n                obj.stop()\n        finish(result)\n";
+    assert_matches_cpython_versions(
+        source,
+        "normal_finally_cell_method_none.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
+fn erased_branch_chain_suffix_preserves_loop_tail_polarity() {
+    assert_matches_cpython(
+        include_str!("fixtures/erased_branch_chain_loop_tail.py"),
+        "erased_branch_chain_loop_tail.py",
+        &LEVELS,
+    );
+}
+
+#[test]
+fn erased_module_comprehension_cells_precede_synthetic_annotations() {
+    for future in ["", "from __future__ import annotations\n"] {
+        for annotation in ["value: int\n", "if flag:\n    value: int\n"] {
+            for body in [
+                "assert [(lambda: item) for item in items]\n",
+                "assert [(lambda: z) for z in items]\nassert [(lambda: a) for a in items]\n",
+                "out = [(lambda: z) for z in items]\nassert [(lambda: a) for a in items]\n",
+                "assert [(lambda: z) for z in items]\nout = [(lambda: a) for a in items]\n",
+            ] {
+                assert_matches_cpython(
+                    &format!("{future}{annotation}{body}"),
+                    "erased_module_cells.py",
+                    &LEVELS,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn copied_finally_scope_footers_keep_repeated_predecessor_counts() {
+    let source = include_str!("fixtures/copied_finally_scope_footer.py");
+    for source in [
+        source.to_owned(),
+        source.replace("assert other", "action()"),
+        source.replace("assert flag", "action()"),
+    ] {
+        assert_matches_cpython(&source, "copied_finally_scope_footer.py", &LEVELS);
+    }
+}
+
+#[test]
+fn erased_assertions_preserve_normal_finally_multiple_call_exits() {
+    for (scope, prefix) in [
+        ("def", ""),
+        ("async def", ""),
+        ("def", "    yield 0\n"),
+        ("async def", "    yield 0\n"),
+    ] {
+        for condition in ["predicate()", "flag and other"] {
+            for count in 1..=4 {
+                for separator in ["\n            ", "; "] {
+                    let calls = (0..count)
+                        .map(|index| format!("consume({index})"))
+                        .collect::<Vec<_>>()
+                        .join(separator);
+                    let source = format!(
+                        "{scope} f(flag, other):\n{prefix}    try:\n        consume()\n    finally:\n        if {condition}:\n            {calls}\n        assert other\n"
+                    );
+                    assert_matches_cpython(&source, "normal_finally_calls.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn conjunctions_preserve_original_ordinary_await_footer() {
+    for prefix in [
+        "",
+        "    if other:\n        assert other\n",
+        "    if other:\n        consume(other)\n",
+        "    with manager:\n        consume(other)\n    if other:\n        assert other\n",
+    ] {
+        for leaf in [
+            "        await consume(flag)\n",
+            "        value = flag\n        await consume(value)\n",
+            "        await consume(other)\n        await consume(flag)\n",
+            "        consume(other)\n        await consume(flag)\n",
+        ] {
+            for condition in [
+                "flag and other",
+                "flag and other and third",
+                "flag is None and other",
+                "flag and other is None",
+            ] {
+                let source = format!(
+                    "async def f(flag, other, third, manager):\n{prefix}    if {condition}:\n{leaf}        assert third\n    assert third\n"
+                );
+                assert_matches_cpython(&source, "conjunction_await_footer.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn erased_guard_preserves_managed_await_footer() {
+    for prefix in ["", "    if flag:\n        assert False\n"] {
+        for condition in ["flag", "not flag", "flag and other"] {
+            for manager in ["manager", "manager()", "manager as value"] {
+                for suffix in ["", "    assert False\n"] {
+                    let source = format!(
+                        "async def sample(flag, other, manager, operation):\n{prefix}    if {condition}:\n        with {manager}:\n            await operation()\n{suffix}"
+                    );
+                    assert_matches_cpython(&source, "managed_await_footer.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn nested_guards_preserve_erased_iterator_footer() {
+    for scope in ["def", "async def"] {
+        for prefix in ["", "    if flag:\n        assert False\n"] {
+            for condition in ["other", "other is True", "other == 'value'"] {
+                for iterable in ["items", "(1, 2, 3)"] {
+                    for depth in [1, 2] {
+                        let nested = "    ".repeat(depth);
+                        let mut source =
+                            format!("{scope} sample(flag, other, items):\n{prefix}    if flag:\n");
+                        for level in 0..depth {
+                            writeln!(source, "{}if {condition}:", "    ".repeat(level + 2))
+                                .unwrap();
+                        }
+                        write!(source, "{nested}        for item in {iterable}:\n{nested}            assert False\n").unwrap();
+                        assert_matches_cpython(&source, "nested_iterator_footer.py", &LEVELS);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn erased_branches_preserve_manager_cleanup_predecessors() {
+    for (scope, manager) in [
+        ("async def", "async with manager"),
+        ("def", "with manager"),
+        ("async def", "with manager"),
+    ] {
+        for prefix in ["", "        if flag:\n            assert False\n"] {
+            for nested in [false, true] {
+                for suffix in ["", "        operation()\n"] {
+                    let mut source = format!(
+                        "{scope} sample(flag, other, manager, operation):\n    {manager}:\n{prefix}"
+                    );
+                    let indent = if nested {
+                        source.push_str("        if flag:\n            operation()\n        elif other:\n            assert False\n        else:\n");
+                        "            "
+                    } else {
+                        "        "
+                    };
+                    for condition in ["other", "other == 'value'"] {
+                        let source = format!(
+                            "{source}{indent}if flag:\n{indent}    assert False\n{indent}if {condition}:\n{indent}    assert False\n{indent}else:\n{indent}    assert False\n{suffix}"
+                        );
+                        assert_matches_cpython(&source, "erased_manager_predecessors.py", &LEVELS);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn erased_try_guards_preserve_finalizer_manager_cleanup() {
+    for scope in ["def", "async def"] {
+        for managers in ["manager", "manager, other, third"] {
+            for condition in ["flag", "condition()", "flag == 'value'"] {
+                for cleanup in ["cleanup()", "cleanup.close()"] {
+                    let source = format!(
+                        "{scope} sample(manager, other, third, flag, condition, cleanup):\n    with {managers}:\n        try:\n            if {condition}:\n                assert False\n        finally:\n            {cleanup}\n"
+                    );
+                    assert_matches_cpython(&source, "erased_finalizer_manager.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn erased_try_body_retains_normal_finally_none_owner() {
+    for scope in ["def", "async def"] {
+        for prefix in [
+            "",
+            "        if flag:\n            consume(value)\n        else:\n            consume(other)\n",
+        ] {
+            for assertions in [
+                "            assert flag\n",
+                "            assert flag\n            assert other\n",
+            ] {
+                let source = format!(
+                    "{scope} f(value, flag, other):\n    with manager():\n{prefix}        try:\n{assertions}        finally:\n            if value is not None:\n                value.close()\n"
+                );
+                assert_matches_cpython(&source, "erased_try_none_owner.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn terminal_raises_preserve_original_conditional_footer() {
+    for scope in ["def", "async def"] {
+        for prefix in [
+            "",
+            "    if other:\n        assert other\n",
+            "    if other:\n        consume(other)\n",
+            "    with manager:\n        consume(other)\n    if other:\n        assert other\n",
+        ] {
+            for leaf in [
+                "raise ValueError(other)",
+                "raise error from other",
+                "raise error",
+                "raise",
+            ] {
+                for condition in ["not flag", "flag and other"] {
+                    let source = format!(
+                        "{scope} f(flag, other, error, manager):\n{prefix}    if {condition}:\n        {leaf}\n"
+                    );
+                    assert_matches_cpython(&source, "terminal_raise_footer.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn terminal_none_returns_preserve_original_conditional_footer() {
+    for scope in ["def", "async def"] {
+        for prefix in [
+            "",
+            "    if other:\n        assert other\n",
+            "    if other:\n        consume(other)\n",
+        ] {
+            for leaf in ["return", "return None"] {
+                for assertion in ["", "        assert flag\n"] {
+                    for condition in ["flag", "not flag", "flag is None", "consume(flag)"] {
+                        for suffix in ["", "    assert other\n", "    pass\n"] {
+                            let source = format!(
+                                "{scope} f(flag, other, consume):\n{prefix}    if {condition}:\n{assertion}        {leaf}\n{suffix}"
+                            );
+                            assert_matches_cpython(
+                                &source,
+                                "terminal_none_return_footer.py",
+                                &LEVELS,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn named_container_iterators_preserve_conditional_footer() {
+    for scope in ["def", "async def"] {
+        for prefix in ["", "    if other:\n        assert other\n"] {
+            for iterable in [
+                "(first, second, 'item')",
+                "[first, second, 'item']",
+                "(first,)",
+                "[first]",
+                "(first, (1, 2))",
+                "[first, (1, 2)]",
+            ] {
+                let source = format!(
+                    "{scope} f(flag, other, first, second):\n{prefix}    if flag != 3:\n        for item in {iterable}:\n            assert item\n"
+                );
+                assert_matches_cpython(&source, "named_container_iterator_footer.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn literal_iterators_keep_original_conditional_footer() {
+    for scope in ["def", "async def"] {
+        for prefix in [
+            "",
+            "    if other:\n        assert other\n",
+            "    if other:\n        consume(other)\n",
+            "    with manager:\n        consume(other)\n    if other:\n        assert other\n",
+        ] {
+            for iterable in ["(1, 2)", "()", "[1, 2]", "[]"] {
+                for leaf in ["assert value", "consume(value)"] {
+                    let source = format!(
+                        "{scope} f(flag, other, manager):\n{prefix}    if flag:\n        for value in {iterable}:\n            {leaf}\n"
+                    );
+                    assert_matches_cpython(&source, "literal_iterator_footer.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn erased_else_guards_preserve_original_paired_call_footer() {
+    for scope in ["def", "async def"] {
+        for prefix in [
+            "",
+            "    if other:\n        assert other\n",
+            "    if other:\n        consume(other)\n",
+            "    with manager:\n        consume(other)\n    if other:\n        assert other\n",
+        ] {
+            for (left, right) in [
+                ("consume(flag)\n", "consume(other)\n"),
+                ("value = flag\n", "value = other\n"),
+                (
+                    "obj.consume(flag)\n",
+                    "obj.consume(other)\nconsume(third)\n",
+                ),
+                (
+                    "value = flag\nconsume(value)\n",
+                    "value = other\nconsume(value)\n",
+                ),
+            ] {
+                for else_prefix in ["", "if third:\n    assert third\n"] {
+                    let mut source = format!(
+                        "{scope} f(flag, other, third, obj, manager):\n{prefix}    if flag:\n"
+                    );
+                    for line in left.lines() {
+                        writeln!(source, "        {line}").unwrap();
+                    }
+                    source.push_str("    else:\n");
+                    for line in format!("{else_prefix}{right}").lines() {
+                        writeln!(source, "        {line}").unwrap();
+                    }
+                    assert_matches_cpython(&source, "paired_call_footer.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn single_loop_origin_preserves_protected_finalizer_join() {
+    let indent = |source: &str| {
+        let mut result = String::new();
+        for line in source.lines() {
+            writeln!(result, "    {line}").unwrap();
+        }
+        result
+    };
+    for prefix in ["", "async "] {
+        for header in ["for item in items:", "while ready:"] {
+            for manager in ["none", "outer", "inner"] {
+                if !prefix.is_empty() && manager != "none" {
+                    continue;
+                }
+                for test in ["flag", "flag and value"] {
+                    let mut body = format!(
+                        "try:\n    if {test}:\n        assert value\n    else:\n        assert not value\nfinally:\n    callback()\n"
+                    );
+                    if manager == "inner" {
+                        body = format!("with manager:\n{}", indent(&body));
+                    }
+                    body = format!("{header}\n{}", indent(&body));
+                    if manager == "outer" {
+                        body = format!("with manager:\n{}", indent(&body));
+                    }
+                    let source = format!(
+                        "{prefix}def sample(flag, value, ready, items, manager, callback):\n{}",
+                        indent(&body)
+                    );
+                    assert_matches_cpython(&source, "single_loop_finalizer_join.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn pass_match_success_preserves_normal_try_fallthrough() {
+    for scope in ["def", "async def"] {
+        for prefix in ["", "with manager:\n    value = produce()\n"] {
+            for cases in [
+                "case 1:\n    consume(value)\ncase _:\n    consume(value)\n",
+                "case 1:\n    pass\ncase _:\n    consume(value)\n",
+                "case A():\n    consume(value)\ncase _:\n    consume(value)\n",
+                "case A():\n    pass\ncase _:\n    consume(value)\n",
+                "case A():\n    pass\ncase B() | C():\n    consume(value)\ncase _:\n    consume(value)\n",
+                "case A():\n    consume(value)\ncase B() | C():\n    consume(value)\ncase _:\n    consume(value)\n",
+                "case A():\n    pass\ncase B() | C():\n    consume(value)\ncase _:\n    obj.consume(value)\n",
+                "case A():\n    pass\ncase B() | C():\n    consume(value)\ncase _:\n    consume(value, mode=\"value\")\n",
+            ] {
+                for handler in ["consume(value)\n", "consume(value)\nraise\n"] {
+                    let mut source = format!("{scope} f(value, obj, manager):\n    try:\n");
+                    for line in prefix.lines() {
+                        writeln!(source, "        {line}").unwrap();
+                    }
+                    source.push_str("        match value:\n");
+                    for line in cases.lines() {
+                        writeln!(source, "            {line}").unwrap();
+                    }
+                    source.push_str("    except Exception:\n");
+                    for line in handler.lines() {
+                        writeln!(source, "        {line}").unwrap();
+                    }
+                    source.push_str("    consume(value)\n");
+                    assert_matches_cpython(&source, "pass_match_try.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn direct_manager_entry_preserves_elided_protected_join() {
+    for (prefix, manager_keyword) in [("", "with"), ("async ", "with"), ("async ", "async with")] {
+        for manager in ["manager", "open_manager(value)"] {
+            for test in ["flag", "flag and other"] {
+                for body in ["pass", "consume(value)"] {
+                    for guarded_cleanup in [false, true] {
+                        let cleanup = if prefix.is_empty() {
+                            "cleanup(value)"
+                        } else {
+                            "await cleanup(value)"
+                        };
+                        let cleanup = if guarded_cleanup {
+                            format!("        if other:\n            {cleanup}\n")
+                        } else {
+                            format!("        {cleanup}\n")
+                        };
+                        let source = format!(
+                            "{prefix}def sample(flag, value, other, manager):\n    try:\n        if {test}:\n            assert value\n        else:\n            assert not value\n        {manager_keyword} {manager}:\n            {body}\n    finally:\n{cleanup}"
+                        );
+                        assert_matches_cpython(&source, "direct_manager_entry_join.py", &LEVELS);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn manager_assignment_target_retains_its_protected_region() {
+    for (prefix, keyword) in [("", "with"), ("async ", "with"), ("async ", "async with")] {
+        for target in ["holder.value", "(holder if flag else alternate).value"] {
+            for finalizer in [false, true] {
+                let mut source = format!("{prefix}def sample(manager, holder, alternate, flag):\n");
+                let indent = if finalizer {
+                    source.push_str("    try:\n");
+                    "        "
+                } else {
+                    "    "
+                };
+                writeln!(source, "{indent}{keyword} manager as {target}:").unwrap();
+                writeln!(source, "{indent}    pass").unwrap();
+                if finalizer {
+                    source.push_str("    finally:\n        cleanup()\n");
+                }
+                assert_matches_cpython(&source, "manager_assignment_target.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn unmanaged_enclosing_finalizer_preserves_live_loop_join() {
+    for scope in ["def", "async def"] {
+        for header in ["for item in items:", "while ready:"] {
+            for condition in ["flag", "flag and value"] {
+                for successor in ["consume(value)", "value = other"] {
+                    let source = format!(
+                        "{scope} sample(flag, value, other, ready, items):\n    try:\n        {header}\n            if {condition}:\n                assert value\n            else:\n                assert not value\n            {successor}\n    finally:\n        cleanup(value)\n"
+                    );
+                    assert_matches_cpython(&source, "enclosing_finalizer_loop_join.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn terminal_async_break_preserves_normal_finally_borrow_boundary() {
+    let indent = |source: &str| {
+        let mut result = String::new();
+        for line in source.lines() {
+            writeln!(result, "    {line}").unwrap();
+        }
+        result
+    };
+    for (prefix_index, prefix) in [
+        "",
+        "break\n",
+        "return\n",
+        "if value:\n    continue\n",
+        "try:\n    await consume(item)\nexcept Other:\n    pass\n",
+        "try:\n    consume(item)\nexcept Other:\n    await recover(value)\n",
+        "if value:\n    return\n",
+        "continue\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (handler_index, handler) in [
+            "pass\n",
+            "await recover(value)\n",
+            "assert flag == value\nvalue = flag\n",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for (cleanup_index, cleanup) in [
+                "cleanup(value)\n",
+                "await cleanup(value)\n",
+                "cleanup(await resolve(value))\n",
+                "await cleanup(await resolve(value))\n",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let protected = format!(
+                    "async for item in source:\n{}",
+                    indent(&format!("{prefix}if flag:\n    break\n"))
+                );
+                let suite = format!(
+                    "try:\n{}except Exception:\n{}finally:\n{}finish(value)\n",
+                    indent(&protected),
+                    indent(handler),
+                    indent(cleanup)
+                );
+                assert_matches_cpython(
+                    &format!("async def f(value, source, flag):\n{}", indent(&suite)),
+                    &format!(
+                        "async_break_finally_{prefix_index}_{handler_index}_{cleanup_index}.py"
+                    ),
+                    &LEVELS,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn erased_assertions_preserve_normal_finally_conditional_exits() {
+    for (scope_index, (scope, prefix)) in [
+        ("def", ""),
+        ("async def", ""),
+        ("def", "    yield 0\n"),
+        ("async def", "    yield 0\n"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (shape_index, finalbody) in [
+            "if flag:\n    consume()\nassert third\n",
+            "if flag:\n    if other:\n        consume()\n    assert third\n",
+            "if flag:\n    value = other\n    consume(value)\n    if third:\n        consume()\n    assert other\n",
+            "value = other\nif flag:\n    value = third\n    consume(value)\n    if value is not None:\n        if flag and other:\n            consume()\n        assert third\n",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut source = format!(
+                "{scope} f(flag, other, third):\n{prefix}    try:\n        consume()\n    finally:\n"
+            );
+            for line in finalbody.lines() {
+                writeln!(source, "        {line}").unwrap();
+            }
+            assert_matches_cpython(
+                &source,
+                &format!("normal_finally_conditional_{scope_index}_{shape_index}.py"),
+                &LEVELS,
+            );
+        }
+    }
+}
+
+#[test]
+fn erased_else_preserves_original_linear_footer() {
+    for scope in ["def", "async def"] {
+        for prefix in [
+            "",
+            "    if other:\n        assert other\n",
+            "    if other:\n        consume(other)\n",
+            "    with manager:\n        consume(other)\n    if other:\n        assert other\n",
+        ] {
+            for leaf in [
+                "value = other",
+                "consume(other)",
+                "value = consume(other)",
+                "obj.value = other",
+            ] {
+                for suffix in ["", "    assert third\n"] {
+                    let source = format!(
+                        "{scope} f(flag, other, third, obj, manager):\n{prefix}    if flag:\n        {leaf}\n        assert third\n    else:\n        assert other\n{suffix}"
+                    );
+                    assert_matches_cpython(&source, "erased_else_linear_footer.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn erased_protected_arms_keep_finalizer_entry_before_nonterminal_control_flow() {
+    let indent = |source: &str| {
+        let mut result = String::new();
+        for line in source.lines() {
+            writeln!(result, "    {line}").unwrap();
+        }
+        result
+    };
+    for prefix in ["", "async "] {
+        for first in [
+            "consume()",
+            "callback()",
+            "manager.release()",
+            "(lambda: None)()",
+            "await callback()",
+            "await value",
+        ] {
+            if prefix.is_empty() && first.starts_with("await ") {
+                continue;
+            }
+            for tail in [
+                "if value:\n    consume()\n",
+                "for item in items:\n    consume(item)\n",
+                "while value:\n    consume()\n    break\n",
+                "with manager:\n    consume()\n",
+                "try:\n    consume()\nexcept Exception:\n    consume()\n",
+            ] {
+                for test in ["flag", "flag and value"] {
+                    let finalizer = format!("{first}\n{tail}");
+                    let body = format!(
+                        "try:\n    if {test}:\n        assert value\n    else:\n        assert not value\nfinally:\n{}",
+                        indent(&finalizer)
+                    );
+                    let source = format!(
+                        "{prefix}def sample(flag, value, manager, items, callback):\n{}",
+                        indent(&body)
+                    );
+                    assert_matches_cpython(&source, "erased_finalizer_entry.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn ordinary_awaits_keep_original_scope_footer_after_erased_assertions() {
+    for prefix in [
+        "",
+        "    if other:\n        assert other\n",
+        "    if other:\n        consume(other)\n",
+        "    with manager:\n        consume(other)\n    if other:\n        assert other\n",
+    ] {
+        for leaf in [
+            "        await consume(flag)\n",
+            "        value = flag\n        await consume(value)\n",
+            "        await consume(other)\n        await consume(flag)\n",
+            "        consume(other)\n        await consume(flag)\n",
+        ] {
+            for (inner, outer) in [
+                ("", ""),
+                ("        assert third\n", ""),
+                ("", "    assert third\n"),
+                ("        assert third\n", "    assert third\n"),
+            ] {
+                let source = format!(
+                    "async def f(flag, other, third, manager):\n{prefix}    if flag:\n{leaf}{inner}{outer}"
+                );
+                assert_matches_cpython(&source, "ordinary_await_scope_footer.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn conjunction_assertions_preserve_original_call_footer() {
+    for scope in ["def", "async def"] {
+        for prefix in [
+            "",
+            "    if other:\n        assert other\n",
+            "    if other:\n        consume(other)\n",
+            "    with manager:\n        consume(other)\n    if other:\n        assert other\n",
+        ] {
+            for test in [
+                "flag and other",
+                "flag and other and third",
+                "flag is None and other",
+                "flag and other is None",
+            ] {
+                for leaf in [
+                    "        consume(flag)\n",
+                    "        value = flag\n        consume(value)\n",
+                ] {
+                    let source = format!(
+                        "{scope} f(flag, other, third, manager):\n{prefix}    if {test}:\n{leaf}        assert third\n    assert third\n"
+                    );
+                    assert_matches_cpython(&source, "conjunction_call_footer.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn erased_assertions_preserve_original_call_footer() {
+    for scope in ["def", "async def"] {
+        for prefix in [
+            "",
+            "    if other:\n        assert other\n",
+            "    if other:\n        consume(other)\n",
+            "    with manager:\n        consume(other)\n    if other:\n        assert other\n",
+        ] {
+            for test in ["flag", "flag is None"] {
+                for call in ["consume()", "obj.consume()"] {
+                    for suffix in ["    assert flag\n", "    return None\n"] {
+                        let source = format!(
+                            "{scope} f(flag, other, obj, manager):\n{prefix}    if {test}:\n        {call}\n{suffix}"
+                        );
+                        assert_matches_cpython(&source, "erased_call_footer.py", &LEVELS);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn erased_protected_arms_keep_resumable_join() {
+    let indent = |source: &str| {
+        let mut result = String::new();
+        for line in source.lines() {
+            writeln!(result, "    {line}").unwrap();
+        }
+        result
+    };
+    for (prefix, suspension) in [
+        ("", ""),
+        ("async ", ""),
+        ("", "yield 1\n"),
+        ("async ", "yield 1\n"),
+    ] {
+        for manager in ["none", "outer", "inner"] {
+            for test in ["flag", "flag and value"] {
+                let mut body = format!(
+                    "if {test}:\n    assert value\nelse:\n    assert not value\nconsume()\n"
+                );
+                if manager == "inner" {
+                    body = format!("with manager:\n{}", indent(&body));
+                }
+                body = format!("try:\n{}except Exception:\n    consume()\n", indent(&body));
+                if manager == "outer" {
+                    body = format!("with manager:\n{}", indent(&body));
+                }
+                let source = format!(
+                    "{prefix}def sample(flag, value, manager):\n{}{}",
+                    indent(suspension),
+                    indent(&body)
+                );
+                assert_matches_cpython(&source, "erased_protected_resumable_join.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn erased_manager_arms_keep_protected_finalizer_join() {
+    let indent = |source: &str| {
+        let mut result = String::new();
+        for line in source.lines() {
+            writeln!(result, "    {line}").unwrap();
+        }
+        result
+    };
+    for prefix in ["", "async "] {
+        for managers in ["manager", "manager, manager"] {
+            for test in ["flag", "flag and value"] {
+                for suffix in ["", "consume()\n"] {
+                    let body = format!(
+                        "if {test}:\n    assert value\nelse:\n    assert not value\n{suffix}"
+                    );
+                    let protected = format!("with {managers}:\n{}", indent(&body));
+                    let body = format!("try:\n{}finally:\n    consume()\n", indent(&protected));
+                    let source = format!(
+                        "{prefix}def sample(flag, value, manager):\n{}",
+                        indent(&body)
+                    );
+                    assert_matches_cpython(&source, "erased_manager_finalizer_join.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn coroutine_terminal_loops_keep_original_scope_footer() {
+    for (prefix_index, prefix) in [
+        "",
+        "    if flag:\n        assert flag\n",
+        "    if flag:\n        consume(flag)\n",
+        "    await consume()\n    if flag:\n        assert flag\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (iterator_index, iterator) in ["values", "obj.values", "iter(values)"]
+            .into_iter()
+            .enumerate()
+        {
+            for (body_index, body) in [
+                "            assert item\n",
+                "            consume(item)\n",
+                "            if flag:\n                continue\n            consume(item)\n",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let source = format!(
+                    "async def f(flag, values, obj):\n{prefix}    if flag:\n        for item in {iterator}:\n{body}"
+                );
+                assert_matches_cpython(
+                    &source,
+                    &format!(
+                        "coroutine_terminal_loop_{prefix_index}_{iterator_index}_{body_index}.py"
+                    ),
+                    &LEVELS,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn erased_loop_assignment_suffix_keeps_original_scope_footer() {
+    for scope in ["def", "async def"] {
+        for prefix in [
+            "",
+            "    if flag:\n        assert flag\n",
+            "    if flag:\n        consume(flag)\n",
+        ] {
+            for iterator in ["values", "obj.values"] {
+                for value in ["item", "item.value", "item[0]"] {
+                    for suffix in [
+                        "            assert result\n",
+                        "            assert result\n            assert flag\n",
+                    ] {
+                        let source = format!(
+                            "{scope} f(flag, values, obj, consume):\n{prefix}    if flag:\n        for item in {iterator}:\n            result = {value}\n{suffix}"
+                        );
+                        assert_matches_cpython(&source, "loop_assignment_footer.py", &LEVELS);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn erased_boolean_arms_preserve_resumable_scope_footer() {
+    for (scope, suspension) in [
+        ("def", ""),
+        ("async def", ""),
+        ("def", "    yield 0\n"),
+        ("async def", "    yield 0\n"),
+    ] {
+        for test in [
+            "flag or other",
+            "flag or other or third",
+            "flag is None or other or third",
+            "flag and other or third",
+        ] {
+            for prefix in [
+                "",
+                "    consume()\n",
+                "    if third:\n        assert third\n",
+                "    with manager:\n        consume()\n",
+            ] {
+                let source = format!(
+                    "{scope} f(flag, other, third, manager):\n{suspension}{prefix}    if {test}:\n        assert third\n"
+                );
+                assert_matches_cpython(&source, "erased_boolean_footer.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn erased_paired_branch_suffix_keeps_each_return_donor() {
+    for declaration in ["def", "async def"] {
+        for (left, right) in [
+            ("consume(flag)", "consume(other)"),
+            ("value = flag", "value = other"),
+            ("obj.consume(flag)", "obj.consume(other)"),
+        ] {
+            let branch = format!("if other:\n    {left}\nelse:\n    {right}\nassert third\n");
+            let nested = branch.replace('\n', "\n    ");
+            for body in [
+                branch.clone(),
+                format!("if flag:\n    {nested}"),
+                format!("if flag:\n    consume(third)\nelse:\n    {nested}"),
+            ] {
+                let source = format!(
+                    "{declaration} f(flag, other, third, obj):\n    {}",
+                    body.replace('\n', "\n    ")
+                );
+                assert_matches_cpython_versions(
+                    &source,
+                    "erased_paired_branch_suffix.py",
+                    &LEVELS,
+                    &[
+                        PythonVersion::Py313,
+                        PythonVersion::Py314,
+                        PythonVersion::Py315,
+                    ],
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn erased_coroutine_paired_branches_preserve_copied_footer_donors() {
+    let source = include_str!("fixtures/coroutine_paired_branch_footers.py");
+    for source in [
+        source.to_owned(),
+        source.replace("assert flag", "action(flag)"),
+        source.replace("        assert flag\n", ""),
+        source.replace("await ", ""),
+        source.replace("async def", "def").replace("await ", ""),
+    ] {
+        assert_matches_cpython_versions(
+            &source,
+            "coroutine_paired_branch_footers.py",
+            &LEVELS,
+            &[
+                PythonVersion::Py313,
+                PythonVersion::Py314,
+                PythonVersion::Py315,
+            ],
+        );
+    }
+    assert_matches_cpython_versions(
+        &source.replace("assert flag", "pass"),
+        "coroutine_paired_branch_footers.py",
+        &LEVELS,
+        &[PythonVersion::Py313],
+    );
+}
+
+#[test]
+fn completed_coroutine_prefix_preserves_comprehension_footer_donors() {
+    let source = include_str!("fixtures/coroutine_completed_comprehension_footers.py");
+    assert_matches_cpython_versions(
+        source,
+        "coroutine_completed_comprehension_footers.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
+fn erased_protected_arms_keep_synchronous_for_finalizer_entry() {
+    let indent = |source: &str| {
+        let mut result = String::new();
+        for line in source.lines() {
+            writeln!(result, "    {line}").unwrap();
+        }
+        result
+    };
+    for prefix in ["", "async "] {
+        for iterable in ["items", "callback()", "manager.items()", "(1, 2)"] {
+            for loop_body in ["consume(item)", "pass", "break", "continue"] {
+                for test in ["flag", "flag and value"] {
+                    let finalizer = format!("for item in {iterable}:\n    {loop_body}\n");
+                    let body = format!(
+                        "try:\n    if {test}:\n        assert value\n    else:\n        assert not value\nfinally:\n{}",
+                        indent(&finalizer)
+                    );
+                    let source = format!(
+                        "{prefix}def sample(flag, value, manager, items, callback):\n{}",
+                        indent(&body)
+                    );
+                    assert_matches_cpython(&source, "erased_for_finalizer_entry.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn async_for_setups_preserve_repeated_scope_footer() {
+    let source = include_str!("fixtures/async_for_original_scope_footer.py");
+    for (index, source) in [
+        source.to_owned(),
+        source.replace("async for", "for"),
+        source.replace("break", "continue"),
+        source.replace("break", "pass"),
+        source.replace("        assert second", "        consume(second)"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            &source,
+            &format!("async_for_original_scope_footer_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
+fn async_for_recovery_preserves_legacy_scope_footer() {
+    assert_matches_cpython_versions(
+        include_str!("fixtures/async_for_recovered_scope_footer.py"),
+        "async_for_recovered_scope_footer.py",
+        &LEVELS,
+        &[PythonVersion::Py312, PythonVersion::Py313],
+    );
+}
+
+#[test]
+fn coroutine_terminal_loops_keep_suspension_and_cleanup_boundaries() {
+    for (index, body) in [
+        "    if flag:\n        async for item in values:\n            consume(item)\n",
+        "    if flag:\n        for item in values:\n            await consume(item)\n",
+        "    if flag:\n        for item in await consume(values):\n            consume(item)\n",
+        "    if flag:\n        for item in values:\n            consume(item)\n        else:\n            consume(flag)\n",
+        "    if flag:\n        for item in values:\n            break\n",
+        "    if flag:\n        for item in values:\n            return item\n",
+        "    if flag:\n        for item in values:\n            yield item\n",
+        "    if flag:\n        for item in (values if flag else obj.values):\n            consume(item)\n",
+        "    if flag:\n        for obj.value in values:\n            consume(obj.value)\n",
+        "    if flag:\n        for (item, (left, right)) in values:\n            consume(item)\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (variant, (prefix, suffix)) in [
+            ("", ""),
+            ("    if flag:\n        assert flag\n", "    return\n"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = format!("async def f(flag, values, obj):\n{prefix}{body}{suffix}");
+            assert_matches_cpython(
+                &source,
+                &format!("coroutine_terminal_loop_boundary_{index}_{variant}.py"),
+                &LEVELS,
+            );
+        }
+    }
+    for (index, body) in [
+        "    with manager():\n        if flag:\n            for item in values:\n                consume(item)\n",
+        "    try:\n        if flag:\n            for item in values:\n                consume(item)\n    finally:\n        consume(flag)\n",
+        "    try:\n        consume(flag)\n    except ValueError:\n        if flag:\n            for item in values:\n                consume(item)\n",
+        "    for value in values:\n        if flag:\n            for item in values:\n                consume(item)\n",
+        "    if await consume(flag):\n        for item in values:\n            consume(item)\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let source = format!(
+            "async def f(flag, values, obj):\n    if flag:\n        assert flag\n{body}"
+        );
+        assert_matches_cpython(
+            &source,
+            &format!("coroutine_terminal_loop_protected_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
+fn manager_entry_conditionals_keep_original_array_owners() {
+    assert_matches_cpython(
+        include_str!("fixtures/manager_entry_conditional_owners.py"),
+        "manager_entry_conditional_owners.py",
+        &LEVELS,
+    );
+}
+
+#[test]
+fn runtime_list_conditionals_keep_original_array_owners() {
+    assert_matches_cpython(
+        include_str!("fixtures/runtime_list_conditional_owners.py"),
+        "runtime_list_conditional_owners.py",
+        &LEVELS,
+    );
+}
+
+#[test]
+fn retained_loop_constant_returns_keep_original_finally_owners() {
+    assert_matches_cpython(
+        include_str!("fixtures/retained_loop_constant_finally_owners.py"),
+        "retained_loop_constant_finally_owners.py",
+        &LEVELS,
+    );
+}
+
+#[test]
 fn erased_nested_arms_keep_the_enclosing_iterator_exit() {
     let source = r"def process(items, flags, kinds, width):
     with manager() as owner, manager(), manager(), manager(), manager(), manager():
@@ -672,6 +5304,486 @@ fn erased_finally_branch_preserves_conditional_continuation() {
 }
 
 #[test]
+fn coroutine_direct_nested_erased_arms_preserve_join() {
+    for (filename, source) in [
+        (
+            "coroutine-both-erased.py",
+            r"async def sample(outer, inner, value, consume):
+    if outer:
+        if inner:
+            assert value
+        else:
+            assert inner
+    else:
+        assert outer
+    result = consume(value)
+    consume(result)
+    return result
+",
+        ),
+        (
+            "ordinary-both-erased.py",
+            r"def sample(outer, inner, value, consume):
+    if outer:
+        if inner:
+            assert value
+        else:
+            assert inner
+    else:
+        assert outer
+    result = consume(value)
+    consume(result)
+    return result
+",
+        ),
+        (
+            "coroutine-mixed-inner.py",
+            r"async def sample(outer, inner, value, consume):
+    if outer:
+        if inner:
+            temporary = value
+        else:
+            assert inner
+    else:
+        assert outer
+    result = consume(value)
+    consume(result)
+    return result
+",
+        ),
+        (
+            "coroutine-live-inner.py",
+            r"async def sample(outer, inner, value, consume):
+    if outer:
+        if inner:
+            temporary = value
+        else:
+            temporary = inner
+    else:
+        assert outer
+    result = consume(value)
+    consume(result)
+    return result
+",
+        ),
+        (
+            "coroutine-no-outer-else.py",
+            r"async def sample(outer, inner, value, consume):
+    if outer:
+        if inner:
+            assert value
+        else:
+            assert inner
+    result = consume(value)
+    consume(result)
+    return result
+",
+        ),
+        (
+            "coroutine-flat-erased.py",
+            r"async def sample(outer, inner, value, consume):
+    if inner:
+        assert value
+    else:
+        assert inner
+    result = consume(value)
+    consume(result)
+    return result
+",
+        ),
+    ] {
+        assert_matches_cpython(source, filename, &LEVELS);
+    }
+}
+
+#[test]
+fn coroutine_nested_erased_arms_with_surrounding_work_preserve_join() {
+    for (filename, source) in [
+        (
+            "erased-prefix.py",
+            r"async def inspect_path(primary, secondary, packet, emit):
+    if primary:
+        assert packet
+        if secondary:
+            assert secondary
+        else:
+            assert primary
+    else:
+        assert packet
+    outcome = emit(packet)
+    emit(outcome)
+    return outcome
+",
+        ),
+        (
+            "erased-suffix.py",
+            r"async def inspect_path(primary, secondary, packet, emit):
+    if primary:
+        if secondary:
+            assert secondary
+        else:
+            assert primary
+        assert packet
+    else:
+        assert packet
+    outcome = emit(packet)
+    emit(outcome)
+    return outcome
+",
+        ),
+        (
+            "erased-prefix-and-suffix.py",
+            r"async def inspect_path(primary, secondary, packet, emit):
+    if primary:
+        assert packet
+        if secondary:
+            assert secondary
+        else:
+            assert primary
+        assert packet
+    else:
+        assert packet
+    outcome = emit(packet)
+    emit(outcome)
+    return outcome
+",
+        ),
+        (
+            "linear-prefix.py",
+            r"async def inspect_path(primary, secondary, packet, emit):
+    if primary:
+        observed = packet
+        if secondary:
+            assert observed
+        else:
+            assert primary
+    else:
+        assert packet
+    outcome = emit(packet)
+    emit(outcome)
+    return outcome
+",
+        ),
+    ] {
+        assert_matches_cpython(source, filename, &LEVELS);
+    }
+}
+
+#[test]
+fn coroutine_nested_mixed_erased_arms_preserve_join() {
+    for (filename, source) in [
+        (
+            "mixed-inner-control.py",
+            r"async def inspect_path(primary, secondary, packet, emit):
+    if primary:
+        assert packet
+        if secondary:
+            assert secondary
+        else:
+            emit(packet)
+    else:
+        assert packet
+    outcome = emit(packet)
+    emit(outcome)
+    return outcome
+",
+        ),
+        (
+            "mixed-inner-mirror.py",
+            r"async def inspect_path(primary, secondary, packet, emit):
+    if primary:
+        assert packet
+        if secondary:
+            emit(packet)
+        else:
+            assert primary
+    else:
+        assert packet
+    outcome = emit(packet)
+    emit(outcome)
+    return outcome
+",
+        ),
+    ] {
+        assert_matches_cpython(source, filename, &LEVELS);
+    }
+}
+
+#[test]
+fn coroutine_nested_erased_arms_after_completed_await_preserve_join() {
+    for (filename, source) in [
+        (
+            "standalone-await-prefix.py",
+            r"async def inspect_path(primary, secondary, packet, emit):
+    if primary:
+        await emit(packet)
+        if secondary:
+            assert secondary
+        else:
+            assert primary
+    else:
+        assert packet
+    outcome = emit(packet)
+    emit(outcome)
+    return outcome
+",
+        ),
+        (
+            "no-await-control.py",
+            r"async def inspect_path(primary, secondary, packet, emit):
+    if primary:
+        assert packet
+        if secondary:
+            assert secondary
+        else:
+            assert primary
+    else:
+        assert packet
+    outcome = emit(packet)
+    emit(outcome)
+    return outcome
+",
+        ),
+        (
+            "await-outside-outer.py",
+            r"async def inspect_path(primary, secondary, packet, emit):
+    await emit(packet)
+    if primary:
+        assert packet
+        if secondary:
+            assert secondary
+        else:
+            assert primary
+    else:
+        assert packet
+    outcome = emit(packet)
+    emit(outcome)
+    return outcome
+",
+        ),
+        (
+            "await-inner-arm.py",
+            r"async def inspect_path(primary, secondary, packet, emit):
+    if primary:
+        assert packet
+        if secondary:
+            await emit(packet)
+        else:
+            assert primary
+    else:
+        assert packet
+    outcome = emit(packet)
+    emit(outcome)
+    return outcome
+",
+        ),
+    ] {
+        assert_matches_cpython(source, filename, &LEVELS);
+    }
+
+    // These eight optimized modern residuals remain in the paired raw-byte screen.
+    // Together with the cases above, the unaffected cells make 64 equality checks.
+    for (filename, source) in [
+        (
+            "assigned-await-prefix.py",
+            r"async def inspect_path(primary, secondary, packet, emit):
+    if primary:
+        observed = await emit(packet)
+        if secondary:
+            assert secondary
+        else:
+            assert primary
+    else:
+        assert packet
+    outcome = emit(packet)
+    emit(outcome)
+    return outcome
+",
+        ),
+        (
+            "await-inner-test.py",
+            r"async def inspect_path(primary, secondary, packet, emit):
+    if primary:
+        assert packet
+        if await emit(secondary):
+            assert secondary
+        else:
+            assert primary
+    else:
+        assert packet
+    outcome = emit(packet)
+    emit(outcome)
+    return outcome
+",
+        ),
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            filename,
+            &LEVELS,
+            &[PythonVersion::Py312, PythonVersion::Py313],
+        );
+        assert_matches_cpython_versions(
+            source,
+            filename,
+            &[OptimizationLevel::Zero],
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
+fn coroutine_completed_await_inner_tests_preserve_erased_join() {
+    for (filename, source) in [
+        (
+            "inner-await-call.py",
+            r"async def inspect_path(primary, secondary, packet, emit):
+    if primary:
+        assert packet
+        if await emit(secondary):
+            assert secondary
+        else:
+            assert primary
+    else:
+        assert packet
+    outcome = emit(packet)
+    emit(outcome)
+    return outcome
+",
+        ),
+        (
+            "inner-await-multiline-call.py",
+            r"async def inspect_path(primary, secondary, packet, emit):
+    if primary:
+        assert packet
+        if await emit(
+            secondary
+        ):
+            assert secondary
+        else:
+            assert primary
+    else:
+        assert packet
+    outcome = emit(packet)
+    emit(outcome)
+    return outcome
+",
+        ),
+        (
+            "inner-await-multiline-await.py",
+            r"async def inspect_path(primary, secondary, packet, emit):
+    if primary:
+        assert packet
+        if (
+            await emit(secondary)
+        ):
+            assert secondary
+        else:
+            assert primary
+    else:
+        assert packet
+    outcome = emit(packet)
+    emit(outcome)
+    return outcome
+",
+        ),
+    ] {
+        assert_matches_cpython(source, filename, &LEVELS);
+    }
+}
+
+#[test]
+fn ordinary_try_nested_erased_arms_preserve_tuple_return_join() {
+    for (filename, source) in [
+        (
+            "direct-short.py",
+            r"def sample(outer, inner, a, b, c, operation):
+    if outer:
+        operation(a)
+    else:
+        assert b
+    return a, b
+",
+        ),
+        (
+            "direct-long.py",
+            r"def sample(outer, inner, a, b, c, operation):
+    if outer:
+        operation(a)
+    else:
+        assert b
+    return a, b, c
+",
+        ),
+        (
+            "nested-short.py",
+            r"def sample(outer, inner, a, b, c, operation):
+    if outer:
+        if inner:
+            assert a
+        else:
+            assert b
+    else:
+        assert c
+    return a, b
+",
+        ),
+        (
+            "nested-long.py",
+            r"def sample(outer, inner, a, b, c, operation):
+    if outer:
+        if inner:
+            assert a
+        else:
+            assert b
+    else:
+        assert c
+    return a, b, c
+",
+        ),
+        (
+            "protected-short.py",
+            r"def sample(outer, inner, a, b, c, operation):
+    try:
+        if outer:
+            if inner:
+                assert a
+            else:
+                assert b
+        else:
+            assert c
+        return a, b
+    except RuntimeError:
+        return None
+",
+        ),
+        (
+            "protected-long.py",
+            r"def sample(outer, inner, a, b, c, operation):
+    try:
+        if outer:
+            if inner:
+                assert a
+            else:
+                assert b
+        else:
+            assert c
+        return a, b, c
+    except RuntimeError:
+        return None
+",
+        ),
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            filename,
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn coroutine_populated_nested_branch_preserves_erased_join() {
     for condition in ["isinstance(item, dict)", "accept(item)"] {
         let source = format!(
@@ -715,6 +5827,55 @@ fn erased_loop_branch_before_condition_keeps_protected_join() {
         "erased_loop_condition_inner_try.py",
         &LEVELS,
     );
+}
+
+#[test]
+fn enclosing_try_else_preserves_manager_borrow_boundary() {
+    for (scope, manager, work) in [
+        ("def", "with", "consume(value)"),
+        ("async def", "with", "consume(value)"),
+        ("async def", "with", "await consume(value)"),
+        ("async def", "async with", "await consume(value)"),
+    ] {
+        for handler in ["Exception", "Exception as error"] {
+            for otherwise in ["consume(result)", "outcome = 1 if result else 2"] {
+                for cleanup in [
+                    "cleanup(value)\n",
+                    "if value is not None:\n    cleanup(value)\n",
+                ] {
+                    let mut source = format!(
+                        "{scope} f(result, value, flag):\n    try:\n        try:\n            {manager} manager():\n                result = {work}\n        except {handler}:\n            raise\n    except Exception:\n        raise\n    else:\n        {otherwise}\n    finally:\n"
+                    );
+                    for line in cleanup.lines() {
+                        writeln!(source, "        {line}").unwrap();
+                    }
+                    assert_matches_cpython(&source, "enclosing_manager_try_else.py", &LEVELS);
+                }
+            }
+        }
+    }
+    for scope in ["def", "async def"] {
+        let source = format!(
+            "{scope} f(result, value, flag):\n    try:\n        try:\n            with manager():\n                result = consume(value)\n        except Exception:\n            raise\n    except Exception:\n        raise\n    else:\n        consume(result)\n    finally:\n        cleanup(value)\n"
+        );
+        for source in [
+            source.replace("    finally:\n        cleanup(value)\n", ""),
+            source.replace(
+                "            raise\n",
+                "            raise\n        else:\n            consume(flag)\n",
+            ),
+            source.replace(
+                "            raise\n",
+                "            raise\n        finally:\n            cleanup(flag)\n",
+            ),
+            source.replace(
+                "            raise\n",
+                "            raise\n        consume(flag)\n",
+            ),
+        ] {
+            assert_matches_cpython(&source, "enclosing_manager_try_else_boundary.py", &LEVELS);
+        }
+    }
 }
 
 #[test]
@@ -769,6 +5930,17 @@ fn erased_coroutine_handler_assertions_preserve_manager_pop_block() {
             assert_matches_cpython(&source, "erased_coroutine_handler_exit.py", &LEVELS);
         }
     }
+}
+
+#[test]
+fn erased_module_handler_assertions_preserve_manager_pop_block() {
+    let source = "with manager:\n    try:\n        raise ValueError\n    except ValueError as problem:\n        assert ready\n";
+    assert_matches_cpython_versions(
+        source,
+        "erased_module_handler_exit.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
 }
 
 #[test]
@@ -926,6 +6098,48 @@ fn elided_conditional_preserves_jump_before_erased_try_tail() {
                 "async def f(manager, flag):\n    try:\n{prefix}        if flag == expected:\n            assert valid(value)\n        else:\n            assert ready(value)\n        assert done()\n        {suffix}\n    finally:\n        cleanup()\n        finish()\n"
             );
             assert_matches_cpython(&source, "conditional_erased_try_tail.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
+fn coroutine_manager_prefix_preserves_protected_finalizer_join() {
+    let indent = |source: &str| {
+        let mut result = String::new();
+        for line in source.lines() {
+            writeln!(result, "    {line}").unwrap();
+        }
+        result
+    };
+    for managers in [
+        &[][..],
+        &["with first:"],
+        &["async with first:"],
+        &["with first:", "with second:"],
+        &["async with first:", "async with second:"],
+        &["with first:", "async with second:"],
+        &["async with first:", "with second:"],
+    ] {
+        for finalizer in [
+            "callback()\n",
+            "await callback()\n",
+            "await value\n",
+            "if value:\n    callback()\n",
+        ] {
+            for test in ["flag", "flag and value"] {
+                let mut body = format!(
+                    "try:\n    if {test}:\n        assert value\n    else:\n        assert not value\nfinally:\n{}",
+                    indent(finalizer)
+                );
+                for manager in managers.iter().rev() {
+                    body = format!("{manager}\n{}", indent(&body));
+                }
+                let source = format!(
+                    "async def sample(flag, value, first, second, callback):\n{}",
+                    indent(&body)
+                );
+                assert_matches_cpython(&source, "coroutine_manager_prefix.py", &LEVELS);
+            }
         }
     }
 }
@@ -2747,6 +7961,38 @@ fn empty_conditionals_preserve_legacy_terminal_return_locations() {
 }
 
 #[test]
+fn terminal_loop_footer_certificate_excludes_nested_conditionals() {
+    for (name, source) in [
+        (
+            "nested_pass",
+            "def f(a, b, c):\n    if a:\n        assert a\n    if b:\n        if c:\n            pass\n",
+        ),
+        (
+            "nested_attribute",
+            "def f(a, b, c, obj):\n    if a:\n        assert a\n    if b:\n        if c:\n            value = obj.attr\n",
+        ),
+        (
+            "linear_loop",
+            include_str!(
+                "fixtures/optimization/3.12+3.13+3.14+3.15/0+1+2/native_terminal_if_footer_provenance/linear/live_extra.py"
+            ),
+        ),
+        (
+            "conditional_loop",
+            include_str!(
+                "fixtures/optimization/3.12+3.13+3.14+3.15/0+1+2/native_terminal_if_footer_provenance/conditional/erased_extra.py"
+            ),
+        ),
+    ] {
+        assert_matches_cpython(
+            source,
+            &format!("terminal_loop_footer_certificate_{name}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn consecutive_elided_conditions_preserve_empty_branch_locations() {
     for (prefix, suffix) in [
         (
@@ -2934,6 +8180,18 @@ fn erased_try_arms_preserve_large_tuple_return_join() {
         "erased_unprotected_tuple_return.py",
         &LEVELS,
     );
+}
+
+#[test]
+fn erased_assertions_preserve_terminal_protected_join_locations() {
+    let source = include_str!("fixtures/protected_join_footers.py");
+    for source in [
+        source.to_owned(),
+        source.replace("assert value", "consume(value)"),
+        source.replace("        assert value\n", ""),
+    ] {
+        assert_matches_cpython(&source, "protected_join_footers.py", &LEVELS);
+    }
 }
 
 #[test]
@@ -3289,6 +8547,117 @@ fn elided_assertions_preserve_unpacking_return_locations() {
                 assert_matches_cpython(&source, "unpacking_before_assert.py", &LEVELS);
             }
         }
+    }
+}
+
+#[test]
+fn elided_assertions_preserve_assignment_before_raising_scope_exit() {
+    for value in [
+        "obj.value",
+        "(1, 2, 3)",
+        "(obj.first, obj.second, obj.third)",
+        "[obj.first, obj.second]",
+        "consume(obj)",
+        "obj",
+    ] {
+        let source = format!(
+            "def f(flag, value, obj):\n    if flag:\n        assert flag\n    if value:\n        values = {value}\n        if flag not in values:\n            raise ValueError()\n        if flag:\n            raise ValueError()\n"
+        );
+        for source in [
+            source.clone(),
+            source.replace("        assert flag", "        consume(flag)"),
+            format!("{source}    return None\n"),
+        ] {
+            assert_matches_cpython(&source, "assignment_before_raising_scope_exit.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
+fn elided_assertions_preserve_conditional_await_footer() {
+    for prefix in [
+        "",
+        "    await consume()\n    if flag:\n        assert flag\n",
+        "    if flag:\n        assert flag\n",
+        "    if flag:\n        consume()\n",
+        "    if flag:\n        assert flag\n    consume()\n",
+    ] {
+        for test in ["flag", "flag is None"] {
+            for awaited in ["consume()", "value"] {
+                let source = format!(
+                    "async def f(flag, value):\n{prefix}    if {test}:\n        await {awaited}\n"
+                );
+                for source in [
+                    source.clone(),
+                    format!("{source}    return None\n"),
+                    format!("{source}    else:\n        consume()\n"),
+                ] {
+                    assert_matches_cpython(&source, "conditional_await_footer.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn elided_assertions_preserve_conditional_unpacking_return_locations() {
+    for scope in ["def", "async def"] {
+        for targets in [
+            "first, second",
+            "first, second, third",
+            "first, second, third, fourth",
+        ] {
+            let values = targets
+                .split(", ")
+                .map(|name| format!("obj.{name}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            for brackets in [false, true] {
+                let target = if brackets {
+                    format!("[{targets}]")
+                } else {
+                    targets.to_owned()
+                };
+                for tail in [
+                    "",
+                    "        assert first\n",
+                    "        assert first\n        assert flag\n",
+                    "        return first\n",
+                ] {
+                    for otherwise in [false, true] {
+                        let branch = if otherwise {
+                            "    if flag:\n        consume()\n    else:\n"
+                        } else {
+                            "    if flag:\n"
+                        };
+                        let source = format!(
+                            "{scope} f(obj, flag):\n{branch}        {target} = {values}\n{tail}"
+                        );
+                        assert_matches_cpython(
+                            &source,
+                            "conditional_unpacking_before_assert.py",
+                            &LEVELS,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn elided_assertions_preserve_conditional_store_return_locations() {
+    for assignment in [
+        "value = consume()",
+        "first = second = consume()",
+        "obj.value = consume()",
+        "obj[0] = consume()",
+        "obj.value, value = consume(), consume()",
+        "obj[0], value = consume(), consume()",
+    ] {
+        let source =
+            format!("def f(obj, flag):\n    if flag:\n        {assignment}\n        assert flag\n");
+        assert_matches_cpython(&source, "conditional_store_before_assert.py", &LEVELS);
     }
 }
 
@@ -6349,6 +11718,33 @@ fn elided_else_preserves_async_comprehension_exit() {
 }
 
 #[test]
+fn async_comprehension_finalizer_preserves_conditional_owner() {
+    for body in ["yield value", "await operation()"] {
+        for comprehension in [
+            "[item async for item in source]",
+            "{item async for item in source}",
+            "{item: item async for item in source}",
+            "[item for item in source]",
+        ] {
+            let source = format!(
+                "async def sample(manager, source, value):\n    async with manager:\n        try:\n            {body}\n        finally:\n            collected = {comprehension}\n            if collected:\n                await consume(*collected)\n"
+            );
+            assert_matches_cpython_versions(
+                &source,
+                "async_comprehension_finalizer.py",
+                &LEVELS,
+                &[
+                    PythonVersion::Py312,
+                    PythonVersion::Py313,
+                    PythonVersion::Py314,
+                    PythonVersion::Py315,
+                ],
+            );
+        }
+    }
+}
+
+#[test]
 fn async_comprehension_preserves_conditional_exception_owner() {
     const TRACE_CONDITION: &str = r"
 import dis, marshal, sys
@@ -6627,6 +12023,32 @@ fn elided_assertions_after_comprehension_branches_keep_store_return_locations() 
                     "{prefix}def f(items, flag):\n    if flag:\n        result = {comprehension}\n{branch_tail}    assert flag\n"
                 );
                 assert_matches_cpython(&source, "comprehension_branch_return.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn erased_branch_assertions_preserve_comprehension_store_return_locations() {
+    for scope in ["def", "async def"] {
+        for comprehension in [
+            "[item for item in items]",
+            "{item for item in items if item.active}",
+            "{item: item.value for item in items}",
+        ] {
+            for prefix in [
+                "",
+                "        consume(items)\n",
+                "        value = consume(items)\n",
+            ] {
+                for branch_tail in ["", "        assert out\n        assert items\n"] {
+                    for suffix in ["", "    assert flag\n"] {
+                        let source = format!(
+                            "{scope} f(flag, items):\n    if flag:\n{prefix}        out = {comprehension}\n{branch_tail}    else:\n{prefix}        out = {comprehension}\n{branch_tail}{suffix}"
+                        );
+                        assert_matches_cpython(&source, "erased_comprehension_footer.py", &LEVELS);
+                    }
+                }
             }
         }
     }
@@ -8086,5 +13508,266 @@ fn boolean_call_prefix_keeps_terminal_finalizer_join() {
             &format!("boolean_call_finalizer_prefix_{index}.py"),
             &LEVELS,
         );
+    }
+}
+
+#[test]
+fn while_break_retains_enclosing_try_else_owner() {
+    for scope in ["def", "async def"] {
+        for condition in ["True", "flag"] {
+            for continuation in [
+                "pass",
+                "consume(value)",
+                "consume(value, mode='value')",
+                "obj.consume({'value': value, 'ready': True})",
+            ] {
+                let source = format!(
+                    "{scope} f(value, flag, obj):\n\
+                     \x20   try:\n\
+                     \x20       while {condition}:\n\
+                     \x20           if flag:\n\
+                     \x20               break\n\
+                     \x20           consume(value)\n\
+                     \x20   except Exception:\n\
+                     \x20       consume(value)\n\
+                     \x20   else:\n\
+                     \x20       {continuation}\n\
+                     \x20   finish(value)\n"
+                );
+                assert_matches_cpython(&source, "while_break_try_else.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn try_except_end_preserves_original_borrow_boundary() {
+    let source = include_str!("fixtures/try_except_borrow_boundary.py");
+    for (index, source) in [
+        source.to_owned(),
+        source.replace("async def", "def").replace("await ", ""),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            &source,
+            &format!("try_except_borrow_boundary_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
+fn runtime_loop_enters_iterator_finalizer_314() {
+    for guarded in [false, true] {
+        for managers in [0, 2] {
+            for handler in ["Error", "Error as problem"] {
+                let body = if guarded {
+                    let loop_body =
+                        "while state.ready:\n    if measure() >= limit:\n        break\n    pass\n";
+                    format!(
+                        "if ready:\n    {}",
+                        loop_body.replace('\n', "\n    ").trim_end()
+                    )
+                } else {
+                    "while state.ready:\n    pass\n".to_owned()
+                };
+                let mut suite = format!(
+                    "try:\n    {}\nexcept {handler}:\n    pass\nfinally:\n    for item in (first, second):\n        pass\n",
+                    body.replace('\n', "\n    ").trim_end(),
+                );
+                for manager in 0..managers {
+                    suite = format!(
+                        "with manager{manager}:\n    {}\n",
+                        suite.replace('\n', "\n    ").trim_end()
+                    );
+                }
+                let source = format!(
+                    "def sample(ready, state):\n    first = second = None\n    {}\n    return state.value\n",
+                    suite.replace('\n', "\n    ").trim_end(),
+                );
+                assert_matches_cpython_versions(
+                    &source,
+                    "runtime_loop_iterator_finalizer.py",
+                    &LEVELS,
+                    &[PythonVersion::Py314],
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn guarded_handler_recovery_reaches_iterator_finalizer_314() {
+    for handler in ["Error", "Error as problem"] {
+        for nested in ["pass", "recover()"] {
+            for cleanup in ["pass", "release(item)"] {
+                for guard in ["first is not None", "state.recover"] {
+                    let source = format!(
+                        "def sample(state, first, second):\n    try:\n        while state.active:\n            step()\n    except {handler}:\n        if {guard}:\n            try:\n                {nested}\n            except LookupError:\n                pass\n    finally:\n        for item in (first, second):\n            {cleanup}\n",
+                    );
+                    assert_matches_cpython_versions(
+                        &source,
+                        "guarded_handler_iterator_finalizer.py",
+                        &LEVELS,
+                        &[PythonVersion::Py314],
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn coroutine_nested_recovery_reaches_finalizer_guard_314() {
+    for work in [
+        "pass",
+        "work()",
+        "if state.done:\n    return\nwork()",
+        "if state.done:\n    return state.value\nwork()",
+        "if state.done:\n    if state.ready:\n        return finish(state)\nwork()",
+        "while state.pending:\n    if state.done:\n        return state.value\n    if state.retry:\n        continue\n    await poll(state)\nwork()",
+    ] {
+        for guard in ["state.ready", "state.ready and accept(problem)"] {
+            for named in [false, true] {
+                for handler_count in [1, 2] {
+                    let first = if named {
+                        "FirstError as first"
+                    } else {
+                        "FirstError"
+                    };
+                    let mut recovery = format!(
+                        "try:\n    if retryable(problem):\n        raise problem\nexcept {first}:\n    pass",
+                    );
+                    if handler_count == 2 {
+                        let second = if named {
+                            "SecondError as second"
+                        } else {
+                            "SecondError"
+                        };
+                        recovery.push_str("\nexcept ");
+                        recovery.push_str(second);
+                        recovery.push_str(":\n    pass");
+                    }
+                    let source = format!(
+                        "async def sample(state):\n    try:\n        {}\n    except Error as problem:\n        if {guard}:\n            {}\n    finally:\n        if state.ready:\n            pass\n",
+                        work.replace('\n', "\n        "),
+                        recovery.replace('\n', "\n            "),
+                    );
+                    assert_matches_cpython_versions(
+                        &source,
+                        "coroutine_nested_recovery_finalizer_guard.py",
+                        &LEVELS,
+                        &[PythonVersion::Py314],
+                    );
+                }
+            }
+        }
+    }
+    for work in ["pass", "work()"] {
+        let source = format!(
+            "async def sample(state):\n    try:\n        {work}\n    except Error as problem:\n        if state.ready:\n            try:\n                try:\n                    if retryable(problem):\n                        raise problem\n                except FirstError:\n                    pass\n            except SecondError:\n                pass\n    finally:\n        if state.ready:\n            pass\n",
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "coroutine_nested_recovery_finalizer_boundary.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
+fn open_elif_join_reaches_nested_finalizer_314() {
+    for function in ["def", "async def"] {
+        for (first, second) in [
+            ("flag", "other"),
+            ("previous is None", "previous != state.key"),
+        ] {
+            for work in ["pass", "work(state)", "value = 1 if flag else 2"] {
+                for value in ["state.kind", "state.kind or 'fallback'"] {
+                    for later in [
+                        "pass",
+                        "if flag:\n    return state",
+                        "with manager:\n    if flag:\n        return state",
+                        "async with manager:\n    if flag:\n        return state",
+                    ] {
+                        if function == "def" && later.starts_with("async with") {
+                            continue;
+                        }
+                        // Boolean copied cleanup under a sync manager has a separate
+                        // existing exception-table ownership mismatch.
+                        if later.starts_with("with") && value != "state.kind" {
+                            continue;
+                        }
+                        let source = format!(
+                            "{function} sample(state, previous, flag, other):\n    try:\n        value = flag and prepare()\n        if {first}:\n            {work}\n        elif {second}:\n            {}\n    except Error:\n        pass\n    finally:\n        try:\n            value = {value}\n        except Error:\n            pass\n",
+                            later.replace('\n', "\n            "),
+                        );
+                        assert_matches_cpython_versions(
+                            &source,
+                            "open_elif_nested_finalizer.py",
+                            &LEVELS,
+                            &[PythonVersion::Py314],
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn completed_recovery_reaches_nested_awaited_cleanup_guard() {
+    for initialized in ["", "    ready = False\n"] {
+        for handler in ["Error", "(Error, OtherError)"] {
+            for guard in ["flag", "retry(problem)"] {
+                for final_work in ["pass", "finish(state)"] {
+                    let source = format!(
+                        "async def sample(state, flag, other, ready):\n{initialized}    try:\n        operation(state)\n    except {handler} as problem:\n        if flag:\n            try:\n                pass\n            except RecoveryError:\n                pass\n        if {guard}:\n            raise\n    finally:\n        try:\n            if not ready and not other:\n                await cleanup(state)\n        finally:\n            {final_work}\n"
+                    );
+                    assert_matches_cpython_versions(
+                        &source,
+                        "nested_awaited_cleanup_guard.py",
+                        &LEVELS,
+                        &[PythonVersion::Py314],
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn runtime_while_reaches_nested_finalizer_entry_314() {
+    for function in ["def", "async def"] {
+        for guard in ["flag", "flag or other"] {
+            for body in ["pass", "if other:\n    break"] {
+                for handler in ["pass", "raise", "await recover(state)\nraise"] {
+                    if function == "def" && handler.starts_with("await") {
+                        continue;
+                    }
+                    for cleanup in [
+                        "pass",
+                        "finish(state)",
+                        "for item in items:\n    finish(item)",
+                    ] {
+                        let source = format!(
+                            "{function} sample(state, items, flag, other):\n    try:\n        while {guard}:\n            {}\n    except Error:\n        {}\n    finally:\n        try:\n            state.result = work(state, items)\n        finally:\n            {}\n",
+                            body.replace('\n', "\n            "),
+                            handler.replace('\n', "\n        "),
+                            cleanup.replace('\n', "\n            "),
+                        );
+                        assert_matches_cpython_versions(
+                            &source,
+                            "while_nested_finalizer_entry.py",
+                            &LEVELS,
+                            &[PythonVersion::Py314],
+                        );
+                    }
+                }
+            }
+        }
     }
 }

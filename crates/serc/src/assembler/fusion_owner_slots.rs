@@ -16,6 +16,9 @@ use smallvec::SmallVec;
 use std::cell::OnceCell;
 use std::cmp::Reverse;
 
+mod builtin_guard;
+use builtin_guard::BuiltinGuardCertificate;
+
 type Key = (i32, i32, i32, i32, u8, Label);
 type Owner = Option<(Label, u32, bool)>;
 
@@ -560,6 +563,120 @@ struct FallbackCertificate {
     observed_local_fusion: bool,
 }
 
+/// Authenticates the cold writer's complete, ordered reconstruction of the table.
+fn cold_region_replacements(
+    originals: &[ExceptionRegion],
+    current: &[ExceptionRegion],
+    retargets: &[(ExceptionRegion, ExceptionRegion)],
+    groups: Option<&[(ExceptionRegion, usize)]>,
+) -> Option<()> {
+    if let Some(groups) = groups
+        && (groups.len() != originals.len()
+            || !groups
+                .iter()
+                .zip(originals)
+                .all(|((region, _), original)| same_manager_region(region, original)))
+    {
+        return None;
+    }
+    let mut replacements = Vec::new();
+    let mut receipts = retargets.iter().peekable();
+    for (index, original) in originals.iter().enumerate() {
+        let first = replacements.len();
+        while let Some((source, rebuilt)) = receipts.peek()
+            && same_manager_region(source, original)
+        {
+            let mut shape = *rebuilt;
+            shape.start = original.start;
+            shape.end = original.end;
+            if !same_manager_region(&shape, original) {
+                return None;
+            }
+            replacements.push(*rebuilt);
+            receipts.next();
+        }
+        let count = replacements.len() - first;
+        if groups.map_or(count == 0, |groups| count != groups[index].1) {
+            return None;
+        }
+    }
+    (receipts.next().is_none()
+        && replacements.len() == current.len()
+        && replacements
+            .iter()
+            .zip(current)
+            .all(|(expected, current)| same_manager_region(expected, current)))
+    .then_some(())
+}
+
+fn incoming(view: &View<'_>, labels: &FxHashSet<Label>) -> Vec<Instruction> {
+    view.items.iter().filter_map(|item| match item {
+        Item::Instruction(instruction)
+            if matches!(instruction.operand(), Operand::Forward(label) | Operand::Backward(label)
+                if labels.contains(&label)) => Some(*instruction),
+        Item::Label(_) | Item::Instruction(_) => None,
+    }).collect()
+}
+
+struct OrdinarySingletonRegion {
+    setup: Label,
+    original: ExceptionRegion,
+    current: ExceptionRegion,
+    regions: Vec<ExceptionRegion>,
+    cold_transported: bool,
+    incoming: Vec<Instruction>,
+    source_boundaries: FxHashSet<Label>,
+}
+
+impl OrdinarySingletonRegion {
+    fn valid(
+        &self,
+        view: &View<'_>,
+        interval: &Certificate,
+        start: usize,
+        condition: usize,
+    ) -> Option<()> {
+        let mut original_shape = self.current;
+        original_shape.start = self.original.start;
+        original_shape.end = self.original.end;
+        if !view
+            .provenance
+            .is_original_ordinary_try_region(self.original)
+            || !view.provenance.ordinary_try_region_origins.contains(&(
+                self.setup,
+                self.original.start,
+                self.original.end,
+                self.original.target,
+            ))
+            || !same_manager_region(&original_shape, &self.original)
+            || self.regions.len() != view.regions.len()
+            || !self
+                .regions
+                .iter()
+                .zip(view.regions)
+                .all(|(a, b)| same_manager_region(a, b))
+            || self.incoming != incoming(view, &interval.labels)
+            || self.source_boundaries
+                != boundaries_in(
+                    &view.items[start..=condition],
+                    &view.provenance.source_boundaries,
+                )
+            || view.items[start..=condition].iter().any(|item| {
+                matches!(item,
+                Item::Label(label) if view.provenance.normal_try_copy_blocks.contains(label)
+                    || view.provenance.retired_normal_try_copy_labels.contains(label)
+                    || view.provenance.normal_try_copy_internal_labels.contains(label)
+                    || view.provenance.removed_pop_block_widths.contains_key(label))
+            })
+        {
+            return None;
+        }
+        let regions = view.fresh_singleton_regions(start, condition)?;
+        matches!(regions.as_slice(), [region] if same_manager_region(region, &self.current))
+            .then_some(())
+    }
+}
+
 /// An authored singleton's entire original fallthrough array, with no vacant-slot reuse.
 struct FreshSingletonCertificate {
     interval: Certificate,
@@ -567,6 +684,8 @@ struct FreshSingletonCertificate {
     manager_regions: Vec<ExceptionRegion>,
     // A separate fresh-array proof may retain overlapping named-handler/outer ranges.
     named_handler_target: Option<Label>,
+    // Ordinary try fragments must keep their exact producer-authenticated identity.
+    ordinary_try_region: Option<OrdinarySingletonRegion>,
 }
 
 impl FreshSingletonCertificate {
@@ -623,17 +742,49 @@ impl FreshSingletonCertificate {
                     })
             })
             .collect::<Vec<_>>();
-        let (owner, removed, named_handler_target) = if let Some((owner, removed)) =
-            view.uniform_owned_interval(start, condition, false, Some(&manager_regions), false)
-        {
-            (owner, removed, None)
-        } else {
-            // Overlapping exception ranges do not populate a never-used array cell.
-            // Keep this authored handler proof separate from uniform-owner recovery.
-            let (target, regions) = view.fresh_named_handler_singleton_regions(start, condition)?;
-            manager_regions = regions;
-            (None, 0, Some(target))
-        };
+        let (owner, removed, named_handler_target, ordinary_try_region) =
+            if let Some((owner, removed)) =
+                view.uniform_owned_interval(start, condition, false, Some(&manager_regions), false)
+            {
+                (owner, removed, None, None)
+            } else if let Some((target, regions)) =
+                view.fresh_named_handler_singleton_regions(start, condition)
+            {
+                // Overlapping exception ranges do not populate a never-used array cell.
+                // Keep this authored handler proof separate from uniform-owner recovery.
+                manager_regions = regions;
+                (None, 0, Some(target), None)
+            } else {
+                if matches!(anchor, Anchor::Entry) {
+                    return None;
+                }
+                let region = view.fresh_ordinary_try_singleton_region(start, condition)?;
+                let setup = view
+                    .provenance
+                    .ordinary_try_region_origins
+                    .iter()
+                    .find_map(|(setup, begin, end, target)| {
+                        (*begin == region.start && *end == region.end && *target == region.target)
+                            .then_some(*setup)
+                    })?;
+                (
+                    None,
+                    0,
+                    None,
+                    Some(OrdinarySingletonRegion {
+                        setup,
+                        original: region,
+                        current: region,
+                        regions: view.regions.to_vec(),
+                        cold_transported: false,
+                        incoming: incoming(view, &labels_in(&view.items[start..=marker])),
+                        source_boundaries: boundaries_in(
+                            &view.items[start..=condition],
+                            &view.provenance.source_boundaries,
+                        ),
+                    }),
+                )
+            };
         if removed != 0 {
             return None;
         }
@@ -652,6 +803,7 @@ impl FreshSingletonCertificate {
             },
             manager_regions,
             named_handler_target,
+            ordinary_try_region,
         };
         result.valid(view, false)?;
         Some(result)
@@ -663,6 +815,10 @@ impl FreshSingletonCertificate {
             && view.original_array_start(start)? != start
         {
             return None;
+        }
+        if let Some(region) = &self.ordinary_try_region {
+            region.valid(view, &self.interval, start, condition)?;
+            return Some(marker);
         }
         if let Some(target) = self.named_handler_target {
             let (current_target, current) =
@@ -693,6 +849,43 @@ impl FreshSingletonCertificate {
             false,
         )?;
         (owner == self.interval.owner && removed == 0).then_some(marker)
+    }
+
+    fn rebind_ordinary_cold_regions(
+        &mut self,
+        view: &View<'_>,
+        retargets: &[(ExceptionRegion, ExceptionRegion)],
+        groups: &[(ExceptionRegion, usize)],
+    ) -> Option<()> {
+        if self.ordinary_try_region.is_none() || self.valid(view, false).is_some() {
+            return Some(());
+        }
+        let (start, condition, _) = self.interval.valid_array(view, false)?;
+        let witness = self.ordinary_try_region.as_mut()?;
+        if witness.cold_transported {
+            return None;
+        }
+        cold_region_replacements(&witness.regions, view.regions, retargets, Some(groups))?;
+        let regions = view.fresh_singleton_regions(start, condition)?;
+        let [region] = regions.as_slice() else {
+            return None;
+        };
+        let mut original_shape = *region;
+        original_shape.start = witness.original.start;
+        original_shape.end = witness.original.end;
+        if !same_manager_region(&original_shape, &witness.original)
+            || !retargets.iter().any(|(source, rebuilt)| {
+                same_manager_region(source, &witness.original)
+                    && same_manager_region(rebuilt, region)
+            })
+        {
+            return None;
+        }
+        witness.current = *region;
+        witness.regions = view.regions.to_vec();
+        witness.cold_transported = true;
+        self.valid(view, false)?;
+        Some(())
     }
 }
 impl FallbackCertificate {
@@ -819,7 +1012,7 @@ impl FallbackCertificate {
             == ExceptionPolicy::AlwaysAbsentPostTryCondition
             && matches!(anchor, Anchor::Label(_))
         {
-            before.post_try_fold_array(start, condition_index, marker_index)?
+            before.post_try_compacted_array(start, condition_index, marker_index)?
         } else {
             if marker.exception_policy().exclusion() != ExceptionExclusion::None
                 || !matches!(
@@ -956,7 +1149,7 @@ impl FallbackCertificate {
                             1,
                         )
                     } else {
-                        view.post_try_fold_array(start, condition, marker)?
+                        view.post_try_compacted_array(start, condition, marker)?
                     }
                 } else {
                     view.uniform_fallback_slots(start, condition)?
@@ -1004,8 +1197,8 @@ impl View<'_> {
         (removed == usize::from(fused)).then_some(owner)
     }
 
-    /// Certifies literal-fold vacancies in one uninterrupted post-try source array.
-    fn post_try_fold_array(
+    /// Certifies literal-fold or global-call vacancies in one post-try source array.
+    fn post_try_compacted_array(
         &self,
         start: usize,
         condition: usize,
@@ -1035,14 +1228,11 @@ impl View<'_> {
                 self.label_index(*label)
                     .is_none_or(|&index| start <= index && index <= marker)
             })
-            || !self.items[start..condition].iter().any(|item| {
-                matches!(item, Item::Instruction(instruction)
-                    if self.uniform_literal_fold_slots(*instruction).is_some())
-            })
         {
             return None;
         }
-        self.uniform_owned_interval(start, condition, false, None, true)
+        let (owner, removed) = self.uniform_owned_interval(start, condition, false, None, true)?;
+        (removed > 0).then_some((owner, removed))
     }
 
     /// Matches the unsaturated literal-fold count to its unique recorded survivor.
@@ -1120,13 +1310,12 @@ impl View<'_> {
         self.uniform_owned_interval(start, condition, observed_local_fusion, None, false)
     }
 
-    /// Proves a literal singleton array under one authored named-handler target.
-    /// No owner is copied: the marker is appended beyond every original live cell.
-    fn fresh_named_handler_singleton_regions(
+    /// Verifies an untouched literal-singleton array and its complete covering regions.
+    fn fresh_singleton_regions(
         &self,
         start: usize,
         condition: usize,
-    ) -> Option<(Label, Vec<ExceptionRegion>)> {
+    ) -> Option<Vec<ExceptionRegion>> {
         if start > condition || condition >= self.items.len() {
             return None;
         }
@@ -1198,7 +1387,32 @@ impl View<'_> {
             }
             position += 1;
         }
-        let regions = original_regions?;
+        original_regions
+    }
+
+    /// Proves a fresh cell under one unchanged, producer-authenticated ordinary try.
+    fn fresh_ordinary_try_singleton_region(
+        &self,
+        start: usize,
+        condition: usize,
+    ) -> Option<ExceptionRegion> {
+        let regions = self.fresh_singleton_regions(start, condition)?;
+        let [region] = regions.as_slice() else {
+            return None;
+        };
+        self.provenance
+            .is_original_ordinary_try_region(*region)
+            .then_some(*region)
+    }
+
+    /// Proves a literal singleton array under one authored named-handler target.
+    /// No owner is copied: the marker is appended beyond every original live cell.
+    fn fresh_named_handler_singleton_regions(
+        &self,
+        start: usize,
+        condition: usize,
+    ) -> Option<(Label, Vec<ExceptionRegion>)> {
+        let regions = self.fresh_singleton_regions(start, condition)?;
         let mut named = regions.iter().filter(|region| {
             !region.is_scope_fallback
                 && region.preserve_lasti
@@ -1986,6 +2200,7 @@ impl FoldedAssertSuccessCertificate {
 #[derive(Default)]
 pub(super) struct FusionOwnerCertificates {
     certificates: Vec<Certificate>,
+    builtin_guard_certificates: Vec<BuiltinGuardCertificate>,
     handler_dispatch_certificates: Vec<HandlerDispatchCertificate>,
     manager_setup_certificates: Vec<ManagerSetupCertificate>,
     fallback_certificates: Vec<FallbackCertificate>,
@@ -2206,6 +2421,10 @@ impl FusionOwnerCertificates {
         };
         let retain_tables = self.retain_captured_fusion_views(&before_view, &after_view);
         let mut result = Self::capture_views(&before_view, &after_view);
+        if p.python_version == crate::PythonVersion::Py314 {
+            result.builtin_guard_certificates =
+                BuiltinGuardCertificate::capture_all(&before_view, &after_view);
+        }
         if retain_tables {
             let mut tables = after_view.into_tables();
             tables.clear();
@@ -2258,7 +2477,11 @@ impl FusionOwnerCertificates {
         ) else {
             return Self::default();
         };
-        Self::capture_views(&b, &a)
+        let mut result = Self::capture_views(&b, &a);
+        if p.python_version == crate::PythonVersion::Py314 {
+            result.builtin_guard_certificates = BuiltinGuardCertificate::capture_all(&b, &a);
+        }
+        result
     }
 
     fn capture_views(b: &View<'_>, a: &View<'_>) -> Self {
@@ -2459,10 +2682,10 @@ impl FusionOwnerCertificates {
     pub(super) fn has_manager_setup_certificates(&self) -> bool {
         !self.handler_dispatch_certificates.is_empty()
             || !self.manager_setup_certificates.is_empty()
-            || self
-                .fresh_singleton_certificates
-                .iter()
-                .any(|certificate| !certificate.manager_regions.is_empty())
+            || !self.builtin_guard_certificates.is_empty()
+            || self.fresh_singleton_certificates.iter().any(|certificate| {
+                !certificate.manager_regions.is_empty() || certificate.ordinary_try_region.is_some()
+            })
     }
 
     /// Transfers exact source cells through the cold pass's recorded region splits.
@@ -2470,6 +2693,7 @@ impl FusionOwnerCertificates {
         &mut self,
         p: &OptimizationPipeline,
         retargets: &[(ExceptionRegion, ExceptionRegion)],
+        groups: &[(ExceptionRegion, usize)],
     ) {
         if self.is_empty() {
             return;
@@ -2486,6 +2710,16 @@ impl FusionOwnerCertificates {
         };
         self.handler_dispatch_certificates
             .retain_mut(|certificate| certificate.rebind_cold_region(&view, retargets).is_some());
+        self.builtin_guard_certificates.retain_mut(|certificate| {
+            certificate
+                .rebind_cold_regions(&view, retargets, groups)
+                .is_some()
+        });
+        self.fresh_singleton_certificates.retain_mut(|certificate| {
+            certificate
+                .rebind_ordinary_cold_regions(&view, retargets, groups)
+                .is_some()
+        });
         for certificate in &mut self.fresh_singleton_certificates {
             let mut transferred = Vec::new();
             for region in &certificate.manager_regions {
@@ -2561,6 +2795,7 @@ impl FusionOwnerCertificates {
 
     fn is_empty(&self) -> bool {
         self.certificates.is_empty()
+            && self.builtin_guard_certificates.is_empty()
             && self.handler_dispatch_certificates.is_empty()
             && self.manager_setup_certificates.is_empty()
             && self.fallback_certificates.is_empty()
@@ -2570,6 +2805,7 @@ impl FusionOwnerCertificates {
 
     fn clear(&mut self) {
         self.certificates.clear();
+        self.builtin_guard_certificates.clear();
         self.handler_dispatch_certificates.clear();
         self.manager_setup_certificates.clear();
         self.fallback_certificates.clear();
@@ -2608,6 +2844,8 @@ impl FusionOwnerCertificates {
 
     fn retain_view(&mut self, view: &View<'_>) {
         self.certificates.retain(|c| c.valid(view, false).is_some());
+        self.builtin_guard_certificates
+            .retain(|certificate| certificate.valid(view, false).is_some());
         self.handler_dispatch_certificates
             .retain(|c| c.valid(view, false).is_some());
         self.manager_setup_certificates
@@ -2657,6 +2895,13 @@ impl FusionOwnerCertificates {
             .certificates
             .iter()
             .filter_map(|c| Some((c.valid(&view, true)?, c.owner)))
+            .chain(
+                self.builtin_guard_certificates
+                    .iter()
+                    .filter_map(|certificate| {
+                        Some((certificate.valid(&view, true)?, certificate.owner()))
+                    }),
+            )
             .chain(
                 self.fallback_certificates
                     .iter()
@@ -3556,6 +3801,144 @@ mod tests {
         assert_eq!(items, expected);
     }
 
+    fn post_try_global_call_pipeline(globals: usize) -> OptimizationPipeline {
+        let mut pipeline =
+            fallback_pipeline(globals, ExceptionPolicy::AlwaysAbsentPostTryCondition);
+        pipeline
+            .exception_owner_provenance
+            .source_boundaries
+            .insert(Label::from_u32(0));
+        pipeline
+    }
+
+    #[test]
+    fn post_try_global_calls_reuse_only_uniform_original_slots() {
+        for globals in [1, 2, 3, 5] {
+            let pipeline = post_try_global_call_pipeline(globals);
+            let before = FusionOwnerCertificates::snapshot(&pipeline);
+            let certificates = FusionOwnerCertificates::capture(&before, &pipeline);
+            assert_eq!(certificates.fallback_certificates.len(), 1);
+            let mut items = before.clone();
+            certificates.apply(
+                &mut items,
+                &pipeline.exception_regions,
+                &pipeline.exception_owner_provenance,
+                &pipeline.preserved_block_boundaries,
+            );
+            let mut expected = before;
+            for item in &mut expected {
+                if let Item::Instruction(marker) = item
+                    && marker.opcode == NOT_TAKEN
+                {
+                    marker.set_exception_policy(ExceptionPolicy::NoneOverridePresent);
+                }
+            }
+            assert_eq!(items, expected);
+        }
+    }
+
+    #[test]
+    fn post_try_global_calls_reject_unknown_or_changed_slots() {
+        for change in 0..16 {
+            let mut pipeline = post_try_global_call_pipeline(1);
+            match change {
+                0 => pipeline
+                    .exception_owner_provenance
+                    .source_boundaries
+                    .clear(),
+                1 => pipeline.exception_owner_provenance.block_boundaries.clear(),
+                2 => pipeline.exception_regions[0].depth = 1,
+                3 => pipeline.exception_regions[0].is_scope_fallback = false,
+                4 => pipeline.exception_regions[0].preserve_lasti = false,
+                5 => pipeline
+                    .exception_regions
+                    .push(pipeline.exception_regions[0]),
+                6 => pipeline
+                    .exception_owner_provenance
+                    .setups
+                    .push((Label::from_u32(0), None)),
+                7 => {
+                    pipeline
+                        .exception_owner_provenance
+                        .removed_pop_block_boundaries
+                        .insert(Label::from_u32(0));
+                }
+                8..=12 => edit_singleton(&mut pipeline, |items| {
+                    let Item::Instruction(load) = &mut items[1] else {
+                        unreachable!();
+                    };
+                    match change {
+                        8 => load.set_operand(Operand::Value(0)),
+                        9 => load.add_pre_fold_extra_instructions(1),
+                        10 => load.local_policy.add_hidden_exception_owner_slots(1),
+                        11 => load.opcode = NOP,
+                        12 => load.set_exception_policy(ExceptionPolicy::AlwaysAbsent),
+                        _ => unreachable!(),
+                    }
+                }),
+                13..=15 => {
+                    let boundary = Label::from_u32(4);
+                    edit_singleton(&mut pipeline, |items| {
+                        items.insert(2, Item::Label(boundary));
+                    });
+                    match change {
+                        13 => {
+                            pipeline
+                                .exception_owner_provenance
+                                .source_boundaries
+                                .insert(boundary);
+                        }
+                        14 => {
+                            pipeline
+                                .exception_owner_provenance
+                                .block_boundaries
+                                .insert(boundary);
+                        }
+                        15 => {
+                            pipeline.preserved_block_boundaries.insert(boundary);
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                _ => unreachable!(),
+            }
+            let before = FusionOwnerCertificates::snapshot(&pipeline);
+            let certificates = FusionOwnerCertificates::capture(&before, &pipeline);
+            assert!(
+                certificates.fallback_certificates.is_empty(),
+                "case {change}"
+            );
+        }
+        for change in 0..4 {
+            let mut pipeline = post_try_global_call_pipeline(1);
+            let before = FusionOwnerCertificates::snapshot(&pipeline);
+            let mut certificates = FusionOwnerCertificates::capture(&before, &pipeline);
+            assert_eq!(certificates.fallback_certificates.len(), 1);
+            match change {
+                0 => pipeline.exception_regions[0].target = Label::from_u32(2),
+                1 => pipeline
+                    .exception_owner_provenance
+                    .source_boundaries
+                    .clear(),
+                2 => edit_singleton(&mut pipeline, |items| {
+                    let Item::Instruction(load) = &mut items[1] else {
+                        unreachable!();
+                    };
+                    load.set_operand(Operand::Value(3));
+                }),
+                3 => edit_singleton(&mut pipeline, |items| {
+                    items.insert(2, Item::Instruction(instruction(NOP, Operand::Value(0))));
+                }),
+                _ => unreachable!(),
+            }
+            certificates.retain_pipeline(&pipeline);
+            assert!(
+                certificates.fallback_certificates.is_empty(),
+                "later case {change}"
+            );
+        }
+    }
+
     #[test]
     fn post_try_literal_fold_rejects_missing_or_changed_provenance() {
         for change in 0..4 {
@@ -3898,6 +4281,271 @@ mod tests {
             crate::assembler::block_graph::BlockGraph::from_items(items, &FxHashSet::default());
     }
 
+    fn ordinary_singleton_pipeline() -> OptimizationPipeline {
+        let mut p = singleton_pipeline(true, true, ExceptionPolicy::NoneUnchangedBooleanSingleton);
+        let region = &mut p.exception_regions[0];
+        region.is_scope_fallback = false;
+        region.preserve_lasti = false;
+        p.exception_owner_provenance
+            .ordinary_try_setups
+            .insert(region.start, region.target);
+        p.exception_owner_provenance
+            .ordinary_try_region_origins
+            .push((region.start, region.start, region.end, region.target));
+        edit_singleton(&mut p, |items| {
+            let index = items.iter().position(|item| matches!(item,
+                Item::Instruction(instruction) if instruction.opcode == crate::target::opcodes::UNPACK_SEQUENCE)).unwrap();
+            items.insert(index, Item::Label(Label::from_u32(4)));
+        });
+        p.next_label = 5;
+        p
+    }
+
+    #[test]
+    fn singleton_ordinary_region_requires_original_complete_provenance() {
+        for mode in 0..13 {
+            let mut p = ordinary_singleton_pipeline();
+            match mode {
+                0 => {}
+                1 => p.exception_owner_provenance.ordinary_try_setups.clear(),
+                2 => p
+                    .exception_owner_provenance
+                    .ordinary_try_region_origins
+                    .clear(),
+                3 => p
+                    .exception_owner_provenance
+                    .ordinary_try_region_origins
+                    .push(p.exception_owner_provenance.ordinary_try_region_origins[0]),
+                4 => p.exception_regions[0].depth = 1,
+                5 => p.exception_regions[0].preserve_lasti = true,
+                6 => p.exception_regions.push(p.exception_regions[0]),
+                7 => p.exception_regions[0].target = Label::from_u32(2),
+                8 => {
+                    p.exception_owner_provenance
+                        .normal_try_copy_blocks
+                        .insert(Label::from_u32(4));
+                }
+                9 => {
+                    p.exception_owner_provenance
+                        .retired_normal_try_copy_labels
+                        .insert(Label::from_u32(4));
+                }
+                10 => {
+                    p.exception_owner_provenance
+                        .normal_try_copy_internal_labels
+                        .push(Label::from_u32(4));
+                }
+                11 => {
+                    p.exception_owner_provenance
+                        .removed_pop_block_widths
+                        .insert(Label::from_u32(4), 1);
+                }
+                12 => p
+                    .exception_owner_provenance
+                    .setups
+                    .push((Label::from_u32(4), None)),
+                _ => unreachable!(),
+            }
+            let certificates = FusionOwnerCertificates::capture_original_owners(&p);
+            assert_eq!(
+                certificates.fresh_singleton_certificates.len(),
+                usize::from(mode == 0),
+                "mode {mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn singleton_ordinary_region_expires_on_changed_array_or_provenance() {
+        for mode in 0..14 {
+            let mut p = ordinary_singleton_pipeline();
+            let mut certificates = FusionOwnerCertificates::capture_original_owners(&p);
+            assert_eq!(certificates.fresh_singleton_certificates.len(), 1);
+            match mode {
+                0 => {}
+                1 => p
+                    .exception_owner_provenance
+                    .ordinary_try_region_origins
+                    .clear(),
+                2 => {
+                    p.exception_owner_provenance
+                        .source_boundaries
+                        .insert(Label::from_u32(4));
+                }
+                3 => {
+                    p.exception_owner_provenance
+                        .normal_try_copy_blocks
+                        .insert(Label::from_u32(4));
+                }
+                4 => {
+                    p.exception_owner_provenance
+                        .retired_normal_try_copy_labels
+                        .insert(Label::from_u32(4));
+                }
+                5 => {
+                    p.exception_owner_provenance
+                        .normal_try_copy_internal_labels
+                        .push(Label::from_u32(4));
+                }
+                6 => {
+                    p.exception_owner_provenance
+                        .removed_pop_block_widths
+                        .insert(Label::from_u32(4), 1);
+                }
+                7 => {
+                    p.exception_regions[0].priority =
+                        ExceptionRegionPriority::Resolved { start: 0, end: 1 }
+                }
+                8 => p.exception_regions[0].end = Label::from_u32(2),
+                9 => p.exception_regions.push(p.exception_regions[0]),
+                10 => edit_singleton(&mut p, |items| {
+                    items.push(Item::Instruction(instruction(
+                        JUMP_FORWARD,
+                        Operand::Forward(Label::from_u32(4)),
+                    )));
+                }),
+                11 => edit_singleton(&mut p, |items| {
+                    let item = items
+                        .iter_mut()
+                        .find_map(|item| match item {
+                            Item::Instruction(i) if i.opcode == crate::target::opcodes::IS_OP => {
+                                Some(i)
+                            }
+                            _ => None,
+                        })
+                        .unwrap();
+                    item.location = SourceLocation::new(9, 9, 1, 5);
+                }),
+                12 => p
+                    .exception_owner_provenance
+                    .setups
+                    .push((Label::from_u32(4), None)),
+                13 => {
+                    p.exception_owner_provenance.ordinary_try_region_origins[0].0 =
+                        Label::from_u32(2);
+                    p.exception_owner_provenance
+                        .ordinary_try_setups
+                        .insert(Label::from_u32(2), Label::from_u32(3));
+                }
+                _ => unreachable!(),
+            }
+            certificates.retain_pipeline(&p);
+            assert_eq!(
+                certificates.fresh_singleton_certificates.len(),
+                usize::from(mode == 0),
+                "mode {mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn cold_region_zero_groups_require_explicit_producer_counts() {
+        let p = ordinary_singleton_pipeline();
+        let original = p.exception_regions[0];
+        assert!(cold_region_replacements(&[original], &[], &[], None).is_none());
+        assert!(cold_region_replacements(&[original], &[], &[], Some(&[])).is_none());
+        assert!(cold_region_replacements(&[original], &[], &[], Some(&[(original, 1)])).is_none());
+        assert!(cold_region_replacements(&[original], &[], &[], Some(&[(original, 0)])).is_some());
+        assert!(
+            cold_region_replacements(&[original], &[original], &[(original, original)], None)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn singleton_ordinary_region_transfers_only_complete_ordered_cold_receipts_once() {
+        for mode in 0..24 {
+            let mut p = ordinary_singleton_pipeline();
+            let original = p.exception_regions[0];
+            let unrelated = ExceptionRegion {
+                start: Label::from_u32(2),
+                end: Label::from_u32(3),
+                ..original
+            };
+            p.exception_regions.push(unrelated);
+            let mut certificates = FusionOwnerCertificates::capture_original_owners(&p);
+            assert_eq!(certificates.fresh_singleton_certificates.len(), 1);
+            assert!(certificates.has_manager_setup_certificates());
+            let rebuilt = ExceptionRegion {
+                start: Label::from_u32(4),
+                ..original
+            };
+            p.exception_regions[0] = rebuilt;
+            let mut receipts = vec![(original, rebuilt), (unrelated, unrelated)];
+            let mut groups = vec![(original, 1), (unrelated, 1)];
+            if mode >= 20 {
+                p.exception_regions.pop();
+                receipts.pop();
+                groups[1].1 = 0;
+            }
+            match mode {
+                0 | 11 => {}
+                1 => {
+                    receipts.remove(0);
+                }
+                2 => {
+                    receipts.pop();
+                }
+                3 => receipts.reverse(),
+                4 => receipts.push((original, rebuilt)),
+                5 => receipts[0].0.end = Label::from_u32(2),
+                6 => {
+                    receipts[0].1.depth = 1;
+                    p.exception_regions[0] = receipts[0].1;
+                }
+                7 => {
+                    receipts[0].1.preserve_lasti = true;
+                    p.exception_regions[0] = receipts[0].1;
+                }
+                8 => {
+                    receipts[0].1.target = Label::from_u32(2);
+                    p.exception_regions[0] = receipts[0].1;
+                }
+                9 => {
+                    receipts[0].1.priority = ExceptionRegionPriority::Resolved { start: 0, end: 1 };
+                    p.exception_regions[0] = receipts[0].1;
+                }
+                10 => p.exception_regions.reverse(),
+                12 => {
+                    p.exception_regions.pop();
+                    receipts.pop();
+                    groups[1].1 = 0;
+                }
+                13 => groups[0].1 = 0,
+                14 => {
+                    groups.pop();
+                }
+                15 => groups.push((unrelated, 0)),
+                16 => groups.reverse(),
+                17 => groups[0].0.target = Label::from_u32(2),
+                18 => groups[1].1 = 0,
+                19 => groups[0].0.priority = ExceptionRegionPriority::Resolved { start: 0, end: 1 },
+                20 => {
+                    groups.pop();
+                }
+                21 => groups.push((unrelated, 0)),
+                22 => groups.reverse(),
+                23 => groups[1].0.target = Label::from_u32(2),
+                _ => unreachable!(),
+            }
+            certificates.retain_after_cold_regions(&p, &receipts, &groups);
+            assert_eq!(
+                certificates.fresh_singleton_certificates.len(),
+                usize::from(mode == 0 || mode == 11 || mode == 12),
+                "mode {mode}"
+            );
+            if mode == 11 {
+                p.exception_regions[0] = original;
+                certificates.retain_after_cold_regions(
+                    &p,
+                    &[(rebuilt, original), (unrelated, unrelated)],
+                    &[(rebuilt, 1), (unrelated, 1)],
+                );
+                assert!(certificates.fresh_singleton_certificates.is_empty());
+            }
+        }
+    }
+
     #[test]
     fn singleton_original_array_without_compaction_uses_fresh_null_slot() {
         for fallthrough in [false, true] {
@@ -4089,9 +4737,9 @@ mod tests {
                 reported_original.end = Label::from_u32(2);
             }
             if mode == 0 {
-                certificates.retain_after_cold_regions(&p, &[]);
+                certificates.retain_after_cold_regions(&p, &[], &[]);
             } else {
-                certificates.retain_after_cold_regions(&p, &[(reported_original, rebuilt)]);
+                certificates.retain_after_cold_regions(&p, &[(reported_original, rebuilt)], &[]);
             }
             assert_eq!(
                 certificates.fresh_singleton_certificates.len(),

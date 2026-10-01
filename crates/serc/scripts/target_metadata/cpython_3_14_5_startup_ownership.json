@@ -272,7 +272,7 @@
     "0x0000000000000001 (NEEDED)             Shared library: [libc.so.6]"
   ],
   "generator_sha256": "213b3eb873f964a5016088ef2004a3a29f1cff308a1f019a01b9a237ddc52980",
-  "header_provenance_sha256": "41d690e04c7ad461bb7b9f3b71347927e2c65a9881cf5c9ae2083f62a0a8b419",
+  "header_provenance_sha256": "cda8cdd1791f626a903e10e973a616332721e59d38dcc7aafa84c2a665d73e69",
   "header_target": "CPython 3.14.5 default-GIL x86_64",
   "helper_sha256": "3aa2465a19c46c6c24c17e84c2123faa0e4c5cc41d218f791ec5e154ccfc3801",
   "layout_sha256": "be47865f2eedcf8688fe4fe7c4726217d67fb349edda8d195b947417db0a1b04",

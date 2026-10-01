@@ -3030,6 +3030,73 @@ fn cleans_docstrings_like_cpython() {
 }
 
 #[test]
+fn erased_comprehension_branch_assertions_preserve_original_return_donors() {
+    for scope in ["def", "async def"] {
+        for comprehension in [
+            "[item for item in items]",
+            "{item for item in items}",
+            "{item: item.value for item in items}",
+        ] {
+            for (left_prefix, right_prefix) in [
+                ("", ""),
+                ("        prefix = [item for item in items]\n", ""),
+                ("", "        prefix = [item for item in items]\n"),
+                (
+                    "        prefix = [item for item in items]\n",
+                    "        prefix = [item for item in items]\n",
+                ),
+                (
+                    "        prefix = {item for item in items if item}\n",
+                    "        prefix = {item: item.value for item in items}\n",
+                ),
+                (
+                    "        prefix = [item for group in items if group for item in group if item]\n",
+                    "        prefix = [item for group in items for item in group]\n",
+                ),
+            ] {
+                let source = format!(
+                    "{scope} f(flag, items):\n    if flag:\n{left_prefix}        out = {comprehension}\n        assert out\n    else:\n{right_prefix}        out = {comprehension}\n        assert out\n    assert flag\n"
+                );
+                let neighbor = source.replace("        assert out", "");
+                for python_version in [
+                    crate::PythonVersion::Py312,
+                    crate::PythonVersion::Py313,
+                    crate::PythonVersion::Py314,
+                    crate::PythonVersion::Py315,
+                ] {
+                    for optimization_level in [
+                        crate::OptimizationLevel::Zero,
+                        crate::OptimizationLevel::One,
+                        crate::OptimizationLevel::Two,
+                    ] {
+                        let options = crate::CompileOptions {
+                            python_version,
+                            optimization_level,
+                            ..crate::CompileOptions::default()
+                        };
+                        let compile = |source: &str| {
+                            crate::compile_with_options(source, "comprehension_footer.py", &options)
+                                .unwrap()
+                                .marshal()
+                        };
+                        let actual = compile(&source);
+                        let expected = compile(&neighbor);
+                        if optimization_level == crate::OptimizationLevel::Zero {
+                            assert_ne!(actual, expected);
+                        } else {
+                            assert_eq!(
+                                actual, expected,
+                                "{python_version:?} {optimization_level:?}: {source}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn uncopied_assertion_backedges_keep_source_positions() {
     use crate::target::opcodes::JUMP_BACKWARD;
 

@@ -10,6 +10,912 @@ use crate::target::opcodes::*;
 use crate::target::operands::{CommonConstant, Conversion, FunctionAttribute, ResumeLocation};
 
 #[test]
+fn folded_try_manager_pop_requires_original_forward_breaks() {
+    for adjacent in [false, true] {
+        for mutation in [
+            "intact",
+            "missing exit",
+            "missing folded edge",
+            "unlocated break",
+            "conditional break",
+            "backward break",
+            "hidden break",
+            "extra break slot",
+            "retained break",
+            "authored bridge nop",
+            "located pop",
+            "small cleanup",
+            "not authored",
+            "handler alias",
+            "setup alias",
+            "blocked bridge",
+            "blocked break",
+        ] {
+            let mut assembler = Assembler::default();
+            let entry = assembler.label();
+            let target = assembler.label();
+            let location = SourceLocation::new(6, 6, 8, 13);
+            assembler.push_linear_item(Item::Instruction(Instruction::new(
+                POP_TOP,
+                Operand::Value(0),
+                location,
+                Some(2),
+            )));
+            let mut jump =
+                Instruction::new(JUMP_FORWARD, Operand::Forward(entry), location, Some(2));
+            if mutation != "not authored" {
+                jump.fusion_policy.mark_authored_break();
+            }
+            jump.jump_policy.prevent_threading_target();
+            jump.jump_policy.retain_nop_for_direct_target();
+            match mutation {
+                "unlocated break" => jump.location = SourceLocation::NONE,
+                "conditional break" => jump.opcode = POP_JUMP_IF_FALSE,
+                "backward break" => jump.set_operand(Operand::Backward(entry)),
+                "hidden break" => jump.local_policy.add_hidden_exception_owner_slots(1),
+                "extra break slot" => jump.add_pre_fold_extra_instructions(1),
+                "retained break" => jump.jump_policy.retain_nop(),
+                "blocked break" => jump.jump_policy.prevent_small_exit_inlining(),
+                _ => {}
+            }
+            assembler.push_linear_item(Item::Instruction(jump));
+            if !adjacent {
+                assembler.push_linear_item(Item::Instruction(Instruction::new(
+                    RAISE_VARARGS,
+                    Operand::Value(0),
+                    location,
+                    Some(2),
+                )));
+            }
+            assembler.mark(entry);
+            if mutation == "handler alias" {
+                assembler.add_exception_region(entry, target, entry, 2, false);
+            }
+            if mutation == "setup alias" {
+                assembler.record_exception_setup(entry, false);
+            }
+            if mutation != "missing folded edge" {
+                assembler.record_folded_loop_exit_anchor(entry);
+            }
+            if mutation == "authored bridge nop" {
+                assembler.original_nop_targets.insert(entry);
+            }
+            if mutation != "missing exit" {
+                assembler
+                    .exception_owner_provenance
+                    .normal_try_exits
+                    .push((entry, target));
+            }
+            let mut bridge = Instruction::new(
+                JUMP_FORWARD,
+                Operand::Forward(target),
+                SourceLocation::NONE,
+                Some(2),
+            );
+            if mutation == "blocked bridge" {
+                bridge.jump_policy.prevent_small_exit_inlining();
+            }
+            assembler.push_linear_item(Item::Instruction(bridge));
+            assembler.mark(target);
+            let marker_index = assembler.instruction_count();
+            let mut marker =
+                Instruction::new(NOP, Operand::Value(0), SourceLocation::NONE, Some(2));
+            marker.fusion_policy.mark_converted_pop_block();
+            marker.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
+            if mutation == "located pop" {
+                marker.location = location;
+            }
+            let marker_item = assembler.linear_items().len();
+            assembler.push_linear_item(Item::Instruction(marker));
+            for _ in 0..if mutation == "small cleanup" { 1 } else { 4 } {
+                assembler.push_linear_item(Item::Instruction(Instruction::new(
+                    LOAD_CONST,
+                    Operand::Value(0),
+                    location,
+                    Some(2),
+                )));
+            }
+            assembler.push_linear_item(Item::Instruction(Instruction::new(
+                RETURN_VALUE,
+                Operand::Value(0),
+                location,
+                Some(2),
+            )));
+            let before = assembler.linear_items().to_vec();
+            assembler.preserve_with_pop_after_folded_try_bridge(marker_index);
+            if matches!(mutation, "intact" | "blocked bridge") {
+                marker.no_location_policy.preserve_location();
+                assert_eq!(
+                    assembler.linear_items()[marker_item],
+                    Item::Instruction(marker)
+                );
+            } else {
+                assert_eq!(assembler.linear_items(), before, "{adjacent}: {mutation}");
+            }
+        }
+    }
+}
+
+#[test]
+fn shared_legacy_join_requires_original_unmodified_forward_edges() {
+    for version in [
+        crate::PythonVersion::Py312,
+        crate::PythonVersion::Py313,
+        crate::PythonVersion::Py314,
+        crate::PythonVersion::Py315,
+    ] {
+        for mutation in [
+            "intact",
+            "conditional",
+            "backward opcode",
+            "backward",
+            "hidden",
+            "compacted",
+            "missing source",
+            "missing block",
+            "folded condition",
+            "folded else",
+            "authored nop",
+            "borrow alias",
+            "fusion",
+            "continuation",
+            "setup",
+            "handler",
+            "no fallthrough",
+            "populated join",
+        ] {
+            let mut assembler = Assembler::with_python_version(version);
+            let join = assembler.label();
+            let start = assembler.label();
+            let mut jump = Instruction::new(
+                JUMP_FORWARD,
+                Operand::Forward(join),
+                SourceLocation::NONE,
+                Some(0),
+            );
+            match mutation {
+                "conditional" => jump.opcode = POP_JUMP_IF_FALSE,
+                "backward opcode" => jump.opcode = JUMP_BACKWARD,
+                "backward" => jump.set_operand(Operand::Backward(join)),
+                "hidden" => jump.local_policy.add_hidden_exception_owner_slots(1),
+                "compacted" => jump.add_pre_fold_extra_instructions(1),
+                _ => {}
+            }
+            let fallthrough = Instruction::new(
+                if mutation == "no fallthrough" {
+                    RETURN_VALUE
+                } else {
+                    STORE_FAST
+                },
+                Operand::Value(0),
+                SourceLocation::new(3, 3, 4, 9),
+                Some(0),
+            );
+            assembler.code = UnoptimizedCode::Linear(vec![
+                Item::Label(start),
+                Item::Instruction(jump),
+                Item::Instruction(fallthrough),
+                Item::Label(join),
+            ]);
+            assembler.record_exception_owner_block_boundary(join);
+            match mutation {
+                "missing source" => {
+                    assembler
+                        .exception_owner_provenance
+                        .source_boundaries
+                        .remove(&join);
+                }
+                "missing block" => {
+                    assembler
+                        .exception_owner_provenance
+                        .block_boundaries
+                        .remove(&join);
+                }
+                "folded condition" => {
+                    assembler.folded_away_condition_targets.insert(join);
+                }
+                "folded else" => {
+                    assembler.folded_away_loop_else_targets.insert(join);
+                }
+                "authored nop" => {
+                    assembler.original_nop_targets.insert(join);
+                }
+                "borrow alias" => {
+                    assembler.borrow_block_aliases.insert(join);
+                }
+                "fusion" => {
+                    assembler
+                        .exception_owner_provenance
+                        .fusion_boundaries
+                        .insert(join);
+                }
+                "continuation" => {
+                    assembler
+                        .exception_owner_provenance
+                        .continuation_boundaries
+                        .insert(join);
+                }
+                "setup" => assembler.record_exception_setup(join, false),
+                "handler" => assembler.add_exception_region(start, join, join, 0, false),
+                "populated join" => {
+                    assembler.emit_with_depth(NOP, 0, 0, ExceptionPolicy::default());
+                }
+                _ => {}
+            }
+            assert!(
+                !assembler.at_original_shared_handler_join(),
+                "{version:?}: {mutation}"
+            );
+            assert_eq!(
+                assembler.at_original_shared_legacy_join(),
+                version == crate::PythonVersion::Py313 && mutation == "intact",
+                "{version:?}: {mutation}"
+            );
+        }
+    }
+}
+
+#[test]
+fn original_while_exit_donor_requires_one_unmodified_condition_edge() {
+    let location = SourceLocation::new(9, 9, 10, 17);
+    for version in [
+        crate::PythonVersion::Py312,
+        crate::PythonVersion::Py313,
+        crate::PythonVersion::Py314,
+        crate::PythonVersion::Py315,
+    ] {
+        for opcode in [POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE] {
+            for backedge_opcode in [JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT] {
+                for mutation in [
+                    "intact",
+                    "alias",
+                    "missing labels",
+                    "populated join",
+                    "no incoming",
+                    "shared join",
+                    "condition opcode",
+                    "condition backward",
+                    "condition location",
+                    "condition depth",
+                    "condition folded",
+                    "condition hidden",
+                    "condition preserved",
+                    "backedge opcode",
+                    "backedge forward",
+                    "backedge to exit",
+                    "backedge depth",
+                    "backedge folded",
+                    "backedge hidden",
+                    "backedge preserved",
+                    "missing source",
+                    "missing block",
+                    "authored nop",
+                    "borrow alias",
+                    "fusion boundary",
+                    "continuation boundary",
+                    "setup boundary",
+                    "handler boundary",
+                    "folded condition",
+                    "folded else",
+                ] {
+                    let mut assembler = Assembler::with_python_version(version);
+                    let head = assembler.label();
+                    let exit = assembler.label();
+                    let alias = assembler.label();
+                    let mut condition =
+                        Instruction::new(opcode, Operand::Forward(exit), location, Some(0));
+                    let mut backedge = Instruction::new(
+                        backedge_opcode,
+                        Operand::Backward(head),
+                        SourceLocation::new(10, 10, 8, 22),
+                        Some(0),
+                    );
+                    match mutation {
+                        "no incoming" => condition.set_operand(Operand::Forward(head)),
+                        "condition opcode" => condition.opcode = NOP,
+                        "condition backward" => condition.set_operand(Operand::Backward(exit)),
+                        "condition location" => condition.location = SourceLocation::NONE,
+                        "condition depth" => {
+                            condition =
+                                Instruction::new(opcode, Operand::Forward(exit), location, Some(1));
+                        }
+                        "condition folded" => condition.add_pre_fold_extra_instructions(1),
+                        "condition hidden" => {
+                            condition.local_policy.add_hidden_exception_owner_slots(1);
+                        }
+                        "condition preserved" => condition.no_location_policy.preserve_location(),
+                        "backedge opcode" => backedge.opcode = JUMP_FORWARD,
+                        "backedge forward" => backedge.set_operand(Operand::Forward(head)),
+                        "backedge to exit" => backedge.set_operand(Operand::Backward(exit)),
+                        "backedge depth" => {
+                            backedge = Instruction::new(
+                                backedge_opcode,
+                                Operand::Backward(head),
+                                backedge.location,
+                                Some(1),
+                            );
+                        }
+                        "backedge folded" => backedge.add_pre_fold_extra_instructions(1),
+                        "backedge hidden" => {
+                            backedge.local_policy.add_hidden_exception_owner_slots(1);
+                        }
+                        "backedge preserved" => backedge.no_location_policy.preserve_location(),
+                        _ => {}
+                    }
+                    assembler.push_linear_item(Item::Label(head));
+                    assembler.push_linear_item(Item::Instruction(condition));
+                    if mutation == "shared join" {
+                        assembler.push_linear_item(Item::Instruction(condition));
+                    }
+                    assembler.push_linear_item(Item::Instruction(backedge));
+                    if mutation != "missing labels" {
+                        assembler.push_linear_item(Item::Label(exit));
+                    }
+                    if mutation == "alias" {
+                        assembler.push_linear_item(Item::Label(alias));
+                    }
+                    if mutation == "populated join" {
+                        assembler.push_linear_item(Item::Instruction(Instruction::new(
+                            NOP,
+                            Operand::Value(0),
+                            location,
+                            Some(0),
+                        )));
+                    }
+                    let provenance = &mut assembler.exception_owner_provenance;
+                    if mutation != "missing source" {
+                        provenance.source_boundaries.insert(exit);
+                    }
+                    if mutation != "missing block" {
+                        provenance.block_boundaries.insert(exit);
+                    }
+                    match mutation {
+                        "fusion boundary" => {
+                            provenance.fusion_boundaries.insert(exit);
+                        }
+                        "continuation boundary" => {
+                            provenance.continuation_boundaries.insert(exit);
+                        }
+                        "setup boundary" => provenance.setups.push((exit, None)),
+                        "handler boundary" => {
+                            assembler.add_exception_region(head, alias, exit, 0, false);
+                        }
+                        "authored nop" => {
+                            assembler.original_nop_targets.insert(exit);
+                        }
+                        "borrow alias" => {
+                            assembler.borrow_block_aliases.insert(exit);
+                        }
+                        "folded condition" => {
+                            assembler.folded_away_condition_targets.insert(exit);
+                        }
+                        "folded else" => {
+                            assembler.folded_away_loop_else_targets.insert(exit);
+                        }
+                        _ => {}
+                    }
+                    let original = assembler.linear_items().to_vec();
+                    assert_eq!(
+                        assembler.original_while_exit_has_false_donor(location),
+                        matches!(mutation, "intact" | "alias"),
+                        "{version:?} {opcode:?} {backedge_opcode:?} {mutation}",
+                    );
+                    assert_eq!(assembler.linear_items(), original);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn nested_finally_exit_donor_requires_full_records_and_one_original_edge() {
+    let location = SourceLocation::new(9, 9, 16, 34);
+    for version in [crate::PythonVersion::Py314, crate::PythonVersion::Py315] {
+        for mutation in 0..36 {
+            let mut assembler = Assembler::with_python_version(version);
+            let end = assembler.label();
+            let alias = assembler.label();
+            let mut records = [
+                Instruction::new(POP_TOP, Operand::Value(0), location, Some(1)),
+                Instruction::new(JUMP_FORWARD, Operand::Forward(end), location, Some(1)),
+                Instruction::new(COPY, Operand::Value(3), SourceLocation::NONE, Some(5)),
+                Instruction::new(POP_EXCEPT, Operand::Value(0), SourceLocation::NONE, Some(4)),
+                Instruction::new(RERAISE, Operand::Value(1), SourceLocation::NONE, Some(1)),
+            ];
+            if (1..=30).contains(&mutation) {
+                let instruction = &mut records[(mutation - 1) / 6];
+                match (mutation - 1) % 6 {
+                    0 => instruction.opcode = NOP,
+                    1 => instruction.set_operand(Operand::Value(7)),
+                    2 => instruction.location = SourceLocation::new(99, 99, 0, 1),
+                    3 => {
+                        *instruction = Instruction::new(
+                            instruction.opcode,
+                            instruction.operand(),
+                            instruction.location,
+                            Some(2),
+                        );
+                    }
+                    4 => instruction.local_policy.add_hidden_exception_owner_slots(1),
+                    5 => instruction.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS),
+                    _ => unreachable!(),
+                }
+            }
+            if mutation == 31 {
+                assembler.push_linear_item(Item::Instruction(Instruction::new(
+                    JUMP_FORWARD,
+                    Operand::Forward(alias),
+                    location,
+                    Some(1),
+                )));
+            }
+            for record in records {
+                assembler.push_linear_item(Item::Instruction(record));
+            }
+            assembler.mark(end);
+            assembler.record_exception_owner_block_boundary(end);
+            assembler.mark(alias);
+            match mutation {
+                32 => {
+                    assembler
+                        .exception_owner_provenance
+                        .source_boundaries
+                        .remove(&end);
+                }
+                33 => {
+                    assembler
+                        .exception_owner_provenance
+                        .block_boundaries
+                        .remove(&end);
+                }
+                34 => {
+                    assembler.folded_away_condition_targets.insert(alias);
+                }
+                35 => {
+                    assembler.folded_away_loop_else_targets.insert(alias);
+                }
+                _ => {}
+            }
+            let before = assembler.linear_items().to_vec();
+            assert_eq!(
+                assembler.original_nested_finally_exit_has_donor(location),
+                mutation == 0,
+                "{version:?}: mutation {mutation}",
+            );
+            assert_eq!(assembler.linear_items(), before);
+        }
+    }
+}
+
+#[test]
+fn recovery_normal_exit_requires_a_populated_original_source() {
+    for version in [
+        crate::PythonVersion::Py312,
+        crate::PythonVersion::Py313,
+        crate::PythonVersion::Py314,
+        crate::PythonVersion::Py315,
+    ] {
+        for mutation in [
+            "intact",
+            "exception alias",
+            "nop only",
+            "empty",
+            "missing source",
+            "preserved head",
+            "preserved alias",
+            "separate empty array",
+            "jump",
+            "return",
+            "marker",
+            "empty policy",
+            "borrow barrier",
+        ] {
+            let mut assembler = Assembler::with_python_version(version);
+            let head = assembler.label();
+            let alias = assembler.label();
+            assembler.mark(head);
+            assembler.record_exception_owner_block_boundary(head);
+            let location = SourceLocation::new(4, 4, 8, 18);
+            let mut work = Instruction::new(CALL, Operand::Value(0), location, Some(1));
+            match mutation {
+                "missing source" => {
+                    assembler
+                        .exception_owner_provenance
+                        .source_boundaries
+                        .remove(&head);
+                }
+                "preserved head" => {
+                    assembler.preserved_block_boundaries.insert(head);
+                }
+                "jump" => work.set_operand(Operand::Forward(alias)),
+                "return" => work.opcode = RETURN_VALUE,
+                "marker" => work.opcode = NOT_TAKEN,
+                "nop only" => work.opcode = NOP,
+                "empty policy" => work.jump_policy.mark_borrow_empty_block(),
+                "borrow barrier" => work
+                    .no_location_policy
+                    .set_borrow_fallthrough(BorrowFallthrough::Barrier),
+                _ => {}
+            }
+            if mutation != "empty" {
+                assembler.push_linear_item(Item::Instruction(work));
+                assembler.push_linear_item(Item::Instruction(Instruction::new(
+                    if mutation == "nop only" { NOP } else { POP_TOP },
+                    Operand::Value(0),
+                    location,
+                    Some(0),
+                )));
+            }
+            assembler.mark(alias);
+            match mutation {
+                "preserved alias" => {
+                    assembler.preserved_block_boundaries.insert(alias);
+                }
+                "separate empty array" => {
+                    assembler.record_exception_owner_block_boundary(alias);
+                }
+                _ => {}
+            }
+            assert_eq!(
+                assembler.current_original_block_has_nonempty_borrow_source(),
+                matches!(mutation, "intact" | "exception alias" | "nop only"),
+                "{version:?} {mutation}"
+            );
+            assert_eq!(
+                assembler.current_original_block_has_runtime_borrow_source(),
+                matches!(mutation, "intact" | "exception alias"),
+                "{version:?} {mutation}"
+            );
+        }
+    }
+}
+
+fn outer_try_iterator_return(
+    version: crate::PythonVersion,
+    opcode: crate::target::Opcode,
+) -> (Assembler, super::CopiedFinallyReturnPrefix, super::Label) {
+    let mut assembler = Assembler::with_python_version(version);
+    let entry = assembler.label();
+    let outer_pop = assembler.label();
+    let slots = if version == crate::PythonVersion::Py315 {
+        2
+    } else {
+        1
+    };
+    assembler.mark(entry);
+    assembler.set_location(SourceLocation::new(8, 9, 12, 20));
+    assembler.emit_with_depth(opcode, 0, slots + 2, ExceptionPolicy::default());
+    assembler.emit_with_depth(POP_TOP, 0, slots + 1, ExceptionPolicy::default());
+    let prefix = assembler.copied_finally_return_prefix().unwrap();
+    assembler.set_location(SourceLocation::NONE);
+    assembler.emit_with_depth(SWAP, slots + 1, slots + 1, ExceptionPolicy::default());
+    for depth in (1..=slots).rev() {
+        assembler.emit_with_depth(POP_TOP, 0, depth, ExceptionPolicy::default());
+    }
+    assembler.mark(outer_pop);
+    assembler.emit_with_depth(RETURN_VALUE, 0, 0, ExceptionPolicy::default());
+    (assembler, prefix, outer_pop)
+}
+
+#[test]
+fn outer_try_iterator_return_binds_original_prefix_and_canonical_footer() {
+    for version in [crate::PythonVersion::Py314, crate::PythonVersion::Py315] {
+        for opcode in [CALL, END_SEND] {
+            for mutation in [
+                "intact",
+                "prefix span",
+                "prefix opcode",
+                "prefix operand",
+                "prefix offset",
+                "foreign stream",
+                "donor moved",
+                "footer opcode",
+                "footer operand",
+                "footer depth",
+                "footer location",
+                "footer local",
+                "footer no location",
+                "footer jump",
+                "footer fusion",
+                "footer owner",
+                "footer width",
+                "footer admission",
+                "footer folded",
+                "footer annotation",
+                "footer extra",
+                "missing boundary",
+                "duplicate boundary",
+                "extra alias",
+                "foreign incoming",
+                "prepared",
+                "legacy",
+            ] {
+                let (mut assembler, mut prefix, outer_pop) =
+                    outer_try_iterator_return(version, opcode);
+                let foreign = assembler.label();
+                let last = assembler.item_count() - 1;
+                match mutation {
+                    "prefix span" => {
+                        for index in 1..3 {
+                            let Item::Instruction(record) =
+                                &mut assembler.linear_items_mut()[index]
+                            else {
+                                panic!()
+                            };
+                            record.location = SourceLocation::new(10, 10, 0, 4);
+                        }
+                    }
+                    "prefix opcode" => {
+                        let Item::Instruction(record) = &mut assembler.linear_items_mut()[1] else {
+                            panic!()
+                        };
+                        record.opcode = if opcode == CALL { END_SEND } else { CALL };
+                    }
+                    "prefix operand" => {
+                        let Item::Instruction(record) = &mut assembler.linear_items_mut()[1] else {
+                            panic!()
+                        };
+                        record.set_operand(Operand::Value(1));
+                    }
+                    "prefix offset" => prefix.cleanup_end += 1,
+                    "foreign stream" => prefix.stream = super::ir::EmissionStreamId::next(),
+                    "donor moved" => assembler.linear_items_mut().swap(1, 2),
+                    "footer extra" => {
+                        let UnoptimizedCode::Linear(items) = &mut assembler.code else {
+                            unreachable!()
+                        };
+                        items.insert(last, pass_instruction(NOP, 0, 0));
+                    }
+                    "missing boundary" => {
+                        assembler.linear_items_mut()[last - 1] = Item::Label(foreign);
+                    }
+                    "duplicate boundary" => {
+                        assembler.linear_items_mut()[0] = Item::Label(outer_pop);
+                    }
+                    "extra alias" => {
+                        let UnoptimizedCode::Linear(items) = &mut assembler.code else {
+                            unreachable!()
+                        };
+                        items.insert(last, Item::Label(foreign));
+                    }
+                    "foreign incoming" => {
+                        assembler.linear_items_mut()[0] = Item::Instruction(Instruction::new(
+                            JUMP_FORWARD,
+                            Operand::Forward(outer_pop),
+                            SourceLocation::NONE,
+                            Some(0),
+                        ));
+                    }
+                    "prepared" => {
+                        let graph = super::block_graph::BlockGraph::from_items(
+                            assembler.linear_items().to_vec(),
+                            &rustc_hash::FxHashSet::default(),
+                        );
+                        let reachable = graph.reachable_blocks(&[]);
+                        assembler.code = UnoptimizedCode::Prepared { graph, reachable };
+                        assert!(assembler.copied_finally_return_prefix().is_none());
+                    }
+                    "legacy" => assembler.python_version = crate::PythonVersion::Py313,
+                    "intact" => {}
+                    _ => {
+                        let Item::Instruction(record) = &mut assembler.linear_items_mut()[3] else {
+                            panic!()
+                        };
+                        match mutation {
+                            "footer opcode" => record.opcode = NOP,
+                            "footer operand" => record.set_operand(Operand::Value(0)),
+                            "footer depth" => {
+                                *record = Instruction::new(
+                                    record.opcode,
+                                    record.operand(),
+                                    record.location,
+                                    None,
+                                );
+                            }
+                            "footer location" => record.location = SourceLocation::new(1, 1, 0, 4),
+                            "footer local" => record.local_policy.mark_force_borrowed_load(),
+                            "footer no location" => record
+                                .no_location_policy
+                                .set_borrow_fallthrough(BorrowFallthrough::Barrier),
+                            "footer jump" => record.jump_policy.retain_nop(),
+                            "footer fusion" => record.fusion_policy.prevent_with_previous(),
+                            "footer owner" => {
+                                record.set_exception_owner(NormalizedExceptionOwner::Absent);
+                            }
+                            "footer width" => record.add_pre_fold_extra_instructions(1),
+                            "footer admission" => record.early_boolean_admissions.append(true),
+                            "footer folded" => {
+                                record.folded_constant_admissions =
+                                    Some(super::ir::FoldAdmissionId::from_u32(0));
+                            }
+                            "footer annotation" => record.mark_original_annotation_jump(),
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+                assembler.record_copied_finally_outer_try_iterator_return(&prefix, outer_pop);
+                assert_eq!(
+                    assembler
+                        .exception_owner_provenance
+                        .copied_finally_iterator_returns
+                        .len(),
+                    usize::from(mutation == "intact"),
+                    "{version:?} {opcode:?} {mutation}",
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn outer_try_iterator_return_rejects_noncoverage_boundary_metadata() {
+    for mutation in [
+        "authored",
+        "borrow alias",
+        "source",
+        "block",
+        "borrow block",
+        "preserved",
+        "fusion",
+        "continuation",
+        "setup",
+        "handler",
+        "folded condition",
+        "folded loop",
+        "omitted count",
+        "omitted location",
+    ] {
+        let (mut assembler, prefix, outer_pop) =
+            outer_try_iterator_return(crate::PythonVersion::Py314, CALL);
+        let provenance = &mut assembler.exception_owner_provenance;
+        match mutation {
+            "authored" => {
+                assembler.original_nop_targets.insert(outer_pop);
+            }
+            "borrow alias" => {
+                assembler.borrow_block_aliases.insert(outer_pop);
+            }
+            "source" => {
+                provenance.source_boundaries.insert(outer_pop);
+            }
+            "block" => {
+                provenance.block_boundaries.insert(outer_pop);
+            }
+            "borrow block" => {
+                provenance.borrow_only_block_boundaries.insert(outer_pop);
+            }
+            "preserved" => {
+                assembler.preserved_block_boundaries.insert(outer_pop);
+            }
+            "fusion" => {
+                provenance.fusion_boundaries.insert(outer_pop);
+            }
+            "continuation" => {
+                provenance.continuation_boundaries.insert(outer_pop);
+            }
+            "setup" => provenance.setups.push((outer_pop, None)),
+            "handler" => assembler
+                .exception_regions
+                .push(super::ir::ExceptionRegion {
+                    is_scope_fallback: false,
+                    priority: super::ir::ExceptionRegionPriority::OriginalRange(
+                        outer_pop, outer_pop,
+                    ),
+                    start: outer_pop,
+                    end: outer_pop,
+                    target: outer_pop,
+                    depth: 0,
+                    preserve_lasti: false,
+                }),
+            "folded condition" => {
+                assembler.folded_away_condition_targets.insert(outer_pop);
+            }
+            "folded loop" => {
+                assembler.folded_away_loop_else_targets.insert(outer_pop);
+            }
+            "omitted count" => {
+                provenance.omitted_nop_counts.insert(outer_pop, 1);
+            }
+            "omitted location" => {
+                provenance
+                    .omitted_nop_locations
+                    .insert(outer_pop, SourceLocation::new(1, 1, 0, 4));
+            }
+            _ => unreachable!(),
+        }
+        let before = assembler.linear_items().to_vec();
+        assembler.record_copied_finally_outer_try_iterator_return(&prefix, outer_pop);
+        assert!(
+            assembler
+                .exception_owner_provenance
+                .copied_finally_iterator_returns
+                .is_empty(),
+            "{mutation}"
+        );
+        assert_eq!(assembler.linear_items(), before, "{mutation}");
+    }
+}
+
+#[test]
+fn outer_try_iterator_return_replays_only_the_unchanged_original_array_once() {
+    for version in [crate::PythonVersion::Py314, crate::PythonVersion::Py315] {
+        for mutation in [
+            "intact",
+            "donor",
+            "return",
+            "missing boundary",
+            "incoming",
+            "preserved",
+        ] {
+            let (mut assembler, prefix, outer_pop) = outer_try_iterator_return(version, CALL);
+            let donor = prefix.original[0].location;
+            assembler.record_copied_finally_outer_try_iterator_return(&prefix, outer_pop);
+            assert_eq!(
+                assembler
+                    .exception_owner_provenance
+                    .copied_finally_iterator_returns
+                    .len(),
+                1
+            );
+            let last = assembler.item_count() - 1;
+            let foreign = assembler.label();
+            match mutation {
+                "donor" => {
+                    let Item::Instruction(record) = &mut assembler.linear_items_mut()[1] else {
+                        panic!()
+                    };
+                    record.set_operand(Operand::Value(1));
+                }
+                "return" => {
+                    let Item::Instruction(record) = &mut assembler.linear_items_mut()[last] else {
+                        panic!()
+                    };
+                    record.jump_policy.retain_nop();
+                }
+                "missing boundary" => assembler.linear_items_mut()[last - 1] = Item::Label(foreign),
+                "incoming" => {
+                    assembler.linear_items_mut()[0] = Item::Instruction(Instruction::new(
+                        JUMP_FORWARD,
+                        Operand::Forward(outer_pop),
+                        SourceLocation::NONE,
+                        Some(0),
+                    ));
+                }
+                "preserved" => {
+                    assembler.preserved_block_boundaries.insert(outer_pop);
+                }
+                "intact" => {}
+                _ => unreachable!(),
+            }
+            assembler.remap_constant_indices(&[]);
+            let mut pipeline = assembler.into_optimization_pipeline();
+            pipeline.propagate_locations_within_blocks();
+            assert!(
+                pipeline
+                    .exception_owner_provenance
+                    .copied_finally_iterator_returns
+                    .is_empty()
+            );
+            let items = pipeline.graph.copy_items();
+            let Some(Item::Instruction(last)) = items.last() else {
+                panic!()
+            };
+            assert_eq!(
+                last.location,
+                if mutation == "intact" {
+                    donor
+                } else {
+                    SourceLocation::NONE
+                },
+                "{version:?} {mutation}"
+            );
+            pipeline.propagate_locations_within_blocks();
+            assert_eq!(pipeline.graph.copy_items(), items);
+        }
+    }
+}
+
+#[test]
 fn conditional_normal_try_borrow_head_requires_proven_fallthrough() {
     let source = super::Label::from_u32(0);
     let fallthrough = super::Label::from_u32(1);
@@ -129,6 +1035,1975 @@ fn conditional_normal_try_borrow_head_requires_proven_fallthrough() {
 }
 
 #[test]
+fn pending_try_continue_copy_binds_original_unwind_and_fallback_aliases() {
+    for mutation in [
+        "intact",
+        "copy start",
+        "copy offset",
+        "missing copy",
+        "duplicate copy",
+        "fallback",
+        "missing fallback",
+        "duplicate fallback",
+        "populated fallback",
+        "jump target",
+        "jump location",
+        "jump opcode",
+        "condition location",
+        "condition target",
+        "condition duplicated",
+        "condition outside unwind",
+    ] {
+        let mut assembler = Assembler::with_python_version(crate::PythonVersion::Py314);
+        let target = assembler.label();
+        let copy_start = assembler.label();
+        let join = assembler.label();
+        let fallback = assembler.label();
+        let foreign = assembler.label();
+        assembler.mark(target);
+        assembler.emit(NOP, 0);
+        let unwind_start = assembler.item_count();
+        assembler.mark(copy_start);
+        let location = SourceLocation::new(4, 4, 7, 16);
+        assembler.set_location(location);
+        assembler.emit(LOAD_FAST, 0);
+        let condition = assembler.emit_forward_with_depth(
+            POP_JUMP_IF_FALSE,
+            join,
+            0,
+            ExceptionPolicy::default(),
+        );
+        let condition_index = usize::try_from(condition.instruction().item_index).unwrap();
+        assembler.emit(LOAD_FAST, 1);
+        assembler.emit(POP_TOP, 0);
+        assembler.mark(join);
+        assembler.mark(fallback);
+        assembler.set_location(SourceLocation::NONE);
+        let jump = assembler.emit_backward(JUMP_BACKWARD, target);
+        let last = assembler.item_count() - 1;
+        let mut captured_copy = copy_start;
+        let mut captured_fallback = fallback;
+        let mut captured_offset = unwind_start;
+        match mutation {
+            "copy start" => captured_copy = foreign,
+            "copy offset" => captured_offset += 1,
+            "missing copy" => assembler.linear_items_mut()[unwind_start] = Item::Label(foreign),
+            "duplicate copy" => assembler.linear_items_mut()[0] = Item::Label(copy_start),
+            "fallback" => captured_fallback = foreign,
+            "missing fallback" => assembler.linear_items_mut()[last - 1] = Item::Label(foreign),
+            "duplicate fallback" => assembler.linear_items_mut()[0] = Item::Label(fallback),
+            "populated fallback" => {
+                assembler.linear_items_mut()[last - 1] = Item::Instruction(Instruction::new(
+                    NOP,
+                    Operand::Value(0),
+                    SourceLocation::NONE,
+                    None,
+                ));
+            }
+            "jump target" => assembler
+                .emitted_jump_mut(jump, "test")
+                .set_operand(Operand::Backward(foreign)),
+            "jump location" => assembler.emitted_jump_mut(jump, "test").location = location,
+            "jump opcode" => assembler.emitted_jump_mut(jump, "test").opcode = JUMP_FORWARD,
+            "condition location" => {
+                let Item::Instruction(record) = &mut assembler.linear_items_mut()[condition_index]
+                else {
+                    panic!()
+                };
+                record.location = SourceLocation::NONE;
+            }
+            "condition target" => {
+                let Item::Instruction(record) = &mut assembler.linear_items_mut()[condition_index]
+                else {
+                    panic!()
+                };
+                record.set_operand(Operand::Forward(foreign));
+            }
+            "condition duplicated" => {
+                assembler.linear_items_mut()[unwind_start + 3] =
+                    assembler.linear_items()[condition_index];
+            }
+            "condition outside unwind" => captured_offset = last - 1,
+            _ => {}
+        }
+        let before = *assembler.emitted_jump_mut(jump, "before certificate");
+        let accepted = assembler.allow_pending_try_copied_finally_continue_exit(
+            jump,
+            target,
+            location,
+            captured_offset,
+            captured_copy,
+            captured_fallback,
+        );
+        assert_eq!(accepted, mutation == "intact", "{mutation}");
+        let after = *assembler.emitted_jump_mut(jump, "after certificate");
+        if accepted {
+            assert!(after.no_location_policy.allows_block_inlining());
+            assert!(!after.only_allows_unconditional_inlining());
+            assert!(assembler.conditional_threading_targets.is_empty());
+        } else {
+            assert_eq!(after, before, "{mutation}");
+        }
+    }
+}
+
+#[test]
+fn nested_guard_location_requires_one_original_condition_and_threadable_bypasses() {
+    for condition in [POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE] {
+        for terminal_opcode in [RETURN_VALUE, RAISE_VARARGS] {
+            for mutation in [
+                "intact",
+                "no bypass",
+                "no guard",
+                "extra condition",
+                "late bypass",
+                "guard location",
+                "terminal location",
+                "guard depth",
+                "terminal depth",
+                "guard folded",
+                "guard hidden",
+                "guard owner",
+                "guard backward",
+                "guard target",
+                "bypass opcode",
+                "bypass location",
+                "bypass folded",
+                "bypass retained",
+                "terminal folded",
+                "terminal hidden",
+                "terminal opcode",
+                "populated join",
+                "missing source boundary",
+                "missing block boundary",
+                "folded condition",
+                "folded loop else",
+            ] {
+                let mut assembler = Assembler::with_python_version(crate::PythonVersion::Py314);
+                let bypass_target = assembler.label();
+                let guard_target = assembler.label();
+                let foreign = assembler.label();
+                let condition_location = SourceLocation::new(8, 8, 7, 12);
+                let terminal_location = SourceLocation::new(9, 9, 8, 20);
+                if mutation != "no bypass" {
+                    assembler.set_location(if mutation == "bypass location" {
+                        SourceLocation::NONE
+                    } else {
+                        SourceLocation::new(4, 4, 8, 20)
+                    });
+                    let bypass = assembler.emit_forward_with_depth(
+                        if mutation == "bypass opcode" {
+                            POP_JUMP_IF_FALSE
+                        } else {
+                            JUMP_FORWARD
+                        },
+                        bypass_target,
+                        0,
+                        ExceptionPolicy::default(),
+                    );
+                    if mutation == "bypass folded" {
+                        assembler
+                            .emitted_jump_mut(bypass, "mutating bypass")
+                            .add_pre_fold_extra_instructions(1);
+                    }
+                    if mutation == "bypass retained" {
+                        assembler
+                            .emitted_jump_mut(bypass, "mutating bypass")
+                            .jump_policy
+                            .retain_nop();
+                    }
+                }
+                assembler.set_location(condition_location);
+                let guard = assembler.emit_forward_with_depth(
+                    if mutation == "no guard" {
+                        NOP
+                    } else {
+                        condition
+                    },
+                    guard_target,
+                    u32::from(mutation == "guard depth"),
+                    ExceptionPolicy::default(),
+                );
+                let instruction = assembler.emitted_jump_mut(guard, "mutating guard");
+                match mutation {
+                    "guard location" => instruction.location.column += 1,
+                    "guard folded" => instruction.add_pre_fold_extra_instructions(1),
+                    "guard hidden" => instruction.local_policy.add_hidden_exception_owner_slots(1),
+                    "guard owner" => {
+                        instruction.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
+                    }
+                    "guard backward" => instruction.set_operand(Operand::Backward(guard_target)),
+                    "guard target" => instruction.set_operand(Operand::Forward(foreign)),
+                    _ => {}
+                }
+                if mutation == "extra condition" || mutation == "late bypass" {
+                    assembler.emit_forward_with_depth(
+                        if mutation == "extra condition" {
+                            condition
+                        } else {
+                            JUMP_FORWARD
+                        },
+                        guard_target,
+                        0,
+                        ExceptionPolicy::default(),
+                    );
+                }
+                assembler.set_location(terminal_location);
+                let terminal = assembler.emit_with_depth(
+                    if mutation == "terminal opcode" {
+                        POP_TOP
+                    } else {
+                        terminal_opcode
+                    },
+                    u32::from(terminal_opcode == RAISE_VARARGS),
+                    u32::from(mutation == "terminal depth"),
+                    ExceptionPolicy::default(),
+                );
+                let instruction = assembler.emitted_instruction_mut(terminal, "mutating terminal");
+                match mutation {
+                    "terminal location" => instruction.location.column += 1,
+                    "terminal folded" => instruction.add_pre_fold_extra_instructions(1),
+                    "terminal hidden" => {
+                        instruction.local_policy.add_hidden_exception_owner_slots(1);
+                    }
+                    _ => {}
+                }
+                for target in [guard_target, bypass_target] {
+                    assembler.record_exception_owner_block_boundary(target);
+                    assembler.mark(target);
+                }
+                match mutation {
+                    "populated join" => {
+                        assembler.emit_with_depth(NOP, 0, 0, ExceptionPolicy::default());
+                    }
+                    "missing source boundary" => {
+                        assembler
+                            .exception_owner_provenance
+                            .source_boundaries
+                            .remove(&guard_target);
+                    }
+                    "missing block boundary" => {
+                        assembler
+                            .exception_owner_provenance
+                            .block_boundaries
+                            .remove(&guard_target);
+                    }
+                    "folded condition" => {
+                        assembler.folded_away_condition_targets.insert(guard_target);
+                    }
+                    "folded loop else" => {
+                        assembler.folded_away_loop_else_targets.insert(guard_target);
+                    }
+                    _ => {}
+                }
+                assert_eq!(
+                    assembler.original_nested_guard_has_false_donor(
+                        condition_location,
+                        terminal_location
+                    ),
+                    mutation == "intact",
+                    "{condition:?}, {terminal_opcode:?}, {mutation}",
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn noncopyable_cleanup_borrow_exits_preserve_their_exact_source_and_target() {
+    for empty_source in [false, true] {
+        for target_shape in ["four slots", "five slots", "conditional"] {
+            for mutation in [
+                "intact",
+                "source location",
+                "source owner",
+                "source target",
+                "source opcode",
+                "stale stream",
+                "remapped stream",
+                "changed remapped source",
+                "unlocated target",
+                "interior target label",
+                "source label",
+                "source label order",
+                "populated source",
+            ] {
+                let mut assembler = Assembler::with_python_version(crate::PythonVersion::Py314);
+                let target = assembler.label();
+                let other = assembler.label();
+                let end = assembler.label();
+                let entry = assembler.label();
+                let alias = assembler.label();
+                assembler.mark(entry);
+                assembler.mark(alias);
+                let source = assembler.emit_forward_with_depth(
+                    JUMP_FORWARD,
+                    target,
+                    0,
+                    ExceptionPolicy::default(),
+                );
+                if empty_source {
+                    assembler.record_noncopyable_empty_borrow_exit(source);
+                } else {
+                    assembler.record_noncopyable_borrow_exit(source);
+                }
+                let location = SourceLocation::new(3, 3, 4, 19);
+                match mutation {
+                    "source location" | "changed remapped source" => {
+                        assembler
+                            .emitted_jump_mut(source, "changing the source")
+                            .location = location;
+                    }
+                    "source owner" => assembler
+                        .emitted_jump_mut(source, "changing the owner")
+                        .set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS),
+                    "source target" => assembler
+                        .emitted_jump_mut(source, "changing the target")
+                        .set_operand(Operand::Forward(other)),
+                    "source opcode" => {
+                        assembler
+                            .emitted_jump_mut(source, "changing the opcode")
+                            .opcode = NOP;
+                    }
+                    "stale stream" => {
+                        assembler.emission_stream = super::ir::EmissionStreamId::next();
+                    }
+                    "source label" => assembler.linear_items_mut()[0] = Item::Label(other),
+                    "source label order" => assembler.linear_items_mut().swap(0, 1),
+                    "populated source" => {
+                        assembler.linear_items_mut()[0] = Item::Instruction(Instruction::new(
+                            NOP,
+                            Operand::Value(0),
+                            SourceLocation::NONE,
+                            Some(0),
+                        ));
+                    }
+                    _ => {}
+                }
+                if matches!(mutation, "remapped stream" | "changed remapped source") {
+                    assembler.emit_with_depth(NOP, 0, 0, ExceptionPolicy::default());
+                    assert!(assembler.take_trailing_nop_location().is_some());
+                    assert_eq!(
+                        assembler.deferred_noncopyable_borrow_exits.len(),
+                        usize::from(mutation == "remapped stream")
+                    );
+                }
+                assembler.mark(target);
+                if mutation != "unlocated target" {
+                    assembler.set_location(location);
+                }
+                if target_shape == "conditional" {
+                    assembler.emit_with_depth(LOAD_FAST, 0, 1, ExceptionPolicy::default());
+                    if mutation == "interior target label" {
+                        assembler.mark(other);
+                    }
+                    assembler.emit_forward_with_depth(
+                        POP_JUMP_IF_FALSE,
+                        end,
+                        0,
+                        ExceptionPolicy::default(),
+                    );
+                    assembler.emit_with_depth(LOAD_CONST, 0, 1, ExceptionPolicy::default());
+                    assembler.emit_with_depth(RETURN_VALUE, 0, 0, ExceptionPolicy::default());
+                } else {
+                    assembler.emit_with_depth(LOAD_GLOBAL, 1, 2, ExceptionPolicy::default());
+                    if mutation == "interior target label" {
+                        assembler.mark(other);
+                    }
+                    if target_shape == "five slots" {
+                        assembler.emit_with_depth(LOAD_FAST, 0, 3, ExceptionPolicy::default());
+                    }
+                    assembler.emit_with_depth(
+                        CALL,
+                        u32::from(target_shape == "five slots"),
+                        1,
+                        ExceptionPolicy::default(),
+                    );
+                    assembler.emit_with_depth(RAISE_VARARGS, 1, 0, ExceptionPolicy::default());
+                }
+                assembler.mark(end);
+                assembler.emit_with_depth(LOAD_CONST, 0, 1, ExceptionPolicy::default());
+                assembler.emit_with_depth(RETURN_VALUE, 0, 0, ExceptionPolicy::default());
+
+                let mut expected = assembler.linear_items().to_vec();
+                let admitted = target_shape != "four slots"
+                    && (matches!(mutation, "intact" | "remapped stream")
+                        || (matches!(
+                            mutation,
+                            "source label" | "source label order" | "populated source"
+                        ) && !empty_source));
+                if admitted {
+                    let Item::Instruction(instruction) = &mut expected[2] else {
+                        unreachable!();
+                    };
+                    instruction
+                        .no_location_policy
+                        .set_borrow_fallthrough(BorrowFallthrough::Barrier);
+                }
+                assembler.resolve_noncopyable_borrow_exits();
+                assert!(assembler.deferred_noncopyable_borrow_exits.is_empty());
+                assert_eq!(
+                    assembler.linear_items(),
+                    expected,
+                    "{empty_source}: {target_shape}: {mutation}"
+                );
+                let Item::Instruction(instruction) = assembler.linear_items()[2] else {
+                    unreachable!();
+                };
+                assert!(instruction.jump_policy.allows_threading_target());
+                assert!(instruction.jump_policy.allows_borrow_threading_target());
+                let expected_labels = if admitted && empty_source {
+                    [entry, alias].into_iter().collect()
+                } else {
+                    rustc_hash::FxHashSet::default()
+                };
+                assert_eq!(assembler.borrow_unreachable_blocks, expected_labels);
+                let expected_boundaries = if admitted && empty_source {
+                    [target].into_iter().collect()
+                } else {
+                    rustc_hash::FxHashSet::default()
+                };
+                assert_eq!(
+                    assembler
+                        .exception_owner_provenance
+                        .borrow_only_block_boundaries,
+                    expected_boundaries
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn noncopyable_retained_finally_nops_keep_source_local_borrow_barriers() {
+    for prepared in [false, true] {
+        for retained in [false, true] {
+            for width in [4, 5] {
+                let mut assembler = Assembler::with_python_version(crate::PythonVersion::Py314);
+                let target = assembler.label();
+                assembler.set_location(SourceLocation::new(2, 2, 4, 16));
+                let source = assembler.emit_forward_with_depth(
+                    JUMP_FORWARD,
+                    target,
+                    0,
+                    ExceptionPolicy::default(),
+                );
+                if retained {
+                    assembler.preserve_redundant_jump_nop_after_threading(source);
+                    assembler.mark_retained_nop_borrow_fallthrough(source);
+                }
+                assembler.record_noncopyable_borrow_exit(source);
+                assembler.mark(target);
+                assembler.set_location(SourceLocation::new(4, 4, 4, 20));
+                assembler.emit_with_depth(LOAD_GLOBAL, 1, 2, ExceptionPolicy::default());
+                if width == 5 {
+                    assembler.emit_with_depth(LOAD_CONST, 0, 3, ExceptionPolicy::default());
+                }
+                assembler.emit_with_depth(
+                    CALL,
+                    u32::from(width == 5),
+                    1,
+                    ExceptionPolicy::default(),
+                );
+                assembler.emit_with_depth(RAISE_VARARGS, 1, 0, ExceptionPolicy::default());
+                let mut original = assembler.linear_items().to_vec();
+                if width == 5 {
+                    let Item::Instruction(jump) = &mut original[0] else {
+                        unreachable!()
+                    };
+                    jump.no_location_policy
+                        .set_borrow_fallthrough(BorrowFallthrough::Barrier);
+                }
+                if prepared {
+                    assembler.used_constant_indices(1);
+                    assert!(matches!(assembler.code, UnoptimizedCode::Prepared { .. }));
+                } else {
+                    assembler.resolve_noncopyable_borrow_exits();
+                }
+                assert!(assembler.deferred_noncopyable_borrow_exits.is_empty());
+                assert!(assembler.borrow_unreachable_blocks.is_empty());
+                assert!(
+                    assembler
+                        .exception_owner_provenance
+                        .borrow_only_block_boundaries
+                        .is_empty()
+                );
+                let pipeline = assembler.into_optimization_pipeline();
+                assert_eq!(pipeline.graph.copy_items(), original);
+                let jump = pipeline
+                    .graph
+                    .iter_items()
+                    .find_map(|item| match item {
+                        Item::Instruction(jump) if jump.opcode == JUMP_FORWARD => Some(jump),
+                        _ => None,
+                    })
+                    .unwrap();
+                assert!(jump.jump_policy.allows_threading_target());
+                assert!(jump.jump_policy.allows_borrow_threading_target());
+            }
+        }
+    }
+}
+
+#[test]
+fn empty_noncopyable_borrow_exits_require_an_original_alias_array() {
+    for empty_source in [false, true] {
+        for populated in [false, true] {
+            let mut assembler = Assembler::with_python_version(crate::PythonVersion::Py314);
+            let target = assembler.label();
+            if populated {
+                let entry = assembler.label();
+                assembler.mark(entry);
+                assembler.emit_with_depth(NOP, 0, 0, ExceptionPolicy::default());
+            }
+            let source = assembler.emit_forward_with_depth(
+                JUMP_FORWARD,
+                target,
+                0,
+                ExceptionPolicy::default(),
+            );
+            if empty_source {
+                assembler.record_noncopyable_empty_borrow_exit(source);
+            } else {
+                assembler.record_noncopyable_borrow_exit(source);
+            }
+            assembler.mark(target);
+            assembler.set_location(SourceLocation::new(3, 3, 4, 19));
+            assembler.emit_with_depth(LOAD_GLOBAL, 1, 2, ExceptionPolicy::default());
+            assembler.emit_with_depth(LOAD_CONST, 0, 3, ExceptionPolicy::default());
+            assembler.emit_with_depth(CALL, 1, 1, ExceptionPolicy::default());
+            assembler.emit_with_depth(RAISE_VARARGS, 1, 0, ExceptionPolicy::default());
+            assembler.resolve_noncopyable_borrow_exits();
+            let Item::Instruction(original) =
+                assembler.linear_items()[source.instruction().item_index as usize]
+            else {
+                unreachable!();
+            };
+            assert_eq!(
+                original.no_location_policy.borrow_fallthrough(),
+                if empty_source {
+                    BorrowFallthrough::Reachable
+                } else {
+                    BorrowFallthrough::Barrier
+                }
+            );
+            assert!(assembler.borrow_unreachable_blocks.is_empty());
+            assert!(
+                assembler
+                    .exception_owner_provenance
+                    .borrow_only_block_boundaries
+                    .is_empty()
+            );
+        }
+    }
+}
+
+#[test]
+fn noncopyable_cleanup_borrow_exits_resolve_before_prepared_graph_reuse() {
+    for empty_source in [false, true] {
+        let mut assembler = Assembler::with_python_version(crate::PythonVersion::Py314);
+        let target = assembler.label();
+        let entry = assembler.label();
+        assembler.mark(entry);
+        let source =
+            assembler.emit_forward_with_depth(JUMP_FORWARD, target, 0, ExceptionPolicy::default());
+        if empty_source {
+            assembler.record_noncopyable_empty_borrow_exit(source);
+        } else {
+            assembler.record_noncopyable_borrow_exit(source);
+        }
+        assembler.mark(target);
+        assembler.set_location(SourceLocation::new(3, 3, 4, 19));
+        assembler.emit_with_depth(LOAD_GLOBAL, 1, 2, ExceptionPolicy::default());
+        assembler.emit_with_depth(LOAD_CONST, 0, 3, ExceptionPolicy::default());
+        assembler.emit_with_depth(CALL, 1, 1, ExceptionPolicy::default());
+        assembler.emit_with_depth(RAISE_VARARGS, 1, 0, ExceptionPolicy::default());
+        assert_eq!(assembler.used_constant_indices(1), [true]);
+        assert!(matches!(assembler.code, UnoptimizedCode::Prepared { .. }));
+        assert!(assembler.deferred_noncopyable_borrow_exits.is_empty());
+        assert_eq!(
+            assembler.borrow_unreachable_blocks.contains(&entry),
+            empty_source
+        );
+        assert_eq!(
+            assembler
+                .exception_owner_provenance
+                .borrow_only_block_boundaries
+                .contains(&target),
+            empty_source
+        );
+        assert_eq!(assembler.used_constant_indices(1), [true]);
+    }
+}
+
+#[test]
+fn generator_call_join_origin_requires_an_original_intact_fallback() {
+    for version in [
+        crate::PythonVersion::Py312,
+        crate::PythonVersion::Py313,
+        crate::PythonVersion::Py314,
+        crate::PythonVersion::Py315,
+    ] {
+        for mutation in [
+            "intact",
+            "no original entry",
+            "located jump",
+            "no direct retention",
+            "no empty join",
+            "extra original slot",
+            "preserved location",
+            "changed first opcode",
+            "changed call opcode",
+            "changed call arity",
+            "changed call depth",
+            "unlocated call",
+            "missing guard",
+            "second guard",
+            "fallback interior label",
+            "source alias",
+            "borrow alias",
+            "borrow empty",
+            "borrow threading denied",
+            "borrow fallthrough barrier",
+            "hidden owner slot",
+            "explicit exception policy",
+            "split return policy",
+        ] {
+            let mut assembler = Assembler::with_python_version(version);
+            let fallback = assembler.label();
+            let entry = assembler.label();
+            let target = assembler.label();
+            let alias = assembler.label();
+            let location = SourceLocation::new(3, 3, 8, 13);
+            let full_call = SourceLocation::new(3, 3, 8, 43);
+            assembler.set_location(location);
+            if mutation != "missing guard" {
+                assembler.emit_forward_with_depth(
+                    POP_JUMP_IF_FALSE,
+                    fallback,
+                    3,
+                    ExceptionPolicy::default(),
+                );
+            }
+            if mutation == "second guard" {
+                assembler.emit_forward_with_depth(
+                    POP_JUMP_IF_FALSE,
+                    fallback,
+                    3,
+                    ExceptionPolicy::default(),
+                );
+            }
+            assembler.emit_forward_with_depth(JUMP_FORWARD, entry, 3, ExceptionPolicy::default());
+            assembler.mark(fallback);
+            assembler.emit_with_depth(
+                if mutation == "changed first opcode" {
+                    NOP
+                } else {
+                    PUSH_NULL
+                },
+                0,
+                4,
+                ExceptionPolicy::default(),
+            );
+            assembler.emit_with_depth(LOAD_CONST, 0, 5, ExceptionPolicy::default());
+            assembler.emit_with_depth(MAKE_FUNCTION, 0, 5, ExceptionPolicy::default());
+            assembler.emit_with_depth(LOAD_FAST, 1, 6, ExceptionPolicy::default());
+            assembler.emit_with_depth(GET_ITER, 0, 6, ExceptionPolicy::default());
+            assembler.emit_with_depth(CALL, 0, 5, ExceptionPolicy::default());
+            if mutation == "fallback interior label" {
+                assembler.mark(alias);
+            }
+            assembler.set_location(if mutation == "unlocated call" {
+                SourceLocation::NONE
+            } else {
+                full_call
+            });
+            assembler.emit_with_depth(
+                if mutation == "changed call opcode" {
+                    LOAD_FAST
+                } else {
+                    CALL
+                },
+                if mutation == "changed call arity" {
+                    2
+                } else {
+                    1
+                },
+                if mutation == "changed call depth" {
+                    4
+                } else {
+                    3
+                },
+                ExceptionPolicy::default(),
+            );
+            if mutation != "no original entry" {
+                assembler.record_exception_owner_block_boundary(entry);
+            }
+            assembler.mark(entry);
+            if mutation == "borrow alias" {
+                assembler.borrow_block_aliases.insert(entry);
+            }
+            if mutation == "source alias" {
+                assembler.mark(alias);
+            }
+            assembler.set_location(SourceLocation::NONE);
+            let emitted = assembler.emit_forward_with_depth(
+                JUMP_FORWARD,
+                target,
+                3,
+                ExceptionPolicy::default(),
+            );
+            assembler.preserve_empty_join_inlined_jump_nop(emitted);
+            let jump = assembler.emitted_jump_mut(emitted, "mutating generator join proof");
+            if mutation == "located jump" {
+                jump.location = full_call;
+            }
+            if matches!(mutation, "no direct retention" | "no empty join") {
+                jump.jump_policy = JumpPolicy::default();
+                if mutation == "no direct retention" {
+                    jump.jump_policy.mark_original_empty_join();
+                } else {
+                    jump.jump_policy.retain_nop_for_direct_target();
+                }
+            }
+            if mutation == "extra original slot" {
+                jump.add_pre_fold_extra_instructions(1);
+            }
+            if mutation == "borrow empty" {
+                jump.jump_policy.mark_borrow_empty_block();
+            }
+            if mutation == "borrow threading denied" {
+                jump.jump_policy.prevent_borrow_threading_target();
+            }
+            if mutation == "borrow fallthrough barrier" {
+                jump.no_location_policy
+                    .set_borrow_fallthrough(BorrowFallthrough::Barrier);
+            }
+            if mutation == "hidden owner slot" {
+                jump.local_policy.add_hidden_exception_owner_slots(1);
+            }
+            if mutation == "explicit exception policy" {
+                jump.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
+            }
+            if mutation == "split return policy" {
+                assembler.allow_split_return_copy(emitted);
+            }
+            if mutation == "preserved location" {
+                assembler.preserve_no_location(emitted.instruction());
+            }
+            assembler.record_original_generator_call_join(emitted);
+            let expected = version >= crate::PythonVersion::Py314 && mutation == "intact";
+            assert_eq!(
+                assembler
+                    .exception_owner_provenance
+                    .original_generator_call_joins
+                    .len(),
+                usize::from(expected),
+                "{version:?}: {mutation}",
+            );
+            if expected {
+                let (recorded_entry, original) = &assembler
+                    .exception_owner_provenance
+                    .original_generator_call_joins[0];
+                assert_eq!(*recorded_entry, entry);
+                assert_eq!(original.first(), Some(&Item::Label(fallback)));
+                assert_eq!(
+                    &original[original.len() - 2..],
+                    &[
+                        Item::Label(entry),
+                        assembler.linear_items().last().copied().unwrap(),
+                    ]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn generator_call_join_constant_transport_preserves_only_original_survivors() {
+    for mutation in [
+        "intact",
+        "removed constant",
+        "changed location",
+        "changed policy",
+    ] {
+        let mut assembler = Assembler::with_python_version(crate::PythonVersion::Py314);
+        let fallback = assembler.label();
+        let entry = assembler.label();
+        let target = assembler.label();
+        assembler.mark(fallback);
+        assembler.set_location(SourceLocation::new(3, 3, 8, 43));
+        assembler.emit_with_depth(LOAD_CONST, 2, 4, ExceptionPolicy::default());
+        assembler.emit_with_depth(LOAD_CONST, 3, 5, ExceptionPolicy::default());
+        assembler.emit_with_depth(CALL, 1, 3, ExceptionPolicy::default());
+        assembler.mark(entry);
+        assembler.set_location(SourceLocation::NONE);
+        let jump =
+            assembler.emit_forward_with_depth(JUMP_FORWARD, target, 3, ExceptionPolicy::default());
+        assembler.preserve_empty_join_inlined_jump_nop(jump);
+        // Transport is tested independently from producer admission.
+        let original = assembler.linear_items().to_vec();
+        assembler
+            .exception_owner_provenance
+            .original_generator_call_joins
+            .push((entry, original));
+        if mutation == "changed location" {
+            let Item::Instruction(first) = &mut assembler.linear_items_mut()[1] else {
+                unreachable!()
+            };
+            first.location.end_column += 1;
+        }
+        if mutation == "changed policy" {
+            let Item::Instruction(first) = &mut assembler.linear_items_mut()[1] else {
+                unreachable!()
+            };
+            first.no_location_policy.preserve_location();
+        }
+        assembler.remap_constant_indices(&[
+            Some(0),
+            None,
+            Some(1),
+            (mutation != "removed constant").then_some(2),
+        ]);
+        let origins = &assembler
+            .exception_owner_provenance
+            .original_generator_call_joins;
+        if mutation == "removed constant" {
+            assert!(origins.is_empty());
+        } else {
+            assert_eq!(origins.len(), 1);
+            let original = &origins[0].1;
+            let Item::Instruction(first) = original[1] else {
+                unreachable!()
+            };
+            let Item::Instruction(second) = original[2] else {
+                unreachable!()
+            };
+            assert_eq!(first.operand(), Operand::Value(1));
+            assert_eq!(second.operand(), Operand::Value(2));
+            assert_eq!(
+                original.as_slice() == assembler.linear_items(),
+                mutation == "intact"
+            );
+        }
+    }
+}
+
+#[test]
+fn located_borrow_join_retention_requires_original_unique_entry() {
+    for version in [crate::PythonVersion::Py314, crate::PythonVersion::Py315] {
+        for mutation in [
+            "intact",
+            "missing source head",
+            "foreign source head",
+            "missing labels",
+            "borrow alias",
+            "shared condition",
+            "shared original tag",
+            "live fallthrough",
+            "unlocated",
+            "not borrow empty",
+            "no direct retention",
+            "already retained",
+        ] {
+            let mut assembler = Assembler::with_python_version(version);
+            let join = assembler.label();
+            let target = assembler.label();
+            let unrelated = assembler.label();
+            let location = SourceLocation::new(4, 4, 7, 24);
+            assembler.set_location(location);
+            assembler.emit_forward_with_depth(
+                POP_JUMP_IF_FALSE,
+                join,
+                0,
+                ExceptionPolicy::default(),
+            );
+            if matches!(mutation, "shared condition" | "shared original tag") {
+                assembler.emit_forward_with_depth(
+                    POP_JUMP_IF_FALSE,
+                    join,
+                    0,
+                    ExceptionPolicy::default(),
+                );
+            }
+            assembler.emit_with_depth(
+                if mutation == "live fallthrough" {
+                    POP_TOP
+                } else {
+                    RETURN_VALUE
+                },
+                0,
+                0,
+                ExceptionPolicy::default(),
+            );
+            if mutation != "missing labels" {
+                assembler.mark(join);
+            }
+            if mutation == "foreign source head" {
+                assembler.record_exception_owner_block_boundary(unrelated);
+            } else if mutation != "missing source head" {
+                assembler.record_exception_owner_block_boundary(join);
+            }
+            if mutation == "borrow alias" {
+                assembler.borrow_block_aliases.insert(join);
+            }
+            if mutation == "unlocated" {
+                assembler.set_location(SourceLocation::NONE);
+            }
+            let exit = assembler.emit_forward_with_depth(
+                JUMP_FORWARD,
+                target,
+                0,
+                ExceptionPolicy::default(),
+            );
+            let jump = assembler.emitted_jump_mut(exit, "preparing the normal join");
+            if mutation != "not borrow empty" {
+                jump.jump_policy.mark_borrow_empty_block();
+            }
+            if mutation != "no direct retention" {
+                jump.jump_policy.retain_nop_for_direct_target();
+            }
+            if mutation == "already retained" {
+                jump.jump_policy.retain_nop();
+            }
+            if mutation == "shared original tag" {
+                jump.jump_policy.mark_original_shared_empty_join();
+            }
+            let original = *jump;
+            assembler.preserve_located_borrow_join_nop(exit);
+            let actual = *assembler.emitted_jump_mut(exit, "checking the normal join");
+            let mut expected = original;
+            if mutation == "intact" {
+                expected.jump_policy.retain_redundant_nop_after_threading();
+            }
+            assert_eq!(actual, expected, "{version:?}/{mutation}");
+            assert!(!actual.jump_policy.is_original_empty_join(), "{mutation}");
+        }
+    }
+}
+
+#[test]
+fn retained_borrow_join_revalidates_live_entries_after_original_proof() {
+    let join = super::Label::from_u32(0);
+    let other = super::Label::from_u32(1);
+    let location = SourceLocation::new(4, 4, 7, 24);
+    for mutation in [
+        "intact",
+        "lost entry",
+        "retargeted entry",
+        "new conditional entry",
+        "new fallthrough",
+        "unlocated",
+        "barrier if removed",
+        "stale original tag",
+    ] {
+        let mut marker = Instruction::new(NOP, Operand::Value(0), location, Some(0));
+        marker.jump_policy.mark_borrow_empty_block();
+        marker.jump_policy.retain_nop();
+        if mutation == "unlocated" {
+            marker.location = SourceLocation::NONE;
+        }
+        if mutation == "barrier if removed" {
+            marker
+                .no_location_policy
+                .set_borrow_fallthrough(BorrowFallthrough::BarrierIfRemoved);
+        }
+        if mutation == "stale original tag" {
+            marker.jump_policy.mark_original_empty_join();
+        }
+        let condition = Item::Instruction(Instruction::new(
+            POP_JUMP_IF_FALSE,
+            Operand::Forward(if mutation == "retargeted entry" {
+                other
+            } else {
+                join
+            }),
+            location,
+            Some(0),
+        ));
+        let mut items = Vec::new();
+        if mutation != "lost entry" {
+            items.push(condition);
+        }
+        if matches!(mutation, "new conditional entry" | "stale original tag") {
+            items.push(condition);
+        }
+        items.push(pass_instruction(
+            if mutation == "new fallthrough" {
+                POP_TOP
+            } else {
+                RETURN_VALUE
+            },
+            0,
+            5,
+        ));
+        items.push(Item::Label(join));
+        items.push(Item::Instruction(marker));
+        items.push(Item::Label(other));
+        items.push(pass_instruction(RETURN_VALUE, 0, 6));
+        super::OptimizationPipeline::remove_borrow_empty_block_markers(&mut items);
+        marker.jump_policy.clear_borrow_empty_block();
+        assert_eq!(
+            items.contains(&Item::Instruction(marker)),
+            mutation == "intact",
+            "{mutation}",
+        );
+    }
+}
+
+#[test]
+fn awaited_finally_borrow_barrier_requires_its_first_noncopyable_original_array() {
+    for version in [crate::PythonVersion::Py314, crate::PythonVersion::Py315] {
+        for prefix_size in 0..=4 {
+            for mutation in [
+                "intact",
+                "missing witness",
+                "duplicate witness",
+                "changed send location",
+                "changed send depth",
+                "changed send target",
+                "changed await location",
+                "changed constant location",
+                "protocol await",
+                "cold bridge",
+                "no backedge",
+                "other incoming edge",
+                "wrong backedge",
+                "source boundary",
+                "duplicate original label",
+                "preserved boundary",
+                "borrow alias",
+                "authored nop target",
+                "exception target",
+                "earlier label",
+                "changed source",
+                "not converted pop",
+                "owned pop",
+                "ignored slots",
+                "hidden folded slots",
+            ] {
+                let mut assembler = Assembler::with_python_version(version);
+                let target = assembler.label();
+                let send_entry = assembler.label();
+                let end = assembler.label();
+                let other = assembler.label();
+                let location = SourceLocation::new(7, 7, 8, 24);
+                assembler.set_location(location);
+                let source = assembler.emit_forward_with_depth(
+                    JUMP_FORWARD,
+                    target,
+                    0,
+                    ExceptionPolicy::default(),
+                );
+                let origin = assembler.record_name_return_borrow_exit(source);
+                assembler.mark(target);
+                let ordinal = assembler.instruction_count();
+                assembler.emit_with_depth(
+                    NOP,
+                    0,
+                    0,
+                    if mutation == "owned pop" {
+                        ExceptionPolicy::default()
+                    } else {
+                        ExceptionPolicy::EXCLUDE_ALWAYS
+                    },
+                );
+                if mutation != "not converted pop" {
+                    assembler.mark_last_as_converted_pop_block();
+                }
+                for _ in 0..prefix_size {
+                    assembler.emit_with_depth(LOAD_FAST, 0, 0, ExceptionPolicy::default());
+                }
+                if mutation == "ignored slots" {
+                    for opcode in [NOP, COPY_FREE_VARS, MAKE_CELL] {
+                        assembler.emit_with_depth(opcode, 0, 0, ExceptionPolicy::default());
+                    }
+                }
+                if mutation == "earlier label" {
+                    assembler.record_exception_owner_block_boundary(other);
+                    assembler.mark(other);
+                }
+                if mutation == "changed await location" {
+                    assembler.set_location(SourceLocation::NONE);
+                }
+                let awaitable = assembler.emit_with_depth(
+                    GET_AWAITABLE,
+                    u32::from(mutation == "protocol await"),
+                    0,
+                    ExceptionPolicy::default(),
+                );
+                if mutation == "hidden folded slots" {
+                    let instruction = assembler
+                        .emitted_instruction_mut(awaitable, "adding omitted original slots");
+                    instruction.add_pre_fold_extra_instructions(4);
+                    instruction.local_policy.add_hidden_exception_owner_slots(4);
+                }
+                assembler.set_location(if mutation == "changed constant location" {
+                    SourceLocation::NONE
+                } else {
+                    location
+                });
+                assembler.emit_with_depth(LOAD_CONST, 0, 0, ExceptionPolicy::default());
+                assembler.set_location(location);
+                assembler.mark(send_entry);
+                let send =
+                    assembler.emit_forward_with_depth(SEND, end, 0, ExceptionPolicy::default());
+                let original_send = *assembler.emitted_jump_mut(send, "saving the await");
+                if mutation != "missing witness" {
+                    for _ in 0..=usize::from(mutation == "duplicate witness") {
+                        assembler
+                            .exception_owner_provenance
+                            .ordinary_await_ends
+                            .push(super::exception_owners::OrdinaryAwaitEnd {
+                                send: original_send,
+                                entry: end,
+                                end_send: Instruction::new(
+                                    END_SEND,
+                                    Operand::Value(0),
+                                    location,
+                                    Some(0),
+                                ),
+                                cleanup: Vec::new(),
+                                bridge: (mutation == "cold bridge")
+                                    .then_some((other, original_send)),
+                            });
+                    }
+                }
+                match mutation {
+                    "changed send location" => {
+                        assembler.emitted_jump_mut(send, "mutating SEND").location =
+                            SourceLocation::NONE;
+                    }
+                    "changed send depth" => {
+                        *assembler.emitted_jump_mut(send, "mutating SEND") =
+                            Instruction::new(SEND, Operand::Forward(end), location, Some(1));
+                    }
+                    "changed send target" => assembler
+                        .emitted_jump_mut(send, "mutating SEND")
+                        .set_operand(Operand::Forward(other)),
+                    "source boundary" => {
+                        assembler
+                            .exception_owner_provenance
+                            .source_boundaries
+                            .insert(send_entry);
+                    }
+                    "preserved boundary" => {
+                        assembler.preserved_block_boundaries.insert(send_entry);
+                    }
+                    "borrow alias" => {
+                        assembler.borrow_block_aliases.insert(send_entry);
+                    }
+                    "authored nop target" => {
+                        assembler.original_nop_targets.insert(send_entry);
+                    }
+                    "exception target" => {
+                        assembler.add_exception_region(other, end, send_entry, 0, false);
+                    }
+                    "changed source" => {
+                        let Item::Instruction(instruction) = &mut assembler.linear_items_mut()[0]
+                        else {
+                            unreachable!();
+                        };
+                        instruction.location = SourceLocation::NONE;
+                    }
+                    _ => {}
+                }
+                assembler.emit_with_depth(YIELD_VALUE, 1, 0, ExceptionPolicy::default());
+                assembler.emit_with_depth(
+                    RESUME,
+                    ResumeLocation::AFTER_AWAIT.argument(),
+                    0,
+                    ExceptionPolicy::default(),
+                );
+                if mutation != "no backedge" {
+                    assembler.emit_backward(
+                        if mutation == "wrong backedge" {
+                            JUMP_BACKWARD
+                        } else {
+                            JUMP_BACKWARD_NO_INTERRUPT
+                        },
+                        send_entry,
+                    );
+                }
+                if mutation == "other incoming edge" {
+                    assembler.emit_forward_with_depth(
+                        JUMP_FORWARD,
+                        send_entry,
+                        0,
+                        ExceptionPolicy::default(),
+                    );
+                }
+                assembler.mark(end);
+                assembler.emit_with_depth(END_SEND, 0, 0, ExceptionPolicy::default());
+                if mutation == "duplicate original label" {
+                    assembler.mark(send_entry);
+                }
+                for _ in 0..8 {
+                    assembler.emit_with_depth(LOAD_FAST, 0, 0, ExceptionPolicy::default());
+                }
+                assembler.mark_noncopyable_finally_borrow_barrier(origin, ordinal);
+                let Item::Instruction(source) = assembler.linear_items()[0] else {
+                    unreachable!();
+                };
+                assert_eq!(
+                    source.no_location_policy.borrow_fallthrough() == BorrowFallthrough::Barrier,
+                    version == crate::PythonVersion::Py314
+                        && prefix_size >= 2
+                        && matches!(mutation, "intact" | "ignored slots" | "hidden folded slots"),
+                    "{version:?}, prefix={prefix_size}, {mutation}",
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn guarded_cleanup_exit_requires_its_original_raise_edge() {
+    for opcode in [POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE] {
+        for mutation in [
+            "intact",
+            "other incoming edge",
+            "backward condition",
+            "condition location",
+            "condition depth",
+            "fallthrough arm",
+            "raise depth",
+            "jump location",
+            "jump owner",
+            "jump hidden slot",
+            "jump folded slot",
+            "not original",
+            "borrow alias",
+            "authored nop",
+            "preserved boundary",
+            "missing source",
+            "missing block",
+            "borrow marker",
+        ] {
+            let mut assembler = Assembler::default();
+            let entry = assembler.label();
+            let target = assembler.label();
+            let location = SourceLocation::new(7, 7, 8, 21);
+            assembler.set_location(location);
+            let condition =
+                assembler.emit_forward_with_depth(opcode, entry, 0, ExceptionPolicy::default());
+            match mutation {
+                "backward condition" => assembler
+                    .emitted_jump_mut(condition, "mutating the guard")
+                    .set_operand(Operand::Backward(entry)),
+                "condition location" => {
+                    assembler
+                        .emitted_jump_mut(condition, "mutating the guard")
+                        .location = SourceLocation::new(6, 6, 8, 21);
+                }
+                "condition depth" => {
+                    *assembler.emitted_jump_mut(condition, "mutating the guard") =
+                        Instruction::new(opcode, Operand::Forward(entry), location, Some(1));
+                }
+                _ => {}
+            }
+            if mutation == "other incoming edge" {
+                assembler.emit_forward_with_depth(opcode, entry, 0, ExceptionPolicy::default());
+            }
+            assembler.emit_with_depth(
+                if mutation == "fallthrough arm" {
+                    POP_TOP
+                } else {
+                    RAISE_VARARGS
+                },
+                1,
+                u32::from(mutation == "raise depth"),
+                ExceptionPolicy::default(),
+            );
+            assembler.record_exception_owner_block_boundary(entry);
+            assembler.mark(entry);
+            let exit = assembler.emit_forward_with_depth(
+                JUMP_FORWARD,
+                target,
+                0,
+                ExceptionPolicy::default(),
+            );
+            assembler.preserve_redundant_jump_nop_after_threading(exit);
+            match mutation {
+                "jump location" => {
+                    assembler
+                        .emitted_jump_mut(exit, "mutating the exit")
+                        .location = SourceLocation::NONE;
+                }
+                "jump owner" => assembler
+                    .emitted_jump_mut(exit, "mutating the exit")
+                    .set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS),
+                "jump hidden slot" => assembler
+                    .emitted_jump_mut(exit, "mutating the exit")
+                    .local_policy
+                    .add_hidden_exception_owner_slots(1),
+                "jump folded slot" => assembler
+                    .emitted_jump_mut(exit, "mutating the exit")
+                    .add_pre_fold_extra_instructions(1),
+                "not original" => {
+                    assembler
+                        .emitted_jump_mut(exit, "mutating the exit")
+                        .jump_policy = JumpPolicy::default();
+                }
+                "borrow alias" => {
+                    assembler.borrow_block_aliases.insert(entry);
+                }
+                "authored nop" => {
+                    assembler.original_nop_targets.insert(entry);
+                }
+                "preserved boundary" => {
+                    assembler.preserved_block_boundaries.insert(entry);
+                }
+                "missing source" => {
+                    assembler
+                        .exception_owner_provenance
+                        .source_boundaries
+                        .remove(&entry);
+                }
+                "missing block" => {
+                    assembler
+                        .exception_owner_provenance
+                        .block_boundaries
+                        .remove(&entry);
+                }
+                "borrow marker" => assembler.mark_borrow_empty_block(exit),
+                _ => {}
+            }
+            let original = assembler.linear_items().to_vec();
+            assembler.record_guarded_try_else_exit(exit);
+            assert_eq!(assembler.linear_items(), original, "{opcode:?} {mutation}");
+            assert_eq!(
+                assembler.exception_owner_provenance.guarded_try_else_exits,
+                if mutation == "intact" {
+                    vec![(entry, target)]
+                } else {
+                    Vec::new()
+                },
+                "{opcode:?} {mutation}"
+            );
+        }
+    }
+}
+
+#[test]
+fn guarded_cleanup_exit_is_absorbed_only_by_its_exact_outer_pop() {
+    for policy in [
+        ExceptionPolicy::AlwaysUnchanged,
+        ExceptionPolicy::AlwaysAbsent,
+    ] {
+        for mutation in [
+            "intact",
+            "no certificate",
+            "different target",
+            "different span",
+            "not pop",
+            "owned pop",
+        ] {
+            let mut assembler = Assembler::default();
+            let entry = assembler.label();
+            let target = assembler.label();
+            let other = assembler.label();
+            let location = SourceLocation::new(7, 7, 8, 21);
+            assembler.set_location(location);
+            assembler.emit_forward_with_depth(
+                POP_JUMP_IF_FALSE,
+                entry,
+                0,
+                ExceptionPolicy::default(),
+            );
+            assembler.emit_with_depth(RAISE_VARARGS, 1, 0, ExceptionPolicy::default());
+            assembler.record_exception_owner_block_boundary(entry);
+            assembler.mark(entry);
+            let exit = assembler.emit_forward_with_depth(
+                JUMP_FORWARD,
+                target,
+                0,
+                ExceptionPolicy::default(),
+            );
+            assembler.preserve_redundant_jump_nop_after_threading(exit);
+            if mutation != "no certificate" {
+                assembler.record_guarded_try_else_exit(exit);
+            }
+            if mutation == "different target" {
+                assembler.exception_owner_provenance.guarded_try_else_exits[0].1 = other;
+            }
+            assembler
+                .emitted_jump_mut(exit, "finishing deferred jump threading")
+                .jump_policy
+                .resolve_deferred_removal();
+            assembler.mark(target);
+            if mutation == "different span" {
+                assembler.set_location(SourceLocation::new(7, 7, 9, 21));
+            }
+            assembler.emit_with_depth(
+                NOP,
+                0,
+                0,
+                if mutation == "owned pop" {
+                    ExceptionPolicy::NonePresent
+                } else {
+                    policy
+                },
+            );
+            if mutation != "not pop" {
+                assembler.mark_last_as_converted_pop_block();
+            }
+            assembler.set_location(SourceLocation::new(9, 9, 4, 12));
+            assembler.emit_with_depth(LOAD_CONST, 0, 1, ExceptionPolicy::default());
+            assembler.emit_with_depth(RETURN_VALUE, 0, 0, ExceptionPolicy::default());
+            assembler.mark(other);
+            let mut pipeline = assembler.into_optimization_pipeline();
+            pipeline.remove_redundant_forward_jumps(true);
+            let markers = pipeline.graph.iter_items().filter(|item| {
+                matches!(item, Item::Instruction(instruction) if instruction.opcode == NOP)
+            }).count();
+            assert_eq!(
+                markers,
+                if mutation == "intact" { 1 } else { 2 },
+                "{policy:?} {mutation}"
+            );
+        }
+    }
+}
+
+#[test]
+fn copied_loop_handler_none_cleanup_requires_exact_records_and_boundaries() {
+    for continued in [false, true] {
+        for opcode in [POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE] {
+            for mutation in [
+                "intact",
+                "wrong origin",
+                "missing start",
+                "missing end",
+                "authored opcode",
+                "authored location",
+                "cleanup opcode",
+                "cleanup location",
+                "cleanup policy",
+                "binding",
+                "nonlocal load",
+                "condition opcode",
+                "condition target",
+                "condition slots",
+                "condition policy",
+                "marker opcode",
+                "marker operand",
+                "marker location",
+                "extra slots",
+                "extra fold",
+                "unreachable",
+                "source boundary",
+                "block boundary",
+                "fusion boundary",
+                "setup",
+                "omitted nop",
+                "preserved boundary",
+                "incoming edge",
+                "missing suffix",
+                "terminal suffix",
+                "duplicate target",
+            ] {
+                let start = super::Label::from_u32(0);
+                let end = super::Label::from_u32(1);
+                let target = super::Label::from_u32(2);
+                let location = SourceLocation::new(5, 5, 8, 16);
+                let guard = SourceLocation::new(7, 7, 7, 19);
+                let mut records = [
+                    Instruction::new(NOP, Operand::Value(0), location, None),
+                    Instruction::new(POP_EXCEPT, Operand::Value(0), location, None),
+                    Instruction::new(LOAD_CONST, Operand::Value(0), location, None),
+                    Instruction::new(STORE_FAST, Operand::Value(3), location, None),
+                    Instruction::new(DELETE_FAST, Operand::Value(3), location, None),
+                    Instruction::new(LOAD_FAST, Operand::Value(2), guard, None),
+                    Instruction::new(opcode, Operand::Forward(target), guard, None),
+                    Instruction::new(NOT_TAKEN, Operand::Value(0), guard, None),
+                ];
+                records[6].local_policy.add_hidden_exception_owner_slots(3);
+                match mutation {
+                    "authored opcode" => records[0].opcode = POP_TOP,
+                    "authored location" => records[0].location = SourceLocation::NONE,
+                    "cleanup opcode" => records[1].opcode = POP_TOP,
+                    "cleanup location" => records[3].location = guard,
+                    "cleanup policy" => {
+                        records[2].set_exception_policy(ExceptionPolicy::NonePresent);
+                    }
+                    "binding" => records[4].set_operand(Operand::Value(4)),
+                    "nonlocal load" => records[5].opcode = LOAD_GLOBAL,
+                    "condition opcode" => records[6].opcode = POP_JUMP_IF_FALSE,
+                    "condition target" => records[6].set_operand(Operand::Backward(target)),
+                    "condition slots" => records[6].local_policy = LocalPolicy::default(),
+                    "condition policy" => {
+                        records[6].set_exception_policy(ExceptionPolicy::NonePresent);
+                    }
+                    "marker opcode" => records[7].opcode = NOP,
+                    "marker operand" => records[7].set_operand(Operand::Value(1)),
+                    "marker location" => records[7].location = location,
+                    "extra slots" => records[5].local_policy.add_hidden_exception_owner_slots(1),
+                    "extra fold" => records[4].add_pre_fold_extra_instructions(1),
+                    "unreachable" => records[0]
+                        .no_location_policy
+                        .set_borrow_fallthrough(BorrowFallthrough::Barrier),
+                    _ => {}
+                }
+                let mut items = vec![Item::Instruction(records[0])];
+                if mutation != "missing start" {
+                    items.push(Item::Label(start));
+                }
+                items.extend(records[1..5].iter().copied().map(Item::Instruction));
+                if mutation != "missing end" {
+                    items.push(Item::Label(end));
+                }
+                items.extend(records[5..].iter().copied().map(Item::Instruction));
+                items.push(Item::Label(target));
+                if mutation == "duplicate target" {
+                    items.push(Item::Label(target));
+                }
+                if mutation != "missing suffix" {
+                    items.push(Item::Instruction(Instruction::new(
+                        if mutation == "terminal suffix" {
+                            RETURN_VALUE
+                        } else {
+                            LOAD_CONST
+                        },
+                        Operand::Value(0),
+                        guard,
+                        None,
+                    )));
+                }
+                if mutation == "incoming edge" {
+                    items.push(Item::Instruction(Instruction::new(
+                        JUMP_FORWARD,
+                        Operand::Forward(start),
+                        guard,
+                        None,
+                    )));
+                }
+                let mut assembler = Assembler::from_linear_items(items.clone());
+                let provenance = &mut assembler.exception_owner_provenance;
+                match mutation {
+                    "source boundary" => {
+                        provenance.source_boundaries.insert(start);
+                    }
+                    "block boundary" => {
+                        provenance.block_boundaries.insert(start);
+                    }
+                    "fusion boundary" => {
+                        provenance.fusion_boundaries.insert(start);
+                    }
+                    "setup" => {
+                        provenance.setups.push((start, None));
+                    }
+                    "omitted nop" => {
+                        provenance.omitted_nop_counts.insert(start, 1);
+                    }
+                    "preserved boundary" => {
+                        assembler.preserved_block_boundaries.insert(start);
+                    }
+                    _ => {}
+                }
+                let origin = usize::from(mutation == "wrong origin");
+                if continued {
+                    assembler.record_copied_continue_none_handler_cleanup(origin);
+                } else {
+                    assembler.record_copied_break_handler_cleanup(origin);
+                }
+                let expected = mutation == "intact"
+                    || (!continued
+                        && matches!(
+                            mutation,
+                            "missing suffix" | "terminal suffix" | "duplicate target"
+                        ));
+                let captures = &assembler.exception_owner_provenance.copied_handler_cleanups;
+                assert_eq!(
+                    captures.len(),
+                    usize::from(expected),
+                    "{continued} {opcode:?} {mutation}"
+                );
+                if let [capture] = captures.as_slice() {
+                    assert_eq!(capture.start, start);
+                    assert_eq!(capture.end, end);
+                    assert_eq!(capture.return_nop, records[0]);
+                    assert_eq!(capture.instructions, records[1..5]);
+                    assert_eq!(capture.missing_null_pops, 2);
+                    assert_eq!(capture.removed_prefix_slots, 1);
+                }
+                assert_eq!(assembler.linear_items(), items.as_slice());
+            }
+        }
+    }
+}
+
+#[test]
+fn ordinary_try_fragments_retain_only_their_exact_original_setup() {
+    for split in [false, true] {
+        for mutation in [
+            "intact",
+            "missing setup",
+            "different setup handler",
+            "manager setup",
+            "wrong origin",
+            "depth at capture",
+            "lasti at capture",
+            "removed setup",
+            "retargeted setup",
+            "duplicate witness",
+            "different witness setup",
+            "different start",
+            "different end",
+            "different target",
+            "fallback",
+            "depth",
+            "lasti",
+        ] {
+            let mut assembler = Assembler::default();
+            let setup = assembler.label();
+            let fragment = if split { assembler.label() } else { setup };
+            let end = assembler.label();
+            let handler = assembler.label();
+            let other = assembler.label();
+            if !matches!(mutation, "missing setup" | "manager setup") {
+                assembler.record_ordinary_try_exception_setup(
+                    setup,
+                    false,
+                    if mutation == "different setup handler" {
+                        other
+                    } else {
+                        handler
+                    },
+                );
+            } else if mutation == "manager setup" {
+                assembler.record_exception_setup(setup, false);
+                assembler
+                    .exception_owner_provenance
+                    .synchronous_with_setups
+                    .insert(setup);
+            }
+            assembler.add_exception_region_with_origin(
+                fragment,
+                end,
+                handler,
+                u32::from(mutation == "depth at capture"),
+                mutation == "lasti at capture",
+                (
+                    if mutation == "wrong origin" {
+                        other
+                    } else {
+                        setup
+                    },
+                    end,
+                ),
+            );
+            let mut region = assembler.exception_regions[0];
+            // Optimization resolves priorities to positions; origin identity must
+            // survive independently and must not be inferred from these numbers.
+            region.priority = super::ExceptionRegionPriority::Resolved { start: 7, end: 19 };
+            let provenance = &mut assembler.exception_owner_provenance;
+            match mutation {
+                "removed setup" => {
+                    provenance.ordinary_try_setups.remove(&setup);
+                }
+                "retargeted setup" => {
+                    provenance.ordinary_try_setups.insert(setup, other);
+                }
+                "duplicate witness" => provenance
+                    .ordinary_try_region_origins
+                    .push(provenance.ordinary_try_region_origins[0]),
+                "different witness setup" => {
+                    provenance.ordinary_try_region_origins[0].0 = other;
+                }
+                "different start" => region.start = other,
+                "different end" => region.end = other,
+                "different target" => region.target = other,
+                "fallback" => region.is_scope_fallback = true,
+                "depth" => region.depth = 1,
+                "lasti" => region.preserve_lasti = true,
+                _ => {}
+            }
+            assert_eq!(
+                provenance.is_original_ordinary_try_region(region),
+                mutation == "intact",
+                "split={split}: {mutation}"
+            );
+        }
+    }
+}
+
+#[test]
+fn constant_pair_layout_preserves_only_the_swap_owner_witness() {
+    for recorded in [false, true] {
+        for first_local in [3, 24] {
+            for mutation in [
+                "intact",
+                "nonconstant",
+                "wrong swap",
+                "nonlocal store",
+                "same local",
+                "unlocated",
+                "other line",
+                "missing fold",
+                "extra fold",
+                "missing hidden",
+                "extra hidden",
+                "owned swap",
+                "borrow barrier",
+                "borrow alias",
+                "fusion barrier",
+                "location donor",
+                "no copy",
+                "constant witness",
+                "store witness",
+                "constant hidden",
+                "store fold",
+                "prefix",
+                "interior label",
+                "suffix",
+            ] {
+                let location = SourceLocation::new(7, 7, 4, 28);
+                let instruction = |opcode, argument, depth| {
+                    Instruction::new(opcode, Operand::Value(argument), location, Some(depth))
+                };
+                let mut records = [
+                    instruction(LOAD_CONST, 0, 1),
+                    instruction(LOAD_CONST, 0, 2),
+                    instruction(SWAP, 2, 2),
+                    instruction(STORE_FAST, first_local, 1),
+                    instruction(STORE_FAST, first_local + 1, 0),
+                ];
+                if mutation != "missing fold" {
+                    records[2].add_pre_fold_extra_instructions(1);
+                }
+                if mutation != "missing hidden" {
+                    records[2].local_policy.add_hidden_exception_owner_slots(1);
+                }
+                if recorded {
+                    records[2].jump_policy.mark_original_uniform_fold();
+                }
+                match mutation {
+                    "nonconstant" => records[0].opcode = LOAD_FAST,
+                    "wrong swap" => records[2].set_operand(Operand::Value(3)),
+                    "nonlocal store" => records[3].opcode = STORE_NAME,
+                    "same local" => records[4].set_operand(Operand::Value(first_local)),
+                    "unlocated" => records[2].location = SourceLocation::NONE,
+                    "other line" => records[4].location = SourceLocation::new(8, 8, 4, 28),
+                    "extra fold" => records[2].add_pre_fold_extra_instructions(1),
+                    "extra hidden" => records[2].local_policy.add_hidden_exception_owner_slots(1),
+                    "owned swap" => records[2].set_exception_policy(ExceptionPolicy::NonePresent),
+                    "borrow barrier" => records[2]
+                        .no_location_policy
+                        .set_borrow_fallthrough(BorrowFallthrough::Barrier),
+                    "borrow alias" => records[2].jump_policy.mark_borrow_empty_block(),
+                    "fusion barrier" => records[2].fusion_policy.prevent_with_previous(),
+                    "location donor" => records[2].fusion_policy.mark_location_from_next(),
+                    "no copy" => records[2].jump_policy.prevent_small_exit_inlining(),
+                    "constant witness" => records[0].jump_policy.mark_original_uniform_fold(),
+                    "store witness" => records[3].jump_policy.mark_original_uniform_fold(),
+                    "constant hidden" => {
+                        records[0].local_policy.add_hidden_exception_owner_slots(1);
+                    }
+                    "store fold" => records[3].add_pre_fold_extra_instructions(1),
+                    _ => {}
+                }
+                let mut items = records.map(Item::Instruction).to_vec();
+                let mut assembler = Assembler::default();
+                let label = assembler.label();
+                match mutation {
+                    "prefix" => items.insert(0, Item::Instruction(instruction(NOP, 0, 0))),
+                    "interior label" => items.insert(3, Item::Label(label)),
+                    "suffix" => items.push(Item::Instruction(instruction(NOP, 0, 0))),
+                    _ => {}
+                }
+                let expected =
+                    (mutation == "intact").then_some([records[2], records[3], records[4]]);
+                assert_eq!(
+                    super::constant_pair_stores(&items),
+                    expected,
+                    "{recorded} {first_local} {mutation}"
+                );
+                items.insert(0, Item::Label(label));
+                assert_eq!(
+                    super::constant_pair_store_tail(&items),
+                    expected,
+                    "tail {recorded} {first_local} {mutation}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn folded_handler_break_deferral_requires_exact_original_edges() {
+    for count in [1, 2] {
+        for mutation in [
+            "intact",
+            "no anchor",
+            "two anchors",
+            "no source boundary",
+            "no block boundary",
+            "other folded target",
+            "loop else",
+            "authored nop",
+            "hidden nop",
+            "borrow alias",
+            "fallthrough",
+            "no edges",
+            "foreign target",
+            "conditional",
+            "backward",
+            "unlocated",
+            "unknown depth",
+            "different depth",
+            "not authored",
+            "threadable",
+            "always nop",
+            "no nop",
+            "extra slot",
+            "no slot",
+            "owner",
+            "preserved location",
+            "hidden owner",
+        ] {
+            let mut assembler = Assembler::default();
+            let anchor = assembler.label();
+            let alias = assembler.label();
+            let head = assembler.label();
+            if mutation != "no anchor" {
+                assembler.record_folded_loop_exit_anchor(anchor);
+            }
+            assembler.record_exception_owner_block_boundary(anchor);
+            match mutation {
+                "two anchors" => assembler.record_folded_loop_exit_anchor(alias),
+                "no source boundary" => {
+                    assembler
+                        .exception_owner_provenance
+                        .source_boundaries
+                        .remove(&anchor);
+                }
+                "no block boundary" => {
+                    assembler
+                        .exception_owner_provenance
+                        .block_boundaries
+                        .remove(&anchor);
+                }
+                "other folded target" => {
+                    assembler.folded_away_condition_targets.insert(alias);
+                }
+                "loop else" => {
+                    assembler.folded_away_loop_else_targets.insert(anchor);
+                }
+                "authored nop" => {
+                    assembler.original_nop_targets.insert(anchor);
+                }
+                "hidden nop" => {
+                    assembler
+                        .exception_owner_provenance
+                        .omitted_nop_counts
+                        .insert(anchor, 1);
+                }
+                "borrow alias" => {
+                    assembler.borrow_block_aliases.insert(alias);
+                }
+                _ => {}
+            }
+            for index in 0..count {
+                if mutation == "no edges" {
+                    break;
+                }
+                let changed = index + 1 == count;
+                let mut jump = Instruction::new(
+                    JUMP_FORWARD,
+                    Operand::Forward(anchor),
+                    SourceLocation::new(4 + index, 4 + index, 8, 13),
+                    if changed && mutation == "unknown depth" {
+                        None
+                    } else {
+                        Some(1)
+                    },
+                );
+                jump.fusion_policy.mark_authored_break();
+                jump.jump_policy.prevent_threading_target();
+                jump.jump_policy.retain_nop_for_direct_target();
+                jump.add_pre_fold_extra_instructions(1);
+                if changed {
+                    match mutation {
+                        "foreign target" => jump.set_operand(Operand::Forward(alias)),
+                        "conditional" => jump.opcode = POP_JUMP_IF_FALSE,
+                        "backward" => jump.set_operand(Operand::Backward(anchor)),
+                        "unlocated" => jump.location = SourceLocation::NONE,
+                        "different depth" => {
+                            jump = Instruction::new(
+                                JUMP_FORWARD,
+                                Operand::Forward(anchor),
+                                jump.location,
+                                Some(2),
+                            );
+                            jump.fusion_policy.mark_authored_break();
+                            jump.jump_policy.prevent_threading_target();
+                            jump.jump_policy.retain_nop_for_direct_target();
+                            jump.add_pre_fold_extra_instructions(1);
+                        }
+                        "not authored" => {
+                            jump = Instruction::new(
+                                JUMP_FORWARD,
+                                Operand::Forward(anchor),
+                                jump.location,
+                                Some(1),
+                            );
+                            jump.jump_policy.prevent_threading_target();
+                            jump.jump_policy.retain_nop_for_direct_target();
+                            jump.add_pre_fold_extra_instructions(1);
+                        }
+                        "threadable" => jump.jump_policy = JumpPolicy::default(),
+                        "always nop" => jump.jump_policy.retain_nop(),
+                        "no nop" => {
+                            jump.jump_policy = JumpPolicy::default();
+                            jump.jump_policy.prevent_threading_target();
+                        }
+                        "extra slot" => jump.add_pre_fold_extra_instructions(1),
+                        "no slot" => {
+                            jump = Instruction::new(
+                                JUMP_FORWARD,
+                                Operand::Forward(anchor),
+                                jump.location,
+                                Some(1),
+                            );
+                            jump.fusion_policy.mark_authored_break();
+                            jump.jump_policy.prevent_threading_target();
+                            jump.jump_policy.retain_nop_for_direct_target();
+                        }
+                        "owner" => jump.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS),
+                        "preserved location" => jump.no_location_policy.preserve_location(),
+                        "hidden owner" => jump.local_policy.add_hidden_exception_owner_slots(1),
+                        _ => {}
+                    }
+                }
+                assembler.push_linear_item(Item::Instruction(jump));
+            }
+            assembler.push_linear_item(Item::Instruction(Instruction::new(
+                if mutation == "fallthrough" {
+                    NOP
+                } else {
+                    JUMP_BACKWARD
+                },
+                Operand::Backward(head),
+                SourceLocation::NONE,
+                Some(1),
+            )));
+            assembler.mark(anchor);
+            assembler.mark(alias);
+            let before = assembler.linear_items().to_vec();
+            assert_eq!(
+                assembler.defer_original_folded_while_break_cleanup_edges(),
+                mutation == "intact" || (mutation == "different depth" && count == 1),
+                "{count}: {mutation}"
+            );
+            if mutation != "intact" && !(mutation == "different depth" && count == 1) {
+                assert_eq!(assembler.linear_items(), before, "{count}: {mutation}");
+            }
+        }
+    }
+}
+
+#[test]
 #[cfg(target_pointer_width = "64")]
 fn instruction_items_remain_cache_compact() {
     assert_eq!(std::mem::size_of::<Option<super::Label>>(), 4);
@@ -147,6 +3022,111 @@ fn instruction_items_remain_cache_compact() {
         std::mem::size_of::<Option<Instruction>>(),
         std::mem::size_of::<Instruction>(),
     );
+}
+
+#[test]
+fn expression_join_call_footers_require_intact_records_and_depths() {
+    let location = SourceLocation::new(2, 2, 4, 20);
+    for arguments in [0, 1, 3] {
+        for mutation in [
+            "intact",
+            "located pop",
+            "incoming depth",
+            "incoming opcode",
+            "call depth",
+            "call location",
+            "call owner",
+            "pop depth",
+            "pop operand",
+            "pop owner",
+            "split suffix",
+            "extra prefix",
+            "missing boundary",
+            "authored nop",
+            "borrow alias",
+            "hidden nop",
+            "trailing alias",
+        ] {
+            let mut assembler = Assembler::default();
+            let join = assembler.label();
+            assembler.set_location(location);
+            assembler.emit_forward_with_depth(
+                if mutation == "incoming opcode" {
+                    POP_JUMP_IF_TRUE
+                } else {
+                    JUMP_FORWARD
+                },
+                join,
+                arguments + 2 + u32::from(mutation == "incoming depth"),
+                ExceptionPolicy::default(),
+            );
+            if mutation != "missing boundary" {
+                assembler.record_exception_owner_block_boundary(join);
+            }
+            assembler.mark(join);
+            match mutation {
+                "authored nop" => {
+                    assembler.original_nop_targets.insert(join);
+                }
+                "borrow alias" => {
+                    assembler.borrow_block_aliases.insert(join);
+                }
+                "hidden nop" => {
+                    assembler
+                        .exception_owner_provenance
+                        .omitted_nop_counts
+                        .insert(join, 1);
+                }
+                _ => {}
+            }
+            if mutation == "extra prefix" {
+                assembler.emit_with_depth(NOP, 0, arguments + 2, ExceptionPolicy::default());
+            }
+            assembler.set_location(if mutation == "call location" {
+                SourceLocation::NONE
+            } else {
+                location
+            });
+            assembler.emit_with_depth(
+                CALL,
+                arguments,
+                1 + u32::from(mutation == "call depth"),
+                if mutation == "call owner" {
+                    ExceptionPolicy::EXCLUDE_ALWAYS
+                } else {
+                    ExceptionPolicy::default()
+                },
+            );
+            if mutation == "split suffix" {
+                let alias = assembler.label();
+                assembler.mark(alias);
+            }
+            assembler.set_location(if mutation == "located pop" {
+                location
+            } else {
+                SourceLocation::NONE
+            });
+            assembler.emit_with_depth(
+                POP_TOP,
+                u32::from(mutation == "pop operand"),
+                u32::from(mutation == "pop depth"),
+                if mutation == "pop owner" {
+                    ExceptionPolicy::EXCLUDE_ALWAYS
+                } else {
+                    ExceptionPolicy::default()
+                },
+            );
+            if mutation == "trailing alias" {
+                let alias = assembler.label();
+                assembler.mark(alias);
+            }
+            assert_eq!(
+                assembler.follows_original_join_footer(),
+                matches!(mutation, "intact" | "located pop"),
+                "{arguments}: {mutation}",
+            );
+        }
+    }
 }
 
 #[test]
@@ -405,6 +3385,40 @@ fn packed_exception_policy_preserves_all_states() {
 }
 
 #[test]
+fn empty_borrow_block_mark_reports_retained_nop_controls() {
+    for retention in ["none", "direct", "always", "threaded", "explicit"] {
+        let mut assembler = Assembler::with_python_version(crate::PythonVersion::Py314);
+        let target = assembler.label();
+        let jump =
+            assembler.emit_forward_with_depth(JUMP_FORWARD, target, 0, ExceptionPolicy::default());
+        let policy = &mut assembler
+            .emitted_jump_mut(jump, "preparing retention")
+            .jump_policy;
+        match retention {
+            "none" => {}
+            "direct" => policy.retain_nop_for_direct_target(),
+            "always" => policy.retain_nop(),
+            "threaded" => policy.preserve_nop_after_threading_for_test(),
+            "explicit" => policy.preserve_explicit_nop(),
+            _ => unreachable!(),
+        }
+        let mut expected = *assembler.emitted_jump_mut(jump, "capturing retention");
+        if retention == "none" {
+            expected.jump_policy.mark_borrow_empty_block();
+        }
+        assert_eq!(
+            assembler.mark_borrow_empty_block_if_unretained(jump),
+            retention == "none",
+            "{retention}",
+        );
+        assert_eq!(
+            *assembler.emitted_jump_mut(jump, "checking retention"),
+            expected
+        );
+    }
+}
+
+#[test]
 fn jump_policy_defaults_are_explicit() {
     let policy = JumpPolicy::default();
     assert!(policy.inline_small_exit());
@@ -534,6 +3548,62 @@ fn deferred_jump_removal_promotes_post_threading_nop_retention() {
     assert!(!policy.defers_redundant_removal());
     assert!(!policy.preserves_nop_after_threading());
     assert_eq!(policy.retained_nop(), RetainedJumpNop::Always);
+}
+
+#[test]
+fn chained_comparison_arm_nop_keeps_threading_and_original_copy_cost() {
+    for version in [crate::PythonVersion::Py314, crate::PythonVersion::Py315] {
+        for retain in [false, true] {
+            for through_join in [false, true] {
+                let mut assembler = Assembler::with_python_version(version);
+                let source = assembler.label();
+                let join = assembler.label();
+                let target = assembler.label();
+                assembler.mark(source);
+                assembler.set_location(SourceLocation::new(2, 2, 12, 22));
+                let jump = assembler.emit_forward_with_depth(
+                    JUMP_FORWARD,
+                    if through_join { join } else { target },
+                    0,
+                    ExceptionPolicy::default(),
+                );
+                if retain {
+                    assembler.preserve_chained_comparison_arm_jump_nop(jump);
+                }
+                if through_join {
+                    assembler.mark(join);
+                    assembler.set_location(SourceLocation::NONE);
+                    let jump = assembler.emit_forward_with_depth(
+                        JUMP_FORWARD,
+                        target,
+                        0,
+                        ExceptionPolicy::default(),
+                    );
+                    assembler.preserve_direct_inlined_jump_nop(jump);
+                }
+                assembler.mark(target);
+                assembler.set_location(SourceLocation::new(3, 3, 15, 20));
+                assembler.emit_with_depth(NOP, 0, 0, ExceptionPolicy::default());
+                assembler.emit_with_depth(LOAD_CONST, 0, 1, ExceptionPolicy::default());
+                assembler.emit_with_depth(RETURN_VALUE, 0, 0, ExceptionPolicy::default());
+
+                let mut pipeline = assembler.into_optimization_pipeline();
+                let source_block = pipeline.graph.label_block(source).unwrap();
+                let target_block = pipeline.graph.label_block(target).unwrap();
+                let original = *pipeline.graph[source_block].last_instruction().unwrap();
+                let original_target = pipeline.graph[target_block].items().to_vec();
+                assert_eq!(pipeline.thread_forward_jumps(), through_join);
+                let mut expected = original;
+                expected.retarget(Operand::Forward(target));
+                expected.add_pre_fold_extra_instructions(u8::from(through_join));
+                let actual = pipeline.graph[source_block].last_instruction().unwrap();
+                assert_eq!(*actual, expected);
+                assert!(!actual.jump_policy.always_retains_nop());
+                assert_eq!(actual.jump_policy.retains_nop_for(actual.operand()), retain);
+                assert_eq!(pipeline.graph[target_block].items(), original_target);
+            }
+        }
+    }
 }
 
 #[test]
@@ -1542,6 +4612,549 @@ fn target_caches_and_extended_arguments_share_the_same_layout() {
 }
 
 #[test]
+fn manager_while_break_requires_original_role_and_full_call_records() {
+    for version in [crate::PythonVersion::Py314, crate::PythonVersion::Py315] {
+        for method in [false, true] {
+            for mutation in [
+                "intact",
+                "no role",
+                "foreign role",
+                "wrong body",
+                "wrong depth",
+                "receiver span",
+                "callee span",
+                "call span",
+                "call arity",
+                "pop span",
+                "hidden load",
+                "borrow load",
+                "folded call",
+                "owned pop",
+                "jump span",
+                "not break",
+                "threadable",
+                "borrow jump",
+                "two breaks",
+                "fallthrough",
+                "extra alias",
+                "source boundary",
+                "folded end",
+                "no source",
+                "late receiver",
+                "late callee",
+                "late call",
+                "late pop",
+                "late jump",
+                "late no role",
+                "late foreign source",
+            ] {
+                let mut assembler = Assembler::with_python_version(version);
+                let source = assembler.label();
+                let entry = assembler.label();
+                let protected_end = assembler.label();
+                let foreign = assembler.label();
+                let receiver = SourceLocation::new(10, 10, 12, 15);
+                let callee = if method {
+                    SourceLocation::new(10, 10, 12, 21)
+                } else {
+                    receiver
+                };
+                let call = SourceLocation::new(10, 10, 12, if method { 23 } else { 17 });
+                let mut records = [
+                    Instruction::new(LOAD_FAST, Operand::Value(0), receiver, Some(3)),
+                    Instruction::new(
+                        if method { LOAD_ATTR } else { PUSH_NULL },
+                        Operand::Value(u32::from(method)),
+                        callee,
+                        Some(4),
+                    ),
+                    Instruction::new(CALL, Operand::Value(0), call, Some(3)),
+                    Instruction::new(POP_TOP, Operand::Value(0), call, Some(2)),
+                    Instruction::new(
+                        JUMP_FORWARD,
+                        Operand::Forward(entry),
+                        SourceLocation::NONE,
+                        Some(2),
+                    ),
+                ];
+                records[4].fusion_policy.mark_authored_break();
+                records[4].jump_policy.prevent_threading_target();
+                match mutation {
+                    "receiver span" => records[0].location.column += 1,
+                    "callee span" => records[1].location.column += 1,
+                    "call span" => records[2].location.column += 1,
+                    "call arity" => records[2].set_operand(Operand::Value(1)),
+                    "pop span" => records[3].location.column += 1,
+                    "hidden load" => records[0].local_policy.add_hidden_exception_owner_slots(1),
+                    "borrow load" => records[0].local_policy.mark_force_borrowed_load(),
+                    "folded call" => records[2].add_pre_fold_extra_instructions(1),
+                    "owned pop" => records[3].set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS),
+                    "jump span" => records[4].location = call,
+                    "not break" => records[4].fusion_policy = FusionPolicy::default(),
+                    "threadable" => records[4].jump_policy = JumpPolicy::default(),
+                    "borrow jump" => records[4].jump_policy.prevent_borrow_threading_target(),
+                    _ => {}
+                }
+                if mutation != "no source" {
+                    assembler.mark(source);
+                }
+                for record in records {
+                    assembler.push_linear_item(Item::Instruction(record));
+                }
+                if mutation == "two breaks" {
+                    assembler.push_linear_item(Item::Instruction(records[4]));
+                }
+                assembler.push_linear_item(Item::Instruction(Instruction::new(
+                    if mutation == "fallthrough" {
+                        POP_TOP
+                    } else {
+                        RAISE_VARARGS
+                    },
+                    Operand::Value(1),
+                    SourceLocation::new(12, 12, 8, 26),
+                    Some(2),
+                )));
+                if mutation == "extra alias" {
+                    assembler.mark(foreign);
+                }
+                assembler.mark(entry);
+                assembler.mark(protected_end);
+                if mutation != "no role" {
+                    assembler.record_original_manager_while_end(
+                        if mutation == "foreign role" {
+                            foreign
+                        } else {
+                            entry
+                        },
+                        usize::from(mutation == "wrong body"),
+                        if mutation == "wrong depth" { 3 } else { 2 },
+                        call,
+                        callee,
+                        receiver,
+                    );
+                }
+                if mutation == "source boundary" {
+                    assembler.record_exception_owner_block_boundary(entry);
+                }
+                if mutation == "folded end" {
+                    assembler.folded_away_loop_else_targets.insert(entry);
+                }
+                let accepted = version == crate::PythonVersion::Py315
+                    && (mutation == "intact" || mutation.starts_with("late "));
+                assert_eq!(
+                    assembler.original_manager_while_call_break_join(protected_end, 0, 2),
+                    accepted.then_some(entry),
+                    "{version:?} method={method} {mutation}"
+                );
+                if !accepted {
+                    continue;
+                }
+                let mut pop =
+                    Instruction::new(NOP, Operand::Value(0), SourceLocation::NONE, Some(2));
+                pop.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
+                pop.fusion_policy.mark_converted_pop_block();
+                pop.jump_policy.preserve_explicit_nop();
+                assembler.push_linear_item(Item::Instruction(pop));
+                assembler.push_linear_item(Item::Instruction(Instruction::new(
+                    RETURN_VALUE,
+                    Operand::Value(0),
+                    call,
+                    Some(0),
+                )));
+                assembler
+                    .exception_owner_provenance
+                    .original_manager_pop_blocks
+                    .push(entry);
+                assembler.preserve_block_boundary(entry);
+                if mutation == "late no role" {
+                    assembler
+                        .exception_owner_provenance
+                        .original_manager_while_ends
+                        .clear();
+                }
+                if mutation == "late foreign source" {
+                    assembler
+                        .exception_owner_provenance
+                        .original_manager_pop_donors
+                        .get_mut(&entry)
+                        .unwrap()
+                        .source = foreign;
+                }
+                let mut pipeline = assembler.into_optimization_pipeline();
+                let source_block = pipeline.graph.label_block(source).unwrap();
+                let changed = match mutation {
+                    "late receiver" => Some(0),
+                    "late callee" => Some(1),
+                    "late call" => Some(2),
+                    "late pop" => Some(3),
+                    "late jump" => Some(4),
+                    _ => None,
+                };
+                if let Some(index) = changed {
+                    pipeline
+                        .graph
+                        .instructions_mut(source_block)
+                        .nth(index)
+                        .unwrap()
+                        .jump_policy
+                        .prevent_borrow_threading_target();
+                }
+                pipeline.replay_original_manager_pop_locations();
+                let target = pipeline.graph.label_block(entry).unwrap();
+                assert_eq!(
+                    pipeline
+                        .graph
+                        .instructions_mut(target)
+                        .next()
+                        .unwrap()
+                        .location,
+                    if mutation == "intact" {
+                        call
+                    } else {
+                        SourceLocation::NONE
+                    },
+                    "method={method} {mutation}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn manager_populated_branch_requires_one_intact_original_donor() {
+    use crate::PythonVersion::{Py314, Py315};
+
+    for version in [Py314, Py315] {
+        for mutation in [
+            "intact",
+            "two donors",
+            "fallthrough",
+            "adjacent donor",
+            "jump only",
+            "wrong depth",
+            "wrong span",
+            "unlocated",
+            "same manager line",
+            "hidden slots",
+            "folded slots",
+            "authored break",
+            "converted pop",
+            "marker donor",
+            "missing source entry",
+            "missing donor entry",
+            "multiple entries",
+            "folded join",
+            "authored join",
+            "wrong target alias",
+            "outside body",
+        ] {
+            let mut assembler = Assembler::with_python_version(version);
+            let entry = assembler.label();
+            let protected_end = assembler.label();
+            let source = assembler.label();
+            let location = SourceLocation::new(10, 10, 12, 20);
+            let mut donor = Instruction::new(STORE_FAST, Operand::Value(0), location, Some(2));
+            let mut jump =
+                Instruction::new(JUMP_FORWARD, Operand::Forward(entry), location, Some(2));
+            match mutation {
+                "wrong depth" => {
+                    donor = Instruction::new(STORE_FAST, Operand::Value(0), location, Some(3));
+                }
+                "wrong span" => jump.location.column += 1,
+                "unlocated" => donor.location = SourceLocation::NONE,
+                "hidden slots" => donor.local_policy.add_hidden_exception_owner_slots(1),
+                "folded slots" => jump.add_pre_fold_extra_instructions(1),
+                "authored break" => jump.fusion_policy.mark_authored_break(),
+                "converted pop" => donor.fusion_policy.mark_converted_pop_block(),
+                "marker donor" => donor.opcode = NOT_TAKEN,
+                "wrong target alias" => jump.set_operand(Operand::Forward(protected_end)),
+                _ => {}
+            }
+            assembler.mark(source);
+            if mutation != "missing donor entry" {
+                assembler.record_exception_owner_block_boundary(source);
+            }
+            assembler.push_linear_item(Item::Instruction(donor));
+            if mutation == "jump only" {
+                let boundary = assembler.label();
+                assembler.mark(boundary);
+            }
+            assembler.push_linear_item(Item::Instruction(jump));
+            if mutation == "two donors" {
+                assembler.push_linear_item(Item::Instruction(jump));
+            }
+            if mutation != "adjacent donor" {
+                assembler.push_linear_item(Item::Instruction(Instruction::new(
+                    if mutation == "fallthrough" {
+                        POP_TOP
+                    } else {
+                        RETURN_VALUE
+                    },
+                    Operand::Value(0),
+                    SourceLocation::new(12, 12, 12, 18),
+                    Some(0),
+                )));
+            }
+            assembler.mark(entry);
+            assembler.mark(protected_end);
+            assembler.record_exception_owner_block_boundary(entry);
+            match mutation {
+                "missing source entry" => {
+                    assembler
+                        .exception_owner_provenance
+                        .source_boundaries
+                        .remove(&entry);
+                }
+                "multiple entries" => {
+                    assembler.record_exception_owner_block_boundary(protected_end);
+                }
+                "folded join" => {
+                    assembler.folded_away_condition_targets.insert(entry);
+                }
+                "authored join" => {
+                    assembler.original_nop_targets.insert(entry);
+                }
+                _ => {}
+            }
+            let manager_location = if mutation == "same manager line" {
+                location
+            } else {
+                SourceLocation::new(8, 8, 9, 18)
+            };
+            assert_eq!(
+                assembler.original_manager_populated_branch_join(
+                    protected_end,
+                    if mutation == "outside body" { 2 } else { 0 },
+                    manager_location,
+                    2,
+                ),
+                (mutation == "intact").then_some(entry),
+                "{version:?}, {mutation}"
+            );
+        }
+    }
+}
+
+#[test]
+fn manager_branch_alias_requires_two_proven_dead_original_exits() {
+    for version in [crate::PythonVersion::Py314, crate::PythonVersion::Py315] {
+        for mutation in 0..25 {
+            let mut assembler = Assembler::with_python_version(version);
+            let source = assembler.label();
+            let entry = assembler.label();
+            let protected_end = assembler.label();
+            let dead = assembler.label();
+            let returned_aliases = [assembler.label(), assembler.label(), assembler.label()];
+            let handler = assembler.label();
+            let cleanup = assembler.label();
+            let exceptional = assembler.label();
+            let donor_location = SourceLocation::new(10, 10, 12, 20);
+            let manager_location = SourceLocation::new(8, 8, 9, 18);
+            let raise_location = SourceLocation::new(14, 14, 12, 30);
+            let instruction = |opcode, operand, location, depth| {
+                Item::Instruction(Instruction::new(opcode, operand, location, Some(depth)))
+            };
+            let mut normal = Instruction::new(
+                JUMP_FORWARD,
+                Operand::Forward(dead),
+                manager_location,
+                Some(2),
+            );
+            normal
+                .no_location_policy
+                .set_borrow_fallthrough(super::ir::BorrowFallthrough::Barrier);
+            let mut items = vec![
+                Item::Label(source),
+                instruction(STORE_FAST, Operand::Value(0), donor_location, 2),
+                instruction(JUMP_FORWARD, Operand::Forward(entry), donor_location, 2),
+                instruction(RETURN_VALUE, Operand::Value(0), manager_location, 0),
+                Item::Label(returned_aliases[0]),
+                Item::Label(returned_aliases[1]),
+                Item::Label(returned_aliases[2]),
+                Item::Instruction(normal),
+                Item::Label(handler),
+                instruction(LOAD_CONST, Operand::Value(0), raise_location, 4),
+                instruction(RAISE_VARARGS, Operand::Value(1), raise_location, 3),
+                Item::Label(cleanup),
+                instruction(POP_EXCEPT, Operand::Value(0), raise_location, 2),
+                instruction(LOAD_CONST, Operand::Value(0), raise_location, 3),
+                instruction(STORE_FAST, Operand::Value(1), raise_location, 2),
+                instruction(
+                    crate::target::opcodes::DELETE_FAST,
+                    Operand::Value(1),
+                    raise_location,
+                    2,
+                ),
+                instruction(JUMP_FORWARD, Operand::Forward(dead), raise_location, 2),
+                Item::Label(exceptional),
+                instruction(RERAISE, Operand::Value(1), SourceLocation::NONE, 2),
+                Item::Label(dead),
+                Item::Label(entry),
+                Item::Label(protected_end),
+            ];
+            for label in [source, entry, dead] {
+                assembler.record_exception_owner_block_boundary(label);
+            }
+            assembler
+                .exception_owner_provenance
+                .return_region_reentries
+                .insert(returned_aliases[0]);
+            assembler
+                .exception_owner_provenance
+                .named_handler_cleanup_targets
+                .insert(exceptional);
+            assembler.original_unlocated_cleanup_targets.insert(cleanup);
+            let mut region = super::ExceptionRegion {
+                is_scope_fallback: false,
+                priority: super::ExceptionRegionPriority::OriginalRange(handler, cleanup),
+                start: handler,
+                end: cleanup,
+                target: exceptional,
+                depth: 3,
+                preserve_lasti: true,
+            };
+            match mutation {
+                1 => items[3] = instruction(POP_TOP, Operand::Value(0), manager_location, 0),
+                2 => items[3] = instruction(RETURN_VALUE, Operand::Value(0), manager_location, 1),
+                3 => {
+                    items[7] =
+                        instruction(JUMP_FORWARD, Operand::Forward(dead), manager_location, 2);
+                }
+                4 => items[10] = instruction(POP_TOP, Operand::Value(0), raise_location, 3),
+                5 => items[14] = instruction(STORE_FAST, Operand::Value(2), raise_location, 2),
+                6 => {
+                    items[16] =
+                        instruction(JUMP_FORWARD, Operand::Forward(entry), raise_location, 2);
+                }
+                7 => {
+                    assembler.original_unlocated_cleanup_targets.clear();
+                }
+                8 => {
+                    assembler
+                        .exception_owner_provenance
+                        .return_region_reentries
+                        .clear();
+                }
+                9 => {
+                    assembler
+                        .exception_owner_provenance
+                        .named_handler_cleanup_targets
+                        .clear();
+                }
+                10 => region.target = returned_aliases[0],
+                11 => region.depth = 2,
+                12 => region.preserve_lasti = false,
+                13 => region.is_scope_fallback = true,
+                14 => {
+                    region.priority =
+                        super::ExceptionRegionPriority::OriginalRange(source, cleanup);
+                }
+                15 => {
+                    assembler.preserved_block_boundaries.insert(cleanup);
+                }
+                16 => {
+                    assembler.record_exception_owner_block_boundary(returned_aliases[1]);
+                }
+                17 => {
+                    assembler.folded_away_condition_targets.insert(cleanup);
+                }
+                18 => {
+                    assembler.original_nop_targets.insert(returned_aliases[0]);
+                }
+                19 => {
+                    assembler
+                        .exception_owner_provenance
+                        .omitted_nop_counts
+                        .insert(cleanup, 1);
+                }
+                20 => {
+                    items[9] = instruction(
+                        JUMP_FORWARD,
+                        Operand::Forward(returned_aliases[0]),
+                        raise_location,
+                        4,
+                    );
+                }
+                21 => {
+                    items[9] =
+                        instruction(JUMP_FORWARD, Operand::Forward(cleanup), raise_location, 4);
+                }
+                22 => {
+                    let Item::Instruction(store) = &mut items[14] else {
+                        unreachable!()
+                    };
+                    store.local_policy.add_hidden_exception_owner_slots(1);
+                }
+                23 => {
+                    assembler
+                        .exception_owner_provenance
+                        .source_boundaries
+                        .remove(&dead);
+                }
+                24 => items[1] = instruction(STORE_FAST, Operand::Value(0), donor_location, 3),
+                _ => {}
+            }
+            assembler.exception_regions.push(region);
+            for item in items {
+                assembler.push_linear_item(item);
+            }
+            assert_eq!(
+                assembler.original_manager_populated_branch_join(
+                    protected_end,
+                    0,
+                    manager_location,
+                    2
+                ),
+                (mutation == 0).then_some(entry),
+                "{version:?}, mutation {mutation}",
+            );
+        }
+    }
+}
+
+#[test]
+fn completed_cold_manager_join_requires_original_footer_and_single_boundary() {
+    for version in [crate::PythonVersion::Py314, crate::PythonVersion::Py315] {
+        for mutation in 0..9 {
+            let mut assembler = Assembler::with_python_version(version);
+            let entry = assembler.label();
+            let protected_end = assembler.label();
+            let mut copy = Instruction::new(COPY, Operand::Value(3), SourceLocation::NONE, Some(6));
+            let mut pop =
+                Instruction::new(POP_EXCEPT, Operand::Value(0), SourceLocation::NONE, Some(5));
+            let mut reraise =
+                Instruction::new(RERAISE, Operand::Value(1), SourceLocation::NONE, Some(2));
+            match mutation {
+                1 => copy.set_operand(Operand::Value(2)),
+                2 => pop.opcode = POP_TOP,
+                3 => reraise.set_operand(Operand::Value(0)),
+                4 => copy.location = SourceLocation::new(4, 4, 8, 16),
+                5 => pop.add_pre_fold_extra_instructions(1),
+                _ => {}
+            }
+            for record in [copy, pop, reraise] {
+                assembler.push_linear_item(Item::Instruction(record));
+            }
+            assembler.mark(entry);
+            assembler.record_exception_owner_block_boundary(entry);
+            if mutation == 6 {
+                let alias = assembler.label();
+                assembler.mark(alias);
+                assembler.record_exception_owner_block_boundary(alias);
+            }
+            if mutation != 7 {
+                assembler.mark(protected_end);
+            }
+            assert_eq!(
+                assembler.original_manager_cleanup_join(protected_end, mutation != 8),
+                (mutation == 0).then_some(entry),
+                "{version:?}: {mutation}",
+            );
+        }
+    }
+}
+
+#[test]
 fn manager_finally_break_donor_requires_every_target_iterator_pop() {
     use crate::PythonVersion::{Py314, Py315};
 
@@ -2406,6 +6019,617 @@ fn optimization_pipeline(items: Vec<Item>) -> super::OptimizationPipeline {
     assembler.into_optimization_pipeline()
 }
 
+fn unpacked_or_capture_items(depth: u32) -> Vec<Item> {
+    let mut items = vec![pass_instruction(UNPACK_SEQUENCE, 1, 3)];
+    for distance in (2..=depth).rev() {
+        items.push(pass_instruction(SWAP, distance, 3));
+    }
+    for column in 0..depth - 1 {
+        let source_column = i32::try_from(column).unwrap();
+        let mut pop = Instruction::new(
+            POP_TOP,
+            Operand::Value(0),
+            SourceLocation::new(3, 3, source_column, source_column + 1),
+            Some(column),
+        );
+        if column.is_multiple_of(2) {
+            pop.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
+        }
+        items.push(Item::Instruction(pop));
+    }
+    items.extend([
+        Item::Instruction(Instruction::new(
+            JUMP_FORWARD,
+            Operand::Forward(super::Label::from_u32(0)),
+            SourceLocation::new(3, 3, 0, 20),
+            Some(1),
+        )),
+        Item::Label(super::Label::from_u32(0)),
+        pass_instruction(RETURN_VALUE, 0, 4),
+    ]);
+    items
+}
+
+#[test]
+fn unpacked_or_capture_rotations_preserve_the_largest_swap_and_pop_records() {
+    for depth in [3, 5, 7, 9] {
+        let items = unpacked_or_capture_items(depth);
+        let depth = usize::try_from(depth).unwrap();
+        let rotation = super::capture_cleanup_rotation(&items).unwrap();
+        assert_eq!(rotation.swap_count, depth - 1);
+        assert_eq!(rotation.removed_slots, depth - 2);
+        assert_eq!(rotation.consumer_rotation, 1);
+        assert_eq!(rotation.consumers.len(), depth - 1);
+        let mut pipeline = optimization_pipeline(items.clone());
+        let (blocks, cleanup, _) = pipeline.optimize_swap_runs();
+        assert!(pipeline.apply_static_swaps((blocks, cleanup)).is_empty());
+        let actual = pipeline.graph.iter_items().copied().collect::<Vec<_>>();
+        assert_eq!(actual.len(), items.len());
+        assert_eq!(&actual[..2], &items[..2]);
+        for index in 2..depth {
+            let (Item::Instruction(before), Item::Instruction(after)) =
+                (items[index], actual[index])
+            else {
+                panic!()
+            };
+            assert_eq!(after.opcode, NOP);
+            assert_eq!(after.operand(), Operand::Value(0));
+            assert_eq!(after.exception_policy(), before.exception_policy());
+            assert_eq!(after.depth_after(), before.depth_after());
+        }
+        let mut pops = items[depth..2 * depth - 1].to_vec();
+        pops.rotate_right(1);
+        assert_eq!(&actual[depth..2 * depth - 1], pops);
+        assert_eq!(&actual[2 * depth - 1..], &items[2 * depth - 1..]);
+    }
+}
+
+#[test]
+fn unpacked_or_capture_rotations_require_the_complete_original_array() {
+    for mutation in 0..17 {
+        let mut items = unpacked_or_capture_items(5);
+        match mutation {
+            0 => items[0] = pass_instruction(UNPACK_SEQUENCE, 0, 3),
+            1 => items[0] = pass_instruction(UNPACK_SEQUENCE, 2, 3),
+            2 => items[0] = pass_instruction(POP_TOP, 0, 3),
+            3 => items[2] = pass_instruction(SWAP, 3, 3),
+            4 => items[2] = pass_instruction(SWAP, 4, 4),
+            5 => items[6] = pass_instruction(POP_TOP, 0, 4),
+            6 => items[6] = pass_instruction(POP_TOP, 1, 3),
+            7 => items[6] = pass_instruction(STORE_FAST, 0, 3),
+            8 => items.insert(4, Item::Label(super::Label::from_u32(1))),
+            9 => items.insert(5, pass_instruction(NOP, 0, 3)),
+            10 => {
+                items.remove(8);
+            }
+            11 => items.insert(9, pass_instruction(POP_TOP, 0, 3)),
+            12 => {
+                items.truncate(9);
+            }
+            13 => {
+                let Item::Instruction(jump) = &mut items[9] else {
+                    panic!()
+                };
+                jump.set_operand(Operand::Backward(super::Label::from_u32(0)));
+            }
+            14 => {
+                let Item::Instruction(jump) = &mut items[9] else {
+                    panic!()
+                };
+                jump.opcode = POP_JUMP_IF_FALSE;
+            }
+            15 => {
+                let Item::Instruction(swap) = &mut items[2] else {
+                    panic!()
+                };
+                swap.jump_policy.retain_nop();
+            }
+            16 => {
+                let Item::Instruction(pop) = &mut items[6] else {
+                    panic!()
+                };
+                pop.no_location_policy.preserve_location();
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            super::capture_cleanup_rotation(&items).is_none(),
+            "mutation {mutation}"
+        );
+    }
+}
+
+fn split_line_capture_items(depth: usize, same_line_pops: usize) -> Vec<Item> {
+    let mut items = vec![pass_instruction(UNPACK_SEQUENCE, 1, 5)];
+    for distance in (2..=depth).rev() {
+        items.push(pass_instruction(SWAP, u32::try_from(distance).unwrap(), 5));
+    }
+    for index in 0..depth - 1 {
+        let column = i32::try_from(index).unwrap();
+        let line = if index < same_line_pops { 5 } else { 3 };
+        let mut pop = Instruction::new(
+            POP_TOP,
+            Operand::Value(0),
+            SourceLocation::new(line, line, column, column + 1),
+            Some(u32::try_from(depth - index).unwrap()),
+        );
+        if index.is_multiple_of(2) {
+            pop.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
+        }
+        items.push(Item::Instruction(pop));
+    }
+    items.push(pass_instruction(STORE_FAST, 0, 3));
+    items.push(pass_instruction(LOAD_FAST, 1, 3));
+    items
+}
+
+#[test]
+fn split_line_capture_rotations_preserve_high_swaps_and_the_outer_tail() {
+    for (depth, count) in [(5, 3), (6, 3), (7, 4), (8, 4), (9, 6)] {
+        let items = split_line_capture_items(depth, count);
+        let rotation = super::capture_cleanup_rotation(&items).unwrap();
+        assert_eq!(rotation.swap_count, depth - 1);
+        assert_eq!(rotation.removed_slots, count - 1);
+        assert_eq!(rotation.consumer_rotation, 1);
+        assert_eq!(rotation.consumers.len(), count);
+        let mut pipeline = optimization_pipeline(items.clone());
+        let (blocks, cleanup, _) = pipeline.optimize_swap_runs();
+        assert!(pipeline.apply_static_swaps((blocks, cleanup)).is_empty());
+        let actual = pipeline.graph.iter_items().copied().collect::<Vec<_>>();
+        assert_eq!(actual.len(), items.len());
+        let first_removed = depth - count + 1;
+        assert_eq!(&actual[..first_removed], &items[..first_removed]);
+        for index in first_removed..depth {
+            let (Item::Instruction(before), Item::Instruction(after)) =
+                (items[index], actual[index])
+            else {
+                panic!()
+            };
+            assert_eq!(after.opcode, NOP);
+            assert_eq!(after.operand(), Operand::Value(0));
+            assert_eq!(after.exception_policy(), before.exception_policy());
+            assert_eq!(after.depth_after(), before.depth_after());
+        }
+        let mut pops = items[depth..depth + count].to_vec();
+        pops.rotate_right(1);
+        assert_eq!(&actual[depth..depth + count], pops);
+        assert_eq!(&actual[depth + count..], &items[depth + count..]);
+    }
+}
+
+#[test]
+fn split_line_capture_slot_prediction_keeps_outer_store_fusion() {
+    for (depth, count) in [(5, 3), (6, 3), (7, 4), (8, 4), (9, 6)] {
+        for fuses in [false, true] {
+            let mut items = split_line_capture_items(depth, count);
+            *items.last_mut().unwrap() = pass_instruction(LOAD_FAST, if fuses { 1 } else { 16 }, 3);
+            let assembler = Assembler::from_linear_items(items);
+            assert_eq!(
+                assembler.current_block_dynamic_exception_owner_slots(),
+                count - 1 + usize::from(fuses)
+            );
+        }
+    }
+}
+
+#[test]
+fn split_line_capture_rotation_requires_the_complete_two_line_tail() {
+    for mutation in 0..21 {
+        let mut items = split_line_capture_items(7, 4);
+        match mutation {
+            0 => items = split_line_capture_items(7, 0),
+            1 => items = split_line_capture_items(7, 1),
+            2 => items = split_line_capture_items(7, 2),
+            3 => items = split_line_capture_items(7, 6),
+            4 => items[13] = pass_instruction(STORE_FAST, 0, 5),
+            5 => items[13] = pass_instruction(STORE_DEREF, 0, 3),
+            6 => {
+                let Item::Instruction(store) = &mut items[13] else {
+                    panic!()
+                };
+                store.local_policy.mark_maybe_null_comprehension_restore();
+            }
+            7 => items[13] = pass_instruction(STORE_FAST, 0, -1),
+            8 => {
+                let Item::Instruction(store) = &mut items[13] else {
+                    panic!()
+                };
+                store.set_operand(Operand::Forward(super::Label::from_u32(0)));
+            }
+            9 => items[8] = pass_instruction(POP_TOP, 1, 5),
+            10 => items[8] = pass_instruction(STORE_FAST, 1, 5),
+            11 => items[8] = pass_instruction(POP_TOP, 0, 4),
+            12 => items[11] = pass_instruction(POP_TOP, 0, 4),
+            13 => items[12] = pass_instruction(POP_TOP, 1, 3),
+            14 => items[12] = pass_instruction(STORE_FAST, 1, 3),
+            15 => items[12] = Item::Label(super::Label::from_u32(0)),
+            16 => items[12] = pass_instruction(NOP, 0, 3),
+            17 => {
+                items.remove(12);
+            }
+            18 => items.insert(12, pass_instruction(STORE_FAST, 1, 3)),
+            19 => items.truncate(13),
+            20 => items.insert(8, Item::Label(super::Label::from_u32(0))),
+            _ => unreachable!(),
+        }
+        assert!(
+            super::partial_capture_cleanup_rotation(&items, 7).is_none(),
+            "mutation {mutation}"
+        );
+    }
+}
+
+#[test]
+fn split_line_capture_rotation_requires_unchanged_prefix_and_swap_records() {
+    for mutation in 0..9 {
+        let mut items = split_line_capture_items(7, 4);
+        match mutation {
+            0 => items[0] = pass_instruction(UNPACK_SEQUENCE, 0, 5),
+            1 => items[0] = pass_instruction(UNPACK_SEQUENCE, 2, 5),
+            2 => items[0] = pass_instruction(UNPACK_EX, 0, 5),
+            3 => items[0] = pass_instruction(UNPACK_SEQUENCE, 1, -1),
+            4 => items[2] = pass_instruction(SWAP, 5, 5),
+            5 => items[2] = pass_instruction(SWAP, 6, 4),
+            6 => items[2] = pass_instruction(SWAP, 6, -1),
+            7 => items.insert(3, Item::Label(super::Label::from_u32(0))),
+            8 => items.insert(3, pass_instruction(NOP, 0, 5)),
+            _ => unreachable!(),
+        }
+        assert!(
+            super::capture_cleanup_rotation(&items).is_none(),
+            "mutation {mutation}"
+        );
+    }
+    for index in 0..14 {
+        for policy in 0..4 {
+            let mut items = split_line_capture_items(7, 4);
+            let Item::Instruction(instruction) = &mut items[index] else {
+                panic!()
+            };
+            match policy {
+                0 => instruction.jump_policy.retain_nop(),
+                1 => instruction.no_location_policy.preserve_location(),
+                2 => instruction.fusion_policy.prevent_with_previous(),
+                3 => instruction.fusion_policy.prevent_with_next(),
+                _ => unreachable!(),
+            }
+            assert!(
+                super::capture_cleanup_rotation(&items).is_none(),
+                "index {index}, policy {policy}"
+            );
+        }
+    }
+}
+
+fn split_nested_capture_items(depth: usize, pops: usize, offset: u32, guard: bool) -> Vec<Item> {
+    let mut items = vec![pass_instruction(UNPACK_SEQUENCE, 1, 5)];
+    for distance in (2..=depth).rev() {
+        items.push(pass_instruction(SWAP, u32::try_from(distance).unwrap(), 5));
+    }
+    for index in 0..pops {
+        let column = i32::try_from(index).unwrap();
+        let mut pop = Instruction::new(
+            POP_TOP,
+            Operand::Value(0),
+            SourceLocation::new(5, 5, column, column + 1),
+            Some(u32::try_from(depth - index - 1).unwrap()),
+        );
+        if index.is_multiple_of(2) {
+            pop.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
+        }
+        items.push(Item::Instruction(pop));
+    }
+    for distance in (2..=depth - pops).rev() {
+        items.push(pass_instruction(SWAP, u32::try_from(distance).unwrap(), 5));
+    }
+    items.extend(vec![pass_instruction(POP_TOP, 0, 3); depth - pops - 2]);
+    items.extend([
+        pass_instruction(STORE_FAST, offset, 3),
+        pass_instruction(STORE_FAST, offset + 1, 3),
+    ]);
+    if guard {
+        items.push(pass_instruction(LOAD_FAST, offset + 2, 3));
+    }
+    items.push(pass_instruction(LOAD_CONST, 0, 7));
+    items
+}
+
+#[test]
+fn split_nested_capture_rotations_predict_both_runs_and_exact_pop_donor() {
+    for (depth, pops) in [(5, 3), (6, 3), (7, 3), (8, 4), (10, 5)] {
+        for offset in [0, 16] {
+            for guard in [false, true] {
+                let items = split_nested_capture_items(depth, pops, offset, guard);
+                let rotation = super::nested_capture_cleanup_rotation(&items).unwrap();
+                assert_eq!(rotation.removed_slots, depth - 2);
+                let donor = rotation.projected_pop_donor.unwrap();
+                assert_eq!(donor.0, depth + pops - 1);
+                assert_eq!(Item::Instruction(donor.1), items[depth + pops - 2]);
+                let assembler = Assembler::from_linear_items(items.clone());
+                assert_eq!(
+                    assembler.current_block_dynamic_exception_owner_slots(),
+                    depth - 2 + usize::from(offset == 0 && (guard || depth - pops == 2))
+                );
+                let mut expected = items[..=(depth - pops)].to_vec();
+                expected.extend(rotation.consumers.iter().copied());
+                let consumed = 1 + rotation.swap_count + rotation.consumers.len();
+                expected.extend_from_slice(&items[consumed..]);
+                let mut pipeline = optimization_pipeline(items);
+                let (blocks, cleanup, _) = pipeline.optimize_swap_runs();
+                pipeline.apply_static_swaps((blocks, cleanup));
+                let actual = pipeline.graph.iter_items().filter(|item| {
+                    !matches!(item, Item::Instruction(instruction) if instruction.opcode == NOP)
+                }).copied().collect::<Vec<_>>();
+                assert_eq!(actual, expected);
+                let Item::Instruction(nop) = pipeline.graph.iter_items().nth(depth + pops).unwrap()
+                else {
+                    panic!()
+                };
+                assert_eq!(nop.opcode, NOP);
+                assert_eq!(nop.location, SourceLocation::NONE);
+                assert!(nop.no_location_policy.preserves_location());
+            }
+        }
+    }
+}
+
+#[test]
+fn split_nested_capture_donor_requires_the_exact_projected_record() {
+    let items = split_nested_capture_items(8, 4, 0, false);
+    let mut pipeline = optimization_pipeline(items);
+    let (blocks, cleanup, _) = pipeline.optimize_swap_runs();
+    let positions = pipeline.graph.item_positions();
+    pipeline
+        .graph
+        .instruction_mut(positions[10])
+        .unwrap()
+        .location
+        .column += 1;
+    pipeline.apply_static_swaps((blocks, cleanup));
+    let nop = pipeline.graph.instruction_mut(positions[12]).unwrap();
+    assert_eq!(nop.opcode, NOP);
+    assert_eq!(nop.location.line, 5);
+    assert!(!nop.no_location_policy.preserves_location());
+}
+
+#[test]
+fn split_nested_capture_rotations_require_both_closed_arrays() {
+    for mutation in 0..12 {
+        let mut items = split_nested_capture_items(8, 4, 0, false);
+        match mutation {
+            0 => items[1] = pass_instruction(SWAP, 7, 5),
+            1 => items[12] = pass_instruction(SWAP, 3, 5),
+            2 => items[13] = pass_instruction(SWAP, 3, 3),
+            3 => items[10] = pass_instruction(POP_TOP, 0, 3),
+            4 => items[15] = pass_instruction(POP_TOP, 0, 4),
+            5 => items[18] = pass_instruction(STORE_FAST, 0, 3),
+            6 => items[18] = pass_instruction(STORE_DEREF, 1, 3),
+            7 => items[19] = pass_instruction(SWAP, 2, 7),
+            8 => items.insert(12, Item::Label(super::Label::from_u32(0))),
+            9 => items.insert(13, pass_instruction(NOP, 0, 5)),
+            10 => items.truncate(19),
+            11 => {
+                let Item::Instruction(store) = &mut items[18] else {
+                    panic!()
+                };
+                store.local_policy.mark_maybe_null_comprehension_restore();
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            super::nested_capture_cleanup_rotation(&items).is_none(),
+            "mutation {mutation}"
+        );
+    }
+    for index in 0..19 {
+        for policy in 0..3 {
+            let mut items = split_nested_capture_items(8, 4, 0, false);
+            let Item::Instruction(instruction) = &mut items[index] else {
+                panic!()
+            };
+            match policy {
+                0 => instruction.jump_policy.retain_nop(),
+                1 => instruction.no_location_policy.preserve_location(),
+                2 => instruction.fusion_policy.prevent_with_previous(),
+                _ => unreachable!(),
+            }
+            assert!(
+                super::nested_capture_cleanup_rotation(&items).is_none(),
+                "index {index}, policy {policy}"
+            );
+        }
+    }
+}
+
+fn nested_capture_items(depth: u32, captures: u32, split_line: bool, guard: bool) -> Vec<Item> {
+    let capture_line = if split_line { 4 } else { 3 };
+    let mut items = vec![pass_instruction(UNPACK_SEQUENCE, 1, capture_line)];
+    for distance in (2..=depth).rev() {
+        items.push(pass_instruction(SWAP, distance, capture_line));
+    }
+    items.extend([pass_instruction(POP_TOP, 0, 3); 2]);
+    for distance in (2..=depth - 2).rev() {
+        items.push(pass_instruction(SWAP, distance, 3));
+    }
+    for _ in 0..depth - 2 - captures {
+        items.push(pass_instruction(POP_TOP, 0, 3));
+    }
+    for local in 0..captures {
+        items.push(pass_instruction(STORE_FAST, local, 3));
+    }
+    if guard {
+        items.push(pass_instruction(LOAD_FAST, captures, 3));
+    }
+    items.push(pass_instruction(LOAD_CONST, 0, 5));
+    items
+}
+
+#[test]
+fn nested_capture_rotations_preserve_arrays_and_predict_compaction() {
+    for (depth, captures) in [(4, 2), (5, 3), (6, 2), (7, 3), (8, 4)] {
+        for split_line in [false, true] {
+            for guard in [false, true] {
+                let items = nested_capture_items(depth, captures, split_line, guard);
+                let rotation = super::nested_capture_cleanup_rotation(&items).unwrap();
+                let swaps = usize::try_from(2 * depth - 4).unwrap();
+                assert_eq!(rotation.swap_count, swaps);
+                assert_eq!(rotation.removed_slots, swaps);
+                assert_eq!(rotation.consumer_rotation, 0);
+                let consumed = 1 + swaps + rotation.consumers.len();
+                let expected = std::iter::once(items[0])
+                    .chain(rotation.consumers.iter().copied())
+                    .chain(items[consumed..].iter().copied())
+                    .collect::<Vec<_>>();
+                let assembler = Assembler::from_linear_items(items.clone());
+                let stores = captures - 2 + u32::from(depth - 2 == captures);
+                let fused = stores / 2 + u32::from(guard && !stores.is_multiple_of(2));
+                assert_eq!(
+                    assembler.current_block_dynamic_exception_owner_slots(),
+                    swaps + usize::try_from(fused).unwrap(),
+                );
+                let mut pipeline = optimization_pipeline(items.clone());
+                let (blocks, cleanup, _) = pipeline.optimize_swap_runs();
+                pipeline.apply_static_swaps((blocks, cleanup));
+                assert_eq!(pipeline.graph.iter_items().count(), items.len());
+                let actual = pipeline.graph.iter_items().filter(|item| {
+                    !matches!(item, Item::Instruction(instruction) if instruction.opcode == NOP)
+                }).copied().collect::<Vec<_>>();
+                assert_eq!(actual, expected);
+            }
+        }
+    }
+}
+
+#[test]
+fn nested_capture_rotations_bound_guard_fusion_and_starred_donors() {
+    for opcode in [LOAD_FAST, LOAD_FAST_BORROW, LOAD_FAST_CHECK] {
+        for offset in [0, 16] {
+            let mut items = nested_capture_items(7, 3, true, true);
+            items[0] = pass_instruction(UNPACK_EX, 0, 4);
+            let guard = items.len() - 2;
+            for item in &mut items {
+                if let Item::Instruction(instruction) = item
+                    && instruction.opcode == STORE_FAST
+                    && let Operand::Value(local) = instruction.operand()
+                {
+                    instruction.set_operand(Operand::Value(local + offset));
+                }
+            }
+            items[guard] = pass_instruction(opcode, 3 + offset, 3);
+            let rotation = super::nested_capture_cleanup_rotation(&items).unwrap();
+            assert_eq!(rotation.consumers.len(), 7 + usize::from(offset == 0));
+            let assembler = Assembler::from_linear_items(items.clone());
+            assert_eq!(
+                assembler.current_block_dynamic_exception_owner_slots(),
+                10 + usize::from(offset == 0),
+            );
+            let mut pipeline = optimization_pipeline(items.clone());
+            let (blocks, cleanup, _) = pipeline.optimize_swap_runs();
+            pipeline.apply_static_swaps((blocks, cleanup));
+            let Item::Instruction(nop) = pipeline.graph.iter_items().nth(1).unwrap() else {
+                panic!()
+            };
+            assert_eq!(nop.opcode, NOP);
+            assert_eq!(nop.location, SourceLocation::NONE);
+            assert!(nop.no_location_policy.preserves_location());
+            if offset == 0 {
+                for index in [0, guard] {
+                    for policy in 0..3 {
+                        let mut changed = items.clone();
+                        let Item::Instruction(instruction) = &mut changed[index] else {
+                            panic!()
+                        };
+                        match policy {
+                            0 => instruction.jump_policy.retain_nop(),
+                            1 => instruction.no_location_policy.preserve_location(),
+                            2 => instruction.fusion_policy.prevent_with_previous(),
+                            _ => unreachable!(),
+                        }
+                        assert!(super::nested_capture_cleanup_rotation(&changed).is_none());
+                    }
+                }
+            }
+        }
+    }
+    let items = vec![
+        pass_instruction(UNPACK_EX, 0, 3),
+        pass_instruction(SWAP, 2, 3),
+        pass_instruction(STORE_FAST, 0, 3),
+        pass_instruction(STORE_FAST, 1, 3),
+        pass_instruction(LOAD_CONST, 0, 4),
+    ];
+    assert!(super::capture_cleanup_rotation(&items).is_none());
+    let mut pipeline = optimization_pipeline(items);
+    let (blocks, cleanup, _) = pipeline.optimize_swap_runs();
+    pipeline.apply_static_swaps((blocks, cleanup));
+    let Item::Instruction(nop) = pipeline.graph.iter_items().nth(1).unwrap() else {
+        panic!()
+    };
+    assert_eq!(nop.opcode, NOP);
+    assert_eq!(nop.location.line, 3);
+    assert!(!nop.no_location_policy.preserves_location());
+}
+
+#[test]
+fn nested_capture_rotations_require_complete_original_arrays() {
+    for mutation in 0..21 {
+        let mut items = nested_capture_items(6, 2, false, false);
+        match mutation {
+            0 => items[0] = pass_instruction(UNPACK_SEQUENCE, 2, 3),
+            1 => items[0] = pass_instruction(LOAD_CONST, 1, 3),
+            2 => items[1] = pass_instruction(SWAP, 5, 3),
+            3 => items[2] = pass_instruction(SWAP, 3, 3),
+            4 => items[2] = pass_instruction(SWAP, 5, 4),
+            5 => items[6] = pass_instruction(POP_TOP, 1, 3),
+            6 => items[6] = pass_instruction(POP_TOP, 0, 4),
+            7 => items[8] = pass_instruction(SWAP, 3, 3),
+            8 => items[9] = pass_instruction(SWAP, 3, 4),
+            9 => items[11] = pass_instruction(POP_TOP, 0, 4),
+            10 => items[14] = pass_instruction(STORE_FAST, 0, 3),
+            11 => items[14] = pass_instruction(STORE_DEREF, 1, 3),
+            12 => items[14] = pass_instruction(STORE_FAST, 1, -1),
+            13 => items[15] = pass_instruction(NOP, 0, 5),
+            14 => items[15] = pass_instruction(LOAD_CONST, 0, -1),
+            15 => items.insert(7, Item::Label(super::Label::from_u32(0))),
+            16 => items.insert(10, pass_instruction(NOP, 0, 3)),
+            17 => {
+                items.remove(7);
+            }
+            18 => items.truncate(15),
+            19 => {
+                let Item::Instruction(store) = &mut items[14] else {
+                    panic!()
+                };
+                store.local_policy.mark_maybe_null_comprehension_restore();
+            }
+            20 => items[8] = pass_instruction(SWAP, u32::MAX, 3),
+            _ => unreachable!(),
+        }
+        assert!(
+            super::nested_capture_cleanup_rotation(&items).is_none(),
+            "mutation {mutation}"
+        );
+    }
+    for index in 0..15 {
+        for policy in 0..3 {
+            let mut items = nested_capture_items(6, 2, false, false);
+            let Item::Instruction(instruction) = &mut items[index] else {
+                panic!()
+            };
+            match policy {
+                0 => instruction.jump_policy.retain_nop(),
+                1 => instruction.no_location_policy.preserve_location(),
+                2 => instruction.fusion_policy.prevent_with_previous(),
+                _ => unreachable!(),
+            }
+            assert!(
+                super::nested_capture_cleanup_rotation(&items).is_none(),
+                "index {index}, policy {policy}"
+            );
+        }
+    }
+}
+
 fn mapping_capture_items(captures: u32, wildcards: u32) -> Vec<Item> {
     let unpacked = captures + wildcards;
     let depth = unpacked + 2;
@@ -2970,6 +7194,108 @@ fn class_failure_return_join_requires_original_pop_and_class_edges() {
         } else {
             assert_eq!(assembler.linear_items(), original, "{mutation}");
         }
+    }
+}
+
+#[test]
+fn original_match_end_accepts_empty_failure_aliases_only() {
+    for mutation in [
+        "alias",
+        "exact end",
+        "wildcard fallthrough",
+        "source boundary",
+        "missing match end",
+        "foreign match end",
+        "foreign target",
+        "conditional edge",
+        "backward edge",
+        "authored nop",
+        "borrow alias",
+        "fusion boundary",
+        "continuation boundary",
+        "setup boundary",
+        "handler entry",
+        "located alias",
+    ] {
+        let mut assembler = Assembler::default();
+        let alias = assembler.label();
+        let end = assembler.label();
+        let foreign = assembler.label();
+        let target = match mutation {
+            "exact end" => end,
+            "foreign target" => foreign,
+            _ => alias,
+        };
+        assembler.set_location(SourceLocation::new(3, 3, 8, 20));
+        if mutation == "backward edge" {
+            assembler.emit_backward(JUMP_BACKWARD, target);
+        } else {
+            let opcode = if mutation == "conditional edge" {
+                POP_JUMP_IF_FALSE
+            } else {
+                JUMP_FORWARD
+            };
+            assembler.emit_forward_with_depth(opcode, target, 0, ExceptionPolicy::default());
+        }
+        assembler.set_location(SourceLocation::new(4, 4, 12, 18));
+        assembler.emit(
+            if mutation == "wildcard fallthrough" {
+                POP_TOP
+            } else {
+                RETURN_VALUE
+            },
+            0,
+        );
+        assembler.mark(alias);
+        if mutation == "located alias" {
+            assembler.emit(NOP, 0);
+        }
+        match mutation {
+            "missing match end" | "source boundary" => assembler.mark(end),
+            "foreign match end" => {
+                assembler.mark(end);
+                assembler.original_match_join = Some(foreign);
+            }
+            _ => assembler.mark_original_match_join(end),
+        }
+        let provenance = &mut assembler.exception_owner_provenance;
+        match mutation {
+            "source boundary" => {
+                provenance.source_boundaries.insert(alias);
+                provenance.block_boundaries.insert(alias);
+            }
+            "authored nop" => {
+                assembler.original_nop_targets.insert(alias);
+            }
+            "borrow alias" => {
+                assembler.borrow_block_aliases.insert(alias);
+            }
+            "fusion boundary" => {
+                provenance.fusion_boundaries.insert(alias);
+            }
+            "continuation boundary" => {
+                provenance.continuation_boundaries.insert(alias);
+            }
+            "setup boundary" => provenance.setups.push((alias, None)),
+            "handler entry" => assembler.exception_regions.push(super::ExceptionRegion {
+                priority: super::ExceptionRegionPriority::OriginalRange(alias, end),
+                is_scope_fallback: false,
+                start: alias,
+                end,
+                target: alias,
+                depth: 0,
+                preserve_lasti: false,
+            }),
+            _ => {}
+        }
+        assert_eq!(
+            assembler.at_original_unconditional_join(),
+            matches!(
+                mutation,
+                "alias" | "exact end" | "wildcard fallthrough" | "source boundary"
+            ),
+            "{mutation}",
+        );
     }
 }
 

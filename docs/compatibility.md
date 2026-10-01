@@ -55,22 +55,35 @@ headers and shared library:
 
 ```console
 /path/to/python3.14.5 scripts/build-cpython-reference.py --output /tmp/cpython-reference
+./scripts/check-cpython-compatibility --reference /tmp/cpython-reference 3.14
 cargo run --release -p serc --example compare_cpython_corpus -- \
   --python-version 3.14 --reference /tmp/cpython-reference --require-all path/to/corpus
 ```
 
+The compatibility script builds a fresh C reference from the selected Python
+interpreter, or accepts a prebuilt reference with `--reference`. Both modes use
+the same pinned Ruff corpus and exact outcome expectations. Build a reference
+for each exact Python target before selecting it.
+
 Each file gets a fresh CPython process with UTF-8 mode, hash seed 0, and site
 initialization disabled. The reference compiles source bytes and marshals
 through the C API, without a Python wrapper or additional imports. It uses
-normal interpreter startup, modeled by Serc's default intern state, and retains
-the filename argument and a second reference to the root code object as a Python
-caller would. The `minimal-v2` protocol fixes this ownership across Python
-versions and rejects older reference artifacts.
+isolated startup with automatic signal-handler installation disabled, and
+retains the filename argument and a second reference to the root code object as
+a Python caller would. The `minimal-v2` protocol fixes this ownership across
+Python versions and rejects older reference artifacts.
+The Linux 3.12 through 3.15 default startup tables are captured from this C protocol, not
+from builtin `compile()` and its AST-type initialization. Their generated inputs
+bind the reference source and two independent native startup observations;
+changing the reference requires recapturing those inputs. The 3.14 profile also
+binds an offline strong-owner proof for every mortal interned startup string.
 
 The comparator verifies the reference protocol, CPython release, and magic
 number, then compares raw marshal bytes, including string interning and object
 sharing. Use `--optimize 1` or `--optimize 2` for optimized compilation;
 interpreter startup stays at level 0.
+All exceptions raised by the compile call are source rejections. Initialization,
+marshal, and I/O errors remain oracle failures.
 
 `--require-all` requires at least one exact match and no failures on accepted
 inputs. Add `--require-rejection-parity` to require clean Serc rejections for

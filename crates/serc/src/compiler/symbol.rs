@@ -765,7 +765,7 @@ impl Compiler<'_> {
         } else {
             None
         };
-        for (restores, location) in restores {
+        for (restores, location, entry) in restores {
             self.assembler.set_location(location);
             let mut last_restore = None;
             // Static SWAP elimination moves the assignment before the reversed restores,
@@ -793,6 +793,8 @@ impl Compiler<'_> {
                 self.assembler
                     .record_original_fallthrough_location(last_restore, location);
             }
+            self.assembler
+                .record_comprehension_restore_owner_prefix(entry);
         }
         Ok(())
     }
@@ -1273,6 +1275,10 @@ impl Compiler<'_> {
             }
 
             fn visit_stmt(&mut self, statement: &'ast Stmt) {
+                if crate::stack_growth_required() {
+                    return crate::grow_stack(|| self.visit_stmt(statement));
+                }
+
                 match statement {
                     Stmt::Expr(expression)
                         if literal_constant(&expression.value).is_some()
@@ -2417,7 +2423,14 @@ impl Compiler<'_> {
                 ComparisonMode::Boolean => operation.boolean_argument(),
             }
         };
-        self.emit(COMPARE_OP, argument, -1)
+        self.emit(COMPARE_OP, argument, -1)?;
+        if matches!(mode, ComparisonMode::Boolean)
+            && self.context.python_version >= PythonVersion::Py313
+        {
+            // Boolean patterns omit the original TO_BOOL just like condition comparisons.
+            self.assembler.add_last_hidden_exception_owner_slots(1);
+        }
+        Ok(())
     }
 
     pub(super) fn emit_conversion(&mut self, conversion: Conversion) -> Result<(), CompileError> {

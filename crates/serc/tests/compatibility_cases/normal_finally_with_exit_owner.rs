@@ -1,4 +1,23 @@
 use crate::common;
+
+#[test]
+fn guarded_async_finally_manager_keeps_enclosing_sync_manager_owner() {
+    for condition in ["value is not None", "value", "value == enabled"] {
+        for recovery in ["", "        except Error:\n            pass\n"] {
+            for binding in ["", " as session"] {
+                for body in ["pass", "await work()"] {
+                    let source = format!(
+                        "async def f(manager, value, enabled):\n    with manager:\n        try:\n            work()\n{recovery}        finally:\n            if {condition}:\n                async with session_factory(){binding}:\n                    {body}\n"
+                    );
+                    common::assert_matches_cpython_marshal(
+                        &source,
+                        "guarded_async_finally_manager.py",
+                    );
+                }
+            }
+        }
+    }
+}
 use crate::common::indent;
 
 #[test]

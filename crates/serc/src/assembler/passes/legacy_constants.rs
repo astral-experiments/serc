@@ -151,12 +151,15 @@ impl OptimizationPipeline {
     }
 
     /// Removes unused legacy constants without changing their admission order.
-    pub(super) fn prune_legacy_constants(&mut self, constants: &mut dyn ConstantTable) {
+    pub(super) fn prune_legacy_constants(
+        &mut self,
+        constants: &mut dyn ConstantTable,
+    ) -> Vec<Option<u32>> {
         if !matches!(
             self.python_version,
             PythonVersion::Py312 | PythonVersion::Py313
         ) {
-            return;
+            return Vec::new();
         }
         let mut used = vec![false; constants.len()];
         if let Some(first) = used.first_mut() {
@@ -179,6 +182,7 @@ impl OptimizationPipeline {
                 instruction.set_operand(Operand::Value(indices[index as usize].unwrap()));
             }
         });
+        indices
     }
 }
 

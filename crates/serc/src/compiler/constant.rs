@@ -14,7 +14,7 @@ use smallvec::SmallVec;
 
 use super::{LOAD_CONST, LOAD_SMALL_INT, NOP, STORE_NAME};
 use crate::assembler::{FoldAdmissionId, Label, OperandPatchId};
-use crate::target::operands::Conversion;
+use crate::target::operands::{BinaryOperation, Conversion};
 use crate::{CompileError, PythonVersion};
 
 use super::expression::{jump_constant_truthiness, literal_truthiness};
@@ -318,6 +318,26 @@ impl crate::assembler::ConstantTable for OutputState {
         };
         self.record_folded_constant_dependencies(&result, values);
         self.constants.intern(result)
+    }
+
+    fn fold_binary_sequence(
+        &mut self,
+        left: Constant,
+        argument: u32,
+        right: Constant,
+    ) -> Result<Option<u32>, CompileError> {
+        let operator = if argument == BinaryOperation::ADD.argument() {
+            Operator::Add
+        } else if argument == BinaryOperation::MULTIPLY.argument() {
+            Operator::Mult
+        } else {
+            return Ok(None);
+        };
+        let Some(result) = fold_sequence_binary(left.clone(), operator, right.clone(), true) else {
+            return Ok(None);
+        };
+        self.record_folded_constant_dependencies(&result, vec![left, right]);
+        self.constants.intern(result).map(Some)
     }
 
     fn len(&self) -> usize {
@@ -2322,98 +2342,9 @@ pub(super) fn fold_constant_with_profile(
                 {
                     fold_complex_power(&left, &right, python_version, native_build_profile)
                 }
-                (Constant::String(mut left), Operator::Add, Constant::String(right)) => {
-                    left.push_str(&right);
-                    Some(Constant::String(left))
+                (left, operator, right) => {
+                    fold_sequence_binary(left, operator, right, boolean_sequence_repetition)
                 }
-                (Constant::SurrogateString(mut left), Operator::Add, Constant::String(right)) => {
-                    left.extend_from_slice(right.as_bytes());
-                    Some(Constant::SurrogateString(left))
-                }
-                (Constant::String(left), Operator::Add, Constant::SurrogateString(right)) => {
-                    let mut bytes = left.into_bytes();
-                    bytes.extend(right);
-                    Some(Constant::SurrogateString(bytes))
-                }
-                (
-                    Constant::SurrogateString(mut left),
-                    Operator::Add,
-                    Constant::SurrogateString(right),
-                ) => {
-                    left.extend(right);
-                    Some(Constant::SurrogateString(left))
-                }
-                (Constant::Bytes(mut left), Operator::Add, Constant::Bytes(right)) => {
-                    left.extend(right);
-                    Some(Constant::Bytes(left))
-                }
-                (Constant::Tuple(mut left), Operator::Add, Constant::Tuple(right)) => {
-                    left.extend(right);
-                    Some(Constant::Tuple(left))
-                }
-                (Constant::String(value), Operator::Mult, times)
-                | (times, Operator::Mult, Constant::String(value)) => {
-                    let times = sequence_repeat_count(
-                        &times,
-                        boolean_sequence_repetition,
-                        value.is_empty(),
-                    )?;
-                    let length = value.chars().count();
-                    let Some(max_times) = 4096_usize.checked_div(length) else {
-                        return Some(Constant::String(String::new()));
-                    };
-                    let times = usize::try_from(times).ok()?;
-                    (times <= max_times).then(|| Constant::String(value.repeat(times)))
-                }
-                (Constant::SurrogateString(value), Operator::Mult, times)
-                | (times, Operator::Mult, Constant::SurrogateString(value)) => {
-                    let times = sequence_repeat_count(
-                        &times,
-                        boolean_sequence_repetition,
-                        value.is_empty(),
-                    )?;
-                    let length = value.iter().filter(|byte| **byte & 0xc0 != 0x80).count();
-                    let Some(max_times) = 4096_usize.checked_div(length) else {
-                        return Some(Constant::String(String::new()));
-                    };
-                    let times = usize::try_from(times).ok()?;
-                    (times <= max_times).then(|| surrogate_string_constant(value.repeat(times)))
-                }
-                (Constant::Bytes(value), Operator::Mult, times)
-                | (times, Operator::Mult, Constant::Bytes(value)) => {
-                    let times = sequence_repeat_count(
-                        &times,
-                        boolean_sequence_repetition,
-                        value.is_empty(),
-                    )?;
-                    let Some(max_times) = 4096_usize.checked_div(value.len()) else {
-                        return Some(Constant::Bytes(Vec::new()));
-                    };
-                    let times = usize::try_from(times).ok()?;
-                    (times <= max_times).then(|| Constant::Bytes(value.repeat(times)))
-                }
-                (Constant::Tuple(value), Operator::Mult, times)
-                | (times, Operator::Mult, Constant::Tuple(value)) => {
-                    let times = sequence_repeat_count(
-                        &times,
-                        boolean_sequence_repetition,
-                        value.is_empty(),
-                    )?;
-                    let Some(max_times) = 256_usize.checked_div(value.len()) else {
-                        return Some(Constant::Tuple(Vec::new()));
-                    };
-                    let times = usize::try_from(times).ok()?;
-                    if times > max_times {
-                        return None;
-                    }
-                    if let Some(budget) = 1024_usize.checked_div(times) {
-                        check_tuple_complexity(&value, budget)?;
-                    }
-                    Some(Constant::Tuple(
-                        (0..times).flat_map(|_| value.iter().cloned()).collect(),
-                    ))
-                }
-                _ => None,
             }
         }
         _ => None,
@@ -2421,6 +2352,92 @@ pub(super) fn fold_constant_with_profile(
     let origin = (u64::from(expression.range().start().to_u32()) << 32)
         | u64::from(expression.range().end().to_u32());
     result.map(|constant| constant.with_non_reflexive_origin(origin))
+}
+
+fn fold_sequence_binary(
+    left: Constant,
+    operator: Operator,
+    right: Constant,
+    boolean_sequence_repetition: bool,
+) -> Option<Constant> {
+    match (left, operator, right) {
+        (Constant::String(mut left), Operator::Add, Constant::String(right)) => {
+            left.push_str(&right);
+            Some(Constant::String(left))
+        }
+        (Constant::SurrogateString(mut left), Operator::Add, Constant::String(right)) => {
+            left.extend_from_slice(right.as_bytes());
+            Some(Constant::SurrogateString(left))
+        }
+        (Constant::String(left), Operator::Add, Constant::SurrogateString(right)) => {
+            let mut bytes = left.into_bytes();
+            bytes.extend(right);
+            Some(Constant::SurrogateString(bytes))
+        }
+        (Constant::SurrogateString(mut left), Operator::Add, Constant::SurrogateString(right)) => {
+            left.extend(right);
+            Some(Constant::SurrogateString(left))
+        }
+        (Constant::Bytes(mut left), Operator::Add, Constant::Bytes(right)) => {
+            left.extend(right);
+            Some(Constant::Bytes(left))
+        }
+        (Constant::Tuple(mut left), Operator::Add, Constant::Tuple(right)) => {
+            left.extend(right);
+            Some(Constant::Tuple(left))
+        }
+        (Constant::String(value), Operator::Mult, times)
+        | (times, Operator::Mult, Constant::String(value)) => {
+            let times =
+                sequence_repeat_count(&times, boolean_sequence_repetition, value.is_empty())?;
+            let length = value.chars().count();
+            let Some(max_times) = 4096_usize.checked_div(length) else {
+                return Some(Constant::String(String::new()));
+            };
+            let times = usize::try_from(times).ok()?;
+            (times <= max_times).then(|| Constant::String(value.repeat(times)))
+        }
+        (Constant::SurrogateString(value), Operator::Mult, times)
+        | (times, Operator::Mult, Constant::SurrogateString(value)) => {
+            let times =
+                sequence_repeat_count(&times, boolean_sequence_repetition, value.is_empty())?;
+            let length = value.iter().filter(|byte| **byte & 0xc0 != 0x80).count();
+            let Some(max_times) = 4096_usize.checked_div(length) else {
+                return Some(Constant::String(String::new()));
+            };
+            let times = usize::try_from(times).ok()?;
+            (times <= max_times).then(|| surrogate_string_constant(value.repeat(times)))
+        }
+        (Constant::Bytes(value), Operator::Mult, times)
+        | (times, Operator::Mult, Constant::Bytes(value)) => {
+            let times =
+                sequence_repeat_count(&times, boolean_sequence_repetition, value.is_empty())?;
+            let Some(max_times) = 4096_usize.checked_div(value.len()) else {
+                return Some(Constant::Bytes(Vec::new()));
+            };
+            let times = usize::try_from(times).ok()?;
+            (times <= max_times).then(|| Constant::Bytes(value.repeat(times)))
+        }
+        (Constant::Tuple(value), Operator::Mult, times)
+        | (times, Operator::Mult, Constant::Tuple(value)) => {
+            let times =
+                sequence_repeat_count(&times, boolean_sequence_repetition, value.is_empty())?;
+            let Some(max_times) = 256_usize.checked_div(value.len()) else {
+                return Some(Constant::Tuple(Vec::new()));
+            };
+            let times = usize::try_from(times).ok()?;
+            if times > max_times {
+                return None;
+            }
+            if let Some(budget) = 1024_usize.checked_div(times) {
+                check_tuple_complexity(&value, budget)?;
+            }
+            Some(Constant::Tuple(
+                (0..times).flat_map(|_| value.iter().cloned()).collect(),
+            ))
+        }
+        _ => None,
+    }
 }
 
 fn sequence_repeat_count(

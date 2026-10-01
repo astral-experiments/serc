@@ -47,7 +47,7 @@ fn clear_redundant_swap_nop_locations(
         } else {
             // Capture unpack/discard records precede their rotations in the native
             // array. Stores and other donors can move across later copy seams.
-            previous_line = (matches!(instruction.opcode, UNPACK_SEQUENCE | POP_TOP)
+            previous_line = (matches!(instruction.opcode, UNPACK_SEQUENCE | UNPACK_EX | POP_TOP)
                 && original_donors.get(&position) == Some(instruction))
             .then_some(instruction.location.line);
         }
@@ -271,6 +271,8 @@ impl OptimizationPipeline {
         // Admit cleanups from their complete original partition before any swap run is
         // rewritten. A newly simplified suffix cannot certify an emitted owner slot.
         let mut capture_cleanup_swaps = FxHashSet::default();
+        let mut capture_cleanup_prefixes = FxHashSet::default();
+        let mut capture_cleanup_donors = FxHashMap::default();
         for block in &blocks {
             for rotation in block.windows(6) {
                 if !matches!(graph.item(rotation[0]), Item::Instruction(prefix)
@@ -297,10 +299,21 @@ impl OptimizationPipeline {
                 .collect::<Vec<_>>();
             for index in 0..items.len() {
                 if let Some(rotation) = capture_cleanup_rotation(&items[index..]) {
+                    capture_cleanup_prefixes.insert(block[index]);
+                    let consumed = 1 + rotation.swap_count + rotation.consumers.len();
+                    if let Some((offset, donor)) = rotation.projected_pop_donor {
+                        // A partial rotation's last pop is a known original record.
+                        // Its exact projected identity can donate to the next cleanup.
+                        capture_cleanup_donors.insert(block[index + offset], donor);
+                    }
                     capture_cleanup_swaps.extend(
-                        block[index + 1..index + 1 + rotation.swap_count]
+                        block[index + 1..index + consumed]
                             .iter()
-                            .copied(),
+                            .copied()
+                            .filter(|position| {
+                                matches!(graph.item(*position), Item::Instruction(instruction)
+                                if instruction.opcode == SWAP)
+                            }),
                     );
                 }
             }
@@ -414,14 +427,16 @@ impl OptimizationPipeline {
             }
             // Rotation simplification only writes SWAP/NOP slots. Snapshot the
             // untouched capture donors before static swaps can reorder any POP_TOP.
-            let original_donors = if self.python_version >= crate::PythonVersion::Py314
+            let mut original_donors = if self.python_version >= crate::PythonVersion::Py314
                 && (!rewritten.is_empty() || instruction_positions.iter().any(|&position| {
                     matches!(graph.item(position), Item::Instruction(instruction) if instruction.opcode == SWAP)
                 }))
             {
                 block.iter().filter_map(|&position| match graph.item(position) {
                     Item::Instruction(instruction)
-                        if matches!(instruction.opcode, UNPACK_SEQUENCE | POP_TOP) =>
+                        if matches!(instruction.opcode, UNPACK_SEQUENCE | POP_TOP)
+                            || (instruction.opcode == UNPACK_EX
+                                && capture_cleanup_prefixes.contains(&position)) =>
                     {
                         Some((position, *instruction))
                     }
@@ -430,6 +445,11 @@ impl OptimizationPipeline {
             } else {
                 FxHashMap::default()
             };
+            original_donors.extend(block.iter().filter_map(|position| {
+                capture_cleanup_donors
+                    .get(position)
+                    .map(|donor| (*position, *donor))
+            }));
             rewritten_blocks.push(SwapBlock {
                 positions: block,
                 rewritten_nops: rewritten,

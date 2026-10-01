@@ -14,7 +14,7 @@ fn matches_cpython_frozenset_compiler_initialized_identifiers() {
             "def first(value):\n    return value in {{'{member}', 'novel_marker'}}\n\
              def second(value):\n    'Distinct constants tuple.'\n    return value in {{'{member}', 'novel_marker'}}\n"
         );
-        common::assert_matches_cpython_marshal(&source, "frozenset_compiler_interning.py");
+        common::assert_matches_cpython_startup_marshal(&source, "frozenset_compiler_interning.py");
     }
 }
 
@@ -69,7 +69,7 @@ fn matches_cpython_frozenset_isolated_startup_identifiers() {
             "def first(value):\n    return value in {{'{member}', 'novel_marker'}}\n\
              def second(value):\n    'Distinct constants tuple.'\n    return value in {{'{member}', 'novel_marker'}}\n"
         );
-        common::assert_matches_cpython_marshal(&source, "frozenset_startup_identifiers.py");
+        common::assert_matches_cpython_startup_marshal(&source, "frozenset_startup_identifiers.py");
     }
 }
 
@@ -97,7 +97,7 @@ fn matches_cpython_startup_strings_with_prior_constants_and_private_names() {
                 "{prefix}def first(value):\n    return value in {{'{member}', 'novel_marker'}}\n\
                  def second(value):\n    'Distinct constants tuple.'\n    return value in {{'{member}', 'novel_marker'}}\n"
             );
-            common::assert_matches_cpython_marshal(&source, "frozenset_startup_origins.py");
+            common::assert_matches_cpython_startup_marshal(&source, "frozenset_startup_origins.py");
         }
     }
 }

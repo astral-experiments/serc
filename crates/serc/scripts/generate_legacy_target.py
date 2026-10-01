@@ -187,7 +187,10 @@ def render_legacy_target(sources: dict[str, str], g) -> str:
             "",
         ]
     )
-    lookup = g.render_preinterned_lookup(static_strings, (), tuple(compiler_strings))
+    # Direct C compilation does not initialize builtin compile()'s AST classes.
+    lookup = g.render_preinterned_lookup(
+        static_strings, (), tuple(compiler_strings), compiler_strings_on_linux=False
+    )
     lookup[0] = "fn is_preinterned_static_string(value: &str) -> bool {"
     lines.extend(lookup)
     lines.extend(["", "#[allow(dead_code)]", "pub(crate) mod operands {"])

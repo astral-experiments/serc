@@ -2,19 +2,42 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::super::block_graph::ItemPosition;
 use super::super::{
-    ConstantTable, Item, Label, Operand, OptimizationPipeline, SourceLocation,
+    ConstantTable, Instruction, Item, Label, Operand, OptimizationPipeline, SourceLocation,
     block_has_fallthrough, block_jump_target,
 };
 use crate::code_object::Constant;
 use crate::target::Opcode;
 use crate::target::opcodes::{
-    BUILD_LIST, BUILD_SET, BUILD_TUPLE, CALL_INTRINSIC_1, CONTAINS_OP, GET_ITER,
+    BINARY_OP, BUILD_LIST, BUILD_SET, BUILD_TUPLE, CALL_INTRINSIC_1, CONTAINS_OP, GET_ITER,
     GET_YIELD_FROM_ITER, LIST_APPEND, LOAD_COMMON_CONSTANT, LOAD_CONST, LOAD_SMALL_INT, NOP,
     SET_ADD, UNARY_NEGATIVE,
 };
 use crate::target::operands::UnaryIntrinsic;
 use crate::target::operands315::CommonConstant;
 use crate::{CompileError, PythonVersion};
+
+#[test]
+fn named_finally_return_constants_use_real_lowering_and_compaction() {
+    super::super::named_finally_returns::tests::assert_common_constant_transport(
+        |pipeline, constants| {
+            pipeline.lower_common_constants(constants);
+        },
+    );
+}
+
+#[test]
+fn awaited_normal_finally_common_constants_follow_the_actual_lowering() {
+    for fold_first in [false, true] {
+        crate::assembler::normal_finally_locations::tests::assert_common_constant_transport(
+            |pipeline, constants| {
+                if fold_first {
+                    pipeline.fold_copied_constants(constants, &[], &[]).unwrap();
+                }
+                pipeline.lower_common_constants(constants);
+            },
+        );
+    }
+}
 
 impl OptimizationPipeline {
     /// Folds 3.15's append-built constant sequences without crossing basic blocks.
@@ -265,17 +288,40 @@ impl OptimizationPipeline {
     }
 
     /// Lowers 3.15's immortal constants after value-based graph optimizations.
+    #[cfg(test)]
+    pub(in crate::assembler) fn lower_guarded_loop_test_constants(
+        &mut self,
+        constants: &mut dyn ConstantTable,
+        proof: &mut super::super::guarded_loop_nops::GuardedLoopNops,
+    ) {
+        self.lower_common_constants_with_guarded_loop_nops(constants, proof);
+    }
+
+    #[cfg(test)]
     pub(super) fn lower_common_constants(&mut self, constants: &mut dyn ConstantTable) {
+        self.lower_common_constants_with_guarded_loop_nops(
+            constants,
+            &mut super::super::guarded_loop_nops::GuardedLoopNops::default(),
+        );
+    }
+
+    pub(super) fn lower_common_constants_with_guarded_loop_nops(
+        &mut self,
+        constants: &mut dyn ConstantTable,
+        guarded_loop_nops: &mut super::super::guarded_loop_nops::GuardedLoopNops,
+    ) {
         if self.python_version != PythonVersion::Py315 {
             return;
         }
+        guarded_loop_nops.revalidate_constants(self);
+        self.retain_named_finally_returns();
         let mut changed = false;
-        self.graph.for_each_instruction_mut(|instruction| {
+        let lower = |instruction: &mut Instruction| {
             if instruction.opcode != LOAD_CONST {
-                return;
+                return false;
             }
             let Some(index) = instruction.value_argument() else {
-                return;
+                return false;
             };
             let common = match constants.get(index) {
                 Constant::None => CommonConstant::NONE,
@@ -283,15 +329,39 @@ impl OptimizationPipeline {
                 Constant::Bool(false) => CommonConstant::FALSE,
                 Constant::String(value) if value.is_empty() => CommonConstant::EMPTY_STR,
                 Constant::SignedInt(-1) => CommonConstant::MINUS_ONE,
-                _ => return,
+                _ => return false,
             };
             instruction.opcode = LOAD_COMMON_CONSTANT;
             instruction.set_operand(Operand::Value(common.argument()));
-            changed = true;
+            true
+        };
+        self.graph.for_each_instruction_mut(|instruction| {
+            changed |= lower(instruction);
         });
         if !changed {
             return;
         }
+        self.exception_owner_provenance
+            .named_finally_returns
+            .retain_mut(|origin| origin.lower_constants(constants.len(), &lower));
+        // Transport only the new awaited-prefix witnesses through this same
+        // value-authenticated lowering, before the constant pool is compacted.
+        self.exception_owner_provenance
+            .awaited_normal_finally_prefixes
+            .retain_mut(|origin| {
+                let mut valid = true;
+                origin.visit_records_mut(|instruction| {
+                    if instruction.opcode == LOAD_CONST
+                        && !matches!(instruction.operand(), Operand::Value(index) if (index as usize) < constants.len())
+                    {
+                        valid = false;
+                    } else {
+                        lower(instruction);
+                    }
+                });
+                valid
+            });
+        guarded_loop_nops.lower_constants(constants.len(), lower);
 
         // Code generation still admits these constants in source order. Only the
         // final constant table drops their unused slots; slot zero remains reserved.
@@ -307,6 +377,7 @@ impl OptimizationPipeline {
         // Earlier folding already established admission order. Replaying its
         // dependencies here could reorder intermediates reused by literal constants.
         let indices = constants.retain_used_in_order(&used);
+        self.remap_folded_normal_finally_constants(&indices);
         self.graph.for_each_instruction_mut(|instruction| {
             if instruction.opcode == LOAD_CONST
                 && let Some(index) = instruction.value_argument()
@@ -314,6 +385,21 @@ impl OptimizationPipeline {
                 instruction.set_operand(Operand::Value(indices[index as usize].unwrap()));
             }
         });
+        self.exception_owner_provenance
+            .awaited_normal_finally_prefixes
+            .retain_mut(|origin| origin.remap_constants(&indices, None));
+        guarded_loop_nops.remap_constants(&indices);
+        guarded_loop_nops.revalidate_constants(self);
+        self.exception_owner_provenance
+            .copied_async_finally_owners
+            .retain_mut(|origin| origin.remap_constants(&indices, None));
+        self.exception_owner_provenance
+            .named_finally_returns
+            .retain_mut(|origin| origin.remap_constants(&indices));
+        self.retain_named_finally_returns();
+        self.exception_owner_provenance
+            .retained_setup_truths
+            .retain_mut(|origin| origin.remap_constants(&indices, None));
     }
 
     /// Captures early Boolean creation from actual copied owners before later CFG rewrites.
@@ -448,6 +534,48 @@ impl OptimizationPipeline {
                         loads.push((position, opcode, argument));
                         source_loads = loads.len();
                     }
+                    BINARY_OP if loads.len() >= 2 && loads.len() - 2 < source_loads => {
+                        let first = loads.len() - 2;
+                        let value = |(_, opcode, argument): &(ItemPosition, Opcode, u32)| {
+                            if *opcode == LOAD_CONST {
+                                constants.get(*argument).clone()
+                            } else {
+                                Constant::Int(u64::from(*argument))
+                            }
+                        };
+                        let left = value(&loads[first]);
+                        let right = value(&loads[first + 1]);
+                        let Some(index) = constants.fold_binary_sequence(left, argument, right)?
+                        else {
+                            loads.clear();
+                            source_loads = 0;
+                            continue;
+                        };
+                        for (operand_position, opcode, argument) in loads.drain(first..) {
+                            if opcode == LOAD_CONST {
+                                folded_operand_admissions.insert(operand_position, argument);
+                            }
+                            let load = self.graph.instruction_mut(operand_position).unwrap();
+                            load.opcode = NOP;
+                            load.set_operand(Operand::Value(0));
+                            load.location = SourceLocation::NONE;
+                            load.no_location_policy.preserve_location();
+                        }
+                        if let Some((marker_position, marker_location)) = copied_jump_marker {
+                            let marker = self.graph.instruction_mut(marker_position).unwrap();
+                            marker.location = if marker_location.line == instruction.location.line {
+                                SourceLocation::NONE
+                            } else {
+                                marker_location
+                            };
+                            marker.no_location_policy.preserve_location();
+                        }
+                        let binary = self.graph.instruction_mut(position).unwrap();
+                        binary.opcode = LOAD_CONST;
+                        binary.set_operand(Operand::Value(index));
+                        loads.push((position, LOAD_CONST, index));
+                        source_loads = loads.len();
+                    }
                     BUILD_TUPLE
                         if argument <= 30
                             && argument as usize <= loads.len()
@@ -530,6 +658,7 @@ impl OptimizationPipeline {
             }
         }
         order.retain(|index| used[*index as usize]);
+        self.retain_named_finally_returns();
         let indices = constants.retain_used(&used, &order, early_booleans);
         self.graph.for_each_instruction_mut(|instruction| {
             instruction.folded_constant_admissions = None;
@@ -539,6 +668,19 @@ impl OptimizationPipeline {
                 instruction.set_operand(Operand::Value(indices[index as usize].unwrap()));
             }
         });
+        self.exception_owner_provenance
+            .awaited_normal_finally_prefixes
+            .retain_mut(|origin| origin.remap_constants(&indices, None));
+        self.exception_owner_provenance
+            .copied_async_finally_owners
+            .retain_mut(|origin| origin.remap_constants(&indices, None));
+        self.exception_owner_provenance
+            .named_finally_returns
+            .retain_mut(|origin| origin.remap_constants(&indices));
+        self.retain_named_finally_returns();
+        self.exception_owner_provenance
+            .retained_setup_truths
+            .retain_mut(|origin| origin.remap_constants(&indices, None));
         Ok(())
     }
 }

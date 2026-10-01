@@ -13,35 +13,64 @@ from pathlib import Path
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--capture-dir", type=Path, required=True)
 parser.add_argument(
-    "--python", type=Path, required=True, help="Captured executable (read only)"
+    "--native-capture", type=Path, required=True, help="Saved direct-C capture"
 )
 args = parser.parse_args()
 if not __debug__:
     parser.error("ownership validation requires assertions; do not use -O")
 ROOT = args.capture_dir.resolve()
-PY = args.python.resolve()
+NATIVE = args.native_capture.resolve()
 L = json.loads((ROOT / "layout.json").read_text())
 S = json.loads((ROOT / "owner-layout.json").read_text())
-META = json.loads((ROOT / "neutral.metadata.json").read_text())
-CAPTURE = json.loads((ROOT / "capture-receipt.json").read_text())
 
 
 def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-assert digest(PY) == META["binary_sha256"]
-assert (
-    CAPTURE["exit_code"] == 0
-    and CAPTURE["runtime_before_sha256"] == CAPTURE["runtime_after_sha256"]
-)
-assert META["observed_equals_unobserved"] and META["table_unchanged_after_memory_read"]
-assert META["two_complete_reads_equal"] and META["thread_count"] == 1
-assert digest(ROOT / "layout.json") == META["layout_sha256"]
-assert digest(ROOT / "neutral.canonical.json") == META["canonical_sha256"]
-assert digest(ROOT / "neutral.addresses.json") == META["intern_addresses_sha256"]
-segments_file = ROOT / "neutral.memory" / "segments.json"
-assert digest(segments_file) == META["memory_segments_sha256"]
+def verify(pin):
+    path = Path(pin["path"])
+    assert path.stat().st_size == pin["bytes"] and digest(path) == pin["sha256"], path
+    return path
+
+
+SOURCE = json.loads((ROOT / "NATIVE-SOURCE.json").read_text())
+assert verify(SOURCE["layout"]) == ROOT / "layout.json"
+verify(SOURCE["header_provenance"])
+verify(SOURCE["producer"])
+assert verify(SOURCE["memory_capture"]) == NATIVE / "MEMORY-COMPLETE.json"
+MEMORY = json.loads(verify(SOURCE["memory_capture"]).read_text())
+assert MEMORY["actual_exit"] == 0
+CAPTURE = json.loads(verify(MEMORY["capture"]).read_text())
+REQUEST = json.loads(verify(CAPTURE["request"]).read_text())
+MEMORY_REQUEST = json.loads(verify(MEMORY["memory_request"]).read_text())
+assert MEMORY_REQUEST["parent_request"] == CAPTURE["request"]
+assert CAPTURE["actual_exit"] == 0 and CAPTURE["status"] == "TWO_READ_NATIVE_STARTUP_CAPTURE"
+assert CAPTURE["observed_equals_unobserved"] and CAPTURE["two_complete_reads_equal"]
+assert CAPTURE["executable_bytes_unchanged"]
+assert CAPTURE["thread_count"] == 1
+assert verify(CAPTURE["observed"]).read_bytes() == verify(CAPTURE["unobserved"]).read_bytes()
+assert CAPTURE["layout"] == SOURCE["original_layout"]
+verify(CAPTURE["layout"])
+verify(REQUEST["producer"])
+verify(REQUEST["layout_source"])
+verify(MEMORY_REQUEST["producer"])
+assert MEMORY_REQUEST["capture_producer"] == REQUEST["producer"]
+assert MEMORY_REQUEST["maps"]["sha256"] == CAPTURE["maps"]["sha256"]
+maps = verify(MEMORY_REQUEST["maps"]).read_text().splitlines()
+assert maps == verify(CAPTURE["maps"]).read_text().splitlines()
+canonical = json.loads(verify(CAPTURE["canonical"]).read_text())
+address_rows = json.loads(verify(CAPTURE["addresses"]).read_text())
+assert len(canonical) == len(address_rows) == CAPTURE["entries"]
+assert sorted(row["value"] for row in address_rows) == canonical
+runtime = REQUEST["runtime"]
+assert runtime["target"]["source_commit"] == "5607950ef232dad16d75c0cf53101d9649d89115"
+verify(runtime["source"])
+verify(runtime["builder"])
+for row in runtime["headers"]["files"]:
+    verify(row["artifact"])
+images = [verify(runtime["binary"]), verify(runtime["libpython"])]
+segments_file = verify(MEMORY_REQUEST["segments"])
 segments = json.loads(segments_file.read_text())
 starts = [s["start"] for s in segments]
 assert starts == sorted(starts)
@@ -50,23 +79,32 @@ for s in segments:
     assert digest(p) == s["sha256"]
     s["bytes"] = p.read_bytes()
     assert len(s["bytes"]) == s["end"] - s["start"]
+assert sum(len(s["bytes"]) for s in segments) == MEMORY_REQUEST["retained_bytes"]
 
 symbols = {}
-for arguments in (["nm", "-D", str(PY)], ["nm", str(PY)]):
-    for line in subprocess.check_output(arguments, text=True).splitlines():
-        fields = line.split()
-        if len(fields) == 3:
-            symbols.setdefault(fields[2], int(fields[0], 16))
+for image in images:
+    bases = []
+    for line in maps:
+        fields = line.split(maxsplit=5)
+        if len(fields) == 6 and fields[5] == str(image):
+            bases.append(int(fields[0].split("-")[0], 16) - int(fields[2], 16))
+    assert bases, image
+    base = min(bases)
+    for arguments in (["nm", "-D", str(image)], ["nm", str(image)]):
+        for line in subprocess.check_output(arguments, text=True, timeout=30).splitlines():
+            fields = line.split()
+            if len(fields) == 3:
+                symbols.setdefault(fields[2], base + int(fields[0], 16))
+assert symbols["PyUnicode_Type"] == MEMORY_REQUEST["unicode_type_address"]
+assert symbols["_PyRuntime"] == MEMORY_REQUEST["runtime_address"]
 type_names = {
     address: name for name, address in symbols.items() if name.endswith("_Type")
 }
 interns = {
-    int(address): record
-    for address, record in json.loads(
-        (ROOT / "neutral.addresses.json").read_text()
-    ).items()
+    row["address"]: {**row, "codepoints": list(map(ord, row["value"]))}
+    for row in address_rows
 }
-assert len(interns) == META["snapshot"]["total"]
+assert len(interns) == CAPTURE["entries"]
 
 
 def read(address, length):
@@ -159,7 +197,7 @@ def spelling(address):
     return "".join(map(chr, record["codepoints"]))
 
 
-interp = META["snapshot"]["interpreter_address"]
+interp = MEMORY_REQUEST["interpreter_address"]
 roots = []
 for name in (
     "interpreter.imports.modules",
@@ -186,7 +224,7 @@ owner_provenance = json.loads((ROOT / "owner-layout-provenance.json").read_text(
 assert owner_provenance["source_commit"] == "5607950ef232dad16d75c0cf53101d9649d89115"
 assert owner_provenance["layout_sha256"] == digest(ROOT / "owner-layout.json")
 assert owner_provenance["generator_sha256"] == digest(
-    Path(__file__).with_name("generate_startup_owner_layout.py")
+    verify(SOURCE["owner_layout_generator"])
 )
 for name in owner_provenance["additional_strong_root_fields"]:
     value = field(interp, name)
@@ -386,7 +424,10 @@ proof = [
 ]
 proof.sort(key=lambda row: row["name"])
 report = {
-    "canonical_sha256": META["canonical_sha256"],
+    "canonical_sha256": CAPTURE["canonical"]["sha256"],
+    "native_capture_sha256": digest(NATIVE / "COMPLETE.json"),
+    "memory_capture_sha256": digest(NATIVE / "MEMORY-COMPLETE.json"),
+    "native_source_sha256": digest(ROOT / "NATIVE-SOURCE.json"),
     "audit_script_sha256": digest(Path(__file__)),
     "owner_layout_sha256": digest(ROOT / "owner-layout.json"),
     "owner_layout_provenance_sha256": digest(ROOT / "owner-layout-provenance.json"),
@@ -398,7 +439,8 @@ report = {
     "unhandled_object_types": dict(unhandled.most_common()),
     "edge_kinds": dict(edge_kinds),
 }
-(ROOT / "retained-owner-audit.json").write_text(json.dumps(report, indent=2) + "\n")
+with (ROOT / "retained-owner-audit.json").open("x") as stream:
+    stream.write(json.dumps(report, indent=2) + "\n")
 print(
     json.dumps(
         {key: value for key, value in report.items() if key != "proof"}, indent=2

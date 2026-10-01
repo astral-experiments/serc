@@ -277,3 +277,35 @@ fn excludes_retained_conditional_pop_blocks_from_enclosing_tries() {
         assert_matches_cpython_marshal(&source, "conditional_pop_block_enclosing_owner.py");
     }
 }
+
+#[test]
+fn matches_cpython_shared_conditional_pop_without_exit_copy() {
+    for definition in ["def", "async def"] {
+        for condition in ["flag", "flag or other"] {
+            for (context, terminal) in [
+                ("", "return work(value)"),
+                ("", "raise Error(value)"),
+                ("", "finish(value)\nreturn value"),
+                ("with manager(value):", "return"),
+                ("with manager(value):", "return value"),
+                ("for item in values:", "break"),
+                ("for item in values:", "continue"),
+            ] {
+                let body = format!(
+                    "try:\n    if {condition}:\n        first(value)\n    else:\n        second(value)\nexcept Error:\n    recover(value)\nelse:\n{}",
+                    crate::common::indent(terminal),
+                );
+                let body = if context.is_empty() {
+                    body
+                } else {
+                    format!("{context}\n{}", crate::common::indent(&body))
+                };
+                let source = format!(
+                    "{definition} f(flag, other, value, values):\n{}    after(value)\n",
+                    crate::common::indent(&body),
+                );
+                assert_matches_cpython_marshal(&source, "shared_conditional_try_pop.py");
+            }
+        }
+    }
+}
