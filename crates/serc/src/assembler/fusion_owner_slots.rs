@@ -45,9 +45,7 @@ fn key(condition: Instruction, marker: Instruction) -> Option<Key> {
     {
         return None;
     }
-    let Operand::Forward(target) = condition.operand() else {
-        return None;
-    };
+    let target = condition.forward_target()?;
     let l = marker.location;
     Some((
         l.line,
@@ -204,7 +202,7 @@ impl<'a> View<'a> {
                     }
                 }
                 Item::Instruction(ins) => {
-                    if let Operand::Forward(l) | Operand::Backward(l) = ins.operand() {
+                    if let Some(l) = ins.jump_target() {
                         boundaries.insert(l);
                     }
                     if ins.opcode == NOT_TAKEN
@@ -592,7 +590,7 @@ impl FreshSingletonCertificate {
         if tail[0].opcode != crate::target::opcodes::LOAD_CONST
             || !matches!(tail[0].operand(), Operand::Value(_))
             || tail[1].opcode != crate::target::opcodes::IS_OP
-            || tail[1].operand() != Operand::Value(0)
+            || tail[1].value_argument() != Some(0)
             || tail[2].opcode != POP_JUMP_IF_FALSE
             || tail[3].exception_policy() != ExceptionPolicy::NoneUnchangedBooleanSingleton
         {
@@ -865,8 +863,8 @@ impl FallbackCertificate {
             };
             if matches.next().is_some()
                 || !crate::target::is_conditional_jump(before.opcode)
-                || !matches!(before.operand(), Operand::Forward(_))
-                || !matches!(after.operand(), Operand::Forward(_))
+                || before.forward_target().is_none()
+                || after.forward_target().is_none()
             {
                 return None;
             }
@@ -1764,9 +1762,7 @@ impl HandlerDispatchCertificate {
             }
             match instruction.opcode {
                 LOAD_GLOBAL => {
-                    let Operand::Value(argument) = instruction.operand() else {
-                        return None;
-                    };
+                    let argument = instruction.value_argument()?;
                     if argument & 1 != 0 {
                         removed += 1;
                         global_call = true;
@@ -1785,7 +1781,7 @@ impl HandlerDispatchCertificate {
                 LOAD_ATTR
                     if matches!(instruction.operand(), Operand::Value(argument) if argument & 1 != 0)
                         && matches!(view.items.get(index + 1), Some(Item::Instruction(next))
-                            if next.opcode == CALL && next.operand() == Operand::Value(0)) => {}
+                            if next.opcode == CALL && next.value_argument() == Some(0)) => {}
                 CALL => call = true,
                 POP_JUMP_IF_FALSE if index == condition => {}
                 _ => return None,
@@ -1900,7 +1896,7 @@ impl FoldedAssertSuccessCertificate {
         if *nop != expected
             || nop.location.line < 0
             || jump.opcode != crate::target::opcodes::JUMP_FORWARD
-            || !matches!(jump.operand(), Operand::Forward(_))
+            || jump.forward_target().is_none()
             || jump.location != nop.location
             || jump.depth_after() != nop.depth_after()
             || jump.exception_policy() != ExceptionPolicy::NoneUnchanged

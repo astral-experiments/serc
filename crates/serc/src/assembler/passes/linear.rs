@@ -1,7 +1,7 @@
 #[cfg(any(test, debug_assertions))]
 use super::super::AssemblerStage;
 use super::super::{
-    Assembler, COMPARE_OP, Instruction, Item, LayoutAssembler, NOP, Operand, POP_JUMP_IF_FALSE,
+    Assembler, COMPARE_OP, Instruction, Item, LayoutAssembler, NOP, POP_JUMP_IF_FALSE,
     POP_JUMP_IF_TRUE, STORE_FAST, STORE_FAST_STORE_FAST, TO_BOOL, UNARY_NOT, UNPACK_SEQUENCE,
     UnoptimizedCode, ends_scope, is_unconditional_jump,
 };
@@ -51,7 +51,7 @@ impl LinearCandidates {
             };
             let opcode = instruction.opcode;
             if TRACK_TARGETS
-                && let Operand::Forward(label) = instruction.operand()
+                && let Some(label) = instruction.forward_target()
                 && let Some(bit) = 1_u8.checked_shl(label.as_u32())
             {
                 candidates.conditional_targets |= bit;
@@ -60,7 +60,7 @@ impl LinearCandidates {
             candidates.adjacent_stores |= previous_was_store && is_store;
             previous_was_store = is_store;
             candidates.boolean_conversion |= matches!(opcode, TO_BOOL | UNARY_NOT);
-            candidates.copy_top |= opcode == COPY && instruction.operand() == Operand::Value(1);
+            candidates.copy_top |= opcode == COPY && instruction.value_argument() == Some(1);
             candidates.individual_load |= matches!(opcode, LOAD_FAST | LOAD_FAST_CHECK);
             candidates.combined_load |= opcode == LOAD_FAST_LOAD_FAST;
             candidates.fusable_instructions += usize::from(matches!(
@@ -143,7 +143,7 @@ fn propagate_assertion_exit_locations(items: &mut [Item], conditional_targets: O
             position += 1;
             continue;
         }
-        let Operand::Forward(label) = jump.operand() else {
+        let Some(label) = jump.forward_target() else {
             unreachable!("a terminal guard must jump forward");
         };
         // A physical alias immediately after NOT_TAKEN is still reached only by
@@ -189,9 +189,7 @@ fn propagate_assertion_exit_locations(items: &mut [Item], conditional_targets: O
                 Item::Label(_) => break,
                 Item::Instruction(instruction) => {
                     end += 1;
-                    if !matches!(instruction.operand(), Operand::Value(_))
-                        || ends_scope(instruction.opcode)
-                    {
+                    if instruction.value_argument().is_none() || ends_scope(instruction.opcode) {
                         break;
                     }
                 }
@@ -254,7 +252,7 @@ fn add_checks_for_uninitialized_loads(
         if matches!(
             instruction.opcode,
             POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE | POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE
-        ) && let Operand::Forward(target) = instruction.operand()
+        ) && let Some(target) = instruction.forward_target()
         {
             if let Some((pending_target, pending_unsafe)) = &mut continuing_state {
                 debug_assert_eq!(*pending_target, target);
@@ -271,7 +269,7 @@ fn add_checks_for_uninitialized_loads(
             &mut unsafe_locals,
             &mut unsafe_high_locals,
         );
-        if !matches!(instruction.operand(), Operand::Value(_)) || ends_scope(instruction.opcode) {
+        if instruction.value_argument().is_none() || ends_scope(instruction.opcode) {
             unsafe_high_locals.fill(true);
             block_has_instruction = false;
         }
@@ -294,7 +292,7 @@ fn optimize_guard_load_fast(
                     })
             }
             Item::Instruction(instruction) => {
-                block_has_instruction = matches!(instruction.operand(), Operand::Value(_))
+                block_has_instruction = instruction.value_argument().is_some()
                     && !ends_scope(instruction.opcode)
                     && instruction.opcode != crate::target::opcodes::NOT_TAKEN
                     && !(instruction.opcode == NOP && instruction.jump_policy.always_retains_nop())
@@ -342,9 +340,7 @@ fn propagate_locations_and_remove_redundant_nops(items: &mut Vec<Item>) {
                     previous_location = Some(instruction.location);
                 }
                 items[read] = Item::Instruction(instruction);
-                if !matches!(instruction.operand(), Operand::Value(_))
-                    || ends_scope(instruction.opcode)
-                {
+                if instruction.value_argument().is_none() || ends_scope(instruction.opcode) {
                     previous_location = None;
                     block_has_instruction = false;
                 }

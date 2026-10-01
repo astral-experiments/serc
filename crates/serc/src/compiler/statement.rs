@@ -2047,6 +2047,13 @@ impl<'source> Compiler<'source> {
                 .active_exception_region_exclusions
                 .is_empty()
             && (direct_sync_manager_body || legacy_split_sync_manager_prefix);
+        // Every before-elided terminal case requires a nonempty erased suffix. With a live
+        // final statement (the usual case), none can apply: avoid repeatedly inspecting the
+        // enclosing cleanup state and AST for each statement in the suite.
+        let has_elided_tail = final_expression_becomes_return
+            && body
+                .last()
+                .is_some_and(|statement| self.context.is_elided_statement(statement));
         let mut next_runtime_statement = 0;
         for (index, statement) in body.iter().enumerate() {
             if legacy_protected_sync_manager_body
@@ -2124,8 +2131,8 @@ impl<'source> Compiler<'source> {
             // enclosing branch's implicit return or its separate conditional exits.
             // A direct terminating arm at scope end also keeps its original false
             // footer when only erased assertions follow the conditional.
-            let terminal_before_elided_assertions = self.context.python_version
-                == crate::PythonVersion::Py312
+            let terminal_before_elided_assertions = has_elided_tail
+                && self.context.python_version == crate::PythonVersion::Py312
                 && !is_final
                 && (self.control.statements.terminal_if_branch_has_siblings
                     || (plain_function_suite
@@ -2147,7 +2154,8 @@ impl<'source> Compiler<'source> {
                     .all(|statement| self.context.is_elided_statement(statement));
             // Removing trailing assertions makes this conditional the function's
             // terminal statement. Keep its comprehension assignment's return span.
-            let terminal_comprehension_before_elided = !is_final
+            let terminal_comprehension_before_elided = has_elided_tail
+                && !is_final
                 && final_expression_becomes_return
                 && self.supports_elided_terminal_if()
                 && !inherited_statement_has_following
@@ -2189,8 +2197,8 @@ impl<'source> Compiler<'source> {
                     }));
             // A nested conditional before removed assertions can contribute its own
             // return locations to the enclosing terminal branch.
-            let terminal_nested_before_elided = self.context.python_version
-                != crate::PythonVersion::Py313
+            let terminal_nested_before_elided = has_elided_tail
+                && self.context.python_version != crate::PythonVersion::Py313
                 && !is_final
                 && plain_function_suite
                 && self.control.statements.in_terminal_if_branch_suite
@@ -2226,7 +2234,8 @@ impl<'source> Compiler<'source> {
                             || (!conditional.body.is_empty()
                                 && conditional.body.iter().all(|statement| self.context.is_elided_statement(statement))))
                         && !suite_contains_yield(&conditional.body)));
-            let coroutine_if_before_elided = final_expression_becomes_return
+            let coroutine_if_before_elided = has_elided_tail
+                && final_expression_becomes_return
                 && self.context.python_version >= crate::PythonVersion::Py313
                 && self.supports_elided_terminal_if()
                 && self.unit.flags & CO_COROUTINE != 0
@@ -2243,7 +2252,8 @@ impl<'source> Compiler<'source> {
                     .context
                     .propagates_following_to_suites
                 && self.terminal_if_before_elided(statement, &body[index + 1..]);
-            let linear_protected_if_before_elided = final_expression_becomes_return
+            let linear_protected_if_before_elided = has_elided_tail
+                && final_expression_becomes_return
                 && self.supports_linear_protected_terminal_if()
                 && self
                     .control
@@ -2256,7 +2266,8 @@ impl<'source> Compiler<'source> {
                     .direct_try_body_statements
                     .contains(&statement.range())
                 && self.terminal_if_before_elided(statement, &body[index + 1..]);
-            let protected_terminal_if_before_elided = final_expression_becomes_return
+            let protected_terminal_if_before_elided = has_elided_tail
+                && final_expression_becomes_return
                 && matches!(statement, Stmt::If(_))
                 && self.supports_protected_terminal_if()
                 && self
@@ -2278,8 +2289,8 @@ impl<'source> Compiler<'source> {
                 || linear_protected_if_before_elided;
             // An assignment with an inlined comprehension becomes terminal when
             // only removed assertions follow it; retain its target's return span.
-            let terminal_assignment_before_elided = self.context.python_version
-                >= crate::PythonVersion::Py314
+            let terminal_assignment_before_elided = has_elided_tail
+                && self.context.python_version >= crate::PythonVersion::Py314
                 && !is_final
                 && final_expression_becomes_return
                 && plain_function_suite
@@ -2299,8 +2310,8 @@ impl<'source> Compiler<'source> {
                     .iter()
                     .all(|statement| self.context.is_elided_statement(statement));
             // Removed assertions leave this match's cases as the function's terminal exits.
-            let terminal_match_before_elided = self.context.python_version
-                >= crate::PythonVersion::Py314
+            let terminal_match_before_elided = has_elided_tail
+                && self.context.python_version >= crate::PythonVersion::Py314
                 && !is_final
                 && self.supports_elided_terminal_if()
                 && self
@@ -2325,8 +2336,8 @@ impl<'source> Compiler<'source> {
             // A try with an erased protected body reaches the implicit return directly
             // when only erased assertions follow. Use the existing terminal lowering so
             // its setup NOP can merge with that return instead of retaining an empty join.
-            let terminal_empty_try_before_elided = self.context.python_version
-                >= crate::PythonVersion::Py314
+            let terminal_empty_try_before_elided = has_elided_tail
+                && self.context.python_version >= crate::PythonVersion::Py314
                 && !is_final
                 && plain_function_suite
                 && !self.has_active_control_flow_region()
@@ -2343,8 +2354,8 @@ impl<'source> Compiler<'source> {
             // Each false edge of a terminal finally loop supplies its own return
             // location. Linear cleanup before the loop and erased assertions after
             // the try body or the try itself do not share those exits.
-            let terminal_finally_while_before_elided = self.context.python_version
-                >= crate::PythonVersion::Py314
+            let terminal_finally_while_before_elided = has_elided_tail
+                && self.context.python_version >= crate::PythonVersion::Py314
                 && !is_final
                 && plain_function_suite
                 && !self.has_active_control_flow_region()

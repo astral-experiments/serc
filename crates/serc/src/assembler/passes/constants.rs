@@ -32,10 +32,7 @@ impl OptimizationPipeline {
         boundaries.extend(&self.original_jump_head_targets);
         boundaries.extend(self.exception_regions.iter().map(|region| region.target));
         boundaries.extend(self.graph.iter_items().filter_map(|item| match item {
-            Item::Instruction(instruction) => match instruction.operand() {
-                Operand::Forward(label) | Operand::Backward(label) => Some(label),
-                Operand::Value(_) | Operand::Deferred(_) => None,
-            },
+            Item::Instruction(instruction) => instruction.jump_target(),
             Item::Label(_) => None,
         }));
         let mut removed_max_depth = None;
@@ -64,7 +61,7 @@ impl OptimizationPipeline {
                 let immediately_iterated =
                     matches!(next_opcode, Some(GET_ITER | GET_YIELD_FROM_ITER));
                 let append = matches!(target.opcode, LIST_APPEND | SET_ADD)
-                    && target.operand() == Operand::Value(1)
+                    && target.value_argument() == Some(1)
                     && (immediately_iterated || next_opcode == Some(CONTAINS_OP));
                 if !intrinsic && !append {
                     continue;
@@ -82,8 +79,7 @@ impl OptimizationPipeline {
                     if instruction.opcode == NOP {
                         continue;
                     }
-                    if instruction.opcode == build_opcode
-                        && instruction.operand() == Operand::Value(0)
+                    if instruction.opcode == build_opcode && instruction.value_argument() == Some(0)
                     {
                         if expect_append {
                             start = Some(previous);
@@ -92,12 +88,12 @@ impl OptimizationPipeline {
                     }
                     if expect_append {
                         if instruction.opcode != append_opcode
-                            || instruction.operand() != Operand::Value(1)
+                            || instruction.value_argument() != Some(1)
                         {
                             break;
                         }
                     } else {
-                        let Operand::Value(argument) = instruction.operand() else {
+                        let Some(argument) = instruction.value_argument() else {
                             break;
                         };
                         match instruction.opcode {
@@ -278,7 +274,7 @@ impl OptimizationPipeline {
             if instruction.opcode != LOAD_CONST {
                 return;
             }
-            let Operand::Value(index) = instruction.operand() else {
+            let Some(index) = instruction.value_argument() else {
                 return;
             };
             let common = match constants.get(index) {
@@ -303,7 +299,7 @@ impl OptimizationPipeline {
         for item in self.graph.iter_items() {
             if let Item::Instruction(instruction) = item
                 && instruction.opcode == LOAD_CONST
-                && let Operand::Value(index) = instruction.operand()
+                && let Some(index) = instruction.value_argument()
             {
                 used[index as usize] = true;
             }
@@ -313,7 +309,7 @@ impl OptimizationPipeline {
         let indices = constants.retain_used_in_order(&used);
         self.graph.for_each_instruction_mut(|instruction| {
             if instruction.opcode == LOAD_CONST
-                && let Operand::Value(index) = instruction.operand()
+                && let Some(index) = instruction.value_argument()
             {
                 instruction.set_operand(Operand::Value(indices[index as usize].unwrap()));
             }
@@ -393,7 +389,7 @@ impl OptimizationPipeline {
                     Item::Instruction(instruction) => instruction,
                 };
                 let position = ItemPosition::new(block, offset);
-                let Operand::Value(argument) = instruction.operand() else {
+                let Some(argument) = instruction.value_argument() else {
                     loads.clear();
                     source_loads = 0;
                     continue;
@@ -527,7 +523,7 @@ impl OptimizationPipeline {
             }
             if let Item::Instruction(instruction) = item
                 && instruction.opcode == LOAD_CONST
-                && let Operand::Value(index) = instruction.operand()
+                && let Some(index) = instruction.value_argument()
             {
                 used[index as usize] = true;
                 order.push(index);
@@ -538,7 +534,7 @@ impl OptimizationPipeline {
         self.graph.for_each_instruction_mut(|instruction| {
             instruction.folded_constant_admissions = None;
             if instruction.opcode == LOAD_CONST
-                && let Operand::Value(index) = instruction.operand()
+                && let Some(index) = instruction.value_argument()
             {
                 instruction.set_operand(Operand::Value(indices[index as usize].unwrap()));
             }
