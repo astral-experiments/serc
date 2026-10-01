@@ -356,7 +356,12 @@ impl Origin {
 impl RetainedFinallyNops {
     pub(super) fn capture(pipeline: &OptimizationPipeline) -> Self {
         let mut result = Self::default();
-        if pipeline.python_version != PythonVersion::Py314 {
+        if pipeline.python_version != PythonVersion::Py314
+            || pipeline
+                .exception_owner_provenance
+                .compound_try_owner_exits
+                .is_empty()
+        {
             return result;
         }
         let items = pipeline.graph.copy_items();

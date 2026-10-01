@@ -205,6 +205,16 @@ fn retained_finally_nop_requires_original_constructor_and_real_rewrites() {
 }
 
 #[test]
+fn retained_finally_nop_requires_compound_try_owner_origin() {
+    let mut pipeline = fixture(false, false, false);
+    pipeline
+        .exception_owner_provenance
+        .compound_try_owner_exits
+        .clear();
+    assert!(RetainedFinallyNops::capture(&pipeline).origins.is_empty());
+}
+
+#[test]
 fn retained_finally_nop_rejects_changed_original_records_and_metadata() {
     let original = fixture(false, false, false).graph.copy_items();
     for index in 5..17 {
