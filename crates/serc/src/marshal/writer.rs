@@ -254,15 +254,25 @@ impl Writer<'_, '_, '_> {
         self.interned_string_with_value(object, || value);
     }
 
+    #[inline]
+    fn interned_string_with_value<'a>(
+        &mut self,
+        object: ObjectId,
+        value: impl FnOnce() -> &'a str,
+    ) {
+        self.interned_string_with_hint(object, value, false);
+    }
+
     #[expect(
         clippy::inline_always,
         reason = "decode metadata names only when emitting their payload"
     )]
     #[inline(always)]
-    fn interned_string_with_value<'a>(
+    fn interned_string_with_hint<'a>(
         &mut self,
         object: ObjectId,
         value: impl FnOnce() -> &'a str,
+        automatically_interned: bool,
     ) {
         let object = self.graph.object_for_writing(object);
         debug_assert!(object.is_interned(), "marshal metadata must be interned");
@@ -270,7 +280,16 @@ impl Writer<'_, '_, '_> {
             object.reference_for_write(ReferenceMode::Forced, &mut self.reference_count);
         match reference {
             ObjectReference::Existing(index) => self.byte_and_long(TYPE_REF, index.as_u32()),
-            ObjectReference::New => self.string_payload::<true>(value(), FLAG_REF),
+            ObjectReference::New => {
+                let value = value();
+                // The hint includes ASCII identifiers and CPython's cached Latin-1 characters.
+                let ascii = if automatically_interned {
+                    value.len() != 2 || value.as_bytes()[0].is_ascii()
+                } else {
+                    value.is_ascii()
+                };
+                self.string_payload_with_ascii::<true>(value, FLAG_REF, ascii);
+            }
             ObjectReference::Unshared => {
                 unreachable!("forced marshal reference cannot be unshared")
             }
@@ -279,8 +298,18 @@ impl Writer<'_, '_, '_> {
 
     #[inline]
     fn string_payload<const INTERNED: bool>(&mut self, value: &str, flag: u8) {
-        let bytes = value.as_bytes();
         let ascii = value.is_ascii();
+        self.string_payload_with_ascii::<INTERNED>(value, flag, ascii);
+    }
+
+    #[inline]
+    fn string_payload_with_ascii<const INTERNED: bool>(
+        &mut self,
+        value: &str,
+        flag: u8,
+        ascii: bool,
+    ) {
+        let bytes = value.as_bytes();
         if ascii && bytes.len() < 256 {
             self.output.extend_from_slice(&[
                 if INTERNED {
@@ -614,6 +643,26 @@ impl<'code> MarshalVisitor<'code> for Writer<'_, '_, 'code> {
     fn metadata_name(&mut self, value: &'code MetadataName, _metadata_id: Option<MetadataId>) {
         let object = self.next_object(OccurrenceKind::MetadataString);
         self.interned_string_with_value(object, || value.as_str());
+    }
+
+    #[inline]
+    fn metadata_names(
+        &mut self,
+        values: &'code [crate::code_object::MetadataName],
+        metadata_ids: Option<&[MetadataId]>,
+        automatically_interned: bool,
+    ) {
+        debug_assert!(
+            metadata_ids.is_none(),
+            "writer does not consume metadata IDs"
+        );
+        debug_assert!(
+            !automatically_interned || values.iter().all(|value| super::key::should_intern(value))
+        );
+        for value in values {
+            let object = self.next_object(OccurrenceKind::MetadataString);
+            self.interned_string_with_hint(object, || value.as_str(), automatically_interned);
+        }
     }
 
     fn code_filename(&mut self, code: &'code CodeObject, _metadata_id: Option<MetadataId>) {

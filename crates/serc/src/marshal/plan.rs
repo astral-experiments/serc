@@ -32,6 +32,28 @@ pub(super) trait MarshalVisitor<'a> {
 
     fn code(&mut self, code: &'a CodeObject, reference_mode: ReferenceMode) -> bool;
     fn code_bytes(&mut self, code: &'a CodeObject);
+    /// Visits metadata tuple members in order.
+    ///
+    /// Compiler-owned IDs follow the same order and length as the metadata tuple.
+    #[inline]
+    fn metadata_names(
+        &mut self,
+        values: &'a [Name],
+        metadata_ids: Option<&[MetadataId]>,
+        _automatically_interned: bool,
+    ) {
+        if let Some(metadata_ids) = metadata_ids {
+            assert_eq!(metadata_ids.len(), values.len(), "metadata ID tuple length");
+            for (value, metadata_id) in values.iter().zip(metadata_ids) {
+                self.metadata_name(value, Some(*metadata_id));
+            }
+        } else {
+            for value in values {
+                self.metadata_name(value, None);
+            }
+        }
+    }
+
     #[expect(
         clippy::ptr_arg,
         reason = "marshal keys borrow immutable vector headers"
@@ -151,17 +173,21 @@ pub(super) fn traverse_code_with_mode<'a, V>(
     }
     let metadata_ids = V::USES_METADATA_IDS.then_some(&code.marshal_provenance.metadata_ids);
     if visitor.names(code) {
-        traverse_metadata_strings(
+        visitor.metadata_names(
             &code.names,
             metadata_ids.map(|ids| ids.names.as_slice()),
-            visitor,
+            code.marshal_provenance
+                .metadata_tuple_properties
+                .is_some_and(|properties| properties.names.automatically_interned),
         );
     }
     if visitor.locals(code) {
-        traverse_metadata_strings(
+        visitor.metadata_names(
             &code.locals,
             metadata_ids.map(|ids| ids.locals.as_slice()),
-            visitor,
+            code.marshal_provenance
+                .metadata_tuple_properties
+                .is_some_and(|properties| properties.locals.automatically_interned),
         );
     }
     visitor.local_kinds(code);
@@ -185,29 +211,6 @@ fn traverse_constants<'a, V>(
     if visitor.constants(values, reference_mode) {
         for value in values {
             traverse_constant(value, ReferenceMode::IfShared, visitor);
-        }
-    }
-}
-
-/// Visits metadata tuple members in order.
-///
-/// Compiler-owned IDs follow the same order and length as the metadata tuple.
-#[inline]
-fn traverse_metadata_strings<'a, V>(
-    values: &'a [Name],
-    metadata_ids: Option<&[MetadataId]>,
-    visitor: &mut V,
-) where
-    V: MarshalVisitor<'a>,
-{
-    if let Some(metadata_ids) = metadata_ids {
-        assert_eq!(metadata_ids.len(), values.len(), "metadata ID tuple length");
-        for (value, metadata_id) in values.iter().zip(metadata_ids) {
-            visitor.metadata_name(value, Some(*metadata_id));
-        }
-    } else {
-        for value in values {
-            visitor.metadata_name(value, None);
         }
     }
 }

@@ -3349,3 +3349,64 @@ fn occurrence_cursor_preserves_position_after_a_kind_mismatch() {
     assert!(mismatch.is_err());
     assert_eq!(cursor.consume(OccurrenceKind::Code), expected);
 }
+
+#[test]
+fn cached_latin1_metadata_keeps_unicode_tags_with_ascii_hints() {
+    fn clear_properties(code: &mut CodeObject) {
+        code.marshal_provenance.metadata_tuple_properties = None;
+        for constant in &mut code.constants {
+            if let Constant::Code(child) = constant {
+                clear_properties(child);
+            }
+        }
+    }
+
+    let source = "é = 1\nÿ = é\ndef child(é, ÿ):\n    return é, ÿ\n";
+    for python_version in [
+        crate::PythonVersion::Py312,
+        crate::PythonVersion::Py313,
+        crate::PythonVersion::Py314,
+        crate::PythonVersion::Py315,
+    ] {
+        let module = crate::compile_with_options(
+            source,
+            "latin1_metadata.py",
+            &crate::CompileOptions {
+                python_version,
+                ..crate::CompileOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            module
+                .code
+                .marshal_provenance
+                .metadata_tuple_properties
+                .unwrap()
+                .names
+                .automatically_interned
+        );
+        let mut fallback = module.clone();
+        clear_properties(&mut fallback.code);
+        let encoded = module.marshal();
+        assert_eq!(encoded, fallback.marshal(), "{python_version}");
+        let unicode = [
+            super::v5::TYPE_INTERNED | super::v5::FLAG_REF,
+            2,
+            0,
+            0,
+            0,
+            0xc3,
+            0xa9,
+        ];
+        assert!(
+            encoded.windows(unicode.len()).any(|bytes| bytes == unicode),
+            "{python_version}"
+        );
+        assert_eq!(
+            module.to_timestamp_pyc(123, 456),
+            fallback.to_timestamp_pyc(123, 456),
+            "{python_version}"
+        );
+    }
+}
