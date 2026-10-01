@@ -398,19 +398,14 @@ impl Ord for CanonicalKey<'_> {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(super) struct SliceKey<'a> {
-    lower: &'a Constant,
-    upper: &'a Constant,
-    step: &'a Constant,
-}
+pub(super) struct SliceKey<'a>(&'a Constant);
 
 impl<'a> SliceKey<'a> {
     fn members(self) -> [ObjectKey<'a>; 3] {
-        [
-            constant_key(self.lower),
-            constant_key(self.upper),
-            constant_key(self.step),
-        ]
+        let Constant::Slice { lower, upper, step } = self.0 else {
+            unreachable!("slice keys refer to slice constants");
+        };
+        [constant_key(lower), constant_key(upper), constant_key(step)]
     }
 }
 
@@ -447,10 +442,17 @@ pub(super) struct StringTupleKey<'a>(StringTupleKind<'a>);
 
 #[derive(Clone, Copy, Debug)]
 enum StringTupleKind<'a> {
-    Constants(&'a [Constant]),
-    Strings(&'a [String]),
-    Names(&'a [Name]),
+    // Borrow the immutable vector header so each variant needs only a thin pointer.
+    Constants(&'a Vec<Constant>),
+    Strings(&'a Vec<String>),
+    Names(&'a Vec<Name>),
 }
+
+const _: () =
+    assert!(std::mem::size_of::<StringTupleKey<'_>>() == 2 * std::mem::size_of::<usize>());
+
+#[cfg(target_pointer_width = "64")]
+const _: [(); 24] = [(); std::mem::size_of::<ObjectKey<'_>>()];
 
 enum StringTupleIter<'a> {
     Constants(slice::Iter<'a, Constant>),
@@ -481,7 +483,7 @@ impl<'a> Iterator for StringTupleIter<'a> {
 impl ExactSizeIterator for StringTupleIter<'_> {}
 
 impl<'a> StringTupleKey<'a> {
-    fn constants(values: &'a [Constant]) -> Self {
+    fn constants(values: &'a Vec<Constant>) -> Self {
         debug_assert!(
             values
                 .iter()
@@ -490,11 +492,11 @@ impl<'a> StringTupleKey<'a> {
         Self(StringTupleKind::Constants(values))
     }
 
-    fn strings(values: &'a [String]) -> Self {
+    fn strings(values: &'a Vec<String>) -> Self {
         Self(StringTupleKind::Strings(values))
     }
 
-    fn names(values: &'a [Name]) -> Self {
+    fn names(values: &'a Vec<Name>) -> Self {
         Self(StringTupleKind::Names(values))
     }
 
@@ -793,7 +795,7 @@ pub(super) fn constant_key(value: &Constant) -> ObjectKey<'_> {
         Constant::Bytes(value) => ObjectKey::Bytes(value),
         Constant::Tuple(values) => constants_tuple_key(values),
         Constant::FrozenSet(values) => ObjectKey::FrozenSet(FrozenSetKey(values)),
-        Constant::Slice { lower, upper, step } => ObjectKey::Slice(SliceKey { lower, upper, step }),
+        Constant::Slice { .. } => ObjectKey::Slice(SliceKey(value)),
         Constant::Code(code) => code_key(code),
     }
 }
@@ -1073,7 +1075,7 @@ fn sorted_frozen_set_members_with_properties<'a>(
     members
 }
 
-pub(super) fn constants_tuple_key(values: &[Constant]) -> ObjectKey<'_> {
+pub(super) fn constants_tuple_key(values: &Vec<Constant>) -> ObjectKey<'_> {
     if values.is_empty() {
         ObjectKey::EmptyTuple
     } else if values
@@ -1088,7 +1090,7 @@ pub(super) fn constants_tuple_key(values: &[Constant]) -> ObjectKey<'_> {
 
 /// Hashes a finalized constants tuple for reuse after moving or cloning its code object.
 /// Empty tuples need no hash; code descendants prevent caching because cloning changes their keys.
-pub(crate) fn constants_tuple_hash(values: &[Constant]) -> Option<u64> {
+pub(crate) fn constants_tuple_hash(values: &Vec<Constant>) -> Option<u64> {
     fn has_code(value: &Constant) -> bool {
         match value {
             Constant::Code(_) => true,
@@ -1109,7 +1111,7 @@ pub(crate) fn bytes_hash(value: &[u8]) -> u64 {
     HashedObjectKey::from(ObjectKey::Bytes(value)).hash
 }
 
-pub(super) fn strings_tuple_key(values: &[String]) -> ObjectKey<'_> {
+pub(super) fn strings_tuple_key(values: &Vec<String>) -> ObjectKey<'_> {
     if values.is_empty() {
         ObjectKey::EmptyTuple
     } else {
@@ -1117,7 +1119,7 @@ pub(super) fn strings_tuple_key(values: &[String]) -> ObjectKey<'_> {
     }
 }
 
-pub(super) fn names_tuple_key(values: &[Name]) -> ObjectKey<'_> {
+pub(super) fn names_tuple_key(values: &Vec<Name>) -> ObjectKey<'_> {
     if values.is_empty() {
         ObjectKey::EmptyTuple
     } else {
@@ -1138,10 +1140,10 @@ pub(super) fn locals_tuple_key(code: &CodeObject) -> ObjectKey<'_> {
 
 /// Precomputes the value-only metadata work shared by all marshal graph traversals.
 pub(crate) fn metadata_tuple_properties(
-    names: &[Name],
-    locals: &[Name],
+    names: &Vec<Name>,
+    locals: &Vec<Name>,
 ) -> MarshalMetadataTupleProperties {
-    fn strings(values: &[Name]) -> MarshalStringTupleProperties {
+    fn strings(values: &Vec<Name>) -> MarshalStringTupleProperties {
         let key = names_tuple_key(values);
         if values.is_empty() {
             return MarshalStringTupleProperties {
@@ -1351,7 +1353,7 @@ mod key_hash_tests {
     #[test]
     fn preserves_derived_hash_stream_for_every_variant() {
         let constants = [Constant::Int(17), Constant::Bool(true)];
-        let strings = [String::from("name"), String::from("other")];
+        let strings = vec![String::from("name"), String::from("other")];
         let keys = [
             ObjectKey::None,
             ObjectKey::Bool(true),
@@ -1374,11 +1376,11 @@ mod key_hash_tests {
             ObjectKey::StringTuple(StringTupleKey::strings(&strings)),
             ObjectKey::AnnotationLocals(17),
             ObjectKey::EmptyTuple,
-            ObjectKey::Slice(SliceKey {
-                lower: &constants[0],
-                upper: &constants[1],
-                step: &Constant::None,
-            }),
+            ObjectKey::Slice(SliceKey(&Constant::Slice {
+                lower: Box::new(constants[0].clone()),
+                upper: Box::new(constants[1].clone()),
+                step: Box::new(Constant::None),
+            })),
             ObjectKey::SliceMember(17),
             ObjectKey::RecreatedFrozenSet(17),
             ObjectKey::Code(17),

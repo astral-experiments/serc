@@ -733,7 +733,10 @@ mod tests {
                 name: Some(MetadataId::from_u32(0)),
                 qualified_name: Some(MetadataId::from_u32(1)),
             },
-            metadata_tuple_properties: Some(crate::marshal::metadata_tuple_properties(&[], &[])),
+            metadata_tuple_properties: Some(crate::marshal::metadata_tuple_properties(
+                &Vec::new(),
+                &Vec::new(),
+            )),
             subtree_has_frozenset_constants: true,
             metadata_alias_scan_unnecessary: true,
             ..MarshalProvenance::default()

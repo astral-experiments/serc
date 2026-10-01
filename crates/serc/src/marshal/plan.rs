@@ -32,7 +32,11 @@ pub(super) trait MarshalVisitor<'a> {
 
     fn code(&mut self, code: &'a CodeObject, reference_mode: ReferenceMode) -> bool;
     fn code_bytes(&mut self, code: &'a CodeObject);
-    fn constants(&mut self, values: &'a [Constant], reference_mode: ReferenceMode) -> bool;
+    #[expect(
+        clippy::ptr_arg,
+        reason = "marshal keys borrow immutable vector headers"
+    )]
+    fn constants(&mut self, values: &'a Vec<Constant>, reference_mode: ReferenceMode) -> bool;
     /// Visits the constants tuple with access to its cached hash before descending into members.
     fn code_constants(&mut self, code: &'a CodeObject) -> bool {
         self.constants(&code.constants, ReferenceMode::IfShared)
@@ -171,8 +175,11 @@ pub(super) fn traverse_code_with_mode<'a, V>(
 }
 
 #[inline]
-fn traverse_constants<'a, V>(values: &'a [Constant], reference_mode: ReferenceMode, visitor: &mut V)
-where
+fn traverse_constants<'a, V>(
+    values: &'a Vec<Constant>,
+    reference_mode: ReferenceMode,
+    visitor: &mut V,
+) where
     V: MarshalVisitor<'a>,
 {
     if visitor.constants(values, reference_mode) {

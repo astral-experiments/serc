@@ -79,7 +79,7 @@ fn code_identity_descendants_cannot_cache_a_constant_tuple_hash() {
             step: Box::new(Constant::None),
         },
     ] {
-        assert_eq!(super::key::constants_tuple_hash(&[value]), None);
+        assert_eq!(super::key::constants_tuple_hash(&vec![value]), None);
     }
 }
 
@@ -438,16 +438,17 @@ fn uses_cpython_reference_cache_boundaries() {
 
 #[test]
 fn precomputed_metadata_hashes_match_borrowed_tuples_from_either_source() {
-    let names = ["value", "méthode", ".0", "é"].map(Name::new);
-    let locals = ["ascii_name", "A09", "_"].map(Name::new);
+    let names = ["value", "méthode", ".0", "é"].map(Name::new).to_vec();
+    let locals = ["ascii_name", "A09", "_"].map(Name::new).to_vec();
+    let empty = Vec::new();
     let properties = metadata_tuple_properties(&names, &locals);
     assert!(!properties.names.automatically_interned);
     assert!(properties.locals.automatically_interned);
 
     for (values, properties) in [
-        (names.as_slice(), properties.names),
-        (locals.as_slice(), properties.locals),
-        (&[], metadata_tuple_properties(&[], &[]).names),
+        (&names, properties.names),
+        (&locals, properties.locals),
+        (&empty, metadata_tuple_properties(&empty, &empty).names),
     ] {
         let constants = values
             .iter()
@@ -506,7 +507,7 @@ def membership(value):
     }
 
     let nested_code = Constant::Tuple(vec![Constant::Code(Box::new(code_object(vec![])))]);
-    assert!(super::key::constants_tuple_hash(&[nested_code]).is_none());
+    assert!(super::key::constants_tuple_hash(&vec![nested_code]).is_none());
 }
 
 #[test]
@@ -1021,11 +1022,18 @@ fn borrowed_string_tuple_keys_compare_across_sources() {
     ];
     let strings = ["alpha".to_string(), "beta".to_string(), long.to_string()];
     let names = ["alpha", "beta", long].map(Name::new);
-    let keys = [0..1, 0..2, 1..2, 2..3].map(|range| {
+    let sources = [0..1, 0..2, 1..2, 2..3].map(|range| {
+        (
+            constants[range.clone()].to_vec(),
+            strings[range.clone()].to_vec(),
+            names[range].to_vec(),
+        )
+    });
+    let keys = sources.each_ref().map(|(constants, strings, names)| {
         [
-            constants_tuple_key(&constants[range.clone()]),
-            strings_tuple_key(&strings[range.clone()]),
-            names_tuple_key(&names[range]),
+            constants_tuple_key(constants),
+            strings_tuple_key(strings),
+            names_tuple_key(names),
         ]
     });
     for (left_index, left_keys) in keys.iter().enumerate() {
@@ -1669,11 +1677,11 @@ impl<'a> MarshalVisitor<'a> for RecordingVisitor<'a> {
 
     fn code_bytes(&mut self, _code: &'a CodeObject) {}
 
-    fn constants(&mut self, values: &'a [Constant], reference_mode: ReferenceMode) -> bool {
+    fn constants(&mut self, values: &'a Vec<Constant>, reference_mode: ReferenceMode) -> bool {
         self.push(RecordedValue::Constants(values), reference_mode);
         !self
             .pruned
-            .is_some_and(|pruned| std::ptr::eq(pruned, values))
+            .is_some_and(|pruned| std::ptr::eq(pruned, values.as_slice()))
     }
 
     fn names(&mut self, _code: &'a CodeObject) -> bool {

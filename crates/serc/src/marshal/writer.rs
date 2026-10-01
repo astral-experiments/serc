@@ -581,7 +581,7 @@ impl<'code> MarshalVisitor<'code> for Writer<'_, '_, 'code> {
     }
 
     #[inline]
-    fn constants(&mut self, values: &'code [Constant], reference_mode: ReferenceMode) -> bool {
+    fn constants(&mut self, values: &'code Vec<Constant>, reference_mode: ReferenceMode) -> bool {
         let object = self.next_object(OccurrenceKind::Constants);
         self.tuple_header(object, values.len(), reference_mode)
     }

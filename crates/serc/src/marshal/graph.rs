@@ -1064,7 +1064,7 @@ fn collect_metadata_aliased_constants<'a>(
     keys: &FxHashSet<HashedObjectKey<'a>>,
 ) -> FxHashSet<usize> {
     fn constants<'a>(
-        values: &'a [Constant],
+        values: &'a Vec<Constant>,
         keys: &FxHashSet<HashedObjectKey<'a>>,
         interned: &mut FxHashSet<usize>,
     ) {
@@ -1755,7 +1755,7 @@ fn frozenset_intern_dependencies(
     }
 
     fn count_tuple<'a>(
-        constants: &'a [Constant],
+        constants: &'a Vec<Constant>,
         inside_frozenset: bool,
         share_tuple_slots: bool,
         owners: &mut FxHashMap<HashedObjectKey<'a>, Owners<'a>>,
@@ -2746,7 +2746,7 @@ impl<'code> GraphVisitor<'_, 'code> {
     /// Records the constants tuple, using a cached value hash when available.
     /// Root and code-bearing tuples retain unique identities; string tuples may alias metadata.
     #[inline]
-    fn constants_with_hash(&mut self, values: &'code [Constant], hash: Option<u64>) -> bool {
+    fn constants_with_hash(&mut self, values: &'code Vec<Constant>, hash: Option<u64>) -> bool {
         let root_constants = std::mem::take(&mut self.root_constants);
         if values.is_empty() {
             return self
@@ -2794,7 +2794,7 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
     }
 
     #[inline]
-    fn constants(&mut self, values: &'code [Constant], _reference_mode: ReferenceMode) -> bool {
+    fn constants(&mut self, values: &'code Vec<Constant>, _reference_mode: ReferenceMode) -> bool {
         self.constants_with_hash(values, None)
     }
 
