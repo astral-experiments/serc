@@ -16414,35 +16414,34 @@ impl Assembler {
         }
         // retain_used moves the same constants without changing their identity.
         // Apply its mapping to every original witness only after all live records.
-        for original in &mut self.exception_owner_provenance.original_uniform_folds {
-            if original.opcode == LOAD_CONST
-                && original.jump_policy.has_original_uniform_fold()
-                && let Operand::Value(index) = original.operand()
-                && index != u32::MAX
-                && let Some(Some(new_index)) = index_map.get(index as usize)
-            {
-                original.set_operand(Operand::Value(*new_index));
-                original.jump_policy.mark_original_uniform_fold();
+        if let Some(provenance) = self.exception_owner_provenance.as_mut() {
+            for original in &mut provenance.original_uniform_folds {
+                if original.opcode == LOAD_CONST
+                    && original.jump_policy.has_original_uniform_fold()
+                    && let Operand::Value(index) = original.operand()
+                    && index != u32::MAX
+                    && let Some(Some(new_index)) = index_map.get(index as usize)
+                {
+                    original.set_operand(Operand::Value(*new_index));
+                    original.jump_policy.mark_original_uniform_fold();
+                }
             }
-        }
-        // These source arrays were captured before unused constants were pruned.
-        // Transport only surviving constant identities; replay still compares every
-        // complete instruction and rejects any other change to the original array.
-        self.exception_owner_provenance
-            .copied_return_membership_prefixes
-            .retain_mut(|origin| {
-                let Operand::Value(index) = origin.constant.operand() else {
-                    return false;
-                };
-                let Some(Some(remapped)) = index_map.get(index as usize) else {
-                    return false;
-                };
-                origin.constant.set_operand(Operand::Value(*remapped));
-                true
-            });
-        self.exception_owner_provenance
-            .copied_return_pop_prefixes
-            .retain_mut(|origin| {
+            // These source arrays were captured before unused constants were pruned.
+            // Transport only surviving constant identities; replay still compares every
+            // complete instruction and rejects any other change to the original array.
+            provenance
+                .copied_return_membership_prefixes
+                .retain_mut(|origin| {
+                    let Operand::Value(index) = origin.constant.operand() else {
+                        return false;
+                    };
+                    let Some(Some(remapped)) = index_map.get(index as usize) else {
+                        return false;
+                    };
+                    origin.constant.set_operand(Operand::Value(*remapped));
+                    true
+                });
+            provenance.copied_return_pop_prefixes.retain_mut(|origin| {
                 let load = &mut origin.records[2];
                 if load.opcode != LOAD_CONST {
                     return false;
@@ -16456,56 +16455,57 @@ impl Assembler {
                 load.set_operand(Operand::Value(*remapped));
                 true
             });
-        self.exception_owner_provenance
-            .saved_named_handler_none_prefixes
-            .retain_mut(|origin| {
-                for item in &mut origin.items {
-                    let Item::Instruction(instruction) = item else {
-                        continue;
-                    };
-                    if instruction.opcode != LOAD_CONST {
-                        continue;
-                    }
-                    let Operand::Value(index) = instruction.operand() else {
-                        return false;
-                    };
-                    let Some(Some(remapped)) = index_map.get(index as usize) else {
-                        return false;
-                    };
-                    instruction.set_operand(Operand::Value(*remapped));
-                }
-                true
-            });
-        self.exception_owner_provenance
-            .original_normal_finally_arrays
-            .retain_mut(|origin| {
-                origin.borrow_join = origin.borrow_join.and_then(|(join, mut first)| {
-                    if first.opcode == LOAD_CONST {
-                        let Operand::Value(index) = first.operand() else {
-                            return None;
+            provenance
+                .saved_named_handler_none_prefixes
+                .retain_mut(|origin| {
+                    for item in &mut origin.items {
+                        let Item::Instruction(instruction) = item else {
+                            continue;
                         };
-                        let remapped = (*index_map.get(index as usize)?)?;
-                        first.set_operand(Operand::Value(remapped));
+                        if instruction.opcode != LOAD_CONST {
+                            continue;
+                        }
+                        let Operand::Value(index) = instruction.operand() else {
+                            return false;
+                        };
+                        let Some(Some(remapped)) = index_map.get(index as usize) else {
+                            return false;
+                        };
+                        instruction.set_operand(Operand::Value(*remapped));
                     }
-                    Some((join, first))
+                    true
                 });
-                for item in &mut origin.prefix {
-                    let Item::Instruction(instruction) = item else {
-                        continue;
-                    };
-                    if instruction.opcode != LOAD_CONST {
-                        continue;
+            provenance
+                .original_normal_finally_arrays
+                .retain_mut(|origin| {
+                    origin.borrow_join = origin.borrow_join.and_then(|(join, mut first)| {
+                        if first.opcode == LOAD_CONST {
+                            let Operand::Value(index) = first.operand() else {
+                                return None;
+                            };
+                            let remapped = (*index_map.get(index as usize)?)?;
+                            first.set_operand(Operand::Value(remapped));
+                        }
+                        Some((join, first))
+                    });
+                    for item in &mut origin.prefix {
+                        let Item::Instruction(instruction) = item else {
+                            continue;
+                        };
+                        if instruction.opcode != LOAD_CONST {
+                            continue;
+                        }
+                        let Operand::Value(index) = instruction.operand() else {
+                            return false;
+                        };
+                        let Some(Some(remapped)) = index_map.get(index as usize) else {
+                            return false;
+                        };
+                        instruction.set_operand(Operand::Value(*remapped));
                     }
-                    let Operand::Value(index) = instruction.operand() else {
-                        return false;
-                    };
-                    let Some(Some(remapped)) = index_map.get(index as usize) else {
-                        return false;
-                    };
-                    instruction.set_operand(Operand::Value(*remapped));
-                }
-                true
-            });
+                    true
+                });
+        }
     }
 
     pub(crate) const fn deferred_none_constant_index(&self) -> Option<u32> {

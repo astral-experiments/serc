@@ -301,7 +301,7 @@ impl OptimizationPipeline {
             legacy_uniform_jump_seed: self.legacy_uniform_jump_seed,
             items: self.graph.into_items(),
             exception_regions: self.exception_regions,
-            exception_owner_provenance: self.exception_owner_provenance,
+            exception_owner_provenance: self.exception_owner_provenance.into(),
             preserved_block_boundaries: self.preserved_block_boundaries,
             removed_max_depth: None,
             next_label: self.next_label,

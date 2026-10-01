@@ -473,20 +473,12 @@ impl Assembler {
                         && label_positions.contains_key(&region.end)
                         && label_positions.contains_key(&region.target)
                 });
+            let provenance = &mut *self.exception_owner_provenance;
             for region in self
                 .exception_regions
                 .iter_mut()
-                .chain(
-                    self.exception_owner_provenance
-                        .normal_try_jump_owners
-                        .values_mut()
-                        .flatten(),
-                )
-                .chain(
-                    self.exception_owner_provenance
-                        .ordinary_await_cleanups
-                        .iter_mut(),
-                )
+                .chain(provenance.normal_try_jump_owners.values_mut().flatten())
+                .chain(provenance.ordinary_await_cleanups.iter_mut())
             {
                 if let super::ExceptionRegionPriority::OriginalRange(start, end) = region.priority {
                     region.priority = super::ExceptionRegionPriority::Resolved {
@@ -555,7 +547,7 @@ impl Assembler {
             next_label: self.next_label,
             legacy_native_labels: self.legacy_native_labels,
             exception_regions: self.exception_regions,
-            exception_owner_provenance: self.exception_owner_provenance,
+            exception_owner_provenance: self.exception_owner_provenance.into(),
             preserved_block_boundaries: self.preserved_block_boundaries,
             borrow_unreachable_blocks: self.borrow_unreachable_blocks,
             borrow_omitted_for_backedges: self.borrow_omitted_for_backedges,
@@ -1244,7 +1236,7 @@ impl OptimizationPipeline {
             legacy_uniform_jump_seed: self.legacy_uniform_jump_seed,
             items,
             exception_regions: self.exception_regions,
-            exception_owner_provenance: self.exception_owner_provenance,
+            exception_owner_provenance: self.exception_owner_provenance.into(),
             preserved_block_boundaries: self.preserved_block_boundaries,
             removed_max_depth,
             next_label: self.next_label,
@@ -1652,7 +1644,8 @@ mod uniform_jump_seed_tests {
             legacy_uniform_jump_seed: uniform,
             items,
             exception_regions: Vec::new(),
-            exception_owner_provenance: Box::default(),
+            exception_owner_provenance:
+                crate::assembler::exception_owners::ExceptionOwnerProvenanceStorage::default(),
             preserved_block_boundaries: rustc_hash::FxHashSet::default(),
             removed_max_depth: None,
             next_label: 1,
