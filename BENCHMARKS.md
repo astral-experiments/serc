@@ -63,6 +63,14 @@ The chart and table use the checked-in
 
 </details>
 
+## Profile-guided release comparison
+
+A separate [ordinary-release versus PGO comparison](docs/pgo-performance.md)
+measured 10–11% lower complete compile-and-write time on held-out Django and NumPy.
+It records paired samples, exact build/runtime commands, full output checks, and
+small import-benchmark regressions. The PGO artifact is opt-in; ordinary release
+builds are unchanged.
+
 ## Reproduction
 
 The [benchmark harness](scripts/benchmarks/README.md) wraps

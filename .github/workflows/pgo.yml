@@ -20,6 +20,11 @@ on:
   pull_request:
     paths: *pgo-paths
   workflow_dispatch:
+    inputs:
+      release:
+        description: Build a PGO release and benchmark held-out Django
+        type: boolean
+        default: false
 
 permissions: {}
 
@@ -29,6 +34,7 @@ concurrency:
 
 jobs:
   pgo-smoke:
+    if: github.event_name != 'workflow_dispatch' || !inputs.release
     name: "PGO pipeline smoke"
     timeout-minutes: 30
     runs-on: ubuntu-24.04
@@ -59,3 +65,74 @@ jobs:
             target/pgo-release/run-*/*.stderr
           if-no-files-found: ignore
           retention-days: 7
+
+  pgo-release:
+    name: "Optimized host release and Django benchmark"
+    if: github.event_name == 'workflow_dispatch' && inputs.release
+    timeout-minutes: 90
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      CARGO_NET_RETRY: 10
+      CARGO_TERM_COLOR: always
+      RUSTUP_MAX_RETRIES: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          submodules: true
+      - uses: ./.github/actions/setup-python
+      - name: "Install LLVM profile tools"
+        run: rustup component add llvm-tools-preview
+      - name: "Build and verify optimized release"
+        run: ./scripts/build-pgo-release "$SERC_TEST_PYTHON"
+      - name: "Fetch held-out Django sources"
+        run: |
+          git clone --depth 1 --branch 5.2.6 https://github.com/django/django.git target/benchmarks/django
+          test "$(git -C target/benchmarks/django rev-parse HEAD)" = 75c4403f07b8ad25893f7832dbe8fc6814b53b2d
+      - name: "Compare fresh compile-and-write runs"
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          manifests = list(Path("target/pgo-release").glob("run-*/manifest.json"))
+          if len(manifests) != 1:
+              raise SystemExit("expected exactly one PGO build manifest")
+          manifest_path = manifests[0]
+          manifest = json.loads(manifest_path.read_text())
+          if manifest["status"] != "complete":
+              raise SystemExit("PGO build did not complete")
+          subprocess.run([
+              sys.executable, "scripts/benchmarks/compare-builds.py",
+              manifest["control_binary"], manifest["binary"],
+              "target/benchmarks/django/django",
+              str(manifest_path.parent / "django-comparison.json"),
+              "--samples", "30", "--warmups", "10", "--jobs", "1",
+              "--cpu", str(min(os.sched_getaffinity(0))),
+              "--baseline-revision", manifest["source_head"],
+              "--optimized-revision", manifest["source_head"],
+          ], check=True)
+          PY
+      - name: "Archive release with executable permissions"
+        run: |
+          for run in target/pgo-release/run-*; do
+            tar -czf "$run/serc-pgo-linux-x86_64.tar.gz" -C "$run" \
+              serc serc-control training.profdata manifest.json django-comparison.json
+          done
+      - name: "Upload optimized release and evidence"
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: serc-pgo-linux-x86_64
+          path: |
+            target/pgo-release/run-*/serc-pgo-linux-x86_64.tar.gz
+            target/pgo-release/run-*/manifest.json
+            target/pgo-release/run-*/django-comparison.json
+            target/pgo-release/run-*/*.stderr
+          if-no-files-found: error
+          retention-days: 14

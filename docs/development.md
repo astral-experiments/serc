@@ -34,7 +34,7 @@ The recipe trains `serc compile` serially and with up to four workers on nine
 [pinned projects](../scripts/pgo_corpus.py), following
 [Ruff's project selection](https://github.com/astral-sh/ruff/blob/fb93595b28f3d38a209ed65c12fce114e249d715/scripts/build_ruff_pgo.py).
 It compiles tracked `.py` sources without importing or executing them, excluding
-tests, vendored code, symlinks, and stubs. NumPy is held out for benchmarking.
+tests, vendored code, symlinks, and stubs. Django and NumPy are held out for benchmarking.
 
 Instrumented and final PGO builds must produce the same complete `.pyc` files as
 an independently built ordinary executable. The manifest also records per-file
@@ -48,8 +48,17 @@ pins, and source/artifact hashes. Keep the source unchanged during a build and
 regenerate profiles after changing the source, toolchain, or corpus.
 
 Use `--train-only` to generate a profile for a later packaging build. Use
-`--debug` to run the full pipeline with debug builds, as the
+`--debug` to run the full pipeline with debug builds, as the default
 [PGO CI workflow](../.github/workflows/pgo.yml) does.
+
+To build a downloadable optimized Linux x86-64 host executable, manually dispatch
+that workflow with `release` enabled. It builds and verifies the release profile,
+compares it with the ordinary release on held-out Django using 30 alternating
+compile-and-write pairs, and uploads a tarball containing both executables, the
+merged profile, build manifest, and raw benchmark results. The tarball preserves
+executable permissions. This host build uses Ubuntu 24.04; it does not replace the
+portable PyPI wheels or change ordinary `cargo build --release` builds.
+See the [measured gains and regression tradeoffs](pgo-performance.md).
 
 Clear `RUSTFLAGS` and `CARGO_ENCODED_RUSTFLAGS` before running. Use
 `--toolchain <name>` to select another Rustup toolchain. If `llvm-profdata` is

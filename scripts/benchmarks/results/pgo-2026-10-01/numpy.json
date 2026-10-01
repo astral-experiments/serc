@@ -1,0 +1,428 @@
+{
+  "commands": {
+    "baseline": [
+      "/workspace/serc/work/performance/pgo/run-j61l5u07/serc-control",
+      "compile",
+      "--quiet",
+      "--jobs",
+      "1",
+      "/workspace/serc/target/benchmarks/numpy/numpy"
+    ],
+    "optimized": [
+      "/workspace/serc/work/performance/pgo/run-j61l5u07/serc",
+      "compile",
+      "--quiet",
+      "--jobs",
+      "1",
+      "/workspace/serc/target/benchmarks/numpy/numpy"
+    ]
+  },
+  "samples": [
+    {
+      "order": [
+        "baseline",
+        "optimized"
+      ],
+      "baseline": 1.248767690999557,
+      "optimized": 1.0531963169996743,
+      "cpu_seconds": {
+        "baseline": 1.2400000000000002,
+        "optimized": 1.0500000000000003
+      }
+    },
+    {
+      "order": [
+        "optimized",
+        "baseline"
+      ],
+      "optimized": 1.0619007109999075,
+      "baseline": 1.1762608389999514,
+      "cpu_seconds": {
+        "optimized": 1.0599999999999992,
+        "baseline": 1.1700000000000017
+      }
+    },
+    {
+      "order": [
+        "baseline",
+        "optimized"
+      ],
+      "baseline": 1.215449733999776,
+      "optimized": 1.137652092999815,
+      "cpu_seconds": {
+        "baseline": 1.2100000000000026,
+        "optimized": 1.139999999999998
+      }
+    },
+    {
+      "order": [
+        "optimized",
+        "baseline"
+      ],
+      "optimized": 1.0631289240000115,
+      "baseline": 1.1960921690006217,
+      "cpu_seconds": {
+        "optimized": 1.0599999999999974,
+        "baseline": 1.19
+      }
+    },
+    {
+      "order": [
+        "baseline",
+        "optimized"
+      ],
+      "baseline": 1.1836613710001984,
+      "optimized": 1.0868592700007866,
+      "cpu_seconds": {
+        "baseline": 1.1800000000000033,
+        "optimized": 1.089999999999998
+      }
+    },
+    {
+      "order": [
+        "optimized",
+        "baseline"
+      ],
+      "optimized": 1.0403719349997118,
+      "baseline": 1.2720884549999028,
+      "cpu_seconds": {
+        "optimized": 1.0300000000000002,
+        "baseline": 1.2800000000000011
+      }
+    },
+    {
+      "order": [
+        "baseline",
+        "optimized"
+      ],
+      "baseline": 1.2007614659996761,
+      "optimized": 1.0682609340001363,
+      "cpu_seconds": {
+        "baseline": 1.1899999999999977,
+        "optimized": 1.0700000000000003
+      }
+    },
+    {
+      "order": [
+        "optimized",
+        "baseline"
+      ],
+      "optimized": 1.0578355469997405,
+      "baseline": 1.1803280809999706,
+      "cpu_seconds": {
+        "optimized": 1.0600000000000023,
+        "baseline": 1.1799999999999962
+      }
+    },
+    {
+      "order": [
+        "baseline",
+        "optimized"
+      ],
+      "baseline": 1.2024386080001932,
+      "optimized": 1.0704613079997216,
+      "cpu_seconds": {
+        "baseline": 1.2000000000000064,
+        "optimized": 1.059999999999996
+      }
+    },
+    {
+      "order": [
+        "optimized",
+        "baseline"
+      ],
+      "optimized": 1.0642772769997464,
+      "baseline": 1.1949598210003387,
+      "cpu_seconds": {
+        "optimized": 1.060000000000004,
+        "baseline": 1.1999999999999993
+      }
+    },
+    {
+      "order": [
+        "baseline",
+        "optimized"
+      ],
+      "baseline": 1.1856413510004131,
+      "optimized": 1.043324727000254,
+      "cpu_seconds": {
+        "baseline": 1.1700000000000017,
+        "optimized": 1.0500000000000043
+      }
+    },
+    {
+      "order": [
+        "optimized",
+        "baseline"
+      ],
+      "optimized": 1.051106797999637,
+      "baseline": 1.3824613870001485,
+      "cpu_seconds": {
+        "optimized": 1.0499999999999998,
+        "baseline": 1.3799999999999928
+      }
+    },
+    {
+      "order": [
+        "baseline",
+        "optimized"
+      ],
+      "baseline": 1.1146358579999287,
+      "optimized": 0.9713239519996932,
+      "cpu_seconds": {
+        "baseline": 1.1000000000000068,
+        "optimized": 0.9700000000000024
+      }
+    },
+    {
+      "order": [
+        "optimized",
+        "baseline"
+      ],
+      "optimized": 0.9970705280002221,
+      "baseline": 1.1353453050005555,
+      "cpu_seconds": {
+        "optimized": 1.0000000000000036,
+        "baseline": 1.1299999999999955
+      }
+    },
+    {
+      "order": [
+        "baseline",
+        "optimized"
+      ],
+      "baseline": 1.1497219109996877,
+      "optimized": 1.0595724149998205,
+      "cpu_seconds": {
+        "baseline": 1.149999999999996,
+        "optimized": 1.0599999999999996
+      }
+    },
+    {
+      "order": [
+        "optimized",
+        "baseline"
+      ],
+      "optimized": 1.0985932579997097,
+      "baseline": 1.2048123960003068,
+      "cpu_seconds": {
+        "optimized": 1.0900000000000025,
+        "baseline": 1.1999999999999984
+      }
+    },
+    {
+      "order": [
+        "baseline",
+        "optimized"
+      ],
+      "baseline": 1.1832344389995342,
+      "optimized": 1.0997700839998288,
+      "cpu_seconds": {
+        "baseline": 1.189999999999995,
+        "optimized": 1.0900000000000007
+      }
+    },
+    {
+      "order": [
+        "optimized",
+        "baseline"
+      ],
+      "optimized": 1.1304208199999266,
+      "baseline": 1.2139283379992776,
+      "cpu_seconds": {
+        "optimized": 1.1199999999999966,
+        "baseline": 1.220000000000005
+      }
+    },
+    {
+      "order": [
+        "baseline",
+        "optimized"
+      ],
+      "baseline": 1.1911632060000557,
+      "optimized": 1.0849289710004086,
+      "cpu_seconds": {
+        "baseline": 1.1899999999999933,
+        "optimized": 1.0699999999999985
+      }
+    },
+    {
+      "order": [
+        "optimized",
+        "baseline"
+      ],
+      "optimized": 1.0674109740002677,
+      "baseline": 1.2757358119997662,
+      "cpu_seconds": {
+        "optimized": 1.070000000000002,
+        "baseline": 1.2800000000000047
+      }
+    },
+    {
+      "order": [
+        "baseline",
+        "optimized"
+      ],
+      "baseline": 1.2363333880002756,
+      "optimized": 1.062976561999676,
+      "cpu_seconds": {
+        "baseline": 1.2099999999999955,
+        "optimized": 1.0599999999999987
+      }
+    },
+    {
+      "order": [
+        "optimized",
+        "baseline"
+      ],
+      "optimized": 1.0984280909997324,
+      "baseline": 1.2594427949998135,
+      "cpu_seconds": {
+        "optimized": 1.099999999999989,
+        "baseline": 1.2599999999999998
+      }
+    },
+    {
+      "order": [
+        "baseline",
+        "optimized"
+      ],
+      "baseline": 1.2353889290006919,
+      "optimized": 1.0565408869997555,
+      "cpu_seconds": {
+        "baseline": 1.230000000000004,
+        "optimized": 1.0500000000000007
+      }
+    },
+    {
+      "order": [
+        "optimized",
+        "baseline"
+      ],
+      "optimized": 1.0964427220005746,
+      "baseline": 1.2267708030003632,
+      "cpu_seconds": {
+        "optimized": 1.090000000000007,
+        "baseline": 1.2300000000000075
+      }
+    },
+    {
+      "order": [
+        "baseline",
+        "optimized"
+      ],
+      "baseline": 1.1962532050001755,
+      "optimized": 1.1772024339998097,
+      "cpu_seconds": {
+        "baseline": 1.1899999999999995,
+        "optimized": 1.1799999999999997
+      }
+    },
+    {
+      "order": [
+        "optimized",
+        "baseline"
+      ],
+      "optimized": 1.1324765789995581,
+      "baseline": 1.18023366899979,
+      "cpu_seconds": {
+        "optimized": 1.0899999999999928,
+        "baseline": 1.1700000000000088
+      }
+    },
+    {
+      "order": [
+        "baseline",
+        "optimized"
+      ],
+      "baseline": 1.2105651390002095,
+      "optimized": 1.074169138999423,
+      "cpu_seconds": {
+        "baseline": 1.209999999999992,
+        "optimized": 1.070000000000002
+      }
+    },
+    {
+      "order": [
+        "optimized",
+        "baseline"
+      ],
+      "optimized": 1.0569635290003134,
+      "baseline": 1.2088084570004867,
+      "cpu_seconds": {
+        "optimized": 1.0599999999999934,
+        "baseline": 1.2000000000000135
+      }
+    },
+    {
+      "order": [
+        "baseline",
+        "optimized"
+      ],
+      "baseline": 1.1725315160001628,
+      "optimized": 1.0681387490003544,
+      "cpu_seconds": {
+        "baseline": 1.1700000000000053,
+        "optimized": 1.0699999999999985
+      }
+    },
+    {
+      "order": [
+        "optimized",
+        "baseline"
+      ],
+      "optimized": 1.062784744000055,
+      "baseline": 1.1896581360006167,
+      "cpu_seconds": {
+        "optimized": 1.0599999999999987,
+        "baseline": 1.1799999999999944
+      }
+    }
+  ],
+  "warmups": 10,
+  "revisions": {
+    "baseline": "6fc817a30558585a5879ddd869b2ccaef889a787",
+    "optimized": "6fc817a30558585a5879ddd869b2ccaef889a787"
+  },
+  "source_files": 505,
+  "source_bytes": 9443546,
+  "source_manifest_sha256": "64984755ff1d9ac9b9ede33bfb99e86610a3b90a92ab06809283fb8117af72d4",
+  "corpus_revision": "b832a09cf2a169c833dd2371e7c07aa00b293242",
+  "binary_sha256": {
+    "baseline": "6d2b4dee4068650f7a4123a6cf7a5a9b610de406a3702a4bee2ed6b81a6da96e",
+    "optimized": "7df19148ebdc246e6e2b13ad0083ede435f6980bcb99a3006772fbce09a68461"
+  },
+  "platform": "Linux-6.18.44-x86_64-with-glibc2.41",
+  "timing_units": "seconds",
+  "environment": {
+    "RAYON_NUM_THREADS": "4"
+  },
+  "affinity": [
+    0
+  ],
+  "cache_conditions": "Warm source/page cache; read all source files before each run; remove all __pycache__ directories before each run. No compiled-module reuse. Cleanup, warming and output verification are untimed. Writes and process exit are timed; no fsync.",
+  "pyc_manifest_sha256": "fbfe5d8dbb0816664ce8386a7984518edb78b6a0c0b7be6c7c4923f001543b32",
+  "pyc_files": 505,
+  "pyc_bytes": 13312503,
+  "summary": {
+    "baseline": {
+      "mean": 1.2074491425000815,
+      "median": 1.1985073354999258,
+      "stdev": 0.04895370335250737,
+      "min": 1.1146358579999287,
+      "max": 1.3824613870001485
+    },
+    "optimized": {
+      "mean": 1.073119675966609,
+      "median": 1.065844125500007,
+      "stdev": 0.03948785489551884,
+      "min": 0.9713239519996932,
+      "max": 1.1772024339998097
+    }
+  },
+  "improvement_percent": 11.125062067238446,
+  "paired_bootstrap_95_percent": [
+    9.639127057845831,
+    12.753212201982766
+  ]
+}

@@ -1,0 +1,1341 @@
+{
+  "sources": {
+    "files": 883,
+    "bytes": 5653893,
+    "sha256": "9604031795cd6871f715c10e641de29221b1fdb72bbd485ec13014158848de4a"
+  },
+  "results": [
+    {
+      "version": "3.12",
+      "optimize": "0",
+      "invalidation_mode": "timestamp",
+      "files": 883,
+      "commands": [
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc-control",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.12",
+          "--optimize",
+          "0",
+          "--invalidation-mode",
+          "timestamp",
+          "/workspace/serc/work/performance/django/django"
+        ],
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.12",
+          "--optimize",
+          "0",
+          "--invalidation-mode",
+          "timestamp",
+          "/workspace/serc/work/performance/django/django"
+        ]
+      ],
+      "pyc_manifest_sha256": "631bf169b78cc3d2f113d77926338ca60010388ef57b7da454b0e293379f3027"
+    },
+    {
+      "version": "3.12",
+      "optimize": "0",
+      "invalidation_mode": "checked-hash",
+      "files": 883,
+      "commands": [
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc-control",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.12",
+          "--optimize",
+          "0",
+          "--invalidation-mode",
+          "checked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ],
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.12",
+          "--optimize",
+          "0",
+          "--invalidation-mode",
+          "checked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ]
+      ],
+      "pyc_manifest_sha256": "59dd759e06e829359e1b851780e7a3b50f15da43a6e40e21cea057f365dcfc27"
+    },
+    {
+      "version": "3.12",
+      "optimize": "0",
+      "invalidation_mode": "unchecked-hash",
+      "files": 883,
+      "commands": [
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc-control",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.12",
+          "--optimize",
+          "0",
+          "--invalidation-mode",
+          "unchecked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ],
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.12",
+          "--optimize",
+          "0",
+          "--invalidation-mode",
+          "unchecked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ]
+      ],
+      "pyc_manifest_sha256": "610ac55752d5b87ad21b09663c2db5d6c9c86037c8c19748e7a1094c4e37352d"
+    },
+    {
+      "version": "3.12",
+      "optimize": "1",
+      "invalidation_mode": "timestamp",
+      "files": 883,
+      "commands": [
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc-control",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.12",
+          "--optimize",
+          "1",
+          "--invalidation-mode",
+          "timestamp",
+          "/workspace/serc/work/performance/django/django"
+        ],
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.12",
+          "--optimize",
+          "1",
+          "--invalidation-mode",
+          "timestamp",
+          "/workspace/serc/work/performance/django/django"
+        ]
+      ],
+      "pyc_manifest_sha256": "b9ca3627a3af44a3296ee9985d14c2678a3574eabfac92a59fd0803afc473025"
+    },
+    {
+      "version": "3.12",
+      "optimize": "1",
+      "invalidation_mode": "checked-hash",
+      "files": 883,
+      "commands": [
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc-control",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.12",
+          "--optimize",
+          "1",
+          "--invalidation-mode",
+          "checked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ],
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.12",
+          "--optimize",
+          "1",
+          "--invalidation-mode",
+          "checked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ]
+      ],
+      "pyc_manifest_sha256": "f848cceb8ec198658d8fcc1a5532add2fa1dce8427375439d1dba836f1d40cb2"
+    },
+    {
+      "version": "3.12",
+      "optimize": "1",
+      "invalidation_mode": "unchecked-hash",
+      "files": 883,
+      "commands": [
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc-control",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.12",
+          "--optimize",
+          "1",
+          "--invalidation-mode",
+          "unchecked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ],
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.12",
+          "--optimize",
+          "1",
+          "--invalidation-mode",
+          "unchecked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ]
+      ],
+      "pyc_manifest_sha256": "92dc918b5aab30095643d1b7b00a85fcc485816ad87a5f4e5e988c9ca130c353"
+    },
+    {
+      "version": "3.12",
+      "optimize": "2",
+      "invalidation_mode": "timestamp",
+      "files": 883,
+      "commands": [
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc-control",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.12",
+          "--optimize",
+          "2",
+          "--invalidation-mode",
+          "timestamp",
+          "/workspace/serc/work/performance/django/django"
+        ],
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.12",
+          "--optimize",
+          "2",
+          "--invalidation-mode",
+          "timestamp",
+          "/workspace/serc/work/performance/django/django"
+        ]
+      ],
+      "pyc_manifest_sha256": "f038d60ac691b79484f4d96394c03c6ff4d323c37d653d6cd8214914f478a581"
+    },
+    {
+      "version": "3.12",
+      "optimize": "2",
+      "invalidation_mode": "checked-hash",
+      "files": 883,
+      "commands": [
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc-control",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.12",
+          "--optimize",
+          "2",
+          "--invalidation-mode",
+          "checked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ],
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.12",
+          "--optimize",
+          "2",
+          "--invalidation-mode",
+          "checked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ]
+      ],
+      "pyc_manifest_sha256": "947019f4725a6d594fc7b4188862861180f303fceb3b066a5142d33e1942f9bc"
+    },
+    {
+      "version": "3.12",
+      "optimize": "2",
+      "invalidation_mode": "unchecked-hash",
+      "files": 883,
+      "commands": [
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc-control",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.12",
+          "--optimize",
+          "2",
+          "--invalidation-mode",
+          "unchecked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ],
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.12",
+          "--optimize",
+          "2",
+          "--invalidation-mode",
+          "unchecked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ]
+      ],
+      "pyc_manifest_sha256": "3283f360d96fc68f43c45165f0e9bdcd666cb2e1ce1716093677c49adb85024d"
+    },
+    {
+      "version": "3.13",
+      "optimize": "0",
+      "invalidation_mode": "timestamp",
+      "files": 883,
+      "commands": [
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc-control",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.13",
+          "--optimize",
+          "0",
+          "--invalidation-mode",
+          "timestamp",
+          "/workspace/serc/work/performance/django/django"
+        ],
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.13",
+          "--optimize",
+          "0",
+          "--invalidation-mode",
+          "timestamp",
+          "/workspace/serc/work/performance/django/django"
+        ]
+      ],
+      "pyc_manifest_sha256": "9a7d11712006436613bebe4eaaad1bb4163bfaa27f4c845dbd20d4760d8b4a19"
+    },
+    {
+      "version": "3.13",
+      "optimize": "0",
+      "invalidation_mode": "checked-hash",
+      "files": 883,
+      "commands": [
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc-control",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.13",
+          "--optimize",
+          "0",
+          "--invalidation-mode",
+          "checked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ],
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.13",
+          "--optimize",
+          "0",
+          "--invalidation-mode",
+          "checked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ]
+      ],
+      "pyc_manifest_sha256": "e04f93fc50b66c7546c39d6c3179a1210ea378e02fc8091d1438df8f90c2cd0c"
+    },
+    {
+      "version": "3.13",
+      "optimize": "0",
+      "invalidation_mode": "unchecked-hash",
+      "files": 883,
+      "commands": [
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc-control",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.13",
+          "--optimize",
+          "0",
+          "--invalidation-mode",
+          "unchecked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ],
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.13",
+          "--optimize",
+          "0",
+          "--invalidation-mode",
+          "unchecked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ]
+      ],
+      "pyc_manifest_sha256": "94f6b22876aa049c7d51dd5af00e18063be784ef43bb7810a7cef1212e865b81"
+    },
+    {
+      "version": "3.13",
+      "optimize": "1",
+      "invalidation_mode": "timestamp",
+      "files": 883,
+      "commands": [
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc-control",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.13",
+          "--optimize",
+          "1",
+          "--invalidation-mode",
+          "timestamp",
+          "/workspace/serc/work/performance/django/django"
+        ],
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.13",
+          "--optimize",
+          "1",
+          "--invalidation-mode",
+          "timestamp",
+          "/workspace/serc/work/performance/django/django"
+        ]
+      ],
+      "pyc_manifest_sha256": "9dda5d6ca4b4955fb1a2c1ab1b6b27258d828bce69e42ba92d106572147560e4"
+    },
+    {
+      "version": "3.13",
+      "optimize": "1",
+      "invalidation_mode": "checked-hash",
+      "files": 883,
+      "commands": [
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc-control",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.13",
+          "--optimize",
+          "1",
+          "--invalidation-mode",
+          "checked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ],
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.13",
+          "--optimize",
+          "1",
+          "--invalidation-mode",
+          "checked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ]
+      ],
+      "pyc_manifest_sha256": "90f5f7999f53cfb2715126dfa3a6fcedeb424dd98edb8440f99401c6444e67fd"
+    },
+    {
+      "version": "3.13",
+      "optimize": "1",
+      "invalidation_mode": "unchecked-hash",
+      "files": 883,
+      "commands": [
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc-control",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.13",
+          "--optimize",
+          "1",
+          "--invalidation-mode",
+          "unchecked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ],
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.13",
+          "--optimize",
+          "1",
+          "--invalidation-mode",
+          "unchecked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ]
+      ],
+      "pyc_manifest_sha256": "4a01489f3ff07cfa7e90b0bd0dff88418f275c86d660db588c15b287236d5cfe"
+    },
+    {
+      "version": "3.13",
+      "optimize": "2",
+      "invalidation_mode": "timestamp",
+      "files": 883,
+      "commands": [
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc-control",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.13",
+          "--optimize",
+          "2",
+          "--invalidation-mode",
+          "timestamp",
+          "/workspace/serc/work/performance/django/django"
+        ],
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.13",
+          "--optimize",
+          "2",
+          "--invalidation-mode",
+          "timestamp",
+          "/workspace/serc/work/performance/django/django"
+        ]
+      ],
+      "pyc_manifest_sha256": "f579544f092c125354c1def4282c895ebb5f2ca982cf8ca5bbb682d4791fbf88"
+    },
+    {
+      "version": "3.13",
+      "optimize": "2",
+      "invalidation_mode": "checked-hash",
+      "files": 883,
+      "commands": [
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc-control",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.13",
+          "--optimize",
+          "2",
+          "--invalidation-mode",
+          "checked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ],
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.13",
+          "--optimize",
+          "2",
+          "--invalidation-mode",
+          "checked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ]
+      ],
+      "pyc_manifest_sha256": "615b9d8f1308832f2e24049c5d63510525da0fdfa5595be50040efc822e39ca5"
+    },
+    {
+      "version": "3.13",
+      "optimize": "2",
+      "invalidation_mode": "unchecked-hash",
+      "files": 883,
+      "commands": [
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc-control",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.13",
+          "--optimize",
+          "2",
+          "--invalidation-mode",
+          "unchecked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ],
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.13",
+          "--optimize",
+          "2",
+          "--invalidation-mode",
+          "unchecked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ]
+      ],
+      "pyc_manifest_sha256": "aef30cb8cf5e786bb12e5d43d1e064b1aa5cf090c5fa81e845ccef06db917aa6"
+    },
+    {
+      "version": "3.14",
+      "optimize": "0",
+      "invalidation_mode": "timestamp",
+      "files": 883,
+      "commands": [
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc-control",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.14",
+          "--optimize",
+          "0",
+          "--invalidation-mode",
+          "timestamp",
+          "/workspace/serc/work/performance/django/django"
+        ],
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.14",
+          "--optimize",
+          "0",
+          "--invalidation-mode",
+          "timestamp",
+          "/workspace/serc/work/performance/django/django"
+        ]
+      ],
+      "pyc_manifest_sha256": "6e5b54a3dfb8970f9fcca9a60fd0140725d7a293ce5ab39abe78d9cbbafbb0fa"
+    },
+    {
+      "version": "3.14",
+      "optimize": "0",
+      "invalidation_mode": "checked-hash",
+      "files": 883,
+      "commands": [
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc-control",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.14",
+          "--optimize",
+          "0",
+          "--invalidation-mode",
+          "checked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ],
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.14",
+          "--optimize",
+          "0",
+          "--invalidation-mode",
+          "checked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ]
+      ],
+      "pyc_manifest_sha256": "531baf349a0515174931d2db6aeeb00823c47a2de6f0e13216a1ea5713f35bf4"
+    },
+    {
+      "version": "3.14",
+      "optimize": "0",
+      "invalidation_mode": "unchecked-hash",
+      "files": 883,
+      "commands": [
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc-control",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.14",
+          "--optimize",
+          "0",
+          "--invalidation-mode",
+          "unchecked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ],
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.14",
+          "--optimize",
+          "0",
+          "--invalidation-mode",
+          "unchecked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ]
+      ],
+      "pyc_manifest_sha256": "1f12ff504dc13efedac7ff9a0c2f0b43ee548551ca016c503987567fcde9c714"
+    },
+    {
+      "version": "3.14",
+      "optimize": "1",
+      "invalidation_mode": "timestamp",
+      "files": 883,
+      "commands": [
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc-control",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.14",
+          "--optimize",
+          "1",
+          "--invalidation-mode",
+          "timestamp",
+          "/workspace/serc/work/performance/django/django"
+        ],
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.14",
+          "--optimize",
+          "1",
+          "--invalidation-mode",
+          "timestamp",
+          "/workspace/serc/work/performance/django/django"
+        ]
+      ],
+      "pyc_manifest_sha256": "6fccd703331cb8a742dd64227c2a7476cfc99a4dffc2c35a0f7c933397063fe3"
+    },
+    {
+      "version": "3.14",
+      "optimize": "1",
+      "invalidation_mode": "checked-hash",
+      "files": 883,
+      "commands": [
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc-control",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.14",
+          "--optimize",
+          "1",
+          "--invalidation-mode",
+          "checked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ],
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.14",
+          "--optimize",
+          "1",
+          "--invalidation-mode",
+          "checked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ]
+      ],
+      "pyc_manifest_sha256": "705f29d4d26d4e1b3f7e5698626e7e01785f6bc30cba0906ecb751d260e52e22"
+    },
+    {
+      "version": "3.14",
+      "optimize": "1",
+      "invalidation_mode": "unchecked-hash",
+      "files": 883,
+      "commands": [
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc-control",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.14",
+          "--optimize",
+          "1",
+          "--invalidation-mode",
+          "unchecked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ],
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.14",
+          "--optimize",
+          "1",
+          "--invalidation-mode",
+          "unchecked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ]
+      ],
+      "pyc_manifest_sha256": "1db56f7a89c11a08505283adbf678dd7d35b1984fb12c830b47e1f05a38f5277"
+    },
+    {
+      "version": "3.14",
+      "optimize": "2",
+      "invalidation_mode": "timestamp",
+      "files": 883,
+      "commands": [
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc-control",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.14",
+          "--optimize",
+          "2",
+          "--invalidation-mode",
+          "timestamp",
+          "/workspace/serc/work/performance/django/django"
+        ],
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.14",
+          "--optimize",
+          "2",
+          "--invalidation-mode",
+          "timestamp",
+          "/workspace/serc/work/performance/django/django"
+        ]
+      ],
+      "pyc_manifest_sha256": "0a4418ad32d6a0afa02e05d843ece714616dce604a2e36c4d499dfdb157c3cb7"
+    },
+    {
+      "version": "3.14",
+      "optimize": "2",
+      "invalidation_mode": "checked-hash",
+      "files": 883,
+      "commands": [
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc-control",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.14",
+          "--optimize",
+          "2",
+          "--invalidation-mode",
+          "checked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ],
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.14",
+          "--optimize",
+          "2",
+          "--invalidation-mode",
+          "checked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ]
+      ],
+      "pyc_manifest_sha256": "fc9d6cf411b608773d88079c3a70a19dd1c0be7213f2c4f48eb0ca8de55c855d"
+    },
+    {
+      "version": "3.14",
+      "optimize": "2",
+      "invalidation_mode": "unchecked-hash",
+      "files": 883,
+      "commands": [
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc-control",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.14",
+          "--optimize",
+          "2",
+          "--invalidation-mode",
+          "unchecked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ],
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.14",
+          "--optimize",
+          "2",
+          "--invalidation-mode",
+          "unchecked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ]
+      ],
+      "pyc_manifest_sha256": "b6e136eb9bdcce8182150e6b74fdbc255ad90945816e3e239fd3af880d0128d5"
+    },
+    {
+      "version": "3.15",
+      "optimize": "0",
+      "invalidation_mode": "timestamp",
+      "files": 883,
+      "commands": [
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc-control",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.15",
+          "--optimize",
+          "0",
+          "--invalidation-mode",
+          "timestamp",
+          "/workspace/serc/work/performance/django/django"
+        ],
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.15",
+          "--optimize",
+          "0",
+          "--invalidation-mode",
+          "timestamp",
+          "/workspace/serc/work/performance/django/django"
+        ]
+      ],
+      "pyc_manifest_sha256": "a17905e5e9d6bf7f4114efcf811d56b05a764d9dc9c37e110c169a8c64e84071"
+    },
+    {
+      "version": "3.15",
+      "optimize": "0",
+      "invalidation_mode": "checked-hash",
+      "files": 883,
+      "commands": [
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc-control",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.15",
+          "--optimize",
+          "0",
+          "--invalidation-mode",
+          "checked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ],
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.15",
+          "--optimize",
+          "0",
+          "--invalidation-mode",
+          "checked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ]
+      ],
+      "pyc_manifest_sha256": "3b1923874c96fa86670b77d266f34f73ed23ca8bcc51f34e7f3e3ff060f9d371"
+    },
+    {
+      "version": "3.15",
+      "optimize": "0",
+      "invalidation_mode": "unchecked-hash",
+      "files": 883,
+      "commands": [
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc-control",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.15",
+          "--optimize",
+          "0",
+          "--invalidation-mode",
+          "unchecked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ],
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.15",
+          "--optimize",
+          "0",
+          "--invalidation-mode",
+          "unchecked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ]
+      ],
+      "pyc_manifest_sha256": "ed4a3314dc0ef0d8d43b95a13ba9f02fbe3e70539f1ca884a2f47083e7fc5e5b"
+    },
+    {
+      "version": "3.15",
+      "optimize": "1",
+      "invalidation_mode": "timestamp",
+      "files": 883,
+      "commands": [
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc-control",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.15",
+          "--optimize",
+          "1",
+          "--invalidation-mode",
+          "timestamp",
+          "/workspace/serc/work/performance/django/django"
+        ],
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.15",
+          "--optimize",
+          "1",
+          "--invalidation-mode",
+          "timestamp",
+          "/workspace/serc/work/performance/django/django"
+        ]
+      ],
+      "pyc_manifest_sha256": "f0c9f5bae47f8939ca279b1251148007fd832e9c7ee909324b3c314a5d881c4b"
+    },
+    {
+      "version": "3.15",
+      "optimize": "1",
+      "invalidation_mode": "checked-hash",
+      "files": 883,
+      "commands": [
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc-control",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.15",
+          "--optimize",
+          "1",
+          "--invalidation-mode",
+          "checked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ],
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.15",
+          "--optimize",
+          "1",
+          "--invalidation-mode",
+          "checked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ]
+      ],
+      "pyc_manifest_sha256": "a91e98ab33481cdb107aff7ed03b0ed974f739a37cba6781224286514bcc0794"
+    },
+    {
+      "version": "3.15",
+      "optimize": "1",
+      "invalidation_mode": "unchecked-hash",
+      "files": 883,
+      "commands": [
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc-control",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.15",
+          "--optimize",
+          "1",
+          "--invalidation-mode",
+          "unchecked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ],
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.15",
+          "--optimize",
+          "1",
+          "--invalidation-mode",
+          "unchecked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ]
+      ],
+      "pyc_manifest_sha256": "46538bd7feca947ca311887b13ccf380d9aa05a41d974547908508b2f5156c71"
+    },
+    {
+      "version": "3.15",
+      "optimize": "2",
+      "invalidation_mode": "timestamp",
+      "files": 883,
+      "commands": [
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc-control",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.15",
+          "--optimize",
+          "2",
+          "--invalidation-mode",
+          "timestamp",
+          "/workspace/serc/work/performance/django/django"
+        ],
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.15",
+          "--optimize",
+          "2",
+          "--invalidation-mode",
+          "timestamp",
+          "/workspace/serc/work/performance/django/django"
+        ]
+      ],
+      "pyc_manifest_sha256": "282d8136d00b0cc24cf987b3503296f3d4f1bfbd66daa62e5fad053d143e0c74"
+    },
+    {
+      "version": "3.15",
+      "optimize": "2",
+      "invalidation_mode": "checked-hash",
+      "files": 883,
+      "commands": [
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc-control",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.15",
+          "--optimize",
+          "2",
+          "--invalidation-mode",
+          "checked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ],
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.15",
+          "--optimize",
+          "2",
+          "--invalidation-mode",
+          "checked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ]
+      ],
+      "pyc_manifest_sha256": "76a725e66e4baa26ad85eb75c2791f7e28400ebfddd2fa67ae755d5bcb35ba27"
+    },
+    {
+      "version": "3.15",
+      "optimize": "2",
+      "invalidation_mode": "unchecked-hash",
+      "files": 883,
+      "commands": [
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc-control",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.15",
+          "--optimize",
+          "2",
+          "--invalidation-mode",
+          "unchecked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ],
+        [
+          "/workspace/serc/work/performance/pgo/run-j61l5u07/serc",
+          "compile",
+          "--quiet",
+          "--jobs",
+          "1",
+          "--python-version",
+          "3.15",
+          "--optimize",
+          "2",
+          "--invalidation-mode",
+          "unchecked-hash",
+          "/workspace/serc/work/performance/django/django"
+        ]
+      ],
+      "pyc_manifest_sha256": "50690bf4678364c8ae86dd8a273027050646e84210fd10011678604f729c68ec"
+    }
+  ]
+}

@@ -38,6 +38,36 @@ source and output hashes, source count and size, revisions and working-tree
 state, toolchain and binary identities, build profile, worker counts, and
 machine details. See [published results](../../BENCHMARKS.md).
 
+## Comparing two Serc builds
+
+Build both revisions with the same locked dependencies, Rust toolchain, and release
+profile, and retain each executable separately. For example, compare complete
+Django package compilations with:
+
+```console
+python3 scripts/benchmarks/compare-builds.py \
+  /path/to/serc-baseline /path/to/serc-optimized /path/to/django/django \
+  target/benchmarks/results/django-comparison.json \
+  --samples 30 --warmups 3 --jobs 1 --cpu 0 \
+  --baseline-revision BASELINE_SHA --optimized-revision OPTIMIZED_REVISION
+```
+
+The harness alternates baseline/optimized and optimized/baseline pairs. Every
+observation launches a fresh process that discovers and reads the sources,
+compiles each file, serializes it once, writes its timestamp `.pyc`, and exits.
+Before each observation, it deletes the corpus's `__pycache__` directories and
+reads every source to keep the input page cache warm. Cleanup, warming, and
+verification are outside the timer; ordinary writes are inside it, without an
+additional `fsync`. Run without concurrent builds, tests, or other benchmarks.
+
+Every pass must succeed, write one cache file per source, and match the complete
+output path/content SHA-256 manifest. Source contents and mtimes must remain
+unchanged. The JSON records commands, executable hashes, corpus revision and
+hash, CPU affinity, raw paired times, means, medians, standard deviations, ranges,
+and a deterministic paired-bootstrap 95% interval for the reduction in mean wall
+time. `--cpu` pins the runner and its children on supported systems; omit it for
+parallel runs or set an affinity mask using `taskset`.
+
 ## Profile-guided build
 
 After running
