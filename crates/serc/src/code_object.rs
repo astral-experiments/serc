@@ -291,6 +291,8 @@ pub(crate) struct MarshalProvenance {
     pub(crate) generated_mangled_strings: FxHashSet<String>,
     /// Strings whose first compiler-cache object was already interned.
     pub(crate) canonical_constant_strings: FxHashSet<String>,
+    /// The root's canonical set includes every explicit string from child compiler units.
+    pub(crate) canonical_constant_strings_complete: bool,
     /// The class-body constant loaded into `__qualname__`, when present.
     pub(crate) qualified_name_constant_index: Option<u32>,
     /// Qualified-name ownership recorded before discarded constants are pruned.
@@ -298,20 +300,33 @@ pub(crate) struct MarshalProvenance {
     /// Whether `%` first entered the compiler cache as a fresh `PyUnicode_Replace` result.
     pub(crate) uncached_percent_constant: bool,
     pub(crate) metadata_ids: MarshalMetadataIds,
+    /// The root's immutable compiler name index, shared by cloned modules.
+    pub(crate) metadata_name_lookup: Option<Arc<crate::compiler::MarshalNameLookup>>,
     /// Value properties computed for the emitted metadata; absent for hand-built code objects.
     pub(crate) metadata_tuple_properties: Option<MarshalMetadataTupleProperties>,
     /// Hash of a constants tuple whose key survives cloning; code identities are excluded.
     pub(crate) constants_tuple_hash: Option<u64>,
+    /// Allocation-keyed hashes are discarded when cloning the code tree.
+    pub(crate) constant_hashes: crate::marshal::ConstantHashes,
     /// Value hashes of the immutable line and exception tables, in wire order.
     pub(crate) table_hashes: Option<[u64; 2]>,
     /// Unpruned traversal size for reserving marshal occurrences and object flags.
     pub(crate) marshal_occurrence_bound: Option<usize>,
+    /// Whole-tree capacity and a proof that no child needs supplemental string-origin analysis.
+    pub(crate) marshal_graph_summary: Option<MarshalGraphSummary>,
     /// Whether this code tree can contain a frozenset constant.
     pub(crate) subtree_has_frozenset_constants: bool,
     /// Whether no surviving constant tuple can share a non-identifier string with code metadata.
     pub(crate) metadata_alias_scan_unnecessary: bool,
     /// Whether the constant cache first admitted a fresh empty bytes object.
     pub(crate) fresh_empty_bytes_constant: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MarshalGraphSummary {
+    pub(crate) objects: usize,
+    pub(crate) constants: usize,
+    pub(crate) no_supplemental_interns: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -720,7 +735,10 @@ mod tests {
                 name: Some(MetadataId::from_u32(0)),
                 qualified_name: Some(MetadataId::from_u32(1)),
             },
-            metadata_tuple_properties: Some(crate::marshal::metadata_tuple_properties(&[], &[])),
+            metadata_tuple_properties: Some(crate::marshal::metadata_tuple_properties(
+                &Vec::new(),
+                &Vec::new(),
+            )),
             subtree_has_frozenset_constants: true,
             metadata_alias_scan_unnecessary: true,
             ..MarshalProvenance::default()

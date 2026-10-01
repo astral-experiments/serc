@@ -32,7 +32,33 @@ pub(super) trait MarshalVisitor<'a> {
 
     fn code(&mut self, code: &'a CodeObject, reference_mode: ReferenceMode) -> bool;
     fn code_bytes(&mut self, code: &'a CodeObject);
-    fn constants(&mut self, values: &'a [Constant], reference_mode: ReferenceMode) -> bool;
+    /// Visits metadata tuple members in order.
+    ///
+    /// Compiler-owned IDs follow the same order and length as the metadata tuple.
+    #[inline]
+    fn metadata_names(
+        &mut self,
+        values: &'a [Name],
+        metadata_ids: Option<&[MetadataId]>,
+        _automatically_interned: bool,
+    ) {
+        if let Some(metadata_ids) = metadata_ids {
+            assert_eq!(metadata_ids.len(), values.len(), "metadata ID tuple length");
+            for (value, metadata_id) in values.iter().zip(metadata_ids) {
+                self.metadata_name(value, Some(*metadata_id));
+            }
+        } else {
+            for value in values {
+                self.metadata_name(value, None);
+            }
+        }
+    }
+
+    #[expect(
+        clippy::ptr_arg,
+        reason = "marshal keys borrow immutable vector headers"
+    )]
+    fn constants(&mut self, values: &'a Vec<Constant>, reference_mode: ReferenceMode) -> bool;
     /// Visits the constants tuple with access to its cached hash before descending into members.
     fn code_constants(&mut self, code: &'a CodeObject) -> bool {
         self.constants(&code.constants, ReferenceMode::IfShared)
@@ -41,6 +67,10 @@ pub(super) trait MarshalVisitor<'a> {
     fn locals(&mut self, code: &'a CodeObject) -> bool;
     fn local_kinds(&mut self, code: &'a CodeObject);
     fn metadata_string(&mut self, value: &'a str, metadata_id: Option<MetadataId>);
+    /// Keeps inline metadata names encoded until a visitor needs their spelling.
+    fn metadata_name(&mut self, value: &'a Name, metadata_id: Option<MetadataId>) {
+        self.metadata_string(value, metadata_id);
+    }
     fn code_filename(&mut self, code: &'a CodeObject, metadata_id: Option<MetadataId>);
     fn code_name(&mut self, code: &'a CodeObject, metadata_id: Option<MetadataId>) {
         self.metadata_string(&code.name, metadata_id);
@@ -55,6 +85,53 @@ pub(super) trait MarshalVisitor<'a> {
         self.bytes(value);
     }
     fn constant(&mut self, value: &'a Constant, reference_mode: ReferenceMode) -> bool;
+
+    // Typed scalar callbacks let the graph and writer use the traversal's existing dispatch.
+    // Default visitors retain the complete constant callback and reference-mode contract.
+    fn none_constant(&mut self, value: &'a Constant, mode: ReferenceMode) {
+        self.constant(value, mode);
+    }
+    fn bool_constant(&mut self, value: &'a Constant, _boolean: bool, mode: ReferenceMode) {
+        self.constant(value, mode);
+    }
+    fn ellipsis_constant(&mut self, value: &'a Constant, mode: ReferenceMode) {
+        self.constant(value, mode);
+    }
+    fn integer_constant(
+        &mut self,
+        value: &'a Constant,
+        _integer: u64,
+        mode: ReferenceMode,
+    ) -> bool {
+        self.constant(value, mode)
+    }
+    fn string_constant(
+        &mut self,
+        value: &'a Constant,
+        _string: &'a String,
+        mode: ReferenceMode,
+    ) -> bool {
+        self.constant(value, mode)
+    }
+    fn signed_integer_constant(
+        &mut self,
+        value: &'a Constant,
+        _integer: i64,
+        mode: ReferenceMode,
+    ) -> bool {
+        self.constant(value, mode)
+    }
+    fn float_constant(&mut self, value: &'a Constant, _float: f64, mode: ReferenceMode) -> bool {
+        self.constant(value, mode)
+    }
+    fn bytes_constant(
+        &mut self,
+        value: &'a Constant,
+        _bytes: &'a [u8],
+        mode: ReferenceMode,
+    ) -> bool {
+        self.constant(value, mode)
+    }
     fn slice_member(&mut self, value: &'a Constant);
     fn cached_slice_string(&mut self, value: &'a Constant) {
         self.constant(value, ReferenceMode::IfShared);
@@ -96,17 +173,21 @@ pub(super) fn traverse_code_with_mode<'a, V>(
     }
     let metadata_ids = V::USES_METADATA_IDS.then_some(&code.marshal_provenance.metadata_ids);
     if visitor.names(code) {
-        traverse_metadata_strings(
+        visitor.metadata_names(
             &code.names,
             metadata_ids.map(|ids| ids.names.as_slice()),
-            visitor,
+            code.marshal_provenance
+                .metadata_tuple_properties
+                .is_some_and(|properties| properties.names.automatically_interned),
         );
     }
     if visitor.locals(code) {
-        traverse_metadata_strings(
+        visitor.metadata_names(
             &code.locals,
             metadata_ids.map(|ids| ids.locals.as_slice()),
-            visitor,
+            code.marshal_provenance
+                .metadata_tuple_properties
+                .is_some_and(|properties| properties.locals.automatically_interned),
         );
     }
     visitor.local_kinds(code);
@@ -120,8 +201,11 @@ pub(super) fn traverse_code_with_mode<'a, V>(
 }
 
 #[inline]
-fn traverse_constants<'a, V>(values: &'a [Constant], reference_mode: ReferenceMode, visitor: &mut V)
-where
+fn traverse_constants<'a, V>(
+    values: &'a Vec<Constant>,
+    reference_mode: ReferenceMode,
+    visitor: &mut V,
+) where
     V: MarshalVisitor<'a>,
 {
     if visitor.constants(values, reference_mode) {
@@ -131,35 +215,35 @@ where
     }
 }
 
-/// Visits metadata tuple members in order.
-///
-/// Compiler-owned IDs follow the same order and length as the metadata tuple.
-#[inline]
-fn traverse_metadata_strings<'a, V>(
-    values: &'a [Name],
-    metadata_ids: Option<&[MetadataId]>,
-    visitor: &mut V,
-) where
-    V: MarshalVisitor<'a>,
-{
-    if let Some(metadata_ids) = metadata_ids {
-        assert_eq!(metadata_ids.len(), values.len(), "metadata ID tuple length");
-        for (value, metadata_id) in values.iter().zip(metadata_ids) {
-            visitor.metadata_string(value, Some(*metadata_id));
-        }
-    } else {
-        for value in values {
-            visitor.metadata_string(value, None);
-        }
-    }
-}
-
-#[inline]
+#[expect(
+    clippy::inline_always,
+    reason = "merge container and scalar dispatch at the code object's constant loop"
+)]
+#[inline(always)]
 fn traverse_constant<'a, V>(value: &'a Constant, reference_mode: ReferenceMode, visitor: &mut V)
 where
     V: MarshalVisitor<'a>,
 {
     match value {
+        Constant::None => visitor.none_constant(value, reference_mode),
+        Constant::Bool(boolean) => visitor.bool_constant(value, *boolean, reference_mode),
+        Constant::Ellipsis => visitor.ellipsis_constant(value, reference_mode),
+        Constant::Int(integer) => {
+            visitor.integer_constant(value, *integer, reference_mode);
+        }
+        Constant::String(string) => {
+            visitor.string_constant(value, string, reference_mode);
+        }
+
+        Constant::SignedInt(integer) => {
+            visitor.signed_integer_constant(value, *integer, reference_mode);
+        }
+        Constant::Float(float) => {
+            visitor.float_constant(value, *float, reference_mode);
+        }
+        Constant::Bytes(bytes) => {
+            visitor.bytes_constant(value, bytes, reference_mode);
+        }
         Constant::Tuple(values) => traverse_constants(values, reference_mode, visitor),
         Constant::Code(code) => {
             traverse_code_with_mode(code, ReferenceMode::IfShared, visitor);

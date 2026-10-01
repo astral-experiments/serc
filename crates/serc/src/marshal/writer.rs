@@ -1,4 +1,4 @@
-use crate::code_object::{CodeFilename, CodeObject, Constant, MetadataId};
+use crate::code_object::{CodeFilename, CodeObject, Constant, MetadataId, MetadataName};
 use crate::{InitialInternState, PythonVersion};
 
 use super::graph::{ObjectGraph, ObjectReference, Occurrence, OccurrenceCursor, OccurrenceKind};
@@ -133,7 +133,7 @@ struct Writer<'output, 'graph, 'code> {
     graph: &'graph mut ObjectGraph<'code>,
     output: &'output mut Vec<u8>,
     reference_count: usize,
-    occurrences: OccurrenceCursor<Vec<Occurrence>>,
+    occurrences: OccurrenceCursor<std::vec::IntoIter<Occurrence>>,
     frozen_set_order_index: usize,
 }
 
@@ -245,14 +245,51 @@ impl Writer<'_, '_, '_> {
         }
     }
 
+    #[expect(
+        clippy::inline_always,
+        reason = "keep metadata reference resolution in the traversal loop"
+    )]
+    #[inline(always)]
     fn interned_string_with_object(&mut self, object: ObjectId, value: &str) {
+        self.interned_string_with_value(object, || value);
+    }
+
+    #[inline]
+    fn interned_string_with_value<'a>(
+        &mut self,
+        object: ObjectId,
+        value: impl FnOnce() -> &'a str,
+    ) {
+        self.interned_string_with_hint(object, value, false);
+    }
+
+    #[expect(
+        clippy::inline_always,
+        reason = "decode metadata names only when emitting their payload"
+    )]
+    #[inline(always)]
+    fn interned_string_with_hint<'a>(
+        &mut self,
+        object: ObjectId,
+        value: impl FnOnce() -> &'a str,
+        automatically_interned: bool,
+    ) {
         let object = self.graph.object_for_writing(object);
         debug_assert!(object.is_interned(), "marshal metadata must be interned");
         let reference =
             object.reference_for_write(ReferenceMode::Forced, &mut self.reference_count);
         match reference {
             ObjectReference::Existing(index) => self.byte_and_long(TYPE_REF, index.as_u32()),
-            ObjectReference::New => self.string_payload::<true>(value, FLAG_REF),
+            ObjectReference::New => {
+                let value = value();
+                // The hint includes ASCII identifiers and CPython's cached Latin-1 characters.
+                let ascii = if automatically_interned {
+                    value.len() != 2 || value.as_bytes()[0].is_ascii()
+                } else {
+                    value.is_ascii()
+                };
+                self.string_payload_with_ascii::<true>(value, FLAG_REF, ascii);
+            }
             ObjectReference::Unshared => {
                 unreachable!("forced marshal reference cannot be unshared")
             }
@@ -261,8 +298,18 @@ impl Writer<'_, '_, '_> {
 
     #[inline]
     fn string_payload<const INTERNED: bool>(&mut self, value: &str, flag: u8) {
-        let bytes = value.as_bytes();
         let ascii = value.is_ascii();
+        self.string_payload_with_ascii::<INTERNED>(value, flag, ascii);
+    }
+
+    #[inline]
+    fn string_payload_with_ascii<const INTERNED: bool>(
+        &mut self,
+        value: &str,
+        flag: u8,
+        ascii: bool,
+    ) {
+        let bytes = value.as_bytes();
         if ascii && bytes.len() < 256 {
             self.output.extend_from_slice(&[
                 if INTERNED {
@@ -563,7 +610,7 @@ impl<'code> MarshalVisitor<'code> for Writer<'_, '_, 'code> {
     }
 
     #[inline]
-    fn constants(&mut self, values: &'code [Constant], reference_mode: ReferenceMode) -> bool {
+    fn constants(&mut self, values: &'code Vec<Constant>, reference_mode: ReferenceMode) -> bool {
         let object = self.next_object(OccurrenceKind::Constants);
         self.tuple_header(object, values.len(), reference_mode)
     }
@@ -590,6 +637,32 @@ impl<'code> MarshalVisitor<'code> for Writer<'_, '_, 'code> {
     fn metadata_string(&mut self, value: &'code str, _metadata_id: Option<MetadataId>) {
         let object = self.next_object(OccurrenceKind::MetadataString);
         self.interned_string_with_object(object, value);
+    }
+
+    #[inline]
+    fn metadata_name(&mut self, value: &'code MetadataName, _metadata_id: Option<MetadataId>) {
+        let object = self.next_object(OccurrenceKind::MetadataString);
+        self.interned_string_with_value(object, || value.as_str());
+    }
+
+    #[inline]
+    fn metadata_names(
+        &mut self,
+        values: &'code [crate::code_object::MetadataName],
+        metadata_ids: Option<&[MetadataId]>,
+        automatically_interned: bool,
+    ) {
+        debug_assert!(
+            metadata_ids.is_none(),
+            "writer does not consume metadata IDs"
+        );
+        debug_assert!(
+            !automatically_interned || values.iter().all(|value| super::key::should_intern(value))
+        );
+        for value in values {
+            let object = self.next_object(OccurrenceKind::MetadataString);
+            self.interned_string_with_hint(object, || value.as_str(), automatically_interned);
+        }
     }
 
     fn code_filename(&mut self, code: &'code CodeObject, _metadata_id: Option<MetadataId>) {
@@ -634,6 +707,79 @@ impl<'code> MarshalVisitor<'code> for Writer<'_, '_, 'code> {
     fn bytes(&mut self, value: &'code [u8]) {
         let object = self.next_object(OccurrenceKind::Bytes);
         self.bytes_with_object(object, value, ReferenceMode::IfShared);
+    }
+
+    #[inline]
+    fn none_constant(&mut self, _value: &'code Constant, _mode: ReferenceMode) {
+        self.byte(TYPE_NONE);
+    }
+
+    #[inline]
+    fn bool_constant(&mut self, _value: &'code Constant, boolean: bool, _mode: ReferenceMode) {
+        self.byte(if boolean { TYPE_TRUE } else { TYPE_FALSE });
+    }
+
+    #[inline]
+    fn ellipsis_constant(&mut self, _value: &'code Constant, _mode: ReferenceMode) {
+        self.byte(TYPE_ELLIPSIS);
+    }
+
+    #[inline]
+    fn integer_constant(
+        &mut self,
+        _value: &'code Constant,
+        integer: u64,
+        mode: ReferenceMode,
+    ) -> bool {
+        let object = self.next_object(OccurrenceKind::Constant);
+        self.integer(object, integer, mode);
+        true
+    }
+
+    #[inline]
+    fn string_constant(
+        &mut self,
+        _value: &'code Constant,
+        string: &'code String,
+        mode: ReferenceMode,
+    ) -> bool {
+        let object = self.next_object(OccurrenceKind::Constant);
+        self.string_with_object(object, string, mode);
+        true
+    }
+
+    #[inline]
+    fn signed_integer_constant(
+        &mut self,
+        _value: &'code Constant,
+        integer: i64,
+        mode: ReferenceMode,
+    ) -> bool {
+        let object = self.next_object(OccurrenceKind::Constant);
+        self.signed_integer(object, integer, mode);
+        true
+    }
+
+    #[inline]
+    fn float_constant(&mut self, _value: &'code Constant, float: f64, mode: ReferenceMode) -> bool {
+        let object = self.next_object(OccurrenceKind::Constant);
+        let Some(flag) = self.begin_object(object, mode) else {
+            return false;
+        };
+        self.byte_and_float(TYPE_BINARY_FLOAT | flag, float);
+        true
+    }
+
+    #[inline]
+    fn bytes_constant(
+        &mut self,
+        _value: &'code Constant,
+        bytes: &'code [u8],
+        mode: ReferenceMode,
+    ) -> bool {
+        let object = self.next_object(OccurrenceKind::Constant);
+        self.bytes_with_object(object, bytes, mode);
+        true
     }
 
     #[inline]

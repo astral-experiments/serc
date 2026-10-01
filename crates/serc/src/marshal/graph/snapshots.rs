@@ -14,8 +14,8 @@ fn shared_constant_and_metadata_identities() {
     for (index, object) in graph.objects_by_id.iter().enumerate() {
         writeln!(
             snapshot,
-            "object {index}: shared={} cached={} interned={}",
-            object.shared, object.cached, object.interned
+            "object {index}: reference_required={} interned={}",
+            object.reference_required, object.interned
         )
         .unwrap();
     }

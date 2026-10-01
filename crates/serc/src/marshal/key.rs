@@ -19,7 +19,7 @@ use super::v5::{
     TYPE_STRING, TYPE_TRUE, TYPE_TUPLE, TYPE_UNICODE,
 };
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(super) enum ObjectKey<'a> {
     // Scalar and immutable-container keys use Python value equality.
     None,
@@ -62,6 +62,49 @@ pub(super) enum ObjectKey<'a> {
     FreshEmptyBytes,
 }
 
+impl Hash for ObjectKey<'_> {
+    #[expect(
+        clippy::inline_always,
+        reason = "specialize hashing for statically known marshal key variants"
+    )]
+    #[inline(always)]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Self::None | Self::Ellipsis | Self::EmptyTuple | Self::FreshEmptyBytes => {}
+            Self::Bool(value) => value.hash(state),
+            Self::Int(value) | Self::Float(value) => value.hash(state),
+            Self::SignedInt(value) => value.hash(state),
+            Self::BigInt(negative, digits) => {
+                negative.hash(state);
+                digits.hash(state);
+            }
+            Self::NonReflexive(value) => value.hash(state),
+            Self::Complex(real, imag) => {
+                real.hash(state);
+                imag.hash(state);
+            }
+            Self::ConstantString(value) | Self::String(value) | Self::Filename(value) => {
+                value.hash(state);
+            }
+            Self::SurrogateFilename(value) | Self::SurrogateString(value) | Self::Bytes(value) => {
+                value.hash(state);
+            }
+            Self::ConstantTuple(value) => value.hash(state),
+            Self::FrozenSet(value) => value.hash(state),
+            Self::StringTuple(value) => value.hash(state),
+            Self::AnnotationLocals(value)
+            | Self::UninternedMetadata(value)
+            | Self::SliceMember(value)
+            | Self::RecreatedFrozenSet(value)
+            | Self::Code(value)
+            | Self::CodeBytes(value)
+            | Self::LocalKinds(value) => value.hash(state),
+            Self::Slice(value) => value.hash(state),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct HashedObjectKey<'a> {
     key: ObjectKey<'a>,
@@ -69,6 +112,11 @@ pub(super) struct HashedObjectKey<'a> {
 }
 
 impl<'a> HashedObjectKey<'a> {
+    #[expect(
+        clippy::inline_always,
+        reason = "specialize precomputed key hashes at traversal call sites"
+    )]
+    #[inline(always)]
     fn new(key: ObjectKey<'a>) -> Self {
         let mut hasher = FxHasher::default();
         key.hash(&mut hasher);
@@ -90,6 +138,96 @@ impl<'a> HashedObjectKey<'a> {
         debug_assert_eq!(Self::new(key).hash, hash, "marshal key hash");
         Self { key, hash }
     }
+}
+
+/// Hashes for immutable constant containers at their finalized allocation addresses.
+/// A cloned code tree owns new allocations and deliberately discards these hints.
+#[derive(Default)]
+pub(crate) struct ConstantHashes(Option<Box<FxHashMap<(u8, usize), u64>>>);
+
+impl std::fmt::Debug for ConstantHashes {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConstantHashes")
+            .field(
+                "containers",
+                &self.0.as_ref().map_or(0, |hashes| hashes.len()),
+            )
+            .finish()
+    }
+}
+
+impl Clone for ConstantHashes {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl ConstantHashes {
+    pub(super) fn get(&self, key: &ObjectKey<'_>) -> Option<u64> {
+        self.0
+            .as_ref()?
+            .get(&container_hash_identity(key)?)
+            .copied()
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.0.is_none()
+    }
+}
+
+fn container_hash_identity(key: &ObjectKey<'_>) -> Option<(u8, usize)> {
+    match key {
+        ObjectKey::ConstantTuple(ConstantTupleKey(values)) => Some((0, values.as_ptr().addr())),
+        ObjectKey::FrozenSet(FrozenSetKey(values)) => Some((1, values.as_ptr().addr())),
+        ObjectKey::StringTuple(StringTupleKey(StringTupleKind::Constants(values))) => {
+            Some((2, values.as_ptr().addr()))
+        }
+        ObjectKey::Slice(SliceKey(value)) => Some((3, std::ptr::from_ref(*value).addr())),
+        _ => None,
+    }
+}
+
+pub(crate) fn constant_hashes_for_code(code: &CodeObject) -> ConstantHashes {
+    fn collect(value: &Constant, hashes: &mut FxHashMap<(u8, usize), u64>) {
+        match value {
+            Constant::Code(code) => {
+                for child in &code.constants {
+                    collect(child, hashes);
+                }
+            }
+            Constant::Tuple(values) | Constant::FrozenSet(values) => {
+                for child in values {
+                    collect(child, hashes);
+                }
+                // Empty allocations share a dangling address and need no expensive hash.
+                if values.is_empty() {
+                    return;
+                }
+                let key = constant_key(value);
+                hashes.insert(
+                    container_hash_identity(&key).expect("nonempty container has a cache identity"),
+                    HashedObjectKey::new(key).hash,
+                );
+            }
+            Constant::Slice { lower, upper, step } => {
+                for child in [lower, upper, step] {
+                    collect(child, hashes);
+                }
+                let key = constant_key(value);
+                hashes.insert(
+                    container_hash_identity(&key).expect("slice has a cache identity"),
+                    HashedObjectKey::new(key).hash,
+                );
+            }
+            _ => {}
+        }
+    }
+    let mut hashes = FxHashMap::default();
+    for value in &code.constants {
+        collect(value, &mut hashes);
+    }
+    ConstantHashes((hashes.len() >= 4).then(|| Box::new(hashes)))
 }
 
 impl<'a> From<ObjectKey<'a>> for HashedObjectKey<'a> {
@@ -117,12 +255,13 @@ pub(super) struct ConstantTupleKey<'a>(&'a [Constant]);
 
 impl PartialEq for ConstantTupleKey<'_> {
     fn eq(&self, other: &Self) -> bool {
-        self.0.len() == other.0.len()
-            && self
-                .0
-                .iter()
-                .zip(other.0)
-                .all(|(left, right)| constants_equal(left, right))
+        std::ptr::eq(self.0, other.0)
+            || (self.0.len() == other.0.len()
+                && self
+                    .0
+                    .iter()
+                    .zip(other.0)
+                    .all(|(left, right)| constants_equal(left, right)))
     }
 }
 
@@ -349,19 +488,14 @@ impl Ord for CanonicalKey<'_> {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(super) struct SliceKey<'a> {
-    lower: &'a Constant,
-    upper: &'a Constant,
-    step: &'a Constant,
-}
+pub(super) struct SliceKey<'a>(&'a Constant);
 
 impl<'a> SliceKey<'a> {
     fn members(self) -> [ObjectKey<'a>; 3] {
-        [
-            constant_key(self.lower),
-            constant_key(self.upper),
-            constant_key(self.step),
-        ]
+        let Constant::Slice { lower, upper, step } = self.0 else {
+            unreachable!("slice keys refer to slice constants");
+        };
+        [constant_key(lower), constant_key(upper), constant_key(step)]
     }
 }
 
@@ -398,10 +532,17 @@ pub(super) struct StringTupleKey<'a>(StringTupleKind<'a>);
 
 #[derive(Clone, Copy, Debug)]
 enum StringTupleKind<'a> {
-    Constants(&'a [Constant]),
-    Strings(&'a [String]),
-    Names(&'a [Name]),
+    // Borrow the immutable vector header so each variant needs only a thin pointer.
+    Constants(&'a Vec<Constant>),
+    Strings(&'a Vec<String>),
+    Names(&'a Vec<Name>),
 }
+
+const _: () =
+    assert!(std::mem::size_of::<StringTupleKey<'_>>() == 2 * std::mem::size_of::<usize>());
+
+#[cfg(target_pointer_width = "64")]
+const _: [(); 24] = [(); std::mem::size_of::<ObjectKey<'_>>()];
 
 enum StringTupleIter<'a> {
     Constants(slice::Iter<'a, Constant>),
@@ -432,7 +573,7 @@ impl<'a> Iterator for StringTupleIter<'a> {
 impl ExactSizeIterator for StringTupleIter<'_> {}
 
 impl<'a> StringTupleKey<'a> {
-    fn constants(values: &'a [Constant]) -> Self {
+    fn constants(values: &'a Vec<Constant>) -> Self {
         debug_assert!(
             values
                 .iter()
@@ -441,11 +582,11 @@ impl<'a> StringTupleKey<'a> {
         Self(StringTupleKind::Constants(values))
     }
 
-    fn strings(values: &'a [String]) -> Self {
+    fn strings(values: &'a Vec<String>) -> Self {
         Self(StringTupleKind::Strings(values))
     }
 
-    fn names(values: &'a [Name]) -> Self {
+    fn names(values: &'a Vec<Name>) -> Self {
         Self(StringTupleKind::Names(values))
     }
 
@@ -460,7 +601,44 @@ impl<'a> StringTupleKey<'a> {
 
 impl PartialEq for StringTupleKey<'_> {
     fn eq(&self, other: &Self) -> bool {
-        self.iter().eq(other.iter())
+        // Select the storage representation once, rather than dispatching both iterators for
+        // every string. All combinations still compare complete spelling sequences.
+        match (self.0, other.0) {
+            (StringTupleKind::Names(left), StringTupleKind::Names(right)) => left == right,
+            (StringTupleKind::Strings(left), StringTupleKind::Strings(right)) => left == right,
+            (StringTupleKind::Constants(left), StringTupleKind::Constants(right)) => {
+                std::ptr::eq(left, right)
+                    || (left.len() == right.len()
+                        && left
+                            .iter()
+                            .zip(right)
+                            .all(|(left, right)| constant_string(left) == constant_string(right)))
+            }
+            (StringTupleKind::Constants(constants), StringTupleKind::Names(names))
+            | (StringTupleKind::Names(names), StringTupleKind::Constants(constants)) => {
+                constants.len() == names.len()
+                    && constants
+                        .iter()
+                        .zip(names)
+                        .all(|(constant, name)| constant_string(constant) == name.as_str())
+            }
+            (StringTupleKind::Constants(constants), StringTupleKind::Strings(strings))
+            | (StringTupleKind::Strings(strings), StringTupleKind::Constants(constants)) => {
+                constants.len() == strings.len()
+                    && constants
+                        .iter()
+                        .zip(strings)
+                        .all(|(constant, string)| constant_string(constant) == string)
+            }
+            (StringTupleKind::Names(names), StringTupleKind::Strings(strings))
+            | (StringTupleKind::Strings(strings), StringTupleKind::Names(names)) => {
+                names.len() == strings.len()
+                    && names
+                        .iter()
+                        .zip(strings)
+                        .all(|(name, string)| name == string)
+            }
+        }
     }
 }
 
@@ -474,8 +652,22 @@ impl Hash for StringTupleKey<'_> {
             StringTupleKind::Names(values) => values.len(),
         };
         length.hash(state);
-        for value in self.iter() {
-            value.hash(state);
+        match self.0 {
+            StringTupleKind::Constants(values) => {
+                for value in values {
+                    constant_string(value).hash(state);
+                }
+            }
+            StringTupleKind::Strings(values) => {
+                for value in values {
+                    value.as_str().hash(state);
+                }
+            }
+            StringTupleKind::Names(values) => {
+                for value in values {
+                    value.as_str().hash(state);
+                }
+            }
         }
     }
 }
@@ -693,7 +885,7 @@ pub(super) fn constant_key(value: &Constant) -> ObjectKey<'_> {
         Constant::Bytes(value) => ObjectKey::Bytes(value),
         Constant::Tuple(values) => constants_tuple_key(values),
         Constant::FrozenSet(values) => ObjectKey::FrozenSet(FrozenSetKey(values)),
-        Constant::Slice { lower, upper, step } => ObjectKey::Slice(SliceKey { lower, upper, step }),
+        Constant::Slice { .. } => ObjectKey::Slice(SliceKey(value)),
         Constant::Code(code) => code_key(code),
     }
 }
@@ -973,7 +1165,7 @@ fn sorted_frozen_set_members_with_properties<'a>(
     members
 }
 
-pub(super) fn constants_tuple_key(values: &[Constant]) -> ObjectKey<'_> {
+pub(super) fn constants_tuple_key(values: &Vec<Constant>) -> ObjectKey<'_> {
     if values.is_empty() {
         ObjectKey::EmptyTuple
     } else if values
@@ -988,7 +1180,7 @@ pub(super) fn constants_tuple_key(values: &[Constant]) -> ObjectKey<'_> {
 
 /// Hashes a finalized constants tuple for reuse after moving or cloning its code object.
 /// Empty tuples need no hash; code descendants prevent caching because cloning changes their keys.
-pub(crate) fn constants_tuple_hash(values: &[Constant]) -> Option<u64> {
+pub(crate) fn constants_tuple_hash(values: &Vec<Constant>) -> Option<u64> {
     fn has_code(value: &Constant) -> bool {
         match value {
             Constant::Code(_) => true,
@@ -1009,7 +1201,7 @@ pub(crate) fn bytes_hash(value: &[u8]) -> u64 {
     HashedObjectKey::from(ObjectKey::Bytes(value)).hash
 }
 
-pub(super) fn strings_tuple_key(values: &[String]) -> ObjectKey<'_> {
+pub(super) fn strings_tuple_key(values: &Vec<String>) -> ObjectKey<'_> {
     if values.is_empty() {
         ObjectKey::EmptyTuple
     } else {
@@ -1017,7 +1209,7 @@ pub(super) fn strings_tuple_key(values: &[String]) -> ObjectKey<'_> {
     }
 }
 
-pub(super) fn names_tuple_key(values: &[Name]) -> ObjectKey<'_> {
+pub(super) fn names_tuple_key(values: &Vec<Name>) -> ObjectKey<'_> {
     if values.is_empty() {
         ObjectKey::EmptyTuple
     } else {
@@ -1038,10 +1230,10 @@ pub(super) fn locals_tuple_key(code: &CodeObject) -> ObjectKey<'_> {
 
 /// Precomputes the value-only metadata work shared by all marshal graph traversals.
 pub(crate) fn metadata_tuple_properties(
-    names: &[Name],
-    locals: &[Name],
+    names: &Vec<Name>,
+    locals: &Vec<Name>,
 ) -> MarshalMetadataTupleProperties {
-    fn strings(values: &[Name]) -> MarshalStringTupleProperties {
+    fn strings(values: &Vec<Name>) -> MarshalStringTupleProperties {
         let key = names_tuple_key(values);
         if values.is_empty() {
             return MarshalStringTupleProperties {
@@ -1163,5 +1355,213 @@ mod intern_tests {
         }
         assert!(!is_cached_character(""));
         assert!(!is_cached_character("éa"));
+    }
+}
+
+#[cfg(test)]
+mod key_hash_tests {
+    use super::{
+        Constant, ConstantTupleKey, FrozenSetKey, FxHasher, Hash, Hasher, NonReflexiveKey,
+        ObjectKey, SliceKey, StringTupleKey,
+    };
+    use std::hash::DefaultHasher;
+
+    // Retain the original compiler-derived implementation as an independent hash-stream oracle.
+    #[derive(Hash)]
+    enum DerivedObjectKey<'a> {
+        None,
+        Bool(bool),
+        Ellipsis,
+        Int(u64),
+        SignedInt(i64),
+        BigInt(bool, &'a [u16]),
+        NonReflexive(NonReflexiveKey),
+        Float(u64),
+        Complex(u64, u64),
+        ConstantString(&'a str),
+        String(&'a str),
+        Filename(&'a str),
+        SurrogateFilename(&'a [u8]),
+        UninternedMetadata(usize),
+        SurrogateString(&'a [u8]),
+        Bytes(&'a [u8]),
+        ConstantTuple(ConstantTupleKey<'a>),
+        FrozenSet(FrozenSetKey<'a>),
+        StringTuple(StringTupleKey<'a>),
+        AnnotationLocals(usize),
+        EmptyTuple,
+        Slice(SliceKey<'a>),
+        SliceMember(usize),
+        RecreatedFrozenSet(usize),
+        Code(usize),
+        CodeBytes(usize),
+        LocalKinds(usize),
+        FreshEmptyBytes,
+    }
+
+    impl<'a> From<ObjectKey<'a>> for DerivedObjectKey<'a> {
+        fn from(key: ObjectKey<'a>) -> Self {
+            match key {
+                ObjectKey::None => Self::None,
+                ObjectKey::Bool(value0) => Self::Bool(value0),
+                ObjectKey::Ellipsis => Self::Ellipsis,
+                ObjectKey::Int(value0) => Self::Int(value0),
+                ObjectKey::SignedInt(value0) => Self::SignedInt(value0),
+                ObjectKey::BigInt(value0, value1) => Self::BigInt(value0, value1),
+                ObjectKey::NonReflexive(value0) => Self::NonReflexive(value0),
+                ObjectKey::Float(value0) => Self::Float(value0),
+                ObjectKey::Complex(value0, value1) => Self::Complex(value0, value1),
+                ObjectKey::ConstantString(value0) => Self::ConstantString(value0),
+                ObjectKey::String(value0) => Self::String(value0),
+                ObjectKey::Filename(value0) => Self::Filename(value0),
+                ObjectKey::SurrogateFilename(value0) => Self::SurrogateFilename(value0),
+                ObjectKey::UninternedMetadata(value0) => Self::UninternedMetadata(value0),
+                ObjectKey::SurrogateString(value0) => Self::SurrogateString(value0),
+                ObjectKey::Bytes(value0) => Self::Bytes(value0),
+                ObjectKey::ConstantTuple(value0) => Self::ConstantTuple(value0),
+                ObjectKey::FrozenSet(value0) => Self::FrozenSet(value0),
+                ObjectKey::StringTuple(value0) => Self::StringTuple(value0),
+                ObjectKey::AnnotationLocals(value0) => Self::AnnotationLocals(value0),
+                ObjectKey::EmptyTuple => Self::EmptyTuple,
+                ObjectKey::Slice(value0) => Self::Slice(value0),
+                ObjectKey::SliceMember(value0) => Self::SliceMember(value0),
+                ObjectKey::RecreatedFrozenSet(value0) => Self::RecreatedFrozenSet(value0),
+                ObjectKey::Code(value0) => Self::Code(value0),
+                ObjectKey::CodeBytes(value0) => Self::CodeBytes(value0),
+                ObjectKey::LocalKinds(value0) => Self::LocalKinds(value0),
+                ObjectKey::FreshEmptyBytes => Self::FreshEmptyBytes,
+            }
+        }
+    }
+
+    fn hash_with<H: Hasher + Default>(value: &impl Hash) -> u64 {
+        let mut hasher = H::default();
+        value.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    #[test]
+    fn preserves_derived_hash_stream_for_every_variant() {
+        let constants = [Constant::Int(17), Constant::Bool(true)];
+        let strings = vec![String::from("name"), String::from("other")];
+        let keys = [
+            ObjectKey::None,
+            ObjectKey::Bool(true),
+            ObjectKey::Ellipsis,
+            ObjectKey::Int(17),
+            ObjectKey::SignedInt(-17),
+            ObjectKey::BigInt(true, &[1, 2, 3]),
+            ObjectKey::NonReflexive(NonReflexiveKey::Source(17)),
+            ObjectKey::Float(1.25_f64.to_bits()),
+            ObjectKey::Complex(1.25_f64.to_bits(), (-3.0_f64).to_bits()),
+            ObjectKey::ConstantString("name"),
+            ObjectKey::String("name"),
+            ObjectKey::Filename("file.py"),
+            ObjectKey::SurrogateFilename(&[0xed, 0xa0, 0x80]),
+            ObjectKey::UninternedMetadata(17),
+            ObjectKey::SurrogateString(&[0xed, 0xa0, 0x80]),
+            ObjectKey::Bytes(&[1, 2, 3]),
+            ObjectKey::ConstantTuple(ConstantTupleKey(&constants)),
+            ObjectKey::FrozenSet(FrozenSetKey(&constants)),
+            ObjectKey::StringTuple(StringTupleKey::strings(&strings)),
+            ObjectKey::AnnotationLocals(17),
+            ObjectKey::EmptyTuple,
+            ObjectKey::Slice(SliceKey(&Constant::Slice {
+                lower: Box::new(constants[0].clone()),
+                upper: Box::new(constants[1].clone()),
+                step: Box::new(Constant::None),
+            })),
+            ObjectKey::SliceMember(17),
+            ObjectKey::RecreatedFrozenSet(17),
+            ObjectKey::Code(17),
+            ObjectKey::CodeBytes(17),
+            ObjectKey::LocalKinds(17),
+            ObjectKey::FreshEmptyBytes,
+        ];
+        for key in keys {
+            let derived = DerivedObjectKey::from(key);
+            assert_eq!(
+                hash_with::<FxHasher>(&key),
+                hash_with::<FxHasher>(&derived),
+                "{key:?}"
+            );
+            assert_eq!(
+                hash_with::<DefaultHasher>(&key),
+                hash_with::<DefaultHasher>(&derived),
+                "{key:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tuple_identity_tests {
+    use super::*;
+
+    #[test]
+    fn string_tuple_identity_is_independent_of_storage_representation() {
+        let spellings: &[&[&str]] = &[
+            &[],
+            &["a"],
+            &["a", "a"],
+            &["a", "b"],
+            &["z"],
+            &["sixteen_byte_key", "a_long_heap_allocated_name"],
+            &["é", "a_long_heap_allocated_name"],
+        ];
+        let strings = spellings
+            .iter()
+            .map(|values| {
+                values
+                    .iter()
+                    .map(|value| (*value).to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let names = spellings
+            .iter()
+            .map(|values| {
+                values
+                    .iter()
+                    .map(|value| Name::new(value))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let constants = strings
+            .iter()
+            .map(|values| {
+                values
+                    .iter()
+                    .cloned()
+                    .map(Constant::String)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        for (left_index, left) in spellings.iter().enumerate() {
+            let left_keys = [
+                StringTupleKey::strings(&strings[left_index]),
+                StringTupleKey::names(&names[left_index]),
+                StringTupleKey::constants(&constants[left_index]),
+            ];
+            for (right_index, right) in spellings.iter().enumerate() {
+                let right_keys = [
+                    StringTupleKey::strings(&strings[right_index]),
+                    StringTupleKey::names(&names[right_index]),
+                    StringTupleKey::constants(&constants[right_index]),
+                ];
+                for left_key in left_keys {
+                    for right_key in right_keys {
+                        assert_eq!(left_key == right_key, left == right);
+                        assert_eq!(left_key.cmp(&right_key), left.cmp(right));
+                        if left == right {
+                            assert_eq!(
+                                HashedObjectKey::from(ObjectKey::StringTuple(left_key)).hash,
+                                HashedObjectKey::from(ObjectKey::StringTuple(right_key)).hash,
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }

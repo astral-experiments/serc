@@ -79,7 +79,7 @@ fn code_identity_descendants_cannot_cache_a_constant_tuple_hash() {
             step: Box::new(Constant::None),
         },
     ] {
-        assert_eq!(super::key::constants_tuple_hash(&[value]), None);
+        assert_eq!(super::key::constants_tuple_hash(&vec![value]), None);
     }
 }
 
@@ -438,16 +438,17 @@ fn uses_cpython_reference_cache_boundaries() {
 
 #[test]
 fn precomputed_metadata_hashes_match_borrowed_tuples_from_either_source() {
-    let names = ["value", "méthode", ".0", "é"].map(Name::new);
-    let locals = ["ascii_name", "A09", "_"].map(Name::new);
+    let names = ["value", "méthode", ".0", "é"].map(Name::new).to_vec();
+    let locals = ["ascii_name", "A09", "_"].map(Name::new).to_vec();
+    let empty = Vec::new();
     let properties = metadata_tuple_properties(&names, &locals);
     assert!(!properties.names.automatically_interned);
     assert!(properties.locals.automatically_interned);
 
     for (values, properties) in [
-        (names.as_slice(), properties.names),
-        (locals.as_slice(), properties.locals),
-        (&[], metadata_tuple_properties(&[], &[]).names),
+        (&names, properties.names),
+        (&locals, properties.locals),
+        (&empty, metadata_tuple_properties(&empty, &empty).names),
     ] {
         let constants = values
             .iter()
@@ -506,7 +507,7 @@ def membership(value):
     }
 
     let nested_code = Constant::Tuple(vec![Constant::Code(Box::new(code_object(vec![])))]);
-    assert!(super::key::constants_tuple_hash(&[nested_code]).is_none());
+    assert!(super::key::constants_tuple_hash(&vec![nested_code]).is_none());
 }
 
 #[test]
@@ -1021,11 +1022,18 @@ fn borrowed_string_tuple_keys_compare_across_sources() {
     ];
     let strings = ["alpha".to_string(), "beta".to_string(), long.to_string()];
     let names = ["alpha", "beta", long].map(Name::new);
-    let keys = [0..1, 0..2, 1..2, 2..3].map(|range| {
+    let sources = [0..1, 0..2, 1..2, 2..3].map(|range| {
+        (
+            constants[range.clone()].to_vec(),
+            strings[range.clone()].to_vec(),
+            names[range].to_vec(),
+        )
+    });
+    let keys = sources.each_ref().map(|(constants, strings, names)| {
         [
-            constants_tuple_key(&constants[range.clone()]),
-            strings_tuple_key(&strings[range.clone()]),
-            names_tuple_key(&names[range]),
+            constants_tuple_key(constants),
+            strings_tuple_key(strings),
+            names_tuple_key(names),
         ]
     });
     for (left_index, left_keys) in keys.iter().enumerate() {
@@ -1669,11 +1677,11 @@ impl<'a> MarshalVisitor<'a> for RecordingVisitor<'a> {
 
     fn code_bytes(&mut self, _code: &'a CodeObject) {}
 
-    fn constants(&mut self, values: &'a [Constant], reference_mode: ReferenceMode) -> bool {
+    fn constants(&mut self, values: &'a Vec<Constant>, reference_mode: ReferenceMode) -> bool {
         self.push(RecordedValue::Constants(values), reference_mode);
         !self
             .pruned
-            .is_some_and(|pruned| std::ptr::eq(pruned, values))
+            .is_some_and(|pruned| std::ptr::eq(pruned, values.as_slice()))
     }
 
     fn names(&mut self, _code: &'a CodeObject) -> bool {
@@ -2980,4 +2988,502 @@ fn legacy_discarded_constants_preserve_qualified_name_identity() {
             );
         }
     }
+}
+
+#[test]
+fn dense_character_metadata_preserves_scalar_aliases_across_targets() {
+    fn clear_metadata_slots(code: &mut CodeObject) {
+        code.marshal_provenance.metadata_ids.domain_len = u32::MAX;
+        for value in &mut code.constants {
+            if let Constant::Code(child) = value {
+                clear_metadata_slots(child);
+            }
+        }
+    }
+
+    fn constant_count(code: &CodeObject) -> usize {
+        code.constants.len()
+            + code
+                .constants
+                .iter()
+                .map(|value| match value {
+                    Constant::Code(child) => constant_count(child),
+                    _ => 0,
+                })
+                .sum::<usize>()
+    }
+
+    let source = "x = 'x'\né = 'é'\ndef f(x, é):\n    def g(x):\n        return 'é', 'x', x, é\n    return g(x)\n";
+    for python_version in [
+        crate::PythonVersion::Py312,
+        crate::PythonVersion::Py313,
+        crate::PythonVersion::Py314,
+        crate::PythonVersion::Py315,
+    ] {
+        let options = crate::CompileOptions {
+            python_version,
+            ..crate::CompileOptions::default()
+        };
+        for total_constants in [31, 32] {
+            let mut hinted = crate::compile_with_options(source, "é", &options).unwrap();
+            // Cross the scalar-cache threshold while retaining nested metadata and constants.
+            let child_constants = constant_count(&hinted.code) - hinted.code.constants.len();
+            hinted
+                .code
+                .constants
+                .resize(total_constants - child_constants, Constant::None);
+            let mut fallback = hinted.clone();
+            clear_metadata_slots(&mut fallback.code);
+            assert_eq!(hinted.marshal(), fallback.marshal(), "{python_version:?}");
+            assert_eq!(
+                hinted.to_timestamp_pyc(0, 0),
+                fallback.to_timestamp_pyc(0, 0),
+                "{python_version:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn retained_name_lookup_preserves_value_sharing_and_cloned_streams() {
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    fn check(module: &crate::CompiledModule) {
+        let mut ordinary = module.clone();
+        ordinary.code.marshal_provenance.metadata_name_lookup = None;
+        let expected = ordinary.marshal();
+        assert_eq!(module.marshal(), expected);
+        assert_eq!(module.clone().marshal(), expected);
+        assert_eq!(module.marshal(), expected);
+        assert_eq!(
+            module.to_timestamp_pyc(123, 456),
+            ordinary.to_timestamp_pyc(123, 456)
+        );
+    }
+
+    for workload in serc_fixtures::COMPILE_MICRO_WORKLOADS
+        .iter()
+        .chain(serc_fixtures::MARSHAL_MICRO_WORKLOADS)
+        .chain(serc_fixtures::COMPOSITE_WORKLOADS)
+        .chain(serc_fixtures::LARGE_WORKLOADS)
+    {
+        check(&crate::compile(workload.source, workload.filename).unwrap());
+    }
+    for python_version in [
+        crate::PythonVersion::Py312,
+        crate::PythonVersion::Py313,
+        crate::PythonVersion::Py314,
+        crate::PythonVersion::Py315,
+    ] {
+        let options = crate::CompileOptions {
+            python_version,
+            ..crate::CompileOptions::default()
+        };
+        // Equal strings appear both before and after metadata, as cached characters, in
+        // frozensets and metadata-aliasing tuples, and as the caller's filename.
+        for filename in ["result", "<module>", "__name__", "ordinary.py", "é"] {
+            for source in [
+                "before = ('result', 'é', '__name__', 'ordinary.py')\n\
+                 def result(é):\n    return ('result', 'é', '__name__', 'ordinary.py')\n\
+                 after = 'result' in {'result', 'é', '__name__', 'ordinary.py'}\n",
+                // Repeated containers, scalar caches and identity-bearing NaNs exercise
+                // sharing and reference order, including 3.15's unreferenced PYC root.
+                "before = ('result', 'é', '__name__', 'ordinary.py', b'', b'a', 257, -0.0)\n\
+                 def result(é):\n    return ('result', 'é', '__name__', 'ordinary.py', b'', b'a', 257, -0.0)\n\
+                 after = ('result', 'é', '__name__', 'ordinary.py', b'', b'a', 257, -0.0)\n\
+                 nan = (1e1000 - 1e1000, (1e1000 - 1e1000,))\n",
+            ] {
+                check(&crate::compile_with_options(source, filename, &options).unwrap());
+            }
+        }
+    }
+    assert_send_sync::<crate::CompiledModule>();
+}
+
+#[test]
+fn graph_summaries_preserve_benchmark_and_cloned_streams() {
+    for workload in serc_fixtures::COMPILE_MICRO_WORKLOADS
+        .iter()
+        .chain(serc_fixtures::MARSHAL_MICRO_WORKLOADS)
+        .chain(serc_fixtures::COMPOSITE_WORKLOADS)
+        .chain(serc_fixtures::LARGE_WORKLOADS)
+    {
+        let module = crate::compile(workload.source, workload.filename).unwrap();
+        let mut fallback = module.clone();
+        fallback.code.marshal_provenance.marshal_graph_summary = None;
+        assert_eq!(module.marshal(), fallback.marshal(), "{}", workload.id);
+        assert_eq!(
+            module.clone().marshal(),
+            fallback.marshal(),
+            "{} clone",
+            workload.id
+        );
+        assert_eq!(
+            module.to_timestamp_pyc(123, 456),
+            fallback.to_timestamp_pyc(123, 456),
+            "{} pyc",
+            workload.id
+        );
+        if workload.id == "large_dataset" {
+            assert!(
+                module
+                    .code
+                    .marshal_provenance
+                    .marshal_graph_summary
+                    .unwrap()
+                    .no_supplemental_interns
+            );
+            assert!(
+                module
+                    .code
+                    .marshal_provenance
+                    .metadata_alias_scan_unnecessary
+            );
+            assert!(
+                !module
+                    .code
+                    .marshal_provenance
+                    .subtree_has_frozenset_constants
+            );
+        }
+    }
+}
+
+#[test]
+fn graph_summary_keeps_nested_qualified_name_origin_analysis() {
+    for python_version in [
+        crate::PythonVersion::Py312,
+        crate::PythonVersion::Py313,
+        crate::PythonVersion::Py314,
+        crate::PythonVersion::Py315,
+    ] {
+        let module = crate::compile_with_options(
+            "def outer():\n    class Inner:\n        pass\n    return Inner\n",
+            "nested_class.py",
+            &crate::CompileOptions {
+                python_version,
+                ..crate::CompileOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            !module
+                .code
+                .marshal_provenance
+                .marshal_graph_summary
+                .unwrap()
+                .no_supplemental_interns
+        );
+        let mut fallback = module.clone();
+        fallback.code.marshal_provenance.marshal_graph_summary = None;
+        assert_eq!(module.marshal(), fallback.marshal(), "{python_version}");
+    }
+}
+
+#[test]
+fn canonical_and_supplemental_interns_preserve_the_same_stream() {
+    let mut child = code_object(vec![Constant::String("σχήμα".to_string())]);
+    child
+        .marshal_provenance
+        .explicitly_interned_strings
+        .insert("σχήμα".to_string());
+    let mut canonical = code_object(vec![
+        Constant::String("méthode".to_string()),
+        Constant::Code(Box::new(child)),
+    ]);
+    canonical
+        .marshal_provenance
+        .canonical_constant_strings
+        .insert("méthode".to_string());
+    let mut supplemental = canonical.clone();
+    supplemental
+        .marshal_provenance
+        .canonical_constant_strings
+        .clear();
+    supplemental
+        .marshal_provenance
+        .explicitly_interned_strings
+        .insert("méthode".to_string());
+
+    for python_version in [
+        crate::PythonVersion::Py312,
+        crate::PythonVersion::Py313,
+        crate::PythonVersion::Py314,
+        crate::PythonVersion::Py315,
+    ] {
+        assert_eq!(
+            super::writer::encode_code_with_options(
+                &canonical,
+                python_version,
+                &crate::InitialInternState::default()
+            ),
+            super::writer::encode_code_with_options(
+                &supplemental,
+                python_version,
+                &crate::InitialInternState::default()
+            ),
+            "{python_version}"
+        );
+    }
+    let graph = ObjectGraph::for_code(&canonical);
+    assert!(graph.is_interned("méthode"));
+    assert!(graph.is_interned("σχήμα"));
+}
+
+#[test]
+fn complete_canonical_strings_preserve_fallback_streams() {
+    fn check(mut module: crate::CompiledModule, label: &str) {
+        assert!(
+            module
+                .code
+                .marshal_provenance
+                .canonical_constant_strings_complete
+        );
+        let expected = module.marshal();
+        let expected_pyc = module.to_timestamp_pyc(0, 0);
+        let cloned = module.clone();
+        assert_eq!(cloned.marshal(), expected, "cloned {label}");
+        module
+            .code
+            .marshal_provenance
+            .canonical_constant_strings_complete = false;
+        assert_eq!(module.marshal(), expected, "fallback {label}");
+        assert_eq!(module.to_timestamp_pyc(0, 0), expected_pyc, "PYC {label}");
+    }
+
+    for workload in serc_fixtures::COMPILE_MICRO_WORKLOADS
+        .iter()
+        .chain(serc_fixtures::MARSHAL_MICRO_WORKLOADS)
+        .chain(serc_fixtures::COMPOSITE_WORKLOADS)
+        .chain(serc_fixtures::LARGE_WORKLOADS)
+    {
+        check(
+            crate::compile(workload.source, workload.filename).unwrap(),
+            workload.id,
+        );
+    }
+
+    let source = "def call(**kwargs): pass\ncall(alpha=1, é=2)\ndef child():\n    return call(beta=3, é=4)\nif False:\n    def discarded():\n        return call(alpha=5, é=6)\nkeys = frozenset({'alpha', 'é'})\n";
+    for python_version in [
+        crate::PythonVersion::Py312,
+        crate::PythonVersion::Py313,
+        crate::PythonVersion::Py314,
+        crate::PythonVersion::Py315,
+    ] {
+        let options = crate::CompileOptions {
+            python_version,
+            ..crate::CompileOptions::default()
+        };
+        check(
+            crate::compile_with_options(source, "interned.py", &options).unwrap(),
+            "nested keywords",
+        );
+    }
+}
+
+#[test]
+fn cached_character_metadata_ids_match_value_lookups() {
+    fn clear_ids(code: &mut CodeObject) {
+        // Keep the compiler's valid ID arrays, but disable allocation of the dense lookup domain.
+        code.marshal_provenance.metadata_ids.domain_len = u32::MAX;
+        for value in &mut code.constants {
+            if let Constant::Code(child) = value {
+                clear_ids(child);
+            }
+        }
+    }
+
+    let integers = (0..64)
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let source = format!(
+        "values = ({integers})\na = 'a'\né = 'é'\ndef a(é):\n    return é, 'a', 'é'\ndef é(a):\n    return a, 'é', 'a'\n"
+    );
+    for python_version in [
+        crate::PythonVersion::Py312,
+        crate::PythonVersion::Py313,
+        crate::PythonVersion::Py314,
+        crate::PythonVersion::Py315,
+    ] {
+        let module = crate::compile_with_options(
+            &source,
+            "é",
+            &crate::CompileOptions {
+                python_version,
+                ..crate::CompileOptions::default()
+            },
+        )
+        .unwrap();
+        let mut fallback = module.clone();
+        clear_ids(&mut fallback.code);
+        assert_eq!(module.marshal(), fallback.marshal(), "{python_version}");
+        assert_eq!(
+            module.to_timestamp_pyc(123, 456),
+            fallback.to_timestamp_pyc(123, 456),
+            "{python_version}"
+        );
+    }
+    for workload in serc_fixtures::COMPILE_MICRO_WORKLOADS
+        .iter()
+        .chain(serc_fixtures::MARSHAL_MICRO_WORKLOADS)
+        .chain(serc_fixtures::COMPOSITE_WORKLOADS)
+        .chain(serc_fixtures::LARGE_WORKLOADS)
+    {
+        let module = crate::compile(workload.source, workload.filename).unwrap();
+        let mut fallback = module.clone();
+        clear_ids(&mut fallback.code);
+        assert_eq!(module.marshal(), fallback.marshal(), "{}", workload.id);
+    }
+}
+
+#[test]
+fn occurrence_cursor_preserves_position_after_a_kind_mismatch() {
+    let code = code_object(Vec::new());
+    let graph = ObjectGraph::for_code(&code);
+    let expected = graph.occurrence_cursor().consume(OccurrenceKind::Code);
+    let mut cursor = graph.occurrence_cursor();
+    let mismatch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cursor.consume(OccurrenceKind::Bytes);
+    }));
+    assert!(mismatch.is_err());
+    assert_eq!(cursor.consume(OccurrenceKind::Code), expected);
+}
+
+#[test]
+fn cached_latin1_metadata_keeps_unicode_tags_with_ascii_hints() {
+    fn clear_properties(code: &mut CodeObject) {
+        code.marshal_provenance.metadata_tuple_properties = None;
+        for constant in &mut code.constants {
+            if let Constant::Code(child) = constant {
+                clear_properties(child);
+            }
+        }
+    }
+
+    let source = "é = 1\nÿ = é\ndef child(é, ÿ):\n    return é, ÿ\n";
+    for python_version in [
+        crate::PythonVersion::Py312,
+        crate::PythonVersion::Py313,
+        crate::PythonVersion::Py314,
+        crate::PythonVersion::Py315,
+    ] {
+        let module = crate::compile_with_options(
+            source,
+            "latin1_metadata.py",
+            &crate::CompileOptions {
+                python_version,
+                ..crate::CompileOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            module
+                .code
+                .marshal_provenance
+                .metadata_tuple_properties
+                .unwrap()
+                .names
+                .automatically_interned
+        );
+        let mut fallback = module.clone();
+        clear_properties(&mut fallback.code);
+        let encoded = module.marshal();
+        assert_eq!(encoded, fallback.marshal(), "{python_version}");
+        let unicode = [
+            super::v5::TYPE_INTERNED | super::v5::FLAG_REF,
+            2,
+            0,
+            0,
+            0,
+            0xc3,
+            0xa9,
+        ];
+        assert!(
+            encoded.windows(unicode.len()).any(|bytes| bytes == unicode),
+            "{python_version}"
+        );
+        assert_eq!(
+            module.to_timestamp_pyc(123, 456),
+            fallback.to_timestamp_pyc(123, 456),
+            "{python_version}"
+        );
+    }
+}
+
+#[test]
+fn container_hashes_match_uncached_streams_and_are_discarded_by_clones() {
+    fn compare(module: crate::CompiledModule, label: &str) -> bool {
+        let enabled = !module.code.marshal_provenance.constant_hashes.is_empty();
+        let mut cloned = module.clone();
+        assert!(cloned.code.marshal_provenance.constant_hashes.is_empty());
+        let expected = cloned.marshal();
+        assert_eq!(module.marshal(), expected, "{label}");
+        assert_eq!(
+            module.to_timestamp_pyc(42, 100),
+            cloned.to_timestamp_pyc(42, 100)
+        );
+        drop(module);
+        // Repeated clones must not regain an address-keyed hint after the original is freed.
+        for _ in 0..8 {
+            let successor = cloned.clone();
+            drop(cloned);
+            cloned = successor;
+            assert!(cloned.code.marshal_provenance.constant_hashes.is_empty());
+            assert_eq!(cloned.marshal(), expected, "cloned {label}");
+        }
+        enabled
+    }
+
+    let mut enabled = 0;
+    for workload in serc_fixtures::MARSHAL_MICRO_WORKLOADS
+        .iter()
+        .chain(serc_fixtures::COMPOSITE_WORKLOADS)
+        .chain(serc_fixtures::LARGE_WORKLOADS)
+    {
+        enabled += usize::from(compare(
+            crate::compile(workload.source, workload.filename).unwrap(),
+            workload.id,
+        ));
+    }
+    assert!(enabled > 0);
+
+    for python_version in [
+        crate::PythonVersion::Py312,
+        crate::PythonVersion::Py313,
+        crate::PythonVersion::Py314,
+        crate::PythonVersion::Py315,
+    ] {
+        for workload in serc_fixtures::MARSHAL_MICRO_WORKLOADS {
+            compare(
+                crate::compile_with_options(
+                    workload.source,
+                    workload.filename,
+                    &crate::CompileOptions {
+                        python_version,
+                        ..crate::CompileOptions::default()
+                    },
+                )
+                .unwrap(),
+                workload.id,
+            );
+        }
+    }
+
+    let mut code = code_object(vec![
+        Constant::Tuple(vec![Constant::Int(1000), Constant::String("café".into())]),
+        Constant::FrozenSet(vec![Constant::Int(2), Constant::Int(1)]),
+        Constant::FrozenSet(vec![Constant::FrozenSet(vec![
+            Constant::Int(1),
+            Constant::Int(2),
+        ])]),
+        Constant::Slice {
+            lower: Box::new(Constant::Int(1000)),
+            upper: Box::new(Constant::String("upper".into())),
+            step: Box::new(Constant::None),
+        },
+    ]);
+    code.marshal_provenance.constant_hashes = super::constant_hashes_for_code(&code);
+    assert!(!code.marshal_provenance.constant_hashes.is_empty());
+    assert_eq!(encode_code(&code), encode_code(&code.clone()));
 }

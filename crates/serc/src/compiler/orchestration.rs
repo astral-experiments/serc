@@ -1591,13 +1591,17 @@ impl<'source> Compiler<'source> {
                     FxHashSet::default()
                 },
                 canonical_constant_strings,
+                canonical_constant_strings_complete: matches!(self.unit.scope, Scope::Module),
                 qualified_name_constant_index: self.output.qualified_name_constant_index,
                 qualified_name_is_canonical: self.output.qualified_name_is_canonical,
                 uncached_percent_constant: self.context.has_uncached_percent_constant(),
                 metadata_ids,
+                metadata_name_lookup: None,
                 metadata_tuple_properties: Some(metadata_tuple_properties),
                 constants_tuple_hash,
+                constant_hashes: crate::marshal::ConstantHashes::default(),
                 marshal_occurrence_bound: Some(marshal_occurrence_bound),
+                marshal_graph_summary: None,
                 table_hashes: None,
                 subtree_has_frozenset_constants: self.output.has_frozenset_constants,
                 metadata_alias_scan_unnecessary: false,
@@ -1611,12 +1615,20 @@ impl<'source> Compiler<'source> {
         code.validate()?;
         code.marshal_provenance.assembly_order = self.context.record_code_assembly(&code);
         if matches!(self.unit.scope, Scope::Module) {
+            code.marshal_provenance.constant_hashes =
+                crate::marshal::constant_hashes_for_code(&code);
             code.marshal_provenance.interning_events = self.context.take_interning_events();
             code.marshal_provenance.interned_metadata_tuples =
                 self.context.take_interned_metadata_tuples();
             code.marshal_provenance.metadata_alias_scan_unnecessary =
                 metadata_alias_scan_unnecessary(&code);
+            let context = Rc::get_mut(&mut self.context)
+                .expect("completed module exclusively owns its compilation context");
+            code.marshal_provenance.metadata_name_lookup = Some(std::sync::Arc::new(
+                std::mem::take(&mut context.scopes.names).into_marshal_lookup(),
+            ));
         }
+        code.marshal_provenance.marshal_graph_summary = crate::marshal::code_graph_summary(&code);
         Ok(code)
     }
 
