@@ -93,10 +93,7 @@ impl BasicBlock {
         };
         let falls_through =
             !ends_scope(instruction.opcode) && !is_unconditional_jump(instruction.opcode);
-        let target = match instruction.operand() {
-            Operand::Forward(target) | Operand::Backward(target) => Some(target),
-            Operand::Value(_) | Operand::Deferred(_) => None,
-        };
+        let target = instruction.jump_target();
         (falls_through, target)
     }
 }
@@ -158,15 +155,13 @@ impl PipelineFeatures {
     fn record(&mut self, instruction: &Instruction) {
         let opcode_features = Self::BY_OPCODE[usize::from(instruction.opcode.code())];
         let mut features = opcode_features & !(Self::FORWARD_FEATURES | Self::CHECK_FEATURES);
-        let operand = instruction.operand();
-        match operand {
-            Operand::Forward(_) => {
-                features |= (opcode_features & Self::FORWARD_FEATURES) | Self::JUMP;
+        if instruction.jump_target().is_some() {
+            features |= Self::JUMP;
+            if instruction.forward_target().is_some() {
+                features |= opcode_features & Self::FORWARD_FEATURES;
             }
-            Operand::Backward(_) => features |= Self::JUMP,
-            Operand::Value(_) | Operand::Deferred(_) => {}
         }
-        if opcode_features & Self::CHECK_COPY != 0 && operand == Operand::Value(1) {
+        if opcode_features & Self::CHECK_COPY != 0 && instruction.value_argument() == Some(1) {
             features |= Self::COPY_TOP;
         }
         if opcode_features & Self::CHECK_FUSION_OWNER != 0 {
@@ -300,7 +295,7 @@ fn normalized_segment_lengths_with_labels<'a>(
             Item::Instruction(instruction) => features.record(instruction),
         }
         let ends_block = matches!(item, Item::Instruction(instruction) if
-            !matches!(instruction.operand(), Operand::Value(_))
+            instruction.value_argument().is_none()
                 || ends_scope(instruction.opcode));
         length += 1;
         has_instruction |= matches!(item, Item::Instruction(_));
@@ -489,7 +484,7 @@ impl BlockGraph {
                     }
                 }
                 Item::Instruction(instruction) => {
-                    if !matches!(instruction.operand(), Operand::Value(_)) {
+                    if instruction.value_argument().is_none() {
                         return false;
                     }
                     has_instruction = true;
@@ -801,7 +796,7 @@ impl BlockGraph {
                 has_instruction = false;
             }
             let ends_block = matches!(item, Item::Instruction(instruction) if
-                !matches!(instruction.operand(), Operand::Value(_))
+                instruction.value_argument().is_none()
                     || ends_scope(instruction.opcode));
             length += 1;
             has_instruction |= matches!(item, Item::Instruction(_));

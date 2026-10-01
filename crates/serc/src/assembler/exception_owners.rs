@@ -218,8 +218,7 @@ pub(super) struct ExceptionOwnerProvenance {
 impl ExceptionOwnerProvenance {
     /// Validates fields whose producer contract requires an authored jump.
     pub(super) fn legacy_seed_capture_shapes_valid(&self) -> bool {
-        let forward =
-            |instruction: &Instruction| matches!(instruction.operand(), Operand::Forward(_));
+        let forward = |instruction: &Instruction| instruction.forward_target().is_some();
         if !self
             .ordinary_await_ends
             .iter()
@@ -239,12 +238,7 @@ impl ExceptionOwnerProvenance {
                         .iter()
                         .map(|(_, instruction)| instruction),
                 )
-                .all(|instruction| {
-                    matches!(
-                        instruction.operand(),
-                        Operand::Forward(_) | Operand::Backward(_)
-                    )
-                })
+                .all(|instruction| instruction.jump_target().is_some())
         {
             return false;
         }
@@ -1156,7 +1150,7 @@ impl OwnerDecisionIndices {
         index: usize,
         pending_threaded_append: Option<usize>,
     ) -> bool {
-        matches!(instruction.operand(), Operand::Value(_))
+        instruction.value_argument().is_some()
             && !matches!(instruction.opcode, NOT_TAKEN | FOR_ITER | SEND)
             && !is_conditional_jump(instruction.opcode)
             && !is_scope_exit(instruction.opcode)
@@ -1291,12 +1285,10 @@ impl UncompactedPrefixIndexes {
                     }
                 }
                 Item::Instruction(instruction) => {
-                    if let Operand::Forward(label) = instruction.operand() {
+                    if let Some(label) = instruction.forward_target() {
                         forward_jumps.entry(label).or_default().push(index);
                     }
-                    if let Operand::Forward(label) | Operand::Backward(label) =
-                        instruction.operand()
-                    {
+                    if let Some(label) = instruction.jump_target() {
                         targets.insert(label);
                         if instruction.fusion_policy.is_authored_break() {
                             authored_break_targets.insert(label);
@@ -1391,7 +1383,7 @@ impl UncompactedPrefixIndexes {
     }
 
     fn has_unique_forward_jump(&self, all: &[Item], instruction: Instruction) -> bool {
-        let Operand::Forward(label) = instruction.operand() else {
+        let Some(label) = instruction.forward_target() else {
             return false;
         };
         self.forward_jumps.get(&label).is_some_and(|positions| {
@@ -1844,10 +1836,10 @@ impl ExceptionOwnerProvenance {
                     return None;
                 };
                 (copy.opcode == crate::target::opcodes::COPY
-                    && copy.operand() == Operand::Value(1)
+                    && copy.value_argument() == Some(1)
                     && to_bool.opcode == crate::target::opcodes::TO_BOOL
                     && is_conditional_jump(condition.opcode)
-                    && matches!(condition.operand(), Operand::Forward(_))
+                    && condition.forward_target().is_some()
                     && marker.opcode == NOT_TAKEN
                     && marker.exception_policy() == super::ExceptionPolicy::NoneDynamic)
                     .then(|| (*entry, position + 3))
@@ -1974,7 +1966,7 @@ impl ExceptionOwnerProvenance {
                 continue;
             };
             if matches!(instruction.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE)
-                && matches!(instruction.operand(), Operand::Forward(_))
+                && instruction.forward_target().is_some()
             {
                 let next = items[index + 1..]
                     .iter()
@@ -2025,10 +2017,7 @@ impl ExceptionOwnerProvenance {
             // the original array; the already-emitted NOT_TAKEN is not a CP record yet.
             if instruction.opcode == NOT_TAKEN
                 || is_scope_exit(instruction.opcode)
-                || matches!(
-                    instruction.operand(),
-                    Operand::Forward(_) | Operand::Backward(_)
-                )
+                || instruction.jump_target().is_some()
             {
                 begin = index + 1;
             }
@@ -2164,8 +2153,7 @@ impl ExceptionOwnerProvenance {
                 .iter()
                 .filter_map(|item| {
                     if let Item::Instruction(instruction) = item
-                        && let Operand::Forward(label) | Operand::Backward(label) =
-                            instruction.operand()
+                        && let Some(label) = instruction.jump_target()
                         && leading.contains(&Item::Label(label))
                     {
                         Some(*instruction)
@@ -2260,9 +2248,9 @@ impl ExceptionOwnerProvenance {
             return false;
         };
         if unpack.opcode != UNPACK_SEQUENCE
-            || unpack.operand() != Operand::Value(0)
+            || unpack.value_argument() != Some(0)
             || discard.opcode != POP_TOP
-            || discard.operand() != Operand::Value(0)
+            || discard.value_argument() != Some(0)
             || !discard.fusion_policy.location_from_next()
             || discard.location != next.location
             || unpack_depth.checked_sub(1) != Some(discard_depth)
@@ -2303,13 +2291,13 @@ impl ExceptionOwnerProvenance {
         // array. The authored failure conditional starts a fresh success array;
         // UNPACK(0) and the subject discard both survive in that new array.
         class.opcode == MATCH_CLASS
-            && class.operand() == Operand::Value(0)
+            && class.value_argument() == Some(0)
             && copy.opcode == COPY
-            && copy.operand() == Operand::Value(1)
+            && copy.value_argument() == Some(1)
             && copy.local_policy.hidden_exception_owner_slots() == 2
             && copy.pre_fold_extra_instructions() == 0
             && failure.opcode == POP_JUMP_IF_NONE
-            && matches!(failure.operand(), Operand::Forward(_))
+            && failure.forward_target().is_some()
             && marker.opcode == NOT_TAKEN
             && [class, copy, failure, marker]
                 .iter()
@@ -2491,12 +2479,11 @@ impl ExceptionOwnerProvenance {
                         && imported.opcode == IMPORT_FROM
                         && store.opcode == STORE_FAST
                         && discard.opcode == POP_TOP
-                        && discard.operand() == Operand::Value(0)
+                        && discard.value_argument() == Some(0)
                         && [level, names, module, imported, store, discard]
                             .iter()
                             .all(|part| {
-                                part.location == level.location
-                                    && matches!(part.operand(), Operand::Value(_))
+                                part.location == level.location && part.value_argument().is_some()
                             })
                     {
                         from_import_members.insert(instructions.len());
@@ -2514,7 +2501,7 @@ impl ExceptionOwnerProvenance {
         };
         if marker.opcode != NOT_TAKEN
             || !matches!(condition.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE)
-            || !matches!(condition.operand(), Operand::Forward(_))
+            || condition.forward_target().is_none()
             || body.last().is_none_or(|last| last.opcode != TO_BOOL)
         {
             return false;
@@ -2532,12 +2519,12 @@ impl ExceptionOwnerProvenance {
                 (cell.opcode == LOAD_FAST
                     && cell.local_policy.is_post_analysis_closure_load()
                     && tuple.opcode == BUILD_TUPLE
-                    && tuple.operand() == Operand::Value(1)
+                    && tuple.value_argument() == Some(1)
                     && code.opcode == LOAD_CONST
                     && function.opcode == MAKE_FUNCTION
-                    && function.operand() == Operand::Value(0)
+                    && function.value_argument() == Some(0)
                     && closure.opcode == SET_FUNCTION_ATTRIBUTE
-                    && closure.operand() == Operand::Value(8)
+                    && closure.value_argument() == Some(8)
                     && store.opcode == STORE_FAST
                     && parts.iter().all(|part| part.location == cell.location))
                 .then_some(start + 1..start + 5)
@@ -2564,12 +2551,12 @@ impl ExceptionOwnerProvenance {
                 };
                 (annotations.opcode == LOAD_CONST
                     && annotation_function.opcode == MAKE_FUNCTION
-                    && annotation_function.operand() == Operand::Value(0)
+                    && annotation_function.value_argument() == Some(0)
                     && code.opcode == LOAD_CONST
                     && function.opcode == MAKE_FUNCTION
-                    && function.operand() == Operand::Value(0)
+                    && function.value_argument() == Some(0)
                     && attribute.opcode == SET_FUNCTION_ATTRIBUTE
-                    && attribute.operand() == Operand::Value(16)
+                    && attribute.value_argument() == Some(16)
                     && store.opcode == STORE_FAST
                     && parts
                         .iter()
@@ -2599,11 +2586,11 @@ impl ExceptionOwnerProvenance {
                     && wrap.opcode == CALL_INTRINSIC_1
                     && wrap.operand() == Operand::Value(UnaryIntrinsic::ASYNC_GEN_WRAP.argument())
                     && yielded.opcode == YIELD_VALUE
-                    && yielded.operand() == Operand::Value(0)
+                    && yielded.value_argument() == Some(0)
                     && resume.opcode == RESUME
                     && matches!(resume.operand(), Operand::Value(1 | 5))
                     && discard.opcode == POP_TOP
-                    && discard.operand() == Operand::Value(0)
+                    && discard.value_argument() == Some(0)
                     && instruction_item_positions[start + 3]
                         == instruction_item_positions[start] + 3
                     && parts.iter().all(|part| part.location == wrap.location)
@@ -2661,7 +2648,7 @@ impl ExceptionOwnerProvenance {
             if index >= body.len() {
                 continue;
             }
-            if !matches!(instruction.operand(), Operand::Value(_)) {
+            if instruction.value_argument().is_none() {
                 return false;
             }
             match instruction.opcode {
@@ -2798,7 +2785,7 @@ impl ExceptionOwnerProvenance {
                                                 == instruction_item_positions[index] + 1
                                             && (matches!(next.opcode, LOAD_FAST | LIST_EXTEND)
                                                 || (next.opcode == BUILD_LIST
-                                                    && next.operand() == Operand::Value(0)
+                                                    && next.value_argument() == Some(0)
                                                     && instructions.get(index + 2).is_some_and(|next| next.opcode == LIST_EXTEND)
                                                     && instruction_item_positions[index + 2]
                                                         == instruction_item_positions[index] + 2)
@@ -2807,7 +2794,7 @@ impl ExceptionOwnerProvenance {
                                                         matches!(parts[0].opcode, LOAD_CONST | LOAD_SMALL_INT)
                                                             && matches!(parts[1].opcode, LOAD_CONST | LOAD_SMALL_INT)
                                                             && parts[2].opcode == BUILD_LIST
-                                                            && parts[2].operand() == Operand::Value(2)
+                                                            && parts[2].value_argument() == Some(2)
                                                             && instruction_item_positions[index + 3]
                                                                 == instruction_item_positions[index] + 3
                                                     })))
@@ -2821,7 +2808,7 @@ impl ExceptionOwnerProvenance {
                     if !unchanged {
                         return false;
                     }
-                    if instruction.operand() == Operand::Value(0)
+                    if instruction.value_argument() == Some(0)
                         && instructions[index + 1].opcode != STORE_FAST
                     {
                         expanded_collection = true;
@@ -2859,7 +2846,7 @@ impl ExceptionOwnerProvenance {
                     {
                         return false;
                     }
-                    let Operand::Value(depth) = instruction.operand() else {
+                    let Some(depth) = instruction.value_argument() else {
                         unreachable!()
                     };
                     let (Some(before), Some(after)) = (
@@ -2993,7 +2980,7 @@ impl ExceptionOwnerProvenance {
                 FORMAT_SIMPLE => {
                     // Runtime interpolation keeps both the value and format records.
                     // Constant and conversion paths need their own compaction proof.
-                    if instruction.operand() != Operand::Value(0)
+                    if instruction.value_argument() != Some(0)
                         || instructions
                             .get(index.wrapping_sub(1))
                             .is_none_or(|previous| {
@@ -3010,7 +2997,7 @@ impl ExceptionOwnerProvenance {
                     // A trailing literal after one runtime interpolation also
                     // retains all records. Require the complete three-piece
                     // producer, not an arbitrary constant suffix.
-                    let trailing_literal = instruction.operand() == Operand::Value(3)
+                    let trailing_literal = instruction.value_argument() == Some(3)
                         && index.checked_sub(4).is_some_and(|start| {
                             let [prefix, value, format, suffix] = &instructions[start..index]
                             else {
@@ -3022,7 +3009,7 @@ impl ExceptionOwnerProvenance {
                                     LOAD_FAST | LOAD_NAME | LOAD_ATTR | CALL | CALL_KW
                                 )
                                 && format.opcode == FORMAT_SIMPLE
-                                && format.operand() == Operand::Value(0)
+                                && format.value_argument() == Some(0)
                                 && suffix.opcode == LOAD_CONST
                                 && [prefix, value, format, suffix]
                                     .iter()
@@ -3094,7 +3081,7 @@ impl ExceptionOwnerProvenance {
                     .filter(|(label, _)| [start, end, setup].contains(&label));
                 if item_index + 4 > marker_index
                     || nop.opcode != NOP
-                    || nop.operand() != Operand::Value(0)
+                    || nop.value_argument() != Some(0)
                     || nop.exception_policy() != super::ExceptionPolicy::EXCLUDE_ALWAYS
                     || !self.setup_nop_ranges.contains(&(*start, *end))
                     || self
@@ -3263,7 +3250,7 @@ impl LayoutAssembler {
                 Item::Label(entry) => Some(*entry),
                 Item::Instruction(unpack)
                     if unpack.opcode == crate::target::opcodes::UNPACK_SEQUENCE
-                        && unpack.operand() == Operand::Value(0)
+                        && unpack.value_argument() == Some(0)
                         && origin.source_entry.is_none()
                         && origin.comprehension_entry.is_none() =>
                 {
@@ -3800,7 +3787,7 @@ impl LayoutAssembler {
                 continue;
             };
             if marker.opcode != NOP
-                || marker.operand() != Operand::Value(0)
+                || marker.value_argument() != Some(0)
                 || marker.exception_policy() != super::ExceptionPolicy::EXCLUDE_ALWAYS
                 || !marker.fusion_policy.is_converted_pop_block()
                 || !marker.jump_policy.preserves_explicit_nop()
@@ -3835,7 +3822,7 @@ impl LayoutAssembler {
                 };
                 let none_tail =
                     matches!(instruction.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
-                        && matches!(instruction.operand(), Operand::Forward(_))
+                        && instruction.forward_target().is_some()
                         && instruction.local_policy.hidden_exception_owner_slots() == 3
                         && instruction.exception_policy() == super::ExceptionPolicy::default();
                 if (instruction.local_policy.hidden_exception_owner_slots() != 0 && !none_tail)
@@ -3860,7 +3847,7 @@ impl LayoutAssembler {
                     break;
                 }
                 if is_conditional_jump(instruction.opcode) {
-                    if matches!(instruction.operand(), Operand::Forward(_)) {
+                    if instruction.forward_target().is_some() {
                         let owner = if tail.early_removals > 0 {
                             // All removed records are in this uniformly protected suffix.
                             // Compaction leaves its old tail available for the appended
@@ -3883,7 +3870,7 @@ impl LayoutAssembler {
                     }
                     break;
                 }
-                if !matches!(instruction.operand(), Operand::Value(_)) {
+                if instruction.value_argument().is_none() {
                     break;
                 }
                 previous = Some(instruction);
@@ -4534,7 +4521,7 @@ impl LayoutAssembler {
             [pop] => (*pop, 0),
             [plain, pop]
                 if plain.opcode == NOP
-                    && plain.operand() == Operand::Value(0)
+                    && plain.value_argument() == Some(0)
                     && plain.location.line >= 0
                     && plain.location == pop.location
                     && plain.local_policy == super::LocalPolicy::default()
@@ -4549,7 +4536,7 @@ impl LayoutAssembler {
             _ => return None,
         };
         if expected.opcode != NOP
-            || expected.operand() != Operand::Value(0)
+            || expected.value_argument() != Some(0)
             || !expected.fusion_policy.is_converted_pop_block()
             || expected.local_policy.hidden_exception_owner_slots() != 0
             || expected.pre_fold_extra_instructions() != 0
@@ -4575,8 +4562,7 @@ impl LayoutAssembler {
             let mut incoming = Vec::new();
             for item in &self.items {
                 if let Item::Instruction(instruction) = item
-                    && let Operand::Forward(label) | Operand::Backward(label) =
-                        instruction.operand()
+                    && let Some(label) = instruction.jump_target()
                     && label_positions.get(&label) == Some(entry_position)
                 {
                     incoming.push(instruction.location);
@@ -4784,7 +4770,7 @@ impl LayoutAssembler {
                                 != super::BorrowFallthrough::Reachable
                             || (instruction.fusion_policy.is_converted_pop_block() && !entry_pop)
                             || instruction.jump_policy.borrow_empty_block()
-                            || !matches!(instruction.operand(), Operand::Value(_))
+                            || instruction.value_argument().is_none()
                             || matches!(instruction.opcode, NOT_TAKEN | FOR_ITER | SEND)
                             || is_scope_exit(instruction.opcode)
                             || (instruction.opcode == NOP
@@ -4812,7 +4798,7 @@ impl LayoutAssembler {
                 || !retained
                 || !null_setup_cells.contains(&(logical + 1))
                 || !matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
-                || !matches!(condition.operand(), Operand::Forward(_))
+                || condition.forward_target().is_none()
                 || condition.local_policy.hidden_exception_owner_slots() != 3
                 || condition.pre_fold_extra_instructions() != 0
                 || condition.no_location_policy.borrow_fallthrough()
@@ -4835,7 +4821,7 @@ impl LayoutAssembler {
                     }
                     Item::Instruction(marker) => {
                         if marker.opcode == NOT_TAKEN
-                            && marker.operand() == Operand::Value(0)
+                            && marker.value_argument() == Some(0)
                             && marker.location == condition.location
                             && marker.exception_policy().owner()
                                 == NormalizedExceptionOwner::Present
@@ -5028,7 +5014,7 @@ impl LayoutAssembler {
                                 crate::target::opcodes::POP_JUMP_IF_FALSE
                                     | crate::target::opcodes::POP_JUMP_IF_TRUE
                             )
-                            && matches!(instruction.operand(), Operand::Forward(_));
+                            && instruction.forward_target().is_some();
                         // A captured original SETUP remains a NULL-owner record when
                         // the compiler explicitly preserves that absence through copies.
                         if instruction.local_policy.hidden_exception_owner_slots() != 0
@@ -5045,8 +5031,7 @@ impl LayoutAssembler {
                             || instruction.fusion_policy.is_converted_pop_block()
                             || (instruction.opcode == NOP
                                 && !retained_setup_nops.contains(&logical))
-                            || (!matches!(instruction.operand(), Operand::Value(_))
-                                && !final_condition)
+                            || (instruction.value_argument().is_none() && !final_condition)
                             || matches!(instruction.opcode, NOT_TAKEN | FOR_ITER | SEND)
                             || is_scope_exit(instruction.opcode)
                         {
@@ -5591,7 +5576,7 @@ impl LayoutAssembler {
                 || record.no_location_policy.borrow_fallthrough()
                     != super::BorrowFallthrough::Reachable
                 || record.jump_policy.borrow_empty_block()
-                || !matches!(record.operand(), Operand::Value(_))
+                || record.value_argument().is_none()
                 || is_scope_exit(record.opcode)
             {
                 return None;
@@ -6009,9 +5994,7 @@ impl LayoutAssembler {
                 Item::Instruction(instruction) => {
                     indexed_instructions.push(instruction);
                     position += 1;
-                    if let Operand::Forward(label) | Operand::Backward(label) =
-                        instruction.operand()
-                    {
+                    if let Some(label) = instruction.jump_target() {
                         jump_targets.insert(label);
                     }
                 }
@@ -6518,7 +6501,7 @@ impl LayoutAssembler {
                             && !flags.contains(OwnerReplayLabelFlags::OMITTED_NOP)
                             && previous.is_some_and(|condition: &Instruction| {
                                 is_conditional_jump(condition.opcode)
-                                    && matches!(condition.operand(), Operand::Forward(_))
+                                    && condition.forward_target().is_some()
                                     && self
                                         .exception_owner_provenance
                                         .original_primitive_condition_boundaries
@@ -6648,16 +6631,16 @@ impl LayoutAssembler {
                                     condition.location == marker.location
                                         && matches!(condition.opcode,
                                             crate::target::opcodes::POP_JUMP_IF_FALSE | crate::target::opcodes::POP_JUMP_IF_TRUE)
-                                        && matches!(condition.operand(), Operand::Forward(_))
+                                        && condition.forward_target().is_some()
                                         && self.exception_owner_provenance.original_primitive_condition_boundaries
                                             .iter().filter(|original| *original == condition).count() == 1
                                 }))
                             && matches!(&indexed_instructions[original_array_start..instruction_index],
                             [load, to_bool, condition]
                                 if matches!(load.opcode, crate::target::opcodes::LOAD_FAST | crate::target::opcodes::LOAD_FAST_BORROW)
-                                    && matches!(load.operand(), Operand::Value(_))
+                                    && load.value_argument().is_some()
                                     && to_bool.opcode == crate::target::opcodes::TO_BOOL
-                                    && to_bool.operand() == Operand::Value(0)
+                                    && to_bool.value_argument() == Some(0)
                                     && [load, to_bool, condition].iter().all(|record| {
                                         record.location == condition.location
                                             && record.exception_policy() == super::ExceptionPolicy::NoneUnchanged
@@ -7537,7 +7520,7 @@ impl LayoutAssembler {
                     // Keep its old slot relative to the actual native array, including
                     // every earlier setup and compaction; authored try labels do not split it.
                     if instruction.opcode == crate::target::opcodes::POP_TOP
-                        && instruction.operand() == Operand::Value(0)
+                        && instruction.value_argument() == Some(0)
                         && owner_history_exact
                         && pop_slot_epoch_known
                         && tail.insertions == 0
@@ -8636,7 +8619,7 @@ impl LayoutAssembler {
                     // cell. Certify its original terminator before a marker-only range
                     // label obscures the array epoch; no removed cell can be reused.
                     if is_conditional_jump(instruction.opcode)
-                        && matches!(instruction.operand(), Operand::Forward(_))
+                        && instruction.forward_target().is_some()
                         && instruction.exception_policy() == super::ExceptionPolicy::NoneUnchanged
                         && owner_history_exact
                         && retained_epoch_known
@@ -8694,7 +8677,7 @@ impl LayoutAssembler {
                     // With no removals or insertions, the first retained SETUP's block
                     // appends into a zero-initialized slot beyond its original live end.
                     if is_conditional_jump(instruction.opcode)
-                        && matches!(instruction.operand(), Operand::Forward(_))
+                        && instruction.forward_target().is_some()
                         && owner_history_exact
                         && retained_epoch_known
                         && instruction.no_location_policy.borrow_fallthrough()
@@ -8754,7 +8737,7 @@ impl LayoutAssembler {
                     // it reuses a NULL record. Resolve the original terminator before
                     // cold-block labeling inserts a bookkeeping label ahead of NOT_TAKEN.
                     if is_conditional_jump(instruction.opcode)
-                        && matches!(instruction.operand(), Operand::Forward(_))
+                        && instruction.forward_target().is_some()
                         && owner_history_exact
                         && tail.insertions == 0
                         && tail.late_removals == 0
@@ -8770,7 +8753,7 @@ impl LayoutAssembler {
                     // Captured handler and finalizer POPs retain their own NULL cells.
                     // A later POP must not replace an earlier physical record.
                     if is_conditional_jump(instruction.opcode)
-                        && matches!(instruction.operand(), Operand::Forward(_))
+                        && instruction.forward_target().is_some()
                         && owner_history_exact
                         && pop_slot_epoch_known
                         && tail.insertions == 0
@@ -8820,7 +8803,7 @@ impl LayoutAssembler {
                         && tail.post_compaction_fusions == 0
                         && previous.is_some_and(|condition| {
                             matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
-                                && matches!(condition.operand(), Operand::Forward(_))
+                                && condition.forward_target().is_some()
                         })
                         && let Some((_, _, region, _)) = captured_method_owner_slots.iter().find(
                             |(array, slot, _, condition)| {
@@ -9270,7 +9253,7 @@ impl LayoutAssembler {
                     // unchanged cleanup suffix, use that suffix's exact region, even when
                     // source-level cleanup exclusions hide it around the late marker.
                     if is_conditional_jump(instruction.opcode)
-                        && matches!(instruction.operand(), Operand::Forward(_))
+                        && instruction.forward_target().is_some()
                         && threaded_conditions.get(&instruction_index)
                             != Some(&NormalizedExceptionOwner::DynamicConditionStrict)
                         && owner_history_exact
@@ -9332,7 +9315,7 @@ impl LayoutAssembler {
                     // Any subsequent local fusion still reuses the same uniformly owned
                     // suffix. Account for every removed record before trusting that slot.
                     if is_conditional_jump(instruction.opcode)
-                        && matches!(instruction.operand(), Operand::Forward(_))
+                        && instruction.forward_target().is_some()
                         && threaded_conditions.get(&instruction_index)
                             != Some(&NormalizedExceptionOwner::DynamicConditionStrict)
                         && owner_history_exact
@@ -9419,7 +9402,7 @@ impl LayoutAssembler {
                     // leaves the same owner in every stale slot reused by a forward marker.
                     // An implicit generator fallback is not an authored original-slot owner.
                     if is_conditional_jump(instruction.opcode)
-                        && matches!(instruction.operand(), Operand::Forward(_))
+                        && instruction.forward_target().is_some()
                         && instruction.exception_policy().exclusion()
                             == super::ExceptionExclusion::None
                         && owner_history_exact
@@ -9533,7 +9516,7 @@ impl LayoutAssembler {
                             .get(instruction_index - 1)
                             .is_some_and(|jump| {
                                 is_conditional_jump(jump.opcode)
-                                    && matches!(jump.operand(), Operand::Forward(_))
+                                    && jump.forward_target().is_some()
                                     && jump.location == instruction.location
                             })
                         && !jump_targets.iter().any(|label| {
@@ -10078,13 +10061,13 @@ impl LayoutAssembler {
                             && matches!(indexed_instructions.get(iterator + 1..instruction_index),
                             Some([load, to_bool, condition])
                                 if matches!(load.opcode, crate::target::opcodes::LOAD_FAST | crate::target::opcodes::LOAD_FAST_BORROW)
-                                    && matches!(load.operand(), Operand::Value(_))
+                                    && load.value_argument().is_some()
                                     && load.local_policy.hidden_exception_owner_slots() == 1
                                     && to_bool.opcode == crate::target::opcodes::TO_BOOL
-                                    && to_bool.operand() == Operand::Value(0)
+                                    && to_bool.value_argument() == Some(0)
                                     && to_bool.local_policy.hidden_exception_owner_slots() == 0
                                     && matches!(condition.opcode, crate::target::opcodes::POP_JUMP_IF_FALSE | crate::target::opcodes::POP_JUMP_IF_TRUE)
-                                    && matches!(condition.operand(), Operand::Forward(_))
+                                    && condition.forward_target().is_some()
                                     && condition.local_policy.hidden_exception_owner_slots() == 0
                                     && [load, to_bool, condition].iter().all(|record| {
                                         record.pre_fold_extra_instructions() == 0
@@ -10290,12 +10273,12 @@ impl LayoutAssembler {
                                             if matches!(load.opcode,
                                                 crate::target::opcodes::LOAD_FAST
                                                     | crate::target::opcodes::LOAD_FAST_BORROW)
-                                                && matches!(load.operand(), Operand::Value(_))
+                                                && load.value_argument().is_some()
                                                 && to_bool.opcode == crate::target::opcodes::TO_BOOL
-                                                && to_bool.operand() == Operand::Value(0)
+                                                && to_bool.value_argument() == Some(0)
                                                 && matches!(condition.opcode,
                                                     crate::target::opcodes::POP_JUMP_IF_FALSE | crate::target::opcodes::POP_JUMP_IF_TRUE)
-                                                && matches!(condition.operand(), Operand::Forward(_))
+                                                && condition.forward_target().is_some()
                                                 && [load, to_bool, condition].iter().all(|record| {
                                                     record.local_policy.hidden_exception_owner_slots() == 0
                                                         && record.pre_fold_extra_instructions() == 0
@@ -10329,14 +10312,14 @@ impl LayoutAssembler {
                                             if matches!(load.opcode,
                                                 crate::target::opcodes::LOAD_FAST
                                                     | crate::target::opcodes::LOAD_FAST_BORROW)
-                                                && matches!(load.operand(), Operand::Value(_))
+                                                && load.value_argument().is_some()
                                                 && copy.opcode == crate::target::opcodes::COPY
-                                                && copy.operand() == Operand::Value(1)
+                                                && copy.value_argument() == Some(1)
                                                 && to_bool.opcode == crate::target::opcodes::TO_BOOL
-                                                && to_bool.operand() == Operand::Value(0)
+                                                && to_bool.value_argument() == Some(0)
                                                 && matches!(condition.opcode,
                                                     crate::target::opcodes::POP_JUMP_IF_FALSE | crate::target::opcodes::POP_JUMP_IF_TRUE)
-                                                && matches!(condition.operand(), Operand::Forward(_))
+                                                && condition.forward_target().is_some()
                                                 && [load, copy, to_bool, condition].iter().all(|record| {
                                                     record.local_policy.hidden_exception_owner_slots() == 0
                                                         && record.pre_fold_extra_instructions() == 0
@@ -10367,14 +10350,14 @@ impl LayoutAssembler {
                                                 && matches!(arg.opcode,
                                                     crate::target::opcodes::LOAD_FAST
                                                         | crate::target::opcodes::LOAD_FAST_BORROW)
-                                                && matches!(arg.operand(), Operand::Value(_))
+                                                && arg.value_argument().is_some()
                                                 && call.opcode == crate::target::opcodes::CALL
-                                                && call.operand() == Operand::Value(1)
+                                                && call.value_argument() == Some(1)
                                                 && to_bool.opcode == crate::target::opcodes::TO_BOOL
-                                                && to_bool.operand() == Operand::Value(0)
+                                                && to_bool.value_argument() == Some(0)
                                                 && matches!(condition.opcode,
                                                     crate::target::opcodes::POP_JUMP_IF_FALSE | crate::target::opcodes::POP_JUMP_IF_TRUE)
-                                                && matches!(condition.operand(), Operand::Forward(_))
+                                                && condition.forward_target().is_some()
                                                 && [global, arg, call, to_bool, condition].iter().all(|record| {
                                                     record.local_policy.hidden_exception_owner_slots() == 0
                                                         && record.pre_fold_extra_instructions() == 0
@@ -10558,7 +10541,7 @@ impl LayoutAssembler {
                     if instruction.opcode == NOT_TAKEN
                         || (instruction.opcode != RETURN_GENERATOR
                             && !is_conditional_jump(instruction.opcode)
-                            && (!matches!(instruction.operand(), Operand::Value(_))
+                            && (instruction.value_argument().is_none()
                                 || is_scope_exit(instruction.opcode)))
                     {
                         retained_pop_prefix = None;
@@ -10827,7 +10810,7 @@ impl LayoutAssembler {
         }
         let prefix = &instructions[array..authored];
         if prefix.iter().any(|record| {
-            !matches!(record.operand(), Operand::Value(_))
+            record.value_argument().is_none()
                 || is_scope_exit(record.opcode)
                 || matches!(
                     record.opcode,
@@ -11121,7 +11104,7 @@ impl LayoutAssembler {
                 || record.opcode == NOP
                 || is_conditional_jump(record.opcode)
                 || is_scope_exit(record.opcode)
-                || matches!(record.operand(), Operand::Forward(_) | Operand::Backward(_))
+                || record.jump_target().is_some()
                 || record.local_policy.hidden_exception_owner_slots() != 0
                 || record.pre_fold_extra_instructions() != 0
                 || record.no_location_policy.borrow_fallthrough()
@@ -11370,7 +11353,7 @@ impl LayoutAssembler {
             return false;
         };
         if discard.opcode != POP_TOP
-            || discard.operand() != Operand::Value(0)
+            || discard.value_argument() != Some(0)
             || discard.location != end_send.location
             || !matches!(
                 (discard.depth_after(), end_send.depth_after()),
@@ -11510,7 +11493,7 @@ impl LayoutAssembler {
             || owners.contains_key(donor_index)
             || donor.local_policy.hidden_exception_owner_slots() != 0
             || nop.opcode != NOP
-            || nop.operand() != Operand::Value(0)
+            || nop.value_argument() != Some(0)
             || nop.fusion_policy.is_converted_pop_block()
             || nop.exception_policy() != super::ExceptionPolicy::EXCLUDE_ALWAYS
             || nop.local_policy.hidden_exception_owner_slots() != 1
@@ -11518,7 +11501,7 @@ impl LayoutAssembler {
             || load.exception_policy() != super::ExceptionPolicy::NoneUnchanged
             || load.local_policy.hidden_exception_owner_slots() != 0
             || !matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
-            || !matches!(condition.operand(), Operand::Forward(_))
+            || condition.forward_target().is_none()
             || condition.exception_policy() != super::ExceptionPolicy::NoneUnchanged
             || condition.local_policy.hidden_exception_owner_slots() != 3
             || [donor, nop, load, condition].iter().any(|instruction| {
@@ -11703,7 +11686,7 @@ impl LayoutAssembler {
                         || actual.no_location_policy.borrow_fallthrough()
                             == super::BorrowFallthrough::Barrier
                         || actual.only_allows_unconditional_inlining()
-                        || !matches!(actual.operand(), Operand::Value(_))
+                        || actual.value_argument().is_none()
                         || is_scope_exit(actual.opcode)
                         || matches!((actual.opcode, actual.operand()),
                             (COMPARE_OP, Operand::Value(argument)) if argument & 16 != 0)
@@ -11972,7 +11955,7 @@ impl LayoutAssembler {
                 || instruction.only_allows_unconditional_inlining()
                 || matches!((instruction.opcode, instruction.operand()),
                     (COMPARE_OP, Operand::Value(argument)) if argument & 16 != 0)
-                || !matches!(instruction.operand(), Operand::Value(_))
+                || instruction.value_argument().is_none()
                 || is_scope_exit(instruction.opcode)
             {
                 return None;
@@ -12079,12 +12062,12 @@ impl LayoutAssembler {
                 .last()
                 .is_none_or(|position| *position >= marker)
             || !matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
-            || !matches!(condition.operand(), Operand::Forward(_))
+            || condition.forward_target().is_none()
             || condition.local_policy.hidden_exception_owner_slots() != 3
             || condition.pre_fold_extra_instructions() != 0
             || condition.exception_policy() != super::ExceptionPolicy::NoneUnchanged
             || append.opcode != NOT_TAKEN
-            || append.operand() != Operand::Value(0)
+            || append.value_argument() != Some(0)
             || append.location != condition.location
             || append.local_policy.hidden_exception_owner_slots() != 0
             || append.pre_fold_extra_instructions() != 0
@@ -12128,7 +12111,7 @@ impl LayoutAssembler {
                 .iter()
                 .enumerate()
                 .any(|(index, instruction)| {
-                    (index + 1 < marker && !matches!(instruction.operand(), Operand::Value(_)))
+                    (index + 1 < marker && instruction.value_argument().is_none())
                         || matches!(instruction.opcode, NOT_TAKEN | FOR_ITER | SEND)
                         || (is_scope_exit(instruction.opcode)
                             && instruction.opcode != RETURN_GENERATOR)
@@ -12154,7 +12137,7 @@ impl LayoutAssembler {
                 };
                 let instruction = instructions[index];
                 if instruction.opcode != NOP
-                    || instruction.operand() != Operand::Value(0)
+                    || instruction.value_argument() != Some(0)
                     || instruction.location != *location
                     || instruction.fusion_policy.is_converted_pop_block()
                     || instruction.pre_fold_extra_instructions() != 0
@@ -12250,12 +12233,9 @@ impl LayoutAssembler {
                         .get(label)
                         .is_some_and(|position| 0 < *position && *position <= marker)
                 })
-            || instructions[..marker - 1].iter().any(|instruction| {
-                matches!(
-                    instruction.operand(),
-                    Operand::Forward(_) | Operand::Backward(_)
-                )
-            })
+            || instructions[..marker - 1]
+                .iter()
+                .any(|instruction| instruction.jump_target().is_some())
         {
             return None;
         }
@@ -12313,7 +12293,7 @@ impl LayoutAssembler {
         let original = *instructions.get(source)?;
         if source < *manager_start
             || original.opcode != POP_TOP
-            || original.operand() != Operand::Value(0)
+            || original.value_argument() != Some(0)
             || original.exception_policy() != super::ExceptionPolicy::NoneUnchanged
             || original.local_policy.hidden_exception_owner_slots() != 0
             || original.pre_fold_extra_instructions() != 0
@@ -12643,7 +12623,7 @@ impl LayoutAssembler {
         if prefix.iter().any(|record| {
             record.exception_policy() != super::ExceptionPolicy::NoneUnchanged
                 || record.opcode == NOP
-                || !matches!(record.operand(), Operand::Value(_))
+                || record.value_argument().is_none()
                 || record.local_policy.hidden_exception_owner_slots() != 0
                 || record.pre_fold_extra_instructions() != 0
                 || record.no_location_policy.borrow_fallthrough()
@@ -12738,7 +12718,7 @@ impl LayoutAssembler {
                         return None;
                     };
                     if copy.opcode != crate::target::opcodes::COPY
-                        || copy.operand() != Operand::Value(1)
+                        || copy.value_argument() != Some(1)
                         || to_bool.opcode != crate::target::opcodes::TO_BOOL
                         || [copy, to_bool].iter().any(|instruction| {
                             instruction.exception_policy()

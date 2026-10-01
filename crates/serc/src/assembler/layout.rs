@@ -257,8 +257,7 @@ impl LayoutAssembler {
             }
             for item in &self.items {
                 if let Item::Instruction(instruction) = item
-                    && let Operand::Forward(label) | Operand::Backward(label) =
-                        instruction.operand()
+                    && let Some(label) = instruction.jump_target()
                     && let Some(flags) = label_flags.get_mut(label.index())
                 {
                     *flags |= BLOCK_BOUNDARY;
@@ -396,7 +395,7 @@ impl LayoutAssembler {
                     block_has_instruction = true;
                     if instruction.opcode == NOT_TAKEN
                         || (!is_conditional_jump_for(self.python_version, instruction.opcode)
-                            && (!matches!(instruction.operand(), Operand::Value(_))
+                            && (instruction.value_argument().is_none()
                                 || ends_scope(instruction.opcode)))
                     {
                         block_has_instruction = false;

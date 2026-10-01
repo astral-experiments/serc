@@ -174,7 +174,7 @@ impl OptimizationPipeline {
             if !previous_was_swap || instruction.opcode != SWAP {
                 continue;
             }
-            let Operand::Value(depth) = instruction.operand() else {
+            let Some(depth) = instruction.value_argument() else {
                 continue;
             };
             if depth == 0 {
@@ -248,7 +248,7 @@ impl OptimizationPipeline {
         let mut block_labels = FxHashSet::default();
         for item in graph.iter_items() {
             if let Item::Instruction(instruction) = item
-                && let Operand::Forward(label) | Operand::Backward(label) = instruction.operand()
+                && let Some(label) = instruction.jump_target()
             {
                 block_labels.insert(label);
             }
@@ -265,10 +265,7 @@ impl OptimizationPipeline {
         // Both swap phases operate within partitions containing a swap.
         let blocks = graph.matching_partition_positions(
             &block_labels,
-            |instruction| {
-                !matches!(instruction.operand(), Operand::Value(_))
-                    || ends_scope(instruction.opcode)
-            },
+            |instruction| instruction.value_argument().is_none() || ends_scope(instruction.opcode),
             |instruction| instruction.opcode == SWAP,
         );
         // Admit cleanups from their complete original partition before any swap run is
@@ -327,7 +324,7 @@ impl OptimizationPipeline {
                     position += 1;
                     continue;
                 }
-                let Operand::Value(first_depth) = first.operand() else {
+                let Some(first_depth) = first.value_argument() else {
                     unreachable!();
                 };
                 let mut depth = usize::try_from(first_depth).unwrap();
@@ -340,7 +337,7 @@ impl OptimizationPipeline {
                         unreachable!();
                     };
                     if instruction.opcode == SWAP {
-                        let Operand::Value(argument) = instruction.operand() else {
+                        let Some(argument) = instruction.value_argument() else {
                             unreachable!();
                         };
                         depth = depth.max(usize::try_from(argument).unwrap());
@@ -361,7 +358,7 @@ impl OptimizationPipeline {
                         unreachable!();
                     };
                     if instruction.opcode == SWAP {
-                        let Operand::Value(argument) = instruction.operand() else {
+                        let Some(argument) = instruction.value_argument() else {
                             unreachable!();
                         };
                         stack.swap(0, usize::try_from(argument).unwrap() - 1);
@@ -404,8 +401,7 @@ impl OptimizationPipeline {
                     else {
                         unreachable!();
                     };
-                    changed |=
-                        instruction.opcode != NOP || instruction.operand() != Operand::Value(0);
+                    changed |= instruction.opcode != NOP || instruction.value_argument() != Some(0);
                     if self.python_version >= crate::PythonVersion::Py314
                         && instruction.opcode == SWAP
                     {
@@ -545,7 +541,7 @@ impl OptimizationPipeline {
                 if swap.opcode != SWAP {
                     continue;
                 }
-                let Operand::Value(depth) = swap.operand() else {
+                let Some(depth) = swap.value_argument() else {
                     unreachable!();
                 };
                 let Some(first) =
@@ -651,7 +647,7 @@ impl OptimizationPipeline {
                             break;
                         }
                         next.location = last_instruction.location;
-                        if !matches!(next.operand(), Operand::Value(_)) || ends_scope(next.opcode) {
+                        if next.value_argument().is_none() || ends_scope(next.opcode) {
                             break;
                         }
                     }
@@ -744,7 +740,7 @@ impl OptimizationPipeline {
             let Some(Item::Instruction(jump)) = source.last() else {
                 continue;
             };
-            let Operand::Forward(target) = jump.operand() else {
+            let Some(target) = jump.forward_target() else {
                 continue;
             };
             if stores.is_empty()

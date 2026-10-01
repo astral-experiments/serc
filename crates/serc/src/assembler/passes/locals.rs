@@ -122,7 +122,7 @@ impl OptimizationPipeline {
             .collect::<FxHashSet<_>>();
         for item in self.graph.iter_items() {
             if let Item::Instruction(instruction) = item
-                && let Operand::Forward(label) | Operand::Backward(label) = instruction.operand()
+                && let Some(label) = instruction.jump_target()
             {
                 targets.insert(label);
             }
@@ -164,17 +164,17 @@ impl OptimizationPipeline {
             let conditional_call_prefix = matches!(body.get(body.len().saturating_sub(3)..),
                 Some([Item::Instruction(load), Item::Instruction(test), Item::Instruction(jump)])
                     if load.opcode == LOAD_FAST
-                        && matches!(load.operand(), Operand::Value(_))
+                        && load.value_argument().is_some()
                         && test.opcode == TO_BOOL
-                        && test.operand() == Operand::Value(0)
+                        && test.value_argument() == Some(0)
                         && jump.opcode == POP_JUMP_IF_FALSE
-                        && matches!(jump.operand(), Operand::Forward(_))
+                        && jump.forward_target().is_some()
                         && load.location.line >= 0
                         && load.location == test.location
                         && test.location == jump.location)
                 && body.iter().any(|item| {
                     matches!(item, Item::Instruction(call)
-                        if call.opcode == CALL && matches!(call.operand(), Operand::Value(_)))
+                        if call.opcode == CALL && call.value_argument().is_some())
                 })
                 && body[2..].iter().all(|item| {
                     matches!(item, Item::Instruction(instruction)
@@ -195,13 +195,13 @@ impl OptimizationPipeline {
                     Item::Instruction(call),
                 ])
                     if context_call.opcode == CALL
-                        && matches!(context_call.operand(), Operand::Value(_))
-                        && copy.opcode == COPY && copy.operand() == Operand::Value(1)
-                        && exit.opcode == LOAD_SPECIAL && exit.operand() == Operand::Value(1)
-                        && swap_two.opcode == SWAP && swap_two.operand() == Operand::Value(2)
-                        && swap_three.opcode == SWAP && swap_three.operand() == Operand::Value(3)
-                        && enter.opcode == LOAD_SPECIAL && enter.operand() == Operand::Value(0)
-                        && call.opcode == CALL && call.operand() == Operand::Value(0)
+                        && context_call.value_argument().is_some()
+                        && copy.opcode == COPY && copy.value_argument() == Some(1)
+                        && exit.opcode == LOAD_SPECIAL && exit.value_argument() == Some(1)
+                        && swap_two.opcode == SWAP && swap_two.value_argument() == Some(2)
+                        && swap_three.opcode == SWAP && swap_three.value_argument() == Some(3)
+                        && enter.opcode == LOAD_SPECIAL && enter.value_argument() == Some(0)
+                        && call.opcode == CALL && call.value_argument() == Some(0)
                         && context_call.location.line >= 0
                         && [copy, exit, swap_two, swap_three, enter, call]
                             .iter().all(|instruction| instruction.location == context_call.location))
@@ -210,7 +210,7 @@ impl OptimizationPipeline {
                         if provenance.synchronous_with_setups.contains(manager))
                 && body[2..].iter().all(|item| {
                     matches!(item, Item::Instruction(instruction)
-                        if matches!(instruction.operand(), Operand::Value(_))
+                        if instruction.value_argument().is_some()
                             && !instruction.jump_policy.borrow_empty_block()
                             && instruction.no_location_policy.borrow_fallthrough() == BorrowFallthrough::Reachable)
                 });
@@ -234,7 +234,7 @@ impl OptimizationPipeline {
                 || pop.opcode != NOP
                 || !pop.fusion_policy.is_converted_pop_block()
                 || nop.opcode != NOP
-                || nop.operand() != Operand::Value(0)
+                || nop.value_argument() != Some(0)
                 || nop.fusion_policy.is_converted_pop_block()
                 || nop.location.line < 0
                 // A discarded or assigned call leaves this protected array nonempty.
@@ -249,20 +249,20 @@ impl OptimizationPipeline {
                     || matches!(body.get(body.len().saturating_sub(3)..),
                         Some([Item::Instruction(call), Item::Instruction(awaitable), Item::Instruction(value)])
                             if matches!(call.opcode, CALL | CALL_KW)
-                                && matches!(call.operand(), Operand::Value(_))
+                                && call.value_argument().is_some()
                                 && awaitable.opcode == GET_AWAITABLE
-                                && awaitable.operand() == Operand::Value(0)
+                                && awaitable.value_argument() == Some(0)
                                 && value.opcode == LOAD_CONST
-                                && matches!(value.operand(), Operand::Value(_))
+                                && value.value_argument().is_some()
                                 && value.location == awaitable.location
                                 && matches!((blocks.get(block_index + 3), blocks.get(block_index + 4)),
                                     (Some([Item::Label(_), Item::Instruction(send)]),
                                      Some([Item::Label(yielded), Item::Instruction(yield_value)]))
                                         if send.opcode == SEND
-                                            && matches!(send.operand(), Operand::Forward(_))
+                                            && send.forward_target().is_some()
                                             && send.location == awaitable.location
                                             && yield_value.opcode == crate::target::opcodes::YIELD_VALUE
-                                            && yield_value.operand() == Operand::Value(1)
+                                            && yield_value.value_argument() == Some(1)
                                             && provenance.ordinary_await_cleanups.iter().filter(|region| {
                                                 region.start == *yielded
                                                     && !region.is_scope_fallback
@@ -362,7 +362,7 @@ impl OptimizationPipeline {
                             continue;
                         }
                         if matches!(instruction.opcode, NOP | NOT_TAKEN)
-                            || !matches!(instruction.operand(), Operand::Value(_))
+                            || instruction.value_argument().is_none()
                             || ends_scope(instruction.opcode)
                             || instruction.jump_policy.borrow_empty_block()
                             || instruction.no_location_policy.borrow_fallthrough()
@@ -547,7 +547,7 @@ impl OptimizationPipeline {
                     return None;
                 }
                 let setup_source = if let [Item::Label(alias)] = leading
-                    && let Operand::Forward(target) = jump.operand()
+                    && let Some(target) = jump.forward_target()
                     && self.exception_owner_provenance.compound_try_owner_exits
                         .iter().filter(|origin| **origin == (*alias, target)).count() == 1
                     && let Some(source_items) =
@@ -565,7 +565,7 @@ impl OptimizationPipeline {
                     && jump.location.line >= 0
                     && leading.iter().all(|item| matches!(item, Item::Label(_)))
                     && let Some(Item::Label(alias)) = leading.last()
-                    && let Operand::Forward(target) = jump.operand()
+                    && let Some(target) = jump.forward_target()
                     && self.exception_owner_provenance.compound_try_owner_exits
                         .iter().filter(|origin| **origin == (*alias, target)).count() == 1
                     && !self.exception_owner_provenance.block_boundaries.contains(alias)
@@ -590,7 +590,7 @@ impl OptimizationPipeline {
                 // Capture the complete span; the checks below require exactly one
                 // original boundary and a nonempty, straight-line surviving prefix.
                 let source_exit_alias = if let [Item::Label(alias)] = leading
-                    && let Operand::Forward(target) = jump.operand()
+                    && let Some(target) = jump.forward_target()
                     && self.exception_owner_provenance.compound_try_owner_exits
                         .iter().filter(|origin| **origin == (*alias, target)).count() == 1
                     && !self.exception_owner_provenance.block_boundaries.contains(alias)
@@ -647,7 +647,7 @@ impl OptimizationPipeline {
                     // Their disappearance does not empty a source whose complete live
                     // prefix survives. Arbitrary or explicitly retained NOPs are excluded.
                     if instruction.opcode == NOP
-                        && instruction.operand() == Operand::Value(0)
+                        && instruction.value_argument() == Some(0)
                         && instruction.fusion_policy.is_converted_pop_block()
                         && instruction.exception_policy()
                             == crate::assembler::ExceptionPolicy::EXCLUDE_ALWAYS
@@ -668,7 +668,7 @@ impl OptimizationPipeline {
                         && source_exit_alias.is_some()
                         && leading.len() == source_label_count + 1
                         && instruction.opcode == NOP
-                        && instruction.operand() == Operand::Value(0)
+                        && instruction.value_argument() == Some(0)
                         && instruction.location.line >= 0
                         && !instruction.fusion_policy.is_converted_pop_block()
                         && instruction.pre_fold_extra_instructions() == 0
@@ -676,7 +676,7 @@ impl OptimizationPipeline {
                         && instruction.jump_policy.retained_nop()
                             == crate::assembler::ir::RetainedJumpNop::None;
                     if (matches!(instruction.opcode, NOP | NOT_TAKEN) && !retained_source_nop)
-                        || !matches!(instruction.operand(), Operand::Value(_))
+                        || instruction.value_argument().is_none()
                         || ends_scope(instruction.opcode)
                         || instruction.jump_policy.borrow_empty_block()
                         || instruction.no_location_policy.borrow_fallthrough()
@@ -704,9 +704,7 @@ impl OptimizationPipeline {
                 {
                     return None;
                 }
-                let Operand::Forward(target) = jump.operand() else {
-                    return None;
-                };
+                let target = jump.forward_target()?;
                 let target_block = self.graph.label_block(target)?;
                 let target_items = self.graph[target_block].items();
                 let setup_join = if setup_source.is_some() {
@@ -857,7 +855,7 @@ impl OptimizationPipeline {
                         continue;
                     }
                     if matches!(instruction.opcode, NOP | NOT_TAKEN)
-                        || !matches!(instruction.operand(), Operand::Value(_))
+                        || instruction.value_argument().is_none()
                         || instruction.jump_policy.borrow_empty_block()
                         || instruction.no_location_policy.borrow_fallthrough()
                             != BorrowFallthrough::Reachable
@@ -1095,7 +1093,7 @@ impl BorrowMarkerRetention {
         let mut incoming_jumps = FxHashMap::<Label, usize>::default();
         for item in items {
             if let Item::Instruction(instruction) = item
-                && let Operand::Forward(target) | Operand::Backward(target) = instruction.operand()
+                && let Some(target) = instruction.jump_target()
             {
                 *incoming_jumps.entry(target).or_default() += 1;
             }
@@ -1135,7 +1133,7 @@ impl BorrowMarkerRetention {
 }
 
 fn instruction_ends_borrow_block(instruction: &Instruction) -> bool {
-    !matches!(instruction.operand(), Operand::Value(_))
+    instruction.value_argument().is_none()
         || ends_scope(instruction.opcode)
         || instruction.opcode == NOT_TAKEN
         || (instruction.opcode == NOP && instruction.jump_policy.always_retains_nop())
@@ -1168,7 +1166,7 @@ fn for_iter_enters_original_cleanup(
             Item::Instruction(first) => {
                 return at_target
                     && first.opcode == END_FOR
-                    && first.operand() == Operand::Value(0)
+                    && first.value_argument() == Some(0)
                     && first.no_location_policy.borrow_fallthrough()
                         == BorrowFallthrough::Reachable
                     && !first.jump_policy.borrow_empty_block();
@@ -1632,7 +1630,7 @@ pub(super) fn update_assertion_local_checks(
     {
         return;
     }
-    let Operand::Value(argument) = instruction.operand() else {
+    let Some(argument) = instruction.value_argument() else {
         return;
     };
     let Ok(local) = usize::try_from(argument) else {
@@ -1712,7 +1710,7 @@ pub(in crate::assembler) fn optimize_linear_assertion_load_fast(
                         | STORE_FAST_LOAD_FAST
                         | STORE_FAST_STORE_FAST
                 );
-                let ends_block = !matches!(instruction.operand(), Operand::Value(_))
+                let ends_block = instruction.value_argument().is_none()
                     || ends_scope(instruction.opcode)
                     || instruction.opcode == NOT_TAKEN
                     || (instruction.opcode == NOP && instruction.jump_policy.always_retains_nop())
@@ -1740,8 +1738,7 @@ pub(in crate::assembler) fn optimize_linear_assertion_load_fast(
                 Item::Label(_) => None,
             })
             .expect("a borrow block with candidates should contain an instruction");
-        let consumes_stack = (!matches!(last.operand(), Operand::Value(_))
-            || ends_scope(last.opcode))
+        let consumes_stack = (last.value_argument().is_none() || ends_scope(last.opcode))
             && last.depth_after() == Some(0);
         if !has_local_mutation && !requires_stack_analysis && consumes_stack {
             for offset in &candidates {
@@ -2009,7 +2006,7 @@ impl OptimizationPipeline {
                 }
                 Item::Instruction(instruction) => {
                     if !matches!(instruction.opcode, NOP | NOT_TAKEN)
-                        && matches!(instruction.operand(), Operand::Value(_))
+                        && instruction.value_argument().is_some()
                     {
                         pending.clear();
                     } else if instruction.opcode == crate::target::opcodes::JUMP_FORWARD
@@ -2017,7 +2014,7 @@ impl OptimizationPipeline {
                         && instruction.jump_policy.allows_borrow_threading_target()
                         && !instruction.jump_policy.always_retains_nop()
                         && !instruction.jump_policy.borrow_empty_block()
-                        && let Operand::Forward(target) = instruction.operand()
+                        && let Some(target) = instruction.forward_target()
                     {
                         for label in &pending {
                             links.insert(*label, target);
@@ -2098,8 +2095,7 @@ impl OptimizationPipeline {
                         && !instruction.jump_policy.borrow_empty_block()
                         && instruction.no_location_policy.borrow_fallthrough()
                             == BorrowFallthrough::Reachable
-                        && let Operand::Forward(target) | Operand::Backward(target) =
-                            instruction.operand()
+                        && let Some(target) = instruction.jump_target()
                         && (nonempty_targets.contains(&target) || routes.contains_key(&target))
                     {
                         graph
@@ -2163,7 +2159,7 @@ impl OptimizationPipeline {
                 }
                 Item::Instruction(instruction) => {
                     if !matches!(instruction.opcode, NOP | NOT_TAKEN)
-                        && matches!(instruction.operand(), Operand::Value(_))
+                        && instruction.value_argument().is_some()
                     {
                         nonempty.extend(pending.drain(..));
                     }
@@ -2320,8 +2316,7 @@ impl OptimizationPipeline {
                             && instruction.no_location_policy.borrow_fallthrough()
                                 == BorrowFallthrough::Reachable
                             && let Some(source) = nearest_label
-                            && let Operand::Forward(target) | Operand::Backward(target) =
-                                instruction.operand()
+                            && let Some(target) = instruction.jump_target()
                             && (instruction.initial_borrow_jump_target() == Some(target)
                                 || threaded_positions.contains(
                                     &crate::assembler::block_graph::ItemPosition::new(
@@ -2365,7 +2360,7 @@ impl OptimizationPipeline {
                 && instruction.opcode == crate::target::opcodes::JUMP_FORWARD
                 && instruction.fusion_policy.is_authored_break()
                 && !instruction.jump_policy.borrow_empty_block()
-                && let Operand::Forward(target) = instruction.operand()
+                && let Some(target) = instruction.forward_target()
                 && let Some(finally_target) = origins.routes.get(&target)
             {
                 targets.insert(instruction_index, *finally_target);
@@ -2405,7 +2400,7 @@ impl OptimizationPipeline {
                         && let (Some(source), Some(original_source)) =
                             (nearest_label, original_source)
                         && origins.snapshots.contains_key(&original_source)
-                        && let Operand::Forward(target) = instruction.operand()
+                        && let Some(target) = instruction.forward_target()
                     {
                         entries.insert(
                             source,
@@ -2455,7 +2450,7 @@ impl OptimizationPipeline {
         }
         for item in self.graph.iter_items() {
             if let Item::Instruction(instruction) = item
-                && let Operand::Forward(target) | Operand::Backward(target) = instruction.operand()
+                && let Some(target) = instruction.jump_target()
             {
                 block_labels.insert(target);
             }
@@ -2487,11 +2482,10 @@ impl OptimizationPipeline {
                 self.graph[block]
                     .last_instruction()
                     .is_none_or(|instruction| {
-                        matches!(instruction.operand(), Operand::Value(_))
-                            && !ends_scope(instruction.opcode)
+                        instruction.value_argument().is_some() && !ends_scope(instruction.opcode)
                     });
             for instruction in self.graph.instructions_mut(block) {
-                let Operand::Value(argument) = instruction.operand() else {
+                let Some(argument) = instruction.value_argument() else {
                     continue;
                 };
                 let Some(local) = usize::try_from(argument)
@@ -2568,10 +2562,7 @@ impl OptimizationPipeline {
         let mut boundaries = self.exception_owner_provenance.block_boundaries.clone();
         boundaries.extend(self.exception_regions.iter().map(|region| region.target));
         boundaries.extend(self.graph.iter_items().filter_map(|item| match item {
-            Item::Instruction(instruction) => match instruction.operand() {
-                Operand::Forward(label) | Operand::Backward(label) => Some(label),
-                Operand::Value(_) | Operand::Deferred(_) => None,
-            },
+            Item::Instruction(instruction) => instruction.jump_target(),
             Item::Label(_) => None,
         }));
         let mut other_occurrences = LocalNopDonors::default();
@@ -2687,7 +2678,7 @@ impl OptimizationPipeline {
                 {
                     return false;
                 }
-                let Operand::Value(local) = instruction.operand() else {
+                let Some(local) = instruction.value_argument() else {
                     continue;
                 };
                 let Ok(local) = usize::try_from(local) else {
@@ -2788,7 +2779,7 @@ impl OptimizationPipeline {
                 {
                     continue;
                 }
-                let Operand::Value(argument) = instruction.operand() else {
+                let Some(argument) = instruction.value_argument() else {
                     continue;
                 };
                 let Ok(local) = usize::try_from(argument) else {
@@ -3001,7 +2992,7 @@ impl OptimizationPipeline {
                 {
                     propagate(target, unsafe_locals);
                 }
-                let Operand::Value(argument) = instruction.operand() else {
+                let Some(argument) = instruction.value_argument() else {
                     continue;
                 };
                 let Ok(local) = usize::try_from(argument) else {
@@ -3163,7 +3154,7 @@ impl OptimizationPipeline {
         for block in checked_blocks {
             let mut initialized = FxHashSet::default();
             for instruction in graph.instructions_mut(block) {
-                let Operand::Value(argument) = instruction.operand() else {
+                let Some(argument) = instruction.value_argument() else {
                     break;
                 };
                 match instruction.opcode {
@@ -3264,7 +3255,7 @@ impl OptimizationPipeline {
                 && last.opcode == crate::target::opcodes::JUMP_FORWARD
                 && last.fusion_policy.is_authored_break()
                 && last.location.line >= 0
-                && matches!(last.operand(), Operand::Forward(_))
+                && last.forward_target().is_some()
                 && !last.jump_policy.borrow_empty_block()
                 && !last.jump_policy.always_retains_nop()
                 && last.no_location_policy.borrow_fallthrough() == BorrowFallthrough::Reachable
@@ -3309,7 +3300,7 @@ impl OptimizationPipeline {
         boundaries.extend(self.exception_regions.iter().map(|region| region.target));
         for item in self.graph.iter_items() {
             if let Item::Instruction(instruction) = item
-                && let Operand::Forward(label) | Operand::Backward(label) = instruction.operand()
+                && let Some(label) = instruction.jump_target()
             {
                 boundaries.insert(label);
             }
@@ -3377,21 +3368,21 @@ impl OptimizationPipeline {
                         // must not borrow a witness from a different original array.
                         let primitive_condition = match instructions.as_slice() {
                             [_, load, attributes @ .., to_bool, jump] => load.opcode == LOAD_FAST
-                                && matches!(load.operand(), Operand::Value(_))
+                                && load.value_argument().is_some()
                                 && attributes.iter().all(|attribute| {
                                     attribute.opcode == LOAD_ATTR
                                         && matches!(attribute.operand(), Operand::Value(argument)
                                                 if argument & 1 == 0)
                                 })
                                 && to_bool.opcode == TO_BOOL
-                                && to_bool.operand() == Operand::Value(0)
+                                && to_bool.value_argument() == Some(0)
                                 && jump.opcode == POP_JUMP_IF_FALSE
-                                && matches!(jump.operand(), Operand::Forward(_)),
+                                && jump.forward_target().is_some(),
                             [_, load, jump] => {
                                 load.opcode == LOAD_FAST
-                                    && matches!(load.operand(), Operand::Value(_))
+                                    && load.value_argument().is_some()
                                     && jump.opcode == POP_JUMP_IF_NONE
-                                    && matches!(jump.operand(), Operand::Forward(_))
+                                    && jump.forward_target().is_some()
                             }
                             _ => false,
                         } && instructions.iter().all(|instruction| {
@@ -3404,7 +3395,7 @@ impl OptimizationPipeline {
                         // fuse its local load across the iterator conversion.
                         let primitive_iteration = match instructions.as_slice() {
                             [_, load, attributes @ .., get_iter] => load.opcode == LOAD_FAST
-                                && matches!(load.operand(), Operand::Value(_))
+                                && load.value_argument().is_some()
                                 && attributes.len() <= 1
                                 && attributes.iter().all(|attribute| {
                                     attribute.opcode == LOAD_ATTR
@@ -3412,7 +3403,7 @@ impl OptimizationPipeline {
                                             if argument & 1 == 0)
                                 })
                                 && get_iter.opcode == GET_ITER
-                                && get_iter.operand() == Operand::Value(0),
+                                && get_iter.value_argument() == Some(0),
                             _ => false,
                         } && items[range.clone()]
                             .iter()
@@ -3429,14 +3420,14 @@ impl OptimizationPipeline {
                         let attribute_assignment = match instructions.as_slice() {
                             [_, value, receiver, store, jump] => {
                                 value.opcode == LOAD_FAST
-                                    && matches!(value.operand(), Operand::Value(_))
+                                    && value.value_argument().is_some()
                                     && receiver.opcode == LOAD_GLOBAL
                                     && matches!(receiver.operand(), Operand::Value(argument)
                                     if argument & 1 == 0)
                                     && store.opcode == STORE_ATTR
-                                    && matches!(store.operand(), Operand::Value(_))
+                                    && store.value_argument().is_some()
                                     && is_unconditional_jump(jump.opcode)
-                                    && matches!(jump.operand(), Operand::Forward(_))
+                                    && jump.forward_target().is_some()
                             }
                             _ => false,
                         };
@@ -3447,13 +3438,13 @@ impl OptimizationPipeline {
                             [_, prefix @ .., load, get_iter, clear, swap] => {
                                 !prefix.is_empty()
                                     && load.opcode == LOAD_FAST
-                                    && matches!(load.operand(), Operand::Value(_))
+                                    && load.value_argument().is_some()
                                     && get_iter.opcode == GET_ITER
-                                    && get_iter.operand() == Operand::Value(0)
+                                    && get_iter.value_argument() == Some(0)
                                     && clear.opcode == LOAD_FAST_AND_CLEAR
-                                    && matches!(clear.operand(), Operand::Value(_))
+                                    && clear.value_argument().is_some()
                                     && swap.opcode == SWAP
-                                    && swap.operand() == Operand::Value(2)
+                                    && swap.value_argument() == Some(2)
                             }
                             _ => false,
                         };
@@ -3487,7 +3478,7 @@ impl OptimizationPipeline {
                                     && !scope_exit
                                     && (instruction.opcode == CALL_KW
                                         || (instruction.opcode == GET_AWAITABLE
-                                            && instruction.operand() == Operand::Value(0))
+                                            && instruction.value_argument() == Some(0))
                                         || (primitive_iteration && instruction.opcode == GET_ITER)
                                         || (primitive_condition && index == 1)
                                         || (unsplit_reachable_array
@@ -3500,7 +3491,7 @@ impl OptimizationPipeline {
                             {
                                 continue;
                             }
-                            let Operand::Value(argument) = instruction.operand() else {
+                            let Some(argument) = instruction.value_argument() else {
                                 continue;
                             };
                             // These five operations survive constant/NOP folding before exit copying:
@@ -3709,8 +3700,7 @@ impl OptimizationPipeline {
             boundaries.extend(exception_regions.iter().map(|region| region.target));
             for item in items.iter() {
                 if let Item::Instruction(instruction) = item
-                    && let Operand::Forward(target) | Operand::Backward(target) =
-                        instruction.operand()
+                    && let Some(target) = instruction.jump_target()
                 {
                     boundaries.insert(target);
                 }
@@ -3746,7 +3736,7 @@ impl OptimizationPipeline {
                     pending.push(block + 1);
                 }
                 if let Some(last) = last
-                    && let Operand::Forward(label) | Operand::Backward(label) = last.operand()
+                    && let Some(label) = last.jump_target()
                     && let Some(target) = label_blocks.get(label.index()).copied()
                     && target < blocks.len()
                 {
@@ -3896,7 +3886,7 @@ impl OptimizationPipeline {
                     items.iter().any(|item| {
                         matches!(item, Item::Instruction(instruction)
                             if instruction.jump_policy.borrow_empty_block()
-                                && !matches!(instruction.operand(), Operand::Value(_)))
+                                && instruction.value_argument().is_none())
                     })
                 })
             .then(|| {
@@ -4046,7 +4036,7 @@ impl OptimizationPipeline {
                         false
                     } else {
                         let is_sole_source_nop = last.opcode == NOP
-                            && last.operand() == Operand::Value(0)
+                            && last.value_argument() == Some(0)
                             && last.location.line >= 0
                             && !last.fusion_policy.is_converted_pop_block()
                             && last.pre_fold_extra_instructions() == 0
@@ -4071,7 +4061,7 @@ impl OptimizationPipeline {
                 // but a surviving threaded jump still reaches its explicit target.
                 // Ignore analysis-only NOPs when deciding whether a marked jump survives:
                 // a zero-distance surrogate still represents the removed empty block.
-                if let Operand::Forward(label) | Operand::Backward(label) = last.operand()
+                if let Some(label) = last.jump_target()
                     && let Some(target) = label_blocks
                         .get(label.index())
                         .copied()
@@ -4456,8 +4446,7 @@ impl OptimizationPipeline {
                         Item::Label(_) => None,
                     })
                     .expect("a borrow block with candidates should contain an instruction");
-                let consumes_stack = (!matches!(last.operand(), Operand::Value(_))
-                    || ends_scope(last.opcode))
+                let consumes_stack = (last.value_argument().is_none() || ends_scope(last.opcode))
                     && last.depth_after() == Some(0);
                 // No local can invalidate a candidate, and an empty outgoing stack proves
                 // every produced reference was consumed in this reachable block.
@@ -4482,7 +4471,7 @@ impl OptimizationPipeline {
                 let Item::Instruction(instruction) = *item else {
                     continue;
                 };
-                let Operand::Value(argument) = instruction.operand() else {
+                let Some(argument) = instruction.value_argument() else {
                     cumulative_effect += opcode_stack_effect(python_version, instruction.opcode, 0);
                     if let Some(depth_after) = instruction.depth_after() {
                         start_depth = Some(i64::from(depth_after) - cumulative_effect);

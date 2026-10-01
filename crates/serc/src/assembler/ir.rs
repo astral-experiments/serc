@@ -1453,6 +1453,32 @@ impl Instruction {
         self.fusion_policy.operand(self.operand_payload)
     }
 
+    /// Read a numeric argument without decoding unrelated symbolic operand variants.
+    pub(super) const fn value_argument(&self) -> Option<u32> {
+        if self.fusion_policy.0 & FusionPolicy::OPERAND_KIND_MASK == FusionPolicy::VALUE_OPERAND {
+            Some(self.operand_payload)
+        } else {
+            None
+        }
+    }
+
+    /// Both jump directions share the high operand-kind bit.
+    pub(super) const fn jump_target(&self) -> Option<Label> {
+        if self.fusion_policy.0 & FusionPolicy::FORWARD_OPERAND != 0 {
+            Some(Label::from_u32(self.operand_payload))
+        } else {
+            None
+        }
+    }
+
+    pub(super) const fn forward_target(&self) -> Option<Label> {
+        if self.fusion_policy.0 & FusionPolicy::OPERAND_KIND_MASK == FusionPolicy::FORWARD_OPERAND {
+            Some(Label::from_u32(self.operand_payload))
+        } else {
+            None
+        }
+    }
+
     pub(super) fn set_operand(&mut self, operand: Operand) {
         if self.operand() != operand {
             self.jump_policy.retire_original_uniform_fold();
@@ -1992,6 +2018,42 @@ mod initial_borrow_metadata_tests {
             }
         }
         encodings
+    }
+
+    #[test]
+    fn specialized_operand_accessors_preserve_all_kinds_and_policy_bits() {
+        for flags in 0..=u8::MAX {
+            for payload in [0, 1, 255, 65_535, u32::MAX - 1] {
+                let mut instruction =
+                    Instruction::value_with_depth(LOAD_FAST, payload, SourceLocation::NONE, 0);
+                instruction.fusion_policy = super::FusionPolicy(flags);
+                assert_eq!(
+                    instruction.value_argument(),
+                    match instruction.operand() {
+                        Operand::Value(value) => Some(value),
+                        _ => None,
+                    }
+                );
+                assert_eq!(
+                    instruction.forward_target(),
+                    match instruction.operand() {
+                        Operand::Forward(label) => Some(label),
+                        _ => None,
+                    }
+                );
+                assert_eq!(
+                    instruction.jump_target(),
+                    match instruction.operand() {
+                        Operand::Forward(label) | Operand::Backward(label) => Some(label),
+                        _ => None,
+                    }
+                );
+            }
+        }
+        // A numeric argument can use all 32 bits, including the reserved label value.
+        let maximum = Instruction::value_with_depth(LOAD_FAST, u32::MAX, SourceLocation::NONE, 0);
+        assert_eq!(maximum.value_argument(), Some(u32::MAX));
+        assert_eq!(maximum.jump_target(), None);
     }
 
     #[test]

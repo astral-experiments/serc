@@ -1620,6 +1620,7 @@ fn parallel_compile_reports_errors_in_serial_order() {
         ["--check", "-j", "4"].as_slice(),
         ["--check"].as_slice(),
         ["--jobs", "4"].as_slice(),
+        ["--jobs", "1"].as_slice(),
         [].as_slice(),
     ] {
         let parallel = serc()
@@ -1640,6 +1641,68 @@ fn parallel_compile_reports_errors_in_serial_order() {
             !options.contains(&"--check")
         );
     }
+}
+
+#[test]
+fn ordered_cache_writer_reports_mixed_failures_and_finishes_later_outputs() {
+    let directory = tempfile::tempdir().unwrap();
+    for (folder, source) in [
+        ("a", "value = 1\n"),
+        ("b", "def broken(:\n"),
+        ("c", "value = 3\n"),
+    ] {
+        let path = directory.path().join(folder);
+        fs_err::create_dir(&path).unwrap();
+        fs_err::write(path.join("module.py"), source).unwrap();
+    }
+    fs_err::write(directory.path().join("a/__pycache__"), "blocked").unwrap();
+    let output = serc()
+        .args(["compile", "--jobs", "1"])
+        .arg(directory.path())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let write_error = stderr.find("failed to create").unwrap();
+    let compile_error = stderr.find("failed to compile").unwrap();
+    assert!(write_error < compile_error, "{stderr}");
+    assert!(
+        stderr.ends_with("failed to compile 2 of 3 files\n"),
+        "{stderr}"
+    );
+    assert!(
+        directory
+            .path()
+            .join("c/__pycache__/module.cpython-314.pyc")
+            .is_file()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn single_worker_reads_output_dependent_symlinks_after_previous_writes() {
+    use std::os::unix::fs::symlink;
+    let directory = tempfile::tempdir().unwrap();
+    let cache = directory.path().join("__pycache__");
+    fs_err::create_dir(&cache).unwrap();
+    let output = cache.join("a.cpython-314.pyc");
+    fs_err::write(&output, "old = True\n").unwrap();
+    fs_err::write(directory.path().join("a.py"), "new = True\n").unwrap();
+    symlink(&output, directory.path().join("z.py")).unwrap();
+    let result = serc()
+        .args(["compile", "--jobs", "1"])
+        .arg(directory.path())
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("z.py"), "{stderr}");
+    assert!(
+        stderr.ends_with("failed to compile 1 of 2 files\n"),
+        "{stderr}"
+    );
+    assert!(!cache.join("z.cpython-314.pyc").exists());
 }
 
 #[test]

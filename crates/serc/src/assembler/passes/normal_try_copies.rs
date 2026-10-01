@@ -76,9 +76,9 @@ pub(super) fn original_local_return(items: &[Item]) -> bool {
     matches!(&items[head_len..],
     [Item::Instruction(load), Item::Instruction(ret)]
         if load.opcode == LOAD_FAST
-            && matches!(load.operand(), Operand::Value(_))
+            && load.value_argument().is_some()
             && ret.opcode == RETURN_VALUE
-            && ret.operand() == Operand::Value(0)
+            && ret.value_argument() == Some(0)
             && [load, ret].iter().all(|instruction| {
                 instruction.location.line >= 0
                     && instruction.pre_fold_extra_instructions() == 0
@@ -106,13 +106,13 @@ pub(super) fn original_local_tuple_return(items: &[Item]) -> Option<[bool; 4]> {
         return None;
     };
     (first.opcode == LOAD_FAST
-        && matches!(first.operand(), Operand::Value(_))
+        && first.value_argument().is_some()
         && second.opcode == LOAD_FAST
-        && matches!(second.operand(), Operand::Value(_))
+        && second.value_argument().is_some()
         && tuple.opcode == BUILD_TUPLE
-        && tuple.operand() == Operand::Value(2)
+        && tuple.value_argument() == Some(2)
         && ret.opcode == RETURN_VALUE
-        && ret.operand() == Operand::Value(0)
+        && ret.value_argument() == Some(0)
         && [first, second, tuple, ret].iter().all(|instruction| {
             instruction.location.line >= 0
                 && instruction.pre_fold_extra_instructions() == 0
@@ -141,13 +141,13 @@ fn original_local_subscript_return(items: &[Item]) -> Option<OriginalTail> {
         return None;
     };
     (value.opcode == LOAD_FAST
-        && matches!(value.operand(), Operand::Value(_))
+        && value.value_argument().is_some()
         && index.opcode == LOAD_FAST
-        && matches!(index.operand(), Operand::Value(_))
+        && index.value_argument().is_some()
         && subscript.opcode == BINARY_OP
         && subscript.operand() == Operand::Value(BinaryOperation::SUBSCR.argument())
         && ret.opcode == RETURN_VALUE
-        && ret.operand() == Operand::Value(0)
+        && ret.value_argument() == Some(0)
         && [value, index, subscript, ret]
             .into_iter()
             .zip([1, 2, 1, 0])
@@ -181,12 +181,10 @@ fn original_computed_return(items: &[Item]) -> Option<OriginalTail> {
     else {
         return None;
     };
-    let Operand::Value(argument) = load.operand() else {
-        return None;
-    };
+    let argument = load.value_argument()?;
     if load.opcode != LOAD_GLOBAL
         || ret.opcode != RETURN_VALUE
-        || ret.operand() != Operand::Value(0)
+        || ret.value_argument() != Some(0)
         || value.depth_after() != Some(1)
         || ret.depth_after() != Some(0)
         || [load, value, ret].iter().any(|instruction| {
@@ -210,7 +208,7 @@ fn original_computed_return(items: &[Item]) -> Option<OriginalTail> {
     } else if argument & 1 != 0
         && load.depth_after() == Some(2)
         && value.opcode == CALL
-        && value.operand() == Operand::Value(0)
+        && value.value_argument() == Some(0)
     {
         // The fused LOAD_GLOBAL still represents its original PUSH_NULL slot.
         4
@@ -526,7 +524,7 @@ impl OptimizationPipeline {
             let Some((Item::Instruction(jump), head)) = graph[block].items().split_last() else {
                 return false;
             };
-            let Operand::Forward(end) = jump.operand() else {
+            let Some(end) = jump.forward_target() else {
                 return false;
             };
             if self.conditional_threading_targets.is_empty()
@@ -581,7 +579,7 @@ impl OptimizationPipeline {
             let Some((Item::Instruction(jump), prefix)) = graph[block].items().split_last() else {
                 return false;
             };
-            let Operand::Forward(end) = jump.operand() else {
+            let Some(end) = jump.forward_target() else {
                 return false;
             };
             if graph.label_block(end) != Some(target)
@@ -690,7 +688,7 @@ impl OptimizationPipeline {
             else {
                 return false;
             };
-            let Operand::Forward(failure) = condition.operand() else {
+            let Some(failure) = condition.forward_target() else {
                 return false;
             };
             let Some(failure_block) = graph.label_block(failure) else {
@@ -713,7 +711,7 @@ impl OptimizationPipeline {
             }
             let class_test = condition.opcode == POP_JUMP_IF_NONE
                 && value.opcode == MATCH_CLASS
-                && matches!(value.operand(), Operand::Value(_))
+                && value.value_argument().is_some()
                 && *value
                     == Instruction::new(
                         MATCH_CLASS,
@@ -737,7 +735,7 @@ impl OptimizationPipeline {
                 };
             let truth_test = matches!(condition.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE)
                 && value.opcode == LOAD_FAST
-                && matches!(value.operand(), Operand::Value(_))
+                && value.value_argument().is_some()
                 && *value
                     == Instruction::new(
                         LOAD_FAST,
@@ -778,7 +776,7 @@ impl OptimizationPipeline {
                 let Item::Instruction(instruction) = item else {
                     return false;
                 };
-                if !matches!(instruction.operand(), Operand::Value(_))
+                if instruction.value_argument().is_none()
                     || instruction.location.line < 0
                     || super::super::ends_scope(instruction.opcode)
                     || matches!(
@@ -1008,7 +1006,7 @@ impl OptimizationPipeline {
                 continue;
             }
             let jump = graph[block].last_instruction().expect("match-success jump");
-            let Operand::Forward(end) = jump.operand() else {
+            let Some(end) = jump.forward_target() else {
                 continue;
             };
             let Some(target) = graph.label_block(end) else {
@@ -1060,9 +1058,9 @@ impl OptimizationPipeline {
             expected_marker
                 .set_exception_policy(super::super::ExceptionPolicy::NoneDynamicCondition);
             if load.opcode != LOAD_FAST
-                || !matches!(load.operand(), Operand::Value(_))
+                || load.value_argument().is_none()
                 || convert.opcode != TO_BOOL
-                || convert.operand() != Operand::Value(0)
+                || convert.value_argument() != Some(0)
                 || condition.opcode != POP_JUMP_IF_FALSE
                 || !matches!(condition.operand(), Operand::Forward(label)
                     if graph.label_block(label) == Some(block))
@@ -1082,7 +1080,7 @@ impl OptimizationPipeline {
                                         instruction.depth_after(),
                                     )
                                 || (instruction != condition
-                                    && (!matches!(instruction.operand(), Operand::Value(_))
+                                    && (instruction.value_argument().is_none()
                                         || super::super::ends_scope(instruction.opcode)
                                         || matches!(
                                             instruction.opcode,
@@ -1152,7 +1150,7 @@ impl OptimizationPipeline {
                     continue;
                 }
                 if returns.contains_key(&target)
-                    && matches!(jump.operand(), Operand::Forward(_))
+                    && jump.forward_target().is_some()
                     && positions[&block] < positions[&target]
                     && ((!intact(block, true, false) && is_opaque_match_source(block))
                         || is_independent_match_tail(block, target)
@@ -1171,7 +1169,7 @@ impl OptimizationPipeline {
                 let observer = is_comparison_observer(block, target);
                 if (!intact(block, true, false) && !opaque_source && !observer)
                     || jump.opcode != JUMP_FORWARD
-                    || !matches!(jump.operand(), Operand::Forward(_))
+                    || jump.forward_target().is_none()
                     || positions[&block] >= positions[&target]
                     || (!jump.jump_policy.inline_small_exit() && !observer)
                     || (jump.jump_policy.always_retains_nop() && !observer)
@@ -1243,7 +1241,7 @@ impl OptimizationPipeline {
                 let bridge = graph[block]
                     .last_instruction()
                     .expect("witnessed comparison bridge");
-                let Operand::Forward(end) = bridge.operand() else {
+                let Some(end) = bridge.forward_target() else {
                     unreachable!()
                 };
                 nodes.push(OriginalNode {
@@ -1267,7 +1265,7 @@ impl OptimizationPipeline {
                 let (jump, prefix) = instructions
                     .split_last()
                     .expect("certified original source");
-                let Operand::Forward(label) = jump.operand() else {
+                let Some(label) = jump.forward_target() else {
                     unreachable!()
                 };
                 let target = graph.label_block(label).expect("closed original target");
@@ -1488,11 +1486,11 @@ impl OptimizationPipeline {
                 || yield_position + 1 >= cleanup_position
                 || self.graph.label_block(region.end) != Some(blocks[yield_position + 1])
                 || yield_value.opcode != YIELD_VALUE
-                || yield_value.operand() != Operand::Value(1)
+                || yield_value.value_argument() != Some(1)
                 || cleanup_throw.opcode != CLEANUP_THROW
-                || cleanup_throw.operand() != Operand::Value(0)
+                || cleanup_throw.value_argument() != Some(0)
                 || end_send.opcode != END_SEND
-                || end_send.operand() != Operand::Value(0)
+                || end_send.value_argument() != Some(0)
                 || yield_value.depth_after() != Some(region.depth)
                 || cleanup_throw.depth_after() != Some(region.depth)
                 || end_send.depth_after()
@@ -1601,7 +1599,7 @@ impl OptimizationPipeline {
         };
         if records.iter().any(|instruction| {
             instruction.location != SourceLocation::NONE
-                || !matches!(instruction.operand(), Operand::Value(_))
+                || instruction.value_argument().is_none()
                 || instruction.pre_fold_extra_instructions() != 0
                 || instruction.local_policy.hidden_exception_owner_slots() != 0
                 || instruction.exception_policy() != super::super::ExceptionPolicy::default()
@@ -1641,9 +1639,7 @@ impl OptimizationPipeline {
         {
             return None;
         }
-        let Operand::Forward(target) = jump.operand() else {
-            return None;
-        };
+        let target = jump.forward_target()?;
         graph.label_block(target)
     }
 
@@ -1697,7 +1693,7 @@ impl OptimizationPipeline {
             let Some((Item::Instruction(jump), head)) = graph[block].items().split_last() else {
                 continue;
             };
-            let Operand::Forward(target) = jump.operand() else {
+            let Some(target) = jump.forward_target() else {
                 continue;
             };
             if owners.is_empty()
@@ -1743,7 +1739,7 @@ impl OptimizationPipeline {
             let shared_reraise = self.python_version >= crate::PythonVersion::Py314
                 && target_instructions.next().is_some_and(|instruction| {
                     instruction.opcode == crate::target::opcodes::RERAISE
-                        && instruction.operand() == Operand::Value(0)
+                        && instruction.value_argument() == Some(0)
                         && instruction.location == SourceLocation::NONE
                         && instruction.exception_policy()
                             == super::super::ExceptionPolicy::default()
@@ -1831,7 +1827,7 @@ impl OptimizationPipeline {
                         if instruction.location.line < 0
                             || instruction.opcode == NOP
                             || super::super::ends_scope(instruction.opcode)
-                            || !matches!(instruction.operand(), Operand::Value(_))
+                            || instruction.value_argument().is_none()
                             || instruction.pre_fold_extra_instructions() != 0
                             || instruction.local_policy.hidden_exception_owner_slots() != 0
                             || instruction.fusion_policy.is_converted_pop_block()
@@ -1938,7 +1934,7 @@ impl OptimizationPipeline {
                         if depth == 0
                             && *return_entry == target
                             && load.opcode == LOAD_FAST
-                            && matches!(load.operand(), Operand::Value(_))
+                            && load.value_argument().is_some()
                             && load.location.line >= 0
                             && ret.location.line >= 0
                             && *load == Instruction::new(
@@ -2177,10 +2173,7 @@ impl OptimizationPipeline {
                         target_is_conditional =
                             super::super::is_conditional_jump(instruction.opcode);
                         if super::super::ends_scope(instruction.opcode)
-                            || matches!(
-                                instruction.operand(),
-                                Operand::Forward(_) | Operand::Backward(_)
-                            )
+                            || instruction.jump_target().is_some()
                         {
                             break;
                         }
@@ -2365,7 +2358,7 @@ impl OptimizationPipeline {
                                         && !self.borrow_block_aliases.contains(label)))
                         },
                     );
-                if !matches!(instruction.operand(), Operand::Forward(_))
+                if instruction.forward_target().is_none()
                     || (instruction.jump_policy.preserves_nop_after_threading()
                         && !original_match_success_head)
                     || instruction.jump_policy.borrow_empty_block()
@@ -2504,7 +2497,7 @@ impl OptimizationPipeline {
             // adjacent incoming jump. Keep that edge through our early removal pass.
             self.graph.for_each_instruction_mut(|instruction| {
                 if instruction.opcode == JUMP_FORWARD
-                    && let Operand::Forward(label) = instruction.operand()
+                    && let Some(label) = instruction.forward_target()
                     && labels.contains(&label)
                 {
                     instruction.jump_policy.defer_removal();
@@ -2906,9 +2899,7 @@ impl OptimizationPipeline {
                 let [Item::Label(split), Item::Instruction(jump)] = graph[pair[1]].items() else {
                     return None;
                 };
-                let Operand::Forward(target) = jump.operand() else {
-                    return None;
-                };
+                let target = jump.forward_target()?;
                 let target_block = graph.label_block(target)?;
                 if *pop
                     != Instruction::new(POP_TOP, Operand::Value(0), SourceLocation::NONE, Some(0))
@@ -3073,18 +3064,14 @@ impl OptimizationPipeline {
                 else {
                     return None;
                 };
-                let Operand::Forward(target) = jump.operand() else {
-                    return None;
-                };
+                let target = jump.forward_target()?;
                 let target_block = graph.label_block(target)?;
                 let [Item::Label(continuation), Item::Instruction(exit)] =
                     graph[target_block].items()
                 else {
                     return None;
                 };
-                let Operand::Forward(tail) = exit.operand() else {
-                    return None;
-                };
+                let tail = exit.forward_target()?;
                 let tail_block = graph.label_block(tail)?;
                 let [
                     Item::Label(tail_head),
@@ -3129,17 +3116,17 @@ impl OptimizationPipeline {
                                 != super::super::ir::NoLocationPolicy::default()
                     })
                     || load.opcode != LOAD_FAST
-                    || !matches!(load.operand(), Operand::Value(_))
+                    || load.value_argument().is_none()
                     || load.depth_after() != Some(1)
                     || load.location.line < 0
                     || load.location.end_line != load.location.line
                     || store.opcode != STORE_DEREF
-                    || !matches!(store.operand(), Operand::Value(_))
+                    || store.value_argument().is_none()
                     || store.depth_after() != Some(0)
                     || store.location.line != load.location.line
                     || store.location.end_line != store.location.line
                     || none.opcode != LOAD_CONST
-                    || !matches!(none.operand(), Operand::Value(_))
+                    || none.value_argument().is_none()
                     || *none
                         != Instruction::new(
                             LOAD_CONST,
@@ -3507,7 +3494,7 @@ impl OptimizationPipeline {
             let [jump] = instructions.as_slice() else {
                 continue;
             };
-            let Operand::Forward(label) = jump.operand() else {
+            let Some(label) = jump.forward_target() else {
                 continue;
             };
             let Some(target) = graph.label_block(label) else {
@@ -3563,7 +3550,7 @@ impl OptimizationPipeline {
             let [Item::Instruction(pop), Item::Instruction(jump)] = &items[head_len..] else {
                 continue;
             };
-            let Operand::Forward(label) = jump.operand() else {
+            let Some(label) = jump.forward_target() else {
                 continue;
             };
             let Some(target) = graph.label_block(label) else {
@@ -3693,7 +3680,7 @@ impl OptimizationPipeline {
             if !authored_break && !ordinary_branch_entry {
                 continue;
             }
-            let Operand::Forward(label) = jump.operand() else {
+            let Some(label) = jump.forward_target() else {
                 continue;
             };
             let Some(mut current) = graph.label_block(label) else {
@@ -3771,7 +3758,7 @@ impl OptimizationPipeline {
                 let Some((Item::Instruction(jump), head)) = items.split_last() else {
                     continue;
                 };
-                let Operand::Forward(target) = jump.operand() else {
+                let Some(target) = jump.forward_target() else {
                     continue;
                 };
                 let Some(target) = graph.label_block(target) else {
@@ -3951,7 +3938,7 @@ impl OptimizationPipeline {
         for &block in order {
             if let Some(jump) = graph[block].last_instruction()
                 && is_unconditional_jump(jump.opcode)
-                && let Operand::Forward(target) = jump.operand()
+                && let Some(target) = jump.forward_target()
                 && graph
                     .label_block(target)
                     .is_some_and(|target| targets.contains(&target))
@@ -4038,7 +4025,7 @@ impl OptimizationPipeline {
                 });
             } else if sources.contains(&block) {
                 let jump = graph[block].last_instruction().expect("certified jump");
-                let Operand::Forward(target) = jump.operand() else {
+                let Some(target) = jump.forward_target() else {
                     unreachable!()
                 };
                 let target = graph.label_block(target).expect("certified target");

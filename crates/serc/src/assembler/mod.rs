@@ -85,7 +85,7 @@ fn constant_pair_store_tail(items: &[Item]) -> Option<[Instruction; 3]> {
         || left.opcode != LOAD_CONST
         || right.opcode != LOAD_CONST
         || swap.opcode != SWAP
-        || swap.operand() != Operand::Value(2)
+        || swap.value_argument() != Some(2)
         || first.opcode != STORE_FAST
         || last.opcode != STORE_FAST
         || !matches!((first.operand(), last.operand()),
@@ -98,9 +98,7 @@ fn constant_pair_store_tail(items: &[Item]) -> Option<[Instruction; 3]> {
         return None;
     }
     for instruction in [left, right, swap, first, last] {
-        let Operand::Value(argument) = instruction.operand() else {
-            return None;
-        };
+        let argument = instruction.value_argument()?;
         let mut expected = Instruction::new(
             instruction.opcode,
             Operand::Value(argument),
@@ -141,19 +139,19 @@ fn single_capture_cleanup_vacancies(items: &[Item]) -> Option<usize> {
             .iter()
             .all(|instruction| instruction.location.line == outer.location.line);
     let multiline_unpack_cleanup = marker.opcode == UNPACK_SEQUENCE
-        && marker.operand() == Operand::Value(1)
+        && marker.value_argument() == Some(1)
         && marker.location == first_pop.location;
     if (marker.opcode != NOT_TAKEN && !same_line_cleanup && !multiline_unpack_cleanup)
         || outer.opcode != SWAP
-        || outer.operand() != Operand::Value(3)
+        || outer.value_argument() != Some(3)
         || inner.opcode != SWAP
-        || inner.operand() != Operand::Value(2)
+        || inner.value_argument() != Some(2)
         || first_pop.opcode != POP_TOP
         || last_pop.opcode != POP_TOP
-        || first_pop.operand() != Operand::Value(0)
-        || last_pop.operand() != Operand::Value(0)
+        || first_pop.value_argument() != Some(0)
+        || last_pop.value_argument() != Some(0)
         || store.opcode != STORE_FAST
-        || !matches!(store.operand(), Operand::Value(_))
+        || store.value_argument().is_none()
         || store.local_policy.may_store_null()
         || outer.location.line < 0
         || outer.location != inner.location
@@ -282,9 +280,9 @@ fn capture_cleanup_rotation(items: &[Item]) -> Option<CaptureCleanupRotation<'_>
     };
     let unpacked =
         prefix.opcode == UNPACK_SEQUENCE && matches!(prefix.operand(), Operand::Value(0 | 1));
-    let starred = prefix.opcode == UNPACK_EX && prefix.operand() == Operand::Value(0);
-    let conditional = prefix.opcode == NOT_TAKEN && prefix.operand() == Operand::Value(0);
-    let popped = prefix.opcode == POP_TOP && prefix.operand() == Operand::Value(0);
+    let starred = prefix.opcode == UNPACK_EX && prefix.value_argument() == Some(0);
+    let conditional = prefix.opcode == NOT_TAKEN && prefix.value_argument() == Some(0);
+    let popped = prefix.opcode == POP_TOP && prefix.value_argument() == Some(0);
     if !(unpacked || starred || conditional || popped)
         || prefix.location.line < 0
         || first_swap.opcode != SWAP
@@ -293,9 +291,7 @@ fn capture_cleanup_rotation(items: &[Item]) -> Option<CaptureCleanupRotation<'_>
     {
         return None;
     }
-    let Operand::Value(depth) = first_swap.operand() else {
-        return None;
-    };
+    let depth = first_swap.value_argument()?;
     let depth = usize::try_from(depth).ok()?;
     // The existing single-capture proof owns depth-three marker/pop rotations.
     if depth < 3 || ((conditional || popped) && depth < 4) {
@@ -321,11 +317,11 @@ fn capture_cleanup_rotation(items: &[Item]) -> Option<CaptureCleanupRotation<'_>
         && items.get(depth..pops_end).is_some_and(|consumers| {
             consumers.iter().all(|item| {
                 matches!(item, Item::Instruction(instruction)
-                if instruction.opcode == POP_TOP && instruction.operand() == Operand::Value(0))
+                if instruction.opcode == POP_TOP && instruction.value_argument() == Some(0))
             })
         })
         && matches!(items.get(pops_end), Some(Item::Instruction(jump))
-            if jump.opcode == JUMP_FORWARD && matches!(jump.operand(), Operand::Forward(_)));
+            if jump.opcode == JUMP_FORWARD && jump.forward_target().is_some());
     let consumer_count = if pop_only_join { swap_count } else { depth };
     let consumed = depth.checked_add(consumer_count)?;
     let consumers = items.get(depth..consumed)?;
@@ -374,7 +370,7 @@ fn capture_cleanup_rotation(items: &[Item]) -> Option<CaptureCleanupRotation<'_>
             else {
                 return None;
             };
-            if nop.opcode != NOP || nop.operand() != Operand::Value(0) {
+            if nop.opcode != NOP || nop.value_argument() != Some(0) {
                 return None;
             }
             nop
@@ -499,7 +495,7 @@ fn reachable_constant_indices(
                 continue;
             };
             if uses_constant_index(instruction.opcode)
-                && let Operand::Value(index) = instruction.operand()
+                && let Some(index) = instruction.value_argument()
                 && let Some(slot) = used.get_mut(index as usize)
             {
                 let newly_used = !std::mem::replace(slot, true);
@@ -545,9 +541,7 @@ fn assertion_constant_indices(items: &[Item], used: &mut [bool]) -> Option<bool>
             instruction.opcode,
             POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE | POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE
         ) {
-            let Operand::Forward(target) = instruction.operand() else {
-                return None;
-            };
+            let target = instruction.forward_target()?;
             let Some(Item::Instruction(not_taken)) = items.next() else {
                 return None;
             };
@@ -576,9 +570,7 @@ fn assertion_constant_indices(items: &[Item], used: &mut [bool]) -> Option<bool>
             assertion_count += 1;
             continue;
         }
-        let Operand::Value(argument) = instruction.operand() else {
-            return None;
-        };
+        let argument = instruction.value_argument()?;
         if instruction.opcode == NOT_TAKEN {
             return None;
         }
@@ -634,7 +626,7 @@ fn terminal_guard_constant_indices(items: &[Item], used: &mut [bool]) -> Option<
             crate::target::opcodes::RETURN_GENERATOR | crate::target::opcodes::YIELD_VALUE
         );
         if uses_constant_index(instruction.opcode)
-            && let Operand::Value(index) = instruction.operand()
+            && let Some(index) = instruction.value_argument()
             && let Some(slot) = used.get_mut(index as usize)
         {
             *slot = true;
@@ -664,13 +656,11 @@ fn terminal_guard_constant_indices(items: &[Item], used: &mut [bool]) -> Option<
             instruction.opcode,
             POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE | POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE
         ) {
-            let Operand::Forward(target) = instruction.operand() else {
-                return None;
-            };
+            let target = instruction.forward_target()?;
             let Some(Item::Instruction(marker)) = items.next() else {
                 return None;
             };
-            if marker.opcode != NOT_TAKEN || marker.operand() != Operand::Value(0) {
+            if marker.opcode != NOT_TAKEN || marker.value_argument() != Some(0) {
                 return None;
             }
             inspect(marker);
@@ -706,7 +696,7 @@ fn terminal_guard_constant_indices(items: &[Item], used: &mut [bool]) -> Option<
                     let Some(Item::Instruction(marker)) = items.next() else {
                         return None;
                     };
-                    if marker.opcode != NOT_TAKEN || marker.operand() != Operand::Value(0) {
+                    if marker.opcode != NOT_TAKEN || marker.value_argument() != Some(0) {
                         return None;
                     }
                     inspect(marker);
@@ -716,7 +706,7 @@ fn terminal_guard_constant_indices(items: &[Item], used: &mut [bool]) -> Option<
                     side_depth = None;
                     continue;
                 }
-                if !matches!(side.operand(), Operand::Value(_)) || side.opcode == NOT_TAKEN {
+                if side.value_argument().is_none() || side.opcode == NOT_TAKEN {
                     return None;
                 }
                 inspect(side);
@@ -765,7 +755,7 @@ fn terminal_guard_constant_indices(items: &[Item], used: &mut [bool]) -> Option<
                     // An unlocated shared exit can otherwise be copied into its predecessors.
                     has_stable_location |= stable_location(next);
                     allows_shared_target &= !next.no_location_policy.is_artificial_eval_break();
-                    if !matches!(next.operand(), Operand::Value(_)) || ends_scope(next.opcode) {
+                    if next.value_argument().is_none() || ends_scope(next.opcode) {
                         break;
                     }
                 }
@@ -774,7 +764,7 @@ fn terminal_guard_constant_indices(items: &[Item], used: &mut [bool]) -> Option<
             guards += 1;
             continue;
         }
-        if !matches!(instruction.operand(), Operand::Value(_)) || instruction.opcode == NOT_TAKEN {
+        if instruction.value_argument().is_none() || instruction.opcode == NOT_TAKEN {
             return None;
         }
         if ends_scope(instruction.opcode) {
@@ -799,7 +789,7 @@ fn terminal_guard_constant_indices(items: &[Item], used: &mut [bool]) -> Option<
                 shared_targets_eligible = false;
                 break;
             }
-            copy = instruction.opcode == COPY && instruction.operand() == Operand::Value(1);
+            copy = instruction.opcode == COPY && instruction.value_argument() == Some(1);
         }
     }
     (guards > 0 && ended_scope).then_some(
@@ -849,7 +839,7 @@ fn single_marker_alias_guard_constant_indices(items: &[Item], used: &mut [bool])
         return None;
     };
     let alias_index = condition_index + 2;
-    if marker.opcode != NOT_TAKEN || marker.operand() != Operand::Value(0) || *alias == target {
+    if marker.opcode != NOT_TAKEN || marker.value_argument() != Some(0) || *alias == target {
         return None;
     }
     let mut aliases = [None; 3];
@@ -894,7 +884,7 @@ fn single_marker_alias_guard_constant_indices(items: &[Item], used: &mut [bool])
             || previous.location != load.location
             || load.location != ret.location
             || load.opcode != LOAD_CONST
-            || !matches!(load.operand(), Operand::Value(_))
+            || load.value_argument().is_none()
             || *load != Instruction::new(LOAD_CONST, load.operand(), load.location, Some(1))
             || *ret != Instruction::new(RETURN_VALUE, Operand::Value(0), ret.location, Some(0))
         {
@@ -1108,7 +1098,7 @@ impl Assembler {
                     instruction.depth_after(),
                 )
         };
-        let Operand::Value(argument) = load.operand() else {
+        let Some(argument) = load.value_argument() else {
             return false;
         };
         if !matches!(load.opcode, LOAD_CONST | LOAD_SMALL_INT)
@@ -1155,7 +1145,7 @@ impl Assembler {
             if !matches!(prefix.opcode, COPY_FREE_VARS | MAKE_CELL) {
                 break;
             }
-            if !matches!(prefix.operand(), Operand::Value(_))
+            if prefix.value_argument().is_none()
                 || *prefix
                     != Instruction::new(
                         prefix.opcode,
@@ -1218,7 +1208,7 @@ impl Assembler {
             let Item::Instruction(instruction) = item else {
                 return false;
             };
-            let Operand::Value(argument) = instruction.operand() else {
+            let Some(argument) = instruction.value_argument() else {
                 return false;
             };
             has_unpack |= instruction.opcode == UNPACK_SEQUENCE;
@@ -1590,7 +1580,7 @@ impl Assembler {
                     && nop.location.line >= 0
                     && previous.location.line == nop.location.line
                     && previous.opcode != NOT_TAKEN
-                    && matches!(previous.operand(), Operand::Value(_))
+                    && previous.value_argument().is_some()
                     && !ends_scope(previous.opcode))
     }
 
@@ -1624,7 +1614,7 @@ impl Assembler {
             && previous.location == statement
             && previous.location.line >= 0
             && jump.opcode == JUMP_FORWARD
-            && matches!(jump.operand(), Operand::Forward(_))
+            && jump.forward_target().is_some()
             && jump.location.line == previous.location.line
         {
             // Only this original setup and jump carry the certificate through CFG passes.
@@ -1657,10 +1647,7 @@ impl Assembler {
     fn last_jump_instruction_mut(&mut self, operation: &str) -> &mut Instruction {
         let instruction = self.required_last_instruction_mut(operation);
         assert!(
-            matches!(
-                instruction.operand(),
-                Operand::Forward(_) | Operand::Backward(_)
-            ),
+            instruction.jump_target().is_some(),
             "{operation} requires a jump instruction"
         );
         instruction
@@ -1694,10 +1681,7 @@ impl Assembler {
     fn emitted_jump_mut(&mut self, emitted: EmittedJump, operation: &str) -> &mut Instruction {
         let instruction = self.emitted_instruction_mut(emitted.instruction(), operation);
         assert!(
-            matches!(
-                instruction.operand(),
-                Operand::Forward(_) | Operand::Backward(_)
-            ),
+            instruction.jump_target().is_some(),
             "{operation} requires an emitted jump"
         );
         instruction
@@ -1711,10 +1695,8 @@ impl Assembler {
                 Item::Instruction(instruction) => {
                     instruction.opcode == NOT_TAKEN
                         || (!is_conditional_jump(instruction.opcode)
-                            && (matches!(
-                                instruction.operand(),
-                                Operand::Forward(_) | Operand::Backward(_)
-                            ) || ends_scope(instruction.opcode)))
+                            && (instruction.jump_target().is_some()
+                                || ends_scope(instruction.opcode)))
                 }
             })
             .map_or(0, |index| index + 1)
@@ -1741,10 +1723,7 @@ impl Assembler {
                 }
                 Item::Instruction(instruction) => {
                     return instruction.opcode == NOT_TAKEN
-                        || matches!(
-                            instruction.operand(),
-                            Operand::Forward(_) | Operand::Backward(_)
-                        )
+                        || instruction.jump_target().is_some()
                         || ends_scope(instruction.opcode);
                 }
             }
@@ -1822,7 +1801,7 @@ impl Assembler {
                 }
                 Item::Instruction(instruction) => {
                     if instruction.opcode == NOT_TAKEN
-                        || !matches!(instruction.operand(), Operand::Value(_))
+                        || instruction.value_argument().is_none()
                         || ends_scope(instruction.opcode)
                         || instruction.jump_policy.borrow_empty_block()
                         || instruction.no_location_policy.borrow_fallthrough()
@@ -1854,7 +1833,7 @@ impl Assembler {
                 }
                 Item::Instruction(instruction) => {
                     if instruction.opcode == NOT_TAKEN
-                        || !matches!(instruction.operand(), Operand::Value(_))
+                        || instruction.value_argument().is_none()
                         || ends_scope(instruction.opcode)
                     {
                         return None;
@@ -1935,7 +1914,7 @@ impl Assembler {
             return false;
         };
         if !matches!(store.opcode, STORE_FAST | STORE_DEREF)
-            || !matches!(store.operand(), Operand::Value(_))
+            || store.value_argument().is_none()
             || store.depth_after() != Some(0)
             || store.location.line < 0
             || store.local_policy != LocalPolicy::default()
@@ -2163,7 +2142,7 @@ impl Assembler {
                 }
                 _ => continue,
             };
-            if !matches!(instruction.operand(), Operand::Forward(_))
+            if instruction.forward_target().is_none()
                 || instruction.location.line < 0
                 || instruction.depth_after() != Some(0)
                 || instruction.local_policy.hidden_exception_owner_slots() != 0
@@ -2254,7 +2233,7 @@ impl Assembler {
             let Item::Instruction(instruction) = item else {
                 continue;
             };
-            let Operand::Forward(target) = instruction.operand() else {
+            let Some(target) = instruction.forward_target() else {
                 continue;
             };
             if !labels.contains(&target) {
@@ -2361,10 +2340,10 @@ impl Assembler {
             return false;
         };
         if copy.opcode != COPY
-            || copy.operand() != Operand::Value(3)
+            || copy.value_argument() != Some(3)
             || pop.opcode != POP_EXCEPT
             || reraise.opcode != RERAISE
-            || reraise.operand() != Operand::Value(1)
+            || reraise.value_argument() != Some(1)
             || [copy, pop, reraise].iter().any(|instruction| {
                 instruction.location != SourceLocation::NONE
                     || instruction.pre_fold_extra_instructions() != 0
@@ -2449,7 +2428,7 @@ impl Assembler {
             return false;
         };
         if previous.opcode != RAISE_VARARGS
-            || previous.operand() != Operand::Value(1)
+            || previous.value_argument() != Some(1)
             || previous.location != raise_location
         {
             return false;
@@ -2653,7 +2632,7 @@ impl Assembler {
                         .count()
                         != 1
                 })
-                || previous.operand() != Operand::Value(0)
+                || previous.value_argument() != Some(0)
                 || previous.location.line < 0
                 || previous.pre_fold_extra_instructions() != 0
                 || previous.local_policy.hidden_exception_owner_slots() != 0
@@ -2682,7 +2661,7 @@ impl Assembler {
                 !edges.is_empty()
                     && edges.iter().all(|edge| {
                         edge.opcode == POP_JUMP_IF_FALSE
-                            && matches!(edge.operand(), Operand::Forward(_))
+                            && edge.forward_target().is_some()
                             && edge.depth_after() == Some(expected_depth)
                             && edge.location.line >= 0
                             && edge.pre_fold_extra_instructions() == 0
@@ -2709,7 +2688,7 @@ impl Assembler {
         let edge = incoming.next()?;
         (incoming.next().is_none()
             && is_conditional_jump(edge.opcode)
-            && matches!(edge.operand(), Operand::Forward(_))
+            && edge.forward_target().is_some()
             && edge.location.line >= 0)
             .then_some(edge.location)
     }
@@ -2742,7 +2721,7 @@ impl Assembler {
         (previous.location.line >= 0
             && previous.opcode != NOP
             && !ends_scope(previous.opcode)
-            && matches!(previous.operand(), Operand::Value(_))
+            && previous.value_argument().is_some()
             && previous.pre_fold_extra_instructions() == 0
             && previous.local_policy.hidden_exception_owner_slots() == 0
             && !previous.no_location_policy.preserves_location())
@@ -2804,7 +2783,7 @@ impl Assembler {
         if previous.location.line < 0
             || matches!(previous.opcode, NOP | NOT_TAKEN)
             || ends_scope(previous.opcode)
-            || !matches!(previous.operand(), Operand::Value(_))
+            || previous.value_argument().is_none()
             || previous.depth_after() != marker.depth_after()
             || previous.pre_fold_extra_instructions() != 0
             || previous.local_policy.hidden_exception_owner_slots() != 0
@@ -2821,7 +2800,7 @@ impl Assembler {
         if incoming.peek().is_none()
             || !incoming.all(|edge| {
                 edge.opcode == JUMP_FORWARD
-                    && matches!(edge.operand(), Operand::Forward(_))
+                    && edge.forward_target().is_some()
                     && edge.depth_after() == marker.depth_after()
                     && edge.jump_policy.inline_small_exit()
                     && edge.pre_fold_extra_instructions() == 0
@@ -2846,7 +2825,7 @@ impl Assembler {
                     else {
                         return false;
                     };
-                    let Operand::Value(constant) = load.operand() else {
+                    let Some(constant) = load.value_argument() else {
                         return false;
                     };
                     let Some(depth) = marker.depth_after() else {
@@ -2880,7 +2859,7 @@ impl Assembler {
                 || instruction.no_location_policy.preserves_location()
                 || instruction.opcode == NOT_TAKEN
                 || (instruction.opcode == NOP && !(constant_return_prefix && original_size == 1))
-                || !matches!(instruction.operand(), Operand::Value(_))
+                || instruction.value_argument().is_none()
             {
                 return;
             }
@@ -3056,7 +3035,7 @@ impl Assembler {
                 _ => continue,
             };
             if !is_conditional_jump(instruction.opcode)
-                || !matches!(instruction.operand(), Operand::Forward(_))
+                || instruction.forward_target().is_none()
                 || instruction.location.line < 0
                 || instruction.pre_fold_extra_instructions() != 0
                 || (instruction.local_policy.hidden_exception_owner_slots() != 0
@@ -3191,7 +3170,7 @@ impl Assembler {
             }
             if !(is_unconditional_jump(instruction.opcode)
                 || is_conditional_jump(instruction.opcode))
-                || !matches!(instruction.operand(), Operand::Forward(_))
+                || instruction.forward_target().is_none()
                 || instruction.pre_fold_extra_instructions() != 0
                 || !self
                     .exception_owner_provenance
@@ -3595,7 +3574,7 @@ impl Assembler {
             return;
         };
         if marker.opcode != NOP
-            || marker.operand() != Operand::Value(0)
+            || marker.value_argument() != Some(0)
             || !marker.fusion_policy.is_converted_pop_block()
             || marker.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
             || marker.location != SourceLocation::NONE
@@ -3721,7 +3700,7 @@ impl Assembler {
                 // A next-instruction edge can disappear before the original copy round.
                 // Admit only the ordinary forward break edges whose complete bridge is copied.
                 if !is_unconditional_jump(instruction.opcode)
-                    || !matches!(instruction.operand(), Operand::Forward(_))
+                    || instruction.forward_target().is_none()
                     || !instruction.fusion_policy.is_authored_break()
                     // Ordinary conditional breaks preserve their source jump's NOP and
                     // reject incoming threading. Neither flag prevents copying their target.
@@ -3805,7 +3784,7 @@ impl Assembler {
         let mut other_pending_targets = Vec::new();
         for item in self.linear_items() {
             if let Item::Instruction(instruction) = item
-                && let Operand::Forward(label) | Operand::Backward(label) = instruction.operand()
+                && let Some(label) = instruction.jump_target()
                 && !labels.contains(&label)
             {
                 if label == target {
@@ -3914,8 +3893,7 @@ impl Assembler {
                     if (is_unconditional_jump(instruction.opcode)
                         || is_conditional_jump(instruction.opcode)
                         || matches!(instruction.opcode, FOR_ITER | SEND))
-                        && let Operand::Forward(target) | Operand::Backward(target) =
-                            instruction.operand()
+                        && let Some(target) = instruction.jump_target()
                         && let Some(&target) = labels.get(&target)
                     {
                         pending.push(target);
@@ -4032,10 +4010,7 @@ impl Assembler {
                 }
                 Item::Instruction(instruction) => {
                     if instruction.opcode == NOT_TAKEN
-                        || matches!(
-                            instruction.operand(),
-                            Operand::Forward(_) | Operand::Backward(_)
-                        )
+                        || instruction.jump_target().is_some()
                         || ends_scope(instruction.opcode)
                     {
                         break;
@@ -4205,10 +4180,8 @@ impl Assembler {
             let Item::Instruction(instruction) = item else {
                 return false;
             };
-            if matches!(
-                instruction.operand(),
-                Operand::Forward(_) | Operand::Backward(_)
-            ) || instruction.opcode == NOT_TAKEN
+            if instruction.jump_target().is_some()
+                || instruction.opcode == NOT_TAKEN
                 || instruction.pre_fold_extra_instructions() != 0
                 || instruction.local_policy.hidden_exception_owner_slots() != 0
                 || instruction.jump_policy.borrow_empty_block()
@@ -4244,10 +4217,8 @@ impl Assembler {
             let Item::Instruction(instruction) = item else {
                 return false;
             };
-            if matches!(
-                instruction.operand(),
-                Operand::Forward(_) | Operand::Backward(_)
-            ) || matches!(instruction.opcode, NOT_TAKEN | COPY | TO_BOOL)
+            if instruction.jump_target().is_some()
+                || matches!(instruction.opcode, NOT_TAKEN | COPY | TO_BOOL)
                 || instruction.jump_policy.borrow_empty_block()
                 || instruction.no_location_policy.borrow_fallthrough()
                     != BorrowFallthrough::Reachable
@@ -4389,7 +4360,7 @@ impl Assembler {
             if instruction.opcode != SWAP {
                 return false;
             }
-            let Operand::Value(depth) = instruction.operand() else {
+            let Some(depth) = instruction.value_argument() else {
                 return false;
             };
             let mut consumers = following
@@ -4492,8 +4463,7 @@ impl Assembler {
             }
             for item in items {
                 if let Item::Instruction(instruction) = item
-                    && let Operand::Forward(label) | Operand::Backward(label) =
-                        instruction.operand()
+                    && let Some(label) = instruction.jump_target()
                 {
                     block_labels.insert(label);
                 }
@@ -4508,10 +4478,8 @@ impl Assembler {
                     Item::Instruction(instruction) => {
                         instruction.opcode == NOT_TAKEN
                             || (!is_conditional_jump(instruction.opcode)
-                                && (matches!(
-                                    instruction.operand(),
-                                    Operand::Forward(_) | Operand::Backward(_)
-                                ) || ends_scope(instruction.opcode)))
+                                && (instruction.jump_target().is_some()
+                                    || ends_scope(instruction.opcode)))
                     }
                 })
                 .map_or(0, |index| index + 1)
@@ -4526,10 +4494,8 @@ impl Assembler {
                     Item::Instruction(instruction) => {
                         instruction.opcode == NOT_TAKEN
                             || (!is_conditional_jump(instruction.opcode)
-                                && (matches!(
-                                    instruction.operand(),
-                                    Operand::Forward(_) | Operand::Backward(_)
-                                ) || ends_scope(instruction.opcode)))
+                                && (instruction.jump_target().is_some()
+                                    || ends_scope(instruction.opcode)))
                     }
                 })
                 .map_or(0, |index| index + 1)
@@ -4810,7 +4776,7 @@ impl Assembler {
                 && let [operands @ .., comparison, condition] =
                     &instructions[pop_index + 1..]
                 && pop.opcode == NOP
-                && pop.operand() == Operand::Value(0)
+                && pop.value_argument() == Some(0)
                 && pop.location == SourceLocation::NONE
                 && pop.fusion_policy.is_converted_pop_block()
                 && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
@@ -4818,7 +4784,7 @@ impl Assembler {
                 && matches!(comparison.operand(), Operand::Value(argument) if argument & 16 != 0)
                 && comparison.location == condition.location
                 && condition.location.line >= 0
-                && matches!(condition.operand(), Operand::Forward(_))
+                && condition.forward_target().is_some()
                 && condition.depth_after() == Some(base_depth)
                 && comparison.depth_after() == base_depth.checked_add(1)
                 && operands.last().and_then(Instruction::depth_after)
@@ -4840,7 +4806,7 @@ impl Assembler {
                 && operands.iter().try_fold(base_depth, |depth, record| {
                     let next = match record.opcode {
                         LOAD_FAST | LOAD_DEREF | LOAD_CONST | crate::target::opcodes::LOAD_SMALL_INT
-                            if matches!(record.operand(), Operand::Value(_)) => depth.checked_add(1)?,
+                            if record.value_argument().is_some() => depth.checked_add(1)?,
                         crate::target::opcodes::LOAD_GLOBAL
                             if matches!(record.operand(), Operand::Value(argument) if argument & 1 == 0) => depth.checked_add(1)?,
                         LOAD_ATTR if depth > base_depth
@@ -4851,7 +4817,7 @@ impl Assembler {
                         && Some(next) <= base_depth.checked_add(2)).then_some(next)
                 }) == base_depth.checked_add(2)
                 && (pop_index == 0
-                    || (instructions[0].operand() == Operand::Value(0)
+                    || (instructions[0].value_argument() == Some(0)
                         && instructions[0].location.line >= 0
                         && instructions[0].fusion_policy == ir::FusionPolicy::default()
                         && instructions[0].exception_policy() == ExceptionPolicy::default()
@@ -4890,7 +4856,7 @@ impl Assembler {
                     && method.opcode == LOAD_ATTR
                     && matches!(method.operand(), Operand::Value(argument) if argument & 1 != 0)
                     && call.opcode == CALL
-                    && call.operand() == Operand::Value(0)
+                    && call.value_argument() == Some(0)
                     && call.location == condition.location =>
             {
                 Some((*pop, *load, *convert, *condition, Some(*method)))
@@ -4899,17 +4865,17 @@ impl Assembler {
         };
         if let Some((pop, load, convert, condition, method)) = single_pop_truth
             && pop.opcode == NOP
-            && pop.operand() == Operand::Value(0)
+            && pop.value_argument() == Some(0)
             && pop.location == SourceLocation::NONE
             && pop.fusion_policy.is_converted_pop_block()
             && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
             && load.opcode == LOAD_FAST
-            && matches!(load.operand(), Operand::Value(_))
+            && load.value_argument().is_some()
             && convert.opcode == TO_BOOL
-            && convert.operand() == Operand::Value(0)
+            && convert.value_argument() == Some(0)
             && convert.location == condition.location
             && condition.location.line >= 0
-            && matches!(condition.operand(), Operand::Forward(_))
+            && condition.forward_target().is_some()
             && instructions[1..].iter().all(|record| {
                 record.location.line == condition.location.line
                     && record.location.end_line == condition.location.end_line
@@ -4926,7 +4892,7 @@ impl Assembler {
             })
             && instructions[..instructions.len() - 1]
                 .iter()
-                .all(|record| matches!(record.operand(), Operand::Value(_)))
+                .all(|record| record.value_argument().is_some())
             && pop.depth_after().is_some()
             && condition.depth_after() == pop.depth_after()
             && load.depth_after() == pop.depth_after().map(|depth| depth + 1)
@@ -4977,13 +4943,13 @@ impl Assembler {
                 if self.python_version == crate::PythonVersion::Py314
                     && !truth
                     && matches!(receiver.opcode, LOAD_FAST | LOAD_DEREF)
-                    && matches!(receiver.operand(), Operand::Value(_))
+                    && receiver.value_argument().is_some()
                     && attribute.opcode == LOAD_ATTR
                     && matches!(attribute.operand(), Operand::Value(argument) if argument & 1 == 0)
                     && condition.location.line >= 0
                     && condition.location.end_line == condition.location.line
                     && plain.location.line != condition.location.line
-                    && matches!(condition.operand(), Operand::Forward(_))
+                    && condition.forward_target().is_some()
                     && pop.depth_after().is_some()
                     && plain.depth_after() == pop.depth_after()
                     && receiver.depth_after()
@@ -5016,11 +4982,11 @@ impl Assembler {
                     && method.opcode == LOAD_ATTR
                     && matches!(method.operand(), Operand::Value(argument) if argument & 1 != 0)
                     && call.opcode == CALL
-                    && call.operand() == Operand::Value(0)
+                    && call.value_argument() == Some(0)
                     && discard.opcode == POP_TOP
                     && matches!(load.opcode, LOAD_FAST | LOAD_DEREF)
                     && matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
-                    && matches!(condition.operand(), Operand::Forward(_)) =>
+                    && condition.forward_target().is_some() =>
             {
                 (*plain, *pop, true)
             }
@@ -5028,8 +4994,8 @@ impl Assembler {
                 if truth
                     && matches!(load.opcode, LOAD_FAST | LOAD_DEREF)
                     && convert.opcode == TO_BOOL
-                    && convert.operand() == Operand::Value(0)
-                    && matches!(condition.operand(), Operand::Forward(_))
+                    && convert.value_argument() == Some(0)
+                    && condition.forward_target().is_some()
                     && condition.location.line >= 0
                     && load.location == condition.location
                     && convert.location == condition.location
@@ -5046,11 +5012,11 @@ impl Assembler {
             _ => return None,
         };
         if plain.opcode != NOP
-            || plain.operand() != Operand::Value(0)
+            || plain.value_argument() != Some(0)
             || plain.location.line < 0
             || plain.fusion_policy != ir::FusionPolicy::default()
             || pop.opcode != NOP
-            || pop.operand() != Operand::Value(0)
+            || pop.value_argument() != Some(0)
             || pop.location != SourceLocation::NONE
             || !pop.fusion_policy.is_converted_pop_block()
             || pop.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
@@ -5065,8 +5031,7 @@ impl Assembler {
                     || instruction.no_location_policy.borrow_fallthrough()
                         != BorrowFallthrough::Reachable
                     || (index != 1 && instruction.exception_policy() != ExceptionPolicy::default())
-                    || (index + 1 != instructions.len()
-                        && !matches!(instruction.operand(), Operand::Value(_)))
+                    || (index + 1 != instructions.len() && instruction.value_argument().is_none())
             })
         {
             return None;
@@ -5154,10 +5119,8 @@ impl Assembler {
                     if boundary
                         || instruction.opcode == NOT_TAKEN
                         || (!is_conditional_jump(instruction.opcode)
-                            && (matches!(
-                                instruction.operand(),
-                                Operand::Forward(_) | Operand::Backward(_)
-                            ) || ends_scope(instruction.opcode)))
+                            && (instruction.jump_target().is_some()
+                                || ends_scope(instruction.opcode)))
                     {
                         return false;
                     }
@@ -5280,7 +5243,7 @@ impl Assembler {
                     if matches!(instruction.opcode, RESUME | COPY_FREE_VARS | MAKE_CELL)
                         || (index + 1 != items.len()
                             && (is_conditional_jump(instruction.opcode)
-                                || !matches!(instruction.operand(), Operand::Value(_))
+                                || instruction.value_argument().is_none()
                                 || ends_scope(instruction.opcode)))
                         || matches!(
                             instruction.opcode,
@@ -5330,10 +5293,7 @@ impl Assembler {
             }
             if instruction.opcode == NOT_TAKEN
                 || (!is_conditional_jump(instruction.opcode)
-                    && (matches!(
-                        instruction.operand(),
-                        Operand::Forward(_) | Operand::Backward(_)
-                    ) || ends_scope(instruction.opcode)))
+                    && (instruction.jump_target().is_some() || ends_scope(instruction.opcode)))
             {
                 break;
             }
@@ -5427,7 +5387,7 @@ impl Assembler {
                 Item::Instruction(first),
                 Item::Instruction(last),
             ] if swap.opcode == SWAP
-                && swap.operand() == Operand::Value(2)
+                && swap.value_argument() == Some(2)
                 && first.opcode == STORE_FAST
                 && last.opcode == STORE_FAST
                 && !first.local_policy.may_store_null()
@@ -5493,10 +5453,10 @@ impl Assembler {
         };
         if previous.opcode == NOP
             || previous.opcode == NOT_TAKEN
-            || !matches!(previous.operand(), Operand::Value(_))
+            || previous.value_argument().is_none()
             || ends_scope(previous.opcode)
             || constant.opcode != NOP
-            || constant.operand() != Operand::Value(0)
+            || constant.value_argument() != Some(0)
             || constant.location.line < 0
             || constant.location.line != pass_location.line
             || constant.fusion_policy.is_converted_pop_block()
@@ -5527,7 +5487,7 @@ impl Assembler {
             && location.line >= 0
             && previous.location.line != location.line
             && !matches!(previous.opcode, NOP | NOT_TAKEN)
-            && matches!(previous.operand(), Operand::Value(_))
+            && previous.value_argument().is_some()
             && !ends_scope(previous.opcode)
             && !previous.fusion_policy.is_converted_pop_block()
             && previous.pre_fold_extra_instructions() == 0
@@ -6039,7 +5999,7 @@ impl Assembler {
         let Some(Item::Instruction(first)) = items.get(pop_index + 1) else {
             return;
         };
-        let Operand::Value(argument) = first.operand() else {
+        let Some(argument) = first.value_argument() else {
             return;
         };
         if !matches!(
@@ -6214,7 +6174,7 @@ impl Assembler {
             {
                 continue;
             }
-            let Operand::Forward(target) = original.operand() else {
+            let Some(target) = original.forward_target() else {
                 continue;
             };
             if original.opcode == JUMP_FORWARD
@@ -6314,10 +6274,10 @@ impl Assembler {
             return;
         };
         if call.opcode != crate::target::opcodes::CALL
-            || !matches!(call.operand(), Operand::Value(_))
+            || call.value_argument().is_none()
             || call.location.line < 0
             || pop.opcode != POP_TOP
-            || pop.operand() != Operand::Value(0)
+            || pop.value_argument() != Some(0)
             || pop.location != call.location
             || iterators == 0
             || !tail.iter().any(|item| matches!(item, Item::Label(_)))
@@ -6497,7 +6457,7 @@ impl Assembler {
             let Some(Item::Instruction(jump)) = items.get(index) else {
                 continue;
             };
-            let Operand::Forward(target) = jump.operand() else {
+            let Some(target) = jump.forward_target() else {
                 continue;
             };
             let Some(&target_index) = labels.get(&target) else {
@@ -6616,7 +6576,7 @@ impl Assembler {
         let Some(Item::Instruction(jump)) = items.get(source_index) else {
             return;
         };
-        let Operand::Forward(target) = jump.operand() else {
+        let Some(target) = jump.forward_target() else {
             return;
         };
         if *jump != origin.original
@@ -6700,7 +6660,7 @@ impl Assembler {
     /// Records a folded condition's synthetic exit to its newly allocated, unique join.
     pub(crate) fn mark_folded_condition_exit(&mut self, emitted: EmittedJump) {
         let instruction = self.emitted_jump_mut(emitted, "marking a folded condition exit");
-        let Operand::Forward(target) = instruction.operand() else {
+        let Some(target) = instruction.forward_target() else {
             panic!("a folded condition exit must have a forward target");
         };
         instruction.jump_policy.mark_borrow_empty_block();
@@ -6725,10 +6685,7 @@ impl Assembler {
         let instruction = self
             .instruction_at_mut(instruction_offset)
             .expect("instruction offset should reference an emitted jump");
-        debug_assert!(matches!(
-            instruction.operand(),
-            Operand::Forward(_) | Operand::Backward(_)
-        ));
+        debug_assert!(instruction.jump_target().is_some());
         instruction.jump_policy.mark_borrow_empty_block();
     }
 
@@ -6737,10 +6694,7 @@ impl Assembler {
         let instruction = self
             .instruction_at_mut(instruction_offset)
             .expect("instruction offset should reference an emitted jump");
-        debug_assert!(matches!(
-            instruction.operand(),
-            Operand::Forward(_) | Operand::Backward(_)
-        ));
+        debug_assert!(instruction.jump_target().is_some());
         if !instruction
             .jump_policy
             .retains_nop_for(instruction.operand())
@@ -6889,13 +6843,13 @@ impl Assembler {
         };
         let target = end + 1 + offset;
         if matches!(previous.opcode, NOP | NOT_TAKEN)
-            || !matches!(previous.operand(), Operand::Value(_))
+            || previous.value_argument().is_none()
             || ends_scope(previous.opcode)
             || previous.local_policy.hidden_exception_owner_slots() == 0
             || previous.local_policy.hidden_exception_owner_slots()
                 == LocalPolicy::MAX_HIDDEN_EXCEPTION_OWNER_SLOTS
             || matches!(next.opcode, NOP | NOT_TAKEN)
-            || !matches!(next.operand(), Operand::Value(_))
+            || next.value_argument().is_none()
             || ends_scope(next.opcode)
             || next.local_policy.hidden_exception_owner_slots()
                 == LocalPolicy::MAX_HIDDEN_EXCEPTION_OWNER_SLOTS
@@ -6978,7 +6932,7 @@ impl Assembler {
     pub(crate) fn record_last_same_line_super_owner_slot(&mut self) {
         let instruction = self.required_last_instruction_mut("recording a super-load owner slot");
         if instruction.opcode == crate::target::opcodes::LOAD_SUPER_ATTR
-            && matches!(instruction.operand(), Operand::Value(_))
+            && instruction.value_argument().is_some()
             && instruction.location.line >= 0
             && instruction.location.line == instruction.location.end_line
             && instruction.exception_policy() == ExceptionPolicy::NoneUnchanged
@@ -7094,7 +7048,7 @@ impl Assembler {
         // iterators still use the one-slot cleanup recognized by Python 3.14.
         let slots = if self.python_version == crate::PythonVersion::Py315
             && matches!(items, [.., Item::Instruction(swap), _, _, _]
-                if swap.opcode == SWAP && swap.operand() == Operand::Value(3))
+                if swap.opcode == SWAP && swap.value_argument() == Some(3))
         {
             2
         } else {
@@ -7119,11 +7073,11 @@ impl Assembler {
             || pops.iter().enumerate().any(|(index, item)| {
                 !matches!(item, Item::Instruction(pop)
                     if pop.opcode == POP_TOP
-                        && pop.operand() == Operand::Value(0)
+                        && pop.value_argument() == Some(0)
                         && pop.depth_after() == Some(stack_slots - u32::try_from(index).unwrap()))
             })
             || ret.opcode != RETURN_VALUE
-            || ret.operand() != Operand::Value(0)
+            || ret.value_argument() != Some(0)
             || swap.depth_after() != Some(stack_slots + 1)
             || ret.depth_after() != Some(0)
             || ret.location.line < 0
@@ -7344,7 +7298,7 @@ impl Assembler {
         call_location: SourceLocation,
     ) {
         let jump = *self.emitted_jump_mut(emitted, "certifying a for-else finally exit");
-        let Operand::Forward(target) = jump.operand() else {
+        let Some(target) = jump.forward_target() else {
             return;
         };
         let index = usize::try_from(emitted.instruction().item_index)
@@ -7529,7 +7483,7 @@ impl Assembler {
     ) {
         let jump = *self.emitted_jump_mut(emitted, "retaining a final match failure join");
         if jump.opcode != JUMP_FORWARD
-            || !matches!(jump.operand(), Operand::Forward(_))
+            || jump.forward_target().is_none()
             || jump.location.line < 0
             || jump.pre_fold_extra_instructions() != 0
             || jump.exception_policy() != ExceptionPolicy::default()
@@ -7562,7 +7516,7 @@ impl Assembler {
         };
         let donor = guard_location.unwrap_or(jump.location);
         if condition.opcode != POP_JUMP_IF_FALSE
-            || !matches!(condition.operand(), Operand::Forward(_))
+            || condition.forward_target().is_none()
             || condition.location != donor
             || condition.pre_fold_extra_instructions() != 0
         {
@@ -7590,7 +7544,7 @@ impl Assembler {
             return;
         };
         let jump = *self.emitted_jump_mut(emitted, "retaining a class failure join");
-        let Operand::Forward(target) = jump.operand() else {
+        let Some(target) = jump.forward_target() else {
             return;
         };
         if self.python_version < crate::PythonVersion::Py314
@@ -7805,8 +7759,8 @@ impl Assembler {
             && first_pop.opcode == POP_TOP
             && last_pop.location == location
             && first_pop.location == location
-            && last_pop.operand() == Operand::Value(0)
-            && first_pop.operand() == Operand::Value(0)
+            && last_pop.value_argument() == Some(0)
+            && first_pop.value_argument() == Some(0)
             && first_pop.depth_after().is_some_and(|depth| {
                 depth.checked_sub(1).is_some_and(|next_depth| {
                     last_pop.depth_after() == Some(next_depth)
@@ -7958,7 +7912,7 @@ impl Assembler {
     /// This only certifies late absorption by the original ownerless `POP_BLOCK`.
     pub(crate) fn record_guarded_try_else_exit(&mut self, emitted: EmittedJump) {
         let jump = *self.emitted_jump_mut(emitted, "recording a guarded try-else exit");
-        let Operand::Forward(target) = jump.operand() else {
+        let Some(target) = jump.forward_target() else {
             return;
         };
         if jump.opcode != JUMP_FORWARD
@@ -7997,7 +7951,7 @@ impl Assembler {
         let (Some(condition), None) = (incoming.next(), incoming.next()) else {
             return;
         };
-        let Operand::Forward(entry) = condition.operand() else {
+        let Some(entry) = condition.forward_target() else {
             return;
         };
         if is_conditional_jump(condition.opcode)
@@ -8021,7 +7975,7 @@ impl Assembler {
     /// Records the live original else array without crossing a preserved empty boundary.
     pub(crate) fn record_populated_try_else_borrow_exit(&mut self, emitted: EmittedJump) {
         let jump = *self.emitted_jump_mut(emitted, "recording a populated try-else exit");
-        let Operand::Forward(target) = jump.operand() else {
+        let Some(target) = jump.forward_target() else {
             return;
         };
         if jump.opcode != JUMP_FORWARD
@@ -8059,7 +8013,7 @@ impl Assembler {
                 }
                 Item::Instruction(instruction) => {
                     if matches!(instruction.opcode, NOP | NOT_TAKEN)
-                        || !matches!(instruction.operand(), Operand::Value(_))
+                        || instruction.value_argument().is_none()
                         || ends_scope(instruction.opcode)
                         || instruction.jump_policy.borrow_empty_block()
                         || instruction.no_location_policy.borrow_fallthrough()
@@ -8108,7 +8062,7 @@ impl Assembler {
             .next()
             .expect("condition jump should precede marker");
         assert!(
-            matches!(jump.operand(), Operand::Forward(_) | Operand::Backward(_)),
+            jump.jump_target().is_some(),
             "condition marker should follow a jump"
         );
         let original = *jump;
@@ -8197,7 +8151,7 @@ impl Assembler {
         let Item::Instruction(success) = items[success_index] else {
             return;
         };
-        let Operand::Forward(exit) = success.operand() else {
+        let Some(exit) = success.forward_target() else {
             return;
         };
         if !success.jump_policy.is_original_match_success() {
@@ -8218,7 +8172,7 @@ impl Assembler {
             let Item::Instruction(source) = item else {
                 continue;
             };
-            let Operand::Forward(join_label) = source.operand() else {
+            let Some(join_label) = source.forward_target() else {
                 continue;
             };
             let Some(&join_index) = labels.get(&join_label) else {
@@ -8227,7 +8181,7 @@ impl Assembler {
             let Item::Instruction(join) = items[join_index] else {
                 continue;
             };
-            let Operand::Forward(success_label) = join.operand() else {
+            let Some(success_label) = join.forward_target() else {
                 continue;
             };
             if source.opcode != JUMP_FORWARD
@@ -8276,7 +8230,7 @@ impl Assembler {
 
     pub(crate) fn preserve_direct_inlined_jump_nop(&mut self, emitted: EmittedJump) {
         let instruction = self.emitted_jump_mut(emitted, "retaining a directly inlined jump NOP");
-        let Operand::Forward(_) = instruction.operand() else {
+        let Some(_) = instruction.forward_target() else {
             panic!("retaining a directly inlined jump NOP requires a forward jump");
         };
         instruction.jump_policy.retain_nop_for_direct_target();
@@ -8609,7 +8563,7 @@ impl Assembler {
         // with no enclosing owner. Only its target-specific iterator cells remain.
         if condition.depth_after() != Some(1 + extra)
             || *last != jump
-            || !matches!(load_guard.operand(), Operand::Value(_))
+            || load_guard.value_argument().is_none()
             || !matches!(method.operand(), Operand::Value(argument) if argument & 1 != 0)
             || !matches!(load_type.operand(), Operand::Value(argument) if argument & 1 == 0)
             || load_guard.location.line < 0
@@ -8773,8 +8727,8 @@ impl Assembler {
                 return false;
             };
             if pop.location.line < 0
-                || !matches!(none.operand(), Operand::Value(_))
-                || !matches!(store.operand(), Operand::Value(_))
+                || none.value_argument().is_none()
+                || store.value_argument().is_none()
             {
                 return false;
             }
@@ -8916,7 +8870,7 @@ impl Assembler {
         }
         let local_load = |instruction: &Instruction, depth| {
             instruction.location.line >= 0
-                && matches!(instruction.operand(), Operand::Value(_))
+                && instruction.value_argument().is_some()
                 && *instruction
                     == Instruction::new(
                         LOAD_FAST,
@@ -9168,9 +9122,9 @@ impl Assembler {
             || global.location.line != awaitable.location.line
             || argument.location.line != awaitable.location.line
             || call.location.line != awaitable.location.line
-            || !matches!(none.operand(), Operand::Value(_))
-            || !matches!(store.operand(), Operand::Value(_))
-            || !matches!(load_guard.operand(), Operand::Value(_))
+            || none.value_argument().is_none()
+            || store.value_argument().is_none()
+            || load_guard.value_argument().is_none()
             || !matches!(global.operand(), Operand::Value(value) if value & 1 != 0)
         {
             return false;
@@ -9429,12 +9383,12 @@ impl Assembler {
             return false;
         };
         if *last != jump
-            || !matches!(load_guard.operand(), Operand::Value(_))
+            || load_guard.value_argument().is_none()
             || !matches!(load_factory.operand(), Operand::Value(argument) if argument & 1 == 0)
             || !matches!(factory_attr.operand(), Operand::Value(argument) if argument & 1 == 0)
             || !matches!(load_argument.operand(), Operand::Value(argument) if argument & 1 == 0)
             || !matches!(method.operand(), Operand::Value(argument) if argument & 1 != 0)
-            || !matches!(await_none.operand(), Operand::Value(_))
+            || await_none.value_argument().is_none()
             || load_guard.location.line < 0
             || condition.location.line != load_guard.location.line
             || marker.location != condition.location
@@ -9700,7 +9654,7 @@ impl Assembler {
             return;
         };
         if authored.opcode != NOP
-            || authored.operand() != Operand::Value(0)
+            || authored.value_argument() != Some(0)
             || authored.location.line < 0
             || authored.location.line == load.location.line
             || authored.fusion_policy.is_converted_pop_block()
@@ -9906,20 +9860,20 @@ impl Assembler {
                     Some(depth),
                 )
             || none.opcode != LOAD_CONST
-            || !matches!(none.operand(), Operand::Value(_))
+            || none.value_argument().is_none()
             || *none
                 != Instruction::new(LOAD_CONST, none.operand(), authored.location, Some(loaded))
             || store.opcode != STORE_FAST
-            || !matches!(store.operand(), Operand::Value(_))
+            || store.value_argument().is_none()
             || *store
                 != Instruction::new(STORE_FAST, store.operand(), authored.location, Some(depth))
             || *delete
                 != Instruction::new(DELETE_FAST, store.operand(), authored.location, Some(depth))
-            || !matches!(load.operand(), Operand::Value(_))
+            || load.value_argument().is_none()
             || *load != expected_load
             || *truth != Instruction::new(TO_BOOL, Operand::Value(0), load.location, Some(loaded))
             || condition.opcode != POP_JUMP_IF_FALSE
-            || !matches!(condition.operand(), Operand::Forward(_))
+            || condition.forward_target().is_none()
             || *condition
                 != Instruction::new(
                     POP_JUMP_IF_FALSE,
@@ -10029,7 +9983,7 @@ impl Assembler {
             || truth.opcode != TO_BOOL
             || truth.depth_after() != load.depth_after()
             || !matches!(condition.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE)
-            || !matches!(condition.operand(), Operand::Forward(_))
+            || condition.forward_target().is_none()
             || condition.depth_after() != Some(depth)
             || marker.opcode != NOT_TAKEN
             || marker.depth_after() != Some(depth)
@@ -10266,14 +10220,14 @@ impl Assembler {
                 || handler_end == body
                 || handler_end == join
                 || pop.opcode != POP_EXCEPT
-                || pop.operand() != Operand::Value(0)
+                || pop.value_argument() != Some(0)
                 || pop.depth_after() != Some(depth)
                 || pop.location.line < 0
                 || none.opcode != LOAD_CONST
-                || !matches!(none.operand(), Operand::Value(_))
+                || none.value_argument().is_none()
                 || none.depth_after() != Some(loaded)
                 || store.opcode != STORE_FAST
-                || !matches!(store.operand(), Operand::Value(_))
+                || store.value_argument().is_none()
                 || store.depth_after() != Some(depth)
                 || delete.opcode != DELETE_FAST
                 || delete.operand() != store.operand()
@@ -10297,17 +10251,17 @@ impl Assembler {
             || jump.location != SourceLocation::NONE
             || jump.depth_after() != Some(after_discard)
             || discard_iterator.opcode != POP_TOP
-            || discard_iterator.operand() != Operand::Value(0)
+            || discard_iterator.value_argument() != Some(0)
             || discard_iterator.location != SourceLocation::NONE
             || discard_iterator.depth_after() != Some(after_discard)
             || load_guard.opcode != LOAD_FAST
-            || !matches!(load_guard.operand(), Operand::Value(_))
+            || load_guard.value_argument().is_none()
             || load_guard.depth_after() != Some(loaded)
             || condition.opcode != POP_JUMP_IF_NONE
             || condition.operand() != Operand::Forward(*join)
             || condition.local_policy.hidden_exception_owner_slots() != 3
             || not_taken.opcode != NOT_TAKEN
-            || not_taken.operand() != Operand::Value(0)
+            || not_taken.value_argument() != Some(0)
             || not_taken.depth_after() != Some(depth)
             || not_taken.pre_fold_extra_instructions() != 0
             || not_taken.exception_policy() != ExceptionPolicy::NonePresent
@@ -10315,16 +10269,16 @@ impl Assembler {
             || load_guard.location.line != condition.location.line
             || not_taken.location != condition.location
             || load_receiver.opcode != LOAD_FAST
-            || !matches!(load_receiver.operand(), Operand::Value(_))
+            || load_receiver.value_argument().is_none()
             || load_receiver.depth_after() != Some(loaded)
             || method.opcode != LOAD_ATTR
             || !matches!(method.operand(), Operand::Value(argument) if argument & 1 != 0)
             || method.depth_after() != Some(method_depth)
             || call.opcode != crate::target::opcodes::CALL
-            || call.operand() != Operand::Value(0)
+            || call.value_argument() != Some(0)
             || call.depth_after() != Some(loaded)
             || discard_call.opcode != POP_TOP
-            || discard_call.operand() != Operand::Value(0)
+            || discard_call.value_argument() != Some(0)
             || discard_call.depth_after() != Some(depth)
             || call.location.line < 0
             || load_receiver.location.line != call.location.line
@@ -10846,7 +10800,7 @@ impl Assembler {
                         && jump.pre_fold_extra_instructions() == 0
                         && jump.local_policy.hidden_exception_owner_slots() == 0
                         && clean_labels(&labels)
-                        && let Operand::Forward(target) = jump.operand()
+                        && let Some(target) = jump.forward_target()
                         && exit_labels.contains(&target)
                     {
                         promoted.extend(
@@ -10982,17 +10936,17 @@ impl Assembler {
             if let (Some(call), Some(comparison)) = (instructions.next(), instructions.next()) {
                 let prefix = [pop, load, condition, call, comparison];
                 if pop.opcode == NOP
-                    && pop.operand() == Operand::Value(0)
+                    && pop.value_argument() == Some(0)
                     && pop.location == SourceLocation::NONE
                     && pop.fusion_policy.is_converted_pop_block()
                     && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
                     && load.opcode == LOAD_FAST
-                    && matches!(load.operand(), Operand::Value(_))
+                    && load.value_argument().is_some()
                     && matches!(condition.operand(), Operand::Value(argument) if argument & 1 != 0)
                     && call.opcode == crate::target::opcodes::CALL
-                    && call.operand() == Operand::Value(0)
+                    && call.value_argument() == Some(0)
                     && matches!(comparison.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
-                    && matches!(comparison.operand(), Operand::Forward(_))
+                    && comparison.forward_target().is_some()
                     && comparison.location.line >= 0
                     && prefix[1..].iter().all(|record| {
                         record.location.line == comparison.location.line
@@ -11028,19 +10982,19 @@ impl Assembler {
             .flatten();
         if let Some(truth_condition) = truth_condition
             && pop.opcode == NOP
-            && pop.operand() == Operand::Value(0)
+            && pop.value_argument() == Some(0)
             && pop.location == SourceLocation::NONE
             && pop.fusion_policy.is_converted_pop_block()
             && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
             && matches!(load.opcode, LOAD_FAST | crate::target::opcodes::LOAD_DEREF)
-            && matches!(load.operand(), Operand::Value(_))
-            && condition.operand() == Operand::Value(0)
+            && load.value_argument().is_some()
+            && condition.value_argument() == Some(0)
             && matches!(
                 truth_condition.opcode,
                 crate::target::opcodes::POP_JUMP_IF_FALSE
                     | crate::target::opcodes::POP_JUMP_IF_TRUE
             )
-            && matches!(truth_condition.operand(), Operand::Forward(_))
+            && truth_condition.forward_target().is_some()
             && truth_condition.location.line >= 0
             && [load, condition, truth_condition].iter().all(|record| {
                 record.location == truth_condition.location
@@ -11070,7 +11024,7 @@ impl Assembler {
             && load.local_policy.hidden_exception_owner_slots() == 0
             && load.pre_fold_extra_instructions() == 0
             && matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
-            && matches!(condition.operand(), Operand::Forward(_))
+            && condition.forward_target().is_some()
             && condition.local_policy.hidden_exception_owner_slots() == 3
             && condition.pre_fold_extra_instructions() == 0
         {
@@ -11134,16 +11088,16 @@ impl Assembler {
             marker,
         ] = records;
         if discard.opcode != POP_TOP
-            || discard.operand() != Operand::Value(0)
+            || discard.value_argument() != Some(0)
             || authored.opcode != NOP
             || authored.fusion_policy.is_converted_pop_block()
             || items.get(return_item) != Some(&Item::Instruction(authored))
             || [inner, outer]
                 .iter()
-                .any(|i| i.opcode != POP_EXCEPT || i.operand() != Operand::Value(0))
+                .any(|i| i.opcode != POP_EXCEPT || i.value_argument() != Some(0))
             || [first_pop, second_pop, final_pop].iter().any(|i| {
                 i.opcode != NOP
-                    || i.operand() != Operand::Value(0)
+                    || i.value_argument() != Some(0)
                     || !i.fusion_policy.is_converted_pop_block()
                     || i.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
             })
@@ -11151,7 +11105,7 @@ impl Assembler {
             || load.local_policy
                 != LocalPolicy::for_load(load.local_policy.force_owned_load(), false)
             || !matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
-            || !matches!(condition.operand(), Operand::Forward(_))
+            || condition.forward_target().is_none()
             || marker.opcode != NOT_TAKEN
             || marker.exception_policy() != ExceptionPolicy::NonePresent
             || marker.location != condition.location
@@ -11218,7 +11172,7 @@ impl Assembler {
             || attribute.opcode != crate::target::opcodes::LOAD_ATTR
             || !matches!(attribute.operand(), Operand::Value(arg) if arg & 1 == 0)
             || !matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
-            || !matches!(condition.operand(), Operand::Forward(_))
+            || condition.forward_target().is_none()
             || marker.opcode != NOT_TAKEN
             || marker.exception_policy() != ExceptionPolicy::NonePresent
             || marker.location != condition.location
@@ -11284,18 +11238,18 @@ impl Assembler {
             *condition,
         ];
         if swap.opcode != SWAP
-            || swap.operand() != Operand::Value(2)
+            || swap.value_argument() != Some(2)
             || pop_except.opcode != POP_EXCEPT
-            || pop_except.operand() != Operand::Value(0)
+            || pop_except.value_argument() != Some(0)
             || [handler_pop, final_pop].iter().any(|pop| {
                 pop.opcode != NOP
-                    || pop.operand() != Operand::Value(0)
+                    || pop.value_argument() != Some(0)
                     || !pop.fusion_policy.is_converted_pop_block()
                     || pop.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
             })
             || !matches!(load.opcode, LOAD_FAST | crate::target::opcodes::LOAD_DEREF)
             || !matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
-            || !matches!(condition.operand(), Operand::Forward(_))
+            || condition.forward_target().is_none()
             || condition.local_policy.hidden_exception_owner_slots() != 3
             || records[..5]
                 .iter()
@@ -11354,20 +11308,20 @@ impl Assembler {
             return;
         };
         if swap.opcode != SWAP
-            || swap.operand() != Operand::Value(2)
+            || swap.value_argument() != Some(2)
             || pop_except.opcode != POP_EXCEPT
-            || pop_except.operand() != Operand::Value(0)
+            || pop_except.value_argument() != Some(0)
             || none.opcode != LOAD_CONST
             || store.opcode != STORE_FAST
             || delete.opcode != DELETE_FAST
             || store.operand() != delete.operand()
             || pop.opcode != NOP
-            || pop.operand() != Operand::Value(0)
+            || pop.value_argument() != Some(0)
             || !pop.fusion_policy.is_converted_pop_block()
             || items.get(pop_item) != Some(&Item::Instruction(*pop))
             || load.opcode != LOAD_FAST
             || !matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
-            || !matches!(condition.operand(), Operand::Forward(_))
+            || condition.forward_target().is_none()
             || marker.opcode != NOT_TAKEN
             || marker.location != condition.location
             || swap.location.line < 0
@@ -11440,7 +11394,7 @@ impl Assembler {
                 || record.no_location_policy.borrow_fallthrough() != BorrowFallthrough::Reachable
                 || record.jump_policy.borrow_empty_block()
                 || record.opcode == NOP
-                || !matches!(record.operand(), Operand::Value(_))
+                || record.value_argument().is_none()
                 || ends_scope(record.opcode)
         }) {
             return;
@@ -11500,7 +11454,7 @@ impl Assembler {
             || prefix.first() != Some(&Item::Instruction(cleanup[0]))
             || cleanup[0].fusion_policy.is_converted_pop_block()
             || cleanup[0].location.line < 0
-            || cleanup[0].operand() != Operand::Value(0)
+            || cleanup[0].value_argument() != Some(0)
             || cleanup[0].depth_after() != Some(u32::from(manager) + 1 + u32::from(handler))
             || cleanup.iter().enumerate().any(|(index, record)| {
                 record.local_policy.hidden_exception_owner_slots() != 0
@@ -11521,14 +11475,14 @@ impl Assembler {
         if manager {
             if cleanup[1].operand() != cleanup[2].operand()
                 || cleanup[2].operand() != cleanup[3].operand()
-                || cleanup[4].operand() != Operand::Value(3)
-                || cleanup[5].operand() != Operand::Value(0)
+                || cleanup[4].value_argument() != Some(3)
+                || cleanup[5].value_argument() != Some(0)
                 || cleanup[5].depth_after() != Some(u32::from(handler))
                 || cleanup[1..]
                     .iter()
                     .any(|record| record.location != cleanup[1].location)
                 || (handler
-                    && (cleanup[6].operand() != Operand::Value(0)
+                    && (cleanup[6].value_argument() != Some(0)
                         || cleanup[6].depth_after() != Some(0)
                         || cleanup[7].depth_after() != Some(1)
                         || cleanup[8].operand() != cleanup[9].operand()
@@ -11538,7 +11492,7 @@ impl Assembler {
                 return;
             }
         } else if cleanup.iter().any(|record| {
-            record.location != cleanup[0].location || record.operand() != Operand::Value(0)
+            record.location != cleanup[0].location || record.value_argument() != Some(0)
         }) || cleanup
             .last()
             .is_none_or(|record| record.depth_after() != Some(0))
@@ -11561,7 +11515,7 @@ impl Assembler {
             return;
         };
         if pop.opcode != NOP
-            || pop.operand() != Operand::Value(0)
+            || pop.value_argument() != Some(0)
             || !pop.fusion_policy.is_converted_pop_block()
             || pop.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
             || pop.depth_after() != Some(0)
@@ -11570,7 +11524,7 @@ impl Assembler {
             || load.opcode != LOAD_FAST
             || load.exception_policy() != ExceptionPolicy::NoneUnchanged
             || !matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
-            || !matches!(condition.operand(), Operand::Forward(_))
+            || condition.forward_target().is_none()
             || condition.exception_policy() != ExceptionPolicy::NoneUnchanged
             || condition.local_policy.hidden_exception_owner_slots() != 3
             || marker.opcode != NOT_TAKEN
@@ -11647,7 +11601,7 @@ impl Assembler {
             };
         if pops.iter().chain(additional_pop.iter()).any(|pop| {
             pop.opcode != NOP
-                || pop.operand() != Operand::Value(0)
+                || pop.value_argument() != Some(0)
                 || !pop.fusion_policy.is_converted_pop_block()
                 || pop.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
                 || pop.local_policy.hidden_exception_owner_slots() != 0
@@ -11656,7 +11610,7 @@ impl Assembler {
             || load.local_policy.hidden_exception_owner_slots() != 0
             || load.pre_fold_extra_instructions() != 0
             || !matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
-            || !matches!(condition.operand(), Operand::Forward(_))
+            || condition.forward_target().is_none()
             || condition.local_policy.hidden_exception_owner_slots() != 3
             || condition.pre_fold_extra_instructions() != 0
         {
@@ -11723,13 +11677,13 @@ impl Assembler {
         let pops = [*first, *second];
         if pops.iter().any(|pop| {
             pop.opcode != NOP
-                || pop.operand() != Operand::Value(0)
+                || pop.value_argument() != Some(0)
                 || !pop.fusion_policy.is_converted_pop_block()
                 || pop.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
                 || pop.local_policy.hidden_exception_owner_slots() != 0
                 || pop.pre_fold_extra_instructions() != 0
         }) || load.opcode != LOAD_CONST
-            || !matches!(load.operand(), Operand::Value(_))
+            || load.value_argument().is_none()
             || load.exception_policy() != ExceptionPolicy::NoneUnchanged
             || load.local_policy.hidden_exception_owner_slots() != 0
             || load.pre_fold_extra_instructions() != 0
@@ -11773,7 +11727,7 @@ impl Assembler {
         let condition = *condition;
         if pops.iter().any(|pop| {
             pop.opcode != NOP
-                || pop.operand() != Operand::Value(0)
+                || pop.value_argument() != Some(0)
                 || !pop.fusion_policy.is_converted_pop_block()
                 || pop.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
         }) || global.opcode != LOAD_GLOBAL
@@ -11781,13 +11735,13 @@ impl Assembler {
             || attribute.opcode != LOAD_ATTR
             || !matches!(attribute.operand(), Operand::Value(argument) if argument & 1 == 0)
             || null.opcode != PUSH_NULL
-            || null.operand() != Operand::Value(0)
+            || null.value_argument() != Some(0)
             || call.opcode != CALL
-            || call.operand() != Operand::Value(0)
+            || call.value_argument() != Some(0)
             || to_bool.opcode != TO_BOOL
-            || to_bool.operand() != Operand::Value(0)
+            || to_bool.value_argument() != Some(0)
             || !matches!(condition.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE)
-            || !matches!(condition.operand(), Operand::Forward(_))
+            || condition.forward_target().is_none()
             || condition.location.line < 0
             || prefix
                 .iter()
@@ -11819,7 +11773,7 @@ impl Assembler {
             return;
         };
         if authored.opcode != NOP
-            || authored.operand() != Operand::Value(0)
+            || authored.value_argument() != Some(0)
             || authored.location.line < 0
             || authored.exception_policy() != ExceptionPolicy::NoneUnchanged
             || authored.fusion_policy.is_converted_pop_block()
@@ -11873,17 +11827,17 @@ impl Assembler {
         let condition = *condition;
         if pops.iter().any(|pop| {
             pop.opcode != NOP
-                || pop.operand() != Operand::Value(0)
+                || pop.value_argument() != Some(0)
                 || !pop.fusion_policy.is_converted_pop_block()
                 || pop.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
         }) || load.opcode != LOAD_FAST
-            || !matches!(load.operand(), Operand::Value(_))
+            || load.value_argument().is_none()
             || attribute.opcode != LOAD_ATTR
             || !matches!(attribute.operand(), Operand::Value(argument) if argument & 1 == 0)
             || to_bool.opcode != TO_BOOL
-            || to_bool.operand() != Operand::Value(0)
+            || to_bool.value_argument() != Some(0)
             || !matches!(condition.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE)
-            || !matches!(condition.operand(), Operand::Forward(_))
+            || condition.forward_target().is_none()
             || condition.location.line < 0
             || prefix
                 .iter()
@@ -11915,7 +11869,7 @@ impl Assembler {
             return;
         };
         if authored.opcode != NOP
-            || authored.operand() != Operand::Value(0)
+            || authored.value_argument() != Some(0)
             || authored.location.line < 0
             || authored.exception_policy() != ExceptionPolicy::NoneUnchanged
             || authored.fusion_policy.is_converted_pop_block()
@@ -11976,7 +11930,7 @@ impl Assembler {
             return;
         };
         if return_value.opcode != LOAD_FAST
-            || !matches!(return_value.operand(), Operand::Value(_))
+            || return_value.value_argument().is_none()
             || return_value.exception_policy() != ExceptionPolicy::NoneUnchanged
             || return_value.local_policy.hidden_exception_owner_slots() != 0
             || return_value.pre_fold_extra_instructions() != 0
@@ -11985,7 +11939,7 @@ impl Assembler {
             || labels.iter().any(|item| !matches!(item, Item::Label(_)))
             || [first, second].iter().any(|pop| {
                 pop.opcode != NOP
-                    || pop.operand() != Operand::Value(0)
+                    || pop.value_argument() != Some(0)
                     || !pop.fusion_policy.is_converted_pop_block()
                     || pop.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
                     || pop.local_policy.hidden_exception_owner_slots() != 0
@@ -11994,7 +11948,7 @@ impl Assembler {
                     || pop.location != first.location
             })
             || load.opcode != LOAD_FAST
-            || !matches!(load.operand(), Operand::Value(_))
+            || load.value_argument().is_none()
             || load.local_policy.hidden_exception_owner_slots() != 0
             || load.pre_fold_extra_instructions() != 0
             || constant.opcode != LOAD_CONST
@@ -12002,11 +11956,11 @@ impl Assembler {
             || constant.local_policy.hidden_exception_owner_slots() != 3
             || constant.pre_fold_extra_instructions() != 3
             || contains.opcode != CONTAINS_OP
-            || contains.operand() != Operand::Value(0)
+            || contains.value_argument() != Some(0)
             || contains.local_policy.hidden_exception_owner_slots() != 1
             || contains.pre_fold_extra_instructions() != 0
             || condition.opcode != POP_JUMP_IF_FALSE
-            || !matches!(condition.operand(), Operand::Forward(_))
+            || condition.forward_target().is_none()
             || marker.opcode != NOT_TAKEN
             || marker.exception_policy() != ExceptionPolicy::NonePresent
             || [condition, marker].iter().any(|record| {
@@ -12088,15 +12042,15 @@ impl Assembler {
         let condition = *condition;
         if pops.iter().any(|pop| {
             pop.opcode != NOP
-                || pop.operand() != Operand::Value(0)
+                || pop.value_argument() != Some(0)
                 || !pop.fusion_policy.is_converted_pop_block()
                 || pop.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
         }) || load.opcode != LOAD_FAST
-            || !matches!(load.operand(), Operand::Value(_))
+            || load.value_argument().is_none()
             || to_bool.opcode != TO_BOOL
-            || to_bool.operand() != Operand::Value(0)
+            || to_bool.value_argument() != Some(0)
             || !matches!(condition.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE)
-            || !matches!(condition.operand(), Operand::Forward(_))
+            || condition.forward_target().is_none()
             || [pops[0], pops[1], load, to_bool, condition]
                 .iter()
                 .any(|instruction| {
@@ -12109,7 +12063,7 @@ impl Assembler {
         let return_nop = match self.linear_items().get(return_item..first_pop_item) {
             Some([Item::Instruction(authored), labels @ ..])
                 if authored.opcode == NOP
-                    && authored.operand() == Operand::Value(0)
+                    && authored.value_argument() == Some(0)
                     && authored.exception_policy() == ExceptionPolicy::NoneUnchanged
                     && !authored.fusion_policy.is_converted_pop_block()
                     && authored.local_policy.hidden_exception_owner_slots() == 0
@@ -12179,11 +12133,11 @@ impl Assembler {
         if prefix.iter().map(|instruction| instruction.opcode).ne([
             END_SEND, POP_TOP, LOAD_FAST, SWAP, SWAP, LOAD_CONST, LOAD_CONST, LOAD_CONST, CALL,
             POP_TOP,
-        ]) || prefix[3].operand() != Operand::Value(3)
-            || prefix[4].operand() != Operand::Value(2)
+        ]) || prefix[3].value_argument() != Some(3)
+            || prefix[4].value_argument() != Some(2)
             || prefix[5].operand() != prefix[6].operand()
             || prefix[6].operand() != prefix[7].operand()
-            || prefix[8].operand() != Operand::Value(3)
+            || prefix[8].value_argument() != Some(3)
             || items.get(return_item) != Some(&Item::Instruction(prefix[2]))
             || prefix.iter().any(|instruction| {
                 instruction.local_policy.hidden_exception_owner_slots() != 0
@@ -12210,7 +12164,7 @@ impl Assembler {
             && load.local_policy.hidden_exception_owner_slots() == 0
             && load.pre_fold_extra_instructions() == 0
             && matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
-            && matches!(condition.operand(), Operand::Forward(_))
+            && condition.forward_target().is_some()
             && condition.local_policy.hidden_exception_owner_slots() == 3
             && condition.pre_fold_extra_instructions() == 0
         {
@@ -12251,7 +12205,7 @@ impl Assembler {
         };
         if items.get(return_item) != Some(&Item::Instruction(*authored))
             || authored.opcode != NOP
-            || authored.operand() != Operand::Value(0)
+            || authored.value_argument() != Some(0)
             || authored.location.line < 0
             || authored.fusion_policy.is_converted_pop_block()
             || [
@@ -12263,8 +12217,8 @@ impl Assembler {
             ] != [LOAD_CONST, LOAD_CONST, LOAD_CONST, CALL, POP_TOP]
             || first.operand() != second.operand()
             || second.operand() != third.operand()
-            || call.operand() != Operand::Value(3)
-            || discard.operand() != Operand::Value(0)
+            || call.value_argument() != Some(3)
+            || discard.value_argument() != Some(0)
             || [second, third, call, discard]
                 .iter()
                 .any(|record| record.location != first.location)
@@ -12272,7 +12226,7 @@ impl Assembler {
                 record.exception_policy() != ExceptionPolicy::NoneUnchanged
                     || record.local_policy.hidden_exception_owner_slots() != 0
                     || record.pre_fold_extra_instructions() != 0
-                    || !matches!(record.operand(), Operand::Value(_))
+                    || record.value_argument().is_none()
             })
         {
             return;
@@ -12287,7 +12241,7 @@ impl Assembler {
             return;
         };
         if pop.opcode != NOP
-            || pop.operand() != Operand::Value(0)
+            || pop.value_argument() != Some(0)
             || !pop.fusion_policy.is_converted_pop_block()
             || pop.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
             || pop.location.line >= 0
@@ -12297,17 +12251,17 @@ impl Assembler {
             || pop.depth_after() != discard.depth_after()
             || authored.depth_after() != pop.depth_after().and_then(|depth| depth.checked_add(2))
             || load.opcode != LOAD_FAST
-            || !matches!(load.operand(), Operand::Value(_))
+            || load.value_argument().is_none()
             || load.exception_policy() != ExceptionPolicy::NoneUnchanged
             || load.local_policy.hidden_exception_owner_slots() != 0
             || load.pre_fold_extra_instructions() != 0
             || !matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
-            || !matches!(condition.operand(), Operand::Forward(_))
+            || condition.forward_target().is_none()
             || condition.local_policy.hidden_exception_owner_slots() != 3
             || condition.pre_fold_extra_instructions() != 0
             || condition.exception_policy() != ExceptionPolicy::NoneUnchanged
             || marker.opcode != NOT_TAKEN
-            || marker.operand() != Operand::Value(0)
+            || marker.value_argument() != Some(0)
             || marker.location != condition.location
             || marker.exception_policy() != ExceptionPolicy::NonePresent
             || marker.local_policy.hidden_exception_owner_slots() != 0
@@ -12390,11 +12344,11 @@ impl Assembler {
             || records.as_chunks::<7>().0.iter().any(|cleanup| {
                 cleanup.iter().map(|instruction| instruction.opcode).ne([
                     SWAP, SWAP, LOAD_CONST, LOAD_CONST, LOAD_CONST, CALL, POP_TOP,
-                ]) || cleanup[0].operand() != Operand::Value(3)
-                    || cleanup[1].operand() != Operand::Value(2)
+                ]) || cleanup[0].value_argument() != Some(3)
+                    || cleanup[1].value_argument() != Some(2)
                     || cleanup[2].operand() != cleanup[3].operand()
                     || cleanup[3].operand() != cleanup[4].operand()
-                    || cleanup[5].operand() != Operand::Value(3)
+                    || cleanup[5].value_argument() != Some(3)
                     || cleanup.iter().any(|instruction| {
                         instruction.local_policy.hidden_exception_owner_slots() != 0
                             || instruction.pre_fold_extra_instructions() != 0
@@ -12429,8 +12383,8 @@ impl Assembler {
                 LOAD_CONST,
                 STORE_FAST,
                 DELETE_FAST,
-            ]) || prefix[0].operand() != Operand::Value(2)
-                || prefix[1].operand() != Operand::Value(0)
+            ]) || prefix[0].value_argument() != Some(2)
+                || prefix[1].value_argument() != Some(0)
                 || prefix[2].operand() != cleanup[2].operand()
                 || prefix[3].operand() != prefix[4].operand()
                 || prefix[1].depth_after().is_none()
@@ -12447,7 +12401,7 @@ impl Assembler {
                         || record.local_policy.hidden_exception_owner_slots() != 0
                         || record.pre_fold_extra_instructions() != 0
                         || record.exception_policy() != ExceptionPolicy::NoneUnchanged
-                        || !matches!(record.operand(), Operand::Value(_))
+                        || record.value_argument().is_none()
                 })
             {
                 return;
@@ -12479,7 +12433,7 @@ impl Assembler {
             && load.local_policy.hidden_exception_owner_slots() == 0
             && load.pre_fold_extra_instructions() == 0
             && matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
-            && matches!(condition.operand(), Operand::Forward(_))
+            && condition.forward_target().is_some()
             && condition.local_policy.hidden_exception_owner_slots() == 3
             && condition.pre_fold_extra_instructions() == 0
         {
@@ -12553,7 +12507,7 @@ impl Assembler {
         let prelude = &records[prelude_start..prelude_start + prelude_len];
         let cleanup = &records[prelude_start + prelude_len..];
         if authored.opcode != NOP
-            || authored.operand() != Operand::Value(0)
+            || authored.value_argument() != Some(0)
             || authored.fusion_policy.is_converted_pop_block()
             || authored.location.line < 0
             || prelude[0].location != authored.location
@@ -12563,7 +12517,7 @@ impl Assembler {
                     .any(|instruction| instruction.location != authored.location))
             || handler_pop.is_some_and(|pop| {
                 pop.opcode != NOP
-                    || pop.operand() != Operand::Value(0)
+                    || pop.value_argument() != Some(0)
                     || !pop.fusion_policy.is_converted_pop_block()
                     || pop.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
                     || pop.location != authored.location
@@ -12575,7 +12529,7 @@ impl Assembler {
                     || instruction.pre_fold_extra_instructions() != 0
                     || (!(unnamed_handler && index == 1)
                         && instruction.exception_policy() != ExceptionPolicy::NoneUnchanged)
-                    || !matches!(instruction.operand(), Operand::Value(_))
+                    || instruction.value_argument().is_none()
             })
             || (named_handler
                 && (prelude.iter().map(|instruction| instruction.opcode).ne([
@@ -12588,7 +12542,7 @@ impl Assembler {
             || (!named_handler && !unnamed_handler && prelude[0].opcode != POP_TOP)
             || (unnamed_handler
                 && (prelude[0].opcode != POP_EXCEPT
-                    || prelude[0].operand() != Operand::Value(0)
+                    || prelude[0].value_argument() != Some(0)
                     || records[3..].as_chunks::<5>().0.iter().any(|manager| {
                         manager
                             .iter()
@@ -12596,8 +12550,8 @@ impl Assembler {
                             .ne([LOAD_CONST, LOAD_CONST, LOAD_CONST, CALL, POP_TOP])
                             || manager[0].operand() != manager[1].operand()
                             || manager[1].operand() != manager[2].operand()
-                            || manager[3].operand() != Operand::Value(3)
-                            || manager[4].operand() != Operand::Value(0)
+                            || manager[3].value_argument() != Some(3)
+                            || manager[4].value_argument() != Some(0)
                             || manager
                                 .iter()
                                 .any(|record| record.location != manager[0].location)
@@ -12608,7 +12562,7 @@ impl Assembler {
                 .ne([LOAD_CONST, LOAD_CONST, LOAD_CONST, CALL, POP_TOP])
             || cleanup[0].operand() != cleanup[1].operand()
             || cleanup[1].operand() != cleanup[2].operand()
-            || cleanup[3].operand() != Operand::Value(3)
+            || cleanup[3].value_argument() != Some(3)
         {
             return;
         }
@@ -12630,7 +12584,7 @@ impl Assembler {
             && load.local_policy.hidden_exception_owner_slots() == 0
             && load.pre_fold_extra_instructions() == 0
             && matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
-            && matches!(condition.operand(), Operand::Forward(_))
+            && condition.forward_target().is_some()
             && condition.local_policy.hidden_exception_owner_slots() == 3
             && condition.pre_fold_extra_instructions() == 0
         {
@@ -12700,7 +12654,7 @@ impl Assembler {
         let inner_try_pop = retained_inner_try.then_some(records[1]);
         if inner_try_pop.is_some_and(|pop| {
             pop.opcode != NOP
-                || pop.operand() != Operand::Value(0)
+                || pop.value_argument() != Some(0)
                 || !pop.fusion_policy.is_converted_pop_block()
                 || pop.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
                 || pop.location != authored.location
@@ -12709,7 +12663,7 @@ impl Assembler {
             return;
         }
         if authored.opcode != NOP
-            || authored.operand() != Operand::Value(0)
+            || authored.value_argument() != Some(0)
             || authored.fusion_policy.is_converted_pop_block()
             || authored.location.line < 0
             || authored.depth_after().is_none()
@@ -12719,8 +12673,8 @@ impl Assembler {
                 .ne([LOAD_CONST, LOAD_CONST, LOAD_CONST, CALL, POP_TOP])
             || cleanup[0].operand() != cleanup[1].operand()
             || cleanup[1].operand() != cleanup[2].operand()
-            || cleanup[3].operand() != Operand::Value(3)
-            || cleanup[4].operand() != Operand::Value(0)
+            || cleanup[3].value_argument() != Some(3)
+            || cleanup[4].value_argument() != Some(0)
             || cleanup
                 .iter()
                 .any(|record| record.location != cleanup[0].location)
@@ -12728,18 +12682,18 @@ impl Assembler {
             || authored.depth_after() != Some(if unnamed_handler { 3 } else { 2 })
             || (unnamed_handler
                 && (records[1].opcode != NOP
-                    || records[1].operand() != Operand::Value(0)
+                    || records[1].value_argument() != Some(0)
                     || !records[1].fusion_policy.is_converted_pop_block()
                     || records[1].location != authored.location
                     || records[1].depth_after() != authored.depth_after()
                     || records[2].opcode != POP_EXCEPT
-                    || records[2].operand() != Operand::Value(0)
+                    || records[2].value_argument() != Some(0)
                     || records[2].location != authored.location
                     || records[2].depth_after() != Some(2)))
             || records.iter().enumerate().any(|(index, record)| {
                 record.local_policy.hidden_exception_owner_slots() != 0
                     || record.pre_fold_extra_instructions() != 0
-                    || !matches!(record.operand(), Operand::Value(_))
+                    || record.value_argument().is_none()
                     || record.exception_policy()
                         != if (unnamed_handler || retained_inner_try) && index == 1 {
                             ExceptionPolicy::EXCLUDE_ALWAYS
@@ -12774,19 +12728,19 @@ impl Assembler {
             _ => return,
         };
         if pop.opcode != NOP
-            || pop.operand() != Operand::Value(0)
+            || pop.value_argument() != Some(0)
             || !pop.fusion_policy.is_converted_pop_block()
             || pop.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
             || pop.location.line >= 0
             || pop.depth_after() != Some(0)
             || load.opcode != LOAD_FAST
-            || !matches!(load.operand(), Operand::Value(_))
-            || to_bool.is_some_and(|record| record.operand() != Operand::Value(0))
+            || load.value_argument().is_none()
+            || to_bool.is_some_and(|record| record.value_argument() != Some(0))
             || (to_bool.is_some()
                 && !matches!(condition.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE))
-            || !matches!(condition.operand(), Operand::Forward(_))
+            || condition.forward_target().is_none()
             || marker.opcode != NOT_TAKEN
-            || marker.operand() != Operand::Value(0)
+            || marker.value_argument() != Some(0)
             || marker.exception_policy()
                 != if to_bool.is_some() {
                     ExceptionPolicy::NoneDynamicCondition
@@ -12859,7 +12813,7 @@ impl Assembler {
             return;
         };
         if marker.opcode != NOP
-            || marker.operand() != Operand::Value(0)
+            || marker.value_argument() != Some(0)
             || !marker.fusion_policy.is_converted_pop_block()
             || marker.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
         {
@@ -12936,7 +12890,7 @@ impl Assembler {
                         let [Item::Label(region_end)] = &items[labels_start..end] else {
                             return;
                         };
-                        let Operand::Forward(join) = instruction.operand() else {
+                        let Some(join) = instruction.forward_target() else {
                             return;
                         };
                         let Some(handler) = self
@@ -12986,7 +12940,7 @@ impl Assembler {
             };
             end += 1;
             if is_conditional_jump(instruction.opcode) || normal_try_prefix_end.is_some() {
-                if matches!(instruction.operand(), Operand::Forward(_)) {
+                if instruction.forward_target().is_some() {
                     if normal_try_prefix_end.is_none() {
                         while matches!(items.get(end), Some(Item::Label(_))) {
                             end += 1;
@@ -13047,7 +13001,7 @@ impl Assembler {
                     // normal-exit jump. A label-only terminal join is not populated
                     // by that pending jump or by a later enclosing continuation.
                     let borrow_join = if retained_setup.is_none()
-                        && let Operand::Forward(join) = instruction.operand()
+                        && let Some(join) = instruction.forward_target()
                     {
                         let mut positions = items.iter().enumerate().filter_map(|(index, item)| {
                             (*item == Item::Label(join)).then_some(index)
@@ -13062,7 +13016,7 @@ impl Assembler {
                                     Item::Label(_) => None,
                                 })?;
                             (!matches!(first.opcode, NOP | NOT_TAKEN)
-                                && matches!(first.operand(), Operand::Value(_))
+                                && first.value_argument().is_some()
                                 && !is_conditional_jump(first.opcode)
                                 && !is_unconditional_jump(first.opcode)
                                 && !ends_scope(first.opcode)
@@ -13089,8 +13043,7 @@ impl Assembler {
                 }
                 return;
             }
-            if !matches!(instruction.operand(), Operand::Value(_)) || ends_scope(instruction.opcode)
-            {
+            if instruction.value_argument().is_none() || ends_scope(instruction.opcode) {
                 return;
             }
             // One authored retained SETUP can introduce range labels without
@@ -13259,19 +13212,19 @@ impl Assembler {
         let provenance = &self.exception_owner_provenance;
         if *last != jump
             || pop.opcode != POP_EXCEPT
-            || pop.operand() != Operand::Value(0)
+            || pop.value_argument() != Some(0)
             || none.opcode != LOAD_CONST
-            || !matches!(none.operand(), Operand::Value(_))
+            || none.value_argument().is_none()
             || none.depth_after() != depth.checked_add(1)
             || store.opcode != STORE_FAST
             || delete.opcode != DELETE_FAST
             || store.operand() != delete.operand()
-            || !matches!(store.operand(), Operand::Value(_))
+            || store.value_argument().is_none()
             || [store, delete, last]
                 .iter()
                 .any(|value| value.depth_after() != Some(depth))
             || jump.opcode != JUMP_FORWARD
-            || !matches!(jump.operand(), Operand::Forward(_))
+            || jump.forward_target().is_none()
             || !jump.no_location_policy.allows_block_inlining()
             || records.iter().any(|value| {
                 value.location != SourceLocation::NONE
@@ -13492,8 +13445,8 @@ impl Assembler {
             || !provenance.source_boundaries.contains(&entry)
             || first.opcode != POP_TOP
             || last.opcode != POP_TOP
-            || first.operand() != Operand::Value(0)
-            || last.operand() != Operand::Value(0)
+            || first.value_argument() != Some(0)
+            || last.value_argument() != Some(0)
             || first.location.line < 0
             || first.location != last.location
             || !intact(first)
@@ -13519,7 +13472,7 @@ impl Assembler {
         let condition = failures.next()?;
         (failures.next().is_none()
             && condition.opcode == POP_JUMP_IF_NONE
-            && matches!(condition.operand(), Operand::Forward(_))
+            && condition.forward_target().is_some()
             && condition.location.line == first.location.line
             && condition.location.column == first.location.column
             && intact(condition)
@@ -13696,10 +13649,10 @@ impl Assembler {
             return None;
         };
         if copy.opcode != COPY
-            || copy.operand() != Operand::Value(3)
+            || copy.value_argument() != Some(3)
             || pop.opcode != POP_EXCEPT
             || reraise.opcode != RERAISE
-            || reraise.operand() != Operand::Value(1)
+            || reraise.value_argument() != Some(1)
             || [copy, pop, reraise].iter().any(|instruction| {
                 instruction.location != SourceLocation::NONE
                     || instruction.pre_fold_extra_instructions() != 0
@@ -13790,7 +13743,7 @@ impl Assembler {
             };
             depth = depth.checked_sub(1)?;
             if pop.opcode != POP_TOP
-                || pop.operand() != Operand::Value(0)
+                || pop.value_argument() != Some(0)
                 || pop.location != SourceLocation::NONE
                 || pop.depth_after() != Some(depth)
             {
@@ -13798,7 +13751,7 @@ impl Assembler {
             }
         }
         (store.opcode == STORE_FAST
-            && matches!(store.operand(), Operand::Value(_))
+            && store.value_argument().is_some()
             && store.location.line >= 0
             && jump.opcode == JUMP_FORWARD
             && jump.operand() == Operand::Forward(entry)
@@ -13888,9 +13841,9 @@ impl Assembler {
         };
         if *exit != emitted_jump
             || exit.opcode != JUMP_FORWARD
-            || !matches!(exit.operand(), Operand::Forward(_))
+            || exit.forward_target().is_none()
             || pop.opcode != NOP
-            || pop.operand() != Operand::Value(0)
+            || pop.value_argument() != Some(0)
             || !pop.fusion_policy.is_converted_pop_block()
             || !pop.jump_policy.preserves_explicit_nop()
             || pop.location.line < 0
@@ -13951,15 +13904,19 @@ impl Assembler {
         let Item::Instruction(instruction) = items[index] else {
             unreachable!();
         };
-        let retained_constant_pass = self.exception_owner_provenance.constant_pass_clusters.iter().any(|cluster| {
-            index.checked_sub(3).is_some_and(|start| {
-                matches!(&items[start..=index], [
+        let retained_constant_pass = self
+            .exception_owner_provenance
+            .constant_pass_clusters
+            .iter()
+            .any(|cluster| {
+                index.checked_sub(3).is_some_and(|start| {
+                    matches!(&items[start..=index], [
                     Item::Label(first), Item::Instruction(constant),
                     Item::Label(second), Item::Instruction(pass),
                 ] if *first == cluster.start && *second == cluster.end
                     && constant.opcode == NOP && constant.location == cluster.constant_location
                     && pass.opcode == NOP && pass.location == cluster.pass_location
-                    && constant.operand() == Operand::Value(0) && pass.operand() == Operand::Value(0)
+                    && constant.value_argument() == Some(0) && pass.value_argument() == Some(0)
                     && !constant.fusion_policy.is_converted_pop_block()
                     && !pass.fusion_policy.is_converted_pop_block()
                     && !constant.jump_policy.preserves_explicit_nop()
@@ -13970,8 +13927,8 @@ impl Assembler {
                     && pass.pre_fold_extra_instructions() == 0
                     && constant.local_policy.hidden_exception_owner_slots() == 0
                     && pass.local_policy.hidden_exception_owner_slots() == 0)
-            })
-        });
+                })
+            });
         if instruction.opcode != NOP
             || instruction.jump_policy.preserves_explicit_nop()
             || retained_constant_pass
@@ -14143,9 +14100,9 @@ impl Assembler {
             || load.opcode != LOAD_FAST
             || truth.opcode != TO_BOOL
             || !matches!(condition.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE)
-            || !matches!(condition.operand(), Operand::Forward(_))
+            || condition.forward_target().is_none()
             || marker.opcode != NOT_TAKEN
-            || marker.operand() != Operand::Value(0)
+            || marker.value_argument() != Some(0)
             || marker.jump_policy.is_authored_branch_marker()
             || [load, truth]
                 .iter()
@@ -14254,16 +14211,16 @@ impl Assembler {
         };
         if [first, second].iter().any(|pop| {
             pop.opcode != NOP
-                || pop.operand() != Operand::Value(0)
+                || pop.value_argument() != Some(0)
                 || !pop.fusion_policy.is_converted_pop_block()
                 || pop.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
         }) || receiver.opcode != LOAD_FAST
             || method.opcode != LOAD_ATTR
             || !matches!(method.operand(), Operand::Value(argument) if argument & 1 != 0)
             || call.opcode != crate::target::opcodes::CALL
-            || call.operand() != Operand::Value(0)
+            || call.value_argument() != Some(0)
             || discard.opcode != POP_TOP
-            || discard.operand() != Operand::Value(0)
+            || discard.value_argument() != Some(0)
             || records.iter().any(|record| {
                 record.local_policy.hidden_exception_owner_slots() != 0
                     || record.pre_fold_extra_instructions() != 0
@@ -14335,7 +14292,7 @@ impl Assembler {
         if !(1..=2).contains(&pops.len())
             || pops.iter().any(|pop| {
                 pop.opcode != NOP
-                    || pop.operand() != Operand::Value(0)
+                    || pop.value_argument() != Some(0)
                     || !pop.fusion_policy.is_converted_pop_block()
                     || pop.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
                     || pop.location != SourceLocation::NONE
@@ -14345,7 +14302,7 @@ impl Assembler {
             || load.depth_after() != Some(2)
             || load.exception_policy() != ExceptionPolicy::NoneUnchanged
             || !matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
-            || !matches!(condition.operand(), Operand::Forward(_))
+            || condition.forward_target().is_none()
             || condition.local_policy.hidden_exception_owner_slots() != 3
             || condition.exception_policy() != ExceptionPolicy::NoneUnchanged
             || condition.depth_after() != Some(1)
@@ -14388,12 +14345,12 @@ impl Assembler {
             return;
         };
         if swap.opcode != SWAP
-            || swap.operand() != Operand::Value(2)
+            || swap.value_argument() != Some(2)
             || pop_except.opcode != POP_EXCEPT
-            || pop_except.operand() != Operand::Value(0)
+            || pop_except.value_argument() != Some(0)
             || [first, second].iter().any(|pop| {
                 pop.opcode != NOP
-                    || pop.operand() != Operand::Value(0)
+                    || pop.value_argument() != Some(0)
                     || !pop.fusion_policy.is_converted_pop_block()
                     || pop.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
             })
@@ -14481,15 +14438,15 @@ impl Assembler {
         if *final_pop_at != pop_item
             || [first, second, final_pop].iter().any(|record| {
                 record.opcode != NOP
-                    || record.operand() != Operand::Value(0)
+                    || record.value_argument() != Some(0)
                     || !record.fusion_policy.is_converted_pop_block()
                     || record.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
                     || record.location != pop.location
             })
             || swap.opcode != SWAP
-            || swap.operand() != Operand::Value(2)
+            || swap.value_argument() != Some(2)
             || pop_except.opcode != POP_EXCEPT
-            || pop_except.operand() != Operand::Value(0)
+            || pop_except.value_argument() != Some(0)
             || none.opcode != LOAD_CONST
             || store.opcode != STORE_FAST
             || delete.opcode != DELETE_FAST
@@ -14512,16 +14469,16 @@ impl Assembler {
                 .iter()
                 .any(|record| record.depth_after() != Some(2))
             || setup.opcode != NOP
-            || setup.operand() != Operand::Value(0)
+            || setup.value_argument() != Some(0)
             || setup.fusion_policy.is_converted_pop_block()
             || setup.exception_policy() != ExceptionPolicy::NoneUnchanged
             || setup.location.line < 0
             || load.opcode != LOAD_FAST
             || truth.opcode != TO_BOOL
             || !matches!(condition.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE)
-            || !matches!(condition.operand(), Operand::Forward(_))
+            || condition.forward_target().is_none()
             || marker.opcode != NOT_TAKEN
-            || marker.operand() != Operand::Value(0)
+            || marker.value_argument() != Some(0)
             || marker.exception_policy() != ExceptionPolicy::NoneDynamicCondition
             || [load, truth, condition].iter().any(|record| {
                 record.location != marker.location
@@ -14604,11 +14561,11 @@ impl Assembler {
         };
         if *authored_at != continue_item
             || discard.opcode != POP_TOP
-            || discard.operand() != Operand::Value(0)
+            || discard.value_argument() != Some(0)
             || discard.depth_after() != Some(2)
             || discard.exception_policy() != ExceptionPolicy::NoneUnchanged
             || authored.opcode != NOP
-            || authored.operand() != Operand::Value(0)
+            || authored.value_argument() != Some(0)
             || authored.fusion_policy.is_converted_pop_block()
             || authored.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
             || authored.depth_after() != Some(2)
@@ -14618,7 +14575,7 @@ impl Assembler {
             || authored.location.end_line > discard.location.end_line
             || [handler_pop, finally_pop].iter().any(|record| {
                 record.opcode != NOP
-                    || record.operand() != Operand::Value(0)
+                    || record.value_argument() != Some(0)
                     || !record.fusion_policy.is_converted_pop_block()
                     || record.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
                     || record.location != authored.location
@@ -14626,12 +14583,12 @@ impl Assembler {
             || handler_pop.depth_after() != Some(2)
             || finally_pop.depth_after() != Some(1)
             || pop_except.opcode != POP_EXCEPT
-            || pop_except.operand() != Operand::Value(0)
+            || pop_except.value_argument() != Some(0)
             || pop_except.location != authored.location
             || pop_except.depth_after() != Some(1)
             || pop_except.exception_policy() != ExceptionPolicy::NoneUnchanged
             || setup.opcode != NOP
-            || setup.operand() != Operand::Value(0)
+            || setup.value_argument() != Some(0)
             || setup.depth_after() != Some(1)
             || setup.fusion_policy.is_converted_pop_block()
             || setup.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
@@ -14641,12 +14598,12 @@ impl Assembler {
             || load.location.line != marker.location.line
             || load.exception_policy() != ExceptionPolicy::NoneUnchanged
             || condition.opcode != POP_JUMP_IF_NONE
-            || !matches!(condition.operand(), Operand::Forward(_))
+            || condition.forward_target().is_none()
             || condition.depth_after() != Some(1)
             || condition.location != marker.location
             || condition.exception_policy() != ExceptionPolicy::NoneUnchanged
             || marker.opcode != NOT_TAKEN
-            || marker.operand() != Operand::Value(0)
+            || marker.value_argument() != Some(0)
             || marker.depth_after() != Some(1)
             || marker.exception_policy() != ExceptionPolicy::NonePresent
             || marker.location.line <= setup.location.line
@@ -14713,17 +14670,17 @@ impl Assembler {
         let records = [value, inner_pop, swap, discard, final_pop, callable];
         if return_item.checked_add(2) != Some(pop_item)
             || value.opcode != LOAD_FAST
-            || !matches!(value.operand(), Operand::Value(_))
+            || value.value_argument().is_none()
             || value.exception_policy() != ExceptionPolicy::NoneUnchanged
             || value.location.line != inner_pop.location.line
             || value.location.end_line != inner_pop.location.end_line
             || value.location.column < inner_pop.location.column
             || value.location.end_column != inner_pop.location.end_column
             || swap.opcode != SWAP
-            || swap.operand() != Operand::Value(2)
+            || swap.value_argument() != Some(2)
             || swap.depth_after() != Some(depth)
             || discard.opcode != POP_TOP
-            || discard.operand() != Operand::Value(0)
+            || discard.value_argument() != Some(0)
             || discard.depth_after() != Some(after_discard)
             || callable.opcode != LOAD_GLOBAL
             || !matches!(callable.operand(), Operand::Value(argument) if argument & 1 != 0)
@@ -14732,7 +14689,7 @@ impl Assembler {
             || final_pop.depth_after() != Some(after_discard)
             || [inner_pop, final_pop].iter().any(|record| {
                 record.opcode != NOP
-                    || record.operand() != Operand::Value(0)
+                    || record.value_argument() != Some(0)
                     || !record.fusion_policy.is_converted_pop_block()
                     || record.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
             })
@@ -14824,7 +14781,7 @@ impl Assembler {
             .flatten()
             .any(|record| {
                 record.opcode != NOP
-                    || record.operand() != Operand::Value(0)
+                    || record.value_argument() != Some(0)
                     || !record.fusion_policy.is_converted_pop_block()
                     || record.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
                     || record.location != pop.location
@@ -14836,7 +14793,7 @@ impl Assembler {
                         != BorrowFallthrough::Reachable
             })
             || load.opcode != LOAD_FAST
-            || !matches!(load.operand(), Operand::Value(_))
+            || load.value_argument().is_none()
             || [pop, load].iter().any(|instruction| {
                 instruction.local_policy.hidden_exception_owner_slots() != 0
                     || instruction.pre_fold_extra_instructions() != 0
@@ -14963,7 +14920,7 @@ impl Assembler {
                 || authored.fusion_policy.is_converted_pop_block()
                 || authored.location.line < 0
                 || iterator.opcode != POP_TOP
-                || iterator.operand() != Operand::Value(0)
+                || iterator.value_argument() != Some(0)
                 || iterator.location != authored.location
                 || authored
                     .depth_after()
@@ -14994,7 +14951,7 @@ impl Assembler {
                         && return_nop.pre_fold_extra_instructions() == 0
                         && [first, second].into_iter().all(|pop| {
                             pop.opcode == NOP
-                                && pop.operand() == Operand::Value(0)
+                                && pop.value_argument() == Some(0)
                                 && pop.fusion_policy.is_converted_pop_block()
                                 && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
                                 && pop.local_policy.hidden_exception_owner_slots() == 0
@@ -15041,7 +14998,7 @@ impl Assembler {
                 || return_nop.local_policy.hidden_exception_owner_slots() != 0
                 || return_nop.pre_fold_extra_instructions() != 0
                 || pop.opcode != NOP
-                || pop.operand() != Operand::Value(0)
+                || pop.value_argument() != Some(0)
                 || !pop.fusion_policy.is_converted_pop_block()
                 || pop.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
                 || pop.local_policy.hidden_exception_owner_slots() != 0
@@ -15127,13 +15084,13 @@ impl Assembler {
             })
             || !matches!(load.opcode, LOAD_FAST | crate::target::opcodes::LOAD_DEREF)
             || !matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
-            || !matches!(condition.operand(), Operand::Forward(_))
+            || condition.forward_target().is_none()
             || condition.local_policy.hidden_exception_owner_slots() != 3
             || condition.pre_fold_extra_instructions() != 0
             || condition.exception_policy() != ExceptionPolicy::default()
             || marker.opcode != NOT_TAKEN
             || marker.location != condition.location
-            || marker.operand() != Operand::Value(0)
+            || marker.value_argument() != Some(0)
             || records.iter().enumerate().any(|(index, (_, instruction))| {
                 (index != 6 && instruction.local_policy.hidden_exception_owner_slots() != 0)
                     || instruction.pre_fold_extra_instructions() != 0
@@ -15211,7 +15168,7 @@ impl Assembler {
         if !matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE) {
             return;
         }
-        let Operand::Forward(target) = condition.operand() else {
+        let Some(target) = condition.forward_target() else {
             return;
         };
         let mut targets = items
@@ -15290,7 +15247,7 @@ impl Assembler {
                 || call[2].opcode != LOAD_GLOBAL
                 || !matches!(call[2].operand(), Operand::Value(argument) if argument & 1 == 0)
                 || call[3].opcode != CALL
-                || call[3].operand() != Operand::Value(2)
+                || call[3].value_argument() != Some(2)
                 || call[4].opcode != TO_BOOL
                 || !matches!(call[5].opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE)
             {
@@ -15308,9 +15265,9 @@ impl Assembler {
             || cleanup
                 .iter()
                 .any(|instruction| instruction.location != continuation.location)
-            || !matches!(last.operand(), Operand::Forward(_))
+            || last.forward_target().is_none()
             || marker.opcode != NOT_TAKEN
-            || marker.operand() != Operand::Value(0)
+            || marker.value_argument() != Some(0)
             || marker.location != last.location
             || records[..=marker_at]
                 .iter()
@@ -15452,7 +15409,7 @@ impl Assembler {
                 == authored.depth_after()
             && pop.depth_after() == iterator.depth_after()
             && instructions.iter().all(|record| {
-                record.operand() == Operand::Value(0)
+                record.value_argument() == Some(0)
                     && record.location == authored.location
                     && record.local_policy.hidden_exception_owner_slots() == 0
                     && record.pre_fold_extra_instructions() == 0
@@ -15502,7 +15459,7 @@ impl Assembler {
         };
         if *label != entry
             || store.opcode != STORE_FAST
-            || !matches!(store.operand(), Operand::Value(_))
+            || store.value_argument().is_none()
             || store.local_policy.hidden_exception_owner_slots() != 0
             || store.pre_fold_extra_instructions() != 0
             || *nop != Instruction::new(NOP, Operand::Value(0), store.location, nop.depth_after())
@@ -16275,12 +16232,12 @@ impl Assembler {
             let Item::Instruction(instruction) = item else {
                 continue;
             };
-            if ended_scope || !matches!(instruction.operand(), Operand::Value(_)) {
+            if ended_scope || instruction.value_argument().is_none() {
                 straight_line = false;
                 break;
             }
             if uses_constant_index(instruction.opcode)
-                && let Operand::Value(index) = instruction.operand()
+                && let Some(index) = instruction.value_argument()
                 && let Some(slot) = used.get_mut(index as usize)
             {
                 let newly_used = !std::mem::replace(slot, true);
@@ -16417,7 +16374,7 @@ impl Assembler {
         for original in &mut self.exception_owner_provenance.original_uniform_folds {
             if original.opcode == LOAD_CONST
                 && original.jump_policy.has_original_uniform_fold()
-                && let Operand::Value(index) = original.operand()
+                && let Some(index) = original.value_argument()
                 && index != u32::MAX
                 && let Some(Some(new_index)) = index_map.get(index as usize)
             {
@@ -16447,7 +16404,7 @@ impl Assembler {
                 if load.opcode != LOAD_CONST {
                     return false;
                 }
-                let Operand::Value(index) = load.operand() else {
+                let Some(index) = load.value_argument() else {
                     return false;
                 };
                 let Some(Some(remapped)) = index_map.get(index as usize) else {
@@ -16466,7 +16423,7 @@ impl Assembler {
                     if instruction.opcode != LOAD_CONST {
                         continue;
                     }
-                    let Operand::Value(index) = instruction.operand() else {
+                    let Some(index) = instruction.value_argument() else {
                         return false;
                     };
                     let Some(Some(remapped)) = index_map.get(index as usize) else {
@@ -16481,9 +16438,7 @@ impl Assembler {
             .retain_mut(|origin| {
                 origin.borrow_join = origin.borrow_join.and_then(|(join, mut first)| {
                     if first.opcode == LOAD_CONST {
-                        let Operand::Value(index) = first.operand() else {
-                            return None;
-                        };
+                        let index = first.value_argument()?;
                         let remapped = (*index_map.get(index as usize)?)?;
                         first.set_operand(Operand::Value(remapped));
                     }
@@ -16496,7 +16451,7 @@ impl Assembler {
                     if instruction.opcode != LOAD_CONST {
                         continue;
                     }
-                    let Operand::Value(index) = instruction.operand() else {
+                    let Some(index) = instruction.value_argument() else {
                         return false;
                     };
                     let Some(Some(remapped)) = index_map.get(index as usize) else {
@@ -16586,7 +16541,7 @@ impl Assembler {
                 load.set_operand(Operand::Value(0));
                 next.opcode = NOP;
                 next.set_operand(Operand::Value(0));
-            } else if next.opcode == JUMP_FORWARD && matches!(next.operand(), Operand::Forward(_)) {
+            } else if next.opcode == JUMP_FORWARD && next.forward_target().is_some() {
                 has_forward_constant_jump = true;
             }
         }
@@ -16606,7 +16561,7 @@ impl Assembler {
             let [Item::Instruction(load), Item::Instruction(jump)] = items[index..index + 2] else {
                 continue;
             };
-            let Operand::Forward(target) = jump.operand() else {
+            let Some(target) = jump.forward_target() else {
                 continue;
             };
             if !is_constant_load(load.opcode) || jump.opcode != JUMP_FORWARD {
@@ -16832,10 +16787,7 @@ fn block_jump_target(block: &[Item]) -> Option<Label> {
             None
         }
     })?;
-    match instruction.operand() {
-        Operand::Forward(target) | Operand::Backward(target) => Some(target),
-        Operand::Value(_) | Operand::Deferred(_) => None,
-    }
+    instruction.jump_target()
 }
 
 fn extended_arg_count(argument: u32) -> u8 {

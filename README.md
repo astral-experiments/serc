@@ -61,12 +61,16 @@ serc compile --check path/to/package
 ```
 
 Compilation uses the available CPUs by default. Use `--jobs` (or `-j`) to set a
-limit, including `--jobs 1` for serial compilation. You can also set the default
-with `RAYON_NUM_THREADS`:
+limit, including `--jobs 1` for one compilation worker. You can also set the
+default with `RAYON_NUM_THREADS`:
 
 ```console
 serc compile --jobs 4 path/to/package
 ```
+
+With `--jobs 1`, compilation of independent source files can overlap cache
+writes on one additional I/O thread. Cache writes and diagnostics retain source
+order.
 
 ### Python version
 

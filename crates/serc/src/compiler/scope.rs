@@ -2324,6 +2324,12 @@ impl ScopeArena {
                         required.insert(name);
                     }
                 }
+                if inputs.implicit_class_reference {
+                    let class = self.names.get("__class__").expect("__class__ is seeded");
+                    if !locals.contains(&class) {
+                        required.insert(class);
+                    }
+                }
                 let lexical_bindings = locals.iter().copied().collect();
                 self.nodes[id].plan = ScopePlan::Function(FunctionPlan {
                     locals,
@@ -2366,6 +2372,12 @@ impl ScopeArena {
                     })
                     .map(|(name, _)| *name),
             );
+            if inputs.implicit_class_reference {
+                let class = self.names.get("__class__").expect("__class__ is seeded");
+                if !locals.contains(&class) {
+                    required.insert(class);
+                }
+            }
             let local_aliases = local_aliases
                 .into_iter()
                 .filter_map(|(alias, original)| {
@@ -2669,6 +2681,7 @@ struct FlatFunctionInputs {
     names: Vec<(NameId, bool)>,
     name_positions: Option<FxHashMap<NameId, usize>>,
     has_annotations: bool,
+    implicit_class_reference: bool,
     complex: bool,
 }
 
@@ -2798,8 +2811,12 @@ impl<'a, 'ast> ModuleNameCollector<'a, 'ast> {
     fn record_flat_name(&mut self, name: &ruff_python_ast::ExprName) -> NameId {
         let spelling = name.id.as_str();
         let id = self.intern(spelling);
-        if spelling == "super" {
-            self.mark_flat_complex();
+        if spelling == "super" && name.ctx == ExprContext::Load {
+            if let Some(flat) = &mut self.flat_function {
+                // A load of super also requests __class__, even when super is shadowed.
+                // Keep this out of the runtime name order: it is not a local occurrence.
+                flat.implicit_class_reference = true;
+            }
         }
         self.record_flat(id, name.ctx != ExprContext::Load);
         id
@@ -2886,6 +2903,7 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
                                 .parameters
                                 .iter()
                                 .any(|parameter| parameter.annotation().is_some())),
+                    implicit_class_reference: false,
                     complex: generic,
                 };
                 for parameter in parameters_in_locals_order(&definition.parameters) {
@@ -9089,6 +9107,7 @@ def function():
             names: Vec::new(),
             name_positions: None,
             has_annotations: false,
+            implicit_class_reference: false,
             complex: false,
         };
 
@@ -9201,6 +9220,45 @@ class _Generic[__T]:
         __local = __value
         _Generic__local = __local
         return alias, __local
+
+class SuperOwner:
+    def method_super(self):
+        return super().method()
+
+    def shadow_super(self, super):
+        return super, __class__
+
+    def bind_class(self):
+        first = super()
+        __class__ = later
+        return first, __class__
+
+    def delete_super(self):
+        del super
+        return super()
+
+    def private_super(self, __private):
+        _SuperOwner__private = __private
+        return super(), __private
+
+    async def async_super(self):
+        return await super().method()
+
+    def annotated_super(self: super) -> __class__:
+        return super()
+
+    def annotated_class(self):
+        __class__: Type
+        return super()
+
+def outside_class(super):
+    return super()
+
+def enclosing_class():
+    __class__ = captured
+    def inner_super():
+        return super()
+    return inner_super
 ";
         for version in [
             PythonVersion::Py312,
@@ -9259,6 +9317,17 @@ class _Generic[__T]:
                         ("generic", false),
                         ("complex", false),
                         ("typed", true),
+                        ("method_super", true),
+                        ("shadow_super", true),
+                        ("bind_class", true),
+                        ("delete_super", true),
+                        ("private_super", true),
+                        ("async_super", true),
+                        ("annotated_super", true),
+                        ("annotated_class", false),
+                        ("outside_class", true),
+                        ("enclosing_class", false),
+                        ("inner_super", true),
                     ],
                     "{version:?}, future={future}"
                 );
@@ -9416,6 +9485,7 @@ class _Generic[__T]:
             names: Vec::new(),
             name_positions: None,
             has_annotations: false,
+            implicit_class_reference: false,
             complex: false,
         };
 
@@ -9444,6 +9514,7 @@ class _Generic[__T]:
                 (NameId::from_u32(2), 1),
             ])),
             has_annotations: false,
+            implicit_class_reference: false,
             complex: false,
         };
 

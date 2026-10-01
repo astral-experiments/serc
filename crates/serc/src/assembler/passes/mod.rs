@@ -266,7 +266,7 @@ impl Assembler {
             });
         }
         for (entry, original) in self.folded_arm_exit_origins {
-            let Operand::Forward(target) = original.operand() else {
+            let Some(target) = original.forward_target() else {
                 continue;
             };
             let (Some(source), Some(target)) =
@@ -300,9 +300,7 @@ impl Assembler {
                 else {
                     return None;
                 };
-                let Operand::Forward(end) = bridge.operand() else {
-                    return None;
-                };
+                let end = bridge.forward_target()?;
                 let end = graph.label_block(end)?;
                 let mut unlocated = super::ir::NoLocationPolicy::default();
                 unlocated.preserve_location();
@@ -362,7 +360,7 @@ impl Assembler {
                     return None;
                 };
                 if !matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
-                    || !matches!(condition.operand(), Operand::Forward(_))
+                    || condition.forward_target().is_none()
                     || condition.location.line < 0
                     || condition.location.line != original.location.line
                     || condition.depth_after() != original.depth_after()
@@ -501,14 +499,13 @@ impl Assembler {
             graph.features().has_jump()
                 || !graph.iter_items().any(|item| {
                     matches!(item, Item::Instruction(instruction)
-                        if matches!(instruction.operand(), Operand::Forward(_) | Operand::Backward(_)))
+                        if instruction.jump_target().is_some())
                 })
         );
         if graph.features().has_jump() {
             for item in graph.iter_items() {
                 if let Item::Instruction(instruction) = item
-                    && let Operand::Forward(label) | Operand::Backward(label) =
-                        instruction.operand()
+                    && let Some(label) = instruction.jump_target()
                 {
                     self.exception_owner_provenance
                         .block_boundaries
@@ -1507,20 +1504,11 @@ impl LayoutAssembler {
                     .unwrap_or(0),
                 Operand::Deferred(_) => 0,
             };
-            let width = if matches!(
-                instruction.operand(),
-                Operand::Forward(_) | Operand::Backward(_)
-            ) && uniform_jump_widths
-            {
+            let width = if instruction.jump_target().is_some() && uniform_jump_widths {
                 // This consistent whole-object proof covers every jump; no
                 // instruction or capture is mutated by accepting it.
                 0
-            } else if native_jump_widths
-                && matches!(
-                    instruction.operand(),
-                    Operand::Forward(_) | Operand::Backward(_)
-                )
-            {
+            } else if native_jump_widths && instruction.jump_target().is_some() {
                 instruction
                     .legacy_initial_jump_width()
                     .expect("all native jumps are certified")

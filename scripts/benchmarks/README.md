@@ -2,8 +2,10 @@
 
 The harness measures process startup, source discovery and reads, compilation at
 optimization level 0, marshaling, and timestamp-invalidated `.pyc` writes. Both
-compilers run sequentially: the preflight and timing use Serc `--jobs 1` and
-CPython `-j 1`. Cache-file cleanup is untimed. For isolated phases, use the
+compilers use one compilation worker: the preflight and timing use Serc
+`--jobs 1` and CPython `-j 1`. Serc can overlap ordered cache writes on an I/O
+thread; CPU affinity also applies to that thread. Cache-file cleanup is untimed.
+For isolated phases, use the
 [Criterion and corpus benchmarks](../../crates/serc_benchmark/README.md).
 
 From the workspace root, with Git, the pinned Rust toolchain, and CPython 3.14.5
