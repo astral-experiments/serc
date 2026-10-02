@@ -245,3 +245,37 @@ fn cell_try_else_ternary_owner_uncaptured_control() {
         "cell_try_else_ternary_owner_uncaptured_control.py",
     );
 }
+
+#[test]
+fn copied_return_none_marker_reuses_owned_suffix_after_try_else() {
+    for call in [
+        "record(action)",
+        "logger().info('message', extra=details | {'key': str(key)})",
+        "logger().info('message', extra=details | {'key': normalize(str(key))})",
+    ] {
+        for condition in ["action is not None", "action is None"] {
+            let source = format!(
+                "async def f(value, enabled, action, details, key):\n    try:\n        if value is None:\n            if enabled:\n                try:\n                    prepare()\n                except Error:\n                    pass\n                else:\n                    {call}\n                    return action\n            else:\n                pass\n    finally:\n        if {condition}:\n            finish()\n"
+            );
+            common::assert_matches_cpython_marshal(
+                &source,
+                "copied_return_none_try_else_suffix.py",
+            );
+        }
+    }
+}
+
+#[test]
+fn copied_value_return_truth_marker_reuses_paired_pop_cells() {
+    for value in ["result, output", "output, result"] {
+        for condition in ["cleanup", "cleanup and resource is not None"] {
+            let source = format!(
+                "async def f(a, b, c, d, e, g, h, i, j, resource, k, l, enabled, m, n, o, cleanup, output, r, s, t, u):\n    try:\n        try:\n            pass\n        except Error as error:\n            if enabled:\n                return None\n        result = normalize(value.extract())\n        record(key, f'finished {{label}} in {{clock.now() - start:.2f}} seconds')\n        return {value}\n    except Cancelled:\n        pass\n    except Error as error:\n        pass\n    finally:\n        if {condition}:\n            pass\n"
+            );
+            common::assert_matches_cpython_marshal(
+                &source,
+                "copied_value_return_truth_pop_cells.py",
+            );
+        }
+    }
+}

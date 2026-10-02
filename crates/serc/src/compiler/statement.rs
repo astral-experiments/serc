@@ -11642,6 +11642,7 @@ impl<'source> Compiler<'source> {
                                 && next_loop == 0
                         })
                         .map(|start| (start, self.assembler.item_count()));
+                    let copied_finally_pop_instruction = self.assembler.instruction_count();
                     self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
                     if !starts_jump_target
                         || shared_copied_cleanup_join
@@ -11843,6 +11844,10 @@ impl<'source> Compiler<'source> {
                             }
                         },
                     );
+                    if result.is_ok() && preserve_tos {
+                        self.assembler
+                            .record_copied_finally_none_prefix(copied_finally_pop_instruction);
+                    }
                     if result.is_ok()
                         && let Some(pop_item) = named_handler_try_pop
                     {
