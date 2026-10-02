@@ -109,6 +109,8 @@ pub(super) enum FinallyCopy {
     Normal,
     Exceptional,
     Return(TextRange),
+    Break(TextRange),
+    Continue(TextRange),
 }
 
 /// A semantic source context, independent of physical compiler visitation order.
@@ -1084,13 +1086,37 @@ impl<'ast> Builder<'ast> {
         Some(())
     }
 
-    /// Visits manager cleanup above the nearest loop without unwinding that loop.
+    /// Visits cleanup above the nearest loop without unwinding that loop.
     fn loop_control(&mut self, phase: WithAwait) -> Option<()> {
         let manager_depth = *self.loop_manager_depths.last()?;
-        if self.loop_finally_depths.last() != Some(&self.finally_depth) {
-            return None;
-        }
+        let loop_finally_depth = *self.loop_finally_depths.last()?;
+        let finalizer = if loop_finally_depth == self.finally_depth {
+            None
+        } else {
+            let &(finalizer, entry_manager_depth) = self.finally_sources.last()?;
+            if self.finally_depth != loop_finally_depth + 1
+                || self.manager_depth != entry_manager_depth
+                || !Self::supports_return_finalbody(&finalizer.finalbody)
+            {
+                return None;
+            }
+            Some((finalizer, entry_manager_depth))
+        };
         self.instruction(); // authored Break/Continue NOP before any cleanup
+        if let Some((finalizer, entry_manager_depth)) = finalizer {
+            let copy = match phase {
+                WithAwait::Break(range) => FinallyCopy::Break(range),
+                WithAwait::Continue(range) => FinallyCopy::Continue(range),
+                _ => return None,
+            };
+            self.instruction(); // POP_BLOCK separates the copied cleanup
+            self.finally_sources.pop();
+            self.finally_depth -= 1;
+            let result = self.finally_copy(finalizer, copy);
+            self.finally_depth += 1;
+            self.finally_sources.push((finalizer, entry_manager_depth));
+            result?;
+        }
         for index in (0..self.async_manager_items.len()).rev() {
             let (depth, manager) = self.async_manager_items[index];
             if depth <= manager_depth {
@@ -3705,11 +3731,11 @@ mod finally_occurrence_tests {
     }
 
     #[test]
-    fn finalizers_reject_crossing_exits_but_allow_loop_local_exits() {
+    fn finalizers_reject_nonlocal_body_exits_but_allow_loop_local_exits() {
         for source in [
-            "def f(xs):\n    for x in xs:\n        try:\n            break\n        finally:\n            cleanup()\n",
-            "def f(xs):\n    for x in xs:\n        try:\n            continue\n        finally:\n            cleanup()\n",
             "def f():\n    try:\n        work()\n    finally:\n        return result\n",
+            "def f(xs):\n    for x in xs:\n        try:\n            work()\n        finally:\n            break\n",
+            "def f(xs):\n    for x in xs:\n        try:\n            work()\n        finally:\n            continue\n",
         ] {
             let parsed = parse_module(source).unwrap();
             let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
@@ -4515,6 +4541,79 @@ mod protected_finally_return_tests {
 }
 
 #[cfg(test)]
+mod protected_finally_loop_control_tests {
+    use super::{EmissionContext, FinallyContext, FinallyCopy, NativeLabelPlan, NativeRole};
+    use ruff_python_ast::Stmt;
+    use ruff_python_parser::parse_module;
+
+    #[test]
+    fn loop_exit_copies_keep_distinct_contexts_and_label_ordinals() {
+        for exit in ["break", "continue"] {
+            for cleanup in ["finish()", "if flag:\n                finish()"] {
+                let source = format!(
+                    "def f(items, flag):\n    for item in items:\n        try:\n            {exit}\n        finally:\n            {cleanup}\n"
+                );
+                let parsed = parse_module(&source).unwrap();
+                let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+                    panic!()
+                };
+                let [Stmt::For(loop_)] = function.body.as_slice() else {
+                    panic!()
+                };
+                let [Stmt::Try(finalizer)] = loop_.body.as_slice() else {
+                    panic!()
+                };
+                let copy = match &finalizer.body[0] {
+                    Stmt::Break(exit) => FinallyCopy::Break(exit.range),
+                    Stmt::Continue(exit) => FinallyCopy::Continue(exit.range),
+                    _ => panic!(),
+                };
+                let plan = NativeLabelPlan::function(&function.body, false).unwrap();
+                assert_eq!(plan.remaining_contexts.len(), 3);
+                for (copy, ordinal) in [
+                    (copy, 10),
+                    (FinallyCopy::Normal, 11),
+                    (FinallyCopy::Exceptional, 12),
+                ] {
+                    let context = plan.contexts[&FinallyContext {
+                        parent: EmissionContext::default(),
+                        owner: finalizer.range,
+                        copy,
+                    }];
+                    assert!(plan.remaining_contexts.contains(&context));
+                    if let Stmt::If(branch) = &finalizer.finalbody[0] {
+                        assert_eq!(
+                            plan.copied_remaining[&(context, NativeRole::IfEnd(branch.range))],
+                            ordinal
+                        );
+                    } else {
+                        assert!(plan.copied_remaining.is_empty());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn multiple_unwound_finalizers_and_inner_managers_retain_fallback() {
+        for source in [
+            "def f(items):\n    for item in items:\n        try:\n            try:\n                break\n            finally:\n                inner()\n        finally:\n            outer()\n",
+            "def f(items):\n    for item in items:\n        try:\n            with manager():\n                continue\n        finally:\n            finish()\n",
+            "def f(items):\n    for item in items:\n        try:\n            break\n        finally:\n            with manager():\n                finish()\n",
+        ] {
+            let parsed = parse_module(source).unwrap();
+            let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+                panic!()
+            };
+            assert!(
+                NativeLabelPlan::function(&function.body, false).is_none(),
+                "{source}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod nested_return_cleanup_tests {
     use super::{EmissionContext, FinallyContext, FinallyCopy, NativeLabelPlan, NativeRole};
     use ruff_python_ast::{Expr, Stmt};
@@ -4918,6 +5017,7 @@ mod ordered_finally_manager_tests {
     #[test]
     fn cleanup_local_loops_keep_body_and_else_targets_distinct() {
         for source in [
+            "def f():\n    try:\n        return value\n    finally:\n        for item in items:\n            try:\n                break\n            finally:\n                finish()\n",
             "def f():\n    try:\n        work()\n    finally:\n        for item in items:\n            break\n",
             "def f():\n    try:\n        work()\n    finally:\n        while flag:\n            continue\n",
             "def f():\n    try:\n        return value\n    finally:\n        for item in items:\n            for other in item:\n                consume(other)\n            else:\n                continue\n",
@@ -4941,7 +5041,6 @@ mod ordered_finally_manager_tests {
             "async def f():\n    try:\n        async with manager():\n            return value\n    finally:\n        finish()\n",
             "def f():\n    for item in items:\n        try:\n            return value\n        finally:\n            continue\n",
             "def f():\n    for item in items:\n        try:\n            return value\n        finally:\n            for other in item:\n                consume(other)\n            else:\n                continue\n",
-            "def f():\n    try:\n        return value\n    finally:\n        for item in items:\n            try:\n                break\n            finally:\n                finish()\n",
             "async def f():\n    try:\n        return value\n    finally:\n        async for item in items:\n            consume(item)\n",
         ] {
             let parsed = parse_module(source).unwrap();

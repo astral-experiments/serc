@@ -17368,6 +17368,13 @@ impl<'source> Compiler<'source> {
         copied_continue_item: Option<usize>,
         deferred_finally_end: Option<(usize, &[usize])>,
     ) -> Result<LoopControlUnwind, CompileError> {
+        use super::legacy_native_labels::{FinallyCopy, WithAwait};
+
+        let copy = match origin {
+            WithAwait::Break(range) => FinallyCopy::Break(range),
+            WithAwait::Continue(range) => FinallyCopy::Continue(range),
+            _ => unreachable!("loop control has a break or continue origin"),
+        };
         let captured_none_prefix = continue_target.is_some()
             && matches!(self.control.finally.active_loop_finally_contexts.as_slice(), [context]
                 if self.assembler.ends_with_recorded_finally_nop_pair(context.handler));
@@ -17846,9 +17853,15 @@ impl<'source> Compiler<'source> {
                                             },
                                             prevent_try_exit_inlining,
                                             |compiler| {
-                                                compiler.compile_copied_finally_body(
-                                                    context.body,
-                                                    continue_tail,
+                                                compiler.with_native_finally_copy(
+                                                    context.source_range,
+                                                    copy,
+                                                    |compiler| {
+                                                        compiler.compile_copied_finally_body(
+                                                            context.body,
+                                                            continue_tail,
+                                                        )
+                                                    },
                                                 )
                                             },
                                         )
