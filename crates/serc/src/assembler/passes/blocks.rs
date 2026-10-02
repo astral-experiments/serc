@@ -1775,10 +1775,11 @@ fn comprehension_assignment_exit_location(
     static_swap_tail_location(tail, instructions)
 }
 
-/// Original normal-try exits threaded through one shared, unlocated branch join.
+/// Original normal-try exits threaded through one authenticated shared branch join.
 pub(in crate::assembler) struct ThreadedNormalTryJoins {
     entries: FxHashMap<Label, (Vec<Item>, Vec<Item>)>,
     recoveries: FxHashMap<Label, NamedRecoveryCopy>,
+    located_joins: FxHashMap<Label, (Label, Vec<Item>, Instruction)>,
 }
 
 struct NamedRecoveryCopy {
@@ -1799,27 +1800,40 @@ impl ThreadedNormalTryJoins {
             .is_some_and(|(expected_source, expected_target)| {
                 source == expected_source.as_slice() && target == expected_target.as_slice()
             })
-            && self.recoveries.values().any(|recovery| {
-                if recovery.normal_entry != entry {
-                    return false;
-                }
-                let (Some(prefix), Some(tail)) = (
-                    graph.label_block(recovery.prefix),
-                    graph.label_block(recovery.split),
-                ) else {
-                    return false;
-                };
-                graph[prefix]
-                    .items()
-                    .iter()
-                    .chain(graph[tail].items())
-                    .eq(&recovery.items)
-                    && recovery.sources.iter().any(|(label, items)| {
-                        graph
-                            .label_block(*label)
-                            .is_some_and(|source| graph[source].items() == items)
-                    })
-            })
+            && (self
+                .located_joins
+                .get(&entry)
+                .is_some_and(|(join, items, condition)| {
+                    graph
+                        .label_block(*join)
+                        .is_some_and(|join| graph[join].items() == items)
+                        && graph
+                            .iter_items()
+                            .filter(|item| **item == Item::Instruction(*condition))
+                            .count()
+                            == 1
+                })
+                || self.recoveries.values().any(|recovery| {
+                    if recovery.normal_entry != entry {
+                        return false;
+                    }
+                    let (Some(prefix), Some(tail)) = (
+                        graph.label_block(recovery.prefix),
+                        graph.label_block(recovery.split),
+                    ) else {
+                        return false;
+                    };
+                    graph[prefix]
+                        .items()
+                        .iter()
+                        .chain(graph[tail].items())
+                        .eq(&recovery.items)
+                        && recovery.sources.iter().any(|(label, items)| {
+                            graph
+                                .label_block(*label)
+                                .is_some_and(|source| graph[source].items() == items)
+                        })
+                }))
     }
 }
 
@@ -3878,10 +3892,12 @@ impl OptimizationPipeline {
     pub(in crate::assembler) fn capture_threaded_normal_try_joins(&self) -> ThreadedNormalTryJoins {
         let mut entries = FxHashMap::default();
         let mut recoveries = FxHashMap::default();
+        let mut located_joins = FxHashMap::default();
         if self.exception_owner_provenance.normal_try_exits.is_empty() {
             return ThreadedNormalTryJoins {
                 entries,
                 recoveries,
+                located_joins,
             };
         }
         let graph = &self.graph;
@@ -3906,6 +3922,31 @@ impl OptimizationPipeline {
             let Some(target_block) = graph.label_block(target) else {
                 continue;
             };
+            let located_join_condition = (join_jump.location.line >= 0)
+                .then(|| {
+                    graph.iter_items().find_map(|item| {
+                        let Item::Instruction(condition) = item else {
+                            return None;
+                        };
+                        (matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+                            && condition
+                                .forward_target()
+                                .is_some_and(|label| graph.label_block(label) == Some(join_block))
+                            && condition.location == join_jump.location
+                            && condition.depth_after() == jump.depth_after()
+                            && condition.pre_fold_extra_instructions() == 0
+                            && condition.local_policy.hidden_exception_owner_slots() == 3
+                            && self
+                                .exception_owner_provenance
+                                .source_none_conditions
+                                .iter()
+                                .filter(|origin| origin.instruction == *condition)
+                                .count()
+                                == 1)
+                            .then_some(*condition)
+                    })
+                })
+                .flatten();
             if source == join_block
                 || target_block == source
                 || target_block == join_block
@@ -3917,12 +3958,15 @@ impl OptimizationPipeline {
                 || head.is_empty()
                 || head.iter().any(|item| !matches!(item, Item::Label(_)))
                 || join_jump.opcode != JUMP_FORWARD
-                || join_jump.location != SourceLocation::NONE
+                || (join_jump.location != SourceLocation::NONE && located_join_condition.is_none())
                 || join_jump.pre_fold_extra_instructions() != 0
                 || join_jump.local_policy.hidden_exception_owner_slots() != 0
                 || join_jump.depth_after() != jump.depth_after()
                 || !join_jump.jump_policy.allows_threading_target()
-                || join_jump.jump_policy.retains_nop_for(join_jump.operand())
+                || (join_jump.jump_policy.retains_nop_for(join_jump.operand())
+                    && (join_jump.location == SourceLocation::NONE
+                        || join_jump.jump_policy.retained_nop()
+                            != super::super::ir::RetainedJumpNop::DirectTarget))
                 || join_jump.jump_policy.is_interruptible()
                 || join_head.is_empty()
                 || join_head.iter().any(|item| match item {
@@ -3960,6 +4004,30 @@ impl OptimizationPipeline {
                     other_entry != entry && graph.label_block(other_join) == Some(join_block)
                 },
             ) {
+                continue;
+            }
+            if join_jump.location != SourceLocation::NONE {
+                // A specialized None guard locates the otherwise empty join early.
+                // The normal try edge still visits that join before the shared name
+                // cleanup, whose return must be appended before this edge can copy it.
+                let mut expected_source = graph[source].items().to_vec();
+                let Some(Item::Instruction(expected_jump)) = expected_source.last_mut() else {
+                    unreachable!("captured normal try jump");
+                };
+                expected_jump.retarget(Operand::Forward(target));
+                expected_jump.add_pre_fold_extra_instructions(1);
+                entries.insert(
+                    entry,
+                    (expected_source, graph[target_block].items().to_vec()),
+                );
+                located_joins.insert(
+                    entry,
+                    (
+                        join,
+                        graph[join_block].items().to_vec(),
+                        located_join_condition.expect("located join condition"),
+                    ),
+                );
                 continue;
             }
             // Build this index once, only after finding an intact named return cleanup.
@@ -4201,6 +4269,7 @@ impl OptimizationPipeline {
         ThreadedNormalTryJoins {
             entries,
             recoveries,
+            located_joins,
         }
     }
 
@@ -9027,6 +9096,117 @@ mod copied_match_guard_subject_tests {
                 assert_eq!(records[0], subject);
                 assert!(records[0].fusion_policy.location_from_next());
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod located_normal_try_join_tests {
+    use super::*;
+    use crate::assembler::Assembler;
+    use crate::assembler::exception_owners::SourceNoneCondition;
+
+    fn fixture(origin_count: usize) -> OptimizationPipeline {
+        let location = SourceLocation::new(4, 4, 8, 28);
+        let mut condition = Instruction::new(
+            POP_JUMP_IF_NOT_NONE,
+            Operand::Forward(Label::from_u32(2)),
+            location,
+            Some(1),
+        );
+        condition.local_policy.add_hidden_exception_owner_slots(3);
+        let instruction = |opcode, operand, location, depth| {
+            Item::Instruction(Instruction::new(opcode, operand, location, Some(depth)))
+        };
+        let mut assembler = Assembler::from_linear_items(vec![
+            Item::Label(Label::from_u32(0)),
+            Item::Instruction(condition),
+            Item::Label(Label::from_u32(1)),
+            instruction(
+                JUMP_FORWARD,
+                Operand::Forward(Label::from_u32(2)),
+                location,
+                1,
+            ),
+            Item::Label(Label::from_u32(2)),
+            instruction(
+                JUMP_FORWARD,
+                Operand::Forward(Label::from_u32(3)),
+                location,
+                1,
+            ),
+            Item::Label(Label::from_u32(3)),
+            instruction(POP_EXCEPT, Operand::Value(0), SourceLocation::NONE, 0),
+            instruction(LOAD_CONST, Operand::Value(0), SourceLocation::NONE, 1),
+            instruction(STORE_FAST, Operand::Value(1), SourceLocation::NONE, 0),
+            instruction(DELETE_FAST, Operand::Value(1), SourceLocation::NONE, 0),
+            instruction(
+                JUMP_FORWARD,
+                Operand::Forward(Label::from_u32(4)),
+                SourceLocation::NONE,
+                0,
+            ),
+            Item::Label(Label::from_u32(4)),
+            instruction(LOAD_FAST, Operand::Value(0), location, 1),
+            instruction(RETURN_VALUE, Operand::Value(0), location, 0),
+        ]);
+        assembler
+            .exception_owner_provenance
+            .normal_try_exits
+            .push((Label::from_u32(1), Label::from_u32(2)));
+        for _ in 0..origin_count {
+            assembler
+                .exception_owner_provenance
+                .source_none_conditions
+                .push(SourceNoneCondition {
+                    entry: Label::from_u32(0),
+                    labels: vec![Label::from_u32(0)],
+                    instruction: condition,
+                    entry_prefix: Some(vec![Item::Label(Label::from_u32(0))]),
+                });
+        }
+        assembler.into_optimization_pipeline()
+    }
+
+    #[test]
+    fn located_join_requires_unique_source_condition_provenance() {
+        for count in 0..=2 {
+            let captured = fixture(count).capture_threaded_normal_try_joins();
+            assert_eq!(captured.entries.len(), usize::from(count == 1));
+            assert_eq!(captured.located_joins.len(), usize::from(count == 1));
+        }
+    }
+
+    #[test]
+    fn located_join_replays_exact_source_target_join_and_condition() {
+        for changed_label in [None, Some(0), Some(1), Some(2), Some(3)] {
+            let mut pipeline = fixture(1);
+            let captured = pipeline.capture_threaded_normal_try_joins();
+            let entry = Label::from_u32(1);
+            let source = pipeline.graph.label_block(entry).unwrap();
+            let target = pipeline.graph.label_block(Label::from_u32(3)).unwrap();
+            let jump = pipeline.graph.instructions_mut(source).next_back().unwrap();
+            jump.retarget(Operand::Forward(Label::from_u32(3)));
+            jump.add_pre_fold_extra_instructions(1);
+            if let Some(label) = changed_label {
+                let block = pipeline.graph.label_block(Label::from_u32(label)).unwrap();
+                pipeline
+                    .graph
+                    .instructions_mut(block)
+                    .next_back()
+                    .unwrap()
+                    .location = SourceLocation::new(5, 5, 8, 28);
+            }
+            assert_eq!(
+                captured.matches(
+                    &pipeline.graph,
+                    entry,
+                    pipeline.graph[source].items(),
+                    pipeline.graph[target].items()
+                ),
+                changed_label.is_none(),
+                "{changed_label:?}"
+            );
         }
     }
 }

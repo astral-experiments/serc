@@ -28013,7 +28013,8 @@ impl<'source> Compiler<'source> {
                             && handler_cleanup_has_runtime_jump_exit(tail)
                             && handler_cleanup_has_stable_fallthrough_location(tail)
                             && (!cleanup_has_small_return_successor
-                                || !handler_cleanup_has_nested_branch_exit(tail))));
+                                || !handler_cleanup_has_nested_branch_exit(tail)
+                                || self.assembler.at_original_shared_handler_join())));
             let direct_nested_loop_handler_backedge = nested_loop_conversion_try;
             let copy_nested_loop_handler_backedge = direct_nested_loop_handler_backedge
                 && matches!(
@@ -28048,7 +28049,7 @@ impl<'source> Compiler<'source> {
                         && condition_has_only_runtime_tests(&tail.test)
                         && if_has_multiple_normal_exit_targets(tail)
                         && matches!(tail.body.as_slice(), [Stmt::Break(_) | Stmt::Assign(_)]))
-                && self.assembler.at_original_shared_conditional_join();
+                && self.assembler.at_original_shared_cleanup_join();
             // A final guard and its nested for-end alias the original handler cleanup.
             // The authored break copies that unlocated array before line propagation,
             // while iterator exhaustion and the guard's false edge keep the shared copy.
