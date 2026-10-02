@@ -132,7 +132,7 @@ impl Compiler<'_> {
             .function(scope_id)
             .ok_or_else(|| CompileError::Internal("function scope has no plan".to_string()))?;
         let mut plan = source_plan.clone();
-        for &(name, canonical, comprehension_cell) in &source_plan.deferred_generator_globals {
+        for &(name, canonical, comprehension_cell) in &source_plan.deferred_comprehension_globals {
             if arena.enclosing_function_binds(scope_id, canonical)
                 || self.symbols.active_temporaries.contains(name)
             {
@@ -765,8 +765,8 @@ pub(super) struct FunctionPlan {
     pub(super) local_aliases: Vec<(NameId, NameId)>,
     /// Function bindings, excluding temporary comprehension targets.
     pub(super) lexical_bindings: FxHashSet<NameId>,
-    /// Comprehension targets whose generator references may resolve globally.
-    pub(super) deferred_generator_globals: Vec<(NameId, NameId, bool)>,
+    /// Comprehension targets whose independent references may resolve globally.
+    pub(super) deferred_comprehension_globals: Vec<(NameId, NameId, bool)>,
     pub(super) cell_sort_names: FxHashMap<NameId, String>,
     pub(super) globals: FxHashSet<NameId>,
     pub(super) annotation_references: FxHashSet<NameId>,
@@ -788,6 +788,7 @@ pub(super) struct ScopeBodyFacts {
     pub(super) references: FxHashSet<String>,
     outside_inlined_comprehension_references: FxHashSet<String>,
     outside_inlined_comprehension_requirements: FxHashSet<String>,
+    later_comprehension_references: FxHashSet<String>,
     class_inlined_comprehension_references: FxHashSet<String>,
     explicit_dunder_class_reference: bool,
     pub(super) nested_lambda_requirements: BTreeSet<String>,
@@ -986,6 +987,7 @@ impl FunctionPlan {
             mut references,
             mut outside_inlined_comprehension_references,
             outside_inlined_comprehension_requirements,
+            later_comprehension_references,
             explicit_dunder_class_reference,
             nested_lambda_requirements: lambda_requirements,
             nested_generator_requirements: generator_requirements,
@@ -1094,6 +1096,7 @@ impl FunctionPlan {
             outside_names.extend(
                 outside_inlined_comprehension_requirements
                     .iter()
+                    .chain(&later_comprehension_references)
                     .map(|name| mangle_name(name, private_name)),
             );
             outside_names.extend(
@@ -1109,22 +1112,29 @@ impl FunctionPlan {
             .iter()
             .map(|name| mangle_name(name.as_str(), private_name))
             .collect::<FxHashSet<_>>();
-        // A nested function cannot decide whether a generator reference is global until
-        // the enclosing functions' bindings have been analyzed.
-        let deferred_generator_globals = if module_parent {
+        // Descendants and later comprehensions can refer to a temporary's global namesake.
+        // Preserve native cell promotion when an enclosing function actually binds that name.
+        let deferred_comprehension_globals = if module_parent {
             Vec::new()
         } else {
-            let outside_generator_names = generator_requirements
+            let mut outside_names = outside_inlined_comprehension_requirements
                 .iter()
-                .filter(|name| outside_inlined_comprehension_requirements.contains(*name))
+                .chain(&later_comprehension_references)
                 .map(|name| mangle_name(name, private_name))
                 .collect::<FxHashSet<_>>();
+            outside_names.extend(
+                class_requirements
+                    .iter()
+                    .chain(nested_function_requirements)
+                    .chain(nested_function_annotation_references)
+                    .map(|name| mangle_name(names.resolve(*name), private_name)),
+            );
             locals
                 .comprehension_targets
                 .iter()
                 .filter_map(|name| {
                     let canonical = mangle_name(name.as_str(), private_name);
-                    (outside_generator_names.contains(&canonical)
+                    (outside_names.contains(&canonical)
                         && !non_comprehension_names.contains(&canonical))
                     .then(|| {
                         let comprehension_cell = inlined_comprehension_cellvars
@@ -1156,7 +1166,7 @@ impl FunctionPlan {
                 .filter(|name| locals.globals.contains(name.as_str()))
                 .cloned(),
         );
-        let deferred_generator_globals = deferred_generator_globals
+        let deferred_comprehension_globals = deferred_comprehension_globals
             .into_iter()
             .map(|(name, canonical, comprehension_cell)| {
                 (
@@ -1339,7 +1349,7 @@ impl FunctionPlan {
                 })
                 .collect(),
             lexical_bindings,
-            deferred_generator_globals,
+            deferred_comprehension_globals,
             globals: names.intern_set(locals.globals),
             cell_sort_names: FxHashMap::default(),
             annotation_references: names.intern_set(annotation_references),
@@ -5118,10 +5128,12 @@ impl<'ast> Visitor<'ast> for ScopeBodyFactsCollector<'ast> {
                             if bound {
                                 self.seen_inlined_comprehension_targets
                                     .insert(canonical.into_owned());
-                            } else if !self
+                            } else if self
                                 .seen_inlined_comprehension_targets
                                 .contains(canonical.as_ref())
                             {
+                                self.facts.later_comprehension_references.insert(name);
+                            } else {
                                 self.outside_inlined_comprehension_references
                                     .as_mut()
                                     .expect("inlined comprehension references are initialized")
