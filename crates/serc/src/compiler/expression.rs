@@ -43,8 +43,8 @@ use crate::{CompileError, PythonVersion};
 use super::constant::{
     PercentFormatPart, double_negated_ellipsis, explicit_surrogate_string, first_literal_constant,
     fold_constant, fold_constant_for_version, folded_bool_operand, folded_constant_owner_slots,
-    instruction_folded_ellipsis_depth, is_small_literal_tuple_element, number_constant,
-    optimized_percent_format, two_element_slice_optimization, unique_frozenset_constants,
+    is_small_literal_tuple_element, number_constant, optimized_percent_format,
+    two_element_slice_optimization, unique_frozenset_constants,
 };
 use super::scope::{
     LoweringFunctionPlan, NameId, NameSet, analyze_lambda_scope, analyze_lambda_scope_with_mangler,
@@ -2545,15 +2545,13 @@ impl Compiler<'_> {
             && let Some(constant) = self.source_aware_fold_constant(origin)
         {
             self.pre_register_expression_names(expression)?;
-            if instruction_folded_ellipsis_depth(origin).is_some() {
-                // The preceding operands reach the original constant table before the
-                // flowgraph turns Ellipsis into a Boolean. Its first entry survives.
-                for value in &boolean.values {
-                    if value.range() == origin.range() {
-                        break;
-                    }
-                    self.record_folded_value(value)?;
+            // Code generation reserves preceding operands before the flowgraph folds
+            // their jumps. A later use can keep those original constant slots alive.
+            for value in &boolean.values {
+                if value.range() == origin.range() {
+                    break;
                 }
+                self.record_folded_value(value)?;
             }
             let expression_location = self.source_location(expression.range());
             let origin_location = self.source_location(origin.range());
@@ -2566,14 +2564,15 @@ impl Compiler<'_> {
             self.assembler.set_location(origin_location);
             self.emit_folded_constant(origin, constant)?;
             if boolean.values.len() > 1
-                && boolean
-                    .values
-                    .first()
-                    .is_some_and(|first| first.range() == origin.range())
+                && (boolean.values.len() > 2
+                    || boolean
+                        .values
+                        .first()
+                        .is_some_and(|first| first.range() == origin.range()))
             {
-                // A decisive first operand leaves an empty original block before
-                // the join. Keep pending call inputs in the preceding borrow block,
-                // but allow independent outer Boolean jumps to reach the join.
+                // A decisive first operand or an intermediate folded operand leaves
+                // an empty original block before the join. Keep pending call inputs
+                // in the preceding block, but let independent outer jumps reach the join.
                 let discarded = self.assembler.label();
                 self.assembler.mark(discarded);
                 self.assembler.prevent_borrow_reachability(discarded);
