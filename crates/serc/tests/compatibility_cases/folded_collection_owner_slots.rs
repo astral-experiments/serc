@@ -1,6 +1,39 @@
 use crate::common;
 
 #[test]
+fn matches_cpython_guard_owners_after_starred_literal_prefixes() {
+    for (open, close) in [("[", "]"), ("(", ")"), ("{", "}")] {
+        for prefix in [
+            "1, 2",
+            "1, 2, 3",
+            "1, 2, 3, 4, 5, 6",
+            "(1, 2), (3, 4), (5, 6)",
+        ] {
+            let source = format!(
+                "def f(values, flag):
+    with manager() as state:
+        result = prepare(state)
+        active = False
+        try:
+            initialize(state)
+            active = True
+            selected = [item for item in collect({open}{prefix}, *values{close}, root=result).splitlines() if item != '']
+            if len(selected) == 0:
+                raise Error('empty')
+            use({open}{prefix}, *selected{close}, root=result)
+            finish(['a', 'b', 'c', flag.attr], root=result)
+        finally:
+            if active:
+                close(state)
+    done()
+"
+            );
+            common::assert_matches_cpython_marshal(&source, "starred_prefix_owner_slots.py");
+        }
+    }
+}
+
+#[test]
 fn matches_cpython_finally_owners_after_literal_collection_folding() {
     for (definition, suspension) in [
         ("def", ""),
