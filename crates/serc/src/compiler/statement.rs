@@ -22883,8 +22883,10 @@ impl<'source> Compiler<'source> {
             final_chained_comparison(&statement.test).map(|comparison| comparison.range);
         let empty_folded_failure_block =
             condition_truthiness == Some(false) && self.assembler.at_empty_borrow_block();
+        // Legacy constant conditions must survive the early small-exit copy pass.
+        // Normal assertion lowering preserves that conditional and its failure block.
         if condition_truthiness == Some(true)
-            && self.context.python_version != crate::PythonVersion::Py313
+            && self.context.python_version >= crate::PythonVersion::Py314
         {
             if let Some(constant) = self.context.fold_constant(&statement.test) {
                 self.add_constant(constant)?;

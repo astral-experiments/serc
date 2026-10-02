@@ -27,6 +27,34 @@ fn child<'a>(code: &'a CodeObject, name: &str) -> &'a CodeObject {
 }
 
 #[test]
+fn python312_folded_assertion_copies_shared_return() {
+    // Captured from CPython 3.12.14: the assertion's success jump copies the exit.
+    for assertion in ["assert True", "assert True, 1"] {
+        for (tail, bytecode, line_table) in [
+            (
+                "return value",
+                &[151, 0, 124, 0, 114, 3, 9, 0, 124, 0, 83, 0, 124, 0, 83, 0][..],
+                &[
+                    128, 0, 217, 7, 12, 216, 15, 19, 216, 11, 16, 128, 76, 136, 53, 128, 76,
+                ][..],
+            ),
+            (
+                "return None",
+                &[151, 0, 124, 0, 114, 2, 9, 0, 121, 0, 121, 0][..],
+                &[128, 0, 217, 7, 12, 216, 15, 19, 217, 11, 15][..],
+            ),
+        ] {
+            let source = format!("def f(value):\n    if value:\n        {assertion}\n    {tail}\n");
+            let module = compile(&source, PythonVersion::Py312);
+            let function = child(&module, "f");
+            assert_eq!(function.bytecode, bytecode, "{source}");
+            assert_eq!(function.line_table, line_table, "{source}");
+            assert!(function.exception_table.is_empty());
+        }
+    }
+}
+
+#[test]
 fn legacy_ast_folds_boolean_inversion_inside_literal_subscripts() {
     for version in [PythonVersion::Py312, PythonVersion::Py313] {
         for (expression, expected) in [
