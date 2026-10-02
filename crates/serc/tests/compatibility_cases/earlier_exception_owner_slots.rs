@@ -204,6 +204,23 @@ fn copied_call_return_none_marker_without_handler_control() {
     common::assert_matches_cpython_marshal(&source, "copied_call_return_none_without_handler.py");
 }
 
+#[test]
+fn cleanup_truth_marker_preserves_owner_after_guard_target_copy() {
+    for managers in ["trace('operation')", "trace('operation'), counter()"] {
+        for condition in ["tracker", "tracker and not self.disabled"] {
+            for work in ["prepare()", "self.prepare()"] {
+                let source = format!(
+                    "async def f(self, cached, enabled, tracker, item, tag):\n    with {managers}:\n        if cached is not None:\n            if enabled:\n                try:\n                    {work}\n                finally:\n                    if {condition}:\n                        tracker.record('done')\n            record(self.renderer, 'event', outcome='success', extra_tags=['hit', tag, 'source'], count=item.count())\n        elif self.conversation:\n            pass\n"
+                );
+                common::assert_matches_cpython_marshal(
+                    &source,
+                    "cleanup_truth_guard_target_copy.py",
+                );
+            }
+        }
+    }
+}
+
 fn copied_call_return_none_source() -> &'static str {
     include_str!(
         "../fixtures/compatibility/earlier_exception_owner_slots/copied_call_return_none_marker_after_completed_async_manager/copied_call_return_none_after_async_manager.py"

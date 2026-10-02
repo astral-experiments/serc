@@ -5545,6 +5545,110 @@ impl LayoutAssembler {
         ))
     }
 
+    /// Resolves a truth marker that reuses an unchanged cleanup-condition record.
+    fn original_cleanup_truth_owner(
+        &self,
+        condition_index: usize,
+        array: usize,
+        tail: ExceptionOwnerTail,
+        instructions: &[&Instruction],
+        positions: &OwnerLabelPositions,
+        jump_targets: &FxHashSet<Label>,
+    ) -> Option<usize> {
+        use crate::target::opcodes::{
+            LOAD_DEREF, LOAD_FAST, LOAD_FAST_BORROW, POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE,
+            PUSH_EXC_INFO, TO_BOOL,
+        };
+
+        if tail.insertions != 0 || tail.post_compaction_fusions != 0 {
+            return None;
+        }
+        let start = condition_index.checked_sub(2)?;
+        let [load, to_bool, condition] = instructions.get(start..=condition_index)? else {
+            return None;
+        };
+        let provenance = &self.exception_owner_provenance;
+        if array > start
+            || !matches!(load.opcode, LOAD_FAST | LOAD_FAST_BORROW | LOAD_DEREF)
+            || to_bool.opcode != TO_BOOL
+            || to_bool.value_argument() != Some(0)
+            || !matches!(condition.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE)
+            || condition.forward_target().is_none()
+            || provenance
+                .original_primitive_condition_boundaries
+                .iter()
+                .filter(|origin| **origin == **condition)
+                .count()
+                != 1
+            || [load, to_bool, condition].iter().any(|record| {
+                record.location != condition.location
+                    || record.pre_fold_extra_instructions() != 0
+                    || record.exception_policy() != super::ExceptionPolicy::NoneUnchanged
+                    || record.no_location_policy.borrow_fallthrough()
+                        == super::BorrowFallthrough::Barrier
+                    || record.jump_policy.borrow_empty_block()
+            })
+            || to_bool.local_policy.hidden_exception_owner_slots() != 0
+            || condition.local_policy.hidden_exception_owner_slots() != 0
+            || jump_targets
+                .iter()
+                .chain(&provenance.block_boundaries)
+                .chain(&provenance.source_boundaries)
+                .any(|label| {
+                    positions
+                        .get(label)
+                        .is_some_and(|position| start < *position && *position <= condition_index)
+                })
+        {
+            return None;
+        }
+        let normal = tail.late_removals == 0
+            && (1..=3).contains(&tail.early_removals)
+            && provenance
+                .normal_finally_truth_prefixes
+                .iter()
+                .filter(|[_, original_load, original_bool, original_condition]| {
+                    let mut expected_load = *original_load;
+                    expected_load
+                        .local_policy
+                        .add_hidden_exception_owner_slots(1);
+                    if load.opcode == LOAD_FAST_BORROW {
+                        expected_load.opcode = LOAD_FAST_BORROW;
+                    }
+                    **load == expected_load
+                        && **to_bool == *original_bool
+                        && **condition == *original_condition
+                })
+                .count()
+                == 1;
+        let exceptional = tail.late_removals == 1
+            && tail.early_removals == 0
+            && array + 1 == start
+            && instructions[array].opcode == PUSH_EXC_INFO
+            && instructions[array].value_argument() == Some(0)
+            && instructions[array].location == SourceLocation::NONE
+            && instructions[array].exception_policy() == super::ExceptionPolicy::NoneUnchanged
+            && instructions[array]
+                .local_policy
+                .hidden_exception_owner_slots()
+                == 0
+            && instructions[array].pre_fold_extra_instructions() == 0
+            && load.local_policy.hidden_exception_owner_slots() == 0
+            && provenance
+                .setups
+                .iter()
+                .filter(|(entry, location)| {
+                    location.is_none() && positions.get(entry) == Some(&array)
+                })
+                .count()
+                == 1;
+        if !normal && !exceptional {
+            return None;
+        }
+        let region = self.uniform_exception_owner(start, condition_index + 1, positions)?;
+        (!self.exception_regions[region].is_scope_fallback).then_some(region)
+    }
+
     /// Recovers an owned handler cell across its fully captured finalizer SETUP.
     fn named_handler_try_owner(
         &self,
@@ -9111,6 +9215,26 @@ impl LayoutAssembler {
                             }
                         }
                     }
+                    // These captured truth tests append into an owned condition cell:
+                    // either one to three early vacancies, or the handler's late SETUP.
+                    if is_conditional_jump(instruction.opcode)
+                        && owner_history_exact
+                        && pop_slot_epoch_known
+                        && instruction_index >= 2
+                        && (instruction_index - 2..=instruction_index)
+                            .all(|index| !owners.contains_key(index))
+                        && let Some(region) = self.original_cleanup_truth_owner(
+                            instruction_index,
+                            original_array_start,
+                            tail,
+                            &indexed_instructions,
+                            &label_positions,
+                            &jump_targets,
+                        )
+                    {
+                        pending_normal_none_owner = Some((instruction_index + 1, Some(region)));
+                    }
+
                     // Value returns have no authored return NOP. Both adjacent POPs can
                     // disappear into this captured truth load; four or five early removals
                     // place its appended marker exactly on the second or first NULL cell.
