@@ -10913,7 +10913,41 @@ impl Assembler {
         instruction.jump_policy.preserve_explicit_nop();
     }
 
-    /// Records the direct local None test following an authored normal-finally `POP_BLOCK`.
+    /// Captures a copied finalizer's local None test without normal-fallthrough provenance.
+    pub(crate) fn record_copied_finally_none_prefix(&mut self, ordinal: usize) {
+        let mut instructions = self
+            .linear_items()
+            .iter()
+            .filter_map(|item| match item {
+                Item::Instruction(instruction) => Some(*instruction),
+                Item::Label(_) => None,
+            })
+            .skip(ordinal);
+        let (Some(pop), Some(load), Some(condition)) = (
+            instructions.next(),
+            instructions.next(),
+            instructions.next(),
+        ) else {
+            return;
+        };
+        if pop.opcode == NOP
+            && pop.fusion_policy.is_converted_pop_block()
+            && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
+            && matches!(load.opcode, LOAD_FAST | crate::target::opcodes::LOAD_DEREF)
+            && load.local_policy.hidden_exception_owner_slots() == 0
+            && load.pre_fold_extra_instructions() == 0
+            && matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+            && condition.forward_target().is_some()
+            && condition.local_policy.hidden_exception_owner_slots() == 3
+            && condition.pre_fold_extra_instructions() == 0
+        {
+            self.exception_owner_provenance
+                .copied_finally_none_prefixes
+                .push((pop, load, condition));
+        }
+    }
+
+    /// Records a direct local None test following a normal finalizer's `POP_BLOCK`.
     pub(crate) fn record_normal_finally_none_prefix(&mut self, ordinal: usize) {
         let mut instructions = self
             .linear_items()
@@ -12015,7 +12049,7 @@ impl Assembler {
             .push(origin);
     }
 
-    /// Captures the original return POP pair and its direct local truth test.
+    /// Captures the return POP pair and its local truth test, including constant-return NOPs.
     pub(crate) fn record_copied_return_truth_prefix(
         &mut self,
         return_item: usize,
@@ -12072,7 +12106,23 @@ impl Assembler {
                     && authored.depth_after() == pops[0].depth_after()
                     && labels.iter().all(|item| matches!(item, Item::Label(_))) =>
             {
-                *authored
+                Some(*authored)
+            }
+            Some(prefix)
+                if pops[0].depth_after().is_some_and(|depth| depth > 0)
+                    && pops[0].depth_after() == pops[1].depth_after()
+                    && prefix
+                        .iter()
+                        .rev()
+                        .find_map(|item| match item {
+                            Item::Instruction(value) => Some(value),
+                            Item::Label(_) => None,
+                        })
+                        .is_some_and(|value| {
+                            value.opcode != NOP && value.depth_after() == pops[0].depth_after()
+                        }) =>
+            {
+                None
             }
             _ => return,
         };

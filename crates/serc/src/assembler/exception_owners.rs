@@ -103,6 +103,7 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) retained_normal_pop_blocks: FxHashMap<Label, RetainedNormalPopBlock>,
     pub(super) original_normal_finally_arrays: Vec<OriginalNormalFinallyArray>,
     pub(super) normal_finally_none_prefixes: Vec<(Instruction, Instruction, Instruction)>,
+    pub(super) copied_finally_none_prefixes: Vec<(Instruction, Instruction, Instruction)>,
     pub(super) normal_finally_method_none_prefixes: Vec<[Instruction; 5]>,
     pub(super) normal_finally_truth_prefixes: Vec<[Instruction; 4]>,
     pub(super) copied_return_none_prefixes: Vec<CopiedReturnNonePrefix>,
@@ -262,6 +263,7 @@ impl ExceptionOwnerProvenance {
         }
         self.normal_finally_none_prefixes
             .iter()
+            .chain(&self.copied_finally_none_prefixes)
             .map(|origin| &origin.2)
             .chain(
                 self.normal_finally_method_none_prefixes
@@ -457,7 +459,11 @@ impl ExceptionOwnerProvenance {
                 visit(&mut record.1);
             }
         }
-        for record in &mut self.normal_finally_none_prefixes {
+        for record in self
+            .normal_finally_none_prefixes
+            .iter_mut()
+            .chain(&mut self.copied_finally_none_prefixes)
+        {
             visit(&mut record.0);
             visit(&mut record.1);
             visit(&mut record.2);
@@ -515,7 +521,9 @@ impl ExceptionOwnerProvenance {
             }
         }
         for origin in &mut self.copied_return_truth_prefixes {
-            visit(&mut origin.return_nop);
+            if let Some(instruction) = origin.return_nop.as_mut() {
+                visit(instruction);
+            }
             for instruction in &mut origin.pops {
                 visit(instruction);
             }
@@ -813,10 +821,10 @@ pub(super) struct CopiedReturnAttributeTruthPrefix {
     pub(super) condition: Instruction,
 }
 
-/// A constant return's original POP pair and complete local truthiness test.
+/// A return's original POP pair, optional authored NOP, and complete local truthiness test.
 #[derive(Debug)]
 pub(super) struct CopiedReturnTruthPrefix {
-    pub(super) return_nop: Instruction,
+    pub(super) return_nop: Option<Instruction>,
     pub(super) pops: [Instruction; 2],
     pub(super) load: Instruction,
     pub(super) to_bool: Instruction,
@@ -6781,6 +6789,7 @@ impl LayoutAssembler {
                                 && provenance
                                     .normal_finally_none_prefixes
                                     .iter()
+                                    .chain(&provenance.copied_finally_none_prefixes)
                                     .filter(|(_, original_load, original_condition)| {
                                         let Some(load) =
                                             indexed_instructions.get(instruction_index)
@@ -7211,9 +7220,11 @@ impl LayoutAssembler {
                                             expected_load.opcode = load.opcode;
                                         }
                                         pop == *instruction
-                                            && origin.return_nop.location == instruction.location
-                                            && origin.return_nop.depth_after()
-                                                == instruction.depth_after()
+                                            && origin.return_nop.is_some_and(|authored| {
+                                                authored.location == instruction.location
+                                                    && authored.depth_after()
+                                                        == instruction.depth_after()
+                                            })
                                             && expected_load == **load
                                             && indexed_instructions
                                                 .get(instruction_index + 2)
@@ -8438,6 +8449,9 @@ impl LayoutAssembler {
                                 .exception_owner_provenance
                                 .normal_finally_none_prefixes
                                 .iter()
+                                .chain(
+                                    &self.exception_owner_provenance.copied_finally_none_prefixes,
+                                )
                                 .any(|(_, original_load, original_condition)| {
                                     let load = *indexed_instructions[instruction_index - 1];
                                     let mut expected_load = *original_load;
@@ -8999,6 +9013,48 @@ impl LayoutAssembler {
                             }
                         }
                     }
+                    // Value returns have no authored return NOP. Both adjacent POPs can
+                    // disappear into this captured truth load; four or five early removals
+                    // place its appended marker exactly on the second or first NULL cell.
+                    if is_conditional_jump(instruction.opcode)
+                        && owner_history_exact
+                        && pop_slot_epoch_known
+                        && (4..=5).contains(&tail.early_removals)
+                        && tail.insertions == 0
+                        && tail.late_removals == 0
+                        && tail.post_compaction_fusions == 0
+                        && instruction_index >= original_array_start + 2
+                        && (instruction_index - 2..=instruction_index)
+                            .all(|index| !owners.contains_key(index))
+                        && !jump_targets.iter().any(|label| {
+                            label_positions.get(label).is_some_and(|position| {
+                                instruction_index - 2 < *position
+                                    && *position <= instruction_index + 1
+                            })
+                        })
+                        && self
+                            .exception_owner_provenance
+                            .copied_return_truth_prefixes
+                            .iter()
+                            .filter(|origin| {
+                                let mut load = origin.load;
+                                load.local_policy.add_hidden_exception_owner_slots(2);
+                                if indexed_instructions[instruction_index - 2].opcode
+                                    == crate::target::opcodes::LOAD_FAST_BORROW
+                                {
+                                    load.opcode = crate::target::opcodes::LOAD_FAST_BORROW;
+                                }
+                                origin.return_nop.is_none()
+                                    && load == *indexed_instructions[instruction_index - 2]
+                                    && origin.to_bool
+                                        == *indexed_instructions[instruction_index - 1]
+                                    && origin.condition == *instruction
+                            })
+                            .count()
+                            == 1
+                    {
+                        pending_normal_none_owner = Some((instruction_index + 1, None));
+                    }
                     // A normal-finally local None test removes exactly three comparison
                     // records. With a retained POP its marker reuses IS_OP; with one
                     // deleted POP it reuses LOAD_CONST(None). Both belong to the unchanged
@@ -9018,7 +9074,16 @@ impl LayoutAssembler {
                             .exception_owner_provenance
                             .normal_finally_none_prefixes
                             .iter()
-                            .map(|(pop, load, condition)| (pop, load, condition, None, false));
+                            .map(|(pop, load, condition)| {
+                                (pop, load, condition, None, false, false)
+                            });
+                        let copied_finally_prefixes = self
+                            .exception_owner_provenance
+                            .copied_finally_none_prefixes
+                            .iter()
+                            .map(|(pop, load, condition)| {
+                                (pop, load, condition, None, false, true)
+                            });
                         let copied_prefixes = self
                             .exception_owner_provenance
                             .copied_manager_return_none_prefixes
@@ -9030,6 +9095,7 @@ impl LayoutAssembler {
                                     &origin.condition,
                                     Some(origin),
                                     false,
+                                    false,
                                 )
                             });
                         let paired_prefixes = self
@@ -9038,12 +9104,26 @@ impl LayoutAssembler {
                             .iter()
                             .filter(|origin| origin.additional_pop.is_none())
                             .map(|origin| {
-                                (&origin.pops[1], &origin.load, &origin.condition, None, true)
+                                (
+                                    &origin.pops[1],
+                                    &origin.load,
+                                    &origin.condition,
+                                    None,
+                                    true,
+                                    false,
+                                )
                             });
-                        for (original_pop, original_load, original_condition, copied, paired) in
-                            normal_prefixes
-                                .chain(copied_prefixes)
-                                .chain(paired_prefixes)
+                        for (
+                            original_pop,
+                            original_load,
+                            original_condition,
+                            copied,
+                            paired,
+                            copied_finally,
+                        ) in normal_prefixes
+                            .chain(copied_finally_prefixes)
+                            .chain(copied_prefixes)
+                            .chain(paired_prefixes)
                         {
                             if instruction != original_condition {
                                 continue;
@@ -9150,8 +9230,54 @@ impl LayoutAssembler {
                                         )
                                 })
                                 .and_then(|removed_before| load_index.checked_add(removed_before));
-                            if removed_pop > 0 && original_pop_slot == Some(instruction_index + 1) {
+                            if !copied_finally
+                                && removed_pop > 0
+                                && original_pop_slot == Some(instruction_index + 1)
+                            {
                                 pending_normal_none_owner = Some((instruction_index + 1, None));
+                                continue;
+                            }
+                            // A copied local-return finalizer can follow an earlier try's
+                            // POP in the same array. Only the unchanged owned suffix before
+                            // this captured final POP must cover the marker's old cell.
+                            if !paired
+                                && copied.is_none()
+                                && removed_pop == 1
+                                && pop_slot_epoch_known
+                                && let Some(distance) = original_pop_slot
+                                    .and_then(|pop| pop.checked_sub(instruction_index + 1))
+                                    .filter(|distance| *distance > 0)
+                                && let Some(start) = load_index.checked_sub(distance)
+                                && original_array_start <= start
+                                && indexed_instructions[start..load_index]
+                                    .iter()
+                                    .enumerate()
+                                    .all(|(offset, record)| {
+                                        let mut changes = ExceptionOwnerTail::default();
+                                        changes.instruction(record, None);
+                                        record.opcode != NOP
+                                            && record.pre_fold_extra_instructions() == 0
+                                            && record.exception_policy()
+                                                == super::ExceptionPolicy::NoneUnchanged
+                                            && record.no_location_policy.borrow_fallthrough()
+                                                != super::BorrowFallthrough::Barrier
+                                            && !record.jump_policy.borrow_empty_block()
+                                            && !owners.contains_key(start + offset)
+                                            && changes.early_removals == 0
+                                            && changes.insertions == 0
+                                            && changes.late_removals == 0
+                                            && changes.post_compaction_fusions == 0
+                                    })
+                                && let Some(region) = self.uniform_exception_owner(
+                                    start,
+                                    load_index,
+                                    &label_positions,
+                                )
+                                && !self.exception_regions[region].is_scope_fallback
+                                && !self.exception_regions[region].preserve_lasti
+                            {
+                                pending_normal_none_owner =
+                                    Some((instruction_index + 1, Some(region)));
                                 continue;
                             }
                             // With both original POPs erased, earlier folds can put the
@@ -9226,6 +9352,9 @@ impl LayoutAssembler {
                                 instruction_index + 1,
                                 &label_positions,
                             ) && !self.exception_regions[region].is_scope_fallback
+                                // A copied handler exit may have consumed earlier handler
+                                // POPs. Its surrounding manager is not a condition-cell donor.
+                                && (!copied_finally || (pop_slot_epoch_known && !self.exception_regions[region].preserve_lasti))
                             {
                                 pending_normal_none_owner =
                                     Some((instruction_index + 1, Some(region)));

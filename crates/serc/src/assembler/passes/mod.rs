@@ -806,8 +806,11 @@ impl OptimizationPipeline {
                     }
                 }
             }
-            for (_, _, condition) in
-                &mut self.exception_owner_provenance.normal_finally_none_prefixes
+            for (_, _, condition) in self
+                .exception_owner_provenance
+                .normal_finally_none_prefixes
+                .iter_mut()
+                .chain(&mut self.exception_owner_provenance.copied_finally_none_prefixes)
             {
                 if condition == before {
                     *condition = *after;
