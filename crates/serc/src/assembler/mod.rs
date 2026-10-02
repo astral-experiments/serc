@@ -71,18 +71,24 @@ fn constant_pair_store_tail(items: &[Item]) -> Option<[Instruction; 3]> {
         .iter()
         .take_while(|item| matches!(item, Item::Label(_)))
         .count();
+    if entry_len == 0 {
+        return None;
+    }
+    constant_pair_stores(&items[entry_len..])
+}
+
+fn constant_pair_stores(items: &[Item]) -> Option<[Instruction; 3]> {
     let [
         Item::Instruction(left),
         Item::Instruction(right),
         Item::Instruction(swap),
         Item::Instruction(first),
         Item::Instruction(last),
-    ] = &items[entry_len..]
+    ] = items
     else {
         return None;
     };
-    if entry_len == 0
-        || left.opcode != LOAD_CONST
+    if left.opcode != LOAD_CONST
         || right.opcode != LOAD_CONST
         || swap.opcode != SWAP
         || swap.value_argument() != Some(2)
