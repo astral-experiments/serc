@@ -62,10 +62,17 @@ cargo run --release -p serc --example compare_cpython_corpus -- \
 Each file gets a fresh CPython process with UTF-8 mode, hash seed 0, and site
 initialization disabled. The reference compiles source bytes and marshals
 through the C API, without a Python wrapper or additional imports. It uses
-normal interpreter startup, modeled by Serc's default intern state, and retains
-the filename argument and a second reference to the root code object as a Python
-caller would. The `minimal-v2` protocol fixes this ownership across Python
-versions and rejects older reference artifacts.
+isolated startup with automatic signal-handler installation disabled, and
+retains the filename argument and a second reference to the root code object as
+a Python caller would. The `minimal-v2` protocol fixes this ownership across
+Python versions and rejects older reference artifacts.
+
+The Linux 3.12 through 3.15 default startup tables are captured from this C
+protocol, not from builtin `compile()` and its AST-type initialization. Their
+generated inputs bind the reference source and two independent native startup
+observations; changing the reference requires recapturing those inputs. The 3.14
+profile also binds an offline strong-owner proof for every mortal interned
+startup string.
 
 The comparator verifies the reference protocol, CPython release, and magic
 number, then compares raw marshal bytes, including string interning and object

@@ -182,6 +182,23 @@ class RenderPreinternedLookupTest(unittest.TestCase):
             rendered,
         )
 
+    def test_preserves_compiler_aliases_only_in_non_linux_fallback(self) -> None:
+        arguments = (["static"], ("retained",), ("", "left", "retained", "static"))
+        original = generator.render_preinterned_lookup(*arguments)
+        native = generator.render_preinterned_lookup(
+            *arguments, compiler_strings_on_linux=False
+        )
+        self.assertIn("        [] => return true,", original)
+        self.assertIn('        0x6c65 => return value == "left",', original)
+        self.assertIn('        [] => return cfg!(not(target_os = "linux")),', native)
+        self.assertIn(
+            '        0x6c65 => return cfg!(not(target_os = "linux")) && value == "left",',
+            native,
+        )
+        for lines in [original, native]:
+            self.assertIn('        0x7265 => return value == "retained",', lines)
+            self.assertIn("        0x7374 => (0, 1),", lines)
+
     def test_renders_exact_prefix_ranges_and_startup_candidates(self) -> None:
         self.assertEqual(
             generator.render_preinterned_lookup(
@@ -220,8 +237,8 @@ class TargetSelectionTest(unittest.TestCase):
 
     def test_legacy_targets_have_exact_independent_inputs(self) -> None:
         for minor, version, module, supplement_count in [
-            ("3.12", (3, 12, 14), "cpython_3_12_14.rs", 2956),
-            ("3.13", (3, 13, 15), "cpython_3_13_15.rs", 2648),
+            ("3.12", (3, 12, 14), "cpython_3_12_14.rs", 2899),
+            ("3.13", (3, 13, 15), "cpython_3_13_15.rs", 2569),
         ]:
             with self.subTest(minor=minor):
                 generator.select_target_version(minor)
@@ -248,6 +265,54 @@ class TargetSelectionTest(unittest.TestCase):
                 )
             ),
         )
+
+    def test_minimal_startup_requires_reference_and_repeated_capture(self) -> None:
+        generator.select_target_version("3.12")
+        relative, _ = generator.startup_input()
+        original = json.loads((generator.CRATE_ROOT / relative).read_text())
+        reference = (
+            generator.CRATE_ROOT.parent.parent / "scripts/cpython-reference.c"
+        ).read_bytes()
+        generator.validate_minimal_startup_profile(original, reference)
+        for mutation in (
+            "source",
+            "protocol",
+            "legacy_protocol",
+            "duplicate",
+            "failed",
+            "different_sets",
+            "single_read",
+            "changed_output",
+            "wrong_count",
+            "wrong_thread_count",
+            "wrong_build",
+        ):
+            with self.subTest(mutation=mutation):
+                profile = json.loads(json.dumps(original))
+                if mutation == "source":
+                    profile["reference_source_sha256"] = "0" * 64
+                elif mutation == "protocol":
+                    profile["reference_protocol"] = "python-wrapper"
+                elif mutation == "legacy_protocol":
+                    profile["reference_protocol"] = "minimal-v1"
+                elif mutation == "duplicate":
+                    profile["observations"][1] = profile["observations"][0]
+                elif mutation == "failed":
+                    profile["observations"][0]["actual_exit"] = 1
+                elif mutation == "different_sets":
+                    profile["observations"][0]["canonical_sha256"] = "0" * 64
+                elif mutation == "single_read":
+                    profile["observations"][0]["two_complete_reads_equal"] = False
+                elif mutation == "changed_output":
+                    profile["observations"][0]["observed_equals_unobserved"] = False
+                elif mutation == "wrong_count":
+                    profile["observations"][0]["entries"] += 1
+                elif mutation == "wrong_thread_count":
+                    profile["observations"][0]["thread_count"] = 2
+                else:
+                    profile["gil_enabled"] = False
+                with self.assertRaisesRegex(ValueError, "provenance is incomplete"):
+                    generator.validate_minimal_startup_profile(profile, reference)
 
     def test_shared_legacy_semantic_properties_are_source_checked(self) -> None:
         from generate_legacy_target import render_legacy_opcodes
@@ -285,7 +350,7 @@ class TargetSelectionTest(unittest.TestCase):
     def test_startup_fixture_matches_target_and_pinned_digest(self) -> None:
         generator.select_target_version("3.15")
         strings = generator.read_startup_strings()
-        self.assertEqual(len(strings), 2790)
+        self.assertEqual(len(strings), 2652)
         self.assertEqual(strings, tuple(sorted(set(strings))))
         self.assertFalse(any(value.startswith("/") for value in strings))
         with (
@@ -302,10 +367,11 @@ class TargetSelectionTest(unittest.TestCase):
     def test_314_startup_fixture_has_complete_retained_ownership(self) -> None:
         generator.select_target_version("3.14")
         strings = generator.read_startup_strings()
-        self.assertEqual(len(strings), 2617)
+        self.assertEqual(len(strings), 2537)
         self.assertIn("struct_rusage", strings)
         path = generator.CRATE_ROOT / generator.STARTUP_314_INPUT
         original = json.loads(path.read_text())
+        read_bytes = Path.read_bytes
         for mutation in [
             "missing_owner",
             "missing_proof",
@@ -325,13 +391,23 @@ class TargetSelectionTest(unittest.TestCase):
                     profile["gil_enabled"] = False
                 data = json.dumps(profile).encode()
                 with (
-                    mock.patch.object(Path, "read_bytes", return_value=data),
+                    mock.patch.object(
+                        Path,
+                        "read_bytes",
+                        autospec=True,
+                        side_effect=lambda candidate, data=data: (
+                            data if candidate == path else read_bytes(candidate)
+                        ),
+                    ),
                     mock.patch.object(
                         generator,
                         "STARTUP_314_SHA256",
                         hashlib.sha256(data).hexdigest(),
                     ),
-                    self.assertRaisesRegex(ValueError, "incomplete retained ownership"),
+                    self.assertRaisesRegex(
+                        ValueError,
+                        "incomplete retained ownership|provenance is incomplete",
+                    ),
                 ):
                     generator.read_startup_strings()
 
