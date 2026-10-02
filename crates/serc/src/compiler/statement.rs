@@ -31038,6 +31038,7 @@ impl<'source> Compiler<'source> {
                     }) && !suite_contains_abrupt_control_flow(&clause.body)
                 })
                 && (suite_has_linear_borrow_fallthrough(&conditional.body)
+                    || suite_has_populated_conditional_alternative(&conditional.body)
                     || synchronous_guarded_recovery_entry
                     || coroutine_guarded_recovery_entry
                     || coroutine_manager_arm_reaches_finally(&conditional.body)
@@ -32556,7 +32557,9 @@ impl<'source> Compiler<'source> {
             && self.control.finally.active_normal_finally_bodies == 0
             && self.control.finally.active_finally_end_blocks == 0
             && self.control.finally.active_copied_finally_bodies == 0
-            && managed_while_reraise_leaves_empty_borrow_exit(&statement.body);
+            && (managed_while_reraise_leaves_empty_borrow_exit(&statement.body)
+                || (matches!(statement.finalbody.first(), Some(Stmt::While(_)))
+                    && managed_iterator_continue_leaves_empty_borrow_exit(&statement.body)));
         if (!statement.handlers.is_empty() && !normal_finally_is_borrow_reachable)
             || nested_handler_exit
             || nested_named_recovery_exit
@@ -34228,7 +34231,19 @@ impl<'source> Compiler<'source> {
                         let Stmt::If(tail) = last else {
                             return false;
                         };
-                        (leading.is_empty() || suite_has_linear_borrow_fallthrough(leading))
+                        (leading.is_empty()
+                            || suite_has_linear_borrow_fallthrough(leading)
+                            // An earlier closed guard rejoins before this condition. Its
+                            // recovery cannot pop the manager owning the later empty join.
+                            || matches!(leading, [Stmt::If(guard)]
+                                if guard.elif_else_clauses.is_empty()
+                                    && condition_has_only_runtime_tests(&guard.test)
+                                    && condition_has_linear_runtime_leaves(&guard.test)
+                                    && !expression_suspends_current_scope(&guard.test)
+                                    && (matches!(guard.body.as_slice(), [Stmt::Pass(_)])
+                                        || suite_has_linear_borrow_fallthrough(&guard.body)
+                                        || (matches!(guard.body.as_slice(), [Stmt::Try(_)])
+                                            && copied_finally_has_joined_try_cleanup(&guard.body)))))
                             && tail.elif_else_clauses.is_empty()
                             && condition_has_linear_runtime_leaves(&tail.test)
                             && condition_jump_target_count(&tail.test, false) == 1
@@ -40038,6 +40053,71 @@ fn managed_while_reraise_leaves_empty_borrow_exit(body: &[Stmt]) -> bool {
     })
 }
 
+// Moving an iterator's continue handler leaves its abandoned cleanup between the
+// manager exit and a leading cleanup loop, whose entry has no work to absorb it.
+fn managed_iterator_continue_leaves_empty_borrow_exit(body: &[Stmt]) -> bool {
+    let Some(Stmt::With(manager)) = body.last() else {
+        return false;
+    };
+    let Some(Stmt::For(iterator)) = manager.body.last() else {
+        return false;
+    };
+    !manager.is_async
+        && manager.items.iter().all(|item| {
+            !expression_contains_inline_branch(&item.context_expr)
+                && !expression_suspends_current_scope(&item.context_expr)
+        })
+        && !iterator.is_async
+        && iterator.orelse.is_empty()
+        && !suite_contains_loop_break(&iterator.body)
+        && !suite_contains_return(&iterator.body)
+        && iterator.body.iter().enumerate().any(|(index, part)| {
+            index + 1 < iterator.body.len()
+                && matches!(part, Stmt::Try(recovery)
+                if !recovery.is_star
+                    && recovery.orelse.is_empty()
+                    && recovery.finalbody.is_empty()
+                    && matches!(recovery.handlers.as_slice(), [handler]
+                        if handler.as_except_handler().is_some_and(|handler| {
+                            handler.type_.is_some()
+                                && handler.name.is_none()
+                                && matches!(handler.body.last(), Some(Stmt::Continue(_)))
+                        })))
+        })
+}
+
+// A nested complete conditional can retain a located jump from its linear
+// alternative even when the other arm ends in a separate runtime guard.
+fn suite_has_populated_conditional_alternative(body: &[Stmt]) -> bool {
+    let Some((Stmt::If(branch), prefix)) = body.split_last() else {
+        return false;
+    };
+    let runtime = |test: &Expr| {
+        condition_has_only_runtime_tests(test)
+            && !expression_contains_inline_branch(test)
+            && !expression_suspends_current_scope(test)
+    };
+    let guarded_linear = |body: &[Stmt]| {
+        body.iter().all(|part| {
+            suite_has_linear_borrow_fallthrough(std::slice::from_ref(part))
+                || matches!(part, Stmt::If(guard)
+                    if runtime(&guard.test)
+                        && guard.elif_else_clauses.is_empty()
+                        && suite_has_linear_borrow_fallthrough(&guard.body))
+        })
+    };
+    (prefix.is_empty() || suite_has_linear_borrow_fallthrough(prefix))
+        && runtime(&branch.test)
+        && guarded_linear(&branch.body)
+        && branch.elif_else_clauses.last().is_some_and(|clause| {
+            clause.test.is_none() && suite_has_linear_borrow_fallthrough(&clause.body)
+        })
+        && branch
+            .elif_else_clauses
+            .iter()
+            .all(|clause| clause.test.as_ref().is_none_or(runtime) && guarded_linear(&clause.body))
+}
+
 // These named recovery shapes leave the nested try's original normal exit empty.
 // Earlier returns use separately copied finalizers and do not reopen that entry.
 fn nested_named_recovery_leaves_empty_borrow_entry(statement: &ruff_python_ast::StmtTry) -> bool {
@@ -41995,19 +42075,38 @@ fn suite_ends_in_empty_try_exit_block(body: &[Stmt], loop_tail: bool) -> bool {
                     })) && (prefix.is_empty() || suite_has_linear_borrow_fallthrough(prefix))
                 })
             };
+            // A later conditional jump cannot bypass the outer empty join when
+            // an earlier nested recovery already stopped borrowing traversal.
+            let threaded_exit = statement
+                .body
+                .last()
+                .is_some_and(statement_threads_through_empty_join)
+                && !statement.body[..statement.body.len().saturating_sub(1)]
+                    .iter()
+                    .any(|part| {
+                        matches!(part, Stmt::Try(recovery)
+                        if !recovery.is_star
+                            && recovery.orelse.is_empty()
+                            && recovery.finalbody.is_empty()
+                            && !recovery.handlers.is_empty()
+                            && suite_ends_in_empty_try_exit_block(&recovery.body, false))
+                    });
             (statement.elif_else_clauses.is_empty()
                 && !suite_terminates(&statement.body)
-                && !statement
-                    .body
-                    .last()
-                    .is_some_and(statement_threads_through_empty_join))
+                && !threaded_exit)
                 // Returning earlier arms leave no live jump around the final elif's
                 // empty POP_BLOCK join. Its false edge and linear body share that exit.
                 || (runtime_test(&statement.test)
                     && returns(&statement.body)
                     && statement.elif_else_clauses.split_last().is_some_and(|(last, earlier)| {
                         last.test.as_ref().is_some_and(runtime_test)
-                            && suite_has_linear_borrow_fallthrough(&last.body)
+                            && (suite_has_linear_borrow_fallthrough(&last.body)
+                                || last.body.split_last().is_some_and(|(tail, prefix)| {
+                                    matches!(tail, Stmt::Assign(assignment)
+                                        if recovery_assignment_has_nonempty_join(assignment))
+                                        && (prefix.is_empty()
+                                            || suite_has_linear_borrow_fallthrough(prefix))
+                                }))
                             && earlier.iter().all(|clause| {
                                 clause.test.as_ref().is_some_and(runtime_test)
                                     && returns(&clause.body)
