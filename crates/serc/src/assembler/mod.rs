@@ -10107,7 +10107,7 @@ impl Assembler {
         self.record_shared_break_truth_prefix(unwind_start);
     }
 
-    /// Certifies the iterator discard shared by a copied local-None-guarded method call.
+    /// Certifies the iterator discard shared by a copied guarded method call.
     pub(crate) fn prepare_copied_finally_iterator_break(
         &mut self,
         emitted: EmittedJump,
@@ -10183,18 +10183,43 @@ impl Assembler {
         else {
             return;
         };
+        let (start, load_guard, guard_call, condition, not_taken, cleanup) = match unwind {
+            [
+                Item::Label(start),
+                Item::Instruction(load),
+                Item::Instruction(condition),
+                Item::Instruction(marker),
+                cleanup @ ..,
+            ] if condition.opcode == POP_JUMP_IF_NONE => {
+                (start, load, None, condition, marker, cleanup)
+            }
+            [
+                Item::Label(start),
+                Item::Instruction(load),
+                Item::Instruction(method),
+                Item::Instruction(call),
+                Item::Instruction(boolean),
+                Item::Instruction(condition),
+                Item::Instruction(marker),
+                cleanup @ ..,
+            ] if condition.opcode == POP_JUMP_IF_FALSE => (
+                start,
+                load,
+                Some((method, call, boolean)),
+                condition,
+                marker,
+                cleanup,
+            ),
+            _ => return,
+        };
         let [
-            Item::Label(start),
-            Item::Instruction(load_guard),
-            Item::Instruction(condition),
-            Item::Instruction(not_taken),
             Item::Label(body),
             Item::Instruction(load_receiver),
             Item::Instruction(method),
             Item::Instruction(call),
             Item::Instruction(discard_call),
             Item::Label(join),
-        ] = unwind
+        ] = cleanup
         else {
             return;
         };
@@ -10208,6 +10233,31 @@ impl Assembler {
         ) else {
             return;
         };
+        if let Some((method, call, boolean)) = guard_call {
+            if !matches!(method.operand(), Operand::Value(argument) if argument & 1 != 0)
+                || method.location.line != condition.location.line
+                || call.location != condition.location
+                || boolean.location != condition.location
+                || *method
+                    != Instruction::new(
+                        LOAD_ATTR,
+                        method.operand(),
+                        method.location,
+                        Some(method_depth),
+                    )
+                || *call
+                    != Instruction::new(
+                        crate::target::opcodes::CALL,
+                        Operand::Value(0),
+                        call.location,
+                        Some(loaded),
+                    )
+                || *boolean
+                    != Instruction::new(TO_BOOL, Operand::Value(0), boolean.location, Some(loaded))
+            {
+                return;
+            }
+        }
         if let Some(prefix) = handler_cleanup {
             let [
                 Item::Label(handler_end),
@@ -10263,14 +10313,25 @@ impl Assembler {
             || load_guard.opcode != LOAD_FAST
             || load_guard.value_argument().is_none()
             || load_guard.depth_after() != Some(loaded)
-            || condition.opcode != POP_JUMP_IF_NONE
+            || condition.opcode
+                != if guard_call.is_some() {
+                    POP_JUMP_IF_FALSE
+                } else {
+                    POP_JUMP_IF_NONE
+                }
             || condition.operand() != Operand::Forward(*join)
-            || condition.local_policy.hidden_exception_owner_slots() != 3
+            || condition.local_policy.hidden_exception_owner_slots()
+                != if guard_call.is_some() { 0 } else { 3 }
             || not_taken.opcode != NOT_TAKEN
             || not_taken.value_argument() != Some(0)
             || not_taken.depth_after() != Some(depth)
             || not_taken.pre_fold_extra_instructions() != 0
-            || not_taken.exception_policy() != ExceptionPolicy::NonePresent
+            || not_taken.exception_policy()
+                != if guard_call.is_some() {
+                    ExceptionPolicy::NoneDynamicCondition
+                } else {
+                    ExceptionPolicy::NonePresent
+                }
             || load_guard.location.line < 0
             || load_guard.location.line != condition.location.line
             || not_taken.location != condition.location
