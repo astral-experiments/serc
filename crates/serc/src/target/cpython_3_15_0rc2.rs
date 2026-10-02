@@ -18,7 +18,7 @@
 // Python/Python-ast.c: sha256:d144cb054c1bbd3237ec5be66af90d7c3b8248e77ec8d1568a0f49b14483349d
 // Python/assemble.c: sha256:831156f971b07c1ceae22c97a90e9e56363b4a2856896f5383690a30509b94c8
 // Include/internal/pycore_runtime_structs.h: sha256:3d109737636b7a14a6bf786901c55d402715e671adf8f10af3b0dac8b88b7286
-// scripts/target_metadata/cpython_3_15_0rc2_startup.json: sha256:bec0bd2dedbe3b38ca68e446c67abf0f8d0f4793b551d9c7036acb0517765d63
+// scripts/target_metadata/cpython_3_15_0rc2_startup.json: sha256:57c1d606a70991d3034184aae59352d3f3810194785b76a7e16b9adb9d066d63
 
 use super::{Opcode, opcodes};
 
@@ -1154,7 +1154,7 @@ pub(crate) static COMPILER_INTERNED_STRINGS: &[&str] = &[
     "vararg",
 ];
 
-// Captured before the isolated compile() oracle parses any source.
+// Captured before the isolated minimal C reference parses any source.
 // Installation paths are supplied only through an explicit InitialInternState.
 pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
     ".0",
@@ -1200,13 +1200,9 @@ pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
     "<frozen getpath>",
     "<frozen importlib._bootstrap>",
     "<frozen importlib._bootstrap_external>",
-    "<frozen linecache>",
     "<frozen zipimport>",
     "ABI_THREAD",
     "AT_NO_AUTOMOUNT",
-    "AT_STATX_DONT_SYNC",
-    "AT_STATX_FORCE_SYNC",
-    "AT_STATX_SYNC_AS_STAT",
     "AppleFrameworkLoader",
     "AppleFrameworkLoader.create_module",
     "ArithmeticError",
@@ -1276,7 +1272,6 @@ pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
     "CLOCK_MONOTONIC_RAW",
     "CLOCK_PROCESS_CPUTIME_ID",
     "CLOCK_REALTIME",
-    "CLOCK_TAI",
     "CLOCK_THREAD_CPUTIME_ID",
     "CLONE_FILES",
     "CLONE_FS",
@@ -1442,9 +1437,6 @@ pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
     "HKEY_LOCAL_MACHINE",
     "INSTRUCTION",
     "IOError",
-    "ITIMER_PROF",
-    "ITIMER_REAL",
-    "ITIMER_VIRTUAL",
     "ImportCycleError",
     "ImportError",
     "ImportWarning",
@@ -1465,7 +1457,6 @@ pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
     "IndexError",
     "InterruptedError",
     "IsADirectoryError",
-    "ItimerError",
     "JUMP",
     "KeyError",
     "KeyboardInterrupt",
@@ -1508,7 +1499,6 @@ pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
     "NGROUPS_MAX",
     "NODEV",
     "NO_EVENTS",
-    "NSIG",
     "NameError",
     "NamespaceLoader",
     "NamespaceLoader.__init__",
@@ -1585,7 +1575,6 @@ pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
     "PC_SYMLINK_MAX",
     "PC_SYNC_IO",
     "PC_VDISABLE",
-    "PIDFD_NONBLOCK",
     "PLATLIBDIR",
     "PLATSTDLIB_LANDMARK",
     "POSIX_FADV_DONTNEED",
@@ -1595,7 +1584,6 @@ pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
     "POSIX_FADV_SEQUENTIAL",
     "POSIX_FADV_WILLNEED",
     "POSIX_SPAWN_CLOSE",
-    "POSIX_SPAWN_CLOSEFROM",
     "POSIX_SPAWN_DUP2",
     "POSIX_SPAWN_OPEN",
     "PREFIX",
@@ -1643,11 +1631,6 @@ pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
     "RTLD_NODELETE",
     "RTLD_NOLOAD",
     "RTLD_NOW",
-    "RWF_APPEND",
-    "RWF_DSYNC",
-    "RWF_HIPRI",
-    "RWF_NOWAIT",
-    "RWF_SYNC",
     "R_OK",
     "Reader",
     "RecursionError",
@@ -1711,7 +1694,6 @@ pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
     "SC_MEMLOCK_RANGE",
     "SC_MEMORY_PROTECTION",
     "SC_MESSAGE_PASSING",
-    "SC_MINSIGSTKSZ",
     "SC_MQ_OPEN_MAX",
     "SC_MQ_PRIO_MAX",
     "SC_NGROUPS_MAX",
@@ -1802,67 +1784,10 @@ pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
     "SEEK_DATA",
     "SEEK_HOLE",
     "SEP",
-    "SIGABRT",
-    "SIGALRM",
-    "SIGBUS",
-    "SIGCHLD",
-    "SIGCLD",
-    "SIGCONT",
-    "SIGFPE",
-    "SIGHUP",
-    "SIGILL",
-    "SIGINT",
-    "SIGIO",
-    "SIGIOT",
-    "SIGKILL",
-    "SIGPIPE",
-    "SIGPOLL",
-    "SIGPROF",
-    "SIGPWR",
-    "SIGQUIT",
-    "SIGRTMAX",
-    "SIGRTMIN",
-    "SIGSEGV",
-    "SIGSTKFLT",
-    "SIGSTOP",
-    "SIGSYS",
-    "SIGTERM",
-    "SIGTRAP",
-    "SIGTSTP",
-    "SIGTTIN",
-    "SIGTTOU",
-    "SIGURG",
-    "SIGUSR1",
-    "SIGUSR2",
-    "SIGVTALRM",
-    "SIGWINCH",
-    "SIGXCPU",
-    "SIGXFSZ",
-    "SIG_BLOCK",
-    "SIG_DFL",
-    "SIG_IGN",
-    "SIG_SETMASK",
-    "SIG_UNBLOCK",
     "SOURCE_SUFFIXES",
     "SPLICE_F_MORE",
     "SPLICE_F_MOVE",
     "SPLICE_F_NONBLOCK",
-    "STATX_ATIME",
-    "STATX_BASIC_STATS",
-    "STATX_BLOCKS",
-    "STATX_BTIME",
-    "STATX_CTIME",
-    "STATX_DIOALIGN",
-    "STATX_GID",
-    "STATX_INO",
-    "STATX_MNT_ID",
-    "STATX_MNT_ID_UNIQUE",
-    "STATX_MODE",
-    "STATX_MTIME",
-    "STATX_NLINK",
-    "STATX_SIZE",
-    "STATX_TYPE",
-    "STATX_UID",
     "STDLIB_LANDMARKS",
     "STDLIB_SUBDIR",
     "STOP_ITERATION",
@@ -1959,7 +1884,6 @@ pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
     "TFD_CLOEXEC",
     "TFD_NONBLOCK",
     "TFD_TIMER_ABSTIME",
-    "TFD_TIMER_CANCEL_ON_SET",
     "TIMEOUT_MAX",
     "TMP_MAX",
     "TabError",
@@ -2216,8 +2140,6 @@ pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
     "_get_zstd_decompressor_class",
     "_getframe",
     "_getframemodulename",
-    "_getline_from_code",
-    "_getlines_from_code",
     "_git",
     "_has_deadlocked",
     "_have_functions",
@@ -2232,7 +2154,6 @@ pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
     "_install",
     "_install_external_importers",
     "_install_importlib",
-    "_interactive_cache",
     "_is_dir",
     "_is_gil_enabled",
     "_is_immortal",
@@ -2251,9 +2172,6 @@ pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
     "_local",
     "_lock",
     "_locks",
-    "_make_key",
-    "_make_lazycache_entry",
-    "_make_lazycache_entry.<locals>.get_lines",
     "_make_relax_case",
     "_make_relax_case.<locals>._relax_case",
     "_make_thread_handle",
@@ -2300,7 +2218,6 @@ pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
     "_read_directory",
     "_recalculate",
     "_recursion_count",
-    "_register_code",
     "_relax_case",
     "_relaxed_path_cache",
     "_release_lock",
@@ -2323,7 +2240,6 @@ pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
     "_setprofileallthreads",
     "_settraceallthreads",
     "_setup",
-    "_source_unavailable",
     "_spec_from_module",
     "_stdlib_dir",
     "_thread",
@@ -2368,7 +2284,6 @@ pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
     "ag_state",
     "ag_suspended",
     "aiter",
-    "alarm",
     "algorithm",
     "aliased_encoding",
     "aliases",
@@ -2467,7 +2382,6 @@ pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
     "check_hash_based_pycs",
     "check_hash_pycs_mode",
     "check_source",
-    "checkcache",
     "checked",
     "child",
     "child_name",
@@ -2481,18 +2395,17 @@ pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
     "chroot",
     "classmethod",
     "clear_tool_id",
-    "clearcache",
     "clock_getres",
     "clock_gettime",
     "clock_gettime_ns",
     "clock_settime",
     "clock_settime_ns",
     "closerange",
+    "cls",
     "co_branches",
     "co_lines",
     "co_positions",
     "code_debug_ranges",
-    "code_id",
     "code_object",
     "code_page_encode",
     "codecaliases",
@@ -2507,7 +2420,6 @@ pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
     "confstr",
     "confstr_names",
     "conjugate",
-    "const",
     "consumed",
     "contents",
     "context_aware_warnings",
@@ -2677,7 +2589,6 @@ pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
     "decoding_map",
     "decomp",
     "decompress",
-    "default_int_handler",
     "default_max_str_digits",
     "delattr",
     "deleter",
@@ -2809,7 +2720,6 @@ pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
     "file_size",
     "filename2",
     "filename_base",
-    "filenames",
     "files",
     "filesystem_encoding",
     "filesystem_errors",
@@ -2873,12 +2783,14 @@ pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
     "get_inheritable",
     "get_instructions",
     "get_int_max_str_digits",
+    "get_jit_code",
     "get_lazy_imports",
     "get_lazy_imports_filter",
-    "get_lines",
     "get_local_events",
     "get_native_id",
     "get_nested",
+    "get_oparg",
+    "get_opcode",
     "get_resource_reader",
     "get_terminal_size",
     "get_tool",
@@ -2900,9 +2812,6 @@ pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
     "getgroups",
     "getincrementaldecoder",
     "getincrementalencoder",
-    "getitimer",
-    "getline",
-    "getlines",
     "getloadavg",
     "getlogin",
     "getpgid",
@@ -2919,7 +2828,6 @@ pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
     "getresgid",
     "getresuid",
     "getsid",
-    "getsignal",
     "getsizeof",
     "getswitchinterval",
     "getter",
@@ -3049,6 +2957,7 @@ pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
     "is_remote_debug_enabled",
     "is_stack_trampoline_active",
     "is_symlink",
+    "is_valid",
     "isabs",
     "isalnum",
     "isalpha",
@@ -3215,11 +3124,9 @@ pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
     "latin_7",
     "latin_8",
     "latin_9",
-    "lazy_entry",
     "lazy_imports",
     "lazy_modules",
     "lazy_submodule",
-    "lazycache",
     "lchown",
     "library",
     "library_dir",
@@ -3250,6 +3157,7 @@ pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
     "login_tty",
     "lookup",
     "lookup_error",
+    "lower",
     "lower_suffix_contents",
     "lseek",
     "lstat",
@@ -3362,7 +3270,6 @@ pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
     "ord",
     "orig_argv",
     "origname",
-    "os",
     "os_name",
     "output",
     "override",
@@ -3393,13 +3300,11 @@ pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
     "pathconf_names",
     "pathconfig_warnings",
     "pathname",
-    "pause",
     "pc_multilingual_850_euro",
     "perf_counter",
     "perf_counter_ns",
     "perf_profiling",
     "pidfd_open",
-    "pidfd_send_signal",
     "pipe",
     "pipe2",
     "pkgdir",
@@ -3430,8 +3335,6 @@ pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
     "pth",
     "pth_dir",
     "pthread_getcpuclockid",
-    "pthread_kill",
-    "pthread_sigmask",
     "ptsname",
     "putenv",
     "pwrite",
@@ -3455,7 +3358,6 @@ pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
     "quotedprintable",
     "r8",
     "radix",
-    "raise_signal",
     "range",
     "raw_data",
     "raw_unicode_escape_decode",
@@ -3491,6 +3393,7 @@ pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
     "resize",
     "resolution",
     "resolve",
+    "rest",
     "restart_events",
     "result",
     "results",
@@ -3554,7 +3457,6 @@ pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
     "set_lazy_imports_filter",
     "set_local_events",
     "set_name",
-    "set_wakeup_fd",
     "setattr",
     "setdefault",
     "setdlopenflags",
@@ -3562,7 +3464,6 @@ pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
     "seteuid",
     "setgid",
     "setgroups",
-    "setitimer",
     "setns",
     "setpgid",
     "setpgrp",
@@ -3585,25 +3486,18 @@ pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
     "shiftjis2004",
     "shiftjisx0213",
     "show_ref_count",
-    "si_band",
     "si_code",
-    "si_errno",
     "si_pid",
     "si_signo",
     "si_status",
     "si_uid",
-    "siginterrupt",
-    "signal",
-    "sigpending",
-    "sigtimedwait",
-    "sigwait",
-    "sigwaitinfo",
     "site_import",
     "sizeof_digit",
     "sjis",
     "sjis_2004",
     "sjisx0213",
     "skip_source_first_line",
+    "slice",
     "smsl",
     "sorted",
     "source_bytes",
@@ -3640,7 +3534,6 @@ pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
     "st_rdev",
     "st_size",
     "st_uid",
-    "stack",
     "stack_size",
     "start_joinable_thread",
     "start_new",
@@ -3654,8 +3547,6 @@ pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
     "staticmethod",
     "statvfs",
     "statvfs_result",
-    "statx",
-    "statx_result",
     "stdio_encoding",
     "stdio_errors",
     "stdlib_dir",
@@ -3663,6 +3554,7 @@ pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
     "stdlib_module_names",
     "stdlib_zip",
     "stop",
+    "str",
     "str_digits_check_threshold",
     "stream",
     "streamreader",
@@ -3675,39 +3567,9 @@ pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
     "stripped_path",
     "strk1048_2002",
     "strptime",
-    "strsignal",
     "struct",
     "struct_rusage",
-    "struct_siginfo",
     "struct_time",
-    "stx_atime",
-    "stx_atime_ns",
-    "stx_attributes",
-    "stx_attributes_mask",
-    "stx_blksize",
-    "stx_blocks",
-    "stx_btime",
-    "stx_btime_ns",
-    "stx_ctime",
-    "stx_ctime_ns",
-    "stx_dev",
-    "stx_dev_major",
-    "stx_dev_minor",
-    "stx_dio_mem_align",
-    "stx_dio_offset_align",
-    "stx_gid",
-    "stx_ino",
-    "stx_mask",
-    "stx_mnt_id",
-    "stx_mode",
-    "stx_mtime",
-    "stx_mtime_ns",
-    "stx_nlink",
-    "stx_rdev",
-    "stx_rdev_major",
-    "stx_rdev_minor",
-    "stx_size",
-    "stx_uid",
     "subgroup",
     "submodule_search_locations",
     "suboffsets",
@@ -3742,6 +3604,7 @@ pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
     "tcgetpgrp",
     "tcsetpgrp",
     "terminal_size",
+    "test",
     "text_encoding",
     "thai",
     "thread",
@@ -3816,7 +3679,7 @@ pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
     "unshare",
     "unused_data",
     "update",
-    "updatecache",
+    "upper",
     "urandom",
     "us",
     "us_ascii",
@@ -3875,7 +3738,6 @@ pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
     "utime",
     "uu",
     "uu_codec",
-    "valid_signals",
     "var",
     "varnames",
     "vars",
@@ -3995,7 +3857,7 @@ fn is_preinterned_static_string(value: &str) -> bool {
         0x5f57 => (43, 44),
         0x5f5f => (44, 212),
         0x5f61 => {
-            if value == "_attributes" {
+            if cfg!(not(target_os = "linux")) && value == "_attributes" {
                 return true;
             }
             (212, 219)
@@ -4004,7 +3866,7 @@ fn is_preinterned_static_string(value: &str) -> bool {
         0x5f63 => (221, 222),
         0x5f64 => (222, 223),
         0x5f66 => {
-            if value == "_fields" {
+            if cfg!(not(target_os = "linux")) && value == "_fields" {
                 return true;
             }
             (223, 232)
@@ -4027,33 +3889,33 @@ fn is_preinterned_static_string(value: &str) -> bool {
         0x6166 => (263, 265),
         0x616c => (265, 272),
         0x616e => {
-            if value == "annotation" {
+            if cfg!(not(target_os = "linux")) && value == "annotation" {
                 return true;
             }
             (272, 273)
         }
         0x6170 => (273, 274),
         0x6172 => {
-            if value == "argtypes" {
+            if cfg!(not(target_os = "linux")) && value == "argtypes" {
                 return true;
             }
             (274, 279)
         }
         0x6173 => {
-            if value == "asname" {
+            if cfg!(not(target_os = "linux")) && value == "asname" {
                 return true;
             }
             (279, 282)
         }
         0x6174 => {
-            if value == "attr" {
+            if cfg!(not(target_os = "linux")) && value == "attr" {
                 return true;
             }
             (282, 284)
         }
         0x6175 => (284, 285),
         0x6261 => {
-            if value == "bases" {
+            if cfg!(not(target_os = "linux")) && value == "bases" {
                 return true;
             }
             (285, 287)
@@ -4062,7 +3924,7 @@ fn is_preinterned_static_string(value: &str) -> bool {
         0x6269 => (288, 292),
         0x626c => (292, 294),
         0x626f => {
-            if value == "body" {
+            if cfg!(not(target_os = "linux")) && value == "body" {
                 return true;
             }
             (294, 295)
@@ -4071,7 +3933,9 @@ fn is_preinterned_static_string(value: &str) -> bool {
         0x6279 => (302, 307),
         0x635f => (307, 312),
         0x6361 => {
-            if value == "cases" || value == "cause" {
+            if cfg!(not(target_os = "linux")) && value == "cases"
+                || cfg!(not(target_os = "linux")) && value == "cause"
+            {
                 return true;
             }
             (312, 327)
@@ -4080,13 +3944,15 @@ fn is_preinterned_static_string(value: &str) -> bool {
         0x6365 => (328, 329),
         0x6368 => (329, 331),
         0x636c => {
-            if value == "cls" {
+            if cfg!(not(target_os = "linux")) && value == "cls" {
                 return true;
             }
             (331, 337)
         }
         0x636f => {
-            if value == "comparators" || value == "context_expr" {
+            if cfg!(not(target_os = "linux")) && value == "comparators"
+                || cfg!(not(target_os = "linux")) && value == "context_expr"
+            {
                 return true;
             }
             (337, 373)
@@ -4096,7 +3962,10 @@ fn is_preinterned_static_string(value: &str) -> bool {
         0x645f => (375, 376),
         0x6461 => (376, 381),
         0x6465 => {
-            if value == "decorator_list" || value == "default_value" || value == "defaults" {
+            if cfg!(not(target_os = "linux")) && value == "decorator_list"
+                || cfg!(not(target_os = "linux")) && value == "default_value"
+                || cfg!(not(target_os = "linux")) && value == "defaults"
+            {
                 return true;
             }
             (381, 392)
@@ -4109,7 +3978,9 @@ fn is_preinterned_static_string(value: &str) -> bool {
         0x6561 => (408, 409),
         0x6566 => (409, 410),
         0x656c => {
-            if value == "elt" || value == "elts" {
+            if cfg!(not(target_os = "linux")) && value == "elt"
+                || cfg!(not(target_os = "linux")) && value == "elts"
+            {
                 return true;
             }
             (410, 411)
@@ -4123,7 +3994,7 @@ fn is_preinterned_static_string(value: &str) -> bool {
         0x6664 => (444, 447),
         0x6667 => (447, 448),
         0x6669 => {
-            if value == "finalbody" {
+            if cfg!(not(target_os = "linux")) && value == "finalbody" {
                 return true;
             }
             (448, 460)
@@ -4135,7 +4006,7 @@ fn is_preinterned_static_string(value: &str) -> bool {
         0x6675 => (474, 477),
         0x6763 => (477, 478),
         0x6765 => {
-            if value == "generators" {
+            if cfg!(not(target_os = "linux")) && value == "generators" {
                 return true;
             }
             (478, 486)
@@ -4143,9 +4014,9 @@ fn is_preinterned_static_string(value: &str) -> bool {
         0x6769 => (486, 487),
         0x676c => (487, 488),
         0x6772 => (488, 490),
-        0x6775 => return value == "guard",
+        0x6775 => return cfg!(not(target_os = "linux")) && value == "guard",
         0x6861 => {
-            if value == "handlers" {
+            if cfg!(not(target_os = "linux")) && value == "handlers" {
                 return true;
             }
             (490, 494)
@@ -4154,13 +4025,15 @@ fn is_preinterned_static_string(value: &str) -> bool {
         0x6869 => (496, 497),
         0x686f => (497, 500),
         0x6964 => (500, 503),
-        0x6966 => return value == "ifs",
+        0x6966 => return cfg!(not(target_os = "linux")) && value == "ifs",
         0x6967 => (503, 505),
         0x696d => (505, 508),
         0x696e => (508, 531),
         0x696f => (531, 532),
         0x6973 => {
-            if value == "is_async" || value == "is_lazy" {
+            if cfg!(not(target_os = "linux")) && value == "is_async"
+                || cfg!(not(target_os = "linux")) && value == "is_lazy"
+            {
                 return true;
             }
             (532, 541)
@@ -4170,18 +4043,18 @@ fn is_preinterned_static_string(value: &str) -> bool {
         0x6a73 => (547, 548),
         0x6a75 => (548, 549),
         0x6b65 => {
-            if value == "keywords" {
+            if cfg!(not(target_os = "linux")) && value == "keywords" {
                 return true;
             }
             (549, 553)
         }
         0x6b69 => (553, 554),
         0x6b77 => {
-            if value == "kw_defaults"
-                || value == "kwarg"
-                || value == "kwd_attrs"
-                || value == "kwd_patterns"
-                || value == "kwonlyargs"
+            if cfg!(not(target_os = "linux")) && value == "kw_defaults"
+                || cfg!(not(target_os = "linux")) && value == "kwarg"
+                || cfg!(not(target_os = "linux")) && value == "kwd_attrs"
+                || cfg!(not(target_os = "linux")) && value == "kwd_patterns"
+                || cfg!(not(target_os = "linux")) && value == "kwonlyargs"
             {
                 return true;
             }
@@ -4189,14 +4062,14 @@ fn is_preinterned_static_string(value: &str) -> bool {
         }
         0x6c61 => (559, 567),
         0x6c65 => {
-            if value == "left" {
+            if cfg!(not(target_os = "linux")) && value == "left" {
                 return true;
             }
             (567, 572)
         }
         0x6c69 => (572, 578),
         0x6c6f => {
-            if value == "lower" {
+            if cfg!(not(target_os = "linux")) && value == "lower" {
                 return true;
             }
             (578, 583)
@@ -4211,7 +4084,7 @@ fn is_preinterned_static_string(value: &str) -> bool {
         0x6d79 => (618, 619),
         0x6e5f => (619, 622),
         0x6e61 => {
-            if value == "names" {
+            if cfg!(not(target_os = "linux")) && value == "names" {
                 return true;
             }
             (622, 627)
@@ -4227,13 +4100,17 @@ fn is_preinterned_static_string(value: &str) -> bool {
         0x6f66 => (644, 647),
         0x6f6e => (647, 651),
         0x6f70 => {
-            if value == "op" || value == "operand" || value == "ops" || value == "optional_vars" {
+            if cfg!(not(target_os = "linux")) && value == "op"
+                || cfg!(not(target_os = "linux")) && value == "operand"
+                || cfg!(not(target_os = "linux")) && value == "ops"
+                || cfg!(not(target_os = "linux")) && value == "optional_vars"
+            {
                 return true;
             }
             (651, 659)
         }
         0x6f72 => {
-            if value == "orelse" {
+            if cfg!(not(target_os = "linux")) && value == "orelse" {
                 return true;
             }
             (659, 661)
@@ -4243,7 +4120,7 @@ fn is_preinterned_static_string(value: &str) -> bool {
         0x6f76 => (665, 666),
         0x6f77 => (666, 667),
         0x7061 => {
-            if value == "patterns" {
+            if cfg!(not(target_os = "linux")) && value == "patterns" {
                 return true;
             }
             (667, 675)
@@ -4251,7 +4128,7 @@ fn is_preinterned_static_string(value: &str) -> bool {
         0x7065 => (675, 679),
         0x7069 => (679, 681),
         0x706f => {
-            if value == "posonlyargs" {
+            if cfg!(not(target_os = "linux")) && value == "posonlyargs" {
                 return true;
             }
             (681, 687)
@@ -4262,26 +4139,28 @@ fn is_preinterned_static_string(value: &str) -> bool {
         0x7175 => (699, 703),
         0x7261 => (703, 704),
         0x7265 => {
-            if value == "rest" || value == "returns" {
+            if cfg!(not(target_os = "linux")) && value == "rest"
+                || cfg!(not(target_os = "linux")) && value == "returns"
+            {
                 return true;
             }
             (704, 732)
         }
-        0x7269 => return value == "right",
+        0x7269 => return cfg!(not(target_os = "linux")) && value == "right",
         0x726f => (732, 733),
         0x7361 => (733, 736),
         0x7363 => (736, 739),
         0x7365 => (739, 757),
         0x7368 => (757, 761),
         0x7369 => {
-            if value == "simple" {
+            if cfg!(not(target_os = "linux")) && value == "simple" {
                 return true;
             }
             (761, 765)
         }
         0x736b => (765, 767),
         0x736c => {
-            if value == "slice" {
+            if cfg!(not(target_os = "linux")) && value == "slice" {
                 return true;
             }
             (767, 768)
@@ -4290,27 +4169,27 @@ fn is_preinterned_static_string(value: &str) -> bool {
         0x7370 => (772, 773),
         0x7372 => (773, 775),
         0x7374 => {
-            if value == "str" {
+            if cfg!(not(target_os = "linux")) && value == "str" {
                 return true;
             }
             (775, 793)
         }
         0x7375 => {
-            if value == "subject" {
+            if cfg!(not(target_os = "linux")) && value == "subject" {
                 return true;
             }
             (793, 795)
         }
         0x7379 => (795, 796),
         0x7461 => {
-            if value == "targets" {
+            if cfg!(not(target_os = "linux")) && value == "targets" {
                 return true;
             }
             (796, 802)
         }
         0x7462 => (802, 806),
         0x7465 => {
-            if value == "test" {
+            if cfg!(not(target_os = "linux")) && value == "test" {
                 return true;
             }
             (806, 810)
@@ -4322,7 +4201,9 @@ fn is_preinterned_static_string(value: &str) -> bool {
         0x7477 => (829, 830),
         0x7478 => (830, 831),
         0x7479 => {
-            if value == "type_comment" || value == "type_ignores" {
+            if cfg!(not(target_os = "linux")) && value == "type_comment"
+                || cfg!(not(target_os = "linux")) && value == "type_ignores"
+            {
                 return true;
             }
             (831, 833)
@@ -4331,7 +4212,7 @@ fn is_preinterned_static_string(value: &str) -> bool {
         0x7569 => (836, 837),
         0x756e => (837, 840),
         0x7570 => {
-            if value == "upper" {
+            if cfg!(not(target_os = "linux")) && value == "upper" {
                 return true;
             }
             (840, 841)
@@ -4340,7 +4221,7 @@ fn is_preinterned_static_string(value: &str) -> bool {
         0x7573 => (842, 843),
         0x7574 => (843, 844),
         0x7661 => {
-            if value == "vararg" {
+            if cfg!(not(target_os = "linux")) && value == "vararg" {
                 return true;
             }
             (844, 846)

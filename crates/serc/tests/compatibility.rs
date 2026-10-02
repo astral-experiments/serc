@@ -1,5 +1,7 @@
 mod common;
 mod compatibility_cases;
+#[path = "common/startup_reference.rs"]
+mod startup_reference;
 
 #[cfg(test)]
 mod tests {

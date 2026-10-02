@@ -850,6 +850,40 @@ mod tests {
         for (name, source) in [
             ("module_only.py", b"pass\n".as_slice()),
             ("sharing.py", sharing.as_bytes()),
+            (
+                "minimal_ast_startup.py",
+                concat!(
+                    "def first(value):\n    return value in {'left', 'marker_732'}, 1\n",
+                    "def second(value):\n    return value in {'left', 'marker_732'}, 2\n",
+                )
+                .as_bytes(),
+            ),
+            (
+                "minimal_signal_startup.py",
+                concat!(
+                    "def first(value):\n    return value in {'pause', 'marker_732'}, 1\n",
+                    "def second(value):\n    return value in {'pause', 'marker_732'}, 2\n",
+                )
+                .as_bytes(),
+            ),
+            (
+                "minimal_ast_identifier.py",
+                concat!(
+                    "def metadata(value):\n    return value.left\n",
+                    "def first(value):\n    return value in {'left', 'marker_732'}, 1\n",
+                    "def second(value):\n    return value in {'left', 'marker_732'}, 2\n",
+                )
+                .as_bytes(),
+            ),
+            (
+                "minimal_signal_literal.py",
+                concat!(
+                    "def prior():\n    return 'pause'\n",
+                    "def first(value):\n    return value in {'pause', 'marker_732'}, 1\n",
+                    "def second(value):\n    return value in {'pause', 'marker_732'}, 2\n",
+                )
+                .as_bytes(),
+            ),
             ("optimized.py", optimized.as_bytes()),
             ("latin1.py", b"# coding: latin-1\nvalue = 'caf\xe9'\n"),
         ] {
