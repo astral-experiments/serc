@@ -2531,10 +2531,13 @@ impl OptimizationPipeline {
                     Some(0),
                 );
                 original_exit.jump_policy.mark_borrow_empty_block();
+                let empty_exit = original_exit;
                 original_exit
                     .no_location_policy
                     .set_borrow_fallthrough(BorrowFallthrough::Barrier);
-                if *exit != original_exit
+                // The empty original array itself stops traversal. A terminal
+                // handler can add a redundant source barrier, but is not required.
+                if (*exit != original_exit && *exit != empty_exit)
                     || *label_offsets.get(target)? <= entry_index
                     || labels.len() < 2
                     || !labels.iter().all(|item| matches!(item, Item::Label(label)
