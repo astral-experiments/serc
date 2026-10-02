@@ -757,6 +757,45 @@ impl OptimizationPipeline {
         // Exit duplication changes this surviving conditional's target, not its
         // original array or the normal-finally comparison cells recorded within it.
         for (before, after) in &copied_exit_owner_retargets {
+            let primitive_origins = &mut self
+                .exception_owner_provenance
+                .original_primitive_condition_boundaries;
+            if primitive_origins
+                .iter()
+                .filter(|origin| **origin == *before)
+                .count()
+                == 1
+                && self
+                    .graph
+                    .iter_items()
+                    .filter(|item| matches!(item, Item::Instruction(record) if record == after))
+                    .count()
+                    == 1
+            {
+                for origin in primitive_origins {
+                    if *origin == *before {
+                        *origin = *after;
+                    }
+                }
+                // The named-break proof authenticates this same primitive origin
+                // independently of its cleanup array. Keep both witnesses in sync.
+                for origin in &mut self
+                    .exception_owner_provenance
+                    .copied_named_break_truth_prefixes
+                {
+                    if origin.original_condition == *before {
+                        origin.original_condition = *after;
+                    }
+                }
+            }
+            for prefix in &mut self
+                .exception_owner_provenance
+                .normal_finally_truth_prefixes
+            {
+                if prefix[3] == *before {
+                    prefix[3] = *after;
+                }
+            }
             for prefix in self
                 .exception_owner_provenance
                 .copied_shared_break_truth_prefixes
@@ -773,7 +812,7 @@ impl OptimizationPipeline {
                         && condition == before
                     {
                         // Preserve the actual copy pass's complete before/after record;
-                        // the original named-handler condition remains a separate witness.
+                        // the primitive witness is transported separately above.
                         *condition = *after;
                     }
                 }
