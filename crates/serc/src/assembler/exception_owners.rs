@@ -2342,8 +2342,8 @@ impl ExceptionOwnerProvenance {
             CALL_KW, CONTAINS_OP, DICT_UPDATE, FORMAT_SIMPLE, GET_ITER, IMPORT_FROM, IMPORT_NAME,
             LIST_APPEND, LIST_EXTEND, LOAD_ATTR, LOAD_CONST, LOAD_DEREF, LOAD_FAST, LOAD_GLOBAL,
             LOAD_NAME, LOAD_SMALL_INT, MAKE_FUNCTION, POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE,
-            PUSH_NULL, RESUME, SET_FUNCTION_ATTRIBUTE, STORE_DEREF, STORE_FAST, STORE_NAME,
-            TO_BOOL, UNPACK_SEQUENCE, YIELD_VALUE,
+            PUSH_NULL, RESUME, SET_FUNCTION_ATTRIBUTE, STORE_ATTR, STORE_DEREF, STORE_FAST,
+            STORE_NAME, TO_BOOL, UNPACK_SEQUENCE, YIELD_VALUE,
         };
         use crate::target::operands::UnaryIntrinsic;
 
@@ -2506,28 +2506,63 @@ impl ExceptionOwnerProvenance {
         {
             return false;
         }
-        // A one-cell closure tuple is built from LOAD_CLOSURE, not constants.
-        // Its complete function-construction sequence cannot fold or unpack;
-        // retain all six original records and their exact source identity.
+        // Closure tuples are built from LOAD_CLOSURE, not constants. Capture the
+        // complete construction, including its optional deferred annotation function.
         let closure_members = instructions
-            .windows(6)
+            .iter()
             .enumerate()
-            .filter_map(|(start, parts)| {
-                let [cell, tuple, code, function, closure, store] = parts else {
-                    unreachable!()
+            .filter_map(|(tuple_index, tuple)| {
+                if tuple.opcode != BUILD_TUPLE {
+                    return None;
+                }
+                let Some(count @ 1..) = tuple.value_argument() else {
+                    return None;
                 };
-                (cell.opcode == LOAD_FAST
-                    && cell.local_policy.is_post_analysis_closure_load()
-                    && tuple.opcode == BUILD_TUPLE
-                    && tuple.value_argument() == Some(1)
-                    && code.opcode == LOAD_CONST
-                    && function.opcode == MAKE_FUNCTION
-                    && function.value_argument() == Some(0)
-                    && closure.opcode == SET_FUNCTION_ATTRIBUTE
-                    && closure.value_argument() == Some(8)
-                    && store.opcode == STORE_FAST
-                    && parts.iter().all(|part| part.location == cell.location))
-                .then_some(start + 1..start + 5)
+                let mut start = tuple_index.checked_sub(usize::try_from(count).ok()?)?;
+                let cells = &instructions[start..tuple_index];
+                if cells.iter().any(|cell| {
+                    cell.opcode != LOAD_FAST || !cell.local_policy.is_post_analysis_closure_load()
+                }) {
+                    return None;
+                }
+                let [code, function, closure] =
+                    instructions.get(tuple_index + 1..tuple_index + 4)?
+                else {
+                    unreachable!();
+                };
+                if code.opcode != LOAD_CONST
+                    || function.opcode != MAKE_FUNCTION
+                    || function.value_argument() != Some(0)
+                    || closure.opcode != SET_FUNCTION_ATTRIBUTE
+                    || closure.value_argument() != Some(8)
+                {
+                    return None;
+                }
+                let mut store_index = tuple_index + 4;
+                if instructions.get(store_index).is_some_and(|attribute| {
+                    attribute.opcode == SET_FUNCTION_ATTRIBUTE
+                        && attribute.value_argument() == Some(16)
+                }) {
+                    let annotation_start = start.checked_sub(2)?;
+                    let [annotations, annotation_function] = &instructions[annotation_start..start]
+                    else {
+                        unreachable!();
+                    };
+                    if annotations.opcode != LOAD_CONST
+                        || annotation_function.opcode != MAKE_FUNCTION
+                        || annotation_function.value_argument() != Some(0)
+                    {
+                        return None;
+                    }
+                    start = annotation_start;
+                    store_index += 1;
+                }
+                let store = instructions.get(store_index)?;
+                (store.opcode == STORE_FAST
+                    && instructions[start..=store_index]
+                        .iter()
+                        .all(|part| part.location == tuple.location))
+                .then_some(start..store_index + 1)
             })
             .flatten()
             .collect::<FxHashSet<_>>();
@@ -2602,6 +2637,26 @@ impl ExceptionOwnerProvenance {
                         .and_then(|depth| depth.checked_sub(1))
                         .is_some_and(|depth| discard.depth_after() == Some(depth)))
                 .then_some(start..start + 4)
+            })
+            .flatten()
+            .collect::<FxHashSet<_>>();
+        // A discarded constant yield retains all four original records. Its resume
+        // has no SEND loop or branch that could split the containing instruction array.
+        let constant_yield_members = instructions
+            .windows(4)
+            .enumerate()
+            .filter_map(|(start, parts)| {
+                let [value, yielded, resume, discard] = parts else {
+                    unreachable!()
+                };
+                (value.opcode == LOAD_CONST
+                    && yielded.opcode == YIELD_VALUE
+                    && yielded.value_argument() == Some(0)
+                    && resume.opcode == RESUME
+                    && resume.value_argument() == Some(1)
+                    && discard.opcode == POP_TOP
+                    && parts.iter().all(|part| part.location == value.location))
+                .then_some(start + 1..start + 4)
             })
             .flatten()
             .collect::<FxHashSet<_>>();
@@ -2723,7 +2778,8 @@ impl ExceptionOwnerProvenance {
                 LOAD_FAST => {
                     // CP's superinstruction operands each occupy four bits.
                     // Larger local indices retain separate original records.
-                    if matches!(instruction.operand(), Operand::Value(0..=15))
+                    if !closure_members.contains(&index)
+                        && matches!(instruction.operand(), Operand::Value(0..=15))
                         && instructions.get(index + 1).is_some_and(|next| {
                             next.opcode == LOAD_FAST
                                 && next.location.line == instruction.location.line
@@ -2764,6 +2820,7 @@ impl ExceptionOwnerProvenance {
                 {
                     expanded_collection = true;
                 }
+                YIELD_VALUE | RESUME | POP_TOP if constant_yield_members.contains(&index) => {}
                 BUILD_LIST => {
                     // Empty local lists retain their existing certificate. Nonempty
                     // lists below CPython's three-item constant-fold threshold also
@@ -3048,7 +3105,8 @@ impl ExceptionOwnerProvenance {
                         return false;
                     }
                 }
-                LOAD_NAME | LOAD_ATTR | LOAD_CONST | STORE_NAME | CALL | IMPORT_NAME => {}
+                LOAD_NAME | LOAD_ATTR | LOAD_CONST | STORE_NAME | STORE_ATTR | CALL
+                | IMPORT_NAME => {}
                 crate::target::opcodes::SWAP if comprehension_restore_count > 0 && index == 0 => {}
                 _ => return false,
             }
