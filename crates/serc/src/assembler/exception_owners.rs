@@ -1189,7 +1189,7 @@ impl OwnerDecisionIndices {
 /// A complete original array through one value Boolean, captured before CFG rewrites.
 #[derive(Debug)]
 pub(super) struct RetainedSetupValueArray {
-    entry: Label,
+    entry: Option<Label>,
     value_entry: Label,
     prefix: Vec<Item>,
     setups: Vec<(Label, Option<SourceLocation>)>,
@@ -1871,17 +1871,16 @@ impl ExceptionOwnerProvenance {
             {
                 continue;
             }
-            let Some(begin) = items[..start].iter().rposition(|item| {
+            let begin = items[..start].iter().rposition(|item| {
                 matches!(item, Item::Label(label)
                     if self.source_boundaries.contains(label)
                         && self.block_boundaries.contains(label))
-            }) else {
-                continue;
-            };
-            let Item::Label(entry) = items[begin] else {
-                unreachable!();
-            };
-            let prefix = &items[begin..start + value_prefix.len()];
+            });
+            let entry = begin.map(|begin| match items[begin] {
+                Item::Label(entry) => entry,
+                Item::Instruction(_) => unreachable!(),
+            });
+            let prefix = &items[begin.unwrap_or(0)..start + value_prefix.len()];
             let setups = self
                 .setups
                 .iter()
@@ -4857,42 +4856,75 @@ impl LayoutAssembler {
             let Some(&marker_index) = value_jump_positions.get(&origin.value_entry) else {
                 continue;
             };
-            if !provenance.source_boundaries.contains(&origin.entry)
-                || !provenance.block_boundaries.contains(&origin.entry)
-                || provenance
-                    .retained_setup_value_arrays
-                    .iter()
-                    .filter(|other| other.value_entry == origin.value_entry)
-                    .count()
-                    != 1
+            if origin.entry.is_some_and(|entry| {
+                !provenance.source_boundaries.contains(&entry)
+                    || !provenance.block_boundaries.contains(&entry)
+            }) || provenance
+                .retained_setup_value_arrays
+                .iter()
+                .filter(|other| other.value_entry == origin.value_entry)
+                .count()
+                != 1
             {
                 continue;
             }
-            let mut starts =
-                self.items.iter().enumerate().filter_map(|(index, item)| {
-                    (*item == Item::Label(origin.entry)).then_some(index)
-                });
-            let Some(begin) = starts.next() else {
-                continue;
+            let begin = if let Some(entry) = origin.entry {
+                let mut starts = self
+                    .items
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, item)| (*item == Item::Label(entry)).then_some(index));
+                let Some(begin) = starts.next() else {
+                    continue;
+                };
+                if starts.next().is_some() {
+                    continue;
+                }
+                begin
+            } else {
+                // Without a source join, the entire original function-entry prefix
+                // must still match. No earlier instruction array can supply its cells.
+                let begin = self
+                    .items
+                    .iter()
+                    .position(|item| matches!(item, Item::Instruction(_)))
+                    .unwrap_or(0);
+                if !matches!(origin.prefix.first(), Some(Item::Instruction(_)))
+                    || self.items[..begin].iter().any(|item| {
+                        let Item::Label(label) = item else {
+                            unreachable!();
+                        };
+                        jump_targets.contains(label)
+                            || provenance.source_boundaries.contains(label)
+                            || provenance.block_boundaries.contains(label)
+                            || provenance.is_normal_try_copy_label(*label)
+                            || self
+                                .exception_regions
+                                .iter()
+                                .any(|region| region.target == *label)
+                    })
+                {
+                    continue;
+                }
+                begin
             };
             let Some(current) = self.items.get(begin..begin + origin.prefix.len()) else {
                 continue;
             };
-            if starts.next().is_some()
-                || current
-                    .iter()
-                    .zip(&origin.prefix)
-                    .any(|(actual, expected)| {
-                        let mut expected = *expected;
-                        if let (Item::Instruction(actual), Item::Instruction(expected)) =
-                            (actual, &mut expected)
-                            && expected.opcode == crate::target::opcodes::LOAD_FAST
-                            && actual.opcode == crate::target::opcodes::LOAD_FAST_BORROW
-                        {
-                            expected.opcode = actual.opcode;
-                        }
-                        *actual != expected
-                    })
+            if current
+                .iter()
+                .zip(&origin.prefix)
+                .any(|(actual, expected)| {
+                    let mut expected = *expected;
+                    if let (Item::Instruction(actual), Item::Instruction(expected)) =
+                        (actual, &mut expected)
+                        && expected.opcode == crate::target::opcodes::LOAD_FAST
+                        && actual.opcode == crate::target::opcodes::LOAD_FAST_BORROW
+                    {
+                        expected.opcode = actual.opcode;
+                    }
+                    *actual != expected
+                })
             {
                 continue;
             }
@@ -4916,7 +4948,7 @@ impl LayoutAssembler {
                         || provenance.removed_pop_block_boundaries.contains(label)
                         || provenance.omitted_nop_counts.contains_key(label)
                         || provenance.omitted_nop_locations.contains_key(label)
-                        || (*label != origin.entry
+                        || (Some(*label) != origin.entry
                             && (provenance.block_boundaries.contains(label)
                                 || provenance.source_boundaries.contains(label)
                                 || self.preserved_block_boundaries.contains(label)
@@ -4936,8 +4968,13 @@ impl LayoutAssembler {
             {
                 continue;
             }
-            let Some(&array_start) = positions.get(&origin.entry) else {
-                continue;
+            let array_start = if let Some(entry) = origin.entry {
+                let Some(&start) = positions.get(&entry) else {
+                    continue;
+                };
+                start
+            } else {
+                0
             };
             let mut logical = array_start;
             let mut removed = 0;
@@ -4948,7 +4985,7 @@ impl LayoutAssembler {
             for item in &current[..current.len() - 1] {
                 match item {
                     Item::Label(label) => {
-                        if *label == origin.entry {
+                        if Some(*label) == origin.entry {
                             continue;
                         }
                         let setups = origin
@@ -7758,21 +7795,24 @@ impl LayoutAssembler {
                                     first_unprotected_setup || unprotected_array_prefix
                                 });
                             // Fusion leaves its newer stale tail after early compaction.
-                            // If no records changed after this retained SETUP, exactly one
-                            // slot before its protected suffix is the original NULL NOP.
+                            // If no later fusion changes this retained SETUP's coordinates,
+                            // one slot before its protected suffix is the original NULL NOP.
+                            // Entry prologue insertion consumes this newer tail first; earlier
+                            // peephole removals cannot change the fusion-stage coordinates.
                             let fused_retained_setup_cell = instruction.opcode == NOT_TAKEN
                                 && instruction.exception_policy().owner()
                                     == NormalizedExceptionOwner::DynamicCondition
                                 && owner_history_exact
                                 && pop_slot_epoch_known
-                                && tail.insertions == 0
+                                && tail.insertions == setup_tail.insertions
+                                && (tail.insertions == 0 || original_array_start == 0)
                                 && tail.post_compaction_fusions > 0
                                 && tail.post_compaction_fusions
                                     == setup_tail.post_compaction_fusions
-                                && tail.early_removals == setup_tail.early_removals
                                 && tail
                                     .post_compaction_fusions
-                                    .checked_sub(instruction_index - start)
+                                    .checked_sub(tail.insertions)
+                                    .and_then(|slots| slots.checked_sub(instruction_index - start))
                                     == Some(1)
                                 && start.checked_sub(1).is_some_and(|index| {
                                     original_array_start <= index
@@ -7795,13 +7835,13 @@ impl LayoutAssembler {
                                 && original_array_start == 0
                                 && owner_history_exact
                                 && pop_slot_epoch_known
-                                && tail.insertions == 0
+                                && tail.insertions == setup_tail.insertions
                                 && tail.post_compaction_fusions
                                     == setup_tail.post_compaction_fusions
-                                && tail.early_removals == setup_tail.early_removals
                                 && tail
                                     .post_compaction_fusions
-                                    .checked_sub(instruction_index - start)
+                                    .checked_sub(tail.insertions)
+                                    .and_then(|slots| slots.checked_sub(instruction_index - start))
                                     .is_some_and(|before_suffix| before_suffix > 1)
                                 && null_original_entry_prefix(start, setup_label, &owners);
                             has_owner &= !(fused_retained_setup_cell || fused_unprotected_prefix);

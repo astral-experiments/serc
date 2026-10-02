@@ -1,6 +1,28 @@
 use crate::common;
 
 #[test]
+fn retained_setup_value_slots_preserve_function_entry_provenance() {
+    for count in [4, 5] {
+        let managers = vec!["manager()"; count].join(", ");
+        for prefix in ["", "    prepare()\n", "    if flag:\n        prepare()\n"] {
+            for expression in [
+                "value or fallback",
+                "value and fallback",
+                "value.attr or fallback",
+            ] {
+                let source = format!(
+                    "def f(value, fallback, flag):\n{prefix}    with {managers}:\n        try:\n            result = {expression}\n            return result\n        finally:\n            for child in children():\n                child.finish()\n"
+                );
+                common::assert_matches_cpython_marshal(
+                    &source,
+                    "retained_setup_value_function_entry.py",
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn matches_cpython_multi_with_original_slot_owners() {
     for (definition, tail) in [
         ("def", ""),
