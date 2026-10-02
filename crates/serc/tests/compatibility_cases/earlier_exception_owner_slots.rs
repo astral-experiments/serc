@@ -264,6 +264,23 @@ fn cell_try_else_ternary_owner_uncaptured_control() {
 }
 
 #[test]
+fn copied_constant_return_after_async_manager_preserves_removed_try_slots() {
+    for return_value in ["", " None", " 1", " value"] {
+        for handler in ["", "    except Error:\n        pass\n"] {
+            for cleanup in ["finish(tags or {})", "self.finish(tags or {})"] {
+                let source = format!(
+                    "async def f(self, manager, tags, value):\n    try:\n        async with manager:\n            return{return_value}\n{handler}    finally:\n        {cleanup}\n"
+                );
+                common::assert_matches_cpython_marshal(
+                    &source,
+                    "copied_constant_return_after_async_manager.py",
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn copied_return_none_marker_reuses_owned_suffix_after_try_else() {
     for call in [
         "record(action)",
