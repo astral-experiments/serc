@@ -55,9 +55,15 @@ headers and shared library:
 
 ```console
 /path/to/python3.14.5 scripts/build-cpython-reference.py --output /tmp/cpython-reference
+./scripts/check-cpython-compatibility --reference /tmp/cpython-reference 3.14
 cargo run --release -p serc --example compare_cpython_corpus -- \
   --python-version 3.14 --reference /tmp/cpython-reference --require-all path/to/corpus
 ```
+
+The compatibility script builds a fresh C reference from the selected Python
+interpreter, or accepts a prebuilt reference with `--reference`. Both modes use
+the same pinned Ruff corpus and exact outcome expectations. Build a reference
+for each exact Python target before selecting it.
 
 Each file gets a fresh CPython process with UTF-8 mode, hash seed 0, and site
 initialization disabled. The reference compiles source bytes and marshals

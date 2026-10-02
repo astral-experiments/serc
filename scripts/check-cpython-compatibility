@@ -3,14 +3,28 @@
 set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-if [[ $# -gt 2 ]]; then
+usage() {
     echo "usage: check-cpython-compatibility [PYTHON [3.12|3.13|3.14|3.15]]" >&2
+    echo "       check-cpython-compatibility --reference REFERENCE [3.12|3.13|3.14|3.15]" >&2
     exit 2
+}
+
+reference=""
+if [[ "${1:-}" == --reference ]]; then
+    if [[ $# -lt 2 || $# -gt 3 || -z "${2:-}" || "${2:-}" == -* ]]; then
+        usage
+    fi
+    reference="$2"
+    python_version="${3:-3.14}"
+else
+    if [[ $# -gt 2 ]]; then
+        usage
+    fi
+    python_version="${2:-3.14}"
+    python="${1:-${CPYTHON:-python$python_version}}"
 fi
 
-python_version="${2:-3.14}"
 expected_args="$("$repo_root/scripts/ruff-corpus-expectations" "$python_version")"
-python="${1:-${CPYTHON:-python$python_version}}"
 ruff="$repo_root/vendor/ruff"
 
 "$repo_root/scripts/check-ruff-pin"
@@ -31,10 +45,12 @@ for corpus_root in "${corpus_roots[@]}"; do
     fi
 done
 
-reference_dir="$(mktemp -d)"
-trap 'rm -rf "$reference_dir"' EXIT
-reference="$reference_dir/cpython-reference"
-"$python" -I -S "$repo_root/scripts/build-cpython-reference.py" --output "$reference"
+if [[ -z "$reference" ]]; then
+    reference_dir="$(mktemp -d)"
+    trap 'rm -rf "$reference_dir"' EXIT
+    reference="$reference_dir/cpython-reference"
+    "$python" -B -I -S "$repo_root/scripts/build-cpython-reference.py" --output "$reference"
+fi
 
 comparison_args=(
     --reference "$reference"
