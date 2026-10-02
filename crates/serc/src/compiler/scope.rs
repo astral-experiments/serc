@@ -2851,6 +2851,10 @@ impl<'a, 'ast> ModuleNameCollector<'a, 'ast> {
 
 impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
     fn visit_stmt(&mut self, statement: &'ast Stmt) {
+        if crate::stack_growth_required() {
+            return crate::grow_stack(|| self.visit_stmt(statement));
+        }
+
         self.source.observe_stmt(statement);
         let at_module_scope = self.nested_scope_depth == 0;
         if matches!(
