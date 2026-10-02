@@ -1273,6 +1273,10 @@ impl Compiler<'_> {
             }
 
             fn visit_stmt(&mut self, statement: &'ast Stmt) {
+                if crate::stack_growth_required() {
+                    return crate::grow_stack(|| self.visit_stmt(statement));
+                }
+
                 match statement {
                     Stmt::Expr(expression)
                         if literal_constant(&expression.value).is_some()
