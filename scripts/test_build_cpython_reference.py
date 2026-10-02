@@ -54,12 +54,18 @@ class LibrarySelectionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "missing"):
             self.select(configured)
 
-    def test_wrong_configured_library_does_not_fallback(self):
+    def test_stale_existing_library_uses_verified_prefix(self):
         configured = self.root / "configured"
         configured.mkdir()
         (configured / self.library.name).touch()
+        self.assertEqual(self.select(configured), self.library)
+
+    def test_unrelated_loaded_library_is_rejected(self):
+        other = self.root / "other.so"
+        other.touch()
+        self.loaded.return_value = other
         with self.assertRaisesRegex(ValueError, "differs"):
-            self.select(configured)
+            self.select(self.libdir)
 
     def test_wrong_fallback_library_is_rejected(self):
         other = self.root / "other.so"

@@ -46,9 +46,12 @@ def reference_library(library_dir: Path, library_name: str) -> Path:
     if not library_name or Path(library_name).name != library_name:
         raise ValueError("Invalid CPython shared library filename")
     library = library_dir / library_name
-    relocated = not library_dir.exists()
+    loaded = loaded_libpython(required=not library_dir.exists())
+    relocated = not library_dir.exists() or (
+        library.is_file() and loaded is not None and not library.samefile(loaded)
+    )
     if relocated:
-        # Relocated CI archives can retain their original build-time LIBDIR.
+        # The build-time LIBDIR may still exist after the interpreter is relocated.
         prefix = Path(sys.base_prefix).resolve(strict=True)
         library = prefix / "lib" / library_name
         if not library.resolve(strict=True).is_relative_to(prefix):
@@ -57,7 +60,6 @@ def reference_library(library_dir: Path, library_name: str) -> Path:
         raise ValueError(f"CPython shared library is missing: {library}")
     # Some distributions statically embed Python in the executable while also
     # providing the configured shared library for embedding consumers.
-    loaded = loaded_libpython(required=relocated)
     if loaded is not None and not library.samefile(loaded):
         raise ValueError("Selected libpython differs from the running interpreter")
     return library
