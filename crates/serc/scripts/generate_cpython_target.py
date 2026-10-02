@@ -1491,7 +1491,11 @@ def check_numeric_authority() -> None:
         source = path.read_text()
         if re.search(r"Opcode::new\s*\(", source):
             raise ValueError(f"{relative} constructs Opcode outside the target module")
-        if match := raw_operand.search(source):
+        for match in raw_operand.finditer(source):
+            # Inspect the suffix after matching the full numeric token. Putting
+            # this exclusion in the regex could backtrack to a digit prefix.
+            if re.match(r"\s*=>", source[match.end() :]):
+                continue
             raise ValueError(
                 f"{relative} duplicates a numeric target operand near `{match.group(0)}`"
             )

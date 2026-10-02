@@ -111,6 +111,29 @@ class NumericAuthorityTest(unittest.TestCase):
             ("const LOAD_CONST: u8 = 82;\n", "duplicates numeric opcode LOAD_CONST"),
             ("emit(BINARY_OP, 0);\n", "duplicates a numeric target operand"),
             ("Opcode::new(82);\n", "constructs Opcode outside the target module"),
+            (
+                "emit(LOAD_COMMON_CONSTANT,13);\n",
+                "duplicates a numeric target operand near `LOAD_COMMON_CONSTANT,13`",
+            ),
+            (
+                "emit(LOAD_COMMON_CONSTANT,\n    313);\n",
+                "duplicates a numeric target operand",
+            ),
+            (
+                "match slot { 12 => LOAD_COMMON_CONSTANT, 313 => POP_JUMP_IF_FALSE };\n"
+                "emit(LOAD_COMMON_CONSTANT,37);\n",
+                "duplicates a numeric target operand near `LOAD_COMMON_CONSTANT,37`",
+            ),
+            (
+                "match slot { 12=>LOAD_COMMON_CONSTANT,0x13f=>POP_JUMP_IF_FALSE };\n"
+                "emit(LOAD_COMMON_CONSTANT,0x1f);\n",
+                "duplicates a numeric target operand near `LOAD_COMMON_CONSTANT,0x1f`",
+            ),
+        )
+        match_arms = (
+            "match slot { 12 => LOAD_COMMON_CONSTANT,\n    13 => POP_JUMP_IF_FALSE };\n",
+            "match slot { 12=>LOAD_COMMON_CONSTANT,313=>POP_JUMP_IF_FALSE };\n",
+            "match slot { 12=>LOAD_COMMON_CONSTANT,0x13f=>POP_JUMP_IF_FALSE };\n",
         )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -128,6 +151,13 @@ class NumericAuthorityTest(unittest.TestCase):
             ):
                 generator.check_numeric_authority()
                 for path in paths:
+                    for source in match_arms:
+                        with self.subTest(path=path.relative_to(root), source=source):
+                            path.write_text(source)
+                            try:
+                                generator.check_numeric_authority()
+                            finally:
+                                path.write_text("")
                     for source, message in cases:
                         with self.subTest(path=path.relative_to(root), source=source):
                             path.write_text(source)
