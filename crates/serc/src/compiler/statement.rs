@@ -29606,11 +29606,9 @@ impl<'source> Compiler<'source> {
             let no_match = self.assembler.label();
             let body_cleanup = self.assembler.label();
 
-            // Later legacy handlers retain the original exception, accumulated
+            // Later handlers retain the original exception, accumulated
             // exceptions, and unmatched subgroup above the saved exception state.
-            let handler_depth = if handler_index > 0
-                && self.context.python_version <= crate::PythonVersion::Py313
-            {
+            let handler_depth = if handler_index > 0 {
                 base_depth + 4
             } else {
                 base_depth + 2
