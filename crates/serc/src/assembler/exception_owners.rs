@@ -10642,6 +10642,58 @@ impl LayoutAssembler {
                                                 })
                                     )
                             });
+                        let single_pop_attribute_truth_marker = early_return_nop_slot.is_some_and(|(_, pop, _, _)| {
+                            indexed_instructions[pop].local_policy.hidden_exception_owner_slots() == 1
+                                && matches!(indexed_instructions.get(pop + 1..instruction_index),
+                                    Some([load, attribute, to_bool, condition])
+                                        if matches!(load.opcode, crate::target::opcodes::LOAD_FAST | crate::target::opcodes::LOAD_FAST_BORROW)
+                                            && attribute.opcode == crate::target::opcodes::LOAD_ATTR
+                                            && attribute.value_argument().is_some_and(|argument| argument & 1 == 0)
+                                            && to_bool.opcode == crate::target::opcodes::TO_BOOL
+                                            && to_bool.value_argument() == Some(0)
+                                            && matches!(condition.opcode, crate::target::opcodes::POP_JUMP_IF_FALSE | crate::target::opcodes::POP_JUMP_IF_TRUE)
+                                            && condition.forward_target().is_some()
+                                            && [load, attribute, to_bool, condition].iter().all(|record| {
+                                                record.local_policy.hidden_exception_owner_slots() == 0
+                                                    && record.pre_fold_extra_instructions() == 0
+                                                    && record.exception_policy() == super::ExceptionPolicy::NoneUnchanged
+                                                    && record.no_location_policy.borrow_fallthrough() == super::BorrowFallthrough::Reachable
+                                                    && !record.jump_policy.borrow_empty_block()
+                                            })
+                                            && [attribute, to_bool, condition].iter().all(|record| record.location == instruction.location)
+                                            && load.location.line == instruction.location.line
+                                            && load.location.end_line == instruction.location.end_line
+                                            && load.location.column == instruction.location.column
+                                            && load.location.end_column < instruction.location.end_column
+                                            && self.exception_owner_provenance.original_primitive_condition_boundaries
+                                                .iter().filter(|origin| **origin == **condition).count() == 1)
+                        });
+                        // A longer unchanged prefix can move the attribute marker before
+                        // the authored return cell, into the same protected source array.
+                        let attribute_truth_protected_prefix = single_pop_attribute_truth_marker
+                            && early_return_nop_slot.is_some_and(|(array, pop, slot, region)| {
+                                instruction_index < slot
+                                    && slot - instruction_index <= pop - array
+                                    && indexed_instructions[pop - (slot - instruction_index)..pop]
+                                        .iter()
+                                        .all(|record| {
+                                            record.exception_policy()
+                                                == super::ExceptionPolicy::NoneUnchanged
+                                                && record.opcode != NOP
+                                                && record
+                                                    .local_policy
+                                                    .hidden_exception_owner_slots()
+                                                    == 0
+                                                && record.pre_fold_extra_instructions() == 0
+                                                && record.no_location_policy.borrow_fallthrough()
+                                                    != super::BorrowFallthrough::Barrier
+                                        })
+                                    && self.uniform_exception_owner(
+                                        pop - (slot - instruction_index),
+                                        pop,
+                                        &label_positions,
+                                    ) == Some(region)
+                            });
                         // A value-preserving Boolean introduces COPY and TO_BOOL after
                         // the original POP_BLOCK has been compacted. When the unchanged
                         // expansion reaches the adjacent captured POP cell, it inherits
@@ -10750,14 +10802,15 @@ impl LayoutAssembler {
                             })
                             && let Some((array, pop, slot, region)) = early_return_nop_slot
                             && original_array_start == array
-                            && instruction_index.checked_sub(slot).is_some_and(|distance| {
-                                distance
-                                    <= usize::from(
-                                        indexed_instructions[pop]
-                                            .local_policy
-                                            .hidden_exception_owner_slots(),
-                                    )
-                            })
+                            && (attribute_truth_protected_prefix
+                                || instruction_index.checked_sub(slot).is_some_and(|distance| {
+                                    distance
+                                        <= usize::from(
+                                            indexed_instructions[pop]
+                                                .local_policy
+                                                .hidden_exception_owner_slots(),
+                                        )
+                                }))
                             && ((instruction_index - pop == 3
                                 && matches!(
                                     indexed_instructions[pop + 1].opcode,
@@ -10776,10 +10829,13 @@ impl LayoutAssembler {
                                     ) && previous.local_policy.hidden_exception_owner_slots() == 3
                                 }))
                                 || single_pop_truth_marker
+                                || single_pop_attribute_truth_marker
                                 || single_pop_boolean_marker
                                 || single_pop_call_marker)
                         {
-                            let source_region = (instruction_index == slot).then_some(region);
+                            let source_region = (instruction_index == slot
+                                || attribute_truth_protected_prefix)
+                                .then_some(region);
                             owners.insert(
                                 instruction_index,
                                 ExceptionOwnerDecision::override_with_region(source_region),
