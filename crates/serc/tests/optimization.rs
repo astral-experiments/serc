@@ -2430,6 +2430,65 @@ fn elided_non_final_disjunction_keeps_backedge_copy_order() {
 }
 
 #[test]
+fn erased_return_guard_preserves_authored_else_jump() {
+    let header = "def sample(outer, check, left, right, work, manager, items, limit):\n";
+    let source = |guard: &str, body: &str, suffix: &str, alternate: Option<&str>| {
+        let mut source = format!("{header}    if outer(left, right):\n        if {guard}:\n");
+        for line in body.lines() {
+            writeln!(source, "            {line}").unwrap();
+        }
+        for line in suffix.lines() {
+            writeln!(source, "        {line}").unwrap();
+        }
+        if let Some(alternate) = alternate {
+            writeln!(source, "    else:\n        {alternate}").unwrap();
+        }
+        source.push_str("    return 0\n");
+        source
+    };
+    let guard = "check(left, right)";
+    let mut cases = Vec::new();
+    for exit in ["return 1", "raise ValueError"] {
+        for alternate in ["assert right", "pass", "work(right)"] {
+            cases.push(source(guard, exit, "assert left", Some(alternate)));
+        }
+        cases.push(source(guard, exit, "assert left", None));
+    }
+    cases.push(source(guard, "return 1", "", Some("assert right")));
+    for guard in ["not check(left, right)", "left or right", "left and right"] {
+        cases.push(source(
+            guard,
+            "return 1",
+            "assert left",
+            Some("assert right"),
+        ));
+    }
+    for body in ["work(left)\nreturn 1", "if left:\n    work(left)\nreturn 1"] {
+        cases.push(source(guard, body, "assert left", Some("assert right")));
+    }
+    let ordinary = source(guard, "return 1", "assert left", Some("assert right"));
+    let body = ordinary.strip_prefix(header).unwrap();
+    for (owner, cleanup) in [
+        ("with manager:", ""),
+        ("try:", "    finally:\n        work(right)\n"),
+    ] {
+        let mut wrapped = format!("{header}    {owner}\n");
+        for line in body.lines() {
+            writeln!(wrapped, "    {line}").unwrap();
+        }
+        wrapped.push_str(cleanup);
+        cases.push(wrapped);
+    }
+    cases.push(ordinary.replace(
+        "    return 0\n",
+        "    return work(left, right, limit, items, manager)\n",
+    ));
+    for source in cases {
+        assert_matches_cpython(&source, "erased_return_guard_else.py", &LEVELS);
+    }
+}
+
+#[test]
 fn erased_assertions_preserve_raising_try_guard_exit_locations() {
     for scope in ["def", "async def"] {
         for condition in ["flag", "not flag", "flag or other"] {
