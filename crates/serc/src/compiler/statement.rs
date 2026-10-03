@@ -16044,6 +16044,11 @@ impl<'source> Compiler<'source> {
                         // An unguarded wildcard falls through to the match's empty join.
                         // Keep that block's line event when a small outer exit replaces it.
                         self.assembler.preserve_direct_inlined_jump_nop(branch_exit);
+                    } else if self.elided_terminating_if_fallthrough(body).is_some() {
+                        // Erased assertions leave the terminating guard's false-edge
+                        // array empty when a copied return replaces this exit jump.
+                        self.assembler
+                            .preserve_empty_join_inlined_jump_nop(branch_exit);
                     } else if let Some(Stmt::If(nested)) = body
                         .last()
                         .filter(|statement| matches!(statement, Stmt::If(_)))
