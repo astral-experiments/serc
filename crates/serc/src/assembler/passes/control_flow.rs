@@ -1138,7 +1138,7 @@ impl OptimizationPipeline {
                     // Thirty records are the separately certified named-handler await.
                     let guarded_manager = original_len == 65 + iterator_extra_slot;
                     let awaited_handler = original_len == 30 + iterator_extra_slot;
-                    if !matches!(original_len, 12 | 17)
+                    if !matches!(original_len, 12 | 15 | 17 | 20)
                         && !awaited_handler
                         && !guarded_try
                         && !guarded_manager

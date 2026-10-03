@@ -29,6 +29,16 @@ fn nested_none_guard_preserves_named_cleanup_copy_order() {
 }
 
 #[test]
+fn method_guarded_finalizer_copies_each_iterator_discard() {
+    for guard in ["value.check()", "item.check()"] {
+        let source = format!(
+            "def f(items, value):\n    for item in items:\n        try:\n            work()\n        except Error as error:\n            if item:\n                break\n            recover()\n        finally:\n            if {guard}:\n                value.finish()\n    assert value is not None\n    raise value\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "guarded_finally_iterator.py");
+    }
+}
+
+#[test]
 fn protected_while_break_keeps_its_nop_before_empty_normal_exit() {
     let source = r"def f(first, second, value):
     try:
