@@ -221,6 +221,22 @@ fn cleanup_truth_marker_preserves_owner_after_guard_target_copy() {
     }
 }
 
+#[test]
+fn copied_attribute_truth_marker_reuses_authored_return_cell() {
+    for calls in [3, 4, 5, 6] {
+        for value in ["None", "0"] {
+            let work = "        work()\n".repeat(calls);
+            let source = format!(
+                "def f(state):\n    try:\n{work}        return {value}\n    finally:\n        if state.enabled:\n            finish()\n"
+            );
+            common::assert_matches_cpython_marshal(
+                &source,
+                "copied_attribute_truth_return_cell.py",
+            );
+        }
+    }
+}
+
 fn copied_call_return_none_source() -> &'static str {
     include_str!(
         "../fixtures/compatibility/earlier_exception_owner_slots/copied_call_return_none_marker_after_completed_async_manager/copied_call_return_none_after_async_manager.py"
