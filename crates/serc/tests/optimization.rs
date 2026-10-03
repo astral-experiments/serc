@@ -429,6 +429,44 @@ fn erased_else_preserves_protected_iterator_continue() {
 }
 
 #[test]
+fn copied_callable_finalizer_preserves_iterator_break_exits() {
+    for (index, successor) in [
+        "        cleanup()\n",
+        "        if cleanup is not None:\n            cleanup()\n",
+        "        if cleanup is not None:\n            cleanup()\n        marker = 1\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let source = format!(
+            "def sample(items, groups, choose, holder, read, cleanup):\n    for outer in items:\n        for inner in choose(groups, 0):\n            cache: dict = {{}}\n            if cleanup is not None:\n                cleanup()\n            try:\n                first = holder.open(inner)\n                second = read(first)\n                marker = 0\n                break\n            except LookupError as error:\n                seen = error\n                read(seen)\n            finally:\n                if cleanup is not None:\n                    cleanup()\n{successor}"
+        );
+        assert_matches_cpython(
+            &source,
+            &format!("copied_callable_break_{index}.py"),
+            &LEVELS,
+        );
+    }
+
+    for (index, source) in [
+        "def sample(items, groups, read, cleanup):\n    for outer in items:\n        for inner in groups:\n            try:\n                value = read(inner)\n                break\n            except LookupError as error:\n                read(error)\n            finally:\n                if cleanup is not None:\n                    cleanup()\n        cleanup()\n",
+        "def sample(items, groups, read, cleanup):\n    for outer in items:\n        for inner in groups:\n            try:\n                value = read(inner)\n                break\n            except LookupError as error:\n                read(error)\n            finally:\n                if cleanup is not None:\n                    cleanup.close()\n        read(outer)\n",
+        "def sample(items, groups, read, cleanup):\n    for outer in items:\n        for inner in groups:\n            try:\n                value = read(inner)\n                break\n            except LookupError as error:\n                read(error)\n            finally:\n                if cleanup is not None:\n                    cleanup()\n",
+        "def sample(items, groups, read, cleanup):\n    for outer in items:\n        for inner in groups:\n            try:\n                value = read(inner)\n                break\n            except LookupError:\n                read(outer)\n            finally:\n                if cleanup is not None:\n                    cleanup()\n        cleanup()\n",
+        "def sample(items, groups, read, cleanup):\n    for outer in items:\n        for inner in groups:\n            try:\n                value = read(inner)\n                break\n            except LookupError as error:\n                seen = error\n                read(seen)\n            finally:\n                if cleanup is not None:\n                    cleanup(inner)\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            source,
+            &format!("copied_callable_break_control_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn erased_branches_preserve_protected_while_join() {
     for loop_test in ["True", "flag", "flag != stop"] {
         let source = format!(
