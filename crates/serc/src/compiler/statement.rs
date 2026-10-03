@@ -15497,9 +15497,8 @@ impl<'source> Compiler<'source> {
                                 && is_elided_suite(&nested.body)
                                 && matches!(nested.elif_else_clauses.as_slice(), [clause]
                                     if clause.test.is_none() && is_elided_suite(&clause.body)));
-                    // An erased suffix leaves the populated inner If's original join
-                    // unchanged. Only expose that tail to this ordinary certificate;
-                    // the complete body still compiles with its original boundaries.
+                    // Strip an erased suffix when both inner arms are linear or erased.
+                    // Compile the complete body with its original boundaries.
                     let nested_else_body = if protected_elided_nested_join
                         || coroutine_populated_nested_join
                         || (self.context.python_version >= crate::PythonVersion::Py314
@@ -15514,10 +15513,12 @@ impl<'source> Compiler<'source> {
                             && effective_nested_else_body.len() < body.len()
                             && matches!(effective_nested_else_body.split_last(), Some((Stmt::If(nested), leading))
                             if (leading.is_empty() || suite_has_linear_borrow_fallthrough(leading))
-                                && suite_has_linear_borrow_fallthrough(&nested.body)
                                 && matches!(nested.elif_else_clauses.as_slice(), [clause]
                                     if clause.test.is_none()
-                                        && suite_has_linear_borrow_fallthrough(&clause.body))))
+                                        && ((suite_has_linear_borrow_fallthrough(&nested.body)
+                                            && suite_has_linear_borrow_fallthrough(&clause.body))
+                                            || (is_elided_suite(&nested.body)
+                                                && is_elided_suite(&clause.body))))))
                     {
                         effective_nested_else_body
                     } else {

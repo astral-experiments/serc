@@ -1406,6 +1406,23 @@ fn linear_prefix_and_elided_suffix_preserve_nested_if_join() {
 }
 
 #[test]
+fn erased_suffix_preserves_assertion_only_nested_join() {
+    for prefix in ["", "        work(left)\n", "        saved = left\n"] {
+        for assertion in [
+            "left == right",
+            "(\n                left == right\n            )",
+        ] {
+            for value in ["result", "work(left, right, outer, inner, result)"] {
+                let source = format!(
+                    "def sample(outer, inner, left, right, work):\n    if outer:\n{prefix}        if inner:\n            assert {assertion}\n        else:\n            assert left != right\n        assert left\n        assert right\n    else:\n        assert right\n        assert left\n    result = left\n    return {value}\n"
+                );
+                assert_matches_cpython(&source, "assertion_only_nested_join.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
 fn erased_else_after_breaking_for_preserves_branch_join() {
     for tail in ["finish()", "value = None", "return None"] {
         let source = format!(
