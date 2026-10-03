@@ -7376,16 +7376,22 @@ impl Compiler<'_> {
             self.emit_collection_constant(constant)?;
             self.attach_folded_operand_admissions(operand_folds);
             self.emit(kind.extend_opcode(), 1, -1)?;
+            let hidden_owner_slots = folded_elements_owner_slots(
+                self.context.python_version,
+                &elements[..unpacking_start],
+                unpacking_start - 2,
+            );
             self.assembler
-                .add_last_constant_fold_slots(folded_elements_owner_slots(
-                    self.context.python_version,
-                    &elements[..unpacking_start],
-                    if elements.len() <= 30 {
-                        unpacking_start.saturating_sub(2)
-                    } else {
-                        0
-                    },
-                ));
+                .add_last_constant_fold_slots(hidden_owner_slots);
+            // This literal prefix folds before unpacking adds any dynamic element.
+            // Its removed cells therefore share the surviving extension's owner.
+            if elements[..unpacking_start]
+                .iter()
+                .all(is_small_literal_tuple_element)
+            {
+                self.assembler
+                    .record_last_uniform_fold_owner_slots(hidden_owner_slots);
+            }
         } else {
             for element in &elements[..unpacking_start] {
                 self.compile_expression(element)?;
