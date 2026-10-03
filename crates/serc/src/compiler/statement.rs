@@ -10650,7 +10650,6 @@ impl<'source> Compiler<'source> {
                     let copied_return_unwinds_inner_async_manager = self.unit.flags
                         & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                         == CO_COROUTINE
-                        && preserve_tos
                         && !return_is_overridden
                         && context_index == 0
                         && finally_context.with_depth == 0
@@ -34296,7 +34295,8 @@ impl<'source> Compiler<'source> {
                                                 && !recovery.handlers.is_empty()
                                         }
                                         Stmt::With(manager) => {
-                                            !manager.is_async
+                                            (!manager.is_async
+                                                || self.unit.flags & CO_COROUTINE != 0)
                                                 && manager.items.len() == 1
                                                 && !expression_contains_inline_branch(
                                                     &manager.items[0].context_expr,
