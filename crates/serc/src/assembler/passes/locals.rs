@@ -6073,6 +6073,50 @@ mod tests {
     }
 
     #[test]
+    fn borrowed_ranges_preserve_try_join_after_empty_original() {
+        use crate::target::opcodes::{CALL, PUSH_NULL};
+
+        let head = Label::from_u32(0);
+        let retired = Label::from_u32(1);
+        let join = Label::from_u32(2);
+        let items = [
+            Item::Label(head),
+            instruction(JUMP_FORWARD, Operand::Forward(join)),
+            Item::Label(retired),
+            Item::Label(join),
+            instruction(LOAD_FAST, Operand::Value(2)),
+            instruction(PUSH_NULL, Operand::Value(0)),
+            instruction(LOAD_FAST, Operand::Value(4)),
+            instruction(CALL, Operand::Value(1)),
+            instruction(POP_TOP, Operand::Value(0)),
+        ];
+        let unreachable = FxHashSet::from_iter([retired]);
+        for preserved in [
+            FxHashSet::default(),
+            FxHashSet::from_iter([retired]),
+            FxHashSet::from_iter([join]),
+        ] {
+            let labels = BorrowBoundaryLabels::collect(&items, [], &unreachable, &preserved);
+            let (ranges, blocks, blocked) = borrow_block_ranges_with_label_count(
+                &items,
+                |label| labels.is_boundary(label),
+                &unreachable,
+                &preserved,
+                labels.len(),
+            );
+            if preserved.contains(&join) {
+                assert_eq!(ranges, [0..2, 2..3, 3..9]);
+                assert_eq!(blocks, [0, 1, 2]);
+                assert_eq!(blocked, [false, true, false]);
+            } else {
+                assert_eq!(ranges, [0..2, 2..9]);
+                assert_eq!(blocks, [0, 1, 1]);
+                assert_eq!(blocked, [false, true]);
+            }
+        }
+    }
+
+    #[test]
     fn borrowed_ranges_use_bound_labels_only_and_preserve_sparse_indices() {
         let first = Label::from_u32(2);
         let target = Label::from_u32(7);
