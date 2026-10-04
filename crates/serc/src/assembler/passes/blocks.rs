@@ -17,6 +17,134 @@ use crate::target::opcodes::{
 };
 use crate::target::{is_conditional_jump, is_unconditional_jump};
 
+/// Finds a protected return owner while retaining equal ambient scope fallbacks.
+fn original_protected_return_owner(
+    regions: &[ExceptionRegion],
+    memberships: &[std::ops::Range<usize>],
+    source: usize,
+    target: usize,
+    returned: usize,
+    end: Label,
+) -> Option<usize> {
+    let mut owners = memberships
+        .iter()
+        .enumerate()
+        .filter(|(index, membership)| {
+            !regions[*index].is_scope_fallback
+                && (membership.contains(&source) || membership.contains(&target))
+        });
+    let (index, membership) = owners.next()?;
+    let region = regions[index];
+    (owners.next().is_none()
+        && !region.is_scope_fallback
+        && region.depth == 0
+        && !region.preserve_lasti
+        && region.end == end
+        && membership.contains(&source)
+        && membership.contains(&target)
+        && !membership.contains(&returned)
+        && memberships.iter().enumerate().all(|(index, membership)| {
+            !regions[index].is_scope_fallback
+                || (membership.contains(&source) == membership.contains(&target)
+                    && membership.contains(&target) == membership.contains(&returned))
+        }))
+    .then_some(index)
+}
+
+/// Matches an original tuple join whose last element is a conditional value.
+fn original_tuple_return_join(
+    predecessor: &[Item],
+    fallthrough: &[Item],
+    source: &[Item],
+    alternative: &[Item],
+    returned: &[Item],
+) -> Option<(Label, Label, bool)> {
+    let [
+        Item::Label(_),
+        Item::Instruction(value),
+        Item::Instruction(branch),
+    ] = predecessor
+    else {
+        return None;
+    };
+    let [Item::Label(_), Item::Instruction(other)] = fallthrough else {
+        return None;
+    };
+    let [
+        Item::Label(entry),
+        Item::Instruction(tuple),
+        Item::Instruction(jump),
+    ] = source
+    else {
+        return None;
+    };
+    let [Item::Label(_), Item::Instruction(alternate)] = alternative else {
+        return None;
+    };
+    let [
+        Item::Label(return_entry),
+        Item::Label(end),
+        Item::Instruction(ret),
+    ] = returned
+    else {
+        return None;
+    };
+    let arity = tuple.value_argument()?;
+    let split_return = jump.no_location_policy.copies_split_return_exit();
+    let alternate_slots = alternate.pre_fold_extra_instructions();
+    (tuple.opcode == BUILD_TUPLE
+        && arity > 0
+        && tuple.depth_after() == Some(1)
+        && tuple.location.line >= 0
+        && [value, other].iter().all(|instruction| {
+            matches!(instruction.opcode, LOAD_FAST | LOAD_CONST | LOAD_SMALL_INT)
+                && instruction.value_argument().is_some()
+                && instruction.depth_after() == Some(arity)
+                && instruction.location.line == tuple.location.line
+        })
+        && matches!(alternate.opcode, LOAD_FAST | LOAD_CONST | LOAD_SMALL_INT)
+        && alternate.value_argument().is_some()
+        && alternate.depth_after() == Some(1)
+        && alternate.location.line == tuple.location.line
+        && branch.operand() == Operand::Forward(*entry)
+        && branch.depth_after() == Some(arity)
+        && jump.operand() == Operand::Forward(*return_entry)
+        && jump.depth_after() == Some(1)
+        && branch.no_location_policy.copies_split_return_exit() == split_return
+        && [branch, jump].iter().all(|instruction| {
+            instruction.opcode == JUMP_FORWARD
+                && instruction.location == SourceLocation::NONE
+                && !instruction
+                    .jump_policy
+                    .retains_nop_for(instruction.operand())
+                && !has_jump_eval_check(instruction)
+        })
+        && return_entry != end
+        && ret.opcode == RETURN_VALUE
+        && ret.value_argument() == Some(0)
+        && ret.depth_after() == Some(0)
+        && ret.location.line == tuple.location.line
+        && [value, branch, other, tuple, jump, ret]
+            .iter()
+            .all(|instruction| {
+                instruction.pre_fold_extra_instructions() == 0
+                    && instruction.local_policy.hidden_exception_owner_slots() == 0
+                    && instruction.exception_policy() == ExceptionPolicy::default()
+            })
+        && alternate.exception_policy() == ExceptionPolicy::default()
+        && (matches!(
+            (
+                alternate_slots,
+                alternate.local_policy.hidden_exception_owner_slots()
+            ),
+            (0, 0)
+        ) || (alternate.opcode == LOAD_CONST
+            && (1..=3).contains(&alternate_slots)
+            && alternate.local_policy.hidden_exception_owner_slots()
+                == u16::from(alternate_slots))))
+    .then_some((*entry, *end, split_return))
+}
+
 /// Recognizes a located attribute assignment with exactly four original copy slots.
 fn is_four_slot_attribute_store_jump(items: &[Item]) -> bool {
     let Some(first) = items
@@ -5144,6 +5272,112 @@ impl OptimizationPipeline {
             })
             .collect::<FxHashMap<_, _>>();
 
+        let tuple_order = order_if(
+            self.python_version >= crate::PythonVersion::Py314
+                && !self
+                    .exception_owner_provenance
+                    .ordinary_try_setups
+                    .is_empty(),
+        );
+        let original_tuple_return_seams = tuple_order
+            .iter()
+            .filter_map(|&source| {
+                let position = positions[source.index()];
+                let predecessor = *order.get(position.checked_sub(2)?)?;
+                let fallthrough = *order.get(position.checked_sub(1)?)?;
+                let alternative = *order.get(position + 1)?;
+                let returned = *order.get(position + 2)?;
+                let owned = [predecessor, fallthrough, source, alternative];
+                let (entry, end, split_return) = original_tuple_return_join(
+                    graph[predecessor].items(),
+                    graph[fallthrough].items(),
+                    graph[source].items(),
+                    graph[alternative].items(),
+                    graph[returned].items(),
+                )?;
+                let alternate = graph[alternative].last_instruction()?;
+                let region_index = original_protected_return_owner(
+                    &self.exception_regions,
+                    &region_memberships,
+                    positions[predecessor.index()],
+                    position,
+                    positions[returned.index()],
+                    end,
+                )?;
+                if !split_return {
+                    let mut fallbacks =
+                        region_memberships
+                            .iter()
+                            .enumerate()
+                            .filter(|(index, membership)| {
+                                let region = self.exception_regions[*index];
+                                region.is_scope_fallback
+                                    && owned
+                                        .iter()
+                                        .chain([&returned])
+                                        .all(|block| membership.contains(&positions[block.index()]))
+                            });
+                    let fallback = self.exception_regions[fallbacks.next()?.0];
+                    if fallbacks.next().is_some() || fallback.depth != 0 || !fallback.preserve_lasti
+                    {
+                        return None;
+                    }
+                }
+                ((alternate.pre_fold_extra_instructions() == 0
+                    || self
+                        .exception_owner_provenance
+                        .uniform_fold_owner_slots
+                        .iter()
+                        .filter(|original| {
+                            **original
+                                == (
+                                    alternate.location,
+                                    LOAD_CONST,
+                                    u16::from(alternate.pre_fold_extra_instructions()),
+                                )
+                        })
+                        .count()
+                        == 1)
+                    && self
+                        .exception_owner_provenance
+                        .is_original_ordinary_try_region(self.exception_regions[region_index])
+                    && self
+                        .exception_owner_provenance
+                        .block_boundaries
+                        .contains(&entry)
+                    && exception_split_labels.contains(&end)
+                    && predecessors[source.index()] == 2
+                    && predecessors[returned.index()] == 2
+                    && [predecessor, fallthrough, alternative]
+                        .iter()
+                        .all(|block| predecessors[block.index()] == 1)
+                    && owned
+                        .iter()
+                        .all(|block| !exception_boundary_blocks[block.index()])
+                    && region_memberships.iter().all(|membership| {
+                        owned.iter().all(|block| {
+                            membership.contains(&positions[block.index()])
+                                == membership.contains(&position)
+                        })
+                    }))
+                .then(|| {
+                    (
+                        source,
+                        (
+                            predecessor,
+                            returned,
+                            region_index,
+                            owned
+                                .into_iter()
+                                .chain([returned])
+                                .map(|block| (block, graph[block].items().to_vec()))
+                                .collect::<Vec<_>>(),
+                        ),
+                    )
+                })
+            })
+            .collect::<FxHashMap<_, _>>();
+
         // A chained comparison reaches its protected value arm through a separate
         // NOT_TAKEN/jump array. Preserve the complete original arrays before copying
         // the unowned return; only that one earlier predecessor may revisit the copy.
@@ -5298,7 +5532,7 @@ impl OptimizationPipeline {
                 })
             })
             .collect::<FxHashMap<_, _>>();
-        let mut comparison_return_revisits =
+        let mut protected_return_revisits =
             FxHashMap::<_, (BasicBlockId, Vec<Item>, Vec<Item>, usize, (Label, Label))>::default();
 
         // Keep locations already present on original return records distinct from
@@ -6048,8 +6282,10 @@ impl OptimizationPipeline {
                         && graph[*original_return].items() == return_items
                 },
             );
-            let comparison_return_seam = original_comparison_return_seams.get(&source).filter(
-                |(_, original_return, _, arrays)| {
+            let protected_return_origin = original_comparison_return_seams
+                .get(&source)
+                .or_else(|| original_tuple_return_seams.get(&source))
+                .filter(|(_, original_return, _, arrays)| {
                     inline_small_exit
                         && !planned_copy
                         && target_pre_fusion_size == 1
@@ -6058,9 +6294,8 @@ impl OptimizationPipeline {
                         && arrays
                             .iter()
                             .all(|(block, items)| graph[*block].items() == items)
-                },
-            );
-            let comparison_return_revisit = comparison_return_revisits.get(&source).filter(
+                });
+            let protected_return_revisit = protected_return_revisits.get(&source).filter(
                 |(original_target, source_items, target_items, region_index, hole)| {
                     inline_small_exit
                         && !planned_copy
@@ -7027,7 +7262,7 @@ impl OptimizationPipeline {
             if inline_exit_copy || !source_has_fallthrough {
                 if planned_copy
                     || (inline_no_location_block && target_chain_end > target_position)
-                    || comparison_return_revisit.is_some()
+                    || protected_return_revisit.is_some()
                 {
                     let copied_positions = copied
                         .iter()
@@ -7519,8 +7754,8 @@ impl OptimizationPipeline {
                 copied.remove(0);
                 graph.insert_label(source, 1, copied_label);
             }
-            let inline_comparison_return =
-                comparison_return_seam.is_some_and(|(_, original_return, region_index, arrays)| {
+            let inline_protected_return = protected_return_origin.is_some_and(
+                |(_, original_return, region_index, arrays)| {
                     let [
                         Item::Label(entry),
                         Item::Label(end),
@@ -7553,24 +7788,32 @@ impl OptimizationPipeline {
                         && protected_fragment_origins.is_empty()
                         && copied_region_exclusions[*region_index]
                             .contains(&(*entry, *exclusion_end))
-                });
-            if inline_comparison_return {
-                let (predecessor, _, region_index, arrays) = comparison_return_seam.unwrap();
+                },
+            );
+            if inline_protected_return {
+                let (predecessor, _, region_index, arrays) = protected_return_origin.unwrap();
                 let original_predecessor = arrays
                     .iter()
                     .find(|(block, _)| block == predecessor)
                     .unwrap();
                 let Item::Instruction(ret) = &mut copied[2] else {
-                    unreachable!("certified comparison return");
+                    unreachable!("certified protected return");
                 };
-                // The removed original jump is still a slot during repeated exit copying.
-                ret.add_pre_fold_extra_instructions(1);
+                // The tuple join retains both its replaced jump and its original POP_BLOCK
+                // in the four-slot copy budget, even while their labels share one IR block.
+                ret.add_pre_fold_extra_instructions(
+                    if original_tuple_return_seams.contains_key(&source) {
+                        2
+                    } else {
+                        1
+                    },
+                );
                 let Item::Label(exclusion_end) = copied[3] else {
                     unreachable!("certified return exclusion end");
                 };
                 let mut expected_target = graph[source].items().to_vec();
                 expected_target.extend_from_slice(&copied);
-                comparison_return_revisits.insert(
+                protected_return_revisits.insert(
                     *predecessor,
                     (
                         source,
@@ -7597,7 +7840,7 @@ impl OptimizationPipeline {
             } else if inline_no_location_block
                 || inline_unprotected_return
                 || inline_unprotected_raise
-                || inline_comparison_return
+                || inline_protected_return
                 || (inline_small_exit && target_terminal_opcode == Some(RERAISE))
                 || planned_copy
             {
@@ -10336,6 +10579,427 @@ mod located_normal_try_join_tests {
                 changed_label.is_none(),
                 "{changed_label:?}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tuple_return_copy_tests {
+    use super::*;
+
+    fn fixture(arity: u32, mutation: &str) -> OptimizationPipeline {
+        let location = SourceLocation::new(3, 3, 4, 60);
+        let label = Label::from_u32;
+        let value = |opcode, argument, depth| {
+            Instruction::new(opcode, Operand::Value(argument), location, Some(depth))
+        };
+        let jump = |opcode, target, depth| {
+            Instruction::new(
+                opcode,
+                Operand::Forward(label(target)),
+                location,
+                Some(depth),
+            )
+        };
+        let mut branch = jump(JUMP_FORWARD, 4, arity);
+        branch.location = SourceLocation::NONE;
+        branch.no_location_policy.allow_split_return_exit_copy();
+        let mut exit = jump(JUMP_FORWARD, 6, 1);
+        exit.location = SourceLocation::NONE;
+        exit.no_location_policy.allow_split_return_exit_copy();
+        let mut tuple = value(BUILD_TUPLE, arity, 1);
+        let mut first = value(LOAD_CONST, 0, arity);
+        let mut returned = value(RETURN_VALUE, 0, 0);
+        let fallback = matches!(
+            mutation,
+            "ambient fallback"
+                | "ambient folded alternate"
+                | "partial fallback"
+                | "fallback depth"
+                | "fallback lasti"
+                | "duplicate fallback"
+                | "duplicate fallback depth"
+                | "duplicate fallback lasti"
+                | "mixed fallback flags"
+        );
+        if fallback || mutation == "unflagged no fallback" {
+            branch = jump(JUMP_FORWARD, 4, arity);
+            branch.location = SourceLocation::NONE;
+            exit = jump(JUMP_FORWARD, 6, 1);
+            exit.location = SourceLocation::NONE;
+            if mutation == "mixed fallback flags" {
+                branch.no_location_policy.allow_split_return_exit_copy();
+            }
+        }
+        let mut alternate = value(LOAD_CONST, 2, 1);
+        let alternate_slots = if mutation == "alternate saturated" {
+            4
+        } else {
+            u8::try_from(arity).unwrap()
+        };
+        if mutation.starts_with("alternate ")
+            || matches!(mutation, "folded alternate" | "ambient folded alternate")
+        {
+            if mutation != "alternate hidden only" {
+                alternate.add_pre_fold_extra_instructions(alternate_slots);
+            }
+            if mutation != "alternate pre-fold only" {
+                alternate
+                    .local_policy
+                    .add_hidden_exception_owner_slots(u16::from(alternate_slots));
+            }
+        }
+        match mutation {
+            "arity" => tuple.set_operand(Operand::Value(arity + 1)),
+            "empty tuple" => tuple.set_operand(Operand::Value(0)),
+            "tuple depth" => tuple = value(BUILD_TUPLE, arity, 2),
+            "value depth" => first = value(LOAD_CONST, 0, arity + 1),
+            "value opcode" => first = value(LOAD_DEREF, 0, arity),
+            "tuple opcode" => tuple = value(CALL, arity, 1),
+            "jump location" => exit.location = location,
+            "jump permission" => {
+                exit = jump(JUMP_FORWARD, 6, 1);
+                exit.location = SourceLocation::NONE;
+            }
+            "jump target" => branch.set_operand(Operand::Forward(label(5))),
+            "return depth" => returned = value(RETURN_VALUE, 0, 1),
+            "return location" => returned.location = SourceLocation::NONE,
+            "folded slot" => returned.add_pre_fold_extra_instructions(1),
+            "hidden slot" => tuple.local_policy.add_hidden_exception_owner_slots(1),
+            "exception policy" => tuple.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS),
+            _ => {}
+        }
+        let mut items = vec![
+            Item::Label(label(0)),
+            Item::Instruction(value(LOAD_FAST, 0, 1)),
+            Item::Instruction(jump(
+                POP_JUMP_IF_FALSE,
+                if mutation == "shared predecessor" {
+                    2
+                } else {
+                    5
+                },
+                0,
+            )),
+            Item::Label(label(1)),
+        ];
+        for depth in 1..arity {
+            items.push(Item::Instruction(value(LOAD_FAST, depth, depth)));
+        }
+        items.extend([
+            Item::Instruction(value(LOAD_FAST, 0, arity)),
+            Item::Instruction(jump(POP_JUMP_IF_FALSE, 3, arity - 1)),
+            Item::Label(label(2)),
+            Item::Instruction(first),
+            Item::Instruction(branch),
+            Item::Label(label(3)),
+            Item::Instruction(value(LOAD_CONST, 1, arity)),
+            Item::Label(label(4)),
+        ]);
+        if mutation == "extra entry" {
+            items.push(Item::Label(label(9)));
+        }
+        items.extend([
+            Item::Instruction(tuple),
+            Item::Instruction(exit),
+            Item::Label(label(5)),
+            Item::Instruction(alternate),
+        ]);
+        let mut assembler = crate::assembler::Assembler::from_linear_items(items);
+        if alternate.pre_fold_extra_instructions() != 0
+            || alternate.local_policy.hidden_exception_owner_slots() != 0
+        {
+            assembler.record_last_uniform_fold_owner_slots(usize::from(alternate_slots));
+        }
+        let originals = &mut assembler
+            .exception_owner_provenance
+            .uniform_fold_owner_slots;
+        match mutation {
+            "alternate missing origin" => originals.clear(),
+            "alternate duplicate origin" => originals.push(originals[0]),
+            "alternate changed location" => originals[0].0 = SourceLocation::new(3, 3, 5, 60),
+            "alternate changed opcode" => originals[0].1 = LOAD_SMALL_INT,
+            "alternate changed count" => originals[0].2 = 1,
+            // The range cap must reject even an invalid small-fold receipt.
+            "alternate saturated" => originals.push((alternate.location, LOAD_CONST, 4)),
+            _ => {}
+        }
+        for item in [
+            Item::Label(label(if mutation == "return aliases" { 7 } else { 6 })),
+            Item::Label(label(if mutation == "return aliases" { 6 } else { 7 })),
+            Item::Instruction(returned),
+            Item::Label(label(8)),
+            Item::Instruction(value(RETURN_VALUE, 0, 0)),
+        ] {
+            assembler.push_linear_item(item);
+        }
+        if fallback {
+            for item in [
+                Item::Label(label(10)),
+                Item::Instruction(value(RETURN_VALUE, 0, 0)),
+            ] {
+                assembler.push_linear_item(item);
+            }
+        }
+        assembler.next_label = if fallback { 11 } else { 10 };
+        assembler.record_ordinary_try_exception_setup(label(0), false, label(8));
+        assembler.add_exception_region(label(0), label(7), label(8), 0, false);
+        if fallback {
+            assembler.add_stopiteration_exception_region_with_depth(
+                label(0),
+                label(if mutation == "partial fallback" { 7 } else { 8 }),
+                label(10),
+                u32::from(mutation == "fallback depth"),
+            );
+            if mutation == "fallback lasti" {
+                assembler
+                    .exception_regions
+                    .last_mut()
+                    .unwrap()
+                    .preserve_lasti = false;
+            }
+            if mutation.starts_with("duplicate fallback") {
+                let mut duplicate = *assembler.exception_regions.last().unwrap();
+                if mutation == "duplicate fallback depth" {
+                    duplicate.depth = 1;
+                }
+                if mutation == "duplicate fallback lasti" {
+                    duplicate.preserve_lasti = false;
+                }
+                assembler.exception_regions.push(duplicate);
+            }
+        }
+        match mutation {
+            "missing origin" => assembler
+                .exception_owner_provenance
+                .ordinary_try_region_origins
+                .clear(),
+            "duplicate origin" => assembler
+                .exception_owner_provenance
+                .ordinary_try_region_origins
+                .push((label(0), label(0), label(7), label(8))),
+            "owner depth" => assembler.exception_regions[0].depth = 1,
+            "owner end" => assembler.exception_regions[0].end = label(6),
+            "owner lasti" => assembler.exception_regions[0].preserve_lasti = true,
+            "owner fallback" => assembler.exception_regions[0].is_scope_fallback = true,
+            "owner target" => assembler.exception_regions[0].target = label(3),
+            "second owner" => {
+                assembler.add_exception_region(label(1), label(7), label(8), 1, false);
+            }
+            "legacy" => assembler.python_version = crate::PythonVersion::Py313,
+            _ => {}
+        }
+        assembler.into_optimization_pipeline()
+    }
+
+    #[test]
+    fn tuple_return_revisit_requires_original_slots_and_owner() {
+        for mutation in [
+            "intact",
+            "arity",
+            "empty tuple",
+            "tuple depth",
+            "value depth",
+            "value opcode",
+            "tuple opcode",
+            "jump location",
+            "jump permission",
+            "jump target",
+            "return depth",
+            "return location",
+            "folded slot",
+            "hidden slot",
+            "exception policy",
+            "extra entry",
+            "return aliases",
+            "shared predecessor",
+            "missing origin",
+            "duplicate origin",
+            "owner depth",
+            "owner end",
+            "owner lasti",
+            "owner fallback",
+            "owner target",
+            "second owner",
+            "legacy",
+            "folded alternate",
+            "ambient fallback",
+            "ambient folded alternate",
+            "alternate pre-fold only",
+            "alternate hidden only",
+            "alternate missing origin",
+            "alternate duplicate origin",
+            "alternate changed location",
+            "alternate changed opcode",
+            "alternate changed count",
+            "alternate saturated",
+            "unflagged no fallback",
+            "partial fallback",
+            "fallback depth",
+            "fallback lasti",
+            "duplicate fallback",
+            "duplicate fallback depth",
+            "duplicate fallback lasti",
+            "mixed fallback flags",
+        ] {
+            let mut pipeline = fixture(2, mutation);
+            let absence = pipeline.capture_original_location_absence();
+            pipeline.duplicate_exit_blocks(&absence, &mut Vec::new());
+            if !matches!(
+                mutation,
+                "intact" | "folded alternate" | "ambient fallback" | "ambient folded alternate"
+            ) {
+                let mut baseline = fixture(2, mutation);
+                baseline
+                    .exception_owner_provenance
+                    .ordinary_try_region_origins
+                    .clear();
+                let absence = baseline.capture_original_location_absence();
+                baseline.duplicate_exit_blocks(&absence, &mut Vec::new());
+                assert_eq!(
+                    pipeline.graph.iter_items().collect::<Vec<_>>(),
+                    baseline.graph.iter_items().collect::<Vec<_>>(),
+                    "{mutation}"
+                );
+                assert_eq!(
+                    pipeline.exception_regions.len(),
+                    baseline.exception_regions.len()
+                );
+                assert!(
+                    pipeline
+                        .exception_regions
+                        .iter()
+                        .zip(&baseline.exception_regions)
+                        .all(|(left, right)| {
+                            crate::assembler::fusion_owner_slots::same_manager_region(left, right)
+                        }),
+                    "{mutation}"
+                );
+                continue;
+            }
+            let mut in_arm = false;
+            let mut returned = false;
+            for item in pipeline.graph.iter_items() {
+                match item {
+                    Item::Label(label) if *label == Label::from_u32(2) => in_arm = true,
+                    Item::Label(label) if *label == Label::from_u32(3) => in_arm = false,
+                    Item::Instruction(instruction)
+                        if in_arm && instruction.opcode == RETURN_VALUE =>
+                    {
+                        returned = true;
+                    }
+                    _ => {}
+                }
+            }
+            assert!(returned);
+        }
+    }
+
+    #[test]
+    fn tuple_return_revisit_keeps_four_slots_and_unowned_return() {
+        for mutation in ["intact", "ambient folded alternate"] {
+            for version in [crate::PythonVersion::Py314, crate::PythonVersion::Py315] {
+                for arity in 1..=3 {
+                    let mut pipeline = fixture(arity, mutation);
+                    pipeline.python_version = version;
+                    let original_owner = pipeline.exception_regions[0];
+                    let original_fallback = pipeline
+                        .exception_regions
+                        .iter()
+                        .find(|region| region.is_scope_fallback)
+                        .copied();
+                    let absence = pipeline.capture_original_location_absence();
+                    pipeline.duplicate_exit_blocks(&absence, &mut Vec::new());
+                    let items = pipeline.graph.iter_items().copied().collect::<Vec<_>>();
+                    let labels = items
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(position, item)| {
+                            if let Item::Label(label) = item {
+                                Some((*label, position))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<FxHashMap<_, _>>();
+                    let start = labels[&Label::from_u32(2)];
+                    let end = labels[&Label::from_u32(3)];
+                    let instructions = items[start..end]
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(offset, item)| {
+                            if let Item::Instruction(instruction) = item {
+                                Some((start + offset, instruction))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        instructions
+                            .iter()
+                            .map(|(_, instruction)| instruction.opcode)
+                            .collect::<Vec<_>>(),
+                        [LOAD_CONST, BUILD_TUPLE, RETURN_VALUE],
+                        "{version:?}/{arity}"
+                    );
+                    assert_eq!(
+                        instructions[1..]
+                            .iter()
+                            .map(|(_, instruction)| 1 + usize::from(
+                                instruction.pre_fold_extra_instructions()
+                            ))
+                            .sum::<usize>(),
+                        4
+                    );
+                    for (position, instruction) in instructions {
+                        let mut owners = pipeline
+                            .exception_regions
+                            .iter()
+                            .filter(|region| {
+                                labels[&region.start] <= position && position < labels[&region.end]
+                            })
+                            .collect::<Vec<_>>();
+                        let fallbacks = owners
+                            .iter()
+                            .filter(|region| region.is_scope_fallback)
+                            .copied()
+                            .collect::<Vec<_>>();
+                        if let Some(original) = original_fallback {
+                            assert_eq!(fallbacks.len(), 1);
+                            let expected = ExceptionRegion {
+                                start: fallbacks[0].start,
+                                end: fallbacks[0].end,
+                                ..original
+                            };
+                            assert!(crate::assembler::fusion_owner_slots::same_manager_region(
+                                fallbacks[0],
+                                &expected
+                            ));
+                        } else {
+                            assert!(fallbacks.is_empty());
+                        }
+                        owners.retain(|region| !region.is_scope_fallback);
+                        if instruction.opcode == RETURN_VALUE {
+                            assert!(owners.is_empty(), "{version:?}/{arity}");
+                        } else {
+                            assert_eq!(owners.len(), 1, "{version:?}/{arity}");
+                            assert_eq!(owners[0].target, Label::from_u32(8));
+                            assert_eq!(owners[0].depth, 0);
+                            assert!(!owners[0].preserve_lasti);
+                            assert!(!owners[0].is_scope_fallback);
+                            let expected = ExceptionRegion {
+                                start: owners[0].start,
+                                end: owners[0].end,
+                                ..original_owner
+                            };
+                            assert!(crate::assembler::fusion_owner_slots::same_manager_region(
+                                owners[0], &expected
+                            ));
+                        }
+                    }
+                }
+            }
         }
     }
 }

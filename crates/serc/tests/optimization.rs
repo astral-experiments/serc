@@ -3731,6 +3731,59 @@ fn nested_authored_pass_preserves_returns_before_removed_assertions() {
 }
 
 #[test]
+fn protected_conditional_tuple_returns_revisit_completed_tail() {
+    let source = r"
+async def run(record, select, ready):
+    try:
+        item = record
+        flag = ready
+        if select:
+            flag = not flag
+        choice = flag
+        return (item.field, 17 if choice else 23) if select else (29, 31)
+    except Exception:
+        return (37, 41)
+";
+    let unprotected = r"
+async def run(record, select, ready):
+    item = record
+    flag = ready
+    if select:
+        flag = not flag
+    choice = flag
+    return (item.field, 17 if choice else 23) if select else (29, 31)
+";
+    for (index, source) in [
+        source.to_owned(),
+        source.replace("async def", "def"),
+        unprotected.to_owned(),
+        source.replace("17 if choice else 23", "17"),
+        source.replace(" if select else (29, 31)", ""),
+        source.replace(
+            "(item.field, 17 if choice else 23) if select else (29, 31)",
+            "(17 if choice else 23) if select else 29",
+        ),
+        source.replace(
+            "(item.field, 17 if choice else 23) if select else (29, 31)",
+            "(17 if choice else 23,) if select else (29,)",
+        ),
+        source.replace(
+            "(item.field, 17 if choice else 23) if select else (29, 31)",
+            "(item.left, item.right, 17 if choice else 23) if select else (29, 31, 43)",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            &source,
+            &format!("conditional_tuple_return_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn erased_loop_branches_preserve_terminal_returns() {
     let source = r"
 def run(data, items, consume, flag):
