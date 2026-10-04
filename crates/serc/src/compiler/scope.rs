@@ -5457,6 +5457,10 @@ fn contextual_expression_requirements(
     collect: impl Fn(&Expr) -> BTreeSet<String>,
 ) -> BTreeSet<String> {
     let raw = collect(expression);
+    // Normalization only filters raw requirements; an empty set cannot gain names.
+    if raw.is_empty() {
+        return raw;
+    }
     let mut spellings = VariableSpellings::default();
     spellings.visit_expr(expression);
     let aliases = colliding_private_spellings(&spellings.names, mangle);
@@ -6098,12 +6102,12 @@ pub(super) fn inlined_comprehension_local_names_in_expression(expression: &Expr)
 
 /// Enclosing bindings passed through an annotation to its nested functions and comprehensions.
 pub(super) fn annotation_nested_required_names(expression: &Expr) -> BTreeSet<String> {
-    let required =
-        analyze_expression_scope(&ruff_python_ast::Parameters::default(), expression).required;
-    let mut nested: BTreeSet<_> = nested_expression_required_names(expression)
-        .intersection(&required)
-        .cloned()
-        .collect();
+    let mut nested = nested_expression_required_names(expression);
+    if !nested.is_empty() {
+        let required =
+            analyze_expression_scope(&ruff_python_ast::Parameters::default(), expression).required;
+        nested.retain(|name| required.contains(name));
+    }
     nested.extend(annotation_comprehension_requirements(expression).captures);
     nested
 }
