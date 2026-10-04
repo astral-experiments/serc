@@ -3413,6 +3413,40 @@ fn erased_assertion_preserves_try_break_exit_donor() {
 }
 
 #[test]
+fn erased_inner_while_tail_preserves_borrow_boundary() {
+    for (index, (outer, assertion_prefix, tail, guard)) in [
+        (true, true, "assert value", "True"),
+        (false, true, "assert value", "True"),
+        (true, false, "assert value", "True"),
+        (false, false, "assert value", "True"),
+        (true, true, "work(value)", "True"),
+        (true, false, "assert value", "receiver.ready(value)"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let prefix = if assertion_prefix {
+            "    assert attempt\n"
+        } else {
+            ""
+        };
+        let body = format!(
+            "while {guard}:\n    value = work(value)\n    attempt += 1\n{prefix}    ready = receiver.ready(value)\n    if ready:\n        break\n    {tail}\nif receiver.ready(value):\n    assert value\n"
+        );
+        let body = if outer {
+            format!("for item in items:\n    {}", body.replace('\n', "\n    "))
+        } else {
+            body
+        };
+        let source = format!(
+            "def sample(value, items, work, receiver):\n    attempt = 0\n    {}",
+            body.replace('\n', "\n    ")
+        );
+        assert_matches_cpython(&source, &format!("erased_inner_while_{index}.py"), &LEVELS);
+    }
+}
+
+#[test]
 fn elided_assertions_preserve_terminal_loop_break_locations() {
     for (case, source) in [
         "def f(flag, items):\n    if flag:\n        for item in items:\n            if item:\n                break\n        assert flag\n",
