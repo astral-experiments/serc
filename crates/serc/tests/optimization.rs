@@ -193,6 +193,59 @@ fn protected_erased_else_preserves_completed_iterator_backedges() {
 }
 
 #[test]
+fn protected_completed_inner_for_preserves_erased_else_backedge() {
+    let protected = r"def collect(groups, cleanup, sink, fallback):
+    try:
+        for group in groups:
+            for record in group:
+                if record.enabled:
+                    assert record.entries
+                    for flag, value in record.entries:
+                        chosen = value if flag else fallback
+                        assert chosen
+                else:
+                    assert record.enabled
+            assert group
+    finally:
+        cleanup()
+        sink(groups)
+";
+    let unprotected = protected
+        .replace("    try:\n", "")
+        .replace(
+            "    finally:\n        cleanup()\n        sink(groups)\n",
+            "",
+        )
+        .lines()
+        .map(|line| line.strip_prefix("    ").unwrap_or(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for (index, source) in [
+        protected.replace("value if flag else fallback", "value"),
+        protected.to_owned(),
+        unprotected.replace("value if flag else fallback", "value"),
+        unprotected,
+        protected.replace(
+            "                else:\n                    assert record.enabled",
+            "                else:\n                    sink(record)",
+        ),
+        protected.replace(
+            "                if record.enabled:",
+            "                for flag, value in record.entries:\n                    assert flag == value\n                if record.enabled:",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            &source,
+            &format!("protected_completed_inner_for_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn erased_nested_arms_keep_the_enclosing_iterator_exit() {
     let source = r"def process(items, flags, kinds, width):
     with manager() as owner, manager(), manager(), manager(), manager(), manager():
