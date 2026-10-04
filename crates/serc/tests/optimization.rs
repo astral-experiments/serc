@@ -271,6 +271,43 @@ fn protected_erased_else_preserves_completed_iterator_backedges() {
 }
 
 #[test]
+fn managed_name_await_preserves_erased_else_backedge() {
+    let source = r"
+async def run(values, transform, manager, pending, cleanup):
+    try:
+        for value in values:
+            item = transform(value)
+            if item == 0:
+                with manager(item, enabled=True):
+                    await pending
+            else:
+                assert item
+    finally:
+        cleanup()
+        cleanup()
+";
+    for (index, source) in [
+        source.to_owned(),
+        source.replace("await pending", "await transform(item)"),
+        source.replace("await pending", "transform(item)"),
+        source.replace(
+            "                with manager(item, enabled=True):\n                    await pending",
+            "                await pending",
+        ),
+        source.replace("with manager(", "with manager.scope("),
+        source.replace(
+            "                assert item",
+            "                transform(item)",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(&source, &format!("managed_name_await_{index}.py"), &LEVELS);
+    }
+}
+
+#[test]
 fn protected_conditional_store_preserves_erased_else_backedge() {
     let protected = r"def collect(batches, left, right, cleanup, sink):
     try:
