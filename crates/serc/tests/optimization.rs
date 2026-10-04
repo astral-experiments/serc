@@ -7961,6 +7961,61 @@ fn erased_iterator_else_stays_inside_enclosing_finally() {
 }
 
 #[test]
+fn protected_iterator_tail_preserves_completed_nested_conditionals() {
+    let source = r"def sample(items, flag, work, finish):
+    try:
+        for item in items:
+            item = work(item)
+            assert flag
+            if item is None:
+                if flag:
+                    value = work(item)
+                    assert value
+                    value = work(value)
+                else:
+                    assert flag
+            else:
+                assert flag
+        assert flag
+    finally:
+        finish()
+";
+    for (index, source) in [
+        source.to_owned(),
+        source.replace("                else:\n                    assert flag\n", ""),
+        source.replace(
+            "                else:\n                    assert flag\n",
+            "                else:\n                    work(flag)\n",
+        ),
+        source.replace("            else:\n                assert flag\n", ""),
+        source.replace(
+            "                if flag:\n                    value = work(item)\n                    assert value\n                    value = work(value)\n                else:\n                    assert flag\n",
+            "                work(item)\n",
+        ),
+        source.replace("    finally:\n        finish()\n", "    except LookupError:\n        pass\n"),
+        source.replace("                if flag:\n", "                if item is flag:\n"),
+        source.replace(
+            "                    value = work(item)\n",
+            "                    assert item\n                    value = work(item)\n",
+        ),
+        source.replace("            if item is None:\n", "            if item is not None:\n"),
+        source.replace(
+            "            else:\n                assert flag\n",
+            "            else:\n                work(flag)\n",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            &source,
+            &format!("protected_iterator_nested_conditionals_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn erased_conditional_join_precedes_named_awaitable_finalizer() {
     let source = r"async def f(resource, cleanup):
     try:

@@ -19176,6 +19176,37 @@ impl<'source> Compiler<'source> {
             && final_body
                 .iter()
                 .all(|statement| self.context.is_elided_statement(statement));
+        let completed_work_at_restart = self
+            .control
+            .loops
+            .contexts
+            .last()
+            .is_some_and(|context| context.continue_label == restart);
+        let completed_conditional_arm = |body: &[Stmt]| {
+            !body.is_empty()
+                && body.iter().all(|part| {
+                    let single = std::slice::from_ref(part);
+                    self.context.is_elided_statement(part)
+                        || (suite_has_linear_borrow_fallthrough(single)
+                            && suite_has_nonsuspending_conditional_work(single)
+                            && !suite_contains_yield(single))
+                })
+        };
+        // Each nested arm completes before the outer erased edge reaches the
+        // iterator. Removed assertions do not introduce another owner or exit.
+        let completed_conditional_work = |part: &Stmt| {
+            completed_work_at_restart
+                && matches!(part, Stmt::If(branch)
+                    if condition_has_linear_runtime_leaves(&branch.test)
+                        && !expression_suspends_current_scope(&branch.test)
+                        && original_condition_has_unique_jump_target(&branch.test, true)
+                        && original_condition_has_unique_jump_target(&branch.test, false)
+                        && completed_conditional_arm(&branch.body)
+                        && (branch.elif_else_clauses.is_empty()
+                            || matches!(branch.elif_else_clauses.as_slice(), [clause]
+                                if clause.test.is_none()
+                                    && completed_conditional_arm(&clause.body))))
+        };
         let iterator_inside_finally = matches!(self.unit.scope, Scope::Function { .. })
             && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
             && self.control.finally.active_finally_try_bodies == 1
@@ -19201,7 +19232,14 @@ impl<'source> Compiler<'source> {
             })
             && condition_has_linear_runtime_leaves(final_test)
             && condition_jump_target_count(final_test, false) == 1
-            && (erased_final_body || suite_has_linear_borrow_fallthrough(final_body));
+            && (erased_final_body
+                || suite_has_linear_borrow_fallthrough(final_body)
+                || (!final_body.is_empty()
+                    && final_body.iter().all(|part| {
+                        self.context.is_elided_statement(part)
+                            || suite_has_linear_borrow_fallthrough(std::slice::from_ref(part))
+                            || completed_conditional_work(part)
+                    })));
         // With no intervening cleanup, the removed else reaches the iterator
         // directly. Native normalizes that backward condition into fresh slots.
         // A comparison chain keeps its own operand cleanup before the same exit.
@@ -19213,12 +19251,6 @@ impl<'source> Compiler<'source> {
         // A conditional call argument rejoins before the call's discarded result,
         // so its internal branches also stay separate from the erased false edge.
         // An inner if without else completes either edge before the same backedge.
-        let completed_work_at_restart = self
-            .control
-            .loops
-            .contexts
-            .last()
-            .is_some_and(|context| context.continue_label == restart);
         let protected_iterator_work_else = eligible_else
             && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
             && self.control.in_loop_tail_without_nested_cleanup()
@@ -19245,19 +19277,7 @@ impl<'source> Compiler<'source> {
                                             && [&value.body, &value.orelse].into_iter().all(|value|
                                                 !expression_contains_inline_branch(value)
                                                     && !expression_suspends_current_scope(value)))))
-                            // Erased arms keep their condition but add no work or
-                            // cleanup before reaching the same iterator backedge.
-                            || (completed_work_at_restart && matches!(statement, Stmt::If(branch)
-                                if condition_has_linear_runtime_leaves(&branch.test)
-                                    && !expression_suspends_current_scope(&branch.test)
-                                    && original_condition_has_unique_jump_target(&branch.test, true)
-                                    && original_condition_has_unique_jump_target(&branch.test, false)
-                                    && !branch.body.is_empty()
-                                    && branch.body.iter().all(|part| self.context.is_elided_statement(part))
-                                    && matches!(branch.elif_else_clauses.as_slice(), [clause]
-                                        if clause.test.is_none()
-                                            && !clause.body.is_empty()
-                                            && clause.body.iter().all(|part| self.context.is_elided_statement(part)))))
+                            || completed_conditional_work(statement)
                             || matches!(statement, Stmt::Expr(expression)
                                 if cleanup_conditional_argument_has_eager_call_prefix(&expression.value))
                             || matches!(statement, Stmt::For(inner)
@@ -20315,6 +20335,21 @@ impl<'source> Compiler<'source> {
                         })
                     });
                 let linear_exit_body = |body: &[Stmt]| {
+                    if non_final_branch
+                        && !try_body_normal_exit
+                        && body
+                            .iter()
+                            .any(|part| !self.context.is_elided_statement(part))
+                        && body.iter().all(|part| {
+                            let single = std::slice::from_ref(part);
+                            self.context.is_elided_statement(part)
+                                || (suite_has_linear_borrow_fallthrough(single)
+                                    && suite_has_nonsuspending_conditional_work(single)
+                                    && !suite_contains_yield(single))
+                        })
+                    {
+                        return true;
+                    }
                     if self.unit.flags & CO_COROUTINE == 0 {
                         return suite_has_linear_borrow_fallthrough(body);
                     }
@@ -20327,6 +20362,25 @@ impl<'source> Compiler<'source> {
                     suite_has_linear_borrow_fallthrough(&body[..=end])
                         && suite_has_nonsuspending_conditional_work(&body[..=end])
                 };
+                let enclosing_finally_donor = non_final_branch
+                    && !try_body_normal_exit
+                    && iterator_inside_finally
+                    && self.control.in_loop_tail_without_nested_cleanup()
+                    // Only the enclosing protected try is active, not a finalizer copy.
+                    && self.control.finally.active_return_finally_contexts.len() == 1
+                    && self.control.finally.active_loop_finally_contexts.len() == 1
+                    && self.control.finally.active_pass_finally_locations.is_empty()
+                    && self
+                        .control
+                        .finally
+                        .preserved_return_value_contexts
+                        .is_empty()
+                    && self.control.finally.copied_return_finally_preserved_values == 0
+                    && self.control.finally.active_finally_try_bodies == 1
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_copied_finally_bodies == 0
+                    && self.control.finally.active_finally_end_blocks == 0
+                    && self.control.finally.active_overriding_finally_returns == 0;
                 if shared_match_failure || copied_erased_branch_exit {
                     self.assembler.set_location(SourceLocation::NONE);
                 } else if let Some(range) = suite_match_failure_range(body) {
@@ -20352,7 +20406,9 @@ impl<'source> Compiler<'source> {
                     // A single ordinary try keeps the backedge's exception owner while
                     // the false condition supplies its location. A normal try exit's
                     // converted POP_BLOCK prevents threading but keeps the same donor.
+                    // A finally outside the iterator likewise keeps that false donor.
                     && (!self.has_active_control_flow_region()
+                        || enclosing_finally_donor
                         // A coroutine's implicit stop-iteration wrapper does not
                         // change this nonsuspending false edge's source donor.
                         || (self.unit.flags & CO_COROUTINE != 0
@@ -20376,7 +20432,8 @@ impl<'source> Compiler<'source> {
                     && self.control.withs.active_with_exits.is_empty()
                     && !self.control.in_exception_handler()
                     && self.control.exceptions.active_exception_group_handlers == 0
-                    && self.control.finally.is_inactive_for_return_unwind()
+                    && (self.control.finally.is_inactive_for_return_unwind()
+                        || enclosing_finally_donor)
                     && self.control.loops.contexts.len() == 1
                     && self
                         .control
