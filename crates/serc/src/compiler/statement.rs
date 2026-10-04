@@ -21421,7 +21421,16 @@ impl<'source> Compiler<'source> {
             if self.context.python_version == crate::PythonVersion::Py314
                 && matches!(self.unit.scope, Scope::Function { .. })
                 && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
-                && self.control.loops.contexts.is_empty()
+                && (self.control.loops.contexts.is_empty()
+                    || (statement.orelse.is_empty()
+                        && matches!(self.control.loops.contexts.as_slice(), [outer]
+                            if matches!(outer.iterator_cleanup, IteratorCleanup::Sync)
+                                && !outer.has_orelse
+                                && outer.with_depth == self.control.withs.active_with_exits.len()
+                                && outer.exception_region_depth
+                                    == self.control.exceptions.active_exception_region_exclusions.len()
+                                && outer.finally_end_depth
+                                    == self.control.finally.active_finally_end_blocks)))
                 && !self.has_active_control_flow_region()
                 && !self.control.in_exception_handler()
                 && self.control.finally.is_inactive_for_return_unwind()
@@ -21435,7 +21444,13 @@ impl<'source> Compiler<'source> {
                     borrow_body = leading;
                 }
                 if !borrow_body.split_last().is_some_and(|(last, leading)| {
-                    (leading.is_empty() || suite_has_linear_borrow_fallthrough(leading))
+                    (leading.is_empty()
+                        || suite_has_linear_borrow_fallthrough(leading)
+                        || leading.iter().all(|part| {
+                            suite_has_linear_borrow_fallthrough(std::slice::from_ref(part))
+                                || (matches!(part, Stmt::Global(declaration) if declaration.names.is_empty())
+                                    && self.context.is_elided_statement(part))
+                        }))
                         && matches!(last, Stmt::If(branch)
                         if branch.elif_else_clauses.is_empty()
                             && branch.body.split_last().is_some_and(|(last, leading)| {
