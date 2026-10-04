@@ -15,6 +15,41 @@ use serc::{
 };
 
 #[test]
+fn sequence_capture_wildcard_cleanup_matrix() {
+    let source = r#"
+def run(value):
+    match value:
+        case Packet(
+            kind=Kind(tag="entry"),
+            values=[first, _, _, _, last],
+            options=[],
+        ):
+            return first, last
+    return None
+"#;
+    let nested = format!(
+        "def outer():\n{}\n    return run\n",
+        source.lines().fold(String::new(), |mut output, line| {
+            writeln!(output, "    {line}").unwrap();
+            output
+        })
+    );
+    for source in [
+        source.to_owned(),
+        source.replace("_, last]", "_, _]").replace("return first, last", "return first"),
+        source.replace(
+            "Packet(\n            kind=Kind(tag=\"entry\"),\n            values=[first, _, _, _, last],\n            options=[],\n        )",
+            "Packet(kind=Kind(tag=\"entry\"), values=[first, _, _, _, last], options=[])",
+        ),
+        source.replace("            kind=Kind", "            options=[],\n            kind=Kind").replace("            options=[],\n        )", "        )"),
+        source.replace("[first, _, _, _, last]", "[first, _, last]"),
+        nested,
+    ] {
+        assert_matches_cpython(&source, "sequence_capture_cleanup.py", &LEVELS);
+    }
+}
+
+#[test]
 fn retired_normal_try_exits_preserve_borrow_boundaries() {
     let source = r"
 def run(active, take, consume, entries):

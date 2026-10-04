@@ -188,6 +188,7 @@ struct CaptureCleanupRotation<'a> {
     removed_slots: usize,
     consumer_rotation: usize,
     consumers: &'a [Item],
+    projected_pop_donor: Option<(usize, Instruction)>,
 }
 
 /// Captures followed by mapping wildcards emit repeated full rotations before cleanup.
@@ -274,11 +275,83 @@ fn mapping_capture_cleanup_rotation(items: &[Item]) -> Option<CaptureCleanupRota
         removed_slots: swap_count,
         consumer_rotation: captures,
         consumers,
+        projected_pop_donor: None,
+    })
+}
+
+/// Wildcards consume only the front of a sequence capture's descending rotation.
+fn sequence_capture_cleanup_rotation(items: &[Item]) -> Option<CaptureCleanupRotation<'_>> {
+    let [Item::Instruction(prefix), Item::Instruction(first), ..] = items else {
+        return None;
+    };
+    let unpacked = usize::try_from(prefix.value_argument()?).ok()?;
+    let depth = usize::try_from(first.value_argument()?).ok()?;
+    if prefix.opcode != UNPACK_SEQUENCE
+        || unpacked < 3
+        || !(unpacked..=unpacked.checked_add(1)?).contains(&depth)
+        || prefix.location.line < 0
+    {
+        return None;
+    }
+    for (index, item) in items.get(1..depth)?.iter().enumerate() {
+        if !matches!(item, Item::Instruction(instruction)
+            if instruction.opcode == SWAP
+                && instruction.value_argument() == u32::try_from(depth - index).ok()
+                && instruction.location.line == prefix.location.line)
+        {
+            return None;
+        }
+    }
+    let count = items[depth..]
+        .iter()
+        .take_while(|item| {
+            matches!(item, Item::Instruction(instruction)
+            if instruction.opcode == POP_TOP
+                && instruction.value_argument() == Some(0)
+                && instruction.location.line == prefix.location.line)
+        })
+        .count();
+    if count < 3 || count >= unpacked {
+        return None;
+    }
+    let consumed = depth.checked_add(count)?;
+    let Item::Instruction(following) = items.get(consumed)? else {
+        return None;
+    };
+    if !matches!(following.opcode, SWAP | MATCH_SEQUENCE | STORE_FAST)
+        || following.value_argument().is_none()
+        || following.location.line < 0
+    {
+        return None;
+    }
+    for item in &items[..consumed] {
+        let Item::Instruction(instruction) = item else {
+            return None;
+        };
+        if instruction.no_location_policy != ir::NoLocationPolicy::default()
+            || instruction.fusion_policy != ir::FusionPolicy::default()
+            || instruction.jump_policy != ir::JumpPolicy::default()
+        {
+            return None;
+        }
+    }
+    let Item::Instruction(last_pop) = items[consumed - 2] else {
+        unreachable!();
+    };
+    Some(CaptureCleanupRotation {
+        swap_count: depth - 1,
+        removed_slots: count - 1,
+        consumer_rotation: 1,
+        consumers: &items[depth..consumed],
+        // The rotated last pop can retire NOPs from the following capture's swaps.
+        projected_pop_donor: Some((consumed - 1, last_pop)),
     })
 }
 
 fn capture_cleanup_rotation(items: &[Item]) -> Option<CaptureCleanupRotation<'_>> {
-    if let Some(rotation) = mapping_capture_cleanup_rotation(items) {
+    if let Some(rotation) =
+        mapping_capture_cleanup_rotation(items).or_else(|| sequence_capture_cleanup_rotation(items))
+    {
         return Some(rotation);
     }
     let [Item::Instruction(prefix), Item::Instruction(first_swap), ..] = items else {
@@ -422,6 +495,7 @@ fn capture_cleanup_rotation(items: &[Item]) -> Option<CaptureCleanupRotation<'_>
         removed_slots: consumer_count - 1 - usize::from(retained_line_nop),
         consumer_rotation: 1,
         consumers,
+        projected_pop_donor: None,
     })
 }
 
