@@ -8771,3 +8771,41 @@ fn erased_assertions_preserve_populated_scope_footer() {
         assert_matches_cpython(source, "populated_scope_footer.py", &LEVELS);
     }
 }
+
+#[test]
+fn filtered_dict_store_preserves_protected_iterator_backedge() {
+    let source = r"def collect(batches, selected, produce, accept, sink, cleanup):
+    try:
+        for batch in batches:
+            for key, value in batch:
+                if key not in selected and value in selected:
+                    snapshot = {slot: data for slot, data in produce(batch)}
+                    assert snapshot
+                    selected[key] = value
+                    sink(snapshot)
+                else:
+                    assert key != value
+    finally:
+        cleanup()
+";
+    let filtered = source.replace("produce(batch)}", "produce(batch) if data}");
+    let unprotected = filtered
+        .replace("    try:\n", "")
+        .replace("    finally:\n        cleanup()\n", "")
+        .lines()
+        .map(|line| line.strip_prefix("    ").unwrap_or(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for source in [
+        source.to_owned(),
+        filtered.clone(),
+        filtered.replace(" if data}", " if data is not None}"),
+        filtered.replace(" if data}", " if not data}"),
+        filtered.replace(" if data}", " if accept(data)}"),
+        filtered.replace(" if data}", " if slot in selected}"),
+        filtered.replace("assert key != value", "sink(key)"),
+        unprotected,
+    ] {
+        assert_matches_cpython(&source, "filtered_protected_iterator.py", &LEVELS);
+    }
+}
