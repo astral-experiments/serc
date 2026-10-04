@@ -2370,6 +2370,79 @@ impl Assembler {
         true
     }
 
+    /// Keeps one original break until its bare-raise else's handler cleanup is copied.
+    pub(crate) fn defer_original_raising_while_break_cleanup(&mut self) -> bool {
+        if self.python_version < crate::PythonVersion::Py314 {
+            return false;
+        }
+        let items = self.linear_items();
+        let labels = trailing_labels(items).collect::<Vec<_>>();
+        let prefix = &items[..items.len() - labels.len()];
+        let Some(Item::Instruction(raised)) = prefix.last() else {
+            return false;
+        };
+        let Some(depth) = raised.depth_after() else {
+            return false;
+        };
+        if labels.is_empty()
+            || raised.location.line < 0
+            || *raised
+                != Instruction::new(
+                    RAISE_VARARGS,
+                    Operand::Value(0),
+                    raised.location,
+                    Some(depth),
+                )
+            || self.join_labels_have_authored_location(&labels)
+            || labels.iter().any(|label| {
+                prefix.contains(&Item::Label(*label))
+                    || self.folded_away_condition_targets.contains(label)
+                    || self.folded_away_loop_else_targets.contains(label)
+                    || self
+                        .exception_owner_provenance
+                        .omitted_nop_counts
+                        .contains_key(label)
+            })
+        {
+            return false;
+        }
+        let mut incoming = None;
+        for (index, item) in prefix.iter().enumerate() {
+            let Item::Instruction(jump) = item else {
+                continue;
+            };
+            let target = match jump.operand() {
+                Operand::Forward(target) | Operand::Backward(target)
+                    if labels.contains(&target) =>
+                {
+                    target
+                }
+                _ => continue,
+            };
+            let mut expected = Instruction::new(
+                JUMP_FORWARD,
+                Operand::Forward(target),
+                jump.location,
+                Some(depth),
+            );
+            expected.fusion_policy.mark_authored_break();
+            expected.jump_policy.prevent_threading_target();
+            expected.jump_policy.retain_nop_for_direct_target();
+            expected.add_pre_fold_extra_instructions(1);
+            if jump.location.line < 0 || *jump != expected || incoming.replace(index).is_some() {
+                return false;
+            }
+        }
+        let Some(index) = incoming else {
+            return false;
+        };
+        let Item::Instruction(jump) = &mut self.linear_items_mut()[index] else {
+            unreachable!("the original break was checked above");
+        };
+        jump.jump_policy.defer_removal();
+        true
+    }
+
     /// Certifies a guard-false donor beside a separate normal-finally exit.
     ///
     /// The two source labels alias an empty original array after exceptional cleanup.

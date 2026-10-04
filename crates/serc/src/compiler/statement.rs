@@ -28577,6 +28577,24 @@ impl<'source> Compiler<'source> {
                     !self.context.is_elided_statement(part)
                 }), Some(Stmt::While(tail)) if tail.orelse.is_empty())
                 && self.assembler.defer_original_while_break_cleanup_edges();
+            let handler_has_raising_while_break_cleanup = self.context.python_version
+                >= crate::PythonVersion::Py314
+                && !statement.is_star
+                && statement.orelse.is_empty()
+                && !terminal
+                && loop_tail.is_none()
+                && !cleanup_has_small_return_successor
+                && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+                && self.control.loops.contexts.is_empty()
+                && self.control.withs.active_with_exits.is_empty()
+                && self.control.exceptions.active_exception_handlers.is_empty()
+                && self.control.exceptions.active_exception_group_handlers == 0
+                && self.control.finally.active_normal_finally_bodies == 0
+                && self.control.finally.active_finally_end_blocks == 0
+                && self.control.finally.active_copied_finally_bodies == 0
+                && self.control.generators.coroutine_suspension_epoch == handler_suspension_epoch
+                && handler_ends_in_raising_while_break(&handler.body)
+                && self.assembler.defer_original_raising_while_break_cleanup();
             // Removed assertions do not separate a for-loop's authored break from
             // its artificial name cleanup. Preserve that original unlocated join
             // so exit copying gives break and exhaustion their own cleanup spans.
@@ -28625,6 +28643,7 @@ impl<'source> Compiler<'source> {
                 || handler_has_guarded_finally_cleanup
                 || coroutine_guarded_finally_cleanup
                 || handler_has_named_while_break_join
+                || handler_has_raising_while_break_cleanup
                 || handler_has_original_conditional_loop_join
                 || handler_has_guarded_for_break_join
                 || handler_has_nested_else_loop_cleanup
@@ -42269,6 +42288,23 @@ fn handler_ends_in_runtime_while_break(body: &[Stmt]) -> bool {
         && !suite_contains_loop_break_with_finally(&tail.body)
 }
 
+fn handler_ends_in_raising_while_break(body: &[Stmt]) -> bool {
+    let Some(Stmt::While(tail)) = body.last() else {
+        return false;
+    };
+    matches!(tail.orelse.as_slice(), [Stmt::Raise(raised)]
+        if raised.exc.is_none() && raised.cause.is_none())
+        && condition_has_only_runtime_tests(&tail.test)
+        && !expression_suspends_current_scope(&tail.test)
+        && !expression_contains_chained_comparison(&tail.test)
+        && condition_jump_target_count(&tail.test, false) == 1
+        && suite_contains_loop_break(&tail.body)
+        && !suite_contains_multiple_loop_breaks(&tail.body)
+        && !suite_contains_loop(&tail.body)
+        && !suite_contains_loop_break_with_finally(&tail.body)
+        && !suite_contains_loop_break_with_manager(&tail.body)
+}
+
 // A terminal recovery can share the containing handler's unlocated cleanup.
 // Incoming jumps copy that cleanup, leaving its original block empty. A located
 // suffix stops this path. A final else can share it; without a final else, a
@@ -44537,6 +44573,33 @@ fn suite_contains_loop_break_with_finally(body: &[Stmt]) -> bool {
     detector.0
 }
 
+/// Detects a managed break owned by this loop, excluding nested loop bodies and scopes.
+fn suite_contains_loop_break_with_manager(body: &[Stmt]) -> bool {
+    struct Detector(bool);
+
+    impl<'a> Visitor<'a> for Detector {
+        fn visit_stmt(&mut self, statement: &'a Stmt) {
+            if self.0 {
+                return;
+            }
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_stmt(statement));
+            }
+            match statement {
+                Stmt::With(manager) if suite_contains_loop_break(&manager.body) => self.0 = true,
+                Stmt::For(loop_statement) => self.visit_body(&loop_statement.orelse),
+                Stmt::While(loop_statement) => self.visit_body(&loop_statement.orelse),
+                Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {}
+                _ => walk_stmt(self, statement),
+            }
+        }
+    }
+
+    let mut detector = Detector(false);
+    detector.visit_body(body);
+    detector.0
+}
+
 fn is_unfolded_nested_else_return(expression: &Expr) -> bool {
     let Expr::If(conditional) = expression else {
         return false;
@@ -46100,6 +46163,102 @@ mod tests {
     };
     use ruff_python_ast::Stmt;
     use ruff_python_parser::parse_module;
+
+    #[test]
+    fn managed_break_respects_loop_and_scope_ownership() {
+        for (body, expected) in [
+            ("with manager:\n    if flag:\n        break", true),
+            ("if flag:\n    with manager:\n        break", true),
+            (
+                "try:\n    with manager:\n        break\nexcept Error:\n    pass",
+                true,
+            ),
+            ("with manager:\n    continue", false),
+            (
+                "for item in items:\n    with manager:\n        break",
+                false,
+            ),
+            (
+                "for item in items:\n    pass\nelse:\n    with manager:\n        break",
+                true,
+            ),
+            ("while flag:\n    with manager:\n        break", false),
+            (
+                "while flag:\n    pass\nelse:\n    with manager:\n        break",
+                true,
+            ),
+            (
+                "def inner():\n    while True:\n        with manager:\n            break",
+                false,
+            ),
+            (
+                "class Inner:\n    while True:\n        with manager:\n            break",
+                false,
+            ),
+            ("break", false),
+            ("with manager:\n    operation()", false),
+        ] {
+            let source = format!("while True:\n    {}\n", body.replace('\n', "\n    "));
+            let parsed = parse_module(&source).unwrap();
+            let [Stmt::While(loop_statement)] = parsed.suite().as_slice() else {
+                panic!("expected one enclosing loop");
+            };
+            assert_eq!(
+                super::suite_contains_loop_break_with_manager(&loop_statement.body),
+                expected,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn raising_while_cleanup_requires_one_unwind_free_break() {
+        let source = "while ready():\n    if selected():\n        value = 41\n        break\n    advance()\nelse:\n    raise\n";
+        for (body, expected) in [
+            (source.to_owned(), true),
+            (source.replace("else:\n    raise\n", ""), false),
+            (source.replace("    raise\n", "    advance()\n"), false),
+            (
+                source.replace("    raise\n", "    raise ValueError\n"),
+                false,
+            ),
+            (source.replace("while ready():", "while True:"), false),
+            (
+                source.replace("while ready():", "while await ready():"),
+                false,
+            ),
+            (
+                source.replace("    advance()\n", "    if other():\n        break\n"),
+                false,
+            ),
+            (
+                source.replace("    advance()\n", "    while other():\n        break\n"),
+                false,
+            ),
+            (
+                source.replace(
+                    "        break\n",
+                    "        with manager:\n            break\n",
+                ),
+                false,
+            ),
+            (
+                source.replace(
+                    "        break\n",
+                    "        try:\n            break\n        finally:\n            cleanup()\n",
+                ),
+                false,
+            ),
+            (format!("{source}after()\n"), false),
+        ] {
+            let parsed = parse_module(&body).unwrap();
+            assert_eq!(
+                super::handler_ends_in_raising_while_break(parsed.suite()),
+                expected,
+                "{body}"
+            );
+        }
+    }
 
     #[test]
     fn boolean_values_finish_before_the_store() {

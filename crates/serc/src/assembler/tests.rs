@@ -11,6 +11,172 @@ use crate::target::opcodes::*;
 use crate::target::operands::{CommonConstant, Conversion, FunctionAttribute, ResumeLocation};
 
 #[test]
+fn raising_while_cleanup_requires_exact_original_edges() {
+    for version in [
+        crate::PythonVersion::Py312,
+        crate::PythonVersion::Py313,
+        crate::PythonVersion::Py314,
+        crate::PythonVersion::Py315,
+    ] {
+        for mutation in [
+            "intact",
+            "no edge",
+            "two edges",
+            "conditional",
+            "backward",
+            "unknown depth",
+            "different depth",
+            "unlocated",
+            "not authored",
+            "threadable",
+            "always nop",
+            "no slot",
+            "extra slot",
+            "owner",
+            "preserved",
+            "hidden",
+            "fallthrough",
+            "raise operand",
+            "raise depth",
+            "raise owner",
+            "raise location",
+            "authored target",
+            "borrow alias",
+            "folded target",
+            "folded else",
+            "hidden target",
+            "handler target",
+            "cycle",
+        ] {
+            let mut assembler = Assembler::with_python_version(version);
+            let end = assembler.label();
+            if mutation == "cycle" {
+                assembler.mark(end);
+            }
+            let count = if mutation == "two edges" {
+                2
+            } else {
+                usize::from(mutation != "no edge")
+            };
+            for _ in 0..count {
+                assembler.set_location(SourceLocation::new(4, 4, 8, 13));
+                let jump = assembler.emit_forward_with_depth(
+                    JUMP_FORWARD,
+                    end,
+                    1,
+                    ExceptionPolicy::default(),
+                );
+                assembler.mark_jump_as_authored_break(jump);
+                assembler.prevent_jump_threading_target(jump);
+                assembler.preserve_direct_inlined_jump_nop(jump);
+                if mutation != "no slot" {
+                    assembler.add_last_original_block_slots(if mutation == "extra slot" {
+                        2
+                    } else {
+                        1
+                    });
+                }
+                let Item::Instruction(jump) = assembler.linear_items_mut().last_mut().unwrap()
+                else {
+                    unreachable!()
+                };
+                match mutation {
+                    "conditional" => jump.opcode = POP_JUMP_IF_FALSE,
+                    "backward" => jump.set_operand(Operand::Backward(end)),
+                    "unknown depth" | "different depth" => {
+                        let mut replacement = Instruction::new(
+                            JUMP_FORWARD,
+                            Operand::Forward(end),
+                            jump.location,
+                            if mutation == "unknown depth" {
+                                None
+                            } else {
+                                Some(2)
+                            },
+                        );
+                        replacement.fusion_policy.mark_authored_break();
+                        replacement.jump_policy = jump.jump_policy;
+                        replacement.add_pre_fold_extra_instructions(1);
+                        *jump = replacement;
+                    }
+                    "unlocated" => jump.location = SourceLocation::NONE,
+                    "not authored" => jump.fusion_policy = FusionPolicy::default(),
+                    "threadable" => jump.jump_policy = JumpPolicy::default(),
+                    "always nop" => jump.jump_policy.retain_nop(),
+                    "owner" => jump.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS),
+                    "preserved" => jump.no_location_policy.preserve_location(),
+                    "hidden" => jump.local_policy.add_hidden_exception_owner_slots(1),
+                    _ => {}
+                }
+            }
+            assembler.set_location(if mutation == "raise location" {
+                SourceLocation::NONE
+            } else {
+                SourceLocation::new(8, 8, 4, 9)
+            });
+            assembler.emit_with_depth(
+                if mutation == "fallthrough" {
+                    NOP
+                } else {
+                    RAISE_VARARGS
+                },
+                u32::from(mutation == "raise operand"),
+                if mutation == "raise depth" { 2 } else { 1 },
+                if mutation == "raise owner" {
+                    ExceptionPolicy::EXCLUDE_ALWAYS
+                } else {
+                    ExceptionPolicy::default()
+                },
+            );
+            assembler.mark(end);
+            match mutation {
+                "authored target" => {
+                    assembler.original_nop_targets.insert(end);
+                }
+                "borrow alias" => {
+                    assembler.borrow_block_aliases.insert(end);
+                }
+                "folded target" => {
+                    assembler.folded_away_condition_targets.insert(end);
+                }
+                "folded else" => {
+                    assembler.folded_away_loop_else_targets.insert(end);
+                }
+                "hidden target" => {
+                    assembler
+                        .exception_owner_provenance
+                        .omitted_nop_counts
+                        .insert(end, 1);
+                }
+                "handler target" => {
+                    assembler.record_exception_setup(end, false);
+                }
+                _ => {}
+            }
+            let before = assembler.linear_items().to_vec();
+            let accepted = mutation == "intact" && version >= crate::PythonVersion::Py314;
+            assert_eq!(
+                assembler.defer_original_raising_while_break_cleanup(),
+                accepted,
+                "{version:?}: {mutation}"
+            );
+            let mut expected = before;
+            if accepted {
+                let Item::Instruction(jump) = &mut expected[0] else {
+                    unreachable!()
+                };
+                jump.jump_policy.defer_removal();
+            }
+            assert_eq!(
+                assembler.linear_items(),
+                expected,
+                "{version:?}: {mutation}"
+            );
+        }
+    }
+}
+
+#[test]
 fn plain_linear_scopes_do_not_allocate_owner_provenance() {
     let mut assembler = Assembler::with_python_version(crate::PythonVersion::Py314);
     assembler.emit(LOAD_CONST, 0);

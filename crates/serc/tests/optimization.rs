@@ -53,6 +53,43 @@ fn copied_finally_compound_break_threads_both_conditions() {
 }
 
 #[test]
+fn handler_raising_while_else_preserves_break_cleanup() {
+    let source = r"async def guarded_finalizer(owner, enabled, marker):
+    try:
+        await perform(owner)
+    except ValueError:
+        raise
+    except RuntimeError as failure:
+        note(owner)
+        while ready(owner):
+            if selected(owner):
+                marker = 41
+                break
+            advance(owner)
+        else:
+            raise
+    finally:
+        if enabled and marker != 17:
+            try:
+                await owner.finish(marker)
+            except OSError:
+                note(29)
+";
+    for source in [
+        source.to_owned(),
+        source.replace("        else:\n            raise\n", ""),
+        source.replace("except RuntimeError as failure:", "except RuntimeError:"),
+        source.replace("async def", "def").replace("await ", ""),
+        source.replace("        while ready(owner):\n            if selected(owner):\n                marker = 41\n                break\n            advance(owner)\n        else:\n            raise\n",
+            "        if selected(owner):\n            marker = 41\n        else:\n            raise\n"),
+        source.replace("        if enabled and marker != 17:\n            try:\n                await owner.finish(marker)\n            except OSError:\n                note(29)\n",
+            "        try:\n            await owner.finish(marker)\n        except OSError:\n            note(29)\n"),
+    ] {
+        assert_matches_cpython(&source, "handler_raising_while_else.py", &LEVELS);
+    }
+}
+
+#[test]
 fn unnamed_handler_match_cleanup_preserves_success_edges() {
     let source = r"async def handler_match(owner, kinds, operation, sink, choice):
     result = None
