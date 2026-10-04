@@ -9175,6 +9175,74 @@ else:
 }
 
 #[test]
+fn erased_protected_iterator_suffix_preserves_tail_condition() {
+    let source = r"def nested_erased_tail(items, enabled, ready, sink, cleanup):
+    try:
+        for item in items:
+            sink(item)
+            if enabled:
+                first = sink(item)
+                second = sink(item)
+                if ready == 0:
+                    sink(first)
+                assert ready
+    finally:
+        cleanup()
+        cleanup()
+";
+    let unprotected = r"def nested_unprotected_tail(items, enabled, ready, sink):
+    for item in items:
+        sink(item)
+        if enabled:
+            first = sink(item)
+            second = sink(item)
+            if ready == 0:
+                sink(first)
+            assert ready
+";
+    let conditional = "                if ready == 0:\n                    sink(first)\n";
+    let nested_cleanup = "                try:\n                    if ready == 0:\n                        sink(first)\n                    assert ready\n                finally:\n                    cleanup()\n";
+    let forms = [
+        source.to_owned(),
+        source
+            .replace(
+                "nested_erased_tail(items, enabled, ready, sink, cleanup)",
+                "nested_store_tail(items, enabled, ready, output, sink, cleanup)",
+            )
+            .replace("sink(first)", "output[0] = first"),
+        source
+            .replace("nested_erased_tail", "nested_plain_tail")
+            .replace("                assert ready\n", ""),
+        source
+            .replace("nested_erased_tail", "nested_live_tail")
+            .replace("assert ready", "sink(ready)"),
+        unprotected.to_owned(),
+        source
+            .replace("nested_erased_tail", "flat_erased_tail")
+            .replace(conditional, ""),
+        source
+            .replace("nested_erased_tail", "nested_cleanup_tail")
+            .replace(
+                &format!("{conditional}                assert ready\n"),
+                nested_cleanup,
+            ),
+        source
+            .replace("nested_erased_tail", "iterator_else_tail")
+            .replace(
+                "    finally:\n",
+                "        else:\n            sink(ready)\n    finally:\n",
+            ),
+    ];
+    for (index, source) in forms.into_iter().enumerate() {
+        assert_matches_cpython(
+            &source,
+            &format!("erased_protected_iterator_suffix_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn erased_assertions_preserve_populated_scope_footer() {
     for source in [
         r"def finish(left, right, sink):
