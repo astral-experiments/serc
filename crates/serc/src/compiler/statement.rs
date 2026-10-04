@@ -19221,6 +19221,37 @@ impl<'source> Compiler<'source> {
             && final_body
                 .iter()
                 .all(|statement| self.context.is_elided_statement(statement));
+        // A completed manager's normal exit returns to the saved loop owner.
+        // Calls and completed awaits in its body cannot reach the erased else.
+        let completed_manager_work = matches!(final_body, [Stmt::With(manager)]
+        if !manager.is_async
+            && manager.items.iter().all(|item| {
+                !expression_contains_inline_branch(&item.context_expr)
+                    && !expression_suspends_current_scope(&item.context_expr)
+                    && !expression_yields_in_current_scope(&item.context_expr)
+                    && item.optional_vars.as_ref().is_none_or(|target| {
+                        matches!(target.as_ref(), Expr::Name(_))
+                    })
+            })
+            && manager.body.iter().any(|part| !self.context.is_elided_statement(part))
+            && manager.body.iter().all(|part| {
+                if self.context.is_elided_statement(part) {
+                    return true;
+                }
+                let Stmt::Expr(expression) = part else {
+                    return false;
+                };
+                let (value, is_awaited) = match expression.value.as_ref() {
+                    Expr::Await(awaited) if self.unit.flags & CO_COROUTINE != 0 => {
+                        (awaited.value.as_ref(), true)
+                    }
+                    value => (value, false),
+                };
+                (matches!(value, Expr::Call(_)) || (is_awaited && matches!(value, Expr::Name(_))))
+                    && !expression_contains_inline_branch(value)
+                    && !expression_suspends_current_scope(value)
+                    && !expression_yields_in_current_scope(value)
+            }));
         let completed_work_at_restart = self
             .control
             .loops
@@ -19301,7 +19332,11 @@ impl<'source> Compiler<'source> {
                                                 !expression_contains_inline_branch(value))))
                     }))
         };
-        let iterator_inside_finally = ordinary_function
+        let iterator_inside_finally = (ordinary_function
+            || (completed_manager_work
+                && matches!(self.unit.scope, Scope::Function { .. })
+                && self.unit.flags & CO_COROUTINE != 0
+                && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0))
             && self.control.finally.active_finally_try_bodies == 1
             && (erased_final_body
                 || self
@@ -19327,6 +19362,7 @@ impl<'source> Compiler<'source> {
             && (condition_jump_target_count(final_test, false) == 1
                 || (ordinary_function && condition_has_flat_iterator_and_leaves(final_test)))
             && (erased_final_body
+                || completed_manager_work
                 || suite_has_linear_borrow_fallthrough(final_body)
                 || (!final_body.is_empty()
                     && final_body.iter().all(|part| {
@@ -19359,7 +19395,8 @@ impl<'source> Compiler<'source> {
                 .last()
                 .is_some_and(|context| context.iterator_cleanup != IteratorCleanup::None)
             && condition_has_runtime_iterator_leaves(final_test)
-            && (suite_has_linear_borrow_fallthrough(final_body)
+            && (completed_manager_work
+                || suite_has_linear_borrow_fallthrough(final_body)
                 || (!final_body.is_empty()
                     && final_body.iter().all(|statement| {
                         self.context.is_elided_statement(statement)
