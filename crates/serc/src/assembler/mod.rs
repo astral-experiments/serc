@@ -16200,6 +16200,18 @@ impl Assembler {
         preserve_lasti: bool,
         origin: (Label, Label),
     ) {
+        if depth == 0
+            && !preserve_lasti
+            && self
+                .exception_owner_provenance
+                .ordinary_try_setups
+                .get(&origin.0)
+                == Some(&target)
+        {
+            self.exception_owner_provenance
+                .ordinary_try_region_origins
+                .push((origin.0, start, end, target));
+        }
         self.exception_regions.push(ExceptionRegion {
             is_scope_fallback: false,
             priority: ExceptionRegionPriority::OriginalRange(origin.0, origin.1),

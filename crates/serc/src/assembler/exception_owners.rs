@@ -204,6 +204,8 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) legacy_protocol_await_setups: Vec<LegacyProtocolAwaitSetup>,
     // Authored ordinary-try SETUP and its original handler, independently of split ranges.
     pub(super) ordinary_try_setups: FxHashMap<Label, Label>,
+    // Original SETUP and exact depth-zero fragment start, end and handler.
+    pub(super) ordinary_try_region_origins: Vec<(Label, Label, Label, Label)>,
     // Authored name-clearing exception handlers, independent of overlapping outer regions.
     pub(super) named_handler_cleanup_targets: FxHashSet<Label>,
     // Original ordinary-await suspension regions, resolved alongside their live regions.
@@ -379,6 +381,24 @@ pub(super) struct ExceptionOwnerProvenance {
 }
 
 impl ExceptionOwnerProvenance {
+    /// Authenticates a concrete fragment without inferring its setup from range positions.
+    pub(super) fn is_original_ordinary_try_region(&self, region: super::ExceptionRegion) -> bool {
+        let mut origins =
+            self.ordinary_try_region_origins
+                .iter()
+                .filter(|(_, start, end, target)| {
+                    *start == region.start && *end == region.end && *target == region.target
+                });
+        let Some((setup, _, _, target)) = origins.next() else {
+            return false;
+        };
+        origins.next().is_none()
+            && !region.is_scope_fallback
+            && region.depth == 0
+            && !region.preserve_lasti
+            && self.ordinary_try_setups.get(setup) == Some(target)
+    }
+
     /// Separates original jump-target roles from compiler-authored boundaries.
     pub(super) fn bind_normal_try_borrow_exits(
         &mut self,
