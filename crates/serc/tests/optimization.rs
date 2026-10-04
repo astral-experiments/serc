@@ -8716,3 +8716,58 @@ fn boolean_call_prefix_keeps_terminal_finalizer_join() {
         );
     }
 }
+
+#[test]
+fn erased_assertions_preserve_populated_iterator_branch_joins() {
+    let source = r"def collect(groups):
+    result = 0
+    for group in groups:
+        for left, right in group:
+            if left is None or right is None:
+                assert left is right
+            else:
+                result = max(result, abs(left - right))
+                assert result >= 0
+    return result
+";
+    for source in [
+        source.to_owned(),
+        source.replace(
+            "                result = max(result, abs(left - right))\n                assert result >= 0",
+            "                assert left is not None\n                result = max(result, abs(left - right))",
+        ),
+        source.replace(
+            "                assert result >= 0",
+            "                assert result >= 0\n                consume(result)",
+        ),
+        source.replace("result = max(result, abs(left - right))", "consume(left, right)"),
+        source.replace(" or right is None", " and right is None"),
+        source.replace(" or right is None", ""),
+        source.replace("                assert result >= 0\n", ""),
+        source.replace("assert left is right", "consume(left, right)"),
+    ] {
+        assert_matches_cpython(&source, "populated_iterator_branch_join.py", &LEVELS);
+    }
+}
+
+#[test]
+fn erased_assertions_preserve_populated_scope_footer() {
+    for source in [
+        r"def finish(left, right, sink):
+    if left or right:
+        assert left
+    else:
+        sink(right)
+        assert right
+",
+        r"def finish(left, right, sink):
+    if left and right:
+        assert right
+        sink(left)
+    else:
+        assert left
+",
+    ] {
+        assert_matches_cpython(source, "populated_scope_footer.py", &LEVELS);
+    }
+}
