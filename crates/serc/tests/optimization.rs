@@ -4000,6 +4000,52 @@ fn nested_try_else_break_preserves_borrowed_tail() {
 }
 
 #[test]
+fn erased_managed_while_tail_preserves_borrow_boundary() {
+    let source = r"def collect(manager, receiver, work, ready):
+    with manager() as left, manager() as right:
+        item = work()
+        assert ready()
+        other = work()
+        while True:
+            values = right.poll()
+            if values and values[0]:
+                break
+            assert item.ready()
+            assert ready()
+        with manager():
+            item.finish()
+        other.finish()
+        assert right.ready()
+        assert right.empty()
+    receiver.finish()
+";
+    for source in [
+        source.to_owned(),
+        source.replace("if values and values[0]:", "if values:"),
+        source.replace(
+            "        while True:\n            values = right.poll()\n            if values and values[0]:\n                break\n            assert item.ready()\n            assert ready()\n",
+            "",
+        ),
+        source.replace(
+            "with manager() as left, manager() as right:",
+            "with manager() as right:",
+        ),
+        source.replace(
+            "        assert right.empty()\n",
+            "        assert right.empty()\n        right.finish()\n",
+        ),
+        source.replace(
+            "        with manager():\n            item.finish()\n",
+            "        item.finish()\n",
+        ),
+        source.replace("            assert ready()", "            ready()"),
+        source.replace("while True:", "while ready():"),
+    ] {
+        assert_matches_cpython(&source, "erased_managed_while_tail.py", &LEVELS);
+    }
+}
+
+#[test]
 fn erased_inner_while_tail_preserves_borrow_boundary() {
     for (index, (outer, assertion_prefix, tail, guard)) in [
         (true, true, "assert value", "True"),
