@@ -10107,7 +10107,7 @@ impl Assembler {
         self.record_shared_break_truth_prefix(unwind_start);
     }
 
-    /// Certifies the iterator discard shared by a copied guarded method call.
+    /// Certifies the iterator discard shared by a copied guarded call.
     pub(crate) fn prepare_copied_finally_iterator_break(
         &mut self,
         emitted: EmittedJump,
@@ -10215,7 +10215,7 @@ impl Assembler {
         let [
             Item::Label(body),
             Item::Instruction(load_receiver),
-            Item::Instruction(method),
+            Item::Instruction(call_setup),
             Item::Instruction(call),
             Item::Instruction(discard_call),
             Item::Label(join),
@@ -10338,9 +10338,13 @@ impl Assembler {
             || load_receiver.opcode != LOAD_FAST
             || load_receiver.value_argument().is_none()
             || load_receiver.depth_after() != Some(loaded)
-            || method.opcode != LOAD_ATTR
-            || !matches!(method.operand(), Operand::Value(argument) if argument & 1 != 0)
-            || method.depth_after() != Some(method_depth)
+            || !matches!((call_setup.opcode, call_setup.operand()),
+                (LOAD_ATTR, Operand::Value(argument)) if argument & 1 != 0)
+                && !matches!(
+                    (call_setup.opcode, call_setup.operand()),
+                    (crate::target::opcodes::PUSH_NULL, Operand::Value(0))
+                )
+            || call_setup.depth_after() != Some(method_depth)
             || call.opcode != crate::target::opcodes::CALL
             || call.value_argument() != Some(0)
             || call.depth_after() != Some(loaded)
@@ -10349,7 +10353,7 @@ impl Assembler {
             || discard_call.depth_after() != Some(depth)
             || call.location.line < 0
             || load_receiver.location.line != call.location.line
-            || method.location.line != call.location.line
+            || call_setup.location.line != call.location.line
             || discard_call.location != call.location
             || start == body
             || start == join
@@ -10374,7 +10378,7 @@ impl Assembler {
                 load_guard,
                 condition,
                 load_receiver,
-                method,
+                call_setup,
                 call,
                 discard_call,
                 discard_iterator,
@@ -10389,7 +10393,7 @@ impl Assembler {
                 load_guard,
                 not_taken,
                 load_receiver,
-                method,
+                call_setup,
                 call,
                 discard_call,
                 discard_iterator,
@@ -10400,7 +10404,7 @@ impl Assembler {
         {
             return;
         }
-        // The conditional false edge and method-call fallthrough share this original
+        // The conditional false edge and call fallthrough share this original
         // source-less discard. Both need their own copy, even when the break reaches
         // ordinary code after the loop rather than an unlocated scope exit.
         self.prepare_no_location_block_for_inlining(emitted);
