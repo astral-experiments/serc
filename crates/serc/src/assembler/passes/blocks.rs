@@ -3106,6 +3106,37 @@ impl OptimizationPipeline {
             temperatures[index] = COLD_BLOCK;
         }
 
+        // Range-only tails are retired by reachability, not the head's copy flag.
+        // A newly entered tail cannot certify an empty original cleanup array.
+        let retired_handler_arrays = self
+            .exception_owner_provenance
+            .retired_handler_borrow_markers
+            .iter()
+            .filter_map(|(marker, original_labels)| {
+                let head = graph.label_block(*marker)?;
+                if graph[head].last_instruction().is_some()
+                    || temperatures[head.index()] != 0
+                    || graph.label_block(*original_labels.first()?) != Some(head)
+                {
+                    return None;
+                }
+                for (index, label) in original_labels.iter().enumerate() {
+                    let block = graph.label_block(*label)?;
+                    if temperatures[block.index()] != 0
+                        || self.exception_regions.iter().any(|region| graph.label_block(region.target) == Some(block))
+                        || graph.iter_items().any(|item| matches!(item, Item::Instruction(instruction)
+                            if instruction.jump_target().and_then(|target| graph.label_block(target)) == Some(block)))
+                        || (index > 0
+                            && (self.exception_owner_provenance.source_boundaries.contains(label)
+                                || self.exception_owner_provenance.block_boundaries.contains(label)
+                                || self.preserved_block_boundaries.contains(label)))
+                    {
+                        return None;
+                    }
+                }
+                Some((head, *marker))
+            })
+            .collect::<FxHashMap<_, _>>();
         let mut order = Vec::with_capacity(graph.len());
         for expected_cold in [false, true] {
             for block in graph.order().iter().copied() {
@@ -3113,12 +3144,18 @@ impl OptimizationPipeline {
                     || (!expected_cold
                         && (temperatures[block.index()] == WARM_BLOCK
                             || (temperatures[block.index()] == 0
-                                && omitted_backedges.contains(&block))))
+                                && (omitted_backedges.contains(&block)
+                                    || retired_handler_arrays.contains_key(&block)))))
                 {
                     order.push(block);
                 }
             }
         }
+        omitted_markers.extend(
+            retired_handler_arrays
+                .iter()
+                .filter_map(|(block, label)| (temperatures[block.index()] == 0).then_some(*label)),
+        );
 
         let async_iteration_exits = order.iter().filter(|block| {
             graph[**block].items().iter().any(|item| {
@@ -3227,6 +3264,16 @@ impl OptimizationPipeline {
             order.splice(insertion_position..insertion_position, terminal_restore);
         }
 
+        // Borrow-only originals must not create protected ranges while cold
+        // relocation rebuilds the physical exception owners.
+        let region_order = (!retired_handler_arrays.is_empty()).then(|| {
+            order
+                .iter()
+                .copied()
+                .filter(|block| !retired_handler_arrays.contains_key(block))
+                .collect::<Vec<_>>()
+        });
+        let region_order = region_order.as_deref().unwrap_or(&order);
         let mut final_label = None;
         let mut rebuilt_regions = Vec::new();
         let original_regions = std::mem::take(&mut self.exception_regions);
@@ -3240,20 +3287,20 @@ impl OptimizationPipeline {
                     .is_some_and(|position| original_start <= position && position < original_end)
             };
             let mut index = 0;
-            while index < order.len() {
-                while index < order.len() && !is_member(order[index]) {
+            while index < region_order.len() {
+                while index < region_order.len() && !is_member(region_order[index]) {
                     index += 1;
                 }
-                if index == order.len() {
+                if index == region_order.len() {
                     break;
                 }
-                let start = block_labels[order[index].index()]
+                let start = block_labels[region_order[index].index()]
                     .expect("cold-block pass should label every ordered block");
-                while index < order.len() && is_member(order[index]) {
+                while index < region_order.len() && is_member(region_order[index]) {
                     index += 1;
                 }
-                let end = if index < order.len() {
-                    block_labels[order[index].index()]
+                let end = if index < region_order.len() {
+                    block_labels[region_order[index].index()]
                         .expect("cold-block pass should label every ordered block")
                 } else if let Some(label) = final_label {
                     label
@@ -4815,6 +4862,42 @@ impl OptimizationPipeline {
             .iter()
             .flat_map(|region| [region.start, region.end])
             .collect::<FxHashSet<_>>();
+        let original_handler_arrays = self
+            .exception_owner_provenance
+            .borrow_handler_cleanup_arrays
+            .iter()
+            .filter_map(|(entry, records)| {
+                let block = graph.label_block(*entry)?;
+                let chain = metadata_split_exit_chain(
+                    graph,
+                    &order,
+                    positions[block.index()],
+                    &predecessors,
+                    &exception_split_labels,
+                );
+                let actual = chain
+                    .iter()
+                    .flat_map(|block| graph[*block].items())
+                    .skip_while(|item| matches!(item, Item::Label(_)));
+                (actual.eq(records.iter())
+                    && records.iter().all(|item| {
+                        let Item::Label(label) = item else {
+                            return true;
+                        };
+                        exception_split_labels.contains(label)
+                            && !self.exception_regions.iter().any(|region| region.target == *label)
+                            && !self.exception_owner_provenance.source_boundaries.contains(label)
+                            && !self.exception_owner_provenance.block_boundaries.contains(label)
+                            && !self.preserved_block_boundaries.contains(label)
+                            && !graph.iter_items().any(|item| matches!(item, Item::Instruction(instruction)
+                                if matches!(instruction.operand(), Operand::Forward(target) | Operand::Backward(target) if target == *label)))
+                    }))
+                .then(|| (block, std::iter::once(*entry).chain(records.iter().filter_map(|item| match item {
+                    Item::Label(label) => Some(*label),
+                    Item::Instruction(_) => None,
+                })).collect::<Vec<_>>()))
+            })
+            .collect::<FxHashMap<_, _>>();
         // A protected expression exit can be one original array split at POP_BLOCK.
         // Snapshot its complete source, expression tail and return before any copy.
         let protected_order = order_if(!self.exception_regions.is_empty());
@@ -8235,8 +8318,23 @@ impl OptimizationPipeline {
             }
             if !drop_blocks[block.index()] {
                 final_order.push(block);
-            } else if exception_boundary_blocks[block.index()] {
+            } else if exception_boundary_blocks[block.index()]
+                || original_handler_arrays.contains_key(&block)
+            {
                 graph.retain_items(block, |item| matches!(item, Item::Label(_)));
+                if let Some(original_labels) = original_handler_arrays.get(&block) {
+                    // Native keeps the copied cleanup's empty original array. Separate
+                    // both ends until cold ordering, but add no physical instruction.
+                    let marker = Label::from_u32(self.next_label);
+                    let after = Label::from_u32(self.next_label + 1);
+                    self.next_label += 2;
+                    graph.insert_label(block, 0, marker);
+                    graph.insert_label(block, graph[block].items().len(), after);
+                    self.preserved_block_boundaries.extend([marker, after]);
+                    self.exception_owner_provenance
+                        .retired_handler_borrow_markers
+                        .insert(marker, original_labels.clone());
+                }
                 final_order.push(block);
             }
             for copied in inline_copies.remove(&block).unwrap_or_default() {
@@ -8303,6 +8401,247 @@ impl OptimizationPipeline {
             propagate_normal_try_pop_continuations(graph, &original_pop_ranges, &handler_entries);
         }
         Ok(copied_entry_labels)
+    }
+}
+
+#[cfg(test)]
+mod retired_handler_borrow_tests {
+    use super::*;
+    use crate::assembler::Assembler;
+    use crate::target::opcodes::PUSH_EXC_INFO;
+
+    fn fixture(variation: &str, capture: bool) -> OptimizationPipeline {
+        let mut assembler = Assembler::with_python_version(crate::PythonVersion::Py314);
+        let start = assembler.label();
+        let handler = assembler.label();
+        let cleanup = assembler.label();
+        let continuation = assembler.label();
+        let end = assembler.label();
+        assembler.mark(start);
+        assembler.set_location(SourceLocation::new(1, 1, 0, 4));
+        assembler.emit_with_depth(LOAD_CONST, 0, 1, ExceptionPolicy::default());
+        assembler.emit_with_depth(POP_TOP, 0, 0, ExceptionPolicy::default());
+        assembler.emit_forward_with_depth(JUMP_FORWARD, end, 0, ExceptionPolicy::default());
+        assembler.mark(handler);
+        assembler.set_location(SourceLocation::new(2, 2, 0, 4));
+        assembler.emit_with_depth(PUSH_EXC_INFO, 0, 1, ExceptionPolicy::default());
+        if variation == "conditional entry" {
+            assembler.emit_with_depth(LOAD_CONST, 0, 2, ExceptionPolicy::default());
+            assembler.emit_forward_with_depth(
+                POP_JUMP_IF_TRUE,
+                cleanup,
+                1,
+                ExceptionPolicy::default(),
+            );
+            assembler.emit_with_depth(RERAISE, 0, 1, ExceptionPolicy::default());
+        } else {
+            assembler.emit_forward_with_depth(JUMP_FORWARD, cleanup, 1, ExceptionPolicy::default());
+        }
+        assembler.mark(cleanup);
+        assembler
+            .exception_owner_provenance
+            .source_boundaries
+            .insert(cleanup);
+        assembler
+            .exception_owner_provenance
+            .block_boundaries
+            .insert(cleanup);
+        assembler.set_location(if variation == "located suffix" {
+            SourceLocation::new(3, 3, 0, 4)
+        } else {
+            SourceLocation::NONE
+        });
+        assembler.emit_with_depth(POP_EXCEPT, 0, 0, ExceptionPolicy::default());
+        let range_end = matches!(
+            variation,
+            "range endpoint"
+                | "promoted range endpoint"
+                | "copied tail entry"
+                | "range aliases"
+                | "copied tail alias"
+        )
+        .then(|| {
+            let label = assembler.label();
+            assembler.mark(label);
+            assembler.add_exception_region(cleanup, label, handler, 0, true);
+            if matches!(variation, "range aliases" | "copied tail alias") {
+                let alias = assembler.label();
+                assembler.mark(alias);
+                assembler.add_exception_region(cleanup, alias, handler, 0, true);
+            }
+            label
+        });
+        let jump = assembler.emit_forward_with_depth(
+            JUMP_FORWARD,
+            continuation,
+            0,
+            ExceptionPolicy::default(),
+        );
+        assembler.prepare_no_location_block_for_inlining(jump);
+        if capture {
+            assembler.record_borrow_handler_cleanup(cleanup);
+        }
+        if variation == "promoted range endpoint" {
+            assembler
+                .exception_owner_provenance
+                .source_boundaries
+                .insert(range_end.unwrap());
+        }
+        if variation == "changed record" {
+            let Item::Instruction(pop) = assembler
+                .linear_items_mut()
+                .iter_mut()
+                .find(|item| matches!(item, Item::Instruction(value) if value.opcode == POP_EXCEPT))
+                .unwrap()
+            else {
+                unreachable!()
+            };
+            pop.add_pre_fold_extra_instructions(1);
+        }
+        assembler.mark(continuation);
+        assembler.set_location(SourceLocation::new(4, 4, 0, 4));
+        assembler.emit_with_depth(LOAD_CONST, 0, 1, ExceptionPolicy::default());
+        assembler.emit_with_depth(POP_TOP, 0, 0, ExceptionPolicy::default());
+        assembler.emit_forward_with_depth(JUMP_FORWARD, end, 0, ExceptionPolicy::default());
+        assembler.mark(end);
+        assembler.set_location(SourceLocation::new(5, 5, 0, 4));
+        for _ in 0..3 {
+            assembler.emit_with_depth(LOAD_FAST, 0, 1, ExceptionPolicy::default());
+            assembler.emit_with_depth(POP_TOP, 0, 0, ExceptionPolicy::default());
+        }
+        assembler.emit_with_depth(LOAD_CONST, 0, 1, ExceptionPolicy::default());
+        assembler.emit_with_depth(RETURN_VALUE, 0, 0, ExceptionPolicy::default());
+        assembler.add_exception_region(start, handler, handler, 0, false);
+        assembler.into_optimization_pipeline()
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct RegionSnapshot {
+        range: (usize, usize, usize),
+        depth: u32,
+        preserve_lasti: bool,
+        scope_fallback: bool,
+        priority: (bool, usize, usize),
+    }
+
+    fn physical(pipeline: &OptimizationPipeline) -> (Vec<Instruction>, Vec<RegionSnapshot>) {
+        let mut offsets = FxHashMap::default();
+        let mut instructions = Vec::new();
+        for item in pipeline.graph.iter_items() {
+            match item {
+                Item::Label(label) => {
+                    offsets.insert(*label, instructions.len());
+                }
+                Item::Instruction(instruction) => instructions.push(*instruction),
+            }
+        }
+        for instruction in &mut instructions {
+            if let Operand::Forward(label) | Operand::Backward(label) = instruction.operand() {
+                instruction.set_operand(Operand::Value(u32::try_from(offsets[&label]).unwrap()));
+            }
+        }
+        let regions = pipeline
+            .exception_regions
+            .iter()
+            .map(|region| {
+                use crate::assembler::ir::ExceptionRegionPriority;
+                RegionSnapshot {
+                    range: (
+                        offsets[&region.start],
+                        offsets[&region.end],
+                        offsets[&region.target],
+                    ),
+                    depth: region.depth,
+                    preserve_lasti: region.preserve_lasti,
+                    scope_fallback: region.is_scope_fallback,
+                    priority: match region.priority {
+                        ExceptionRegionPriority::OriginalRange(start, end) => {
+                            (false, offsets[&start], offsets[&end])
+                        }
+                        ExceptionRegionPriority::Resolved { start, end } => (true, start, end),
+                    },
+                }
+            })
+            .collect();
+        (instructions, regions)
+    }
+
+    #[test]
+    fn only_copied_exact_cleanup_retains_an_empty_borrow_array() {
+        for variation in [
+            "intact",
+            "range endpoint",
+            "promoted range endpoint",
+            "copied tail entry",
+            "range aliases",
+            "copied tail alias",
+            "conditional entry",
+            "located suffix",
+            "changed record",
+        ] {
+            let mut captured = fixture(variation, true);
+            let mut control = fixture(variation, false);
+            let range_ends = captured
+                .exception_owner_provenance
+                .borrow_handler_cleanup_arrays
+                .first()
+                .map(|(_, items)| {
+                    items
+                        .iter()
+                        .filter_map(|item| match item {
+                            Item::Label(label) => Some(*label),
+                            Item::Instruction(_) => None,
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            for pipeline in [&mut captured, &mut control] {
+                pipeline.duplicate_exit_blocks(&FxHashSet::default(), &mut Vec::new());
+                if variation == "copied tail entry" {
+                    let start = pipeline.graph.order()[0];
+                    let jump = pipeline.graph.instructions_mut(start).next_back().unwrap();
+                    assert_eq!(jump.opcode, JUMP_FORWARD);
+                    jump.set_operand(Operand::Forward(range_ends[0]));
+                } else if variation == "copied tail alias" {
+                    assert_eq!(range_ends.len(), 2);
+                    pipeline
+                        .exception_owner_provenance
+                        .source_boundaries
+                        .insert(range_ends[1]);
+                }
+            }
+            assert_eq!(
+                captured
+                    .exception_owner_provenance
+                    .retired_handler_borrow_markers
+                    .len(),
+                usize::from(matches!(
+                    variation,
+                    "intact"
+                        | "range endpoint"
+                        | "copied tail entry"
+                        | "range aliases"
+                        | "copied tail alias"
+                )),
+                "{variation}: retired head"
+            );
+            assert_eq!(physical(&captured), physical(&control), "{variation}: copy");
+            let markers = captured.push_cold_blocks_to_end(None);
+            assert!(control.push_cold_blocks_to_end(None).is_empty());
+            assert_eq!(physical(&captured), physical(&control), "{variation}: cold");
+            assert_eq!(
+                markers.len(),
+                usize::from(matches!(
+                    variation,
+                    "intact" | "range endpoint" | "range aliases"
+                )),
+                "{variation}"
+            );
+            assert!(markers.iter().all(|marker| {
+                let block = captured.graph.label_block(*marker).unwrap();
+                captured.graph[block].last_instruction().is_none()
+            }));
+        }
     }
 }
 

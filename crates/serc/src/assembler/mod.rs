@@ -13498,6 +13498,84 @@ impl Assembler {
         false
     }
 
+    /// Captures a source-less handler array before copying can erase its original entry.
+    pub(crate) fn record_borrow_handler_cleanup(&mut self, entry: Label) {
+        if self.python_version != crate::PythonVersion::Py314 {
+            return;
+        }
+        let items = self.linear_items();
+        let Some(start) = items.iter().rposition(|item| *item == Item::Label(entry)) else {
+            return;
+        };
+        let array = items[start + 1..]
+            .iter()
+            .skip_while(|item| matches!(item, Item::Label(_)))
+            .copied()
+            .collect::<Vec<_>>();
+        // Enclosing handlers add range endpoints inside this original array,
+        // without introducing another instruction-array entry.
+        if array.iter().any(|item| {
+            let Item::Label(label) = item else {
+                return false;
+            };
+            !self.exception_regions.iter().any(|region| region.start == *label || region.end == *label)
+                || self.exception_regions.iter().any(|region| region.target == *label)
+                || self.exception_owner_provenance.source_boundaries.contains(label)
+                || self.exception_owner_provenance.block_boundaries.contains(label)
+                || self.preserved_block_boundaries.contains(label)
+                || items.iter().any(|item| matches!(item, Item::Instruction(instruction)
+                    if matches!(instruction.operand(), Operand::Forward(target) | Operand::Backward(target) if target == *label)))
+        }) {
+            return;
+        }
+        let records = array
+            .iter()
+            .filter_map(|item| match item {
+                Item::Instruction(instruction) => Some(*instruction),
+                Item::Label(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let valid_shape = match records.as_slice() {
+            [pop, jump] => pop.opcode == POP_EXCEPT && jump.opcode == JUMP_FORWARD,
+            [pop, load, store, delete, jump] => {
+                pop.opcode == POP_EXCEPT
+                    && load.opcode == LOAD_CONST
+                    && store.opcode == STORE_FAST
+                    && delete.opcode == DELETE_FAST
+                    && store.operand() == delete.operand()
+                    && jump.opcode == JUMP_FORWARD
+            }
+            _ => false,
+        };
+        if !valid_shape
+            || records.iter().any(|instruction| {
+                instruction.location != SourceLocation::NONE
+                    || instruction.local_policy.hidden_exception_owner_slots() != 0
+                    || instruction.exception_policy() != ExceptionPolicy::default()
+            })
+            || !records.last().is_some_and(|jump| {
+                jump.forward_target().is_some() && jump.no_location_policy.allows_block_inlining()
+            })
+        {
+            return;
+        }
+        let aliases = trailing_labels(&items[..items.len() - array.len()]);
+        if !aliases.into_iter().any(|label| {
+            self.exception_owner_provenance
+                .source_boundaries
+                .contains(&label)
+                && self
+                    .exception_owner_provenance
+                    .block_boundaries
+                    .contains(&label)
+        }) {
+            return;
+        }
+        self.exception_owner_provenance
+            .borrow_handler_cleanup_arrays
+            .push((entry, array));
+    }
+
     /// Finds the sole original match donor for a manager's normal `POP_BLOCK`.
     pub(crate) fn original_manager_match_join(
         &self,
