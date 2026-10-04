@@ -19252,8 +19252,14 @@ impl<'source> Compiler<'source> {
                                 if clause.test.is_none()
                                     && completed_conditional_arm(&clause.body))))
         };
-        let iterator_inside_finally = matches!(self.unit.scope, Scope::Function { .. })
-            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+        let ordinary_function = matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0;
+        let completed_dict_store = |part: &Stmt| {
+            ordinary_function
+                && self.control.finally.active_finally_try_bodies == 1
+                && iterator_arm_has_completed_dict_store(part)
+        };
+        let iterator_inside_finally = ordinary_function
             && self.control.finally.active_finally_try_bodies == 1
             && (erased_final_body
                 || self
@@ -19276,13 +19282,15 @@ impl<'source> Compiler<'source> {
                     && context.continue_label == restart
             })
             && condition_has_linear_runtime_leaves(final_test)
-            && condition_jump_target_count(final_test, false) == 1
+            && (condition_jump_target_count(final_test, false) == 1
+                || (ordinary_function && condition_has_flat_iterator_and_leaves(final_test)))
             && (erased_final_body
                 || suite_has_linear_borrow_fallthrough(final_body)
                 || (!final_body.is_empty()
                     && final_body.iter().all(|part| {
                         self.context.is_elided_statement(part)
                             || suite_has_linear_borrow_fallthrough(std::slice::from_ref(part))
+                            || completed_dict_store(part)
                             || completed_conditional_work(part)
                     })));
         // With no intervening cleanup, the removed else reaches the iterator
@@ -19312,6 +19320,7 @@ impl<'source> Compiler<'source> {
                     && final_body.iter().all(|statement| {
                         self.context.is_elided_statement(statement)
                             || suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement))
+                            || completed_dict_store(statement)
                             // Both value arms merge before the name store, independently
                             // of the enclosing condition's erased false edge.
                             || (completed_work_at_restart && matches!(statement, Stmt::Assign(assignment)
@@ -43027,6 +43036,141 @@ fn conditional_for_else_cleanup_exit(statement: &ruff_python_ast::StmtIf) -> boo
         && cleanup.orelse.is_empty()
         && suite_has_linear_borrow_fallthrough(&cleanup.body)
         && suite_has_linear_borrow_fallthrough(&cleanup.finalbody)
+}
+
+/// Each flat conjunction leaf can independently thread its erased false edge to the iterator.
+fn condition_has_flat_iterator_and_leaves(expression: &Expr) -> bool {
+    matches!(expression, Expr::BoolOp(boolean)
+    if boolean.op == BoolOp::And
+        && boolean.values.len() > 1
+        && boolean.values.iter().all(|value| {
+            condition_has_linear_runtime_leaves(value)
+                && original_condition_has_unique_jump_target(value, true)
+                && original_condition_has_unique_jump_target(value, false)
+                && !expression_suspends_current_scope(value)
+                && !expression_yields_in_current_scope(value)
+        }))
+}
+
+/// An eager dict store restores its one iterator before the enclosing arm's backedge.
+fn iterator_arm_has_completed_dict_store(statement: &Stmt) -> bool {
+    let Stmt::Assign(assignment) = statement else {
+        return false;
+    };
+    let Expr::DictComp(comprehension) = assignment.value.as_ref() else {
+        return false;
+    };
+    let [iterator] = comprehension.generators.as_ref() else {
+        return false;
+    };
+    matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+        && !expression_suspends_current_scope(&assignment.value)
+        && !expression_yields_in_current_scope(&assignment.value)
+        && !iterator.is_async
+        && iterator.ifs.is_empty()
+        && (matches!(iterator.target, Expr::Name(_))
+            || matches!(&iterator.target, Expr::Tuple(tuple)
+                if !tuple.elts.is_empty()
+                    && tuple.elts.iter().all(|item| matches!(item, Expr::Name(_)))))
+        && !expression_contains_inline_branch(&iterator.iter)
+        && comprehension
+            .key
+            .as_deref()
+            .is_some_and(|key| !expression_contains_inline_branch(key))
+        && !expression_contains_inline_branch(&comprehension.value)
+}
+
+#[cfg(test)]
+mod protected_iterator_erased_else_tests {
+    use ruff_python_ast::Stmt;
+    use ruff_python_parser::parse_module;
+
+    #[test]
+    fn conjunction_leaves_require_independent_runtime_edges() {
+        for (expected, expressions) in [
+            (
+                true,
+                &[
+                    "left and right",
+                    "left not in values and right in values",
+                    "left and right and third",
+                    "not left and check(right)",
+                ][..],
+            ),
+            (
+                false,
+                &[
+                    "left",
+                    "left or right",
+                    "left and (right or third)",
+                    "left and not (right and third)",
+                    "left and True",
+                    "False and right",
+                    "left and first < second < third",
+                    "left and (right if flag else third)",
+                    "left and (await right)",
+                    "left and (yield right)",
+                    "left and (yield from right)",
+                ][..],
+            ),
+        ] {
+            for expression in expressions {
+                let parsed = parse_module(&format!("if {expression}:\n    pass\n")).unwrap();
+                let Stmt::If(branch) = &parsed.suite()[0] else {
+                    panic!("expected conditional");
+                };
+                assert_eq!(
+                    super::condition_has_flat_iterator_and_leaves(&branch.test),
+                    expected,
+                    "{expression}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dict_store_requires_one_completed_synchronous_iterator() {
+        for (expected, statements) in [
+            (
+                true,
+                &[
+                    "result = {item: item for item in items}",
+                    "result = {key: value for key, value in items}",
+                    "result = {key: convert(value) for key, value in source.items()}",
+                ][..],
+            ),
+            (
+                false,
+                &[
+                    "result = [item for item in items]",
+                    "result = {item for item in items}",
+                    "result = (item for item in items)",
+                    "result = {item: item for item in items if item}",
+                    "result = {item: other for item in items for other in items}",
+                    "result = {item: item async for item in items}",
+                    "result = {key: value for key, (value, other) in items}",
+                    "result = {key: value for key, *value in items}",
+                    "result = {item: item for item in (left if flag else right)}",
+                    "result = {(left if flag else right): item for item in items}",
+                    "result = {item: left or right for item in items}",
+                    "result = {item: await consume(item) for item in items}",
+                    "result = {item: item for item in await source()}",
+                    "result = {item: item for item in (yield items)}",
+                    "obj.result = {item: item for item in items}",
+                    "first = second = {item: item for item in items}",
+                ][..],
+            ),
+        ] {
+            for statement in statements {
+                let parsed = parse_module(statement).unwrap();
+                assert_eq!(
+                    super::iterator_arm_has_completed_dict_store(&parsed.suite()[0]),
+                    expected,
+                    "{statement}",
+                );
+            }
+        }
+    }
 }
 
 /// Certifies normal exits from conditional work under a coroutine's synthetic owner.

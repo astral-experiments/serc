@@ -101,6 +101,98 @@ async def run(items, mode, note):
 }
 
 #[test]
+fn protected_erased_else_preserves_completed_iterator_backedges() {
+    let simple = r"def collect(items, selected, sink, cleanup):
+    try:
+        for item in items:
+            if item not in selected:
+                sink(item)
+            else:
+                assert item
+    finally:
+        cleanup()
+";
+    let compound = simple.replace(
+        "item not in selected:",
+        "item not in selected and selected:",
+    );
+    let comprehension = simple.replace(
+        "                sink(item)",
+        "                snapshot = {value: value for value in items}\n                sink(snapshot)",
+    );
+    let compound_comprehension = comprehension.replace(
+        "item not in selected:",
+        "item not in selected and selected:",
+    );
+    let nested = r"def collect(batches, selected, sink, cleanup):
+    try:
+        for batch in batches:
+            for key, value in batch:
+                if key not in selected and value in selected:
+                    snapshot = {slot: data for slot, data in batch}
+                    assert snapshot
+                    selected[key] = value
+                    sink(snapshot)
+                else:
+                    assert key != value
+    finally:
+        cleanup()
+";
+    let unprotected = nested
+        .replace(
+            "batches, selected, sink, cleanup",
+            "batches, selected, sink",
+        )
+        .replace("    try:\n", "")
+        .replace("    finally:\n        cleanup()\n", "")
+        .lines()
+        .map(|line| line.strip_prefix("    ").unwrap_or(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for (index, source) in [
+        simple.to_owned(),
+        compound,
+        comprehension.clone(),
+        comprehension
+            .replace(
+                "items, selected, sink, cleanup",
+                "items, pairs, selected, sink, cleanup",
+            )
+            .replace(
+                "{value: value for value in items}",
+                "{key: value for key, value in pairs}",
+            ),
+        compound_comprehension.clone(),
+        compound_comprehension.replace("assert item", "sink(item)"),
+        nested.to_owned(),
+        nested.replace("assert key != value", "sink(key)"),
+        unprotected,
+        nested.replace(" and value in selected", ""),
+        nested.replace("{slot: data for slot, data in batch}", "selected.copy()"),
+        nested
+            .replace("def collect(batches,", "def collect(batch,")
+            .replace("        for batch in batches:\n", "")
+            .lines()
+            .map(|line| {
+                line.strip_prefix("    ")
+                    .filter(|_| line.starts_with("            "))
+                    .unwrap_or(line)
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            &source,
+            &format!("protected_erased_iterator_backedge_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn erased_nested_arms_keep_the_enclosing_iterator_exit() {
     let source = r"def process(items, flags, kinds, width):
     with manager() as owner, manager(), manager(), manager(), manager(), manager():
