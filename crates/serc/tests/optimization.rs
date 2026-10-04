@@ -467,6 +467,32 @@ fn copied_callable_finalizer_preserves_iterator_break_exits() {
 }
 
 #[test]
+fn async_iterator_preserves_shared_try_else_backedges() {
+    for (definition, iterator) in [("async def", "async for"), ("def", "for")] {
+        for body in [
+            "                output[item] = value\n",
+            "                value = read(item)\n                if value is None:\n                    continue\n                if not value:\n                    touch(item)\n                else:\n                    output[item] = read(value)\n",
+        ] {
+            let source = format!(
+                "{definition} sample(items, output, read, touch):\n    {iterator} item in items:\n        try:\n            value = read(item)\n            if value is False:\n                raise LookupError\n        except LookupError:\n            touch(item)\n        else:\n            if item.primary is not None:\n                touch(item)\n            elif item.secondary is not None:\n{body}"
+            );
+            assert_matches_cpython(&source, "shared_try_else_backedge.py", &LEVELS);
+        }
+    }
+
+    for source in [
+        "async def sample(items, output, read, touch):\n    async for item in items:\n        try:\n            value = read(item)\n            if value is False:\n                raise LookupError\n        except LookupError:\n            touch(item)\n        else:\n            if item.secondary is not None:\n                output[item] = value\n",
+        "async def sample(items, output):\n    async for item in items:\n        output[item] = item\n",
+        "async def sample(items, output, read, touch):\n    async for item in items:\n        try:\n            value = read(item)\n            if value is False:\n                raise LookupError\n        except LookupError:\n            touch(item)\n        else:\n            if item.primary is not None:\n                touch(item)\n            elif item.secondary is not None:\n                output[item] = value\n        touch(item)\n",
+        "async def sample(items, output):\n    async for item in items:\n        if item is not None:\n            output[item] = item\n        pass\n",
+        "async def sample(items, output):\n    async for item in items:\n        output[item] = item\n        assert item\n",
+        "async def sample(items, output):\n    async for item in items:\n        if item is not None:\n            output[item] = item\n            assert item\n",
+    ] {
+        assert_matches_cpython(source, "async_backedge_control.py", &LEVELS);
+    }
+}
+
+#[test]
 fn erased_branches_preserve_protected_while_join() {
     for loop_test in ["True", "flag", "flag != stop"] {
         let source = format!(
