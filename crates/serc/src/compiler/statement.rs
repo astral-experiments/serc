@@ -43070,7 +43070,12 @@ fn iterator_arm_has_completed_dict_store(statement: &Stmt) -> bool {
         && !expression_suspends_current_scope(&assignment.value)
         && !expression_yields_in_current_scope(&assignment.value)
         && !iterator.is_async
-        && iterator.ifs.is_empty()
+        && iterator.ifs.len() <= 1
+        && iterator.ifs.iter().all(|condition| {
+            condition_has_linear_runtime_leaves(condition)
+                && original_condition_has_unique_jump_target(condition, true)
+                && original_condition_has_unique_jump_target(condition, false)
+        })
         && (matches!(iterator.target, Expr::Name(_))
             || matches!(&iterator.target, Expr::Tuple(tuple)
                 if !tuple.elts.is_empty()
@@ -43140,6 +43145,10 @@ mod protected_iterator_erased_else_tests {
                     "result = {item: item for item in items}",
                     "result = {key: value for key, value in items}",
                     "result = {key: convert(value) for key, value in source.items()}",
+                    "result = {item: item for item in items if item}",
+                    "result = {item: item for item in items if not item}",
+                    "result = {key: value for key, value in items if value is not None}",
+                    "result = {item: item for item in items if check(item)}",
                 ][..],
             ),
             (
@@ -43148,7 +43157,11 @@ mod protected_iterator_erased_else_tests {
                     "result = [item for item in items]",
                     "result = {item for item in items}",
                     "result = (item for item in items)",
-                    "result = {item: item for item in items if item}",
+                    "result = {item: item for item in items if item and check(item)}",
+                    "result = {item: item for item in items if item if check(item)}",
+                    "result = {item: item for item in items if True}",
+                    "result = {item: item for item in items if left < item < right}",
+                    "result = {item: item for item in items if await check(item)}",
                     "result = {item: other for item in items for other in items}",
                     "result = {item: item async for item in items}",
                     "result = {key: value for key, (value, other) in items}",
