@@ -22061,8 +22061,11 @@ impl<'source> Compiler<'source> {
         };
         let linear = |body: &[Stmt]| {
             is_elided(body)
-                || (suite_has_linear_borrow_fallthrough(body)
-                    && body.iter().all(|stmt| !matches!(stmt, Stmt::Pass(_))))
+                || (!body.is_empty()
+                    && body.iter().all(|stmt| !matches!(stmt, Stmt::Pass(_)))
+                    && body
+                        .split(|stmt| self.context.is_elided_statement(stmt))
+                        .all(|part| part.is_empty() || suite_has_linear_borrow_fallthrough(part)))
         };
         let valid_test = |test: &Expr| {
             condition_has_linear_runtime_leaves(test) && !expression_suspends_current_scope(test)
