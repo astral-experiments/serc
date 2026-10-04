@@ -19259,6 +19259,35 @@ impl<'source> Compiler<'source> {
                 && self.control.finally.active_finally_try_bodies == 1
                 && iterator_arm_has_completed_dict_store(part)
         };
+        // Exhausting the inner iterator restores the enclosing finally owner.
+        // Its completed stores cannot enter the outer condition's erased edge.
+        let completed_inner_for = |part: &Stmt| {
+            ordinary_function
+                && self.control.finally.active_finally_try_bodies == 1
+                && matches!(part, Stmt::For(inner)
+                if !inner.is_async
+                    && inner.orelse.is_empty()
+                    && (matches!(inner.target.as_ref(), Expr::Name(_))
+                        || matches!(inner.target.as_ref(), Expr::Tuple(tuple)
+                            if !tuple.elts.is_empty()
+                                && tuple.elts.iter().all(|item| matches!(item, Expr::Name(_)))))
+                    && !expression_contains_inline_branch(&inner.iter)
+                    && !expression_suspends_current_scope(&inner.iter)
+                    && !expression_yields_in_current_scope(&inner.iter)
+                    && !inner.body.is_empty()
+                    && inner.body.iter().all(|part| {
+                        self.context.is_elided_statement(part)
+                            || suite_has_nonsuspending_linear_fallthrough(std::slice::from_ref(part))
+                            || matches!(part, Stmt::Assign(assignment)
+                                if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                                    && !expression_suspends_current_scope(&assignment.value)
+                                    && !expression_yields_in_current_scope(&assignment.value)
+                                    && matches!(assignment.value.as_ref(), Expr::If(value)
+                                        if condition_has_linear_runtime_leaves(&value.test)
+                                            && [&value.body, &value.orelse].into_iter().all(|value|
+                                                !expression_contains_inline_branch(value))))
+                    }))
+        };
         let iterator_inside_finally = ordinary_function
             && self.control.finally.active_finally_try_bodies == 1
             && (erased_final_body
@@ -19291,6 +19320,7 @@ impl<'source> Compiler<'source> {
                         self.context.is_elided_statement(part)
                             || suite_has_linear_borrow_fallthrough(std::slice::from_ref(part))
                             || completed_dict_store(part)
+                            || completed_inner_for(part)
                             || completed_conditional_work(part)
                     })));
         // With no intervening cleanup, the removed else reaches the iterator
@@ -19321,6 +19351,7 @@ impl<'source> Compiler<'source> {
                         self.context.is_elided_statement(statement)
                             || suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement))
                             || completed_dict_store(statement)
+                            || completed_inner_for(statement)
                             // Both value arms merge before the name store, independently
                             // of the enclosing condition's erased false edge.
                             || (completed_work_at_restart && matches!(statement, Stmt::Assign(assignment)
