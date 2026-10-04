@@ -237,6 +237,7 @@ impl Assembler {
     pub(in crate::assembler) fn into_optimization_pipeline(mut self) -> OptimizationPipeline {
         self.prune_unused_loop_finally_region_boundaries();
         self.resolve_folded_condition_borrow_entries();
+        let mut exception_owner_provenance = self.exception_owner_provenance.into_box();
         let (mut graph, initial_reachable) = match self.code {
             UnoptimizedCode::Linear(items) => (
                 BlockGraph::from_items(items, &rustc_hash::FxHashSet::default()),
@@ -307,7 +308,7 @@ impl Assembler {
                 if labels.is_empty()
                     || !labels.iter().all(|item| {
                         matches!(item, Item::Label(label)
-                        if self.exception_owner_provenance.block_boundaries.contains(label)
+                        if exception_owner_provenance.block_boundaries.contains(label)
                             && !self.original_nop_targets.contains(label))
                     })
                     || bridge.opcode != JUMP_FORWARD
@@ -369,7 +370,7 @@ impl Assembler {
                     // TO_BOOL. Admit those three slots only on the captured source record.
                     || (condition.local_policy.hidden_exception_owner_slots() != 0
                         && (condition.local_policy.hidden_exception_owner_slots() != 3
-                            || !self.exception_owner_provenance.source_none_conditions
+                            || !exception_owner_provenance.source_none_conditions
                                 .iter().any(|origin| origin.instruction == condition)))
                     || condition.exception_policy() != super::ExceptionPolicy::default()
                     || graph[condition_block].last_instruction() != Some(&condition)
@@ -444,12 +445,8 @@ impl Assembler {
                 .prevent_small_exit_inlining();
         }
         if !self.exception_regions.is_empty()
-            || !self
-                .exception_owner_provenance
-                .normal_try_jump_owners
-                .is_empty()
-            || !self
-                .exception_owner_provenance
+            || !exception_owner_provenance.normal_try_jump_owners.is_empty()
+            || !exception_owner_provenance
                 .ordinary_await_cleanups
                 .is_empty()
         {
@@ -464,7 +461,7 @@ impl Assembler {
                 })
                 .collect::<rustc_hash::FxHashMap<_, _>>();
             // Removed source labels cannot certify an intact original await.
-            self.exception_owner_provenance
+            exception_owner_provenance
                 .ordinary_await_cleanups
                 .retain(|region| {
                     label_positions.contains_key(&region.start)
@@ -475,13 +472,13 @@ impl Assembler {
                 .exception_regions
                 .iter_mut()
                 .chain(
-                    self.exception_owner_provenance
+                    exception_owner_provenance
                         .normal_try_jump_owners
                         .values_mut()
                         .flatten(),
                 )
                 .chain(
-                    self.exception_owner_provenance
+                    exception_owner_provenance
                         .ordinary_await_cleanups
                         .iter_mut(),
                 )
@@ -502,41 +499,33 @@ impl Assembler {
                         if instruction.jump_target().is_some())
                 })
         );
-        self.exception_owner_provenance
-            .bind_normal_try_borrow_exits(
-                &graph,
-                &self.preserved_block_boundaries,
-                &self.exception_regions,
-                &self.folded_loop_exit_anchors,
-            );
+        exception_owner_provenance.bind_normal_try_borrow_exits(
+            &graph,
+            &self.preserved_block_boundaries,
+            &self.exception_regions,
+            &self.folded_loop_exit_anchors,
+        );
         if graph.features().has_jump() {
             for item in graph.iter_items() {
                 if let Item::Instruction(instruction) = item
                     && let Some(label) = instruction.jump_target()
                 {
-                    self.exception_owner_provenance
-                        .block_boundaries
-                        .insert(label);
+                    exception_owner_provenance.block_boundaries.insert(label);
                 }
             }
         }
         // Later CFG passes can restore protected jump owners but only from this map.
         if (!self.exception_regions.is_empty()
-            || !self
-                .exception_owner_provenance
-                .normal_try_jump_owners
-                .is_empty())
+            || !exception_owner_provenance.normal_try_jump_owners.is_empty())
             && (graph.features().has_forward_conditional()
-                || !self
-                    .exception_owner_provenance
+                || !exception_owner_provenance
                     .original_value_jump_prefixes
                     .is_empty())
         {
-            self.exception_owner_provenance
-                .capture_uncompacted_conditional_arrays(
-                    &graph.copy_items(),
-                    self.python_version == crate::PythonVersion::Py314,
-                );
+            exception_owner_provenance.capture_uncompacted_conditional_arrays(
+                &graph.copy_items(),
+                self.python_version == crate::PythonVersion::Py314,
+            );
         }
         Self::restore_legacy_return_pop_blocks(&mut graph, &self.legacy_return_pop_blocks);
         OptimizationPipeline {
@@ -559,7 +548,7 @@ impl Assembler {
             next_label: self.next_label,
             legacy_native_labels: self.legacy_native_labels,
             exception_regions: self.exception_regions,
-            exception_owner_provenance: self.exception_owner_provenance,
+            exception_owner_provenance,
             preserved_block_boundaries: self.preserved_block_boundaries,
             borrow_unreachable_blocks: self.borrow_unreachable_blocks,
             borrow_omitted_for_backedges: self.borrow_omitted_for_backedges,
@@ -1290,7 +1279,7 @@ impl OptimizationPipeline {
             legacy_uniform_jump_seed: self.legacy_uniform_jump_seed,
             items,
             exception_regions: self.exception_regions,
-            exception_owner_provenance: self.exception_owner_provenance,
+            exception_owner_provenance: self.exception_owner_provenance.into(),
             preserved_block_boundaries: self.preserved_block_boundaries,
             removed_max_depth,
             next_label: self.next_label,
@@ -1646,6 +1635,7 @@ impl LayoutAssembler {
 mod uniform_jump_seed_tests {
     use super::{Assembler, Instruction, Item, Label, LayoutAssembler, Operand, SourceLocation};
     use crate::PythonVersion;
+    use crate::assembler::exception_owners::LazyExceptionOwnerProvenance;
     use crate::target::opcodes::{
         EXTENDED_ARG, JUMP_BACKWARD, LOAD_CONST, NOP, POP_TOP, RETURN_VALUE,
     };
@@ -1689,7 +1679,7 @@ mod uniform_jump_seed_tests {
             legacy_uniform_jump_seed: uniform,
             items,
             exception_regions: Vec::new(),
-            exception_owner_provenance: Box::default(),
+            exception_owner_provenance: LazyExceptionOwnerProvenance::default(),
             preserved_block_boundaries: rustc_hash::FxHashSet::default(),
             removed_max_depth: None,
             next_label: 1,

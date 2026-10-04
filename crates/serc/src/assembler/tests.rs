@@ -1,3 +1,4 @@
+use super::exception_owners::LazyExceptionOwnerProvenance;
 use super::ir::{
     BorrowFallthrough, ExceptionPolicy, FusionPolicy, JumpPolicy, LocalPolicy, NoLocationPolicy,
     RetainedJumpNop, UnoptimizedCode,
@@ -8,6 +9,26 @@ use super::{
 };
 use crate::target::opcodes::*;
 use crate::target::operands::{CommonConstant, Conversion, FunctionAttribute, ResumeLocation};
+
+#[test]
+fn plain_linear_scopes_do_not_allocate_owner_provenance() {
+    let mut assembler = Assembler::with_python_version(crate::PythonVersion::Py314);
+    assembler.emit(LOAD_CONST, 0);
+    assembler.emit(RETURN_VALUE, 0);
+    assert!(assembler.exception_owner_provenance.setups.is_empty());
+    assembler.record_omitted_nop_targets(SourceLocation::NONE);
+    assembler.remap_constant_indices(&[Some(0)]);
+    let mut layout = assembler
+        .optimize_linear_assertion_side_exits(0, 0, None)
+        .unwrap();
+    let provenance = &mut layout.exception_owner_provenance;
+    assert!(provenance.as_mut_if_present().is_none());
+
+    let entry = super::Label::from_u32(0);
+    provenance.block_boundaries.insert(entry);
+    let provenance = provenance.as_mut_if_present().unwrap();
+    assert!(provenance.block_boundaries.contains(&entry));
+}
 
 #[test]
 fn borrow_cleanup_capture_requires_an_original_unlocated_array() {
@@ -2043,7 +2064,7 @@ fn fused_final_artifacts_preserve_cache_extended_argument_location_and_depth_sem
             )),
         ],
         exception_regions: Vec::new(),
-        exception_owner_provenance: Box::default(),
+        exception_owner_provenance: LazyExceptionOwnerProvenance::default(),
         preserved_block_boundaries: rustc_hash::FxHashSet::default(),
         removed_max_depth: None,
         next_label: 1,
@@ -2128,7 +2149,7 @@ fn unextended_final_artifacts_preserve_jump_cache_location_and_depth_semantics()
             )),
         ],
         exception_regions: Vec::new(),
-        exception_owner_provenance: Box::default(),
+        exception_owner_provenance: LazyExceptionOwnerProvenance::default(),
         preserved_block_boundaries: rustc_hash::FxHashSet::default(),
         removed_max_depth: None,
         next_label: 1,
@@ -7065,7 +7086,8 @@ fn retained_setup_nop_identity_survives_consecutive_labels_without_aliasing_remo
                     setup_nop_boundaries: [start, end].into_iter().collect(),
                     ..Default::default()
                 },
-            ),
+            )
+            .into(),
             preserved_block_boundaries: rustc_hash::FxHashSet::default(),
             removed_max_depth: None,
             next_label: 4,

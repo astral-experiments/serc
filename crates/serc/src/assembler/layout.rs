@@ -983,6 +983,7 @@ mod tests {
     use rustc_hash::FxHashSet;
 
     use super::*;
+    use crate::assembler::exception_owners::LazyExceptionOwnerProvenance;
     use crate::assembler::{ExceptionPolicy, ExceptionRegion, NOP};
 
     #[test]
@@ -1343,7 +1344,7 @@ mod tests {
             legacy_uniform_jump_seed: false,
             items,
             exception_regions,
-            exception_owner_provenance: Box::default(),
+            exception_owner_provenance: LazyExceptionOwnerProvenance::default(),
             preserved_block_boundaries: FxHashSet::default(),
             removed_max_depth: None,
             next_label: 0,
