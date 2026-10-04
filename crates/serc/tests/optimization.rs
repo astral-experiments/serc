@@ -9076,6 +9076,70 @@ fn erased_assertions_preserve_populated_iterator_branch_joins() {
 }
 
 #[test]
+fn erased_disjunction_preserves_nested_iterator_branch_joins() {
+    let branch = r"if probe.accepts((1, 2)) or value == 0 or flag:
+    assert all(element != 7 for element in group)
+else:
+    assert 1 not in group
+    assert 2 not in group
+    if value == 3:
+        assert 4 in group
+";
+    let indent = |body: &str| {
+        body.lines().fold(String::new(), |mut result, line| {
+            writeln!(result, "    {line}").unwrap();
+            result
+        })
+    };
+    for (depth, branch) in [
+        (2, branch.to_owned()),
+        (2, branch.replace(" or flag", "")),
+        (0, branch.to_owned()),
+        (1, branch.to_owned()),
+        (
+            2,
+            branch.replace("    if value == 3:\n        assert 4 in group\n", ""),
+        ),
+        (
+            2,
+            branch.replace(
+                "assert all(element != 7 for element in group)",
+                "probe.consume(value)",
+            ),
+        ),
+    ]
+    .into_iter()
+    .chain(
+        [
+            "probe.accepts(5) and not probe.accepts(6)",
+            "probe.accepts(5) or not probe.accepts(6)",
+            "probe.accepts(5)",
+        ]
+        .map(|value| {
+            (
+                2,
+                format!("assert 5 in group\nassert 6 in group\nflag = {value}\n{branch}"),
+            )
+        }),
+    ) {
+        let body = match depth {
+            0 => branch,
+            1 => format!("for value in group:\n{}", indent(&branch)),
+            2 => format!(
+                "for group in batches:\n{}",
+                indent(&format!("for value in group:\n{}", indent(&branch))),
+            ),
+            _ => unreachable!(),
+        };
+        let source = format!(
+            "def collect(batches, group, value, probe, flag):\n{}    return None\n",
+            indent(&body),
+        );
+        assert_matches_cpython(&source, "erased_disjunction_loop_join.py", &LEVELS);
+    }
+}
+
+#[test]
 fn erased_assertions_preserve_populated_scope_footer() {
     for source in [
         r"def finish(left, right, sink):
