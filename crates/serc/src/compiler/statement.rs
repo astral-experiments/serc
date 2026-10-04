@@ -42170,12 +42170,12 @@ fn finally_guarded_loop_recovery_leaves_empty_borrow_exit(body: &[Stmt]) -> bool
     // A runtime loop also empties its backedge after a terminal guarded break.
     // Live loop-tail work instead populates that original continuation.
     if early_condition_truthiness(&retry.test) != Some(true)
-        && !(condition_has_only_runtime_tests(&retry.test)
-            && original_condition_has_unique_jump_target(&retry.test, false)
-            && !expression_contains_inline_branch(&retry.test)
-            && !expression_suspends_current_scope(&retry.test)
-            && !expression_yields_in_current_scope(&retry.test)
-            && matches!(retry.body.last(), Some(Stmt::If(tail))
+        && (!condition_has_only_runtime_tests(&retry.test)
+            || !original_condition_has_unique_jump_target(&retry.test, false)
+            || expression_contains_inline_branch(&retry.test)
+            || expression_suspends_current_scope(&retry.test)
+            || expression_yields_in_current_scope(&retry.test)
+            || !matches!(retry.body.last(), Some(Stmt::If(tail))
                 if matches!(tail.body.last(), Some(Stmt::Break(_)))))
     {
         return false;
