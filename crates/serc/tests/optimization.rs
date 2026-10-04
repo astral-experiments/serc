@@ -15,6 +15,56 @@ use serc::{
 };
 
 #[test]
+fn coroutine_erased_inner_arm_preserves_loop_backedges() {
+    let source = r"
+async def run(items, mode, note):
+    await note(mode)
+    for item in items:
+        marker = note(item)
+        if mode == 1:
+            assert marker
+        else:
+            assert not marker
+        if mode == 2:
+            if marker:
+                assert item
+            assert marker
+        else:
+            assert not marker
+    if mode:
+        assert items
+    value = note(mode)
+    return value
+";
+    let (prefix, loop_and_tail) = source.split_once("    for item in items:\n").unwrap();
+    let (loop_body, tail) = loop_and_tail.split_once("    if mode:\n").unwrap();
+    let mut nested_body = String::new();
+    for line in loop_body.lines() {
+        writeln!(nested_body, "    {line}").unwrap();
+    }
+    let nested_loop = format!(
+        "{prefix}    for batch in items:\n        for item in batch:\n{nested_body}    if mode:\n{tail}"
+    );
+    let protected_loop = format!(
+        "{}    with manager:\n        for item in items:\n{nested_body}    if mode:\n{tail}",
+        prefix.replace("items, mode, note", "items, mode, note, manager")
+    );
+    for (index, source) in [
+        source.to_owned(),
+        source.replace("    await note(mode)\n", ""),
+        source.replace("        if mode == 1:\n            assert marker\n        else:\n            assert not marker\n", ""),
+        source.replace("                assert item\n            assert marker\n", "                assert item\n"),
+        source.replace("async def", "def").replace("    await note(mode)\n", ""),
+        source.replace("if marker:", "if mode != 3:"),
+        source.replace("    if mode:\n", "    else:\n        note(mode)\n    if mode:\n"),
+        nested_loop,
+        protected_loop,
+    ].into_iter().enumerate() {
+        assert_matches_cpython(&source, &format!("erased_coroutine_arm_{index}.py"), &LEVELS);
+    }
+}
+
+#[test]
 fn erased_nested_arms_keep_the_enclosing_iterator_exit() {
     let source = r"def process(items, flags, kinds, width):
     with manager() as owner, manager(), manager(), manager(), manager(), manager():
