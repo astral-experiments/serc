@@ -19259,6 +19259,19 @@ impl<'source> Compiler<'source> {
                 && self.control.finally.active_finally_try_bodies == 1
                 && iterator_arm_has_completed_dict_store(part)
         };
+        // Both value arms merge before the name store, independently
+        // of the enclosing condition's erased false edge.
+        let completed_conditional_store = |part: &Stmt| {
+            completed_work_at_restart
+                && matches!(part, Stmt::Assign(assignment)
+                    if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                        && matches!(assignment.value.as_ref(), Expr::If(value)
+                            if condition_has_linear_runtime_leaves(&value.test)
+                                && !expression_suspends_current_scope(&value.test)
+                                && [&value.body, &value.orelse].into_iter().all(|value|
+                                    !expression_contains_inline_branch(value)
+                                        && !expression_suspends_current_scope(value))))
+        };
         // Exhausting the inner iterator restores the enclosing finally owner.
         // Its completed stores cannot enter the outer condition's erased edge.
         let completed_inner_for = |part: &Stmt| {
@@ -19320,6 +19333,7 @@ impl<'source> Compiler<'source> {
                         self.context.is_elided_statement(part)
                             || suite_has_linear_borrow_fallthrough(std::slice::from_ref(part))
                             || completed_dict_store(part)
+                            || completed_conditional_store(part)
                             || completed_inner_for(part)
                             || completed_conditional_work(part)
                     })));
@@ -19352,16 +19366,7 @@ impl<'source> Compiler<'source> {
                             || suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement))
                             || completed_dict_store(statement)
                             || completed_inner_for(statement)
-                            // Both value arms merge before the name store, independently
-                            // of the enclosing condition's erased false edge.
-                            || (completed_work_at_restart && matches!(statement, Stmt::Assign(assignment)
-                                if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
-                                    && matches!(assignment.value.as_ref(), Expr::If(value)
-                                        if condition_has_linear_runtime_leaves(&value.test)
-                                            && !expression_suspends_current_scope(&value.test)
-                                            && [&value.body, &value.orelse].into_iter().all(|value|
-                                                !expression_contains_inline_branch(value)
-                                                    && !expression_suspends_current_scope(value)))))
+                            || completed_conditional_store(statement)
                             || completed_conditional_work(statement)
                             || matches!(statement, Stmt::Expr(expression)
                                 if cleanup_conditional_argument_has_eager_call_prefix(&expression.value))
