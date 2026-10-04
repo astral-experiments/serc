@@ -5507,6 +5507,9 @@ impl Assembler {
                 .map_or(1, |(_, _, count)| count + 1);
             self.exception_owner_provenance.omitted_nop_tail = Some((position, location, count));
         }
+        if labels.is_empty() {
+            return;
+        }
         self.exception_owner_provenance
             .omitted_nop_locations
             .extend(labels.iter().copied().map(|label| (label, location)));
@@ -7804,9 +7807,10 @@ impl Assembler {
                 && jump.exception_policy() == ExceptionPolicy::default()
                 && jump.local_policy.hidden_exception_owner_slots() == 0
             {
+                let jump = *jump;
                 self.exception_owner_provenance
                     .borrow_normal_try_exits
-                    .push((entry, *jump));
+                    .push((entry, jump));
             }
         }
         let Some(location) = wildcard_call_location else {
@@ -16594,9 +16598,12 @@ impl Assembler {
             }
             UnoptimizedCode::Prepared { graph, .. } => graph.for_each_instruction_mut(remap),
         }
+        let Some(provenance) = self.exception_owner_provenance.as_mut_if_present() else {
+            return;
+        };
         // retain_used moves the same constants without changing their identity.
         // Apply its mapping to every original witness only after all live records.
-        for original in &mut self.exception_owner_provenance.original_uniform_folds {
+        for original in &mut provenance.original_uniform_folds {
             if original.opcode == LOAD_CONST
                 && original.jump_policy.has_original_uniform_fold()
                 && let Some(index) = original.value_argument()
@@ -16610,7 +16617,7 @@ impl Assembler {
         // These source arrays were captured before unused constants were pruned.
         // Transport only surviving constant identities; replay still compares every
         // complete instruction and rejects any other change to the original array.
-        self.exception_owner_provenance
+        provenance
             .copied_return_membership_prefixes
             .retain_mut(|origin| {
                 let Operand::Value(index) = origin.constant.operand() else {
@@ -16622,23 +16629,21 @@ impl Assembler {
                 origin.constant.set_operand(Operand::Value(*remapped));
                 true
             });
-        self.exception_owner_provenance
-            .copied_return_pop_prefixes
-            .retain_mut(|origin| {
-                let load = &mut origin.records[2];
-                if load.opcode != LOAD_CONST {
-                    return false;
-                }
-                let Some(index) = load.value_argument() else {
-                    return false;
-                };
-                let Some(Some(remapped)) = index_map.get(index as usize) else {
-                    return false;
-                };
-                load.set_operand(Operand::Value(*remapped));
-                true
-            });
-        self.exception_owner_provenance
+        provenance.copied_return_pop_prefixes.retain_mut(|origin| {
+            let load = &mut origin.records[2];
+            if load.opcode != LOAD_CONST {
+                return false;
+            }
+            let Some(index) = load.value_argument() else {
+                return false;
+            };
+            let Some(Some(remapped)) = index_map.get(index as usize) else {
+                return false;
+            };
+            load.set_operand(Operand::Value(*remapped));
+            true
+        });
+        provenance
             .saved_named_handler_none_prefixes
             .retain_mut(|origin| {
                 for item in &mut origin.items {
@@ -16658,7 +16663,7 @@ impl Assembler {
                 }
                 true
             });
-        self.exception_owner_provenance
+        provenance
             .original_normal_finally_arrays
             .retain_mut(|origin| {
                 origin.borrow_join = origin.borrow_join.and_then(|(join, mut first)| {
