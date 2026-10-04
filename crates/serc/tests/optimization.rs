@@ -3576,6 +3576,118 @@ fn elided_assertions_preserve_unpacking_return_locations() {
 }
 
 #[test]
+fn finally_guarded_loop_recovery_preserves_borrow_boundary() {
+    const GUARDED: &str = "while True:\n    if flag:\n        result = 2\n        break\n    result = take()\n    if result:\n        break";
+    const RUNTIME: &str = "while flag:\n    if flag:\n        result = 2\n        break\n    result = take()\n    if result:\n        break";
+    const SINGLE: &str = "while True:\n    result = take()\n    if flag:\n        break";
+    const IMMEDIATE: &str = "while True:\n    result = take()\n    break";
+    const UNBROKEN: &str = "while True:\n    result = take()\n    if items:\n        marker = 4\n        note(marker)\n    for item in items:\n        note(item)\n    note(result)";
+    let conditional = format!(
+        "{GUARDED}\n    if items:\n        marker = 4\n        note(marker)\n    note(result)"
+    );
+    let iterator =
+        format!("{GUARDED}\n    for item in items:\n        note(item)\n    note(result)");
+    let combined = format!(
+        "{GUARDED}\n    if items:\n        marker = 4\n        note(marker)\n    for item in items:\n        note(item)\n    note(result)"
+    );
+    let runtime = combined.replacen("while True:", "while flag:", 1);
+    let runtime_live_tail = format!("{RUNTIME}\n    note(result)");
+    let single = format!(
+        "{SINGLE}\n    if items:\n        marker = 4\n        note(marker)\n    for item in items:\n        note(item)\n    note(result)"
+    );
+    for (index, (body, initial, handler, suffix)) in [
+        (GUARDED, "result = 1", Some("result = 3"), "note(result)"),
+        (GUARDED, "result = 1", Some("pass"), "note(result)"),
+        (GUARDED, "", Some("result = 3"), "note(result)"),
+        (RUNTIME, "result = 1", Some("result = 3"), "note(result)"),
+        (SINGLE, "result = 1", Some("result = 3"), "note(result)"),
+        (IMMEDIATE, "result = 1", Some("result = 3"), "note(result)"),
+        (GUARDED, "result = 1", None, "note(result)"),
+        (
+            "result = take()",
+            "result = 1",
+            Some("result = 3"),
+            "note(result)",
+        ),
+        (GUARDED, "result = 1", Some("result = 3"), ""),
+        (
+            GUARDED,
+            "result = 1",
+            Some("result = 3"),
+            "note(result)\nnote(flag)",
+        ),
+        (
+            conditional.as_str(),
+            "result = 1",
+            Some("result = 3"),
+            "note(result)",
+        ),
+        (
+            iterator.as_str(),
+            "result = 1",
+            Some("result = 3"),
+            "note(result)",
+        ),
+        (
+            combined.as_str(),
+            "result = 1",
+            Some("result = 3"),
+            "note(result)",
+        ),
+        (
+            runtime.as_str(),
+            "result = 1",
+            Some("result = 3"),
+            "note(result)",
+        ),
+        (
+            single.as_str(),
+            "result = 1",
+            Some("result = 3"),
+            "note(result)",
+        ),
+        (combined.as_str(), "result = 1", None, "note(result)"),
+        (UNBROKEN, "result = 1", Some("result = 3"), "note(result)"),
+        (
+            runtime_live_tail.as_str(),
+            "result = 1",
+            Some("result = 3"),
+            "note(result)",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut source = String::from(
+            "def run(flag, take, note, items):\n    result = 0\n    try:\n        note(flag)\n    finally:\n",
+        );
+        for line in initial.lines() {
+            writeln!(source, "        {line}").unwrap();
+        }
+        if let Some(handler) = handler {
+            source.push_str("        try:\n");
+            for line in body.lines() {
+                writeln!(source, "            {line}").unwrap();
+            }
+            writeln!(source, "        except LookupError:\n            {handler}").unwrap();
+        } else {
+            for line in body.lines() {
+                writeln!(source, "        {line}").unwrap();
+            }
+        }
+        for line in suffix.lines() {
+            writeln!(source, "        {line}").unwrap();
+        }
+        source.push_str("    if result:\n        return 1\n    return 0\n");
+        assert_matches_cpython(
+            &source,
+            &format!("finally_guarded_loop_recovery_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn while_else_keeps_finally_borrowing_after_elided_assertions() {
     for condition in ["condition()", "condition() or count < 3"] {
         for following in ["", "    return obj\n"] {
