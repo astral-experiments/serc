@@ -193,6 +193,58 @@ fn protected_erased_else_preserves_completed_iterator_backedges() {
 }
 
 #[test]
+fn protected_conditional_store_preserves_erased_else_backedge() {
+    let protected = r"def collect(batches, left, right, cleanup, sink):
+    try:
+        for batch in batches:
+            for key in batch:
+                if key in (2, 5):
+                    chosen = left if key == 2 else right
+                    assert chosen
+                    assert chosen != key
+                    assert key
+                else:
+                    assert key
+                    assert batch
+                    assert batches
+    finally:
+        cleanup()
+        sink(batches)
+";
+    let constants = protected.replace("left if key == 2 else right", "7 if key == 2 else 11");
+    let unprotected = protected
+        .replace("    try:\n", "")
+        .replace(
+            "    finally:\n        cleanup()\n        sink(batches)\n",
+            "",
+        )
+        .lines()
+        .map(|line| line.strip_prefix("    ").unwrap_or(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for (index, source) in [
+        constants.clone(),
+        constants.replace("if key in (2, 5):", "if key:"),
+        protected.to_owned(),
+        protected.replace("left if key == 2 else right", "key"),
+        unprotected,
+        protected.replace(
+            "                else:\n                    assert key\n                    assert batch\n                    assert batches",
+            "                else:\n                    sink(key)",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            &source,
+            &format!("protected_conditional_store_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn protected_completed_inner_for_preserves_erased_else_backedge() {
     let protected = r"def collect(groups, cleanup, sink, fallback):
     try:
