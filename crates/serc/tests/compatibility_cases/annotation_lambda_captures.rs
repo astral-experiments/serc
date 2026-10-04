@@ -69,6 +69,30 @@ fn annotation_lambdas_capture_enclosing_names_despite_class_globals() {
 }
 
 #[test]
+fn function_annotations_keep_multiple_shadowed_nested_captures() {
+    let source = r"def outer(value, other):
+    def plain(a: lambda: value, b: [other for _ in ()]):
+        pass
+    class Bound:
+        value = int
+        other = str
+        def method(a: (value, lambda: value), b: (other, lambda: other)):
+            pass
+    class Global:
+        global value, other
+        def method(a: (value, lambda: value), b: (other, lambda: other)):
+            pass
+    return plain, Bound, Global
+";
+    for future in ["", "from __future__ import annotations\n"] {
+        common::assert_matches_cpython_marshal(
+            &format!("{future}{source}"),
+            "function_annotation_shadowed_captures.py",
+        );
+    }
+}
+
+#[test]
 fn discarded_local_annotations_preserve_only_nested_captures() {
     for expression in [
         "value",
