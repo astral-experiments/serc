@@ -34707,9 +34707,16 @@ impl<'source> Compiler<'source> {
                     && self.control.finally.active_normal_finally_bodies == 0
                     && self.control.finally.active_copied_finally_bodies == 0
                     && self.control.finally.active_finally_end_blocks == 0
-                    && finally_conditional_call_suffix_leaves_empty_borrow_exit(
+                    && (finally_conditional_call_suffix_leaves_empty_borrow_exit(
                         &statement.finalbody,
-                    ))
+                    ) || (self.context.python_version == crate::PythonVersion::Py314
+                        && !statement.is_star
+                        && !self.has_active_control_flow_region()
+                        && !self.control.in_exception_handler()
+                        && self.control.finally.is_inactive_for_return_unwind()
+                        && finally_guarded_loop_recovery_leaves_empty_borrow_exit(
+                            &statement.finalbody,
+                        ))))
             {
                 // Branch and manager joins, including empty joins retained when a finally
                 // loop's cold copy moves, interrupt CPython's borrowed-load traversal.
@@ -40079,6 +40086,30 @@ fn suite_has_completed_manager_loop_work(body: &[Stmt]) -> bool {
     })
 }
 
+// Suspension adds resume and cleanup entries even to an otherwise linear suite.
+fn suite_has_nonsuspending_linear_fallthrough(body: &[Stmt]) -> bool {
+    struct SuspensionDetector(bool);
+
+    impl<'ast> Visitor<'ast> for SuspensionDetector {
+        fn visit_expr(&mut self, expression: &'ast Expr) {
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_expr(expression));
+            }
+
+            self.0 |= expression_suspends_current_scope(expression);
+        }
+    }
+
+    if !suite_has_linear_borrow_fallthrough(body)
+        || suite_contains_yield_with_headers(body, true, true)
+    {
+        return false;
+    }
+    let mut detector = SuspensionDetector(false);
+    detector.visit_body(body);
+    !detector.0
+}
+
 /// Certifies a populated named-handler exit into guarded, named linear recovery.
 fn named_handler_break_has_guarded_linear_cleanup(statement: &ruff_python_ast::StmtTry) -> bool {
     let linear =
@@ -42096,6 +42127,90 @@ fn finally_conditional_call_suffix_leaves_empty_borrow_exit(body: &[Stmt]) -> bo
                     matches!(handler.body.as_slice(), [Stmt::Pass(_)])
                 }
         })
+}
+
+// Guarded breaks and a split loop fallthrough bypass the copied recovery's normal exit.
+// Cold relocation leaves that empty array after the normal finalizer's live suffix.
+fn finally_guarded_loop_recovery_leaves_empty_borrow_exit(body: &[Stmt]) -> bool {
+    let Some(index) = body.iter().position(|part| matches!(part, Stmt::Try(_))) else {
+        return false;
+    };
+    let Stmt::Try(recovery) = &body[index] else {
+        unreachable!();
+    };
+    let [Stmt::While(retry)] = recovery.body.as_slice() else {
+        return false;
+    };
+    let [handler] = recovery.handlers.as_slice() else {
+        return false;
+    };
+    let Some(handler) = handler.as_except_handler() else {
+        return false;
+    };
+    if recovery.is_star
+        || !recovery.orelse.is_empty()
+        || !recovery.finalbody.is_empty()
+        || handler.name.is_some()
+        || !matches!(handler.type_.as_deref(), Some(Expr::Name(_)))
+        || !(matches!(handler.body.as_slice(), [Stmt::Pass(_)])
+            || suite_has_nonsuspending_linear_fallthrough(&handler.body))
+        || (index > 0 && !suite_has_nonsuspending_linear_fallthrough(&body[..index]))
+        || index + 1 == body.len()
+        || !body[index + 1..].iter().all(|part| {
+            matches!(part, Stmt::Expr(expression)
+                if matches!(expression.value.as_ref(), Expr::Call(_))
+                    && !expression_contains_inline_branch(&expression.value)
+                    && !expression_suspends_current_scope(&expression.value)
+                    && !expression_yields_in_current_scope(&expression.value))
+        })
+        || !retry.orelse.is_empty()
+    {
+        return false;
+    }
+    // A runtime loop also empties its backedge after a terminal guarded break.
+    // Live loop-tail work instead populates that original continuation.
+    if early_condition_truthiness(&retry.test) != Some(true)
+        && (!condition_has_only_runtime_tests(&retry.test)
+            || !original_condition_has_unique_jump_target(&retry.test, false)
+            || expression_contains_inline_branch(&retry.test)
+            || expression_suspends_current_scope(&retry.test)
+            || expression_yields_in_current_scope(&retry.test)
+            || !matches!(retry.body.last(), Some(Stmt::If(tail))
+                if matches!(tail.body.last(), Some(Stmt::Break(_)))))
+    {
+        return false;
+    }
+    let mut guards = 0;
+    let mut structured_fallthrough = false;
+    retry.body.iter().all(|part| {
+        if let Stmt::For(completed) = part {
+            structured_fallthrough = true;
+            return !completed.is_async
+                && completed.orelse.is_empty()
+                && matches!(completed.target.as_ref(), Expr::Name(_))
+                && !expression_contains_inline_branch(&completed.iter)
+                && !expression_suspends_current_scope(&completed.iter)
+                && !expression_yields_in_current_scope(&completed.iter)
+                && suite_has_nonsuspending_linear_fallthrough(&completed.body);
+        }
+        let Stmt::If(guard) = part else {
+            return suite_has_nonsuspending_linear_fallthrough(std::slice::from_ref(part));
+        };
+        guard.elif_else_clauses.is_empty()
+            && condition_has_only_runtime_tests(&guard.test)
+            && original_condition_has_unique_jump_target(&guard.test, false)
+            && !expression_contains_inline_branch(&guard.test)
+            && !expression_suspends_current_scope(&guard.test)
+            && !expression_yields_in_current_scope(&guard.test)
+            && if let Some((Stmt::Break(_), prefix)) = guard.body.split_last() {
+                guards += 1;
+                prefix.is_empty() || suite_has_nonsuspending_linear_fallthrough(prefix)
+            } else {
+                structured_fallthrough = true;
+                suite_has_nonsuspending_linear_fallthrough(&guard.body)
+            }
+    }) && guards > 0
+        && (guards >= 2 || structured_fallthrough)
 }
 
 // Cold relocation leaves the emptied copy of a loop backedge between normal cleanup
