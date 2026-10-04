@@ -9029,3 +9029,78 @@ fn filtered_dict_store_preserves_protected_iterator_backedge() {
         assert_matches_cpython(&source, "filtered_protected_iterator.py", &LEVELS);
     }
 }
+
+#[test]
+fn completed_set_comparison_preserves_erased_iterator_edges() {
+    for (index, source) in [
+        r"async def erased_sets(batches, left, right, finish):
+    try:
+        for batch in batches:
+            if {item.code for item in left} == {item.code for item in right}:
+                assert batch == 0
+            else:
+                assert batch > 0
+    finally:
+        finish()
+",
+        r"async def nested_erased_sets(batches, left, right, ready, report, finish):
+    try:
+        for batch in batches:
+            if ready:
+                if {item.code for item in left} == {item.code for item in right}:
+                    assert batch == 0
+                else:
+                    assert batch > 0
+            else:
+                report(batch)
+    finally:
+        finish()
+",
+        r"def synchronous_sets(batches, left, right, finish):
+    try:
+        for batch in batches:
+            if {item.code for item in left} == {item.code for item in right}:
+                assert batch == 0
+            else:
+                assert batch > 0
+    finally:
+        finish()
+",
+        r"async def unprotected_sets(batches, left, right):
+    for batch in batches:
+        if {item.code for item in left} == {item.code for item in right}:
+            assert batch == 0
+        else:
+            assert batch > 0
+",
+        r"async def ordinary_operands(batches, left, right, finish):
+    try:
+        for batch in batches:
+            if left == right:
+                assert batch == 0
+            else:
+                assert batch > 0
+    finally:
+        finish()
+",
+        r"async def live_alternate(batches, left, right, report, finish):
+    try:
+        for batch in batches:
+            if {item.code for item in left} == {item.code for item in right}:
+                assert batch == 0
+            else:
+                report(batch)
+    finally:
+        finish()
+",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            source,
+            &format!("completed_set_comparison_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
