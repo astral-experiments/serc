@@ -26953,7 +26953,7 @@ impl<'source> Compiler<'source> {
                         })))
                     && matches!(self.unit.scope, Scope::Function { .. })
                     && (suite_retained_try_exit_has_normal_fallthrough(&statement.orelse)
-                        || suite_retained_try_exit_has_terminal_protected_body(&statement.orelse)
+                        || suite_retained_try_exit_has_terminal_normal_path(&statement.orelse)
                         || coroutine_asserted_else_exit)
                 {
                     if pass_only_handlers {
@@ -38905,10 +38905,10 @@ fn suite_retained_try_exit_has_normal_fallthrough(body: &[Stmt]) -> bool {
         })
 }
 
-// A nested try with a terminal protected body has no normal edge to the branch join.
-// Its handlers are cold entries in CPython's borrow walk. This witness only enables
-// an already reachable retained NOP; original empty-block barriers still apply.
-fn suite_retained_try_exit_has_terminal_protected_body(body: &[Stmt]) -> bool {
+// A nested try can reach the branch join only through its cold recovery handlers.
+// Its normal path may terminate in the protected body or break from the else suite.
+// This enables a retained NOP without bypassing original empty-block barriers.
+fn suite_retained_try_exit_has_terminal_normal_path(body: &[Stmt]) -> bool {
     let Some(Stmt::If(statement)) = body.last() else {
         return false;
     };
@@ -38916,10 +38916,16 @@ fn suite_retained_try_exit_has_terminal_protected_body(body: &[Stmt]) -> bool {
         && if_normal_exit_count(statement) > 0
         && if_suites(statement).any(|body| {
             matches!(body.last(), Some(Stmt::Try(statement))
-                    if !statement.is_star
-                        && statement.orelse.is_empty()
-                        && statement.finalbody.is_empty()
-                        && matches!(statement.body.last(), Some(Stmt::Return(_) | Stmt::Raise(_))))
+            if !statement.is_star
+                && statement.finalbody.is_empty()
+                && ((statement.orelse.is_empty()
+                    && matches!(statement.body.last(), Some(Stmt::Return(_) | Stmt::Raise(_))))
+                    || (suite_has_linear_borrow_fallthrough(&statement.body)
+                        && statement.orelse.split_last().is_some_and(|(last, prefix)| {
+                            matches!(last, Stmt::Break(_))
+                                && (prefix.is_empty()
+                                    || suite_has_linear_borrow_fallthrough(prefix))
+                        }))))
         })
 }
 

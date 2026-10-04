@@ -3413,6 +3413,55 @@ fn erased_assertion_preserves_try_break_exit_donor() {
 }
 
 #[test]
+fn nested_try_else_break_preserves_borrowed_tail() {
+    for (index, (nested, conditional, else_assignment, work_before_break)) in [
+        (true, true, true, false),
+        (true, true, true, true),
+        (true, true, false, false),
+        (true, false, false, false),
+        (false, true, true, false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let success_prefix = if work_before_break {
+            "    work(result)\n    work(value)\n"
+        } else {
+            ""
+        };
+        let branch = if nested {
+            format!(
+                "try:\n    result = work(result)\nexcept LookupError:\n    result = 2\nelse:\n{success_prefix}    break"
+            )
+        } else {
+            "break".to_owned()
+        };
+        let normal = if conditional {
+            let fallback = if else_assignment {
+                "\nelse:\n    result = 3"
+            } else {
+                ""
+            };
+            format!(
+                "if result:\n    {}{fallback}",
+                branch.replace('\n', "\n    ")
+            )
+        } else {
+            branch
+        };
+        let source = format!(
+            "def sample(values, emit, work):\n    for value in values:\n        try:\n            result = work(value)\n        except ValueError:\n            result = 0\n        else:\n            {}\n        emit(value, result)\n",
+            normal.replace('\n', "\n            ")
+        );
+        assert_matches_cpython(
+            &source,
+            &format!("nested_try_else_break_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn erased_inner_while_tail_preserves_borrow_boundary() {
     for (index, (outer, assertion_prefix, tail, guard)) in [
         (true, true, "assert value", "True"),
