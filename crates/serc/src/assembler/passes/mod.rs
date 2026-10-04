@@ -1635,6 +1635,7 @@ impl LayoutAssembler {
 mod uniform_jump_seed_tests {
     use super::{Assembler, Instruction, Item, Label, LayoutAssembler, Operand, SourceLocation};
     use crate::PythonVersion;
+    use crate::assembler::exception_owners::LazyExceptionOwnerProvenance;
     use crate::target::opcodes::{
         EXTENDED_ARG, JUMP_BACKWARD, LOAD_CONST, NOP, POP_TOP, RETURN_VALUE,
     };
@@ -1678,8 +1679,7 @@ mod uniform_jump_seed_tests {
             legacy_uniform_jump_seed: uniform,
             items,
             exception_regions: Vec::new(),
-            exception_owner_provenance:
-                crate::assembler::exception_owners::LazyExceptionOwnerProvenance::default(),
+            exception_owner_provenance: LazyExceptionOwnerProvenance::default(),
             preserved_block_boundaries: rustc_hash::FxHashSet::default(),
             removed_max_depth: None,
             next_label: 1,

@@ -1,5 +1,8 @@
 use std::cell::OnceCell;
 use std::cmp::Reverse;
+use std::fmt;
+use std::ops::{Deref, DerefMut};
+use std::sync::LazyLock;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
@@ -193,12 +196,12 @@ pub(super) struct RetiredBorrowMarker {
 pub(super) struct LazyExceptionOwnerProvenance(Option<Box<ExceptionOwnerProvenance>>);
 
 impl LazyExceptionOwnerProvenance {
-    /// Materializes the mutable metadata before the graph pipeline begins.
+    /// Returns owned metadata, allocating an empty box if needed.
     pub(super) fn into_box(self) -> Box<ExceptionOwnerProvenance> {
         self.0.unwrap_or_default()
     }
 
-    /// Allows metadata-only rewrites to preserve the absence of any owner witnesses.
+    /// Borrows existing metadata without allocating it.
     pub(super) fn as_mut_if_present(&mut self) -> Option<&mut ExceptionOwnerProvenance> {
         self.0.as_deref_mut()
     }
@@ -210,27 +213,27 @@ impl From<Box<ExceptionOwnerProvenance>> for LazyExceptionOwnerProvenance {
     }
 }
 
-impl std::ops::Deref for LazyExceptionOwnerProvenance {
+impl Deref for LazyExceptionOwnerProvenance {
     type Target = ExceptionOwnerProvenance;
 
     #[inline]
     fn deref(&self) -> &Self::Target {
-        static EMPTY: std::sync::LazyLock<ExceptionOwnerProvenance> =
-            std::sync::LazyLock::new(ExceptionOwnerProvenance::default);
+        static EMPTY: LazyLock<ExceptionOwnerProvenance> =
+            LazyLock::new(ExceptionOwnerProvenance::default);
         self.0.as_deref().unwrap_or_else(|| &EMPTY)
     }
 }
 
-impl std::ops::DerefMut for LazyExceptionOwnerProvenance {
+impl DerefMut for LazyExceptionOwnerProvenance {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.0.get_or_insert_with(Box::default)
     }
 }
 
-impl std::fmt::Debug for LazyExceptionOwnerProvenance {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Debug::fmt(&**self, formatter)
+impl fmt::Debug for LazyExceptionOwnerProvenance {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, formatter)
     }
 }
 
