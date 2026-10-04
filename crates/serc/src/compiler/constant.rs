@@ -122,6 +122,16 @@ impl ConstantPool {
         self.values.len()
     }
 
+    fn find(&self, constant: &Constant) -> Option<usize> {
+        if let Some(indices) = &self.indices {
+            indices
+                .find(&self.values, constant, constant_pool_fingerprint(constant))
+                .map(|index| index as usize)
+        } else {
+            find_pool_constant(&self.values, constant)
+        }
+    }
+
     pub(super) fn intern(&mut self, constant: Constant) -> Result<u32, CompileError> {
         if matches!(&constant, Constant::None)
             && matches!(self.values.first(), Some(Constant::None))
@@ -808,26 +818,29 @@ impl Compiler<'_> {
         if self.context.python_version <= PythonVersion::Py313 {
             return Ok(());
         }
-        let operands: Vec<_> = match expression {
-            Expr::BinOp(binary) => [&*binary.left, &*binary.right]
-                .into_iter()
-                .filter_map(|value| self.source_aware_fold_constant(value))
-                .collect(),
-            Expr::UnaryOp(unary) => self
-                .source_aware_fold_constant(&unary.operand)
-                .into_iter()
-                .collect(),
-            Expr::Subscript(subscript) => [&*subscript.value, &*subscript.slice]
-                .into_iter()
-                .filter_map(|value| self.source_aware_fold_constant(value))
-                .collect(),
-            _ => Vec::new(),
+        let operand_expressions = match expression {
+            Expr::BinOp(binary) => [Some(&*binary.left), Some(&*binary.right)],
+            Expr::UnaryOp(unary) => [Some(&*unary.operand), None],
+            Expr::Subscript(subscript) => [Some(&*subscript.value), Some(&*subscript.slice)],
+            _ => return Ok(()),
         };
-        if !operands.is_empty()
-            && let Some(result) = self.source_aware_fold_constant(expression)
-        {
-            self.record_folded_constant_dependencies(&result, operands);
+        let mut operands = operand_expressions
+            .into_iter()
+            .flatten()
+            .filter_map(|value| self.source_aware_fold_constant(value));
+        // Preserve the empty-operand gate before folding the result.
+        let Some(first) = operands.next() else {
+            return Ok(());
+        };
+        let Some(result) = self.source_aware_fold_constant(expression) else {
+            return Ok(());
+        };
+        if self.output.reserved_constant_index(&result).is_some() {
+            return Ok(());
         }
+        let operands = std::iter::once(first).chain(operands).collect();
+        self.output
+            .record_unreserved_folded_constant_dependencies(&result, operands);
         Ok(())
     }
 
@@ -935,8 +948,29 @@ impl OutputState {
         constant
     }
 
+    /// Finds the first reserved pool key without changing its admission order.
+    fn reserved_constant_index(&self, constant: &Constant) -> Option<usize> {
+        self.constants.find(constant).or_else(|| {
+            let kind = std::mem::discriminant(constant);
+            self.deferred_constants
+                .iter()
+                .position(|(_, existing)| {
+                    std::mem::discriminant(existing) == kind
+                        && ConstantEquality::PoolKey.equal(existing, constant)
+                })
+                .map(|index| self.constants.len() + index)
+        })
+    }
+
     /// Preserves operand admissions for containers created by late graph folding.
-    fn record_folded_constant_dependencies(
+    fn record_folded_constant_dependencies(&mut self, result: &Constant, operands: Vec<Constant>) {
+        if self.reserved_constant_index(result).is_none() {
+            self.record_unreserved_folded_constant_dependencies(result, operands);
+        }
+    }
+
+    /// Records dependencies after the caller checked that the result is not reserved.
+    fn record_unreserved_folded_constant_dependencies(
         &mut self,
         result: &Constant,
         mut operands: Vec<Constant>,
@@ -945,24 +979,11 @@ impl OutputState {
             // Cached operands retain their earlier construction order, including folds
             // from discarded branches preceding this set display.
             operands.sort_by_cached_key(|operand| {
-                self.constants
-                    .values
-                    .iter()
-                    .chain(self.deferred_constants.iter().map(|(_, value)| value))
-                    .position(|value| ConstantEquality::PoolKey.equal(value, operand))
-                    .unwrap_or(usize::MAX)
+                self.reserved_constant_index(operand).unwrap_or(usize::MAX)
             });
         }
-        let already_reserved = self
-            .constants
-            .values
-            .iter()
-            .chain(self.deferred_constants.iter().map(|(_, constant)| constant))
-            .any(|constant| ConstantEquality::PoolKey.equal(constant, result));
-        if !already_reserved {
-            self.folded_constant_dependencies
-                .push((result.clone(), operands));
-        }
+        self.folded_constant_dependencies
+            .push((result.clone(), operands));
     }
 }
 
@@ -4975,6 +4996,247 @@ def outer(argument):
         assert_eq!(indices.find(&values, &Constant::Int(2), Some(0)), Some(0));
         assert_eq!(indices.find(&values, &Constant::Int(2), Some(1)), Some(0));
         assert_eq!(indices.find(&values, &Constant::Int(1), None), Some(1));
+    }
+
+    #[test]
+    fn folded_operand_admissions_preserve_version_and_reservation_gates() {
+        for python_version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            for (source, legacy_values, modern_values, modern_dependencies) in [
+                ("runtime_left + runtime_right", vec![], vec![], 0),
+                ("(runtime_left, runtime_right)", vec![], vec![], 0),
+                ("runtime_left + 300", vec![300], vec![300], 0),
+                ("300 + runtime_right", vec![300], vec![300], 0),
+                ("+300", vec![300], vec![300], 0),
+                ("-300", vec![300], vec![300], 1),
+                ("+(200 + 100)", vec![300], vec![200, 100], 1),
+            ] {
+                let parsed = ruff_python_parser::parse_module(source).unwrap();
+                let [ruff_python_ast::Stmt::Expr(statement)] = parsed.suite().as_slice() else {
+                    unreachable!("test cases are expressions");
+                };
+                let mut compiler = super::Compiler::module_with_python_version(
+                    "fold_dependencies.py",
+                    source,
+                    parsed.tokens(),
+                    parsed.suite(),
+                    python_version,
+                );
+                compiler.record_folded_operands(&statement.value).unwrap();
+                let modern = python_version >= PythonVersion::Py314;
+                let expected_values = if modern { modern_values } else { legacy_values };
+                let values = &compiler.output.constants.values;
+                assert_eq!(
+                    values.len(),
+                    expected_values.len(),
+                    "{python_version:?}: {source}"
+                );
+                for (value, expected) in values.iter().zip(expected_values) {
+                    assert!(ConstantEquality::PoolKey.equal(value, &Constant::Int(expected)));
+                }
+                assert_eq!(
+                    compiler.output.folded_constant_dependencies.len(),
+                    if modern { modern_dependencies } else { 0 },
+                    "{python_version:?}: {source}"
+                );
+                if source == "+(200 + 100)" && modern {
+                    assert_eq!(compiler.output.deferred_constants.len(), 1);
+                    assert!(ConstantEquality::PoolKey.equal(
+                        &compiler.output.deferred_constants[0].1,
+                        &Constant::Int(300)
+                    ));
+                } else {
+                    assert!(compiler.output.deferred_constants.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reserved_fold_results_preserve_operand_admissions() {
+        let source = "-300";
+        let parsed = ruff_python_parser::parse_module(source).unwrap();
+        let [ruff_python_ast::Stmt::Expr(statement)] = parsed.suite().as_slice() else {
+            unreachable!("test case is an expression");
+        };
+        for python_version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            for deferred in [false, true] {
+                let mut compiler = super::Compiler::module_with_python_version(
+                    "reserved_fold.py",
+                    source,
+                    parsed.tokens(),
+                    parsed.suite(),
+                    python_version,
+                );
+                let result = Constant::SignedInt(-300);
+                if deferred {
+                    compiler.output.deferred_constants.push((None, result));
+                } else {
+                    compiler.output.constants.intern(result).unwrap();
+                }
+                compiler.record_folded_operands(&statement.value).unwrap();
+                assert!(compiler.output.folded_constant_dependencies.is_empty());
+                assert_eq!(
+                    compiler.output.constants.len(),
+                    if deferred { 1 } else { 2 }
+                );
+                assert!(ConstantEquality::PoolKey.equal(
+                    compiler.output.constants.values.last().unwrap(),
+                    &Constant::Int(300)
+                ));
+                assert_eq!(
+                    compiler.output.deferred_constants.len(),
+                    usize::from(deferred)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reserved_constant_lookup_preserves_pool_precedence_and_identity() {
+        for prefix_len in [0, CONSTANT_INDEX_THRESHOLD + 1] {
+            let mut state = OutputState::default();
+            for value in 0..prefix_len {
+                state
+                    .constants
+                    .intern(Constant::Int(1_000 + u64::try_from(value).unwrap()))
+                    .unwrap();
+            }
+            let pooled = Constant::String("pooled".to_string());
+            let deferred = Constant::Tuple(vec![Constant::Bool(true)]);
+            let duplicate = Constant::FrozenSet(vec![Constant::Int(1), Constant::Int(1)]);
+            let compatible = Constant::FrozenSet(vec![Constant::Int(1), Constant::Int(2)]);
+            let non_reflexive = Constant::Float(f64::NAN).with_non_reflexive_origin(17);
+            let deferred_non_reflexive = Constant::Float(f64::NAN).with_non_reflexive_origin(19);
+            state.deferred_constants = vec![
+                (None, pooled.clone()),
+                (None, deferred.clone()),
+                (None, deferred.clone()),
+                (None, deferred_non_reflexive.clone()),
+            ];
+            let pooled_index =
+                usize::try_from(state.constants.intern(pooled.clone()).unwrap()).unwrap();
+            let duplicate_index =
+                usize::try_from(state.constants.intern(duplicate).unwrap()).unwrap();
+            let non_reflexive_index =
+                usize::try_from(state.constants.intern(non_reflexive.clone()).unwrap()).unwrap();
+
+            assert_eq!(state.reserved_constant_index(&pooled), Some(pooled_index));
+            assert_eq!(
+                state.reserved_constant_index(&deferred),
+                Some(state.constants.len() + 1)
+            );
+            assert_eq!(
+                state.reserved_constant_index(&compatible),
+                Some(duplicate_index)
+            );
+            assert_eq!(
+                state.reserved_constant_index(&non_reflexive),
+                Some(non_reflexive_index)
+            );
+            assert_eq!(
+                state.reserved_constant_index(&deferred_non_reflexive),
+                Some(state.constants.len() + 3)
+            );
+            assert_eq!(
+                state.reserved_constant_index(
+                    &Constant::Float(f64::NAN).with_non_reflexive_origin(18)
+                ),
+                None
+            );
+            assert_eq!(state.reserved_constant_index(&Constant::Int(1)), None);
+            assert_eq!(state.reserved_constant_index(&Constant::Bool(true)), None);
+            state.record_folded_constant_dependencies(&compatible, vec![Constant::Int(2)]);
+            state.record_folded_constant_dependencies(&deferred, vec![Constant::Bool(true)]);
+            assert!(state.folded_constant_dependencies.is_empty());
+
+            let mut reverse = OutputState::default();
+            for value in 0..prefix_len {
+                reverse
+                    .constants
+                    .intern(Constant::Int(1_000 + u64::try_from(value).unwrap()))
+                    .unwrap();
+            }
+            reverse.constants.intern(compatible.clone()).unwrap();
+            reverse.deferred_constants.push((None, compatible));
+            let duplicate = Constant::FrozenSet(vec![Constant::Int(1), Constant::Int(1)]);
+            assert_eq!(reverse.reserved_constant_index(&duplicate), None);
+            reverse.record_folded_constant_dependencies(&duplicate, vec![Constant::Int(1)]);
+            assert_eq!(reverse.folded_constant_dependencies.len(), 1);
+            reverse.deferred_constants.push((None, duplicate));
+            assert_eq!(
+                reverse.reserved_constant_index(&Constant::FrozenSet(vec![
+                    Constant::Int(1),
+                    Constant::Int(3)
+                ])),
+                Some(reverse.constants.len() + 1)
+            );
+        }
+    }
+
+    #[test]
+    fn folded_dependencies_keep_first_reservation_order_and_stable_misses() {
+        for prefix_len in [0, CONSTANT_INDEX_THRESHOLD + 1] {
+            let mut state = OutputState::default();
+            for value in 0..prefix_len {
+                state
+                    .constants
+                    .intern(Constant::Int(1_000 + u64::try_from(value).unwrap()))
+                    .unwrap();
+            }
+            let first = Constant::String("first".to_string());
+            let later = Constant::String("later".to_string());
+            let deferred_first = Constant::Bytes(b"first".to_vec());
+            let deferred_later = Constant::Bytes(b"later".to_vec());
+            let missing_first = Constant::Float(-0.0);
+            let missing_later = Constant::Float(0.0);
+            state.constants.intern(first.clone()).unwrap();
+            state.deferred_constants = vec![
+                (None, later.clone()),
+                (None, deferred_first.clone()),
+                (None, deferred_later.clone()),
+                (None, deferred_first.clone()),
+            ];
+            state.constants.intern(later.clone()).unwrap();
+            let operands = vec![
+                missing_first.clone(),
+                later.clone(),
+                deferred_first.clone(),
+                missing_later.clone(),
+                first.clone(),
+                deferred_later.clone(),
+            ];
+            let result = Constant::FrozenSet(operands.clone());
+            state.record_folded_constant_dependencies(&result, operands);
+            let [(recorded, operands)] = state.folded_constant_dependencies.as_slice() else {
+                panic!("unreserved fold result should retain its dependencies");
+            };
+            assert!(ConstantEquality::PoolKey.equal(recorded, &result));
+            let expected = [
+                first,
+                later,
+                deferred_first,
+                deferred_later,
+                missing_first,
+                missing_later,
+            ];
+            assert_eq!(operands.len(), expected.len());
+            for (actual, expected) in operands.iter().zip(&expected) {
+                assert!(
+                    ConstantEquality::PoolKey.equal(actual, expected),
+                    "{operands:?}"
+                );
+            }
+        }
     }
 
     #[test]
