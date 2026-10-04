@@ -2751,6 +2751,40 @@ impl FlatFunctionInputs {
     }
 }
 
+/// An ordinary local annotation has no runtime names, but nested scopes and bindings still
+/// participate in symbol analysis. Keep those annotations on the complete analysis path.
+fn annotation_requires_full_scope_analysis(annotation: &Expr) -> bool {
+    struct Collector(bool);
+
+    impl<'ast> Visitor<'ast> for Collector {
+        fn visit_expr(&mut self, expression: &'ast Expr) {
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_expr(expression));
+            }
+
+            self.0 |= matches!(
+                expression,
+                Expr::Lambda(_)
+                    | Expr::Generator(_)
+                    | Expr::ListComp(_)
+                    | Expr::SetComp(_)
+                    | Expr::DictComp(_)
+                    | Expr::Named(_)
+                    | Expr::Await(_)
+                    | Expr::Yield(_)
+                    | Expr::YieldFrom(_)
+            );
+            if !self.0 {
+                walk_expr(self, expression);
+            }
+        }
+    }
+
+    let mut collector = Collector(false);
+    collector.visit_expr(annotation);
+    collector.0
+}
+
 impl<'a, 'ast> ModuleNameCollector<'a, 'ast> {
     #[cfg(test)]
     fn collect(
@@ -2869,8 +2903,7 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
         let at_module_scope = self.nested_scope_depth == 0;
         if matches!(
             statement,
-            Stmt::AnnAssign(_)
-                | Stmt::Match(_)
+            Stmt::Match(_)
                 | Stmt::Global(_)
                 | Stmt::Nonlocal(_)
                 | Stmt::TypeAlias(_)
@@ -2880,6 +2913,28 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
             self.mark_flat_complex();
         }
         match statement {
+            Stmt::AnnAssign(assignment)
+                if self
+                    .flat_function
+                    .as_ref()
+                    .is_some_and(|flat| !flat.complex) =>
+            {
+                if !self.eager_annotations
+                    && matches!(assignment.target.as_ref(), Expr::Name(_))
+                    && let Some(value) = &assignment.value
+                    && !annotation_requires_full_scope_analysis(&assignment.annotation)
+                {
+                    self.visit_expr(value);
+                    // Preserve Ruff's value/annotation/target interning order, while excluding
+                    // annotation names from the function's runtime local order and requirements.
+                    let flat = self.flat_function.take();
+                    self.visit_annotation(&assignment.annotation);
+                    self.flat_function = flat;
+                    self.visit_expr(&assignment.target);
+                    return;
+                }
+                self.mark_flat_complex();
+            }
             Stmt::AugAssign(assignment)
                 if self
                     .flat_function
@@ -9235,6 +9290,44 @@ def complex(value: Complex) -> Result:
     local: Declared = value
     return local
 
+def local_order():
+    early: list[AnnotationOnly] = late
+    late: dict[str, int] = {}
+    return early, late
+
+def local_super(value):
+    local: super | __class__ = value
+    return local
+
+class LocalOwner:
+    def private(self, value):
+        __slot: __Annotation = _LocalOwner__slot
+        _LocalOwner__slot = value
+        return __slot
+
+def local_only():
+    local: AnnotationOnly
+    return local
+
+def local_attribute(owner, value):
+    owner.local: AnnotationOnly = value
+
+def local_nested(value):
+    local: (lambda: captured) = value
+    return local
+
+def local_comprehension(value):
+    local: [item for item in captured] = value
+    return local
+
+def local_walrus(value):
+    local: (bound := AnnotationOnly) = value
+    return local
+
+def local_value_walrus(value):
+    local: AnnotationOnly = (bound := value)
+    return local, bound
+
 class _Generic[__T]:
     def typed(self, __value: __T, *, alias: _Generic__T) -> list[__T]:
         __local = __value
@@ -9335,7 +9428,16 @@ def enclosing_class():
                         ("outer", false),
                         ("nested", true),
                         ("generic", false),
-                        ("complex", false),
+                        ("complex", deferred || future),
+                        ("local_order", deferred || future),
+                        ("local_super", deferred || future),
+                        ("private", deferred || future),
+                        ("local_only", false),
+                        ("local_attribute", false),
+                        ("local_nested", false),
+                        ("local_comprehension", false),
+                        ("local_walrus", false),
+                        ("local_value_walrus", false),
                         ("typed", true),
                         ("method_super", true),
                         ("shadow_super", true),
