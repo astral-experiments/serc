@@ -14971,7 +14971,8 @@ impl<'source> Compiler<'source> {
                         && self.context.python_version >= crate::PythonVersion::Py314;
                     let native_elided_loop_exit = self.control.loops.uncopied_loop_tail_statement
                         == Some(statement.range)
-                        && self.optimized_conditional_join(statement);
+                        && (self.optimized_conditional_join(statement)
+                            || self.erased_disjunction_with_guarded_else(statement));
                     if native_elided_loop_exit {
                         self.assembler.set_location(SourceLocation::NONE);
                     }
@@ -22221,6 +22222,35 @@ impl<'source> Compiler<'source> {
                 .all(|clause| clause.test.as_ref().is_none_or(valid_test) && linear(&clause.body))
     }
 
+    /// Recognizes an erased disjunction arm whose else retains only one runtime test.
+    fn erased_disjunction_with_guarded_else(&self, branch: &ruff_python_ast::StmtIf) -> bool {
+        let [otherwise] = branch.elif_else_clauses.as_slice() else {
+            return false;
+        };
+        let Some((Stmt::If(guard), prefix)) = otherwise.body.split_last() else {
+            return false;
+        };
+        let elided = |body: &[Stmt]| {
+            !body.is_empty()
+                && body
+                    .iter()
+                    .all(|statement| self.context.is_elided_statement(statement))
+        };
+        let runtime_test = |test: &Expr| {
+            condition_has_only_runtime_tests(test)
+                && condition_has_linear_runtime_leaves(test)
+                && !expression_suspends_current_scope(test)
+        };
+        matches!(branch.test.as_ref(), Expr::BoolOp(boolean) if boolean.op == BoolOp::Or)
+            && runtime_test(&branch.test)
+            && elided(&branch.body)
+            && otherwise.test.is_none()
+            && elided(prefix)
+            && guard.elif_else_clauses.is_empty()
+            && runtime_test(&guard.test)
+            && elided(&guard.body)
+    }
+
     /// Finds an erased Boolean join that must precede the iterator's unlocated backedge.
     /// Linear prefixes and enclosing one-arm conditions preserve that same join.
     fn optimized_iterator_if_join(
@@ -22245,9 +22275,25 @@ impl<'source> Compiler<'source> {
             let (Stmt::If(branch), prefix) = body.split_last()? else {
                 return None;
             };
+            let guarded_else_join = statement.orelse.is_empty()
+                && matches!(self.control.loops.contexts.as_slice(), [outer]
+                    if matches!(outer.iterator_cleanup, IteratorCleanup::Sync)
+                        && !outer.has_orelse
+                        && outer.with_depth == self.control.withs.active_with_exits.len()
+                        && outer.exception_region_depth
+                            == self.control.exceptions.active_exception_region_exclusions.len()
+                        && outer.finally_end_depth
+                            == self.control.finally.active_finally_end_blocks)
+                && self.erased_disjunction_with_guarded_else(branch);
             if !prefix.iter().all(|statement| {
                 self.context.is_elided_statement(statement)
                     || suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement))
+                    // Both value edges finish at the local store before this tail join.
+                    || (guarded_else_join
+                        && matches!(statement, Stmt::Assign(assignment)
+                            if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                                && matches!(assignment.value.as_ref(), Expr::BoolOp(_))
+                                && expression_has_completed_boolean_value(&assignment.value)))
                     // A conditional continue targets the iterator head separately;
                     // its false edge leaves this tail's original empty join intact.
                     || matches!(statement, Stmt::If(guard)
@@ -22259,7 +22305,7 @@ impl<'source> Compiler<'source> {
             }) {
                 return None;
             }
-            if self.optimized_conditional_join(branch) {
+            if self.optimized_conditional_join(branch) || guarded_else_join {
                 return Some(branch.range);
             }
             // Linear prefixes and enclosing one-arm conditions leave the same
@@ -45210,6 +45256,27 @@ fn condition_reaches_async_break_entry(expression: &Expr) -> bool {
     }
 }
 
+/// Certifies short-circuit values that merge before a separate result store.
+fn expression_has_completed_boolean_value(expression: &Expr) -> bool {
+    if crate::stack_growth_required() {
+        return crate::grow_stack(|| expression_has_completed_boolean_value(expression));
+    }
+    match expression {
+        Expr::BoolOp(boolean) => {
+            boolean.values.len() >= 2
+                && boolean
+                    .values
+                    .iter()
+                    .all(expression_has_completed_boolean_value)
+        }
+        _ => {
+            !expression_contains_inline_branch(expression)
+                && !expression_suspends_current_scope(expression)
+                && !expression_yields_in_current_scope(expression)
+        }
+    }
+}
+
 /// Certifies one nonsuspending Boolean argument that rejoins before an eager call.
 fn call_has_completed_boolean_argument(expression: &Expr) -> bool {
     let Expr::Call(call) = expression else {
@@ -45982,6 +46049,39 @@ mod tests {
     };
     use ruff_python_ast::Stmt;
     use ruff_python_parser::parse_module;
+
+    #[test]
+    fn boolean_values_finish_before_the_store() {
+        for (value, expected) in [
+            ("value or other", true),
+            ("(value or other) and flag", true),
+            ("False or value", true),
+            ("value == other and inspect(value)", true),
+            ("value or await inspect(other)", false),
+            ("(await inspect(value)) or other", false),
+            ("value or (yield other)", false),
+            ("(yield value) or other", false),
+            ("value or (flag if other else result)", false),
+            ("value or (flag < other < result)", false),
+            ("value or inspect(flag or other)", false),
+            ("value or (item for item in items)", false),
+            ("value or [item for item in items]", false),
+        ] {
+            let source = format!("async def sample():\n    result = {value}\n");
+            let parsed = parse_module(&source).unwrap();
+            let Stmt::FunctionDef(function) = &parsed.suite()[0] else {
+                panic!()
+            };
+            let Stmt::Assign(assignment) = &function.body[0] else {
+                panic!()
+            };
+            assert_eq!(
+                super::expression_has_completed_boolean_value(&assignment.value),
+                expected,
+                "{value}"
+            );
+        }
+    }
 
     #[test]
     fn raising_cleanup_exit_rejects_current_scope_suspension() {
