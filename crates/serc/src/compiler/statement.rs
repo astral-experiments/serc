@@ -8157,9 +8157,8 @@ impl<'source> Compiler<'source> {
                 } else {
                     None
                 };
-                // A copied finally body can add narrower exclusions while it is compiled. The
-                // return unwind starts before that copy and subsumes those ranges for surrounding
-                // protected regions, including when another branch follows this return.
+                // Track copied-body exclusions so each region's return unwind replaces
+                // overlapping ranges while preserving earlier, disjoint cleanup holes.
                 let mut copied_return_exclusion_lengths = (!self
                     .control
                     .finally
@@ -13038,7 +13037,11 @@ impl<'source> Compiler<'source> {
                             .as_ref()
                             .and_then(|lengths| lengths.get(index))
                         {
-                            exclusions.truncate(*length);
+                            let preceding = exclusions.get(*length..).map_or(0, |recent| {
+                                self.assembler
+                                    .exclusions_ending_before(recent, exclusion_start)
+                            });
+                            exclusions.truncate(*length + preceding);
                         }
                         exclusions.push((exclusion_start, return_exclusion_end));
                     }
