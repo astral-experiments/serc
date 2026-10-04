@@ -22494,6 +22494,18 @@ impl<'source> Compiler<'source> {
             )
         })?;
         if tail_jumps == LoopBackedge::Required && !suite_terminates(&statement.body) {
+            // The ordinary try/else join owns the original unlocated backedge.
+            let unlocated_original_backedge = self.context.python_version
+                >= crate::PythonVersion::Py314
+                && matches!(statement.body.last(), Some(Stmt::Try(tail))
+                    if !tail.is_star
+                        && !tail.handlers.is_empty()
+                        && !tail.orelse.is_empty()
+                        && tail.finalbody.is_empty())
+                && self.assembler.current_original_block_location().is_none()
+                && !self
+                    .assembler
+                    .current_join_has_located_compacted_predecessor();
             if self.context.python_version <= crate::PythonVersion::Py313 {
                 // Legacy CFG propagation takes the location from the continuing edge,
                 // which can differ from the last lexical statement (such as a break).
@@ -22509,7 +22521,11 @@ impl<'source> Compiler<'source> {
                 self.assembler
                     .set_location(self.source_location(statement.range()));
             }
-            self.emit_jump_backward(JUMP_BACKWARD, start, 0)?;
+            let backedge = self.emit_jump_backward_instruction(JUMP_BACKWARD, start)?;
+            if unlocated_original_backedge {
+                self.assembler
+                    .prepare_no_location_block_for_inlining(backedge);
+            }
             if matches!(statement.body.last(), Some(Stmt::Match(_))) {
                 // Pattern failure and a wildcard body's false edge can share this
                 // original match-end backedge, just as in a synchronous iterator.
