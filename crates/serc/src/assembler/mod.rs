@@ -7795,6 +7795,20 @@ impl Assembler {
         self.exception_owner_provenance
             .normal_try_exits
             .push((entry, target));
+        if self.python_version == crate::PythonVersion::Py314 {
+            let items = self.linear_items();
+            if let Some(start) = items.iter().rposition(|item| *item == Item::Label(entry))
+                && let [Item::Instruction(jump)] = &items[start + 1..]
+                && jump.opcode == JUMP_FORWARD
+                && jump.operand() == Operand::Forward(target)
+                && jump.exception_policy() == ExceptionPolicy::default()
+                && jump.local_policy.hidden_exception_owner_slots() == 0
+            {
+                self.exception_owner_provenance
+                    .borrow_normal_try_exits
+                    .push((entry, *jump));
+            }
+        }
         let Some(location) = wildcard_call_location else {
             return;
         };

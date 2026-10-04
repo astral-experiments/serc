@@ -2715,6 +2715,148 @@ impl OptimizationPipeline {
         Ok(changed)
     }
 
+    /// Restores only an authenticated, instruction-free original normal exit.
+    fn restore_retired_normal_try_arrays(&mut self) {
+        for origin in std::mem::take(&mut self.exception_owner_provenance.retired_normal_try_exits)
+        {
+            let original = &origin.origin;
+            let Some(first) = original
+                .labels
+                .first()
+                .and_then(|label| self.graph.label_block(*label))
+            else {
+                continue;
+            };
+            let Some(position) = self.graph.order().iter().position(|block| *block == first) else {
+                continue;
+            };
+            let Some(previous) = position
+                .checked_sub(1)
+                .map(|index| self.graph.order()[index])
+            else {
+                continue;
+            };
+            if block_has_fallthrough(self.graph[previous].items())
+                || original.labels.iter().any(|label| {
+                    self.exception_owner_provenance
+                        .source_boundaries
+                        .contains(label)
+                        != (original.folded_loop_exit == Some(*label))
+                        || self
+                            .exception_owner_provenance
+                            .block_boundaries
+                            .contains(label)
+                            != (original.original_jump_targets.contains(label)
+                                || original.folded_loop_exit == Some(*label))
+                        || self.folded_loop_exit_anchors.contains(label)
+                            != (original.folded_loop_exit == Some(*label))
+                        || self.preserved_block_boundaries.contains(label)
+                        || self
+                            .exception_regions
+                            .iter()
+                            .any(|region| region.target == *label)
+                        || self.graph.iter_items().any(|item| {
+                            matches!(item, Item::Instruction(instruction)
+                            if instruction.jump_target() == Some(*label))
+                        })
+                })
+            {
+                continue;
+            }
+            let mut expected = original
+                .labels
+                .iter()
+                .copied()
+                .map(Item::Label)
+                .chain(origin.following.iter().copied())
+                .collect::<Vec<_>>();
+            if original.threaded_prefix.as_ref().is_some_and(|prefix| {
+                !prefix.is_intact(
+                    &self.graph,
+                    &self.exception_owner_provenance,
+                    &self.preserved_block_boundaries,
+                    &self.folded_loop_exit_anchors,
+                    &self.exception_regions,
+                ) || !prefix.matches_route(&self.graph, &expected)
+            }) {
+                continue;
+            }
+            if let Some(prefix) = &original.threaded_prefix {
+                expected.insert(0, Item::Label(prefix.end));
+            }
+            let mut actual = self.graph.order()[position..]
+                .iter()
+                .flat_map(|block| self.graph[*block].items())
+                .copied();
+            if !actual.by_ref().take(expected.len()).eq(expected)
+                || !matches!(origin.following.first(), Some(Item::Label(_)))
+            {
+                continue;
+            }
+            let Item::Label(anchor) = origin.following[0] else {
+                unreachable!()
+            };
+            let anchor_block = self
+                .graph
+                .label_block(anchor)
+                .expect("replayed handler anchor");
+            if !self
+                .exception_regions
+                .iter()
+                .any(|region| self.graph.label_block(region.target) == Some(anchor_block))
+            {
+                continue;
+            }
+            let blocks = self.graph.order()[position..]
+                .iter()
+                .copied()
+                .take_while(|block| *block != anchor_block)
+                .chain(std::iter::once(anchor_block))
+                .collect::<Vec<_>>();
+            let mut empty = FxHashSet::default();
+            // The threaded range endpoint stays with its handler, not the omitted marker.
+            for block in blocks {
+                self.graph.retain_items(
+                    block,
+                    |item| !matches!(item, Item::Label(label) if original.labels.contains(label)),
+                );
+                if self.graph[block].items().is_empty() {
+                    empty.insert(block);
+                }
+            }
+            self.graph.retain_order(|block| !empty.contains(&block));
+            let position = self
+                .graph
+                .order()
+                .iter()
+                .position(|block| *block == anchor_block)
+                .expect("retained handler anchor");
+            let marker = Label::from_u32(self.next_label);
+            self.next_label += 1;
+            self.graph.insert_block(
+                position,
+                std::iter::once(Item::Label(marker))
+                    .chain(original.labels.iter().copied().map(Item::Label))
+                    .collect(),
+            );
+            self.preserved_block_boundaries.insert(marker);
+            self.exception_owner_provenance
+                .retired_borrow_markers
+                .insert(
+                    marker,
+                    crate::assembler::exception_owners::RetiredBorrowMarker {
+                        labels: origin.origin.labels,
+                        original_jump_targets: Some(origin.origin.original_jump_targets),
+                        folded_loop_exit: origin.origin.folded_loop_exit,
+                        threaded_prefix: origin
+                            .origin
+                            .threaded_prefix
+                            .map(|prefix| (prefix, anchor)),
+                    },
+                );
+        }
+    }
+
     pub(in crate::assembler) fn push_cold_blocks_to_end(
         &mut self,
         mut owner_retargets: Option<&mut Vec<(ExceptionRegion, ExceptionRegion)>>,
@@ -2723,6 +2865,7 @@ impl OptimizationPipeline {
             normalize_unmoved_interruptible_jumps(&mut self.graph);
             return FxHashSet::default();
         }
+        self.restore_retired_normal_try_arrays();
         // Range-only labels can split our physical graph without starting a
         // native 3.13 instruction array. Keep that distinction when the label's
         // empty block becomes the predecessor of a newly inserted cold bridge.
@@ -3108,16 +3251,25 @@ impl OptimizationPipeline {
 
         // Range-only tails are retired by reachability, not the head's copy flag.
         // A newly entered tail cannot certify an empty original cleanup array.
-        let retired_handler_arrays = self
+        let retired_arrays = self
             .exception_owner_provenance
-            .retired_handler_borrow_markers
+            .retired_borrow_markers
             .iter()
-            .filter_map(|(marker, original_labels)| {
+            .filter_map(|(marker, origin)| {
+                let original_labels = &origin.labels;
                 let head = graph.label_block(*marker)?;
                 if graph[head].last_instruction().is_some()
                     || temperatures[head.index()] != 0
                     || graph.label_block(*original_labels.first()?) != Some(head)
                 {
+                    return None;
+                }
+                if origin.threaded_prefix.as_ref().is_some_and(|(prefix, anchor)| {
+                    !prefix.is_intact(graph, &self.exception_owner_provenance,
+                        &self.preserved_block_boundaries, &self.folded_loop_exit_anchors,
+                        &self.exception_regions)
+                        || graph.label_block(prefix.end) != graph.label_block(*anchor)
+                }) {
                     return None;
                 }
                 for (index, label) in original_labels.iter().enumerate() {
@@ -3126,10 +3278,15 @@ impl OptimizationPipeline {
                         || self.exception_regions.iter().any(|region| graph.label_block(region.target) == Some(block))
                         || graph.iter_items().any(|item| matches!(item, Item::Instruction(instruction)
                             if instruction.jump_target().and_then(|target| graph.label_block(target)) == Some(block)))
-                        || (index > 0
+                        || (if let Some(original_jump_targets) = &origin.original_jump_targets {
+                            self.exception_owner_provenance.source_boundaries.contains(label) != (origin.folded_loop_exit == Some(*label))
+                                || self.preserved_block_boundaries.contains(label)
+                                || self.exception_owner_provenance.block_boundaries.contains(label) != (original_jump_targets.contains(label) || origin.folded_loop_exit == Some(*label))
+                                || self.folded_loop_exit_anchors.contains(label) != (origin.folded_loop_exit == Some(*label))
+                        } else { index > 0
                             && (self.exception_owner_provenance.source_boundaries.contains(label)
                                 || self.exception_owner_provenance.block_boundaries.contains(label)
-                                || self.preserved_block_boundaries.contains(label)))
+                                || self.preserved_block_boundaries.contains(label)) })
                     {
                         return None;
                     }
@@ -3145,14 +3302,14 @@ impl OptimizationPipeline {
                         && (temperatures[block.index()] == WARM_BLOCK
                             || (temperatures[block.index()] == 0
                                 && (omitted_backedges.contains(&block)
-                                    || retired_handler_arrays.contains_key(&block)))))
+                                    || retired_arrays.contains_key(&block)))))
                 {
                     order.push(block);
                 }
             }
         }
         omitted_markers.extend(
-            retired_handler_arrays
+            retired_arrays
                 .iter()
                 .filter_map(|(block, label)| (temperatures[block.index()] == 0).then_some(*label)),
         );
@@ -3266,11 +3423,11 @@ impl OptimizationPipeline {
 
         // Borrow-only originals must not create protected ranges while cold
         // relocation rebuilds the physical exception owners.
-        let region_order = (!retired_handler_arrays.is_empty()).then(|| {
+        let region_order = (!retired_arrays.is_empty()).then(|| {
             order
                 .iter()
                 .copied()
-                .filter(|block| !retired_handler_arrays.contains_key(block))
+                .filter(|block| !retired_arrays.contains_key(block))
                 .collect::<Vec<_>>()
         });
         let region_order = region_order.as_deref().unwrap_or(&order);
@@ -8332,8 +8489,16 @@ impl OptimizationPipeline {
                     graph.insert_label(block, graph[block].items().len(), after);
                     self.preserved_block_boundaries.extend([marker, after]);
                     self.exception_owner_provenance
-                        .retired_handler_borrow_markers
-                        .insert(marker, original_labels.clone());
+                        .retired_borrow_markers
+                        .insert(
+                            marker,
+                            crate::assembler::exception_owners::RetiredBorrowMarker {
+                                labels: original_labels.clone(),
+                                original_jump_targets: None,
+                                folded_loop_exit: None,
+                                threaded_prefix: None,
+                            },
+                        );
                 }
                 final_order.push(block);
             }
@@ -8566,6 +8731,579 @@ mod retired_handler_borrow_tests {
         (instructions, regions)
     }
 
+    fn normal_exit_fixture(variation: &str, capture: bool) -> (OptimizationPipeline, Label, Label) {
+        let version = if variation == "other version" {
+            crate::PythonVersion::Py315
+        } else {
+            crate::PythonVersion::Py314
+        };
+        let mut assembler = Assembler::with_python_version(version);
+        let start = assembler.label();
+        let exit = assembler.label();
+        let alias = assembler.label();
+        let handler = assembler.label();
+        let end = assembler.label();
+        assembler.mark(start);
+        assembler.set_location(SourceLocation::new(1, 1, 0, 4));
+        assembler.emit_with_depth(LOAD_CONST, 0, 1, ExceptionPolicy::default());
+        assembler.emit_with_depth(POP_TOP, 0, 0, ExceptionPolicy::default());
+        assembler.emit_forward_with_depth(
+            JUMP_FORWARD,
+            if matches!(
+                variation,
+                "reachable"
+                    | "second removal"
+                    | "late derived boundary"
+                    | "cold boundary promotion"
+            ) {
+                exit
+            } else {
+                end
+            },
+            0,
+            ExceptionPolicy::default(),
+        );
+        assembler.mark(alias);
+        assembler.mark(exit);
+        assembler.set_location(
+            if variation == "located" || variation.starts_with("folded located") {
+                SourceLocation::new(2, 2, 0, 4)
+            } else {
+                SourceLocation::NONE
+            },
+        );
+        assembler.emit_forward_with_depth(JUMP_FORWARD, end, 0, ExceptionPolicy::default());
+        if capture {
+            assembler.record_normal_try_exit(exit, end, None);
+        }
+        assembler.mark(handler);
+        assembler.emit_with_depth(PUSH_EXC_INFO, 0, 1, ExceptionPolicy::default());
+        assembler.emit_with_depth(POP_EXCEPT, 0, 0, ExceptionPolicy::default());
+        assembler.emit_forward_with_depth(JUMP_FORWARD, end, 0, ExceptionPolicy::default());
+        assembler.mark(end);
+        assembler.set_location(SourceLocation::new(3, 3, 0, 4));
+        assembler.emit_with_depth(LOAD_FAST, 0, 1, ExceptionPolicy::default());
+        assembler.emit_with_depth(POP_TOP, 0, 0, ExceptionPolicy::default());
+        assembler.emit_with_depth(LOAD_CONST, 0, 1, ExceptionPolicy::default());
+        assembler.emit_with_depth(RETURN_VALUE, 0, 0, ExceptionPolicy::default());
+        assembler.add_exception_region(start, exit, handler, 0, false);
+        if variation == "compiler boundary" {
+            assembler
+                .exception_owner_provenance
+                .block_boundaries
+                .insert(alias);
+        }
+        if variation.starts_with("folded ") {
+            assembler.record_exception_owner_block_boundary(alias);
+            if variation != "folded uncertified" {
+                assembler.folded_loop_exit_anchors.insert(alias);
+            }
+            match variation {
+                "folded multiple" => {
+                    assembler.record_exception_owner_block_boundary(exit);
+                    assembler.folded_loop_exit_anchors.insert(exit);
+                }
+                "folded missing source" => {
+                    assembler
+                        .exception_owner_provenance
+                        .source_boundaries
+                        .remove(&alias);
+                }
+                "folded missing block" => {
+                    assembler
+                        .exception_owner_provenance
+                        .block_boundaries
+                        .remove(&alias);
+                }
+                _ => {}
+            }
+        }
+        (assembler.into_optimization_pipeline(), alias, end)
+    }
+
+    #[test]
+    fn only_erased_exact_normal_try_exits_retain_an_empty_borrow_array() {
+        for variation in [
+            "intact",
+            "separate labels",
+            "second removal",
+            "reachable",
+            "located",
+            "changed jump",
+            "changed jump policy",
+            "changed anchor",
+            "changed anchor policy",
+            "source promotion",
+            "boundary promotion",
+            "preserved promotion",
+            "jump promotion",
+            "handler promotion",
+            "other version",
+            "unrelated empty array",
+            "compiler boundary",
+            "late derived boundary",
+            "cold boundary promotion",
+            "folded alias",
+            "folded located",
+            "folded located changed location",
+            "folded uncertified",
+            "folded multiple",
+            "folded missing source",
+            "folded missing block",
+            "folded erased certificate",
+            "folded erased role",
+            "folded replay certificate",
+            "folded replay role",
+            "folded cold certificate",
+            "folded cold role",
+            "new folded certificate",
+        ] {
+            let (mut captured, alias, end) = normal_exit_fixture(variation, true);
+            let (mut control, _, _) = normal_exit_fixture(variation, false);
+            for (index, pipeline) in [&mut captured, &mut control].into_iter().enumerate() {
+                if variation == "folded located changed location" {
+                    if index == 0 {
+                        assert_eq!(
+                            pipeline
+                                .exception_owner_provenance
+                                .initial_borrow_normal_try_exits
+                                .len(),
+                            1,
+                            "{variation}: bound"
+                        );
+                    }
+                    let block = pipeline.graph.label_block(alias).unwrap();
+                    pipeline
+                        .graph
+                        .instructions_mut(block)
+                        .next()
+                        .unwrap()
+                        .location = SourceLocation::new(2, 2, 1, 4);
+                }
+                if variation == "changed jump" {
+                    let block = pipeline.graph.label_block(alias).unwrap();
+                    pipeline
+                        .graph
+                        .instructions_mut(block)
+                        .next()
+                        .unwrap()
+                        .add_pre_fold_extra_instructions(1);
+                }
+                if variation == "changed jump policy" {
+                    let block = pipeline.graph.label_block(alias).unwrap();
+                    pipeline
+                        .graph
+                        .instructions_mut(block)
+                        .next()
+                        .unwrap()
+                        .local_policy
+                        .mark_force_borrowed_load();
+                }
+                if variation == "folded erased certificate" {
+                    pipeline.folded_loop_exit_anchors.remove(&alias);
+                }
+                if variation == "folded erased role" {
+                    pipeline
+                        .exception_owner_provenance
+                        .source_boundaries
+                        .remove(&alias);
+                }
+                pipeline.remove_unreachable_instructions();
+                if index == 0
+                    && matches!(
+                        variation,
+                        "folded alias"
+                            | "folded located"
+                            | "folded replay certificate"
+                            | "folded replay role"
+                            | "folded cold certificate"
+                            | "folded cold role"
+                    )
+                {
+                    assert_eq!(
+                        pipeline
+                            .exception_owner_provenance
+                            .retired_normal_try_exits
+                            .len(),
+                        1,
+                        "{variation}: retired"
+                    );
+                }
+                if matches!(
+                    variation,
+                    "second removal" | "late derived boundary" | "cold boundary promotion"
+                ) {
+                    let start = pipeline.graph.order()[0];
+                    pipeline
+                        .graph
+                        .instructions_mut(start)
+                        .next_back()
+                        .unwrap()
+                        .set_operand(Operand::Forward(end));
+                    pipeline.remove_unreachable_instructions();
+                }
+                if variation != "separate labels" {
+                    pipeline
+                        .graph
+                        .normalize_blocks_if_needed(&pipeline.preserved_block_boundaries);
+                }
+                match variation {
+                    "folded replay certificate" => {
+                        pipeline.folded_loop_exit_anchors.remove(&alias);
+                    }
+                    "folded replay role" => {
+                        pipeline
+                            .exception_owner_provenance
+                            .block_boundaries
+                            .remove(&alias);
+                    }
+                    "new folded certificate" => {
+                        pipeline.folded_loop_exit_anchors.insert(alias);
+                    }
+                    "changed anchor" => {
+                        let block = pipeline
+                            .graph
+                            .label_block(pipeline.exception_regions[0].target)
+                            .unwrap();
+                        pipeline
+                            .graph
+                            .instructions_mut(block)
+                            .next()
+                            .unwrap()
+                            .add_pre_fold_extra_instructions(1);
+                    }
+                    "changed anchor policy" => {
+                        let block = pipeline
+                            .graph
+                            .label_block(pipeline.exception_regions[0].target)
+                            .unwrap();
+                        pipeline
+                            .graph
+                            .instructions_mut(block)
+                            .next()
+                            .unwrap()
+                            .local_policy
+                            .mark_force_borrowed_load();
+                    }
+                    "source promotion" => {
+                        pipeline
+                            .exception_owner_provenance
+                            .source_boundaries
+                            .insert(alias);
+                    }
+                    "boundary promotion" | "late derived boundary" => {
+                        pipeline
+                            .exception_owner_provenance
+                            .block_boundaries
+                            .insert(alias);
+                    }
+                    "preserved promotion" => {
+                        pipeline.preserved_block_boundaries.insert(alias);
+                    }
+                    "jump promotion" => {
+                        let start = pipeline.graph.order()[0];
+                        pipeline
+                            .graph
+                            .instructions_mut(start)
+                            .next_back()
+                            .unwrap()
+                            .set_operand(Operand::Forward(alias));
+                    }
+                    "handler promotion" => {
+                        pipeline.exception_regions[0].target = alias;
+                    }
+                    _ => {}
+                }
+                if variation == "unrelated empty array" {
+                    let empty = pipeline.graph.insert_block(
+                        pipeline.graph.len(),
+                        vec![Item::Instruction(Instruction::new(
+                            NOP,
+                            Operand::Value(0),
+                            SourceLocation::NONE,
+                            Some(0),
+                        ))],
+                    );
+                    pipeline.graph.retain_items(empty, |_| false);
+                    pipeline.restore_retired_normal_try_arrays();
+                    assert!(pipeline.graph.order().contains(&empty));
+                    assert!(pipeline.graph[empty].items().is_empty());
+                }
+                if variation == "cold boundary promotion" {
+                    pipeline.restore_retired_normal_try_arrays();
+                    pipeline
+                        .exception_owner_provenance
+                        .block_boundaries
+                        .insert(alias);
+                }
+                if matches!(variation, "folded cold certificate" | "folded cold role") {
+                    pipeline.restore_retired_normal_try_arrays();
+                    if index == 0 {
+                        assert_eq!(
+                            pipeline
+                                .exception_owner_provenance
+                                .retired_borrow_markers
+                                .len(),
+                            1,
+                            "{variation}: restored"
+                        );
+                    }
+                    if variation == "folded cold certificate" {
+                        pipeline.folded_loop_exit_anchors.remove(&alias);
+                    } else {
+                        pipeline
+                            .exception_owner_provenance
+                            .source_boundaries
+                            .remove(&alias);
+                    }
+                }
+            }
+            assert_eq!(
+                physical(&captured),
+                physical(&control),
+                "{variation}: erasure"
+            );
+            let markers = captured.push_cold_blocks_to_end(None);
+            assert!(control.push_cold_blocks_to_end(None).is_empty());
+            assert_eq!(physical(&captured), physical(&control), "{variation}: cold");
+            assert_eq!(
+                markers.len(),
+                usize::from(matches!(
+                    variation,
+                    "intact"
+                        | "separate labels"
+                        | "second removal"
+                        | "unrelated empty array"
+                        | "folded alias"
+                        | "folded located"
+                )),
+                "{variation}"
+            );
+            assert!(markers.iter().all(|marker| {
+                let block = captured.graph.label_block(*marker).unwrap();
+                captured.graph[block].last_instruction().is_none()
+            }));
+        }
+    }
+
+    #[test]
+    fn only_adjacent_threaded_owner_end_preserves_the_normal_exit() {
+        for variation in [
+            "intact",
+            "nonadjacent",
+            "changed target",
+            "changed source",
+            "region depth",
+            "region target",
+            "region priority",
+            "region fallback",
+            "foreign prefix",
+            "reordered prefix",
+            "second endpoint",
+            "source role",
+            "block role",
+            "preserved role",
+            "folded role",
+            "jump role",
+            "cold role",
+            "cold endpoint",
+            "cold region",
+        ] {
+            let (mut captured, alias, end) = normal_exit_fixture("second removal", true);
+            let (mut control, _, _) = normal_exit_fixture("second removal", false);
+            for (index, pipeline) in [&mut captured, &mut control].into_iter().enumerate() {
+                if variation == "nonadjacent" {
+                    let gap = pipeline.label();
+                    pipeline.graph.insert_block(
+                        1,
+                        vec![
+                            Item::Label(gap),
+                            Item::Instruction(Instruction::new(
+                                NOP,
+                                Operand::Value(0),
+                                SourceLocation::NONE,
+                                Some(0),
+                            )),
+                        ],
+                    );
+                }
+                if variation == "changed target" {
+                    let block = pipeline.graph.label_block(alias).unwrap();
+                    pipeline
+                        .graph
+                        .instructions_mut(block)
+                        .next()
+                        .unwrap()
+                        .add_pre_fold_extra_instructions(1);
+                }
+                let start = Label::from_u32(pipeline.next_label);
+                let endpoint = Label::from_u32(pipeline.next_label + 1);
+                assert!(
+                    pipeline.thread_forward_jumps(),
+                    "{variation}: actual threading"
+                );
+                assert!(pipeline.graph.label_block(start).is_some());
+                assert!(pipeline.graph.label_block(endpoint).is_some());
+                if index == 0 {
+                    let prefix = &pipeline
+                        .exception_owner_provenance
+                        .initial_borrow_normal_try_exits[0]
+                        .threaded_prefix;
+                    assert_eq!(
+                        prefix.is_some(),
+                        !matches!(variation, "nonadjacent" | "changed target"),
+                        "{variation}: capture"
+                    );
+                    if let Some(prefix) = prefix {
+                        assert_eq!(prefix.start, start);
+                        assert_eq!(prefix.end, endpoint);
+                        assert!(!prefix.regions.as_ref().unwrap().is_empty());
+                    }
+                }
+                if variation == "changed source" {
+                    let block = pipeline.graph.label_block(start).unwrap();
+                    pipeline
+                        .graph
+                        .instructions_mut(block)
+                        .next_back()
+                        .unwrap()
+                        .local_policy
+                        .mark_force_borrowed_load();
+                }
+                if variation.starts_with("region ") {
+                    let region = pipeline
+                        .exception_regions
+                        .iter_mut()
+                        .find(|region| region.start == endpoint || region.end == endpoint)
+                        .unwrap();
+                    match variation {
+                        "region depth" => region.depth += 1,
+                        "region target" => region.target = end,
+                        "region priority" => {
+                            region.priority =
+                                ExceptionRegionPriority::Resolved { start: 90, end: 91 }
+                        }
+                        "region fallback" => region.is_scope_fallback = !region.is_scope_fallback,
+                        _ => unreachable!(),
+                    }
+                }
+                pipeline.remove_unreachable_instructions();
+                pipeline
+                    .graph
+                    .normalize_blocks_if_needed(&pipeline.preserved_block_boundaries);
+                let block = pipeline.graph.label_block(alias).unwrap();
+                match variation {
+                    "foreign prefix" | "second endpoint" => {
+                        let extra = pipeline.label();
+                        pipeline.graph.insert_label(
+                            block,
+                            usize::from(variation == "second endpoint"),
+                            extra,
+                        );
+                    }
+                    "reordered prefix" => {
+                        assert_eq!(
+                            pipeline.graph.remove_item_at(block, 0),
+                            Item::Label(endpoint)
+                        );
+                        pipeline.graph.insert_label(block, 1, endpoint);
+                    }
+                    "source role" => {
+                        pipeline
+                            .exception_owner_provenance
+                            .source_boundaries
+                            .insert(endpoint);
+                    }
+                    "block role" => {
+                        pipeline
+                            .exception_owner_provenance
+                            .block_boundaries
+                            .insert(endpoint);
+                    }
+                    "preserved role" => {
+                        pipeline.preserved_block_boundaries.insert(endpoint);
+                    }
+                    "folded role" => {
+                        pipeline.folded_loop_exit_anchors.insert(endpoint);
+                    }
+                    "jump role" => {
+                        let source = pipeline.graph.label_block(start).unwrap();
+                        pipeline
+                            .graph
+                            .instructions_mut(source)
+                            .next_back()
+                            .unwrap()
+                            .set_operand(Operand::Forward(endpoint));
+                    }
+                    _ => {}
+                }
+                if variation.starts_with("cold ") {
+                    pipeline.restore_retired_normal_try_arrays();
+                    if index == 0 {
+                        assert_eq!(
+                            pipeline
+                                .exception_owner_provenance
+                                .retired_borrow_markers
+                                .len(),
+                            1,
+                            "{variation}: restored"
+                        );
+                    }
+                    match variation {
+                        "cold role" => {
+                            pipeline
+                                .exception_owner_provenance
+                                .source_boundaries
+                                .insert(endpoint);
+                        }
+                        "cold endpoint" => {
+                            let source = pipeline.graph.label_block(endpoint).unwrap();
+                            pipeline
+                                .graph
+                                .retain_items(source, |item| *item != Item::Label(endpoint));
+                            let target = pipeline.graph.label_block(end).unwrap();
+                            pipeline.graph.insert_label(target, 0, endpoint);
+                        }
+                        "cold region" => {
+                            let region = pipeline
+                                .exception_regions
+                                .iter_mut()
+                                .find(|region| region.start == endpoint || region.end == endpoint)
+                                .unwrap();
+                            region.preserve_lasti = !region.preserve_lasti;
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+            }
+            assert_eq!(
+                physical(&captured),
+                physical(&control),
+                "{variation}: before restoration"
+            );
+            captured.restore_retired_normal_try_arrays();
+            control.restore_retired_normal_try_arrays();
+            assert_eq!(
+                physical(&captured),
+                physical(&control),
+                "{variation}: restored"
+            );
+            let markers = captured.push_cold_blocks_to_end(None);
+            assert!(control.push_cold_blocks_to_end(None).is_empty());
+            assert_eq!(physical(&captured), physical(&control), "{variation}: cold");
+            assert_eq!(
+                markers.len(),
+                usize::from(variation == "intact"),
+                "{variation}"
+            );
+            assert!(markers.iter().all(|marker| {
+                captured.graph[captured.graph.label_block(*marker).unwrap()]
+                    .last_instruction()
+                    .is_none()
+            }));
+        }
+    }
+
     #[test]
     fn only_copied_exact_cleanup_retains_an_empty_borrow_array() {
         for variation in [
@@ -8613,7 +9351,7 @@ mod retired_handler_borrow_tests {
             assert_eq!(
                 captured
                     .exception_owner_provenance
-                    .retired_handler_borrow_markers
+                    .retired_borrow_markers
                     .len(),
                 usize::from(matches!(
                     variation,

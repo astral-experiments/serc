@@ -33,6 +33,161 @@ pub(super) struct LegacyProtocolAwaitSetup {
     pub(super) exit: Label,
 }
 
+/// An erased normal exit and its following handler's labels and first instruction.
+#[derive(Debug)]
+pub(super) struct RetiredNormalTryExit {
+    pub(super) origin: NormalTryBorrowExit,
+    pub(super) following: Vec<Item>,
+}
+
+/// An intact initial normal exit, before original jumps register derived boundaries.
+#[derive(Clone, Debug)]
+pub(super) struct NormalTryBorrowExit {
+    pub(super) labels: Vec<Label>,
+    pub(super) instruction: Instruction,
+    pub(super) original_jump_targets: FxHashSet<Label>,
+    pub(super) folded_loop_exit: Option<Label>,
+    pub(super) threaded_prefix: Option<ThreadedNormalExitPrefix>,
+}
+
+/// A fresh owner-range endpoint emitted immediately before an intact normal exit.
+#[derive(Clone, Debug)]
+pub(super) struct ThreadedNormalExitPrefix {
+    pub(super) start: Label,
+    pub(super) end: Label,
+    source: Instruction,
+    pub(super) regions: Option<Vec<super::ExceptionRegion>>,
+}
+
+impl ThreadedNormalExitPrefix {
+    pub(super) fn references(&self, region: &super::ExceptionRegion) -> bool {
+        [region.start, region.end, region.target]
+            .iter()
+            .any(|label| *label == self.start || *label == self.end)
+    }
+
+    pub(super) fn is_intact(
+        &self,
+        graph: &super::block_graph::BlockGraph,
+        provenance: &ExceptionOwnerProvenance,
+        preserved: &FxHashSet<Label>,
+        folded: &FxHashSet<Label>,
+        regions: &[super::ExceptionRegion],
+    ) -> bool {
+        self.regions.as_ref().is_some_and(|original| {
+            let mut actual = regions.iter().filter(|region| self.references(region));
+            !original.is_empty()
+                && original.iter().all(|expected| {
+                    actual.next().is_some_and(|actual| {
+                        super::fusion_owner_slots::same_manager_region(actual, expected)
+                    })
+                })
+                && actual.next().is_none()
+        }) && [self.start, self.end].iter().all(|label| {
+            graph.label_block(*label).is_some()
+                && !provenance.source_boundaries.contains(label)
+                && !provenance.block_boundaries.contains(label)
+                && !preserved.contains(label)
+                && !folded.contains(label)
+                && !regions.iter().any(|region| region.target == *label)
+                && !graph.iter_items().any(|item| {
+                    matches!(item, Item::Instruction(instruction)
+                    if instruction.jump_target() == Some(*label))
+                })
+        })
+    }
+
+    pub(super) fn matches_route(
+        &self,
+        graph: &super::block_graph::BlockGraph,
+        tail: &[Item],
+    ) -> bool {
+        let Some(block) = graph.label_block(self.start) else {
+            return false;
+        };
+        let Some(position) = graph.order().iter().position(|item| *item == block) else {
+            return false;
+        };
+        let Some(offset) = graph[block]
+            .items()
+            .iter()
+            .position(|item| *item == Item::Label(self.start))
+        else {
+            return false;
+        };
+        graph.order()[position..]
+            .iter()
+            .flat_map(|block| graph[*block].items())
+            .skip(offset)
+            .take(3 + tail.len())
+            .copied()
+            .eq([
+                Item::Label(self.start),
+                Item::Instruction(self.source),
+                Item::Label(self.end),
+            ]
+            .into_iter()
+            .chain(tail.iter().copied()))
+    }
+}
+
+impl NormalTryBorrowExit {
+    pub(super) fn record_threaded_owner_prefix(
+        &mut self,
+        graph: &super::block_graph::BlockGraph,
+        source: super::block_graph::ItemPosition,
+        target: super::block_graph::ItemPosition,
+        start: Label,
+        end: Label,
+    ) {
+        let target_items = graph[target.block()].items();
+        let source_items = graph[source.block()].items();
+        if self.threaded_prefix.is_some()
+            || target.offset() != self.labels.len()
+            || target_items.len() != self.labels.len() + 1
+            || target_items.last() != Some(&Item::Instruction(self.instruction))
+            || !target_items[..self.labels.len()].iter().copied().eq(self
+                .labels
+                .iter()
+                .copied()
+                .map(Item::Label))
+            || source_items.len() != source.offset() + 1
+            || super::block_has_fallthrough(source_items)
+            || !graph
+                .order()
+                .windows(2)
+                .any(|pair| pair == [source.block(), target.block()])
+            || graph.label_block(start).is_some()
+            || graph.label_block(end).is_some()
+        {
+            return;
+        }
+        let Some(source) = graph[source.block()].last_instruction().copied() else {
+            return;
+        };
+        if source.opcode == self.instruction.opcode
+            && source.operand() == self.instruction.operand()
+            && source.depth_after() == self.instruction.depth_after()
+        {
+            self.threaded_prefix = Some(ThreadedNormalExitPrefix {
+                start,
+                end,
+                source,
+                regions: None,
+            });
+        }
+    }
+}
+
+/// Original aliases retained only for the later borrowed-load graph.
+#[derive(Debug)]
+pub(super) struct RetiredBorrowMarker {
+    pub(super) labels: Vec<Label>,
+    pub(super) original_jump_targets: Option<FxHashSet<Label>>,
+    pub(super) folded_loop_exit: Option<Label>,
+    pub(super) threaded_prefix: Option<(ThreadedNormalExitPrefix, Label)>,
+}
+
 /// Original CFG facts that cannot be recovered from split exception ranges or optimized jumps.
 #[derive(Debug, Default)]
 pub(super) struct ExceptionOwnerProvenance {
@@ -153,6 +308,9 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) synthetic_manager_join_exits: Vec<(Label, Instruction)>,
     // Original ordinary-try exits contain POP_BLOCK followed by JUMP_NO_INTERRUPT.
     pub(super) normal_try_exits: Vec<(Label, Label)>,
+    pub(super) borrow_normal_try_exits: Vec<(Label, Instruction)>,
+    pub(super) initial_borrow_normal_try_exits: Vec<NormalTryBorrowExit>,
+    pub(super) retired_normal_try_exits: Vec<RetiredNormalTryExit>,
     // Sole authored break, retired ordinary-try bridge, and intact normal-finally array.
     pub(super) normal_try_break_pop_owners: Vec<NormalTryBreakPopOwner>,
     // Exact final wildcard call/discard or class-pattern failure pops at a normal try exit.
@@ -172,7 +330,7 @@ pub(super) struct ExceptionOwnerProvenance {
     // Exact unlocated handler arrays whose actual removal can leave a borrow barrier.
     pub(super) borrow_handler_cleanup_arrays: Vec<(Label, Vec<Item>)>,
     // Pending marker to its original entry and interior range labels.
-    pub(super) retired_handler_borrow_markers: FxHashMap<Label, Vec<Label>>,
+    pub(super) retired_borrow_markers: FxHashMap<Label, RetiredBorrowMarker>,
     // Original try/except POP_BLOCK exits inside their own finally, for owner transfer
     // and late redundant-exit removal, but not ordinary-try exit copying.
     pub(super) compound_try_owner_exits: Vec<(Label, Label)>,
@@ -221,6 +379,73 @@ pub(super) struct ExceptionOwnerProvenance {
 }
 
 impl ExceptionOwnerProvenance {
+    /// Separates original jump-target roles from compiler-authored boundaries.
+    pub(super) fn bind_normal_try_borrow_exits(
+        &mut self,
+        graph: &super::block_graph::BlockGraph,
+        preserved: &FxHashSet<Label>,
+        regions: &[super::ExceptionRegion],
+        folded_loop_exit_anchors: &FxHashSet<Label>,
+    ) {
+        for (entry, instruction) in std::mem::take(&mut self.borrow_normal_try_exits) {
+            let Some(block) = graph.label_block(entry) else {
+                continue;
+            };
+            let Some((Item::Instruction(current), labels)) = graph[block].items().split_last()
+            else {
+                continue;
+            };
+            if *current != instruction
+                || !labels.iter().all(|item| {
+                    matches!(item, Item::Label(label)
+                    if self.source_boundaries.contains(label) == folded_loop_exit_anchors.contains(label)
+                        && self.block_boundaries.contains(label) == folded_loop_exit_anchors.contains(label)
+                        && !preserved.contains(label)
+                        && !regions.iter().any(|region| region.target == *label))
+                })
+            {
+                continue;
+            }
+            let labels = labels
+                .iter()
+                .map(|item| {
+                    let Item::Label(label) = item else {
+                        unreachable!()
+                    };
+                    *label
+                })
+                .collect::<Vec<_>>();
+            // A folded loop's break label can alias the following normal-try exit.
+            let mut folded_exits = labels
+                .iter()
+                .copied()
+                .filter(|label| folded_loop_exit_anchors.contains(label));
+            let folded_loop_exit = folded_exits.next();
+            // Folded-loop exits can retain the terminal statement's location.
+            if folded_exits.next().is_some()
+                || (instruction.location != SourceLocation::NONE && folded_loop_exit.is_none())
+            {
+                continue;
+            }
+            let original_jump_targets = graph
+                .iter_items()
+                .filter_map(|item| match item {
+                    Item::Instruction(instruction) => instruction.jump_target(),
+                    Item::Label(_) => None,
+                })
+                .filter(|label| labels.contains(label))
+                .collect();
+            self.initial_borrow_normal_try_exits
+                .push(NormalTryBorrowExit {
+                    labels,
+                    instruction,
+                    original_jump_targets,
+                    folded_loop_exit,
+                    threaded_prefix: None,
+                });
+        }
+    }
+
     /// Validates fields whose producer contract requires an authored jump.
     pub(super) fn legacy_seed_capture_shapes_valid(&self) -> bool {
         let forward = |instruction: &Instruction| instruction.forward_target().is_some();

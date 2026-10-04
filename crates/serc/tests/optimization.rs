@@ -15,6 +15,84 @@ use serc::{
 };
 
 #[test]
+fn retired_normal_try_exits_preserve_borrow_boundaries() {
+    let source = r"
+def run(active, take, consume, entries):
+    result = 0
+    try:
+        consume(active)
+    finally:
+        result = 1
+        try:
+            while True:
+                if active:
+                    result = 2
+                    break
+                result = take()
+                if result:
+                    break
+        except LookupError as error:
+            result = 3
+        consume(result)
+    if result:
+        return 1
+    return 0
+";
+    let unnamed = source.replace("except LookupError as error:", "except LookupError:");
+    for source in [
+        source.to_owned(),
+        unnamed.clone(),
+        unnamed.replace("        except LookupError:", "                selected = [entry for entry in entries]\n                consume(selected)\n        except LookupError:"),
+        unnamed.replace("        except LookupError:", "                for left, right in entries:\n                    consume(left)\n        except LookupError:"),
+        source.replace("        except LookupError as error:", "                selected = [entry for entry in entries]\n                for left, right in entries:\n                    consume(right)\n                selected = take() if active else result\n                if active and selected:\n                    consume(selected)\n        except LookupError as error:"),
+        unnamed.replace("while True:", "while active:").replace("        except LookupError:", "                consume(result)\n        except LookupError:"),
+    ] {
+        assert_matches_cpython(&source, "retired_normal_try_exit.py", &LEVELS);
+    }
+    for source in [
+        r"
+def run(flag, take, note):
+    result = 0
+    try:
+        note(flag)
+    finally:
+        result = 1
+        while True:
+            if flag:
+                result = 2
+                break
+            result = take()
+            if result:
+                break
+        note(result)
+    if result:
+        return 1
+    return 0
+",
+        r"
+def run(flag, take, note):
+    result = 0
+    try:
+        note(flag)
+    finally:
+        result = 1
+        turn = 0
+        try:
+            result = take()
+        except LookupError:
+            result = 3
+        note(result)
+        note(turn)
+    if result:
+        return 1
+    return 0
+",
+    ] {
+        assert_matches_cpython(source, "retired_normal_try_exit_control.py", &LEVELS);
+    }
+}
+
+#[test]
 fn copied_nested_recovery_preserves_borrow_boundary() {
     let source = r"
 def run(flag, load, note):
