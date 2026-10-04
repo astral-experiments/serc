@@ -3731,6 +3731,58 @@ fn nested_authored_pass_preserves_returns_before_removed_assertions() {
 }
 
 #[test]
+fn erased_loop_branches_preserve_terminal_returns() {
+    let source = r"
+def run(data, items, consume, flag):
+    if 101 in data:
+        for key in (103, 107, 109, 113, 127):
+            assert key not in data
+        assert data[101] == 0
+    assert data is not None
+    assert 131 in data.fields
+";
+    let nested = r"
+def run(data, items, consume, flag):
+    if flag:
+        consume(data)
+    else:
+        if 101 in data:
+            for key in (103, 107, 109, 113, 127):
+                assert key not in data
+            assert data[101] == 0
+        assert data is not None
+        assert 131 in data.fields
+";
+    let suffix = "        assert data is not None\n        assert 131 in data.fields\n";
+    for (index, source) in [
+        source.to_owned(),
+        source.replace("    assert 131 in data.fields\n", ""),
+        source.replace(
+            "    assert data is not None\n    assert 131 in data.fields\n",
+            "",
+        ),
+        source.replace(
+            "    assert data is not None\n    assert 131 in data.fields\n",
+            "    consume(data)\n",
+        ),
+        nested.to_owned(),
+        nested.replace(suffix, ""),
+        nested.replace(suffix, "        pass\n"),
+        nested.replace("(103, 107, 109, 113, 127)", "items"),
+        nested.replace("(103, 107, 109, 113, 127)", "items.values()"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            &source,
+            &format!("erased_loop_terminal_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn terminal_else_preserves_nested_conditional_exits_before_removed_assertions() {
     for (index, leaf) in ["assert marker", "pass", "marker = first"]
         .into_iter()

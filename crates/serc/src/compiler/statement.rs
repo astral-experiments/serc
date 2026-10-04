@@ -32,8 +32,8 @@ use crate::target::operands::{
 use super::constant::{
     FirstConstant, first_expression_constant, first_literal_constant, first_suite_constant,
     first_suite_literal_constant, fold_constant, fold_constant_for_version, folded_bool_operand,
-    folded_constant_owner_slots, is_literal_constant, literal_constant, optimized_percent_format,
-    two_element_slice_optimization,
+    folded_constant_owner_slots, is_literal_constant, is_small_literal_tuple_element,
+    literal_constant, optimized_percent_format, two_element_slice_optimization,
 };
 use super::expression::{
     binary_operator, comparison_operator, early_condition_truthiness, expression_contains_yield,
@@ -1730,7 +1730,15 @@ impl<'source> Compiler<'source> {
         };
         let emitted = &body[..=end];
         if end + 1 < body.len()
-            && (suite_has_linear_borrow_fallthrough(emitted) || matches!(emitted, [Stmt::Pass(_)]))
+            && (suite_has_linear_borrow_fallthrough(emitted)
+                || matches!(emitted, [Stmt::Pass(_)])
+                || matches!(emitted, [Stmt::For(iterator)]
+                    if !iterator.is_async
+                        && iterator.orelse.is_empty()
+                        && matches!(iterator.target.as_ref(), Expr::Name(_))
+                        && Self::is_linear_scope_exit_iterator(iterator)
+                        && !iterator.body.is_empty()
+                        && iterator.body.iter().all(is_elided)))
         {
             return true;
         }
@@ -1748,6 +1756,41 @@ impl<'source> Compiler<'source> {
                             && suite_has_linear_borrow_fallthrough(&conditional.body)
                             && !suite_contains_yield(&conditional.body))
             })
+    }
+
+    /// Checks the completed iterable shape used by shared scope exits.
+    fn is_linear_scope_exit_iterator(iterator: &ruff_python_ast::StmtFor) -> bool {
+        let linear_iterator_element = |element: &Expr| {
+            is_small_literal_tuple_element(element)
+                || matches!(element, Expr::Name(_))
+                || matches!(element, Expr::Tuple(tuple)
+                if tuple.elts.len() <= 30
+                    && tuple.elts.iter().all(|part| {
+                        is_small_literal_tuple_element(part)
+                            || matches!(part, Expr::Name(_))
+                            || matches!(part, Expr::Attribute(attribute)
+                                if matches!(attribute.value.as_ref(), Expr::Name(_)))
+                            || matches!(part, Expr::List(list)
+                                if list.elts.len() <= 30
+                                    && list.elts.iter().all(is_small_literal_tuple_element))
+                    }))
+        };
+        (matches!(iterator.target.as_ref(), Expr::Name(_))
+            || matches!(iterator.target.as_ref(), Expr::Tuple(tuple)
+                if tuple.elts.iter().all(|element| matches!(element, Expr::Name(_)))))
+            && (matches!(iterator.iter.as_ref(), Expr::Name(_))
+                || matches!(iterator.iter.as_ref(), Expr::Tuple(tuple)
+                    if tuple.elts.iter().all(linear_iterator_element))
+                || matches!(iterator.iter.as_ref(), Expr::List(list)
+                    if list.elts.iter().all(linear_iterator_element))
+                || matches!(iterator.iter.as_ref(), Expr::Attribute(attribute)
+                    if matches!(attribute.value.as_ref(), Expr::Name(_)))
+                || (matches!(iterator.iter.as_ref(), Expr::Subscript(_))
+                    && !expression_yields_in_current_scope(&iterator.iter))
+                || matches!(iterator.iter.as_ref(), Expr::Call(call)
+                    if matches!(call.func.as_ref(), Expr::Name(_) | Expr::Attribute(_))))
+            && !expression_contains_inline_branch(&iterator.iter)
+            && !expression_suspends_current_scope(&iterator.iter)
     }
 
     /// Finds the normal exits of a terminal try body before erased statements.
