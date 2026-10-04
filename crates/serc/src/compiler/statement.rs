@@ -15538,7 +15538,9 @@ impl<'source> Compiler<'source> {
                             && self.control.finally.is_inactive_for_return_unwind()
                             && effective_nested_else_body.len() < body.len()
                             && matches!(effective_nested_else_body.split_last(), Some((Stmt::If(nested), leading))
-                            if (leading.is_empty() || suite_has_linear_borrow_fallthrough(leading))
+                            if (leading.is_empty()
+                                || is_elided_suite(leading)
+                                || suite_has_linear_borrow_fallthrough(leading))
                                 && matches!(nested.elif_else_clauses.as_slice(), [clause]
                                     if clause.test.is_none()
                                         && ((suite_has_linear_borrow_fallthrough(&nested.body)

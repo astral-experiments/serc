@@ -1512,6 +1512,24 @@ fn linear_prefix_and_elided_suffix_preserve_nested_if_join() {
 }
 
 #[test]
+fn erased_prefix_preserves_nested_branch_join() {
+    for prefix in [
+        "        assert first\n",
+        "        assert first\n        assert second\n",
+    ] {
+        for (body, alternate) in [
+            ("assert first", "assert second"),
+            ("prepare(first)", "prepare(second)"),
+        ] {
+            let source = format!(
+                "def sample(outer, inner, first, second, prepare, record):\n    if outer:\n{prefix}        if inner:\n            {body}\n        else:\n            {alternate}\n        assert first\n        assert second\n    else:\n        assert second\n        assert first\n    assert first\n    assert second\n    result = record.value\n    return result\n"
+            );
+            assert_matches_cpython(&source, "erased_prefix_nested_join.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn erased_suffix_preserves_assertion_only_nested_join() {
     for prefix in ["", "        work(left)\n", "        saved = left\n"] {
         for assertion in [
