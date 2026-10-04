@@ -19221,6 +19221,11 @@ impl<'source> Compiler<'source> {
             && final_body
                 .iter()
                 .all(|statement| self.context.is_elided_statement(statement));
+        // Both eager iterators are restored before the erased arms reach this backedge.
+        let completed_erased_set_test = eligible_else
+            && erased_final_body
+            && self.control.finally.active_finally_try_bodies == 1
+            && condition_has_completed_set_comparison(final_test);
         // A completed manager's normal exit returns to the saved loop owner.
         // Calls and completed awaits in its body cannot reach the erased else.
         let completed_manager_work = matches!(final_body, [Stmt::With(manager)]
@@ -19336,7 +19341,9 @@ impl<'source> Compiler<'source> {
             if matches!(expression.value.as_ref(), Expr::Await(awaited)
                 if matches!(awaited.value.as_ref(), Expr::Name(_))));
         let iterator_inside_finally = (ordinary_function
-            || ((completed_manager_work || completed_direct_await)
+            || ((completed_manager_work
+                || completed_direct_await
+                || (eligible_else && erased_final_body))
                 && matches!(self.unit.scope, Scope::Function { .. })
                 && self.unit.flags & CO_COROUTINE != 0
                 && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0))
@@ -19361,7 +19368,7 @@ impl<'source> Compiler<'source> {
                 context.iterator_cleanup == IteratorCleanup::Sync
                     && context.continue_label == restart
             })
-            && condition_has_linear_runtime_leaves(final_test)
+            && (condition_has_linear_runtime_leaves(final_test) || completed_erased_set_test)
             && (condition_jump_target_count(final_test, false) == 1
                 || (ordinary_function && condition_has_flat_iterator_and_leaves(final_test)))
             && (erased_final_body
@@ -19397,7 +19404,7 @@ impl<'source> Compiler<'source> {
                 .contexts
                 .last()
                 .is_some_and(|context| context.iterator_cleanup != IteratorCleanup::None)
-            && condition_has_runtime_iterator_leaves(final_test)
+            && (condition_has_runtime_iterator_leaves(final_test) || completed_erased_set_test)
             && (completed_manager_work
                 || suite_has_linear_borrow_fallthrough(final_body)
                 || (!final_body.is_empty()
@@ -43172,10 +43179,78 @@ fn iterator_arm_has_completed_dict_store(statement: &Stmt) -> bool {
         && !expression_contains_inline_branch(&comprehension.value)
 }
 
+/// Both eager set operands finish before the comparison's conditional jump.
+fn condition_has_completed_set_comparison(expression: &Expr) -> bool {
+    let Expr::Compare(comparison) = expression else {
+        return false;
+    };
+    comparison.ops.as_ref() == [CmpOp::Eq]
+        && comparison.operands.len() == 2
+        && comparison.operands.iter().all(|operand| {
+            let Expr::SetComp(comprehension) = operand else {
+                return false;
+            };
+            let [iterator] = comprehension.generators.as_slice() else {
+                return false;
+            };
+            !iterator.is_async
+                && iterator.ifs.is_empty()
+                && matches!(iterator.target, Expr::Name(_))
+                && !expression_suspends_current_scope(operand)
+                && !expression_yields_in_current_scope(operand)
+                && !expression_contains_inline_branch(&iterator.iter)
+                && !expression_contains_inline_branch(&comprehension.elt)
+        })
+}
+
 #[cfg(test)]
 mod protected_iterator_erased_else_tests {
     use ruff_python_ast::Stmt;
     use ruff_python_parser::parse_module;
+
+    #[test]
+    fn set_comparison_requires_two_completed_synchronous_iterators() {
+        for (condition, expected) in [
+            ("{x for x in left} == {y for y in right}", true),
+            (
+                "{x.code for x in left()} == {convert(y) for y in right}",
+                true,
+            ),
+            ("{x for x in left} != {y for y in right}", false),
+            ("{x for x in left} == {y for y in right} == other", false),
+            ("{x for x in left} == other", false),
+            ("other == {y for y in right}", false),
+            ("[x for x in left] == {y for y in right}", false),
+            ("{x for x in left if x} == {y for y in right}", false),
+            ("{x for x in left} == {y for y in right if y}", false),
+            (
+                "{x for x in left for z in right} == {y for y in right}",
+                false,
+            ),
+            ("{x async for x in left} == {y for y in right}", false),
+            ("{x for x, z in left} == {y for y in right}", false),
+            (
+                "{x if flag else z for x in left} == {y for y in right}",
+                false,
+            ),
+            (
+                "{x for x in (left if flag else right)} == {y for y in right}",
+                false,
+            ),
+            ("{await x for x in left} == {y for y in right}", false),
+            ("{x for x in await left} == {y for y in right}", false),
+        ] {
+            let parsed = parse_module(&format!("if {condition}:\n    pass\n")).unwrap();
+            let Stmt::If(branch) = &parsed.suite()[0] else {
+                panic!("expected conditional");
+            };
+            assert_eq!(
+                super::condition_has_completed_set_comparison(&branch.test),
+                expected,
+                "{condition}"
+            );
+        }
+    }
 
     #[test]
     fn conjunction_leaves_require_independent_runtime_edges() {
