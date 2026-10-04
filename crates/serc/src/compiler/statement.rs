@@ -19332,8 +19332,11 @@ impl<'source> Compiler<'source> {
                                                 !expression_contains_inline_branch(value))))
                     }))
         };
+        let completed_direct_await = matches!(final_body, [Stmt::Expr(expression)]
+            if matches!(expression.value.as_ref(), Expr::Await(awaited)
+                if matches!(awaited.value.as_ref(), Expr::Name(_))));
         let iterator_inside_finally = (ordinary_function
-            || (completed_manager_work
+            || ((completed_manager_work || completed_direct_await)
                 && matches!(self.unit.scope, Scope::Function { .. })
                 && self.unit.flags & CO_COROUTINE != 0
                 && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0))
