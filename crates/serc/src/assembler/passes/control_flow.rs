@@ -685,6 +685,84 @@ impl OptimizationPipeline {
                 continue;
             }
             let had_instructions = graph[block].last_instruction().is_some();
+            // Keep evidence of the actual erasure, not merely an emitted jump
+            // which threading or copying may have retained elsewhere.
+            if had_instructions
+                && let Some(origin) = self
+                    .exception_owner_provenance
+                    .initial_borrow_normal_try_exits
+                    .iter()
+                    .find(|origin| {
+                        origin
+                            .labels
+                            .first()
+                            .and_then(|label| graph.label_block(*label))
+                            == Some(block)
+                            && graph[block].items().iter().copied().eq(origin
+                                .labels
+                                .iter()
+                                .copied()
+                                .map(Item::Label)
+                                .chain(std::iter::once(Item::Instruction(origin.instruction))))
+                    })
+                && let Some(next) = graph.order().get(block_index + 1).copied()
+                && self
+                    .exception_regions
+                    .iter()
+                    .any(|region| graph.label_block(region.target) == Some(next))
+            {
+                let following = graph[next]
+                    .items()
+                    .iter()
+                    .take_while(|item| matches!(item, Item::Label(_)))
+                    .copied()
+                    .chain(
+                        graph[next]
+                            .items()
+                            .iter()
+                            .find(|item| matches!(item, Item::Instruction(_)))
+                            .copied(),
+                    )
+                    .collect::<Vec<_>>();
+                if !origin.labels.is_empty()
+                    && matches!(following.last(), Some(Item::Instruction(_)))
+                    && origin.labels.iter().all(|label| {
+                        self.exception_owner_provenance
+                            .source_boundaries
+                            .contains(label)
+                            == (origin.folded_loop_exit == Some(*label))
+                            && self
+                                .exception_owner_provenance
+                                .block_boundaries
+                                .contains(label)
+                                == (origin.original_jump_targets.contains(label)
+                                    || origin.folded_loop_exit == Some(*label))
+                            && self.folded_loop_exit_anchors.contains(label)
+                                == (origin.folded_loop_exit == Some(*label))
+                            && !self.preserved_block_boundaries.contains(label)
+                            && !self
+                                .exception_regions
+                                .iter()
+                                .any(|region| region.target == *label)
+                    })
+                    && origin.threaded_prefix.as_ref().is_none_or(|prefix| {
+                        prefix.is_intact(
+                            graph,
+                            &self.exception_owner_provenance,
+                            &self.preserved_block_boundaries,
+                            &self.folded_loop_exit_anchors,
+                            &self.exception_regions,
+                        ) && prefix.matches_route(graph, graph[block].items())
+                    })
+                {
+                    self.exception_owner_provenance
+                        .retired_normal_try_exits
+                        .push(crate::assembler::exception_owners::RetiredNormalTryExit {
+                            origin: origin.clone(),
+                            following,
+                        });
+                }
+            }
             graph.retain_items(block, |item| match item {
                 Item::Label(label) => {
                     // A label-only unreachable array no longer certifies copy continuity.
@@ -3202,6 +3280,19 @@ impl OptimizationPipeline {
                 let end = Label::from_u32(self.next_label + 1);
                 self.next_label += 2;
                 let (block, offset) = instruction_positions[source];
+                let (target_block, target_offset) = instruction_positions[target];
+                for origin in &mut self
+                    .exception_owner_provenance
+                    .initial_borrow_normal_try_exits
+                {
+                    origin.record_threaded_owner_prefix(
+                        graph,
+                        ItemPosition::new(block, offset),
+                        ItemPosition::new(target_block, target_offset),
+                        start,
+                        end,
+                    );
+                }
                 graph.insert_label(block, offset + 1, end);
                 graph.insert_label(block, offset, start);
                 for (index, (region, range)) in self
@@ -3236,6 +3327,22 @@ impl OptimizationPipeline {
                     .push(super::super::ExceptionRegion { start, ..region });
             }
             self.exception_regions.extend(copied_regions);
+            for origin in &mut self
+                .exception_owner_provenance
+                .initial_borrow_normal_try_exits
+            {
+                if let Some(prefix) = &mut origin.threaded_prefix
+                    && prefix.regions.is_none()
+                {
+                    prefix.regions = Some(
+                        self.exception_regions
+                            .iter()
+                            .filter(|region| prefix.references(region))
+                            .copied()
+                            .collect(),
+                    );
+                }
+            }
         }
         self.borrow_threaded_jump_entries =
             Self::snapshot_threaded_borrow_entries(&self.graph, &threaded_borrow_origins);

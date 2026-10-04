@@ -29682,6 +29682,14 @@ impl<'source> Compiler<'source> {
         self.emit_reraise(ReraiseStackState::HandlerCleanup)?;
 
         self.assembler.record_exception_owner_block_boundary(end);
+        if self.context.python_version == crate::PythonVersion::Py314
+            && statement.finalbody.is_empty()
+            && self.control.finally.active_copied_finally_bodies == 0
+        {
+            // Compound and copied finalizers retain their own original-array evidence.
+            // Preserve the standalone try-except join for borrow analysis.
+            self.assembler.record_borrow_analysis_block_boundary(end);
+        }
         self.assembler.mark(end);
         self.set_depth(base_depth);
         Ok(())
