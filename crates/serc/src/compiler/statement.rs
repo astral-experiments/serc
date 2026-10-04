@@ -21629,7 +21629,26 @@ impl<'source> Compiler<'source> {
                                     == self.control.exceptions.active_exception_region_exclusions.len()
                                 && outer.finally_end_depth
                                     == self.control.finally.active_finally_end_blocks)))
-                && !self.has_active_control_flow_region()
+                && (!self.has_active_control_flow_region()
+                    // A manager entered before the loop is not unwound by its
+                    // break. Erased assertions still leave an empty tail array.
+                    || (statement.orelse.is_empty()
+                        && self.control.loops.contexts.is_empty()
+                        && self.control.statements.context.has_following
+                        && !self.control.withs.active_with_exits.is_empty()
+                        && self.control.withs.active_with_region_exclusions.len()
+                            == self.control.withs.active_with_exits.len()
+                        && self
+                            .control
+                            .withs
+                            .active_with_exits
+                            .iter()
+                            .all(|manager| !manager.is_async)
+                        && self
+                            .control
+                            .exceptions
+                            .active_exception_region_exclusions
+                            .is_empty()))
                 && !self.control.in_exception_handler()
                 && self.control.finally.is_inactive_for_return_unwind()
             {
