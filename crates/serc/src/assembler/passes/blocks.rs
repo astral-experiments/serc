@@ -8572,7 +8572,7 @@ impl OptimizationPipeline {
 #[cfg(test)]
 mod retired_handler_borrow_tests {
     use super::*;
-    use crate::assembler::Assembler;
+    use crate::assembler::{Assembler, ExceptionRegionPriority};
     use crate::target::opcodes::PUSH_EXC_INFO;
 
     fn fixture(variation: &str, capture: bool) -> OptimizationPipeline {
