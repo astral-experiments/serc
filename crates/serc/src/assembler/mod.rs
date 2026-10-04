@@ -2397,7 +2397,22 @@ impl Assembler {
         location: SourceLocation,
         allow_recorded_none_guard: bool,
     ) -> bool {
-        let items = self.linear_items();
+        self.original_guarded_finally_exit_origin(
+            self.linear_items(),
+            Some(location),
+            allow_recorded_none_guard,
+        )
+        .is_some()
+    }
+
+    /// Returns the guard entry and separate normal-finally edge at a cleanup join.
+    /// An exact location retains the single-guard contract; copied breaks may share guards.
+    fn original_guarded_finally_exit_origin(
+        &self,
+        items: &[Item],
+        guard_location: Option<SourceLocation>,
+        allow_recorded_none_guard: bool,
+    ) -> Option<(Label, usize)> {
         let labels = trailing_labels(items).collect::<Vec<_>>();
         if self.join_labels_have_authored_location(&labels)
             || labels.iter().any(|label| {
@@ -2405,19 +2420,17 @@ impl Assembler {
                     || self.folded_away_loop_else_targets.contains(label)
             })
         {
-            return false;
+            return None;
         }
         let end = items.len() - labels.len();
-        let Some(start) = end.checked_sub(3) else {
-            return false;
-        };
+        let start = end.checked_sub(3)?;
         let [
             Item::Instruction(copy),
             Item::Instruction(pop),
             Item::Instruction(reraise),
         ] = &items[start..end]
         else {
-            return false;
+            return None;
         };
         if copy.opcode != COPY
             || copy.value_argument() != Some(3)
@@ -2430,19 +2443,54 @@ impl Assembler {
                     || instruction.local_policy.hidden_exception_owner_slots() != 0
             })
         {
-            return false;
+            return None;
         }
         let mut incoming = items.iter().enumerate().filter_map(|(index, item)| match item {
             Item::Instruction(instruction)
                 if matches!(instruction.operand(), Operand::Forward(label) | Operand::Backward(label)
-                    if labels.contains(&label)) => Some((index, instruction)),
+                    if labels.contains(&label)) => Some((index, *instruction)),
             _ => None,
         });
-        let (Some((_, guard)), Some((cleanup_index, cleanup)), None) =
-            (incoming.next(), incoming.next(), incoming.next())
-        else {
-            return false;
+        let (_, first) = incoming.next()?;
+        let (cleanup_index, cleanup) = if guard_location.is_some() {
+            let cleanup = incoming.next()?;
+            if incoming.next().is_some() {
+                return None;
+            }
+            cleanup
+        } else {
+            incoming.next_back()?
         };
+        let target = first.forward_target()?;
+        if guard_location.is_none() {
+            let depth = cleanup.depth_after()?;
+            let copy_depth = depth.checked_add(4)?;
+            if cleanup.location.line < 0
+                || *copy
+                    != Instruction::new(
+                        COPY,
+                        Operand::Value(3),
+                        SourceLocation::NONE,
+                        Some(copy_depth),
+                    )
+                || *pop
+                    != Instruction::new(
+                        POP_EXCEPT,
+                        Operand::Value(0),
+                        SourceLocation::NONE,
+                        Some(copy_depth - 1),
+                    )
+                || *reraise
+                    != Instruction::new(
+                        RERAISE,
+                        Operand::Value(1),
+                        SourceLocation::NONE,
+                        Some(depth),
+                    )
+            {
+                return None;
+            }
+        }
         // A finalizer can end in an original empty borrowing block. Its single
         // unlocated jump threads past this join without supplying another line.
         let empty_cleanup_marker = cleanup.location == SourceLocation::NONE
@@ -2450,16 +2498,32 @@ impl Assembler {
             && cleanup.jump_policy.retained_nop() == ir::RetainedJumpNop::None
             && matches!(items[..cleanup_index].last(), Some(Item::Label(_)))
             && matches!(items.get(cleanup_index + 1), Some(Item::Label(_)));
-        is_conditional_jump(guard.opcode)
-            && guard.location == location
-            && location.line >= 0
-            && cleanup.opcode == JUMP_FORWARD
+        let original_input = |instruction: &Instruction| {
+            instruction.pre_fold_extra_instructions() == 0
+                && instruction.exception_policy() == ExceptionPolicy::default()
+                && !instruction.no_location_policy.preserves_location()
+                && !instruction.fusion_policy.is_authored_break()
+                && instruction.jump_policy.inline_small_exit()
+                && matches!(instruction.operand(), Operand::Forward(label)
+                    if self.exception_owner_provenance.source_boundaries.contains(&label)
+                        && self.exception_owner_provenance.block_boundaries.contains(&label))
+        };
+        let valid = cleanup.opcode == JUMP_FORWARD
             && (cleanup.location.line >= 0 || empty_cleanup_marker)
-            && guard.operand() != cleanup.operand()
-            && guard.depth_after().is_some()
-            && guard.depth_after() == cleanup.depth_after()
+            && cleanup.operand() != Operand::Forward(target)
             && cleanup.local_policy.hidden_exception_owner_slots() == 0
-            && (guard.local_policy.hidden_exception_owner_slots() == 0
+            && original_input(&cleanup)
+            && std::iter::once(first)
+                .chain(incoming.map(|(_, guard)| guard))
+                .all(|guard| {
+                    is_conditional_jump(guard.opcode)
+                        && guard.operand() == Operand::Forward(target)
+                        && guard.location.line >= 0
+                        && guard_location.is_none_or(|location| guard.location == location)
+                        && guard.depth_after().is_some()
+                        && guard.depth_after() == cleanup.depth_after()
+                        && original_input(&guard)
+                        && (guard.local_policy.hidden_exception_owner_slots() == 0
                 // Specializing a same-line None comparison removes LOAD_CONST,
                 // IS_OP, and TO_BOOL. Accept those slots only on the exact recorded
                 // source condition; copied or otherwise reserved guards still reject.
@@ -2470,19 +2534,11 @@ impl Assembler {
                         .exception_owner_provenance
                         .source_none_conditions
                         .iter()
-                        .filter(|origin| origin.instruction == *guard)
+                        .filter(|origin| origin.instruction == guard)
                         .count()
                         == 1))
-            && [guard, cleanup].iter().all(|instruction| {
-                instruction.pre_fold_extra_instructions() == 0
-                    && instruction.exception_policy() == ExceptionPolicy::default()
-                    && !instruction.no_location_policy.preserves_location()
-                    && !instruction.fusion_policy.is_authored_break()
-                    && instruction.jump_policy.inline_small_exit()
-                    && matches!(instruction.operand(), Operand::Forward(label)
-                        if self.exception_owner_provenance.source_boundaries.contains(&label)
-                            && self.exception_owner_provenance.block_boundaries.contains(&label))
-            })
+                });
+        valid.then_some((target, cleanup_index))
     }
 
     /// Certifies the sole false predecessor after a terminal single-argument raise.
@@ -3079,15 +3135,36 @@ impl Assembler {
 
     /// Certifies an empty source join with multiple original conditional exits.
     pub(crate) fn at_original_shared_conditional_join(&self) -> bool {
-        self.original_shared_conditional_join(false)
+        self.original_shared_conditional_join(false, false)
     }
 
-    fn original_shared_conditional_join(&self, allow_recorded_none_guard: bool) -> bool {
+    fn original_shared_conditional_join(
+        &self,
+        allow_recorded_none_guard: bool,
+        allow_plain_nop_fallthrough: bool,
+    ) -> bool {
         let items = self.linear_items();
         let labels = trailing_labels(items).collect::<Vec<_>>();
+        let Some(Item::Instruction(previous)) =
+            items.get(items.len().saturating_sub(labels.len() + 1))
+        else {
+            return false;
+        };
+        // A copied break starts after this body NOP. Its conditional inputs skip
+        // the NOP and enter the separate unlocated jump checked by the recorder.
+        let plain_nop_fallthrough = allow_plain_nop_fallthrough
+            && previous.location.line >= 0
+            && previous.depth_after().is_some()
+            && *previous
+                == Instruction::new(
+                    NOP,
+                    Operand::Value(0),
+                    previous.location,
+                    previous.depth_after(),
+                );
         if labels.is_empty()
             || self.join_labels_have_authored_location(&labels)
-            || self.current_join_has_located_compacted_predecessor()
+            || (self.current_join_has_located_compacted_predecessor() && !plain_nop_fallthrough)
             || labels.iter().any(|label| {
                 self.folded_away_condition_targets.contains(label)
                     || self.folded_away_loop_else_targets.contains(label)
@@ -3095,11 +3172,6 @@ impl Assembler {
         {
             return false;
         }
-        let Some(Item::Instruction(previous)) =
-            items.get(items.len().saturating_sub(labels.len() + 1))
-        else {
-            return false;
-        };
         let falls_through = !ends_scope(previous.opcode) && !is_unconditional_jump(previous.opcode);
         let mut conditional_edges = 0;
         for item in items {
@@ -3147,14 +3219,23 @@ impl Assembler {
 
     /// Certifies an empty cleanup join, including a recorded specialized None guard.
     pub(crate) fn at_original_shared_cleanup_join(&self) -> bool {
-        self.original_shared_conditional_join(true)
+        self.original_shared_conditional_join(true, false)
+    }
+
+    /// Certifies copied-break joins after a plain NOP or a guarded nested-finalizer exit.
+    pub(crate) fn at_original_shared_copied_finally_break_join(&self) -> bool {
+        self.python_version >= crate::PythonVersion::Py314
+            && (self.original_shared_conditional_join(true, true)
+                || self
+                    .original_guarded_finally_exit_origin(self.linear_items(), None, true)
+                    .is_some())
     }
 
     /// Certifies a shared conditional source join without a physical fallthrough donor.
     pub(crate) fn at_original_jump_only_conditional_join(&self) -> bool {
         // Specializing a recorded None guard removes LOAD_CONST, IS_OP, and
         // TO_BOOL inside its predecessor. It does not locate this empty join.
-        self.original_shared_conditional_join(true)
+        self.original_shared_conditional_join(true, false)
             && self
                 .linear_items()
                 .iter()
@@ -10549,6 +10630,10 @@ impl Assembler {
             return;
         };
         let multiple_conditions = matching.next().is_some();
+        let normal_finally_exit = self
+            .original_guarded_finally_exit_origin(head, None, true)
+            .filter(|(entry, index)| *entry == label && *index >= unwind_start)
+            .map(|(_, index)| index);
         if (multiple_conditions && !original_shared_join)
             || !self
                 .exception_owner_provenance
@@ -10579,15 +10664,16 @@ impl Assembler {
                 // The pre-emission certificate authenticates every incoming record.
                 // Restrict its shared entry to this exact copied-finalizer head.
                 index < unwind_start
-                    || target != label
-                    || instruction.operand() != Operand::Forward(label)
-                    || !matches!(
-                        instruction.opcode,
-                        POP_JUMP_IF_FALSE
-                            | POP_JUMP_IF_TRUE
-                            | POP_JUMP_IF_NONE
-                            | POP_JUMP_IF_NOT_NONE
-                    )
+                    || (normal_finally_exit != Some(index)
+                        && (target != label
+                            || instruction.operand() != Operand::Forward(label)
+                            || !matches!(
+                                instruction.opcode,
+                                POP_JUMP_IF_FALSE
+                                    | POP_JUMP_IF_TRUE
+                                    | POP_JUMP_IF_NONE
+                                    | POP_JUMP_IF_NOT_NONE
+                            )))
             })
         {
             return;

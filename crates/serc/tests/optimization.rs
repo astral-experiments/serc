@@ -15,6 +15,44 @@ use serc::{
 };
 
 #[test]
+fn copied_finally_compound_break_threads_both_conditions() {
+    let source = r#"async def copied_break(self, key):
+    while not self.finished():
+        try:
+            with acquire(self.path / "lease") as resource:
+                if self.finished():
+                    break
+        finally:
+            if key not in self.active and pending is not None:
+                pass
+        await clock.pause(0.25)
+    report("done", "loop")
+    raise Halt("complete")
+"#;
+    let mut wrapped = String::from("class Runner:\n");
+    for line in source.lines() {
+        writeln!(wrapped, "    {line}").unwrap();
+    }
+    for source in [
+        source.to_owned(),
+        source.replace("async def", "def").replace("await clock", "clock"),
+        wrapped,
+        source.replace(
+            "            with acquire(self.path / \"lease\") as resource:\n                if self.finished():\n                    break",
+            "            if self.finished():\n                break",
+        ),
+        source.replace("key not in self.active and pending is not None", "key not in self.active"),
+        source.replace("                    break", "                    pass"),
+    ] {
+        assert_matches_cpython(
+            &format!("from __future__ import annotations\n{source}"),
+            "copied_finally_break.py",
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn unnamed_handler_match_cleanup_preserves_success_edges() {
     let source = r"async def handler_match(owner, kinds, operation, sink, choice):
     result = None
