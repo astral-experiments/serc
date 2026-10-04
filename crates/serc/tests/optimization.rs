@@ -15,6 +15,55 @@ use serc::{
 };
 
 #[test]
+fn handler_break_releases_iterator_exception_owner() {
+    let source = r"async def nested_managers(items):
+    for item in items:
+        try:
+            if prepare_needed(item):
+                try:
+                    async with acquire(item) as token:
+                        await prepare(token)
+                except LookupError:
+                    break
+            async with outer(item):
+                async with inner(item):
+                    if accepted(item):
+                        return item
+                    if stopped(item):
+                        break
+        except Exception:
+            continue
+    return None
+";
+    for (index, source) in [
+        source.to_owned(),
+        source
+            .replace("async def", "def")
+            .replace("async with", "with")
+            .replace("await ", ""),
+        source.replace(
+            "            async with outer(item):\n                async with inner(item):\n                    if accepted(item):\n                        return item\n                    if stopped(item):\n                        break\n",
+            "            async with outer(item):\n                if accepted(item):\n                    return item\n                if stopped(item):\n                    break\n",
+        ),
+        source.replace("                    if accepted(item):\n                        return item\n", ""),
+        source.replace(
+            "                try:\n                    async with acquire(item) as token:\n                        await prepare(token)\n                except LookupError:\n                    break\n",
+            "                async with acquire(item) as token:\n                    await prepare(token)\n",
+        ),
+        source.replace("                    if stopped(item):\n                        break\n", ""),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            &format!("from __future__ import annotations\n{source}"),
+            &format!("handler_break_iterator_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn copied_finally_compound_break_threads_both_conditions() {
     let source = r#"async def copied_break(self, key):
     while not self.finished():
