@@ -15436,9 +15436,34 @@ impl<'source> Compiler<'source> {
                         .iter()
                         .rposition(|part| !self.context.is_elided_statement(part))
                         .map_or(0, |index| index + 1)];
+                    // Await completion leaves no suspension edge into the later IfEnd.
+                    let completed_await_arm = |arm: &[Stmt]| {
+                        let mut has_await = false;
+                        for part in arm {
+                            if self.context.is_elided_statement(part) {
+                                continue;
+                            }
+                            if matches!(part, Stmt::Expr(expression)
+                                if matches!(expression.value.as_ref(), Expr::Await(awaited)
+                                    if matches!(awaited.value.as_ref(), Expr::Call(_))
+                                        && !expression_suspends_current_scope(&awaited.value)
+                                        && !expression_contains_inline_branch(&awaited.value)))
+                            {
+                                has_await = true;
+                            } else {
+                                let single = std::slice::from_ref(part);
+                                if !suite_has_linear_borrow_fallthrough(single)
+                                    || !suite_has_nonsuspending_conditional_work(single)
+                                {
+                                    return false;
+                                }
+                            }
+                        }
+                        has_await
+                    };
                     // A coroutine's implicit exception wrapper does not enter the
-                    // populated inner If's empty end array. With only linear,
-                    // nonsuspending work, its false arm remains the sole donor
+                    // populated inner If's empty end array. Once each arm completes,
+                    // its false arm remains the sole donor
                     // after the other arm threads past the erased outer else.
                     let coroutine_populated_nested_join = self.unit.flags
                         & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
@@ -15460,12 +15485,14 @@ impl<'source> Compiler<'source> {
                                     || (suite_has_linear_borrow_fallthrough(std::slice::from_ref(part))
                                         && suite_has_nonsuspending_conditional_work(std::slice::from_ref(part)))
                             })
-                                && suite_has_linear_borrow_fallthrough(&nested.body)
-                                && suite_has_nonsuspending_conditional_work(&nested.body)
+                                && ((suite_has_linear_borrow_fallthrough(&nested.body)
+                                    && suite_has_nonsuspending_conditional_work(&nested.body))
+                                    || completed_await_arm(&nested.body))
                                 && matches!(nested.elif_else_clauses.as_slice(), [clause]
                                     if clause.test.is_none()
-                                        && suite_has_linear_borrow_fallthrough(&clause.body)
-                                        && suite_has_nonsuspending_conditional_work(&clause.body)));
+                                        && ((suite_has_linear_borrow_fallthrough(&clause.body)
+                                            && suite_has_nonsuspending_conditional_work(&clause.body))
+                                            || completed_await_arm(&clause.body))));
                     let matching_manager_region = !self.control.withs.active_with_exits.is_empty()
                         && self.control.withs.active_with_exits.len()
                             == self.control.withs.active_with_region_exclusions.len();
@@ -15785,6 +15812,7 @@ impl<'source> Compiler<'source> {
                             // cannot add a predecessor to that normal continuation.
                             let populated_nested_arm = |arm: &[Stmt]| {
                                 populated_arm(arm)
+                                    || (coroutine_populated_nested_join && completed_await_arm(arm))
                                     || (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                                         && !self.control.statements.in_match
                                         && !self.has_active_control_flow_region()
