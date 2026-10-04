@@ -16896,6 +16896,36 @@ impl<'source> Compiler<'source> {
                                 && original_condition_has_unique_jump_target(&statement.test, false)
                                 && !statement.body.is_empty()
                                 && statement.body.iter().all(|part| self.context.is_elided_statement(part)))))
+                    // An enclosing finally predates this iterator. Erasing the suffix
+                    // leaves the conditional's two exits at the saved loop owner.
+                    || (mode == LoopTailMode::default()
+                        && matches!(self.unit.scope, Scope::Function { .. })
+                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                        && self.control.finally.active_finally_try_bodies == 1
+                        && self.control.exceptions.active_exception_region_exclusions.len() == 1
+                        && self.control.finally.innermost_finally_exception_exclusion_depth == Some(1)
+                        && matches!(self.control.finally.protected_try_loop_depths.as_slice(),
+                            [(1, loop_depth)] if *loop_depth < self.control.loops.contexts.len())
+                        && self.control.withs.active_with_exits.is_empty()
+                        && self.control.withs.active_with_region_exclusions.is_empty()
+                        && !self.control.in_exception_handler()
+                        && self.control.exceptions.active_exception_group_handlers == 0
+                        && self.control.finally.active_normal_finally_bodies == 0
+                        && self.control.finally.active_copied_finally_bodies == 0
+                        && self.control.finally.active_finally_end_blocks == 0
+                        && self.control.finally.active_overriding_finally_returns == 0
+                        && self.control.loops.contexts.last().is_some_and(|context| {
+                            context.iterator_cleanup == IteratorCleanup::Sync
+                                && context.continue_label == restart
+                                && context.with_depth == self.control.withs.active_with_exits.len()
+                                && context.finally_end_depth == self.control.finally.active_finally_end_blocks
+                                && context.exception_region_depth == self.control.exceptions.active_exception_region_exclusions.len()
+                        })
+                        && body[end + 1..].iter().all(|suffix| self.context.is_elided_statement(suffix))
+                        && condition_has_linear_runtime_leaves(&statement.test)
+                        && original_condition_has_unique_jump_target(&statement.test, true)
+                        && original_condition_has_unique_jump_target(&statement.test, false)
+                        && suite_has_nonsuspending_linear_fallthrough(&statement.body))
                     || (!self.has_active_control_flow_region()
                         && !self.control.in_exception_handler()
                         && self.control.finally.is_inactive_for_return_unwind()
