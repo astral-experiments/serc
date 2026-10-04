@@ -271,6 +271,7 @@ impl OptimizationPipeline {
         // Admit cleanups from their complete original partition before any swap run is
         // rewritten. A newly simplified suffix cannot certify an emitted owner slot.
         let mut capture_cleanup_swaps = FxHashSet::default();
+        let mut capture_cleanup_donors = FxHashMap::default();
         for block in &blocks {
             for rotation in block.windows(6) {
                 if !matches!(graph.item(rotation[0]), Item::Instruction(prefix)
@@ -285,9 +286,7 @@ impl OptimizationPipeline {
             }
             if !block.iter().any(|position| {
                 matches!(graph.item(*position), Item::Instruction(instruction)
-                    if (instruction.opcode == UNPACK_SEQUENCE
-                        && matches!(instruction.operand(), Operand::Value(0 | 1)))
-                        || matches!(instruction.opcode, UNPACK_EX | POP_TOP | NOT_TAKEN))
+                    if matches!(instruction.opcode, UNPACK_SEQUENCE | UNPACK_EX | POP_TOP | NOT_TAKEN))
             }) {
                 continue;
             }
@@ -297,6 +296,10 @@ impl OptimizationPipeline {
                 .collect::<Vec<_>>();
             for index in 0..items.len() {
                 if let Some(rotation) = capture_cleanup_rotation(&items[index..]) {
+                    if let Some((offset, donor)) = rotation.projected_pop_donor {
+                        // Static swaps rotate this original POP into the following donor slot.
+                        capture_cleanup_donors.insert(block[index + offset], donor);
+                    }
                     capture_cleanup_swaps.extend(
                         block[index + 1..index + 1 + rotation.swap_count]
                             .iter()
@@ -414,7 +417,7 @@ impl OptimizationPipeline {
             }
             // Rotation simplification only writes SWAP/NOP slots. Snapshot the
             // untouched capture donors before static swaps can reorder any POP_TOP.
-            let original_donors = if self.python_version >= crate::PythonVersion::Py314
+            let mut original_donors = if self.python_version >= crate::PythonVersion::Py314
                 && (!rewritten.is_empty() || instruction_positions.iter().any(|&position| {
                     matches!(graph.item(position), Item::Instruction(instruction) if instruction.opcode == SWAP)
                 }))
@@ -430,6 +433,11 @@ impl OptimizationPipeline {
             } else {
                 FxHashMap::default()
             };
+            original_donors.extend(block.iter().filter_map(|position| {
+                capture_cleanup_donors
+                    .get(position)
+                    .map(|donor| (*position, *donor))
+            }));
             rewritten_blocks.push(SwapBlock {
                 positions: block,
                 rewritten_nops: rewritten,

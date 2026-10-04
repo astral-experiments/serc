@@ -2571,6 +2571,132 @@ fn optimization_pipeline(items: Vec<Item>) -> super::OptimizationPipeline {
     assembler.into_optimization_pipeline()
 }
 
+fn sequence_capture_cleanup_items(depth: usize, count: usize) -> Vec<Item> {
+    let mut items = vec![pass_instruction(UNPACK_SEQUENCE, 5, 5)];
+    for distance in (2..=depth).rev() {
+        items.push(pass_instruction(SWAP, u32::try_from(distance).unwrap(), 5));
+    }
+    for index in 0..count {
+        let column = i32::try_from(index).unwrap();
+        let mut pop = Instruction::new(
+            POP_TOP,
+            Operand::Value(0),
+            SourceLocation::new(5, 5, column, column + 1),
+            Some(u32::try_from(depth - index).unwrap()),
+        );
+        if index.is_multiple_of(2) {
+            pop.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
+        }
+        items.push(Item::Instruction(pop));
+    }
+    items.push(pass_instruction(super::MATCH_SEQUENCE, 0, 6));
+    items
+}
+
+#[test]
+fn sequence_capture_cleanup_preserves_pop_records_and_remaining_stack() {
+    for (depth, count) in [(5, 3), (5, 4), (6, 3), (6, 4)] {
+        let items = sequence_capture_cleanup_items(depth, count);
+        let rotation = super::capture_cleanup_rotation(&items).unwrap();
+        assert_eq!(rotation.swap_count, depth - 1);
+        assert_eq!(rotation.removed_slots, count - 1);
+        assert_eq!(rotation.consumers.len(), count);
+        assert_eq!(
+            Assembler::from_linear_items(items.clone())
+                .current_block_dynamic_exception_owner_slots(),
+            count - 1
+        );
+        let mut pipeline = optimization_pipeline(items.clone());
+        let (blocks, cleanup, _) = pipeline.optimize_swap_runs();
+        assert!(pipeline.apply_static_swaps((blocks, cleanup)).is_empty());
+        let actual = pipeline.graph.iter_items().copied().collect::<Vec<_>>();
+        let first_removed = depth - count + 1;
+        assert_eq!(&actual[..first_removed], &items[..first_removed]);
+        for index in first_removed..depth {
+            let (Item::Instruction(before), Item::Instruction(after)) =
+                (items[index], actual[index])
+            else {
+                panic!()
+            };
+            assert_eq!(after.opcode, NOP);
+            assert_eq!(after.exception_policy(), before.exception_policy());
+            assert_eq!(after.depth_after(), before.depth_after());
+        }
+        let mut pops = items[depth..depth + count].to_vec();
+        pops.rotate_right(1);
+        assert_eq!(&actual[depth..depth + count], pops);
+        assert_eq!(&actual[depth + count..], &items[depth + count..]);
+    }
+}
+
+#[test]
+fn sequence_capture_cleanup_requires_a_complete_same_line_prefix() {
+    for mutation in 0..14 {
+        let mut items = sequence_capture_cleanup_items(6, 3);
+        match mutation {
+            0 => items[0] = pass_instruction(UNPACK_SEQUENCE, 2, 5),
+            1 => items[0] = pass_instruction(UNPACK_SEQUENCE, 4, 5),
+            2 => items[0] = pass_instruction(UNPACK_EX, 5, 5),
+            3 => items[0] = pass_instruction(UNPACK_SEQUENCE, 5, -1),
+            4 => items[2] = pass_instruction(SWAP, 4, 5),
+            5 => items[2] = pass_instruction(SWAP, 5, 6),
+            6 => items[7] = pass_instruction(POP_TOP, 1, 5),
+            7 => items[7] = pass_instruction(POP_TOP, 0, 6),
+            8 => items[7] = pass_instruction(STORE_FAST, 0, 5),
+            9 => items.insert(3, Item::Label(super::Label::from_u32(0))),
+            10 => items.truncate(9),
+            11 => items[9] = pass_instruction(NOP, 0, 6),
+            12 => items[9] = pass_instruction(super::MATCH_SEQUENCE, 0, -1),
+            13 => items = sequence_capture_cleanup_items(6, 2),
+            _ => unreachable!(),
+        }
+        assert!(
+            super::sequence_capture_cleanup_rotation(&items).is_none(),
+            "mutation {mutation}"
+        );
+    }
+    for index in 0..9 {
+        for policy in 0..4 {
+            let mut items = sequence_capture_cleanup_items(6, 3);
+            let Item::Instruction(instruction) = &mut items[index] else {
+                panic!()
+            };
+            match policy {
+                0 => instruction.jump_policy.retain_nop(),
+                1 => instruction.no_location_policy.preserve_location(),
+                2 => instruction.fusion_policy.prevent_with_previous(),
+                3 => instruction.fusion_policy.prevent_with_next(),
+                _ => unreachable!(),
+            }
+            assert!(super::sequence_capture_cleanup_rotation(&items).is_none());
+        }
+    }
+}
+
+#[test]
+fn sequence_capture_cleanup_keeps_the_following_capture_donor() {
+    let mut items = sequence_capture_cleanup_items(5, 3);
+    items.pop();
+    items.extend([
+        pass_instruction(SWAP, 2, 5),
+        pass_instruction(STORE_FAST, 0, 3),
+        pass_instruction(STORE_FAST, 1, 3),
+        pass_instruction(RETURN_VALUE, 0, 7),
+    ]);
+    let mut pipeline = optimization_pipeline(items.clone());
+    let (blocks, cleanup, _) = pipeline.optimize_swap_runs();
+    assert!(pipeline.apply_static_swaps((blocks, cleanup)).is_empty());
+    let actual = pipeline.graph.iter_items().copied().collect::<Vec<_>>();
+    assert_eq!(actual[7], items[6]);
+    let Item::Instruction(nop) = actual[8] else {
+        panic!()
+    };
+    assert_eq!(nop.opcode, NOP);
+    assert_eq!(nop.location, SourceLocation::NONE);
+    assert_eq!(actual[9], items[10]);
+    assert_eq!(actual[10], items[9]);
+}
+
 fn mapping_capture_items(captures: u32, wildcards: u32) -> Vec<Item> {
     let unpacked = captures + wildcards;
     let depth = unpacked + 2;
