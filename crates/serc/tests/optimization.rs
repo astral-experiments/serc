@@ -15,6 +15,78 @@ use serc::{
 };
 
 #[test]
+fn unnamed_handler_match_cleanup_preserves_success_edges() {
+    let source = r"async def handler_match(owner, kinds, operation, sink, choice):
+    result = None
+    try:
+        result = operation()
+        sink(result)
+    except ArithmeticError:
+        return result
+    except LookupError:
+        sink(choice)
+        match choice:
+            case kinds.first:
+                sink(choice)
+                return result
+            case kinds.second:
+                sink(choice)
+                sink(result)
+                result = operation()
+            case _ as captured:
+                sink(captured)
+    except RuntimeError:
+        result = operation()
+    except Exception:
+        raise
+    if owner.value is None:
+        return result
+    return operation()
+";
+    let unprotected = r"async def unprotected_match(owner, kinds, operation, sink, choice):
+    result = None
+    result = operation()
+    sink(result)
+    sink(choice)
+    match choice:
+        case kinds.first:
+            sink(choice)
+            return result
+        case kinds.second:
+            sink(choice)
+            sink(result)
+            result = operation()
+        case _ as captured:
+            sink(captured)
+    if owner.value is None:
+        return result
+    return operation()
+";
+    let conditional = source.replace("handler_match", "conditional_dispatch").replace(
+        "        match choice:\n            case kinds.first:\n                sink(choice)\n                return result\n            case kinds.second:\n                sink(choice)\n                sink(result)\n                result = operation()\n            case _ as captured:\n                sink(captured)",
+        "        if choice == kinds.first:\n            sink(choice)\n            return result\n        elif choice == kinds.second:\n            sink(choice)\n            sink(result)\n            result = operation()\n        else:\n            captured = choice\n            sink(captured)",
+    );
+    for source in [
+        source.to_owned(),
+        source.replace("async def handler_match", "def synchronous_match"),
+        unprotected.to_owned(),
+        source
+            .replace("handler_match", "wildcard_match")
+            .replace("case _ as captured:", "case _:")
+            .replace("sink(captured)", "sink(choice)"),
+        source
+            .replace("handler_match", "returning_middle_match")
+            .replace(
+                "                result = operation()",
+                "                return operation()",
+            ),
+        conditional,
+    ] {
+        assert_matches_cpython(&source, "unnamed_handler_match.py", &LEVELS);
+    }
+}
+
+#[test]
 fn sequence_capture_wildcard_cleanup_matrix() {
     let source = r#"
 def run(value):

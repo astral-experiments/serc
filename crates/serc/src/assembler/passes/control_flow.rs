@@ -4605,8 +4605,8 @@ impl OptimizationPipeline {
         }
     }
 
-    /// Keeps original match successes until their shared named cleanup is copied.
-    fn original_named_match_cleanup_jumps(&self) -> FxHashSet<ItemPosition> {
+    /// Keeps original match successes until their unlocated cleanup is copied.
+    fn original_match_cleanup_jumps(&self) -> FxHashSet<ItemPosition> {
         let mut jumps = FxHashSet::default();
         let mut entries = self
             .exception_owner_provenance
@@ -4639,14 +4639,10 @@ impl OptimizationPipeline {
             {
                 continue;
             }
-            let [
-                Item::Instruction(pop),
-                Item::Instruction(load),
-                Item::Instruction(store),
-                Item::Instruction(delete),
-                Item::Instruction(exit),
-            ] = &items[head..]
-            else {
+            let Some(Item::Instruction(pop)) = items.get(head) else {
+                continue;
+            };
+            let Some(Item::Instruction(exit)) = items.last() else {
                 continue;
             };
             let Some(depth) = pop.depth_after() else {
@@ -4655,9 +4651,7 @@ impl OptimizationPipeline {
             let Some(incoming_depth) = depth.checked_add(1) else {
                 continue;
             };
-            let (Operand::Value(constant), Operand::Value(name), Operand::Forward(end)) =
-                (load.operand(), store.operand(), exit.operand())
-            else {
+            let Operand::Forward(end) = exit.operand() else {
                 continue;
             };
             let plain = |opcode, operand, depth| {
@@ -4666,15 +4660,48 @@ impl OptimizationPipeline {
             let mut expected_exit = plain(JUMP_FORWARD, Operand::Forward(end), depth);
             expected_exit.jump_policy.prevent_threading_target();
             expected_exit.allow_unconditional_block_inlining();
-            if *pop != plain(POP_EXCEPT, Operand::Value(0), depth)
-                || *load != plain(LOAD_CONST, Operand::Value(constant), incoming_depth)
-                || *store != plain(STORE_FAST, Operand::Value(name), depth)
-                || *delete != plain(DELETE_FAST, Operand::Value(name), depth)
-                || *exit != expected_exit
-                || aliases.contains(&Item::Label(end))
-            {
+            if *exit != expected_exit || aliases.contains(&Item::Label(end)) {
                 continue;
             }
+            let minimum_incoming = match &items[head..] {
+                [
+                    _,
+                    Item::Instruction(load),
+                    Item::Instruction(store),
+                    Item::Instruction(delete),
+                    _,
+                ] => {
+                    let (Operand::Value(constant), Operand::Value(name)) =
+                        (load.operand(), store.operand())
+                    else {
+                        continue;
+                    };
+                    if *pop != plain(POP_EXCEPT, Operand::Value(0), depth)
+                        || *load != plain(LOAD_CONST, Operand::Value(constant), incoming_depth)
+                        || *store != plain(STORE_FAST, Operand::Value(name), depth)
+                        || *delete != plain(DELETE_FAST, Operand::Value(name), depth)
+                    {
+                        continue;
+                    }
+                    2
+                }
+                [_, _]
+                    if self.python_version >= crate::PythonVersion::Py314
+                        && self
+                            .exception_owner_provenance
+                            .original_handler_cleanup_join_exits
+                            .contains(&end) =>
+                {
+                    let mut expected_pop = plain(POP_EXCEPT, Operand::Value(0), depth);
+                    // The original unnamed cleanup also contained POP_BLOCK.
+                    expected_pop.add_pre_fold_extra_instructions(1);
+                    if *pop != expected_pop {
+                        continue;
+                    }
+                    1
+                }
+                _ => continue,
+            };
             // The original match marker supplies identity. Full record equality rejects
             // retargeted, folded, or policy-modified successes before this first copy pass.
             let mut incoming = Vec::new();
@@ -4706,7 +4733,7 @@ impl OptimizationPipeline {
                     incoming.push(ItemPosition::new(source, offset));
                 }
             }
-            if intact && incoming.len() >= 2 {
+            if intact && incoming.len() >= minimum_incoming {
                 jumps.extend(incoming);
             }
         }
@@ -4764,10 +4791,10 @@ impl OptimizationPipeline {
         if !has_work {
             return;
         }
-        let named_match_cleanup_jumps = if finalize_borrow_empty_blocks {
+        let match_cleanup_jumps = if finalize_borrow_empty_blocks {
             FxHashSet::default()
         } else {
-            self.original_named_match_cleanup_jumps()
+            self.original_match_cleanup_jumps()
         };
         // A removed original POP_BLOCK can leave its entry and end labels in
         // separate empty graph blocks. Bind them to the next physical record;
@@ -4973,7 +5000,7 @@ impl OptimizationPipeline {
                     }
                     // CPython copies the unlocated cleanup before deleting this adjacent
                     // case jump. Preserve its interrupt check for the copied final jump.
-                    if named_match_cleanup_jumps.contains(&position) {
+                    if match_cleanup_jumps.contains(&position) {
                         previous = Some(position);
                         continue;
                     }
@@ -6516,6 +6543,177 @@ impl OptimizationPipeline {
 mod tests {
     use super::*;
     use crate::assembler::{Assembler, ExceptionRegion, ExceptionRegionPriority};
+
+    #[test]
+    fn unnamed_match_cleanup_requires_original_records() {
+        fn instruction(item: &mut Item) -> &mut Instruction {
+            match item {
+                Item::Instruction(instruction) => instruction,
+                Item::Label(_) => panic!("expected instruction"),
+            }
+        }
+        let [first, second, join, alias, end, handler] = [0, 1, 2, 3, 4, 5].map(Label::from_u32);
+        let location = SourceLocation::new(10, 10, 4, 18);
+        let plain = |opcode, operand, depth| {
+            Instruction::new(opcode, operand, SourceLocation::NONE, Some(depth))
+        };
+        for incoming in [1, 2] {
+            for mutation in [
+                "intact",
+                "modern",
+                "legacy",
+                "match origin",
+                "cleanup origin",
+                "pop missing slot",
+                "pop extra slot",
+                "pop hidden",
+                "pop location",
+                "pop owner",
+                "exit location",
+                "exit threading",
+                "exit inlining",
+                "extra cleanup",
+                "success location",
+                "success depth",
+                "success origin",
+                "success interrupt",
+                "success owner",
+                "borrow alias",
+                "handler entry",
+            ] {
+                let mut success =
+                    Instruction::new(JUMP_FORWARD, Operand::Forward(join), location, Some(1));
+                success.jump_policy.mark_original_match_success();
+                success.jump_policy.mark_interruptible();
+                let mut items = vec![Item::Label(first), Item::Instruction(success)];
+                if incoming == 2 {
+                    items.extend([Item::Label(second), Item::Instruction(success)]);
+                }
+                let mut assembler = Assembler::from_linear_items(items);
+                assembler.next_label = 6;
+                assembler.python_version = crate::PythonVersion::Py314;
+                assembler.mark_original_match_join(join);
+                assembler.push_linear_item(Item::Label(alias));
+                assembler.push_linear_item(Item::Instruction(plain(
+                    POP_EXCEPT,
+                    Operand::Value(0),
+                    0,
+                )));
+                let mut exit = plain(JUMP_FORWARD, Operand::Forward(end), 0);
+                exit.jump_policy.prevent_threading_target();
+                exit.allow_unconditional_block_inlining();
+                assembler.push_linear_item(Item::Instruction(exit));
+                // Use the real unnamed-handler producer for the removed POP_BLOCK slot.
+                assert!(!assembler.record_original_handler_cleanup_join_exit(end, false));
+                let pop_index = assembler.linear_items().len() - 2;
+                match mutation {
+                    "modern" => assembler.python_version = crate::PythonVersion::Py315,
+                    "legacy" => assembler.python_version = crate::PythonVersion::Py313,
+                    "match origin" => assembler
+                        .exception_owner_provenance
+                        .original_match_join_boundaries
+                        .clear(),
+                    "cleanup origin" => assembler
+                        .exception_owner_provenance
+                        .original_handler_cleanup_join_exits
+                        .clear(),
+                    "pop missing slot" => {
+                        assembler.linear_items_mut()[pop_index] =
+                            Item::Instruction(plain(POP_EXCEPT, Operand::Value(0), 0));
+                    }
+                    "pop extra slot" => instruction(&mut assembler.linear_items_mut()[pop_index])
+                        .add_pre_fold_extra_instructions(1),
+                    "pop hidden" => instruction(&mut assembler.linear_items_mut()[pop_index])
+                        .local_policy
+                        .add_hidden_exception_owner_slots(1),
+                    "pop location" => {
+                        instruction(&mut assembler.linear_items_mut()[pop_index]).location =
+                            location;
+                    }
+                    "pop owner" => {
+                        instruction(&mut assembler.linear_items_mut()[pop_index])
+                            .set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
+                    }
+                    "exit location" => {
+                        instruction(&mut assembler.linear_items_mut()[pop_index + 1]).location =
+                            location;
+                    }
+                    "exit threading" => {
+                        assembler.linear_items_mut()[pop_index + 1] =
+                            Item::Instruction(plain(JUMP_FORWARD, Operand::Forward(end), 0));
+                    }
+                    "exit inlining" => {
+                        instruction(&mut assembler.linear_items_mut()[pop_index + 1])
+                            .no_location_policy
+                            .prevent_block_inlining();
+                    }
+                    "extra cleanup" => {
+                        let exit = assembler.pop_linear_item().unwrap();
+                        assembler.push_linear_item(Item::Instruction(plain(
+                            NOP,
+                            Operand::Value(0),
+                            0,
+                        )));
+                        assembler.push_linear_item(exit);
+                    }
+                    "success location" => {
+                        instruction(&mut assembler.linear_items_mut()[1]).location =
+                            SourceLocation::NONE;
+                    }
+                    "success depth" | "success origin" | "success interrupt" => {
+                        let mut changed = Instruction::new(
+                            JUMP_FORWARD,
+                            Operand::Forward(join),
+                            location,
+                            Some(if mutation == "success depth" { 2 } else { 1 }),
+                        );
+                        if mutation != "success origin" {
+                            changed.jump_policy.mark_original_match_success();
+                        }
+                        if mutation != "success interrupt" {
+                            changed.jump_policy.mark_interruptible();
+                        }
+                        assembler.linear_items_mut()[1] = Item::Instruction(changed);
+                    }
+                    "success owner" => {
+                        instruction(&mut assembler.linear_items_mut()[1])
+                            .set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
+                    }
+                    "borrow alias" => {
+                        assembler.borrow_block_aliases.insert(alias);
+                    }
+                    "handler entry" => assembler.exception_regions.push(ExceptionRegion {
+                        start: first,
+                        end,
+                        target: alias,
+                        depth: 0,
+                        preserve_lasti: true,
+                        is_scope_fallback: false,
+                        priority: ExceptionRegionPriority::OriginalRange(first, end),
+                    }),
+                    _ => {}
+                }
+                assembler.push_linear_item(Item::Label(end));
+                assembler.push_linear_item(Item::Instruction(plain(
+                    RETURN_VALUE,
+                    Operand::Value(0),
+                    0,
+                )));
+                assembler.push_linear_item(Item::Label(handler));
+                assembler.push_linear_item(Item::Instruction(plain(RERAISE, Operand::Value(0), 0)));
+                let pipeline = assembler.into_optimization_pipeline();
+                assert_eq!(
+                    pipeline.original_match_cleanup_jumps().len(),
+                    if matches!(mutation, "intact" | "modern") {
+                        incoming
+                    } else {
+                        0
+                    },
+                    "{incoming}: {mutation}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn forward_threading_source_gates_match_unconditional_candidate_scans() {
