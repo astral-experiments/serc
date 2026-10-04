@@ -28055,22 +28055,21 @@ impl<'source> Compiler<'source> {
                 let context = self.control.loops.contexts.last().copied().ok_or_else(|| {
                     CompileError::invalid_syntax("'break' outside loop", handler.body[0].range())
                 })?;
-                self.emit_iterator_cleanup(context.iterator_cleanup, false)?;
                 // The handler has restored its exception state. Both the break
-                // jump and its copied terminal return leave the ordinary tries
-                // entered inside this loop; the preceding POP_EXCEPT does not.
-                let exclusion_start = (context.iterator_cleanup == IteratorCleanup::None
-                    && context.exception_region_depth
-                        < self
-                            .control
-                            .exceptions
-                            .active_exception_region_exclusions
-                            .len())
+                // iterator cleanup and jump leave ordinary tries entered inside
+                // this loop; the preceding POP_EXCEPT does not.
+                let exclusion_start = (context.exception_region_depth
+                    < self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .len())
                 .then(|| {
                     let start = self.assembler.label();
                     self.assembler.mark(start);
                     start
                 });
+                self.emit_iterator_cleanup(context.iterator_cleanup, false)?;
                 if context.break_policy.returns() {
                     self.emit_implicit_return()?;
                 } else {
