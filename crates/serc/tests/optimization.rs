@@ -736,6 +736,48 @@ fn erased_finally_branch_preserves_conditional_continuation() {
 }
 
 #[test]
+fn completed_await_arms_preserve_erased_outer_join() {
+    let source = r"async def sample(enabled, condition, receiver, wait, touch, check):
+    outer = enabled
+    inner = condition
+    item = receiver
+    result = None
+    if not outer:
+        assert inner or item
+        assert item is not None
+        if inner:
+            await wait(item)
+            touch(item)
+        else:
+            await wait(item)
+    else:
+        assert check(item)
+        assert item is receiver
+    receiver.finish(result)
+";
+    for (index, source) in [
+        source.to_owned(),
+        source.replace(
+            "    else:\n        assert check(item)\n        assert item is receiver\n",
+            "    else:\n        touch(item)\n        touch(result)\n",
+        ),
+        source.replace(
+            "        assert inner or item\n        assert item is not None\n",
+            "        touch(item)\n        touch(result)\n",
+        ),
+        source.replace(
+            "        else:\n            await wait(item)\n",
+            "        else:\n            touch(item)\n",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(&source, &format!("completed_await_arm_{index}.py"), &LEVELS);
+    }
+}
+
+#[test]
 fn coroutine_populated_nested_branch_preserves_erased_join() {
     for condition in ["isinstance(item, dict)", "accept(item)"] {
         let source = format!(
