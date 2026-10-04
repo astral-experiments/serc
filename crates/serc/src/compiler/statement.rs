@@ -16830,13 +16830,28 @@ impl<'source> Compiler<'source> {
                         && !self.control.in_exception_handler()
                         && self.control.finally.is_inactive_for_return_unwind()
                         && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
-                        && self.control.in_loop_tail_without_nested_cleanup()
-                        && self.control.in_iterator_loop()
                         && self.control.finally.active_finally_try_bodies == 0
                         && body[end + 1..].iter().all(|suffix| self.context.is_elided_statement(suffix))
                         && condition_has_linear_runtime_leaves(&statement.test)
-                        && suite_has_linear_borrow_fallthrough(&statement.body)
-                        && suite_has_nonsuspending_conditional_work(&statement.body))
+                        && ((self.control.in_loop_tail_without_nested_cleanup()
+                            && self.control.in_iterator_loop()
+                            && suite_has_linear_borrow_fallthrough(&statement.body)
+                            && suite_has_nonsuspending_conditional_work(&statement.body))
+                            // Erased work leaves both original exits separate under the
+                            // loop's saved owners. Exhaustion alone enters a loop else.
+                            || (self.unit.flags & CO_COROUTINE != 0
+                                && self.control.loops.contexts.last().is_some_and(|context| {
+                                    context.iterator_cleanup == IteratorCleanup::Sync
+                                        && context.continue_label == restart
+                                        && context.with_depth == self.control.withs.active_with_exits.len()
+                                        && context.finally_end_depth == self.control.finally.active_finally_end_blocks
+                                        && context.exception_region_depth == self.control.exceptions.active_exception_region_exclusions.len()
+                                })
+                                && !expression_yields_in_current_scope(&statement.test)
+                                && original_condition_has_unique_jump_target(&statement.test, true)
+                                && original_condition_has_unique_jump_target(&statement.test, false)
+                                && !statement.body.is_empty()
+                                && statement.body.iter().all(|part| self.context.is_elided_statement(part)))))
                     || (!self.has_active_control_flow_region()
                         && !self.control.in_exception_handler()
                         && self.control.finally.is_inactive_for_return_unwind()
@@ -19469,8 +19484,8 @@ impl<'source> Compiler<'source> {
             // Folded tests have no runtime edge to copy within a protected region.
             // Exhaustion enters a for-else suite separately from the continuing
             // backedge. Keep its unprotected compound false edges on one forward exit.
+            // Erased coroutine arms retain that exit under the loop's saved owners.
             let copied_for_else_branch_exit = non_final_branch
-                && !self.has_active_control_flow_region()
                 && self.control.loops.contexts.last().is_some_and(|context| {
                     context.has_orelse
                         && context.iterator_cleanup == IteratorCleanup::Sync
@@ -19486,7 +19501,24 @@ impl<'source> Compiler<'source> {
                                 .len()
                 })
                 && condition_has_only_runtime_tests(&statement.test)
-                && condition_jump_target_count(&statement.test, false) > 1;
+                && ((!self.has_active_control_flow_region()
+                    && condition_jump_target_count(&statement.test, false) > 1)
+                    || (self.unit.flags & CO_COROUTINE != 0
+                        && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+                        && !self.control.in_exception_handler()
+                        && self.control.finally.is_inactive_for_return_unwind()
+                        && self.control.finally.active_finally_try_bodies == 0
+                        && statement.elif_else_clauses.is_empty()
+                        && condition_has_linear_runtime_leaves(&statement.test)
+                        && !expression_suspends_current_scope(&statement.test)
+                        && !expression_yields_in_current_scope(&statement.test)
+                        && original_condition_has_unique_jump_target(&statement.test, true)
+                        && original_condition_has_unique_jump_target(&statement.test, false)
+                        && !statement.body.is_empty()
+                        && statement
+                            .body
+                            .iter()
+                            .all(|part| self.context.is_elided_statement(part))));
             let copied_loop_branch_exit = non_final_branch
                 && (self.control.in_loop_tail_without_nested_cleanup()
                     || copied_for_else_branch_exit)
