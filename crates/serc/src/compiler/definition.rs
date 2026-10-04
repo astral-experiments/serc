@@ -1,3 +1,4 @@
+use std::cell::LazyCell;
 use std::collections::{BTreeSet, VecDeque};
 use std::rc::Rc;
 
@@ -1853,11 +1854,14 @@ impl Compiler<'_> {
             return Ok(None);
         }
 
-        let nested_requirements = self.name_id_set(
-            annotations
-                .iter()
-                .flat_map(|(_, annotation)| annotation_nested_required_names(annotation)),
-        );
+        // Only class-shadowed captures need nested annotation requirements.
+        let nested_requirements = LazyCell::new(|| {
+            self.name_id_set(
+                annotations
+                    .iter()
+                    .flat_map(|(_, annotation)| annotation_nested_required_names(annotation)),
+            )
+        });
         let mut freevars = function_plan.annotation_freevars.clone();
         freevars.retain(|name| {
             !self.class_scope_shadows_annotation_name(*name) || nested_requirements.contains(name)
