@@ -15,6 +15,42 @@ use serc::{
 };
 
 #[test]
+fn copied_nested_recovery_preserves_borrow_boundary() {
+    let source = r"
+def run(flag, load, note):
+    try:
+        load()
+    except LookupError:
+        try:
+            note()
+        except TypeError:
+            try:
+                note()
+            except ValueError:
+                pass
+        note()
+    else:
+        note()
+    if not flag:
+        return []
+    note(flag)
+    return flag
+";
+    for source in [
+        source.to_owned(),
+        source.replace("    else:\n        note()\n", ""),
+        source.replace("        note()\n    else:", "        raise\n    else:"),
+        source.replace("            try:\n                note()\n            except ValueError:\n                pass\n", "            pass\n"),
+        source.replace("                pass\n        note()", "                pass\n            note()\n        note()"),
+        source.replace("except TypeError:", "except TypeError as error:"),
+        source.replace("def run", "async def run").replace("        load()", "        await load()"),
+        source.replace("except LookupError:", "except LookupError as error:"),
+    ] {
+        assert_matches_cpython(&source, "nested_recovery_borrow.py", &LEVELS);
+    }
+}
+
+#[test]
 fn coroutine_erased_inner_arm_preserves_loop_backedges() {
     let source = r"
 async def run(items, mode, note):

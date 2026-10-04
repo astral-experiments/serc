@@ -10,6 +10,150 @@ use crate::target::opcodes::*;
 use crate::target::operands::{CommonConstant, Conversion, FunctionAttribute, ResumeLocation};
 
 #[test]
+fn borrow_cleanup_capture_requires_an_original_unlocated_array() {
+    for named in [false, true] {
+        for mutation in [
+            "intact",
+            "legacy",
+            "later target",
+            "located",
+            "owner",
+            "hidden",
+            "copy policy",
+            "source boundary",
+            "block boundary",
+            "live suffix",
+            "interior label",
+            "range endpoint",
+            "range source boundary",
+            "range block boundary",
+            "range preserved boundary",
+            "range handler target",
+            "range jump target",
+            "wrong binding",
+            "wrong opcode",
+        ] {
+            let mut assembler = Assembler::with_python_version(match mutation {
+                "legacy" => crate::PythonVersion::Py313,
+                "later target" => crate::PythonVersion::Py315,
+                _ => crate::PythonVersion::Py314,
+            });
+            let entry = assembler.label();
+            let end = assembler.label();
+            let interior = assembler.label();
+            if mutation == "range jump target" {
+                assembler.emit_forward_with_depth(
+                    JUMP_FORWARD,
+                    interior,
+                    0,
+                    ExceptionPolicy::default(),
+                );
+            }
+            assembler.mark(entry);
+            if mutation != "source boundary" {
+                assembler
+                    .exception_owner_provenance
+                    .source_boundaries
+                    .insert(entry);
+            }
+            if mutation != "block boundary" {
+                assembler
+                    .exception_owner_provenance
+                    .block_boundaries
+                    .insert(entry);
+            }
+            assembler.set_location(if mutation == "located" {
+                SourceLocation::new(1, 1, 0, 4)
+            } else {
+                SourceLocation::NONE
+            });
+            assembler.emit_with_depth(
+                if mutation == "wrong opcode" {
+                    POP_TOP
+                } else {
+                    POP_EXCEPT
+                },
+                0,
+                0,
+                if mutation == "owner" {
+                    ExceptionPolicy::EXCLUDE_ALWAYS
+                } else {
+                    ExceptionPolicy::default()
+                },
+            );
+            if mutation == "hidden" {
+                let Item::Instruction(pop) = &mut assembler.linear_items_mut()[1] else {
+                    unreachable!()
+                };
+                pop.local_policy.add_hidden_exception_owner_slots(1);
+            }
+            if named {
+                assembler.emit_with_depth(LOAD_CONST, 0, 1, ExceptionPolicy::default());
+                assembler.emit_with_depth(STORE_FAST, 0, 0, ExceptionPolicy::default());
+                assembler.emit_with_depth(
+                    DELETE_FAST,
+                    u32::from(mutation == "wrong binding"),
+                    0,
+                    ExceptionPolicy::default(),
+                );
+            }
+            if mutation == "interior label" || mutation.starts_with("range ") {
+                assembler.mark(interior);
+            }
+            if mutation.starts_with("range ") {
+                assembler.add_exception_region(
+                    entry,
+                    interior,
+                    if mutation == "range handler target" {
+                        interior
+                    } else {
+                        end
+                    },
+                    0,
+                    false,
+                );
+                match mutation {
+                    "range source boundary" => {
+                        assembler
+                            .exception_owner_provenance
+                            .source_boundaries
+                            .insert(interior);
+                    }
+                    "range block boundary" => {
+                        assembler
+                            .exception_owner_provenance
+                            .block_boundaries
+                            .insert(interior);
+                    }
+                    "range preserved boundary" => {
+                        assembler.preserved_block_boundaries.insert(interior);
+                    }
+                    _ => {}
+                }
+            }
+            if mutation == "live suffix" {
+                assembler.emit_with_depth(NOP, 0, 0, ExceptionPolicy::default());
+            }
+            let jump =
+                assembler.emit_forward_with_depth(JUMP_FORWARD, end, 0, ExceptionPolicy::default());
+            if mutation != "copy policy" {
+                assembler.prepare_no_location_block_for_inlining(jump);
+            }
+            assembler.record_borrow_handler_cleanup(entry);
+            assert_eq!(
+                !assembler
+                    .exception_owner_provenance
+                    .borrow_handler_cleanup_arrays
+                    .is_empty(),
+                matches!(mutation, "intact" | "range endpoint")
+                    || (!named && mutation == "wrong binding"),
+                "{named}: {mutation}"
+            );
+        }
+    }
+}
+
+#[test]
 fn conditional_normal_try_borrow_head_requires_proven_fallthrough() {
     let source = super::Label::from_u32(0);
     let fallthrough = super::Label::from_u32(1);

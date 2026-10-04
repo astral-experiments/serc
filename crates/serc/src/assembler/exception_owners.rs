@@ -169,6 +169,10 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) original_handler_cleanup_join_exits: FxHashSet<Label>,
     // Source-emitted named cleanup arrays, before original POP_BLOCK restoration.
     pub(super) original_named_handler_cleanup_joins: Vec<(Label, [Instruction; 5])>,
+    // Exact unlocated handler arrays whose actual removal can leave a borrow barrier.
+    pub(super) borrow_handler_cleanup_arrays: Vec<(Label, Vec<Item>)>,
+    // Pending marker to its original entry and interior range labels.
+    pub(super) retired_handler_borrow_markers: FxHashMap<Label, Vec<Label>>,
     // Original try/except POP_BLOCK exits inside their own finally, for owner transfer
     // and late redundant-exit removal, but not ordinary-try exit copying.
     pub(super) compound_try_owner_exits: Vec<(Label, Label)>,
