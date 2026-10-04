@@ -31,6 +31,410 @@ fn plain_linear_scopes_do_not_allocate_owner_provenance() {
 }
 
 #[test]
+fn copied_finally_break_join_keeps_generic_cleanup_strict() {
+    for version in [
+        crate::PythonVersion::Py313,
+        crate::PythonVersion::Py314,
+        crate::PythonVersion::Py315,
+    ] {
+        for mutation in [
+            "intact",
+            "missing source",
+            "missing block",
+            "authored join",
+            "borrow alias",
+            "fusion alias",
+            "continuation alias",
+            "folded condition",
+            "folded else",
+            "foreign jump",
+            "backward condition",
+            "unlocated condition",
+            "condition extra",
+            "missing none origin",
+            "nop owner",
+            "nop extra",
+            "nop hidden",
+            "nop policy",
+            "nop unknown depth",
+        ] {
+            let mut assembler = Assembler::with_python_version(version);
+            let start = assembler.label();
+            let join = assembler.label();
+            let end = assembler.label();
+            let condition = SourceLocation::new(3, 3, 4, 18);
+            let location = SourceLocation::new(4, 4, 8, 12);
+            assembler.mark(start);
+            assembler.record_exception_owner_block_boundary(start);
+            assembler.set_location(condition);
+            let first = assembler.linear_items().len();
+            assembler.emit_forward_with_depth(
+                POP_JUMP_IF_FALSE,
+                join,
+                0,
+                ExceptionPolicy::default(),
+            );
+            let second = assembler.emit_forward_with_depth(
+                POP_JUMP_IF_NONE,
+                join,
+                0,
+                ExceptionPolicy::default(),
+            );
+            assembler
+                .emitted_jump_mut(second, "test None guard")
+                .local_policy
+                .add_hidden_exception_owner_slots(3);
+            if mutation != "missing none origin" {
+                assembler.record_source_none_condition();
+            }
+            if mutation == "foreign jump" {
+                assembler.emit_forward_with_depth(
+                    JUMP_FORWARD,
+                    join,
+                    0,
+                    ExceptionPolicy::default(),
+                );
+            }
+            assembler.set_location(location);
+            let nop = assembler.linear_items().len();
+            assembler.emit_with_depth(NOP, 0, 0, ExceptionPolicy::default());
+            assembler.mark(join);
+            assembler.record_exception_owner_block_boundary(join);
+            match mutation {
+                "missing source" => {
+                    assembler
+                        .exception_owner_provenance
+                        .source_boundaries
+                        .remove(&join);
+                }
+                "missing block" => {
+                    assembler
+                        .exception_owner_provenance
+                        .block_boundaries
+                        .remove(&join);
+                }
+                "authored join" => {
+                    assembler.original_nop_targets.insert(join);
+                }
+                "borrow alias" => {
+                    assembler.borrow_block_aliases.insert(join);
+                }
+                "fusion alias" => {
+                    assembler
+                        .exception_owner_provenance
+                        .fusion_boundaries
+                        .insert(join);
+                }
+                "continuation alias" => {
+                    assembler
+                        .exception_owner_provenance
+                        .continuation_boundaries
+                        .insert(join);
+                }
+                "folded condition" => {
+                    assembler.folded_away_condition_targets.insert(join);
+                }
+                "folded else" => {
+                    assembler.folded_away_loop_else_targets.insert(join);
+                }
+                "backward condition" | "unlocated condition" | "condition extra" => {
+                    let Item::Instruction(first) = &mut assembler.linear_items_mut()[first] else {
+                        unreachable!()
+                    };
+                    match mutation {
+                        "backward condition" => first.retarget(Operand::Backward(join)),
+                        "unlocated condition" => first.location = SourceLocation::NONE,
+                        _ => first.add_pre_fold_extra_instructions(1),
+                    }
+                }
+                "nop owner" | "nop extra" | "nop hidden" | "nop policy" | "nop unknown depth" => {
+                    let Item::Instruction(nop) = &mut assembler.linear_items_mut()[nop] else {
+                        unreachable!()
+                    };
+                    match mutation {
+                        "nop owner" => nop.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS),
+                        "nop extra" => nop.add_pre_fold_extra_instructions(1),
+                        "nop hidden" => nop.local_policy.add_hidden_exception_owner_slots(1),
+                        "nop unknown depth" => {
+                            *nop = Instruction::new(NOP, Operand::Value(0), location, None);
+                        }
+                        _ => nop.jump_policy.prevent_threading_target(),
+                    }
+                }
+                _ => {}
+            }
+            assert!(
+                !assembler.at_original_shared_cleanup_join(),
+                "{version:?}: {mutation}"
+            );
+            assert!(
+                !assembler.at_original_shared_conditional_join(),
+                "{version:?}: {mutation}"
+            );
+            let shared = assembler.at_original_shared_copied_finally_break_join();
+            let expected = version >= crate::PythonVersion::Py314 && mutation == "intact";
+            assert_eq!(shared, expected, "{version:?}: {mutation}");
+            if expected {
+                assembler.set_location(SourceLocation::NONE);
+                let jump = assembler.emit_forward_with_depth(
+                    JUMP_FORWARD,
+                    end,
+                    0,
+                    ExceptionPolicy::default(),
+                );
+                assembler.prevent_jump_threading_target(jump);
+                assembler.mark_jump_as_authored_break(jump);
+                assembler.record_copied_finally_break_head(jump, end, 0, shared);
+                assert_eq!(
+                    assembler.conditional_threading_targets.get(&join),
+                    Some(&SourceLocation::NONE)
+                );
+            }
+        }
+    }
+
+    for version in [
+        crate::PythonVersion::Py313,
+        crate::PythonVersion::Py314,
+        crate::PythonVersion::Py315,
+    ] {
+        for mutation in [
+            "intact",
+            "missing source",
+            "missing block",
+            "authored alias",
+            "borrow alias",
+            "folded alias",
+            "same target",
+            "foreign jump",
+            "backward guard",
+            "unlocated guard",
+            "guard depth",
+            "guard extra",
+            "guard owner",
+            "missing none origin",
+            "unlocated cleanup",
+            "cleanup depth",
+            "cleanup extra",
+            "cleanup owner",
+            "cleanup hidden",
+            "cold opcode",
+            "cold depth",
+            "cold owner",
+            "cold hidden",
+            "outside unwind",
+            "single guard",
+            "empty cleanup",
+        ] {
+            let mut assembler = Assembler::with_python_version(version);
+            let start = assembler.label();
+            let join = assembler.label();
+            let normal_exit = assembler.label();
+            let end = assembler.label();
+            let condition = SourceLocation::new(3, 3, 4, 18);
+            let location = SourceLocation::new(8, 8, 8, 20);
+            if mutation == "outside unwind" {
+                assembler.set_location(condition);
+                assembler.emit_forward_with_depth(
+                    POP_JUMP_IF_FALSE,
+                    join,
+                    0,
+                    ExceptionPolicy::default(),
+                );
+            }
+            assembler.mark(start);
+            assembler.record_exception_owner_block_boundary(start);
+            assembler.set_location(condition);
+            let first = assembler.linear_items().len();
+            assembler.emit_forward_with_depth(
+                POP_JUMP_IF_FALSE,
+                join,
+                0,
+                ExceptionPolicy::default(),
+            );
+            if !matches!(mutation, "single guard" | "empty cleanup") {
+                let second = assembler.emit_forward_with_depth(
+                    POP_JUMP_IF_NONE,
+                    join,
+                    0,
+                    ExceptionPolicy::default(),
+                );
+                assembler
+                    .emitted_jump_mut(second, "test nested None guard")
+                    .local_policy
+                    .add_hidden_exception_owner_slots(3);
+                if mutation != "missing none origin" {
+                    assembler.record_source_none_condition();
+                }
+            }
+            if mutation == "foreign jump" {
+                assembler.emit_forward_with_depth(
+                    JUMP_FORWARD,
+                    normal_exit,
+                    0,
+                    ExceptionPolicy::default(),
+                );
+            }
+            assembler.set_location(location);
+            if mutation == "empty cleanup" {
+                let entry = assembler.label();
+                assembler.mark(entry);
+                assembler.set_location(SourceLocation::NONE);
+            }
+            let cleanup = assembler.linear_items().len();
+            let normal_jump = assembler.emit_forward_with_depth(
+                JUMP_FORWARD,
+                normal_exit,
+                0,
+                ExceptionPolicy::default(),
+            );
+            if mutation == "empty cleanup" {
+                assembler.mark_borrow_empty_block(normal_jump);
+                let handler = assembler.label();
+                assembler.mark(handler);
+            }
+            assembler.set_location(SourceLocation::NONE);
+            let cold = assembler.linear_items().len();
+            assembler.emit_with_depth(COPY, 3, 4, ExceptionPolicy::default());
+            assembler.emit_with_depth(POP_EXCEPT, 0, 3, ExceptionPolicy::default());
+            assembler.emit_with_depth(RERAISE, 1, 0, ExceptionPolicy::default());
+            assembler.mark(normal_exit);
+            assembler.record_exception_owner_block_boundary(normal_exit);
+            assembler.mark(join);
+            assembler.record_exception_owner_block_boundary(join);
+            match mutation {
+                "missing source" => {
+                    assembler
+                        .exception_owner_provenance
+                        .source_boundaries
+                        .remove(&normal_exit);
+                }
+                "missing block" => {
+                    assembler
+                        .exception_owner_provenance
+                        .block_boundaries
+                        .remove(&normal_exit);
+                }
+                "authored alias" => {
+                    assembler.original_nop_targets.insert(normal_exit);
+                }
+                "borrow alias" => {
+                    assembler.borrow_block_aliases.insert(normal_exit);
+                }
+                "folded alias" => {
+                    assembler.folded_away_condition_targets.insert(normal_exit);
+                }
+                "backward guard" | "unlocated guard" | "guard depth" | "guard extra"
+                | "guard owner" => {
+                    let Item::Instruction(instruction) = &mut assembler.linear_items_mut()[first]
+                    else {
+                        unreachable!()
+                    };
+                    match mutation {
+                        "backward guard" => instruction.retarget(Operand::Backward(join)),
+                        "unlocated guard" => instruction.location = SourceLocation::NONE,
+                        "guard depth" => {
+                            *instruction = Instruction::new(
+                                POP_JUMP_IF_FALSE,
+                                Operand::Forward(join),
+                                condition,
+                                Some(1),
+                            );
+                        }
+                        "guard extra" => instruction.add_pre_fold_extra_instructions(1),
+                        _ => instruction.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS),
+                    }
+                }
+                "same target" | "unlocated cleanup" | "cleanup depth" | "cleanup extra"
+                | "cleanup owner" | "cleanup hidden" => {
+                    let Item::Instruction(instruction) = &mut assembler.linear_items_mut()[cleanup]
+                    else {
+                        unreachable!()
+                    };
+                    match mutation {
+                        "same target" => instruction.retarget(Operand::Forward(join)),
+                        "unlocated cleanup" => instruction.location = SourceLocation::NONE,
+                        "cleanup depth" => {
+                            *instruction = Instruction::new(
+                                JUMP_FORWARD,
+                                Operand::Forward(normal_exit),
+                                location,
+                                Some(1),
+                            );
+                        }
+                        "cleanup extra" => instruction.add_pre_fold_extra_instructions(1),
+                        "cleanup hidden" => {
+                            instruction.local_policy.add_hidden_exception_owner_slots(1);
+                        }
+                        _ => instruction.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS),
+                    }
+                }
+                "cold opcode" | "cold depth" | "cold owner" | "cold hidden" => {
+                    let Item::Instruction(instruction) = &mut assembler.linear_items_mut()[cold]
+                    else {
+                        unreachable!()
+                    };
+                    match mutation {
+                        "cold opcode" => instruction.opcode = POP_TOP,
+                        "cold depth" => {
+                            *instruction = Instruction::new(
+                                COPY,
+                                Operand::Value(3),
+                                SourceLocation::NONE,
+                                Some(3),
+                            );
+                        }
+                        "cold hidden" => {
+                            instruction.local_policy.add_hidden_exception_owner_slots(1);
+                        }
+                        _ => instruction.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS),
+                    }
+                }
+                _ => {}
+            }
+            assert!(
+                !assembler.at_original_shared_cleanup_join(),
+                "{version:?}: {mutation}"
+            );
+            assert!(
+                !assembler.at_original_shared_conditional_join(),
+                "{version:?}: {mutation}"
+            );
+            assert_eq!(
+                assembler.original_guarded_finally_exit_has_false_donor(condition, true),
+                matches!(mutation, "single guard" | "empty cleanup"),
+                "{version:?}: {mutation}"
+            );
+            let shared = assembler.at_original_shared_copied_finally_break_join();
+            let expected = version >= crate::PythonVersion::Py314
+                && matches!(mutation, "intact" | "outside unwind" | "single guard");
+            assert_eq!(shared, expected, "{version:?}: {mutation}");
+            if shared {
+                let jump = assembler.emit_forward_with_depth(
+                    JUMP_FORWARD,
+                    end,
+                    0,
+                    ExceptionPolicy::default(),
+                );
+                assembler.prevent_jump_threading_target(jump);
+                assembler.mark_jump_as_authored_break(jump);
+                let unwind_start = if mutation == "outside unwind" {
+                    first - 1
+                } else {
+                    0
+                };
+                assembler.record_copied_finally_break_head(jump, end, unwind_start, shared);
+                assert_eq!(
+                    assembler.conditional_threading_targets.contains_key(&join),
+                    matches!(mutation, "intact" | "single guard"),
+                    "{version:?}: {mutation}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn borrow_cleanup_capture_requires_an_original_unlocated_array() {
     for named in [false, true] {
         for mutation in [
