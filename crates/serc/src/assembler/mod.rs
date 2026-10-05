@@ -6644,12 +6644,13 @@ impl Assembler {
         }
     }
 
-    /// Captures a return-unwind boundary and its materialized original POP record.
+    /// Captures a return-unwind label prefix and its materialized original POP record.
     pub(crate) fn record_name_return_materialized_pop(&mut self) {
         if self.deferred_name_return_borrow_exits.is_empty() {
             return;
         }
-        let [.., Item::Label(entry), Item::Instruction(pop)] = self.linear_items() else {
+        let items = self.linear_items();
+        let Some((Item::Instruction(pop), prefix)) = items.split_last() else {
             return;
         };
         if pop.opcode != NOP
@@ -6658,9 +6659,16 @@ impl Assembler {
         {
             return;
         }
+        let start = prefix
+            .iter()
+            .rposition(|item| matches!(item, Item::Instruction(_)))
+            .map_or(0, |index| index + 1);
+        let Some(Item::Label(entry)) = prefix.get(start) else {
+            return;
+        };
         let span = exception_owners::OriginalPopBlockSpan {
             entry: *entry,
-            items: vec![Item::Label(*entry), Item::Instruction(*pop)],
+            items: items[start..].to_vec(),
         };
         self.name_return_materialized_pops.push(span);
     }
@@ -6688,25 +6696,15 @@ impl Assembler {
         let materialized_pops = std::mem::take(&mut self.name_return_materialized_pops);
         let iterator_region_aliases = std::mem::take(&mut self.name_return_iterator_region_aliases);
         let items = self.linear_items();
-        let labels = items
-            .iter()
-            .enumerate()
-            .filter_map(|(index, item)| match item {
-                Item::Label(label) => Some((*label, index)),
-                Item::Instruction(_) => None,
-            })
-            .collect::<FxHashMap<_, _>>();
-        let materialized_pops = materialized_pops
-            .into_iter()
-            .filter_map(|span| {
-                let &start = labels.get(&span.entry)?;
-                let [Item::Label(entry), Item::Instruction(pop)] = span.items.as_slice() else {
-                    return None;
-                };
-                (*entry == span.entry && items.get(start..start + 2) == Some(span.items.as_slice()))
-                    .then_some((*entry, *pop))
-            })
-            .collect::<FxHashMap<_, _>>();
+        let mut labels = FxHashMap::default();
+        let mut duplicate_labels = FxHashSet::default();
+        for (index, item) in items.iter().enumerate() {
+            if let Item::Label(label) = item
+                && labels.insert(*label, index).is_some()
+            {
+                duplicate_labels.insert(*label);
+            }
+        }
         let jump_targets = items
             .iter()
             .filter_map(|item| match item {
@@ -6717,6 +6715,48 @@ impl Assembler {
                 Item::Label(_) => None,
             })
             .collect::<rustc_hash::FxHashSet<_>>();
+        let mut materialized_pop_labels = FxHashMap::default();
+        for span in materialized_pops {
+            let Some(&start) = labels.get(&span.entry) else {
+                continue;
+            };
+            let Some((Item::Instruction(pop), prefix)) = span.items.split_last() else {
+                continue;
+            };
+            if prefix.first() != Some(&Item::Label(span.entry))
+                || items.get(start..start + span.items.len()) != Some(span.items.as_slice())
+                || pop.opcode != NOP
+                || pop.operand() != Operand::Value(0)
+                || !pop.fusion_policy.is_converted_pop_block()
+                || !prefix.iter().all(|item| {
+                    let Item::Label(label) = item else {
+                        return false;
+                    };
+                    !duplicate_labels.contains(label)
+                        && !jump_targets.contains(label)
+                        && !pop_boundaries.contains(label)
+                        && !self
+                            .exception_owner_provenance
+                            .source_boundaries
+                            .contains(label)
+                        && !self
+                            .exception_owner_provenance
+                            .block_boundaries
+                            .contains(label)
+                        && !self.preserved_block_boundaries.contains(label)
+                })
+            {
+                continue;
+            }
+            for (offset, item) in prefix.iter().enumerate() {
+                let Item::Label(label) = item else {
+                    unreachable!("the captured prefix contains only labels");
+                };
+                // All labels are zero-width; only the last precedes the physical POP.
+                materialized_pop_labels
+                    .insert(*label, (offset + 1 == prefix.len()).then_some(*pop));
+            }
+        }
         let mut barriers = Vec::new();
         'origin: for origin in origins {
             if origin.source.instruction().stream != self.emission_stream {
@@ -6765,12 +6805,12 @@ impl Assembler {
                         {
                             continue 'origin;
                         }
-                        if let Some(pop) = materialized_pops.get(label) {
+                        if let Some(pop) = materialized_pop_labels.get(label) {
                             if pending_pop.is_some() || pop_boundaries.contains(label) {
                                 continue 'origin;
                             }
-                            // This label adds no slot; the captured physical POP does.
-                            pending_materialized_pop = Some(*pop);
+                            // Intermediate aliases add no slot or pending instruction.
+                            pending_materialized_pop = *pop;
                         } else if let Some(original) = iterator_region_aliases.get(label) {
                             // This fresh exception-range label adds no original slot.
                             // Its producer must place it directly after the exact POP
