@@ -82,6 +82,132 @@ fn nested_handler_returns_preserve_outer_finalizer_owners() {
 }
 
 #[test]
+fn nested_erased_assertion_tails_keep_original_loop_backedges() {
+    for (index, source) in [
+        r"from __future__ import annotations
+
+async def nested_await(values, first, second, prepare, observe, ready):
+    for item in values:
+        pending = prepare(item)
+        result = await pending
+        assert result.value
+        current = result.value
+        observe(current)
+        if first:
+            observe(current)
+            if second:
+                selected = values[0]
+                if selected.ready:
+                    pending = prepare(selected)
+                    await pending
+                assert ready(current)
+    return tuple(values)
+",
+        r"from __future__ import annotations
+
+def sync_nested(values, first, second, prepare, observe, ready):
+    for item in values:
+        pending = prepare(item)
+        result = pending
+        assert result.value
+        current = result.value
+        observe(current)
+        if first:
+            observe(current)
+            if second:
+                selected = values[0]
+                if selected.ready:
+                    pending = prepare(selected)
+                    pending
+                assert ready(current)
+    return tuple(values)
+",
+        r"from __future__ import annotations
+
+async def no_suspension(values, first, second, prepare, observe, ready):
+    for item in values:
+        pending = prepare(item)
+        result = pending
+        assert result.value
+        current = result.value
+        observe(current)
+        if first:
+            observe(current)
+            if second:
+                selected = values[0]
+                if selected.ready:
+                    pending = prepare(selected)
+                    pending
+                assert ready(current)
+    return tuple(values)
+",
+        r"from __future__ import annotations
+
+async def no_trailing_assert(values, first, second, prepare, observe, ready):
+    for item in values:
+        pending = prepare(item)
+        result = await pending
+        assert result.value
+        current = result.value
+        observe(current)
+        if first:
+            observe(current)
+            if second:
+                selected = values[0]
+                if selected.ready:
+                    pending = prepare(selected)
+                    await pending
+    return tuple(values)
+",
+        r"from __future__ import annotations
+
+async def unconditional(values, first, second, prepare, observe, ready):
+    for item in values:
+        pending = prepare(item)
+        result = await pending
+        assert result.value
+        current = result.value
+        observe(current)
+        observe(current)
+        selected = values[0]
+        if selected.ready:
+            pending = prepare(selected)
+            await pending
+        assert ready(current)
+    return tuple(values)
+",
+        r"from __future__ import annotations
+
+async def no_inner_suspension(values, first, second, prepare, observe, ready):
+    for item in values:
+        pending = prepare(item)
+        result = await pending
+        assert result.value
+        current = result.value
+        observe(current)
+        if first:
+            observe(current)
+            if second:
+                selected = values[0]
+                if selected.ready:
+                    pending = prepare(selected)
+                    pending
+                assert ready(current)
+    return tuple(values)
+",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            source,
+            &format!("nested_erased_loop_backedge_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn handler_break_releases_iterator_exception_owner() {
     let source = r"async def nested_managers(items):
     for item in items:
