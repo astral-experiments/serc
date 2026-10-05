@@ -15,6 +15,73 @@ use serc::{
 };
 
 #[test]
+fn nested_handler_returns_preserve_outer_finalizer_owners() {
+    let source = r"def nested_handlers(choice, item, owner, operation, cleanup, recover):
+    value = None
+    try:
+        try:
+            try:
+                value = operation(value)
+            except TypeError:
+                try:
+                    value = recover(value)
+                except ValueError:
+                    return {'result': item}
+        finally:
+            for entry in (owner.left, owner.middle, owner.right):
+                if entry is not None:
+                    cleanup(entry)
+    except ValueError:
+        return None
+    except TypeError:
+        return item
+    return value
+";
+    let without_outer = r"def nested_handlers(choice, item, owner, operation, cleanup, recover):
+    value = None
+    try:
+        try:
+            value = operation(value)
+        except TypeError:
+            try:
+                value = recover(value)
+            except ValueError:
+                return {'result': item}
+    finally:
+        for entry in (owner.left, owner.middle, owner.right):
+            if entry is not None:
+                cleanup(entry)
+    return value
+";
+    for (index, source) in [
+        source.to_owned(),
+        source.replace(
+            "            try:\n                value = operation(value)\n            except TypeError:\n                try:\n                    value = recover(value)\n                except ValueError:\n                    return {'result': item}",
+            "            try:\n                value = recover(value)\n            except ValueError:\n                return {'result': item}",
+        ),
+        without_outer.to_owned(),
+        source.replace(
+            "            for entry in (owner.left, owner.middle, owner.right):\n                if entry is not None:\n                    cleanup(entry)",
+            "            cleanup(owner.right)",
+        ),
+        source.replace("return {'result': item}", "return None"),
+        source.replace(
+            "                except ValueError:\n                    return",
+            "                except ValueError as error:\n                    return",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            &source,
+            &format!("nested_handler_return_owner_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn handler_break_releases_iterator_exception_owner() {
     let source = r"async def nested_managers(items):
     for item in items:
