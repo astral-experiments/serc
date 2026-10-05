@@ -17,7 +17,8 @@ serialization.
   https://github.com/astral-sh/serc/pull/989) (astral-sh/serc#991;
   https://github.com/astral-sh/serc/pull/991) (astral-sh/serc#998;
   https://github.com/astral-sh/serc/pull/998) (astral-sh/serc#1005;
-  https://github.com/astral-sh/serc/pull/1005)
+  https://github.com/astral-sh/serc/pull/1005) (astral-sh/serc#1027;
+  https://github.com/astral-sh/serc/pull/1027)
 - Match CPython control flow in coroutines and nested iterators after assertion
   removal (astral-sh/serc#995; https://github.com/astral-sh/serc/pull/995)
   (astral-sh/serc#1016; https://github.com/astral-sh/serc/pull/1016)
