@@ -6644,6 +6644,35 @@ impl Assembler {
         }
     }
 
+    /// Captures a return-unwind label prefix and its materialized original POP record.
+    pub(crate) fn record_name_return_materialized_pop(&mut self) {
+        if self.deferred_name_return_borrow_exits.is_empty() {
+            return;
+        }
+        let items = self.linear_items();
+        let Some((Item::Instruction(pop), prefix)) = items.split_last() else {
+            return;
+        };
+        if pop.opcode != NOP
+            || pop.operand() != Operand::Value(0)
+            || !pop.fusion_policy.is_converted_pop_block()
+        {
+            return;
+        }
+        let start = prefix
+            .iter()
+            .rposition(|item| matches!(item, Item::Instruction(_)))
+            .map_or(0, |index| index + 1);
+        let Some(Item::Label(entry)) = prefix.get(start) else {
+            return;
+        };
+        let span = exception_owners::OriginalPopBlockSpan {
+            entry: *entry,
+            items: items[start..].to_vec(),
+        };
+        self.name_return_materialized_pops.push(span);
+    }
+
     /// Certifies a metadata-only iterator-region label beside the return's unwind label.
     pub(crate) fn record_name_return_iterator_region_alias(&mut self, boundary: Label) {
         if self.deferred_name_return_borrow_exits.is_empty() {
@@ -6657,23 +6686,25 @@ impl Assembler {
             .insert(boundary, original);
     }
 
-    /// Rejects copy-based borrowing only for a proven oversized original return array.
+    /// Rejects copy-based borrowing only for a proven noncopyable original return block.
     fn resolve_name_return_borrow_exits(&mut self) {
         if self.deferred_name_return_borrow_exits.is_empty() {
             return;
         }
         let origins = std::mem::take(&mut self.deferred_name_return_borrow_exits);
         let pop_boundaries = std::mem::take(&mut self.name_return_pop_boundaries);
+        let materialized_pops = std::mem::take(&mut self.name_return_materialized_pops);
         let iterator_region_aliases = std::mem::take(&mut self.name_return_iterator_region_aliases);
         let items = self.linear_items();
-        let labels = items
-            .iter()
-            .enumerate()
-            .filter_map(|(index, item)| match item {
-                Item::Label(label) => Some((*label, index)),
-                Item::Instruction(_) => None,
-            })
-            .collect::<FxHashMap<_, _>>();
+        let mut labels = FxHashMap::default();
+        let mut duplicate_labels = FxHashSet::default();
+        for (index, item) in items.iter().enumerate() {
+            if let Item::Label(label) = item
+                && labels.insert(*label, index).is_some()
+            {
+                duplicate_labels.insert(*label);
+            }
+        }
         let jump_targets = items
             .iter()
             .filter_map(|item| match item {
@@ -6684,6 +6715,48 @@ impl Assembler {
                 Item::Label(_) => None,
             })
             .collect::<rustc_hash::FxHashSet<_>>();
+        let mut materialized_pop_labels = FxHashMap::default();
+        for span in materialized_pops {
+            let Some(&start) = labels.get(&span.entry) else {
+                continue;
+            };
+            let Some((Item::Instruction(pop), prefix)) = span.items.split_last() else {
+                continue;
+            };
+            if prefix.first() != Some(&Item::Label(span.entry))
+                || items.get(start..start + span.items.len()) != Some(span.items.as_slice())
+                || pop.opcode != NOP
+                || pop.operand() != Operand::Value(0)
+                || !pop.fusion_policy.is_converted_pop_block()
+                || !prefix.iter().all(|item| {
+                    let Item::Label(label) = item else {
+                        return false;
+                    };
+                    !duplicate_labels.contains(label)
+                        && !jump_targets.contains(label)
+                        && !pop_boundaries.contains(label)
+                        && !self
+                            .exception_owner_provenance
+                            .source_boundaries
+                            .contains(label)
+                        && !self
+                            .exception_owner_provenance
+                            .block_boundaries
+                            .contains(label)
+                        && !self.preserved_block_boundaries.contains(label)
+                })
+            {
+                continue;
+            }
+            for (offset, item) in prefix.iter().enumerate() {
+                let Item::Label(label) = item else {
+                    unreachable!("the captured prefix contains only labels");
+                };
+                // All labels are zero-width; only the last precedes the physical POP.
+                materialized_pop_labels
+                    .insert(*label, (offset + 1 == prefix.len()).then_some(*pop));
+            }
+        }
         let mut barriers = Vec::new();
         'origin: for origin in origins {
             if origin.source.instruction().stream != self.emission_stream {
@@ -6704,7 +6777,9 @@ impl Assembler {
                 continue;
             }
             let mut size = 0;
+            let mut located = false;
             let mut pending_pop = None;
+            let mut pending_materialized_pop = None;
             let mut needs_iterator_pop = false;
             for item in &items[target_index + 1..] {
                 match item {
@@ -6720,6 +6795,7 @@ impl Assembler {
                     }
                     Item::Label(label) => {
                         if needs_iterator_pop
+                            || pending_materialized_pop.is_some()
                             || jump_targets.contains(label)
                             || self
                                 .exception_owner_provenance
@@ -6729,7 +6805,13 @@ impl Assembler {
                         {
                             continue 'origin;
                         }
-                        if let Some(original) = iterator_region_aliases.get(label) {
+                        if let Some(pop) = materialized_pop_labels.get(label) {
+                            if pending_pop.is_some() || pop_boundaries.contains(label) {
+                                continue 'origin;
+                            }
+                            // Intermediate aliases add no slot or pending instruction.
+                            pending_materialized_pop = *pop;
+                        } else if let Some(original) = iterator_region_aliases.get(label) {
                             // This fresh exception-range label adds no original slot.
                             // Its producer must place it directly after the exact POP
                             // boundary already counted by this return traversal.
@@ -6755,6 +6837,10 @@ impl Assembler {
                     Item::Instruction(instruction) => {
                         match (instruction.opcode, instruction.operand()) {
                             (LOAD_FAST, Operand::Value(_)) if size == 0 => {}
+                            (NOP, Operand::Value(0))
+                                if size > 0
+                                    && !needs_iterator_pop
+                                    && pending_materialized_pop == Some(*instruction) => {}
                             (SWAP, Operand::Value(2)) if size > 0 && !needs_iterator_pop => {
                                 needs_iterator_pop = true;
                             }
@@ -6763,12 +6849,24 @@ impl Assembler {
                             }
                             (RETURN_VALUE, Operand::Value(0))
                                 if size > 0 && !needs_iterator_pop => {}
+                            // Ordinary copied cleanup contributes a lower bound to
+                            // the original block before folding and load fusion.
+                            _ if size > 0
+                                && !needs_iterator_pop
+                                && !matches!(
+                                    instruction.opcode,
+                                    NOP | COPY_FREE_VARS | MAKE_CELL | NOT_TAKEN | SWAP
+                                )
+                                && !is_unconditional_jump(instruction.opcode) => {}
                             _ => continue 'origin,
                         }
                         pending_pop = None;
+                        pending_materialized_pop = None;
                         size += 1 + usize::from(instruction.pre_fold_extra_instructions());
-                        if instruction.opcode == RETURN_VALUE {
-                            if instruction.location.line >= 0 && size > 4 {
+                        located |= instruction.location.line >= 0;
+                        let conditional = is_conditional_jump(instruction.opcode);
+                        if conditional || ends_scope(instruction.opcode) {
+                            if located && (conditional || size > 4) {
                                 barriers.push(index);
                             }
                             break;

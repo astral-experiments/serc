@@ -11782,6 +11782,7 @@ impl<'source> Compiler<'source> {
                     {
                         self.assembler.preserve_last_no_location();
                     }
+                    self.assembler.record_name_return_materialized_pop();
                     // A copied inner finally remains protected by the next outer finally. The
                     // outermost copy runs after every protected region has been unwound.
                     let copied_finally_start = if context_index > 0 {

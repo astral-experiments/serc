@@ -11,6 +11,309 @@ use crate::target::opcodes::*;
 use crate::target::operands::{CommonConstant, Conversion, FunctionAttribute, ResumeLocation};
 
 #[test]
+fn deferred_name_return_requires_a_noncopyable_original_target() {
+    for (case, barrier) in [
+        ("five slots", true),
+        ("four slots", false),
+        ("erased pop", true),
+        ("pre-fold slot", true),
+        ("unlocated", false),
+        ("foreign label", false),
+        ("original block", false),
+        ("changed source", false),
+        ("conditional", true),
+        ("unlocated conditional", false),
+        ("unconditional", false),
+        ("not taken", false),
+        ("nop", false),
+        ("make cell", false),
+        ("copy free vars", false),
+        ("invalid swap", false),
+        ("unfinished swap", false),
+        ("materialized pop five slots", true),
+        ("materialized pop four slots", false),
+        ("materialized pop changed source", false),
+        ("materialized pop changed capture", false),
+        ("materialized pop changed label", false),
+        ("materialized pop jump target", false),
+        ("materialized pop preserved boundary", false),
+        ("materialized pop original boundary", false),
+        ("materialized pop plain nop", false),
+        ("materialized pop foreign label", false),
+        ("materialized pop unfinished iterator", false),
+        ("materialized pop no capture", false),
+    ] {
+        let mut assembler = Assembler::with_python_version(crate::PythonVersion::Py314);
+        let target = assembler.label();
+        let end = assembler.label();
+        let jump =
+            assembler.emit_forward_with_depth(JUMP_FORWARD, target, 0, ExceptionPolicy::default());
+        assembler.defer_name_return_borrow_exit(jump);
+        if matches!(case, "changed source" | "materialized pop changed source") {
+            let Item::Instruction(instruction) = &mut assembler.linear_items_mut()[0] else {
+                unreachable!()
+            };
+            instruction.set_operand(Operand::Forward(end));
+        }
+        assembler.mark(target);
+        if !matches!(case, "unlocated" | "unlocated conditional") {
+            assembler.set_location(SourceLocation::new(1, 1, 0, 1));
+        }
+        assembler.emit(LOAD_FAST, 0);
+        if case == "pre-fold slot" {
+            assembler.add_last_original_block_slots(1);
+        }
+        if matches!(case, "erased pop" | "foreign label" | "original block") {
+            let boundary = assembler.label();
+            assembler.mark(boundary);
+            if case == "erased pop" {
+                assembler.record_name_return_pop_boundary(boundary, 1);
+            } else if case == "original block" {
+                assembler.preserved_block_boundaries.insert(boundary);
+            }
+        }
+        let mut materialized_boundary = None;
+        if case.starts_with("materialized pop") {
+            if case == "materialized pop unfinished iterator" {
+                assembler.emit(SWAP, 2);
+            }
+            let boundary = assembler.label();
+            assembler.mark(boundary);
+            assembler.emit(NOP, 0);
+            if case != "materialized pop plain nop" {
+                assembler.mark_last_as_converted_pop_block();
+            }
+            if case != "materialized pop no capture" {
+                assembler.record_name_return_materialized_pop();
+            }
+            let length = assembler.linear_items().len();
+            if case == "materialized pop changed capture" {
+                let Item::Instruction(pop) = &mut assembler.linear_items_mut()[length - 1] else {
+                    unreachable!()
+                };
+                pop.location = SourceLocation::new(2, 2, 0, 1);
+            } else if case == "materialized pop changed label" {
+                let replacement = assembler.label();
+                assembler.linear_items_mut()[length - 2] = Item::Label(replacement);
+            } else if case == "materialized pop preserved boundary" {
+                assembler.preserved_block_boundaries.insert(boundary);
+            } else if case == "materialized pop original boundary" {
+                assembler
+                    .exception_owner_provenance
+                    .block_boundaries
+                    .insert(boundary);
+            } else if case == "materialized pop foreign label" {
+                let foreign = assembler.label();
+                assembler.mark(foreign);
+            }
+            materialized_boundary = Some(boundary);
+        }
+        if matches!(
+            case,
+            "conditional" | "unlocated conditional" | "unconditional"
+        ) {
+            assembler.emit_forward_with_depth(
+                if case == "unconditional" {
+                    JUMP_FORWARD
+                } else {
+                    POP_JUMP_IF_FALSE
+                },
+                end,
+                0,
+                ExceptionPolicy::default(),
+            );
+        } else {
+            match case {
+                "not taken" | "nop" | "make cell" | "copy free vars" => {
+                    let opcode = match case {
+                        "nop" => NOP,
+                        "make cell" => MAKE_CELL,
+                        "copy free vars" => COPY_FREE_VARS,
+                        _ => NOT_TAKEN,
+                    };
+                    assembler.emit(opcode, 0);
+                }
+                "invalid swap" | "unfinished swap" => {
+                    assembler.emit(SWAP, if case == "invalid swap" { 3 } else { 2 });
+                }
+                _ => {}
+            }
+            if case == "materialized pop four slots" {
+                assembler.emit(POP_TOP, 0);
+            } else if matches!(
+                case,
+                "four slots" | "erased pop" | "pre-fold slot" | "materialized pop five slots"
+            ) {
+                assembler.emit(LOAD_CONST, 0);
+                assembler.emit(POP_TOP, 0);
+            } else {
+                assembler.emit(LOAD_FAST, 1);
+                assembler.emit(LOAD_FAST, 2);
+                assembler.emit(STORE_ATTR, 0);
+            }
+        }
+        assembler.emit(RETURN_VALUE, 0);
+        if case == "materialized pop jump target" {
+            assembler.emit_forward_with_depth(
+                JUMP_FORWARD,
+                materialized_boundary.unwrap(),
+                0,
+                ExceptionPolicy::default(),
+            );
+        }
+        assembler.mark(end);
+        assembler.resolve_name_return_borrow_exits();
+        let Item::Instruction(instruction) = &assembler.linear_items()[0] else {
+            unreachable!()
+        };
+        assert_eq!(
+            instruction.no_location_policy.borrow_fallthrough() == BorrowFallthrough::Barrier,
+            barrier,
+            "{case}",
+        );
+    }
+}
+
+#[test]
+fn deferred_name_return_materialized_pop_requires_exact_label_prefix() {
+    for mutation in [
+        "intact",
+        "four slots",
+        "changed label",
+        "reordered labels",
+        "extra label",
+        "removed label",
+        "changed pop",
+        "source boundary",
+        "block boundary",
+        "preserved boundary",
+        "forward ingress",
+        "backward ingress",
+        "duplicate label",
+        "duplicate captured label",
+        "omitted pop collision",
+        "unfinished iterator",
+        "plain nop",
+        "no capture",
+    ] {
+        let mut assembler = Assembler::with_python_version(crate::PythonVersion::Py314);
+        let target = assembler.label();
+        let jump =
+            assembler.emit_forward_with_depth(JUMP_FORWARD, target, 0, ExceptionPolicy::default());
+        assembler.defer_name_return_borrow_exit(jump);
+        assembler.mark(target);
+        assembler.set_location(SourceLocation::new(1, 1, 0, 1));
+        assembler.emit(LOAD_FAST, 0);
+        if mutation == "unfinished iterator" {
+            assembler.emit(SWAP, 2);
+        }
+        let prefix_start = assembler.linear_items().len();
+        let aliases = [
+            assembler.label(),
+            assembler.label(),
+            assembler.label(),
+            assembler.label(),
+        ];
+        for (index, label) in aliases.iter().enumerate() {
+            assembler.mark(*label);
+            if mutation == "duplicate captured label" && index == 1 {
+                assembler.mark(*label);
+            }
+        }
+        assembler.emit(NOP, 0);
+        if mutation != "plain nop" {
+            assembler.mark_last_as_converted_pop_block();
+        }
+        if mutation != "no capture" {
+            assembler.record_name_return_materialized_pop();
+        }
+        match mutation {
+            "changed label" => {
+                let replacement = assembler.label();
+                assembler.linear_items_mut()[prefix_start + 1] = Item::Label(replacement);
+            }
+            "reordered labels" => {
+                assembler
+                    .linear_items_mut()
+                    .swap(prefix_start + 1, prefix_start + 2);
+            }
+            "extra label" => {
+                let extra = assembler.label();
+                let UnoptimizedCode::Linear(items) = &mut assembler.code else {
+                    unreachable!();
+                };
+                items.insert(prefix_start + 1, Item::Label(extra));
+            }
+            "removed label" => {
+                let UnoptimizedCode::Linear(items) = &mut assembler.code else {
+                    unreachable!();
+                };
+                items.remove(prefix_start + 1);
+            }
+            "changed pop" => {
+                let Item::Instruction(pop) = assembler.linear_items_mut().last_mut().unwrap()
+                else {
+                    unreachable!();
+                };
+                pop.location = SourceLocation::new(2, 2, 0, 1);
+            }
+            "source boundary" => {
+                assembler
+                    .exception_owner_provenance
+                    .source_boundaries
+                    .insert(aliases[1]);
+            }
+            "block boundary" => {
+                assembler
+                    .exception_owner_provenance
+                    .block_boundaries
+                    .insert(aliases[1]);
+            }
+            "preserved boundary" => {
+                assembler.preserved_block_boundaries.insert(aliases[1]);
+            }
+            "omitted pop collision" => {
+                assembler.record_name_return_pop_boundary(aliases[1], 1);
+            }
+            _ => {}
+        }
+        if mutation != "four slots" {
+            assembler.emit(LOAD_CONST, 0);
+        }
+        assembler.emit(POP_TOP, 0);
+        assembler.emit(RETURN_VALUE, 0);
+        if matches!(mutation, "forward ingress" | "backward ingress") {
+            if mutation == "forward ingress" {
+                assembler.emit_forward_with_depth(
+                    JUMP_FORWARD,
+                    aliases[1],
+                    0,
+                    ExceptionPolicy::default(),
+                );
+            } else {
+                assembler.emit_backward_with_depth_and_exception_policy(
+                    JUMP_BACKWARD,
+                    aliases[1],
+                    0,
+                    ExceptionPolicy::default(),
+                );
+            }
+        } else if mutation == "duplicate label" {
+            assembler.mark(aliases[1]);
+        }
+        assembler.resolve_name_return_borrow_exits();
+        let Item::Instruction(jump) = &assembler.linear_items()[0] else {
+            unreachable!();
+        };
+        assert_eq!(
+            jump.no_location_policy.borrow_fallthrough() == BorrowFallthrough::Barrier,
+            mutation == "intact",
+            "{mutation}"
+        );
+    }
+}
+
+#[test]
 fn raising_while_cleanup_requires_exact_original_edges() {
     for version in [
         crate::PythonVersion::Py312,
