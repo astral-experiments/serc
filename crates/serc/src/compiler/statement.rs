@@ -8685,7 +8685,7 @@ impl<'source> Compiler<'source> {
                                     && iterator.finally_end_depth == 0
                                     && iterator.exception_region_depth == handler.exception_region_depth
                         );
-                // An ordinary try surrounding a direct handler/finally pair still owns
+                // An ordinary try surrounding a handler chain and finalizer still owns
                 // the copied finalizer after the handler and finally collectors unwind.
                 // Track those boundaries separately without changing handler POP slots.
                 let tracks_outer_try_handler_finally_unwinds = self
@@ -8707,12 +8707,13 @@ impl<'source> Compiler<'source> {
                             self.control.exceptions.active_exception_handlers.as_slice(),
                             self.control.finally.active_return_finally_contexts.as_slice(),
                         ),
-                        ([handler], [finally])
+                        ([handler, nested @ ..], [finally])
                             if ((handler.name.is_none() && self.control.loops.contexts.is_empty())
                                 // Clearing a handler's name does not exit its enclosing
                                 // ordinary try. A synchronous bare return or direct constant
                                 // tail has the same owner boundary without loops.
                                 || (handler.name.is_some()
+                                    && nested.is_empty()
                                     && (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                                             == CO_COROUTINE
                                         || (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
@@ -8745,7 +8746,14 @@ impl<'source> Compiler<'source> {
                                 && handler.exception_region_depth
                                     == finally.exception_region_depth + 1
                                 && self.control.exceptions.active_exception_region_exclusions.len()
-                                    == handler.exception_region_depth + 1
+                                    == handler.exception_region_depth + nested.len() + 1
+                                && nested.iter().enumerate().all(|(index, inner)| {
+                                    inner.exception_region_depth == handler.exception_region_depth + index + 1
+                                        && inner.try_body_depth == handler.try_body_depth
+                                        && inner.with_depth == handler.with_depth
+                                        && inner.loop_depth == handler.loop_depth
+                                        && inner.finally_end_depth == handler.finally_end_depth
+                                })
                     );
                 // Two named handlers can return through an ordinary try nested inside a
                 // pending finally. The outer handler's name cleanup still belongs to that
@@ -28233,7 +28241,14 @@ impl<'source> Compiler<'source> {
                         if outer.try_body_depth == self.control.exceptions.active_try_marker_slots.len()
                             && outer.with_depth == self.control.withs.active_with_exits.len()
                             && outer.loop_depth == self.control.loops.contexts.len()
-                ) && self.control.finally.active_finally_try_bodies == 0
+                ) && (self.control.finally.active_finally_try_bodies == 0
+                    // An older finalizer does not separate these unnamed handlers.
+                    || (self.control.exceptions.active_exception_handlers[0].name.is_none()
+                        && self.control.finally.active_copied_finally_bodies == 0
+                        && self.control.finally.active_loop_finally_contexts.len()
+                            == self.control.finally.active_finally_try_bodies
+                        && self.control.finally.active_loop_finally_contexts.iter()
+                            .all(|context| context.handler_depth == 0)))
                     && self.control.finally.active_normal_finally_bodies == 0
                     && self.control.finally.active_finally_end_blocks == 0
                     && self
