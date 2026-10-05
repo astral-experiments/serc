@@ -1,5 +1,126 @@
 # Changelog
 
+## 0.1.2
+
+Released on 2026-10-05.
+
+Serc 0.1.2 improves CPython bytecode compatibility and speeds up compilation and
+serialization.
+
+### Bug fixes
+
+- Preserve shared returns and cleanup exits when constant-true assertions are
+  folded on Python 3.12 (astral-sh/serc#975;
+  https://github.com/astral-sh/serc/pull/975)
+- Match CPython control flow when optimization removes nested assertions or
+  branch prefixes (astral-sh/serc#989;
+  https://github.com/astral-sh/serc/pull/989) (astral-sh/serc#991;
+  https://github.com/astral-sh/serc/pull/991) (astral-sh/serc#998;
+  https://github.com/astral-sh/serc/pull/998) (astral-sh/serc#1005;
+  https://github.com/astral-sh/serc/pull/1005) (astral-sh/serc#1027;
+  https://github.com/astral-sh/serc/pull/1027)
+- Match CPython control flow in coroutines and nested iterators after assertion
+  removal (astral-sh/serc#995; https://github.com/astral-sh/serc/pull/995)
+  (astral-sh/serc#1016; https://github.com/astral-sh/serc/pull/1016)
+- Preserve implicit returns after optimization erases terminal loop assertions
+  (astral-sh/serc#1012; https://github.com/astral-sh/serc/pull/1012)
+- Match CPython loop bytecode when optimization removes `else` assertions after
+  assignments, comprehensions, and inner loops (astral-sh/serc#1004;
+  https://github.com/astral-sh/serc/pull/1004) (astral-sh/serc#1006;
+  https://github.com/astral-sh/serc/pull/1006) (astral-sh/serc#1007;
+  https://github.com/astral-sh/serc/pull/1007) (astral-sh/serc#1008;
+  https://github.com/astral-sh/serc/pull/1008)
+- Match CPython loop bytecode after assertion removal inside `try` blocks and
+  context managers (astral-sh/serc#993;
+  https://github.com/astral-sh/serc/pull/993) (astral-sh/serc#999;
+  https://github.com/astral-sh/serc/pull/999) (astral-sh/serc#1019;
+  https://github.com/astral-sh/serc/pull/1019) (astral-sh/serc#1020;
+  https://github.com/astral-sh/serc/pull/1020)
+- Match CPython loop bytecode in coroutines and async loops after awaits and
+  assertion removal (astral-sh/serc#994;
+  https://github.com/astral-sh/serc/pull/994) (astral-sh/serc#1002;
+  https://github.com/astral-sh/serc/pull/1002) (astral-sh/serc#1010;
+  https://github.com/astral-sh/serc/pull/1010) (astral-sh/serc#1011;
+  https://github.com/astral-sh/serc/pull/1011)
+- Match CPython cleanup ordering when `break` or `continue` exits through
+  `finally` blocks (astral-sh/serc#977;
+  https://github.com/astral-sh/serc/pull/977) (astral-sh/serc#981;
+  https://github.com/astral-sh/serc/pull/981) (astral-sh/serc#1022;
+  https://github.com/astral-sh/serc/pull/1022)
+- Match CPython exception tables for returns and conditional cleanup in
+  `finally` blocks (astral-sh/serc#982;
+  https://github.com/astral-sh/serc/pull/982) (astral-sh/serc#983;
+  https://github.com/astral-sh/serc/pull/983) (astral-sh/serc#984;
+  https://github.com/astral-sh/serc/pull/984)
+- Match CPython exception tables for returns and nested cleanup in async context
+  managers (astral-sh/serc#985; https://github.com/astral-sh/serc/pull/985)
+- Match CPython iterator cleanup when `finally` blocks call methods or local
+  callables (astral-sh/serc#986; https://github.com/astral-sh/serc/pull/986)
+  (astral-sh/serc#992; https://github.com/astral-sh/serc/pull/992)
+- Match CPython local-variable loads after conditional cleanup, `try`/`else`
+  breaks, and exception-handler exits (astral-sh/serc#976;
+  https://github.com/astral-sh/serc/pull/976) (astral-sh/serc#1000;
+  https://github.com/astral-sh/serc/pull/1000) (astral-sh/serc#1003;
+  https://github.com/astral-sh/serc/pull/1003) (astral-sh/serc#1009;
+  https://github.com/astral-sh/serc/pull/1009)
+- Match CPython local-variable loads after conditional loops in `finally` blocks
+  (astral-sh/serc#1001; https://github.com/astral-sh/serc/pull/1001)
+- Match CPython exception tables for conditional tuple returns inside `try`
+  blocks (astral-sh/serc#1015; https://github.com/astral-sh/serc/pull/1015)
+- Match CPython bytecode and source locations for exception-handler cleanup and
+  closure setup (astral-sh/serc#979; https://github.com/astral-sh/serc/pull/979)
+  (astral-sh/serc#980; https://github.com/astral-sh/serc/pull/980)
+- Match CPython exception tables when `break` or `return` exits nested exception
+  handlers and `finally` blocks (astral-sh/serc#1023;
+  https://github.com/astral-sh/serc/pull/1023) (astral-sh/serc#1024;
+  https://github.com/astral-sh/serc/pull/1024) (astral-sh/serc#1025;
+  https://github.com/astral-sh/serc/pull/1025) (astral-sh/serc#1026;
+  https://github.com/astral-sh/serc/pull/1026)
+- Match CPython cleanup for sequence patterns with multiple wildcards and match
+  statements inside unnamed exception handlers (astral-sh/serc#1018;
+  https://github.com/astral-sh/serc/pull/1018) (astral-sh/serc#1021;
+  https://github.com/astral-sh/serc/pull/1021)
+- Keep later global references independent from temporary comprehension targets
+  (astral-sh/serc#972; https://github.com/astral-sh/serc/pull/972)
+- Calculate the correct stack size for later `except*` handlers containing
+  calls, suspension, or nested cleanup on Python 3.14 and 3.15
+  (astral-sh/serc#974; https://github.com/astral-sh/serc/pull/974)
+- Compile deeply nested statement suites without overflowing small thread stacks
+  (astral-sh/serc#971; https://github.com/astral-sh/serc/pull/971)
+- Preserve the final operand’s source line in chained `None` comparisons on
+  Python 3.12 and 3.13 (astral-sh/serc#973;
+  https://github.com/astral-sh/serc/pull/973)
+- Match CPython startup string interning and marshal identity on Linux for the
+  documented native reference profile across Python 3.12 through 3.15
+  (astral-sh/serc#978; https://github.com/astral-sh/serc/pull/978)
+- Match CPython constant tables and bytecode when folding Boolean expressions
+  and starred collection literals (astral-sh/serc#987;
+  https://github.com/astral-sh/serc/pull/987) (astral-sh/serc#988;
+  https://github.com/astral-sh/serc/pull/988)
+
+### Performance
+
+- Speed up marshal serialization (astral-sh/serc#930;
+  https://github.com/astral-sh/serc/pull/930) (astral-sh/serc#931;
+  https://github.com/astral-sh/serc/pull/931) (astral-sh/serc#932;
+  https://github.com/astral-sh/serc/pull/932) (astral-sh/serc#962;
+  https://github.com/astral-sh/serc/pull/962)
+- Reduce compilation overhead (astral-sh/serc#948;
+  https://github.com/astral-sh/serc/pull/948) (astral-sh/serc#964;
+  https://github.com/astral-sh/serc/pull/964)
+- Speed up compilation of annotation-heavy code (astral-sh/serc#996;
+  https://github.com/astral-sh/serc/pull/996) (astral-sh/serc#997;
+  https://github.com/astral-sh/serc/pull/997) (astral-sh/serc#1013;
+  https://github.com/astral-sh/serc/pull/1013)
+- Reduce memory allocations during compilation (astral-sh/serc#1017;
+  https://github.com/astral-sh/serc/pull/1017)
+- Reduce repeated work when compiling folded constants (astral-sh/serc#1014;
+  https://github.com/astral-sh/serc/pull/1014)
+- Speed up source nesting validation (astral-sh/serc#930;
+  https://github.com/astral-sh/serc/pull/930) (astral-sh/serc#931;
+  https://github.com/astral-sh/serc/pull/931) (astral-sh/serc#932;
+  https://github.com/astral-sh/serc/pull/932)
+
 ## 0.1.1
 
 Released on 2026-09-29.
