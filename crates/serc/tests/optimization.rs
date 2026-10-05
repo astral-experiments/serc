@@ -9618,3 +9618,63 @@ fn completed_set_comparison_preserves_erased_iterator_edges() {
         );
     }
 }
+
+#[test]
+fn copied_return_cleanup_preserves_earlier_loop_exclusions() {
+    let source = r"def reduced_return(choice, item, owner, operation, cleanup, recover):
+    value = None
+    try:
+        try:
+            if choice:
+                return {'result': operation(item)}
+            value = operation(item)
+        finally:
+            for entry in (owner.left, owner.middle, owner.right):
+                if entry is not None:
+                    cleanup(entry)
+    except ValueError:
+        return None
+    except TypeError:
+        return item
+    return value
+";
+    let unprotected = r"def no_outer_handler(choice, item, owner, operation, cleanup, recover):
+    value = None
+    try:
+        if choice:
+            return {'result': operation(item)}
+        value = operation(item)
+    finally:
+        for entry in (owner.left, owner.middle, owner.right):
+            if entry is not None:
+                cleanup(entry)
+    return value
+";
+    let cleanup_loop = r"            for entry in (owner.left, owner.middle, owner.right):
+                if entry is not None:
+                    cleanup(entry)
+";
+    for (index, source) in [
+        source.to_owned(),
+        unprotected.to_owned(),
+        source.replace("reduced_return", "no_early_return").replace(
+            "return {'result': operation(item)}",
+            "value = {'result': operation(item)}",
+        ),
+        source
+            .replace("reduced_return", "boolean_guard")
+            .replace("entry is not None", "entry"),
+        source
+            .replace("reduced_return", "linear_cleanup")
+            .replace(cleanup_loop, "            cleanup(owner.right)\n"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            &source,
+            &format!("copied_return_cleanup_loop_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
