@@ -88,6 +88,50 @@ fn named_handler_returns_preserve_outer_finalizer_owners() {
 }
 
 #[test]
+fn following_name_return_with_copied_cleanup() {
+    let source = r"def plain_call(value, fallback, flag, work, cleanup, owner):
+    try:
+        try:
+            if flag:
+                work()
+        except Exception:
+            return fallback
+        return value
+    finally:
+        cleanup()
+";
+    let attribute = source
+        .replace("plain_call", "attribute_store")
+        .replace("cleanup()", "owner.attr = flag");
+    for (index, source) in [
+        source.to_owned(),
+        source
+            .replace("plain_call", "conditional_call")
+            .replace("cleanup()", "cleanup(1 if flag else 2)"),
+        source
+            .replace("plain_call", "short_circuit_call")
+            .replace("cleanup()", "cleanup(flag and value)"),
+        attribute.clone(),
+        attribute.replace("attribute_store", "linear_body").replace(
+            "            if flag:\n                work()",
+            "            work()",
+        ),
+        attribute
+            .replace("attribute_store", "fallthrough_handler")
+            .replace("return fallback", "work()"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            &source,
+            &format!("following_name_return_with_copied_cleanup_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn nested_handler_returns_preserve_outer_finalizer_owners() {
     let source = r"def nested_handlers(choice, item, owner, operation, cleanup, recover):
     value = None
