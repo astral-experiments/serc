@@ -15,6 +15,79 @@ use serc::{
 };
 
 #[test]
+fn named_handler_returns_preserve_outer_finalizer_owners() {
+    let source = r"def named_nested(choice, item, owner, operation, cleanup, recover):
+    value = None
+    try:
+        try:
+            try:
+                value = operation(value)
+            except ValueError as error:
+                value = recover(value)
+                if choice is None:
+                    cleanup(value)
+                    raise
+                try:
+                    value = operation(value)
+                except TypeError:
+                    cleanup(value)
+                    return {'result': item}
+        finally:
+            for entry in (owner.left, owner.middle, owner.right):
+                if entry is not None:
+                    cleanup(entry)
+    except ValueError:
+        return None
+    except TypeError:
+        return item
+    return value
+";
+    let without_outer = r"def no_outer_try(choice, item, owner, operation, cleanup, recover):
+    value = None
+    try:
+        try:
+            value = operation(value)
+        except ValueError as error:
+            value = recover(value)
+            if choice is None:
+                cleanup(value)
+                raise
+            try:
+                value = operation(value)
+            except TypeError:
+                cleanup(value)
+                return {'result': item}
+    finally:
+        for entry in (owner.left, owner.middle, owner.right):
+            if entry is not None:
+                cleanup(entry)
+    return value
+";
+    for (index, source) in [
+        source.to_owned(),
+        source.replace("named_nested(", "unnamed_outer(")
+            .replace("except ValueError as error:", "except ValueError:"),
+        source.replace("named_nested(", "no_conditional_raise(")
+            .replace("                if choice is None:\n                    cleanup(value)\n                    raise\n", ""),
+        source.replace("named_nested(", "single_handler(")
+            .replace("                try:\n                    value = operation(value)\n                except TypeError:\n                    cleanup(value)\n                    return {'result': item}",
+                     "                cleanup(value)\n                return {'result': item}"),
+        source.replace("named_nested(", "constant_return(")
+            .replace("return {'result': item}", "return None"),
+        without_outer.to_owned(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            &source,
+            &format!("named_nested_return_owner_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn nested_handler_returns_preserve_outer_finalizer_owners() {
     let source = r"def nested_handlers(choice, item, owner, operation, cleanup, recover):
     value = None
