@@ -19182,7 +19182,8 @@ impl<'source> Compiler<'source> {
             && !self
                 .assembler
                 .current_join_has_located_compacted_predecessor())
-            || (self.assembler.at_original_shared_handler_join()
+            || ((self.assembler.at_original_shared_handler_join()
+                || self.assembler.at_original_shared_conditional_join())
                 && self.assembler.current_original_block_location().is_none()
                 && self
                     .assembler
