@@ -15,6 +15,49 @@ use serc::{
 };
 
 #[test]
+fn conditional_iterator_return_copies_preserve_locations_and_owners() {
+    let source = r"async def sample(items, manager, state):
+    try:
+        for item in items:
+            try:
+                with manager:
+                    if item:
+                        return make_value()
+                    return await state.read()
+            except LookupError:
+                if item:
+                    raise
+            finally:
+                if state is not None:
+                    await state.close()
+                    state = None
+    except ValueError:
+        return failed()
+    except Exception as error:
+        return recover(error)
+";
+    for (index, source) in [
+        source.to_owned(),
+        source.replace("async def", "def").replace("await ", ""),
+        source.replace("with manager:", "with manager if item else fallback():"),
+        source.replace("                    state = None\n", ""),
+        source
+            .replace(" as error", "")
+            .replace("recover(error)", "recover()"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython_versions(
+            &source,
+            &format!("conditional_iterator_return_{index}.py"),
+            &LEVELS,
+            &[PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn continue_copies_inner_cleanup_inside_an_enclosing_finalizer() {
     let source = r"async def sample(state, cleanup):
     try:
