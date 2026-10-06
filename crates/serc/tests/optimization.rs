@@ -2205,6 +2205,14 @@ async def run(values, transform, manager, pending, cleanup):
         ),
         source.replace("with manager(", "with manager.scope("),
         source.replace(
+            "await pending",
+            "await pending\n                assert item",
+        ),
+        source.replace(
+            "                with manager(item, enabled=True):",
+            "                assert item\n                with manager(item, enabled=True):",
+        ),
+        source.replace(
             "                assert item",
             "                transform(item)",
         ),
@@ -2213,6 +2221,63 @@ async def run(values, transform, manager, pending, cleanup):
     .enumerate()
     {
         assert_matches_cpython(&source, &format!("managed_name_await_{index}.py"), &LEVELS);
+    }
+}
+
+#[test]
+fn completed_manager_work_preserves_retained_loop_owners() {
+    let source = r"async def sample(items, resource, work, cleanup, flag):
+    with resource():
+        try:
+            for item in items:
+                if flag:
+                    with resource() as handle:
+                        await work(item)
+                    assert handle
+                else:
+                    assert item
+        finally:
+            cleanup()
+";
+    let nested = r"async def sample(items, resource, work, cleanup, flag):
+    try:
+        with resource():
+            for batch in items:
+                try:
+                    for item in batch:
+                        if flag:
+                            with resource() as handle:
+                                await work(item)
+                            assert handle
+                        else:
+                            assert item
+                finally:
+                    cleanup()
+    finally:
+        cleanup()
+";
+    for (index, source) in [
+        source.to_owned(),
+        source.replace("                    assert handle\n", ""),
+        source.replace(
+            "                else:\n                    assert item",
+            "                else:\n                    work(item)",
+        ),
+        nested.to_owned(),
+        nested.replace("                            assert handle\n", ""),
+        nested.replace(
+            "                            assert handle",
+            "                            assert handle\n                            assert item",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            &source,
+            &format!("retained_manager_loop_{index}.py"),
+            &LEVELS,
+        );
     }
 }
 

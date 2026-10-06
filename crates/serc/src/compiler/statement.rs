@@ -19529,7 +19529,11 @@ impl<'source> Compiler<'source> {
             && condition_has_completed_set_comparison(final_test);
         // A completed manager's normal exit returns to the saved loop owner.
         // Calls and completed awaits in its body cannot reach the erased else.
-        let completed_manager_work = matches!(final_body, [Stmt::With(manager)]
+        let mut manager_work = final_body
+            .iter()
+            .filter(|part| !self.context.is_elided_statement(part));
+        let completed_manager_work = matches!((manager_work.next(), manager_work.next()),
+        (Some(Stmt::With(manager)), None)
         if !manager.is_async
             && manager.items.iter().all(|item| {
                 !expression_contains_inline_branch(&item.context_expr)
@@ -19641,6 +19645,67 @@ impl<'source> Compiler<'source> {
         let completed_direct_await = matches!(final_body, [Stmt::Expr(expression)]
             if matches!(expression.value.as_ref(), Expr::Await(awaited)
                 if matches!(awaited.value.as_ref(), Expr::Name(_))));
+        // Completed manager work can retain several enclosing cleanup scopes when
+        // every scope predates this iterator and no cleanup copy is in progress.
+        let retained_manager_owners = completed_manager_work
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+            && self.control.finally.active_finally_try_bodies > 0
+            && self.control.finally.active_finally_try_bodies
+                == self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .len()
+            && self.control.finally.protected_try_loop_depths.len()
+                == self.control.finally.active_finally_try_bodies
+            && self
+                .control
+                .finally
+                .protected_try_loop_depths
+                .iter()
+                .enumerate()
+                .all(|(index, (depth, loop_depth))| {
+                    *depth == index + 1 && *loop_depth < self.control.loops.contexts.len()
+                })
+            && self
+                .control
+                .finally
+                .innermost_finally_exception_exclusion_depth
+                == Some(self.control.finally.active_finally_try_bodies)
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && self.control.finally.active_overriding_finally_returns == 0
+            && self
+                .control
+                .finally
+                .active_pass_finally_locations
+                .is_empty()
+            && self
+                .control
+                .finally
+                .preserved_return_value_contexts
+                .is_empty()
+            && self.control.finally.copied_return_finally_preserved_values == 0
+            && self
+                .control
+                .finally
+                .copied_return_finally_loop_depth
+                .is_none()
+            && !self.control.finally.copy_return_finally_condition_exit
+            && !self.control.finally.copies_terminating_finally_returns
+            && self.control.withs.active_with_exits.len()
+                == self.control.withs.active_with_region_exclusions.len()
+            && self.control.withs.active_with_exits.iter().all(|manager| {
+                !manager.is_async && manager.loop_depth < self.control.loops.contexts.len()
+            })
+            && self.control.loops.contexts.last().is_some_and(|context| {
+                context.iterator_cleanup == IteratorCleanup::Sync
+                    && context.continue_label == restart
+            })
+            && condition_has_linear_runtime_leaves(final_test)
+            && condition_jump_target_count(final_test, false) == 1;
         let iterator_inside_finally = (ordinary_function
             || ((completed_manager_work
                 || completed_direct_await
@@ -19698,7 +19763,9 @@ impl<'source> Compiler<'source> {
         let protected_iterator_work_else = eligible_else
             && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
             && self.control.in_loop_tail_without_nested_cleanup()
-            && (self.control.finally.active_finally_try_bodies == 0 || iterator_inside_finally)
+            && (self.control.finally.active_finally_try_bodies == 0
+                || iterator_inside_finally
+                || retained_manager_owners)
             && self
                 .control
                 .loops
