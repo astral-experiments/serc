@@ -7253,11 +7253,15 @@ impl<'source> Compiler<'source> {
                         .is_empty()
                     && self.control.finally.copied_return_finally_preserved_values == 0)
                     .then(|| {
-                        let [finally] =
-                            self.control.finally.active_loop_finally_contexts.as_slice()
-                        else {
+                        let (finally, enclosing) =
+                            self.control.finally.active_loop_finally_contexts.split_last()?;
+                        // Finalizers surrounding the loop remain active; only this
+                        // innermost finalizer is copied before the continue.
+                        if enclosing.iter().any(|outer| {
+                            outer.loop_depth >= self.control.loops.contexts.len()
+                        }) {
                             return None;
-                        };
+                        }
                         let [Stmt::If(tail)] = finally.body else {
                             return None;
                         };
