@@ -15,6 +15,51 @@ use serc::{
 };
 
 #[test]
+fn recovery_finalizer_preserves_local_return_borrow_boundary() {
+    let source = r"def sample(items, work, recover, cleanup, valid):
+    for item in items:
+        value = work(item)
+        try:
+            try:
+                work(value)
+            except Exception:
+                if not valid(value):
+                    raise
+                result = recover(value)
+                if valid(result):
+                    return work(result)
+                continue
+            return value
+        finally:
+            try:
+                cleanup()
+            except Exception:
+                pass
+    raise ValueError()
+";
+    for (name, source) in [
+        ("plain", source.to_owned()),
+        (
+            "no_guard",
+            source.replace("                if not valid(value):\n                    raise\n", ""),
+        ),
+        (
+            "no_handler_return",
+            source.replace("                if valid(result):\n                    return work(result)\n", ""),
+        ),
+        ("named_handler", source.replace("except Exception:", "except Exception as error:")),
+        (
+            "plain_finally",
+            source.replace("            try:\n                cleanup()\n            except Exception:\n                pass", "            cleanup()"),
+        ),
+        ("return_call", source.replace("            return value", "            return work(value)")),
+        ("coroutine", source.replace("def sample", "async def sample")),
+    ] {
+        assert_matches_cpython(&source, &format!("recovery_finalizer_return_{name}.py"), &LEVELS);
+    }
+}
+
+#[test]
 fn erased_branches_preserve_nested_finalizer_loop_exits() {
     let source = r"def sample(items, flag, check, manager, finish):
     try:

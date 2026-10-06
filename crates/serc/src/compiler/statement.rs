@@ -27184,6 +27184,20 @@ impl<'source> Compiler<'source> {
                     matches!(context.body, [Stmt::Expr(expression)]
                         if matches!(expression.value.as_ref(), Expr::Call(_))
                             && !expression_contains_inline_branch(&expression.value))
+                        || (self.context.python_version == crate::PythonVersion::Py314
+                            && matches!(self.unit.scope, Scope::Function { .. })
+                            && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+                            && matches!(context.body, [Stmt::Try(cleanup)]
+                                if !cleanup.is_star
+                                    && cleanup.orelse.is_empty()
+                                    && cleanup.finalbody.is_empty()
+                                    && is_call_expression_suite(&cleanup.body)
+                                    && suite_has_nonsuspending_linear_fallthrough(&cleanup.body)
+                                    && matches!(cleanup.handlers.as_slice(), [handler]
+                                        if handler.as_except_handler().is_some_and(|handler| {
+                                            matches!(handler.type_.as_deref(), Some(Expr::Name(_)))
+                                                && matches!(handler.body.as_slice(), [Stmt::Pass(_)])
+                                        }))))
                         || matches!(context.body, [Stmt::Expr(expression)]
                             if matches!(expression.value.as_ref(), Expr::Await(awaited)
                                 if matches!(awaited.value.as_ref(), Expr::Call(_))
