@@ -15,6 +15,29 @@ use serc::{
 };
 
 #[test]
+fn compound_finalizer_conditions_preserve_retired_handler_slots() {
+    let source = r"def sample(value, state):
+    try:
+        token = work(value)
+        if type(token) is not int or token != 0 or not state.first:
+            raise RuntimeError()
+        token = work(state)
+        if type(token) is not int or token != 0 or not state.second:
+            raise RuntimeError()
+    except (AttributeError, ValueError) as error:
+        raise RuntimeError() from error
+    finally:
+        try:
+            if state.second and not finish(value):
+                raise RuntimeError()
+        finally:
+            if state.first and not finish(state):
+                raise RuntimeError()
+";
+    assert_matches_cpython(source, "compound_finalizer_condition.py", &LEVELS);
+}
+
+#[test]
 fn return_retires_inner_try_before_iterator_after_finalizer_and_manager() {
     let source = r"async def sample(items, manager, ready):
     for item in items:
