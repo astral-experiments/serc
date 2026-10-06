@@ -3537,6 +3537,79 @@ impl OptimizationPipeline {
                 returns.insert(target, tail);
             }
         }
+        // Paired normal and handler exits share an original join. Located joins
+        // surrender their predicted NOP only after the complete schedule is accepted.
+        let mut guarded_handler_joins = FxHashMap::default();
+        if self.python_version >= crate::PythonVersion::Py314 {
+            for &join in order {
+                let Some((Item::Instruction(jump), head)) = graph[join].items().split_last() else {
+                    continue;
+                };
+                let Some(label) = jump.forward_target() else {
+                    continue;
+                };
+                let Some(target) = graph.label_block(label) else {
+                    continue;
+                };
+                let Some(tail @ OriginalTail::LocalTupleReturn { .. }) =
+                    original_return_tail(label)
+                else {
+                    continue;
+                };
+                if head.is_empty()
+                    || !head.iter().all(|item| matches!(item, Item::Label(_)))
+                    || !head.iter().any(|item| matches!(item, Item::Label(label)
+                        if self.exception_owner_provenance.source_boundaries.contains(label)))
+                    || positions[&join] >= positions[&target]
+                    || self.exception_regions.iter().any(|region| {
+                        !region.is_scope_fallback && match (
+                            graph.label_block(region.start),
+                            graph.label_block(region.end),
+                        ) {
+                            (Some(start), Some(end)) => {
+                                [join, target].iter().any(|block|
+                                    (positions[&start]..positions[&end]).contains(&positions[block]))
+                            }
+                            _ => true,
+                        }
+                    })
+                    || !exits.values().any(|(_, target, pass)| *target == join && pass.is_none())
+                    || !graph[join].items().iter().any(|item| matches!(item,
+                        Item::Label(label) if self.exception_owner_provenance.original_handler_cleanup_join_exits.contains(label)))
+                    || graph[join].items().iter().any(|item| matches!(item,
+                        Item::Label(label) if self.borrow_block_aliases.contains(label)
+                            || self.folded_original_predecessor_targets.contains(label)
+                            || self.folded_condition_exit_targets.contains(label)
+                            || self.original_nop_targets.contains(label)
+                            || self.exception_owner_provenance.omitted_nop_counts.contains_key(label)
+                            || self.exception_owner_provenance.omitted_nop_locations.contains_key(label)
+                            || self.exception_owner_provenance.setups.iter().any(|(entry, _)| entry == label)
+                            || self.exception_regions.iter().any(|region| region.target == *label)))
+                {
+                    continue;
+                }
+                let mut expected = Instruction::new(
+                    JUMP_FORWARD,
+                    jump.operand(),
+                    jump.location,
+                    jump.depth_after(),
+                );
+                if jump.location == SourceLocation::NONE {
+                    expected.no_location_policy.preserve_location();
+                } else if jump.location.line >= 0 {
+                    expected.jump_policy.mark_original_empty_join();
+                    expected.jump_policy.retain_redundant_nop_after_threading();
+                    expected.no_location_policy.set_borrow_fallthrough(
+                        super::super::ir::BorrowFallthrough::RetainedNopReachable,
+                    );
+                } else {
+                    continue;
+                }
+                if *jump == expected {
+                    guarded_handler_joins.insert(join, (target, tail));
+                }
+            }
+        }
         // An unnamed handler's recorded original cleanup can connect two normal
         // try exits. Its omitted POP_BLOCK is already carried on POP_EXCEPT; keep
         // all three slots in the same closed schedule instead of threading around it.
@@ -3575,6 +3648,7 @@ impl OptimizationPipeline {
                     .original_handler_cleanup_join_exits
                     .contains(&label)
                 || (!exits.contains_key(&target)
+                    && !guarded_handler_joins.contains_key(&target)
                     && !matches!(returns.get(&target), Some(OriginalTail::LocalTupleReturn { .. })))
                 || positions[&block] >= positions[&target]
                 || !items[..head_len].iter().any(|item| {
@@ -3598,6 +3672,17 @@ impl OptimizationPipeline {
                 direct_handler_return_joins.insert(block);
             }
             joins.insert(block, target);
+        }
+        guarded_handler_joins.retain(|join, _| {
+            handler_cleanup_joins
+                .iter()
+                .any(|cleanup| joins.get(cleanup) == Some(join))
+        });
+        for &join in order {
+            if let Some(&(target, tail)) = guarded_handler_joins.get(&join) {
+                joins.insert(join, target);
+                returns.insert(target, tail);
+            }
         }
         // Named cleanup contains two original POP_BLOCK records before POP_EXCEPT.
         // Its complete source snapshot is necessary: an earlier handler arm can copy
@@ -3753,6 +3838,10 @@ impl OptimizationPipeline {
                     continue;
                 };
                 if pass.is_some() || original_jump_targets.contains(&exit) {
+                    continue;
+                }
+                if guarded_handler_joins.contains_key(&join) {
+                    private_joins.push(join);
                     continue;
                 }
                 let items = graph[join].items();
@@ -4211,6 +4300,11 @@ impl OptimizationPipeline {
                 .instructions_mut(block)
                 .next_back()
                 .expect("certified original empty join");
+            if guarded_handler_joins.contains_key(&block)
+                && jump.jump_policy.is_original_empty_join()
+            {
+                jump.jump_policy.consume_original_join_copy_prediction();
+            }
             jump.location = SourceLocation::NONE;
             jump.no_location_policy.clear_preserved_location();
             jump.no_location_policy.allow_block_inlining();
