@@ -37537,7 +37537,7 @@ pub(super) fn condition_jump_target_count(expression: &Expr, jump_on: bool) -> u
     1
 }
 
-/// Whether a runtime condition reaches this target through a comparison's POP_TOP cleanup.
+/// Whether a runtime condition reaches this target through a comparison's `POP_TOP` cleanup.
 fn condition_has_cleanup_jump_target(expression: &Expr, jump_on: bool) -> bool {
     if crate::stack_growth_required() {
         return crate::grow_stack(|| condition_has_cleanup_jump_target(expression, jump_on));
