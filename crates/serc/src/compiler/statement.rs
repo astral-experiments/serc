@@ -19716,16 +19716,27 @@ impl<'source> Compiler<'source> {
                     || copied_for_else_branch_exit)
                 && (!self.has_active_control_flow_region()
                     || condition_has_only_runtime_tests(&statement.test));
+            let managed_erased_iterator_exit = !non_final_branch
+                && self.control.in_loop_tail_without_nested_cleanup()
+                && self
+                    .control
+                    .loops
+                    .contexts
+                    .last()
+                    .is_some_and(|context| context.with_depth > 0)
+                && matches!(statement.test.as_ref(), Expr::BoolOp(_));
             if ((copied_loop_branch_exit && self.unit.flags & CO_COROUTINE == 0)
                 || (self.unit.flags & CO_COROUTINE != 0
                     && !non_final_branch
-                    && self.control.in_loop_tail_without_nested_cleanup()))
+                    && self.control.in_loop_tail_without_nested_cleanup())
+                || managed_erased_iterator_exit)
                 && self.context.python_version >= crate::PythonVersion::Py314
                 && !try_body_normal_exit
                 && statement.elif_else_clauses.is_empty()
                 && matches!(self.unit.scope, Scope::Function { .. })
                 && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
-                && self.control.withs.active_with_region_exclusions.is_empty()
+                && (self.control.withs.active_with_region_exclusions.is_empty()
+                    || managed_erased_iterator_exit)
                 && self
                     .control
                     .exceptions
@@ -19741,7 +19752,7 @@ impl<'source> Compiler<'source> {
                 && !expression_suspends_current_scope(&statement.test)
                 && condition_jump_target_count(&statement.test, true) > 1
                 && (condition_jump_target_count(&statement.test, false) == 1
-                    || (self.unit.flags & CO_COROUTINE != 0
+                    || ((self.unit.flags & CO_COROUTINE != 0 || managed_erased_iterator_exit)
                         && matches!(statement.test.as_ref(), Expr::BoolOp(_))
                         && condition_jump_target_count(&statement.test, false) > 1))
                 && !statement.body.is_empty()
@@ -19762,7 +19773,7 @@ impl<'source> Compiler<'source> {
                 self.assembler.set_location(SourceLocation::NONE);
                 let backedge = self.emit_loop_tail_backedge(restart, false)?;
                 self.assembler.mark_as_artificial_eval_break(backedge);
-                if self.unit.flags & CO_COROUTINE != 0 {
+                if self.unit.flags & CO_COROUTINE != 0 || managed_erased_iterator_exit {
                     self.assembler.record_last_original_loop_backedge();
                 }
                 return Ok(LoopBackedge::Emitted);
