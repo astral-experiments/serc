@@ -59,6 +59,45 @@ fn continue_copies_inner_cleanup_inside_an_enclosing_finalizer() {
 }
 
 #[test]
+fn conditional_manager_preserves_shared_subscript_return() {
+    let source = r"def sample(key, root, cache):
+    try:
+        if key:
+            with root:
+                pass
+        else:
+            work()
+    except Exception:
+        pass
+    return cache[key]
+";
+    for (name, source) in [
+        ("subscript", source.to_owned()),
+        ("tuple", source.replace("cache[key]", "(cache, key)")),
+        ("name", source.replace("cache[key]", "cache")),
+        ("constant", source.replace("cache[key]", "None")),
+        ("call", source.replace("cache[key]", "cache(key)")),
+        (
+            "final_arm",
+            source.replace(
+                "            with root:\n                pass\n        else:\n            work()",
+                "            work()\n        else:\n            with root:\n                pass",
+            ),
+        ),
+        (
+            "no_outer_try",
+            "def sample(key, root, cache):\n    if key:\n        with root:\n            pass\n    else:\n        work()\n    return cache[key]\n".to_owned(),
+        ),
+    ] {
+        assert_matches_cpython(
+            &source,
+            &format!("conditional_manager_return_{name}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn named_handler_returns_preserve_outer_finalizer_owners() {
     let source = r"def named_nested(choice, item, owner, operation, cleanup, recover):
     value = None

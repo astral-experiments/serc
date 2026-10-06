@@ -3318,6 +3318,7 @@ impl OptimizationPipeline {
             let items = graph[block].items();
             let tail = original_local_tuple_return(items)
                 .map(|located| OriginalTail::LocalTupleReturn { located })
+                .or_else(|| original_local_subscript_return(items))
                 .or_else(|| original_computed_return(items))
                 .or_else(|| {
                     handler_continuations
