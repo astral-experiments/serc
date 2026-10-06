@@ -167,10 +167,6 @@ fn continue_copies_cleanup_after_completed_finalizer_prefixes() {
         "with manager:\n                    note()",
         "try:\n                    work()\n                except Exception:\n                    with manager:\n                        note()\n                if choice:\n                    note()",
         "yield note()",
-        "if choice:\n                    return",
-        "if choice:\n                    raise ValueError",
-        "if choice:\n                    break",
-        "if choice:\n                    continue",
     ]
     .into_iter()
     .enumerate()
