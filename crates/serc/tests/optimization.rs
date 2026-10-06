@@ -836,6 +836,56 @@ fn erased_final_else_suffix_preserves_coroutine_loop_exits() {
 }
 
 #[test]
+fn coroutine_for_else_return_keeps_shared_branch_exit() {
+    let source = r"async def sample(items, step, flag, left, right, third, work):
+    for item in items:
+        event = await step(item)
+        if event is None:
+            break
+        if flag:
+            value = event.value
+            if left == work(value) and right == value.kind and third:
+                return value.result
+        elif event.other:
+            work(event)
+    else:
+        return None
+    return False
+";
+    for (name, source) in [
+        ("and", source.to_owned()),
+        ("two_leaves", source.replace(" and third", "")),
+        ("or", source.replace(" and ", " or ")),
+        (
+            "single",
+            source.replace(
+                "left == work(value) and right == value.kind and third",
+                "left",
+            ),
+        ),
+        (
+            "no_loop_else",
+            source.replace("    else:\n        return None\n", ""),
+        ),
+        (
+            "synchronous",
+            source.replace("async def", "def").replace("await ", ""),
+        ),
+        ("no_await", source.replace("await ", "")),
+        (
+            "return_call",
+            source.replace("return value.result", "return work(value)"),
+        ),
+    ] {
+        assert_matches_cpython(
+            &source,
+            &format!("coroutine_for_else_return_{name}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn erased_coroutine_final_elif_preserves_shared_backedge() {
     let source = r"async def sample(items, manager, verify):
     async with manager():

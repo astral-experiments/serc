@@ -19955,6 +19955,31 @@ impl<'source> Compiler<'source> {
             // Exhaustion enters a for-else suite separately from the continuing
             // backedge. Keep its unprotected compound false edges on one forward exit.
             // Erased coroutine arms retain that exit under the loop's saved owners.
+            // With no intervening cleanup, a live coroutine return keeps the
+            // non-final arm's false edges on their original forward exit.
+            let copied_coroutine_for_else_return = self.context.python_version
+                >= crate::PythonVersion::Py314
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                    == CO_COROUTINE
+                && self.control.withs.active_with_exits.is_empty()
+                && self.control.withs.active_with_region_exclusions.is_empty()
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty()
+                && !self.control.in_exception_handler()
+                && self.control.finally.is_inactive_for_return_unwind()
+                && statement.elif_else_clauses.is_empty()
+                && condition_has_linear_runtime_leaves(&statement.test)
+                && !expression_suspends_current_scope(&statement.test)
+                && !expression_yields_in_current_scope(&statement.test)
+                && matches!(statement.body.as_slice(), [Stmt::Return(returned)]
+                if returned.value.as_deref().is_none_or(|value| {
+                    !expression_contains_inline_branch(value)
+                        && !expression_suspends_current_scope(value)
+                        && !expression_yields_in_current_scope(value)
+                }));
             let copied_for_else_branch_exit = non_final_branch
                 && self.control.loops.contexts.last().is_some_and(|context| {
                     context.has_orelse
@@ -19988,7 +20013,8 @@ impl<'source> Compiler<'source> {
                         && statement
                             .body
                             .iter()
-                            .all(|part| self.context.is_elided_statement(part))));
+                            .all(|part| self.context.is_elided_statement(part)))
+                    || copied_coroutine_for_else_return);
             let copied_loop_branch_exit = non_final_branch
                 && (self.control.in_loop_tail_without_nested_cleanup()
                     || copied_for_else_branch_exit)
