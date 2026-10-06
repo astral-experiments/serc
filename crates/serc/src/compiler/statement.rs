@@ -19286,23 +19286,38 @@ impl<'source> Compiler<'source> {
         let original_optimized_empty_else = eligible_else
             && statement.elif_else_clauses.len() == 1
             && !self.has_active_control_flow_region();
+        let nested_finally_erased_else = matches!(self.unit.scope, Scope::Function { .. })
+            && self.control.finally.active_finally_try_bodies > 1
+            && self.control.finally.active_finally_try_bodies
+                == self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .len()
+            && !statement.body.is_empty()
+            && statement
+                .body
+                .iter()
+                .all(|part| self.context.is_elided_statement(part))
+            && self.control.in_loop_tail_without_nested_cleanup();
         let protected_finally_loop_else = eligible_else
             && statement.elif_else_clauses.len() == 1
             && leading.is_empty()
             && matches!(statement.test.as_ref(), Expr::Name(_))
             && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
-            && self.control.finally.active_finally_try_bodies == 1
-            && self
-                .control
-                .exceptions
-                .active_exception_region_exclusions
-                .len()
-                == 1
+            && ((self.control.finally.active_finally_try_bodies == 1
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .len()
+                    == 1)
+                || nested_finally_erased_else)
             && self.control.loops.contexts.last().is_some_and(|context| {
                 context.continue_label == restart
                     && context.iterator_cleanup == IteratorCleanup::Sync
                     && !context.has_orelse
-                    && context.exception_region_depth == 1
+                    && (context.exception_region_depth == 1 || nested_finally_erased_else)
                     && context.with_depth == self.control.withs.active_with_exits.len()
                     && context.finally_end_depth == self.control.finally.active_finally_end_blocks
                     && self.assembler.instruction_count() == context.body_start

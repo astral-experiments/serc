@@ -15,6 +15,57 @@ use serc::{
 };
 
 #[test]
+fn erased_branches_preserve_nested_finalizer_loop_exits() {
+    let source = r"def sample(items, flag, check, manager, finish):
+    try:
+        with manager():
+            try:
+                for item in items:
+                    if flag:
+                        assert check(item)
+                    else:
+                        assert not check(item)
+            finally:
+                finish()
+    finally:
+        finish()
+";
+    let single = r"def sample(items, flag, check, manager, finish):
+    with manager():
+        try:
+            for item in items:
+                if flag:
+                    assert check(item)
+                else:
+                    assert not check(item)
+        finally:
+            finish()
+";
+    let plain = r"def sample(items, flag, check, manager, finish):
+    for item in items:
+        if flag:
+            assert check(item)
+        else:
+            assert not check(item)
+";
+    for (name, source) in [
+        ("nested", source.to_owned()),
+        ("single", single.to_owned()),
+        ("plain", plain.to_owned()),
+        (
+            "live_else",
+            source.replace("assert not check(item)", "check(item)"),
+        ),
+    ] {
+        assert_matches_cpython(
+            &source,
+            &format!("nested_finalizer_erased_branch_{name}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn erased_prefix_preserves_conditional_continue_exit() {
     let source = r#"async def sample(items, selected, verify):
     for item in items:
