@@ -16874,6 +16874,20 @@ impl<'source> Compiler<'source> {
                     && !context.has_orelse
                     && context.continue_label == restart
             });
+        let final_async_iterator_arm = mode == LoopTailMode::default()
+            && split_short_circuit
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && self.control.in_loop_tail_without_nested_cleanup()
+            && self.control.loops.contexts.last().is_some_and(|context| {
+                context.iterator_cleanup == IteratorCleanup::Async
+                    && !context.has_orelse
+                    && context.continue_label == restart
+            });
         let erased_final_else = |statement: &ruff_python_ast::StmtIf| {
             !mode.non_final_branch
                 && final_coroutine_iterator_arm
@@ -16921,7 +16935,11 @@ impl<'source> Compiler<'source> {
                         && body[end + 1..].iter().all(|suffix| self.context.is_elided_statement(suffix)))
                     // Iterator arms keep both inner exits when their erased
                     // suffix sits under the surrounding loop owner.
-                    || ((mode.non_final_branch || final_coroutine_iterator_arm)
+                    || ((mode.non_final_branch
+                        || final_coroutine_iterator_arm
+                        || (final_async_iterator_arm
+                            && original_condition_has_unique_jump_target(&statement.test, true)
+                            && original_condition_has_unique_jump_target(&statement.test, false)))
                         && !mode.try_body_normal_exit
                         && self.has_active_control_flow_region()
                         && !self.control.in_exception_handler()
@@ -19232,6 +19250,43 @@ impl<'source> Compiler<'source> {
                     == 0)
     }
 
+    /// Certifies completed iterator work whose remaining branches only guard erased suites.
+    fn suite_has_completed_erased_iterator_work(&self, body: &[Stmt]) -> bool {
+        if crate::stack_growth_required() {
+            return crate::grow_stack(|| self.suite_has_completed_erased_iterator_work(body));
+        }
+        body.iter().all(|statement| {
+            self.context.is_elided_statement(statement)
+                || matches!(statement, Stmt::Pass(_))
+                || match statement {
+                    Stmt::If(branch) => {
+                        branch.elif_else_clauses.is_empty()
+                            && !branch.body.is_empty()
+                            && branch.body.iter().all(|part| self.context.is_elided_statement(part))
+                            && condition_has_only_runtime_tests(&branch.test)
+                            && condition_has_linear_runtime_leaves(&branch.test)
+                            && !expression_suspends_current_scope(&branch.test)
+                            && !expression_yields_in_current_scope(&branch.test)
+                            && original_condition_has_unique_jump_target(&branch.test, true)
+                            && original_condition_has_unique_jump_target(&branch.test, false)
+                    }
+                    Stmt::For(inner) => {
+                        !inner.is_async
+                            && inner.orelse.is_empty()
+                            && (matches!(inner.target.as_ref(), Expr::Name(_))
+                                || matches!(inner.target.as_ref(), Expr::Tuple(tuple)
+                                    if !tuple.elts.is_empty()
+                                        && tuple.elts.iter().all(|item| matches!(item, Expr::Name(_)))))
+                            && !expression_contains_inline_branch(&inner.iter)
+                            && !expression_suspends_current_scope(&inner.iter)
+                            && !expression_yields_in_current_scope(&inner.iter)
+                            && self.suite_has_completed_erased_iterator_work(&inner.body)
+                    }
+                    _ => false,
+                }
+        })
+    }
+
     fn compile_loop_tail_if(
         &mut self,
         statement: &ruff_python_ast::StmtIf,
@@ -19573,7 +19628,17 @@ impl<'source> Compiler<'source> {
                                         || inner.body.iter().all(|part| {
                                             self.context.is_elided_statement(part)
                                                 || matches!(part, Stmt::Pass(_))
-                                        })))
+                                        })
+                                        || (completed_work_at_restart
+                                            && (matches!(inner.target.as_ref(), Expr::Name(_))
+                                                || matches!(inner.target.as_ref(), Expr::Tuple(tuple)
+                                                    if !tuple.elts.is_empty()
+                                                        && tuple.elts.iter().all(|item| matches!(item, Expr::Name(_)))))
+                                            && self.control.loops.contexts.last().is_some_and(|context| {
+                                                context.iterator_cleanup == IteratorCleanup::Sync
+                                                    && !context.has_orelse
+                                            })
+                                            && self.suite_has_completed_erased_iterator_work(&inner.body))))
                             || matches!(statement, Stmt::If(branch)
                                 if (branch.elif_else_clauses.is_empty()
                                     || branch.elif_else_clauses.last().is_some_and(|clause| clause.test.is_none()))

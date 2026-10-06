@@ -141,6 +141,91 @@ fn chained_comparison_try_exit_preserves_borrow_fallthrough() {
 }
 
 #[test]
+fn erased_suffix_preserves_async_iterator_branch_exits() {
+    let source = r"async def sample(source, known, saved, convert, manager, check):
+    async with manager():
+        async for item in source:
+            value = convert(item)
+            if value in known:
+                saved.append(value)
+            assert not await check(item)
+        assert saved
+";
+    let unmanaged = r"async def sample(source, known, saved, convert, manager, check):
+    async for item in source:
+        value = convert(item)
+        if value in known:
+            saved.append(value)
+        assert not await check(item)
+    assert saved
+";
+    for (name, source) in [
+        ("managed", source.to_owned()),
+        ("unmanaged", unmanaged.to_owned()),
+        ("name_test", source.replace("value in known", "known")),
+        (
+            "plain_assert",
+            source.replace("not await check", "not check"),
+        ),
+        (
+            "no_suffix",
+            source.replace("            assert not await check(item)\n", ""),
+        ),
+        (
+            "sync_iterator",
+            source.replace("async for item", "for item"),
+        ),
+    ] {
+        assert_matches_cpython(
+            &source,
+            &format!("async_iterator_erased_suffix_{name}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
+fn erased_nested_iterator_work_preserves_shared_exit() {
+    let source = r"async def sample(items, flag, manager, load, check):
+    with manager:
+        for item in items:
+            with manager:
+                value = await load(item)
+            assert check(value)
+            if flag in value:
+                graph = value[flag]
+                for node in graph:
+                    if node.parent is not None:
+                        assert check(node.parent)
+                    for child in node.children:
+                        assert check(child)
+            else:
+                assert check(value)
+";
+    for (name, source) in [
+        ("base", source.to_owned()),
+        (
+            "no_prefix",
+            source.replace("            with manager:\n                value = await load(item)\n            assert check(value)\n", "            value = item\n"),
+        ),
+        (
+            "single_inner_loop",
+            source.replace("                    for child in node.children:\n                        assert check(child)\n", ""),
+        ),
+        ("sync", source.replace("async def", "def").replace("await load(item)", "load(item)")),
+        ("tuple_target", source.replace("for node in graph:", "for key, node in graph.items():")),
+        (
+            "direct_call",
+            source.replace("                graph = value[flag]\n                for node in graph:\n                    if node.parent is not None:\n                        assert check(node.parent)\n                    for child in node.children:\n                        assert check(child)\n", "                check(value)\n"),
+        ),
+        ("no_else", source.replace("            else:\n                assert check(value)\n", "")),
+        ("live_else", source.replace("            else:\n                assert check(value)\n", "            else:\n                check(value)\n")),
+    ] {
+        assert_matches_cpython(&source, &format!("nested_erased_iterator_{name}.py"), &LEVELS);
+    }
+}
+
+#[test]
 fn erased_branches_preserve_nested_finalizer_loop_exits() {
     let source = r"def sample(items, flag, check, manager, finish):
     try:
