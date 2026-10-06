@@ -7289,6 +7289,14 @@ impl<'source> Compiler<'source> {
                                                     && handler.exception_region_depth == 1)
                                             && self.control.exceptions.active_exception_region_exclusions.len() == 2)
                                 }
+                                Expr::UnaryOp(unary) => {
+                                    context.iterator_cleanup == IteratorCleanup::None
+                                        && self.unit.flags
+                                            & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                                            == CO_COROUTINE
+                                        && unary.op == UnaryOp::Not
+                                        && matches!(unary.operand.as_ref(), Expr::Name(_))
+                                }
                                 Expr::Compare(comparison) => {
                                     context.iterator_cleanup == IteratorCleanup::None
                                         && matches!(comparison.first_operand(), Expr::Name(_))
@@ -7301,7 +7309,10 @@ impl<'source> Compiler<'source> {
                             }
                             && matches!(tail.body.as_slice(), [Stmt::Try(recovery)]
                                 if !recovery.is_star && recovery.finalbody.is_empty()))
-                        .then(|| tail.test.range())
+                        .then(|| match tail.test.as_ref() {
+                            Expr::UnaryOp(unary) => unary.operand.range(),
+                            _ => tail.test.range(),
+                        })
                     })
                     .flatten()
                     .map(|range| self.source_location(range));
