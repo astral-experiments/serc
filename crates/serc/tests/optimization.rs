@@ -124,6 +124,38 @@ fn conditional_raise_exits_keep_compound_finalizers_ownerless() {
 }
 
 #[test]
+fn coroutine_awaited_branches_preserve_recovery_finalizer_borrowing() {
+    let source = r"async def sample(value, state, ready):
+    failed = False
+    try:
+        await prepare()
+        if value is None:
+            prior = await action()
+            if ready:
+                check(prior)
+            else:
+                check(value)
+            await verify(prior)
+        elif value != state.key:
+            async with manager():
+                prior = await load(await lookup(value))
+            await verify(prior)
+    except Exception:
+        failed = True
+        await recover()
+        raise
+    finally:
+        try:
+            await finish(value=value, state=state, failed=failed)
+        except Exception:
+            if not failed:
+                raise
+            recover_cleanup()
+";
+    assert_matches_cpython(source, "coroutine_await_recovery.py", &LEVELS);
+}
+
+#[test]
 fn coroutine_conditional_stores_preserve_recovery_finalizer_borrowing() {
     let source = r#"async def sample(value, state, ready):
     tag = "unset"
