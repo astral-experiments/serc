@@ -15,6 +15,41 @@ use serc::{
 };
 
 #[test]
+fn erased_coroutine_final_elif_preserves_shared_backedge() {
+    let source = r"async def sample(items, manager, verify):
+    async with manager():
+        for item in items:
+            if item.ready():
+                assert verify(item)
+            elif item.kind == 2 or item.matches():
+                assert verify(item)
+";
+    for (name, source) in [
+        ("async_manager", source.to_owned()),
+        (
+            "nested",
+            source.replace(
+                "            elif item.kind == 2 or item.matches():\n                assert verify(item)",
+                "            else:\n                if item.kind == 2 or item.matches():\n                    assert verify(item)",
+            ),
+        ),
+        (
+            "plain",
+            source
+                .replace("    async with manager():\n", "")
+                .replace("\n    ", "\n"),
+        ),
+        (
+            "live_first",
+            source.replacen("assert verify(item)", "verify(item)", 1),
+        ),
+        ("live_suffix", format!("{source}            verify(item)\n")),
+    ] {
+        assert_matches_cpython(&source, &format!("erased_final_elif_{name}.py"), &LEVELS);
+    }
+}
+
+#[test]
 fn managed_mixed_erased_iterator_guard_preserves_shared_backedge() {
     let source = r"def sample(items, manager, check):
     with manager():
