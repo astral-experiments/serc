@@ -19775,7 +19775,12 @@ impl<'source> Compiler<'source> {
                 && self.control.loops.contexts.last().is_some_and(|context| {
                     context.iterator_cleanup == IteratorCleanup::Sync && !context.has_orelse
                 })
-                && condition_has_linear_runtime_leaves(&statement.test)
+                && (condition_has_linear_runtime_leaves(&statement.test)
+                    || (self.unit.flags & CO_COROUTINE != 0
+                        && condition_has_completed_call_leaves(
+                            &statement.test,
+                            self.context.python_version,
+                        )))
                 && condition_has_only_runtime_tests(&statement.test)
                 && !expression_suspends_current_scope(&statement.test)
                 && condition_jump_target_count(&statement.test, true) > 1
