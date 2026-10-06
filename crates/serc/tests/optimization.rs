@@ -11554,3 +11554,18 @@ fn copied_return_cleanup_preserves_earlier_loop_exclusions() {
         );
     }
 }
+
+#[test]
+fn nested_iterator_value_return_preserves_cleanup_exit_locations() {
+    let source = "def sample(items, action):\n    for outer in items:\n        for inner in items:\n            try:\n                return []\n            finally:\n                try:\n                    action()\n                except Exception:\n                    action()\n    return []\n";
+    for (name, source) in [
+        ("value", source.to_owned()),
+        ("bare", source.replacen("return []", "return", 1)),
+        (
+            "one_loop",
+            source.replace("    for outer in items:", "    if items:"),
+        ),
+    ] {
+        assert_matches_cpython(&source, &format!("nested_iterator_exit_{name}.py"), &LEVELS);
+    }
+}
