@@ -226,6 +226,37 @@ fn erased_nested_iterator_work_preserves_shared_exit() {
 }
 
 #[test]
+fn copied_conditional_backedge_preserves_outer_handler() {
+    let source = "def sample(stop, action, other, recover, outer_recover, flag):\n    try:\n        while not stop():\n            if flag:\n                return\n            try:\n                action() if flag else other()\n            except ValueError:\n                recover()\n    except Exception:\n        outer_recover()\n";
+    for source in [
+        source.to_owned(),
+        source.replace(
+            "        while not stop():",
+            "        try:\n            action()\n        except KeyError:\n            recover()\n        while not stop():",
+        ),
+        "def sample(stop, action, other, recover, outer_recover, flag):\n    while not stop():\n        if flag:\n            return\n        try:\n            action() if flag else other()\n        except ValueError:\n            recover()\n".to_owned(),
+        source.replace("            if flag:\n                return\n", ""),
+        source.replace(
+            "action() if flag else other()",
+            "value = action() if flag else other()",
+        ),
+        source.replace(
+            "                action() if flag else other()",
+            "                if flag:\n                    action()\n                else:\n                    other()",
+        ),
+        source.replace("action() if flag else other()", "action()"),
+        source
+            .replace("outer_recover, flag):", "outer_recover, flag, manager, items):")
+            .replace(
+                "            if flag:\n                return",
+                "            if flag:\n                with manager:\n                    values = {key: list(value) for key, value in items}\n                if values:\n                    try:\n                        action()\n                    except LookupError:\n                        recover()\n                return",
+            ),
+    ] {
+        assert_matches_cpython(&source, "conditional_recovery.py", &LEVELS);
+    }
+}
+
+#[test]
 fn erased_branches_preserve_nested_finalizer_loop_exits() {
     let source = r"def sample(items, flag, check, manager, finish):
     try:
