@@ -26888,7 +26888,16 @@ impl<'source> Compiler<'source> {
                     .preserve_no_location(normal_exit.instruction());
             }
             if unlocated_conditional_exit {
-                self.assembler.prevent_borrow_reachability(end);
+                // A comparison cleanup copies this exit into its nonempty POP_TOP
+                // block, keeping the continuation reachable for borrowed loads.
+                let cleanup_reaches_exit = matches!(statement.body.last(), Some(Stmt::If(branch))
+                if terminating_if_fallthrough_test(branch).is_some_and(|test| {
+                    condition_has_only_runtime_tests(test)
+                        && condition_has_cleanup_jump_target(test, false)
+                }));
+                if !cleanup_reaches_exit {
+                    self.assembler.prevent_borrow_reachability(end);
+                }
                 self.assembler
                     .preserve_no_location(normal_exit.instruction());
             }
@@ -37526,6 +37535,33 @@ pub(super) fn condition_jump_target_count(expression: &Expr, jump_on: bool) -> u
         return 2;
     }
     1
+}
+
+/// Whether a runtime condition reaches this target through a comparison's POP_TOP cleanup.
+fn condition_has_cleanup_jump_target(expression: &Expr, jump_on: bool) -> bool {
+    if crate::stack_growth_required() {
+        return crate::grow_stack(|| condition_has_cleanup_jump_target(expression, jump_on));
+    }
+    match expression {
+        Expr::UnaryOp(unary) if unary.op == UnaryOp::Not => {
+            condition_has_cleanup_jump_target(&unary.operand, !jump_on)
+        }
+        Expr::BoolOp(boolean) => {
+            if matches!(boolean.op, BoolOp::Or) == jump_on {
+                boolean
+                    .values
+                    .iter()
+                    .any(|value| condition_has_cleanup_jump_target(value, jump_on))
+            } else {
+                boolean
+                    .values
+                    .last()
+                    .is_some_and(|last| condition_has_cleanup_jump_target(last, jump_on))
+            }
+        }
+        Expr::Compare(comparison) => !jump_on && comparison.ops.len() > 1,
+        _ => false,
+    }
 }
 
 // The first line-resolution pass sees the predecessors from codegen_jump_if, including

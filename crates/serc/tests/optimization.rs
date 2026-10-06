@@ -60,6 +60,87 @@ fn recovery_finalizer_preserves_local_return_borrow_boundary() {
 }
 
 #[test]
+fn chained_comparison_try_exit_preserves_borrow_fallthrough() {
+    let source = r"def sample(items, action, guard, recover):
+    for item in items:
+        try:
+            left, right = action()
+            if left < item < right:
+                return left, right
+        except ValueError:
+            pass
+        if item:
+            recover()
+    return None
+";
+    for (name, condition) in [
+        ("chain", "left < item < right"),
+        ("and_names", "left and right"),
+        ("or_names", "left or right"),
+        ("and_calls", "guard(left) and guard(right)"),
+        ("and_compares", "left == item and right is not None"),
+        ("chain_and_head", "guard(left) and left < item < right"),
+        (
+            "chain_and_middle",
+            "guard(left) and left < item < right and guard(right)",
+        ),
+        ("chain_and_tail", "left < item < right and guard(right)"),
+        ("chain_or_head", "guard(left) or left < item < right"),
+        ("chain_or_tail", "left < item < right or guard(right)"),
+        ("chain_negated", "not (left < item < right)"),
+    ] {
+        assert_matches_cpython(
+            &source.replace("left < item < right", condition),
+            &format!("chained_comparison_recovery_{name}.py"),
+            &LEVELS,
+        );
+    }
+    let conjunction = source.replace("left < item < right", "left and right");
+    for (name, source) in [
+        (
+            "and_prefix",
+            conjunction.replace(
+                "            left, right = action()\n",
+                "            recover()\n            left, right = action()\n",
+            ),
+        ),
+        (
+            "and_scalar",
+            conjunction.replace("return left, right", "return left"),
+        ),
+        (
+            "and_no_tail_guard",
+            conjunction.replace(
+                "        if item:\n            recover()\n",
+                "        recover()\n",
+            ),
+        ),
+        (
+            "chain_scalar",
+            source.replace("return left, right", "return left"),
+        ),
+        (
+            "chain_and_no_tail_guard",
+            source
+                .replace(
+                    "left < item < right",
+                    "left < item < right and guard(right)",
+                )
+                .replace(
+                    "        if item:\n            recover()\n",
+                    "        recover()\n",
+                ),
+        ),
+    ] {
+        assert_matches_cpython(
+            &source,
+            &format!("chained_comparison_recovery_{name}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn erased_branches_preserve_nested_finalizer_loop_exits() {
     let source = r"def sample(items, flag, check, manager, finish):
     try:
