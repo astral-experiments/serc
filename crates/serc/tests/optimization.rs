@@ -38,6 +38,37 @@ fn compound_finalizer_conditions_preserve_retired_handler_slots() {
 }
 
 #[test]
+fn handler_return_keeps_outer_finalizer_owner_through_iterator_cleanup() {
+    let source = r"async def sample(items, flag):
+    try:
+        for item in items:
+            try:
+                await work(item)
+            except ValueError as error:
+                if flag:
+                    return False
+            finally:
+                finish(item)
+    finally:
+        await finish(flag)
+";
+    for (index, source) in [
+        source.to_owned(),
+        source.replace("return False", "return flag"),
+        source.replace("return False", "return"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            &source,
+            &format!("nested_finalizer_iterator_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn return_retires_inner_try_before_iterator_after_finalizer_and_manager() {
     let source = r"async def sample(items, manager, ready):
     for item in items:
