@@ -12852,7 +12852,10 @@ impl<'source> Compiler<'source> {
                         protected_outer_iterator_start,
                         deferred_outer_iterator_depth,
                         preserve_tos,
-                        if tracks_iterator_region_unwinds || unwinds_handler_and_with {
+                        if tracks_iterator_region_unwinds
+                            || tracks_finally_region_unwinds
+                            || unwinds_handler_and_with
+                        {
                             handler_region_unwind_starts.as_deref_mut()
                         } else {
                             None
@@ -12873,7 +12876,10 @@ impl<'source> Compiler<'source> {
                         0,
                         protected_outer_iterator_start,
                         preserve_tos,
-                        if tracks_iterator_region_unwinds || unwinds_handler_and_with {
+                        if tracks_iterator_region_unwinds
+                            || tracks_finally_region_unwinds
+                            || unwinds_handler_and_with
+                        {
                             handler_region_unwind_starts.as_deref_mut()
                         } else {
                             None
