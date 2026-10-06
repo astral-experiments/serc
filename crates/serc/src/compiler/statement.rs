@@ -31884,6 +31884,27 @@ impl<'source> Compiler<'source> {
                 && matches!(branch.elif_else_clauses.as_slice(), [clause]
                     if clause.test.is_none()
                         && suite_has_linear_borrow_fallthrough(&clause.body)));
+        // An elif keeps the first arm's jump even without a final else. Its
+        // populated recovery entry remains reachable after handlers move cold.
+        let elif_recovery_entry = self.context.python_version == crate::PythonVersion::Py314
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && !self.has_active_control_flow_region()
+            && !self.control.in_exception_handler()
+            && self.control.finally.is_inactive_for_return_unwind()
+            && self.suite_has_nonempty_borrow_entry(&statement.finalbody)
+            && matches!(statement.finalbody.as_slice(), [Stmt::Try(cleanup)]
+                if !cleanup.is_star
+                    && cleanup.orelse.is_empty()
+                    && cleanup.finalbody.is_empty()
+                    && suite_has_nonsuspending_linear_fallthrough(&cleanup.body))
+            && matches!(statement.body.last(), Some(Stmt::If(branch))
+            if suite_has_nonsuspending_linear_fallthrough(&branch.body)
+                && branch.elif_else_clauses.iter().all(|clause| {
+                    suite_has_nonsuspending_linear_fallthrough(&clause.body)
+                }));
         // A live linear arm before the final else keeps a reachable jump directly
         // into normal cleanup after handlers move cold. Folded assertions can leave
         // that jump behind an empty block, so a merely nonterminal arm is insufficient.
@@ -31938,7 +31959,9 @@ impl<'source> Compiler<'source> {
             && matches!(statement.body.last(), Some(Stmt::If(conditional))
             if condition_has_only_runtime_tests(&conditional.test)
                 && !expression_contains_inline_branch(&conditional.test)
-                && conditional.elif_else_clauses.last().is_some_and(|clause| clause.test.is_none())
+                && conditional.elif_else_clauses.last().is_some_and(|clause| {
+                    clause.test.is_none() || elif_recovery_entry
+                })
                 && !suite_contains_abrupt_control_flow(&conditional.body)
                 && conditional.elif_else_clauses.iter().all(|clause| {
                     clause.test.as_ref().is_none_or(|test| {

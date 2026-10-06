@@ -15,6 +15,31 @@ use serc::{
 };
 
 #[test]
+fn elif_branches_preserve_recovery_finalizer_borrowing() {
+    let source = r"def sample(value, state):
+    try:
+        if value is None:
+            action()
+        elif value != state:
+            action()
+    except Exception:
+        pass
+    finally:
+        try:
+            action(value, state)
+        except Exception:
+            pass
+";
+    for handler in ["pass", "recover()"] {
+        assert_matches_cpython(
+            &source.replace("        pass", &format!("        {handler}")),
+            &format!("elif_recovery_finalizer_{handler}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn async_loop_else_preserves_finalizer_borrow_boundary() {
     let source = r#"async def sample(value):
     if mode is not None:
