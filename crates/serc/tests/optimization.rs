@@ -290,6 +290,69 @@ fn raising_finalizer_preserves_handler_return_iterator_owner() {
 }
 
 #[test]
+fn copied_iterator_break_joins_guarded_handler_exits() {
+    let source = r"def nested_cleanup(groups, skip, retry, stop, acquire, transform, close, done):
+    for batch in groups:
+        finished = False
+        for item in batch:
+            if item is None or skip(item):
+                continue
+            ticket = None
+            try:
+                ticket = acquire(item)
+                if ticket is None or retry(ticket):
+                    continue
+                result = transform(ticket)
+                if result is None or retry(result):
+                    continue
+                finished = stop(result)
+                if finished:
+                    break
+            except ValueError:
+                continue
+            finally:
+                if ticket is not None:
+                    try:
+                        close(ticket)
+                    except RuntimeError:
+                        pass
+        if finished:
+            done(batch)
+            return
+";
+    let single_loop = source
+        .lines()
+        .enumerate()
+        .fold(String::new(), |mut text, (index, line)| {
+            if index == 1 {
+                writeln!(text, "    batch = groups").unwrap();
+            } else {
+                let line = if index > 1 {
+                    line.strip_prefix("    ").unwrap_or(line)
+                } else {
+                    line
+                };
+                writeln!(text, "{line}").unwrap();
+            }
+            text
+        });
+    for (index, source) in [
+        source.to_owned(),
+        source.replace("                    break", "                    continue"),
+        single_loop,
+        source.replace(
+            "                if ticket is not None:\n                    try:\n                        close(ticket)\n                    except RuntimeError:\n                        pass",
+            "                try:\n                    close(ticket)\n                except RuntimeError:\n                    pass",
+        ),
+        include_str!(
+            "fixtures/compatibility/copied_finally_break_threading/matches_cpython_marshal_for_guarded_try_finally_iterator_breaks/guarded_body_and_handler_break_none_guard.py"
+        ).to_owned(),
+    ].into_iter().enumerate() {
+        assert_matches_cpython(&source, &format!("guarded_handler_iterator_{index}.py"), &LEVELS);
+    }
+}
+
+#[test]
 fn recovery_finalizer_preserves_local_return_borrow_boundary() {
     let source = r"def sample(items, work, recover, cleanup, valid):
     for item in items:

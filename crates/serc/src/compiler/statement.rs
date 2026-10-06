@@ -6781,7 +6781,10 @@ impl<'source> Compiler<'source> {
                     self.assembler.set_location(location);
                 }
                 let copied_finally_try_iterator_entry = (copied_finally_try_iterator_join
-                    && self.assembler.at_original_shared_finally_iterator_join())
+                    && self.assembler.at_original_shared_finally_iterator_join(
+                        finally_unwind_start,
+                        copied_finally_iterator_handler,
+                    ))
                 .then(|| self.assembler.item_count());
                 self.emit_iterator_cleanup(context.iterator_cleanup, false)?;
                 if copied_finalizer_location.is_some() {

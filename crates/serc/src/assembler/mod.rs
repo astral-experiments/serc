@@ -3340,9 +3340,144 @@ impl Assembler {
         self.original_shared_handler_join(&[POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE], false)
     }
 
-    /// Certifies a copied finalizer join that includes an exactly recorded named cleanup.
-    pub(crate) fn at_original_shared_finally_iterator_join(&self) -> bool {
+    /// Certifies a copied finalizer join before its iterator discard is appended.
+    pub(crate) fn at_original_shared_finally_iterator_join(
+        &self,
+        unwind_start: usize,
+        named_handler: bool,
+    ) -> bool {
         self.original_shared_handler_join(&[], true)
+            || (!named_handler && self.original_guarded_handler_iterator_join(unwind_start))
+    }
+
+    /// Checks a guarded try's normal and handled exits beside its terminating cold cleanup.
+    fn original_guarded_handler_iterator_join(&self, unwind_start: usize) -> bool {
+        let items = self.linear_items();
+        let labels = trailing_labels(items).collect::<Vec<_>>();
+        let provenance = &self.exception_owner_provenance;
+        if self.python_version < crate::PythonVersion::Py314
+            || labels.len() != 2
+            || self.join_labels_have_authored_location(&labels)
+            || self.current_join_has_located_compacted_predecessor()
+            || labels.iter().any(|label| {
+                !provenance.source_boundaries.contains(label)
+                    || !provenance.block_boundaries.contains(label)
+                    || provenance.omitted_nop_counts.contains_key(label)
+                    || provenance.omitted_nop_locations.contains_key(label)
+                    || self.preserved_block_boundaries.contains(label)
+                    || self.folded_away_condition_targets.contains(label)
+                    || self.folded_away_loop_else_targets.contains(label)
+                    || self.folded_condition_exit_targets.contains(label)
+                    || items
+                        .iter()
+                        .filter(|item| **item == Item::Label(*label))
+                        .count()
+                        != 1
+            })
+        {
+            return false;
+        }
+        let end = items.len() - labels.len();
+        let Some(cold_start) = end.checked_sub(3) else {
+            return false;
+        };
+        let mut incoming = items.iter().enumerate().filter_map(|(index, item)| match item {
+            Item::Instruction(instruction)
+                if matches!(instruction.operand(), Operand::Forward(label) | Operand::Backward(label)
+                    if labels.contains(&label)) => Some((index, *instruction)),
+            _ => None,
+        });
+        let (
+            Some((guard_index, guard)),
+            Some((normal_index, normal)),
+            Some((handled_index, handled)),
+        ) = (incoming.next(), incoming.next(), incoming.next())
+        else {
+            return false;
+        };
+        let (Some(guard_target), Some(exit), Some(depth)) = (
+            guard.forward_target(),
+            normal.forward_target(),
+            guard.depth_after(),
+        ) else {
+            return false;
+        };
+        let Some(cold_depth) = depth.checked_add(4) else {
+            return false;
+        };
+        if incoming.next().is_some()
+            || guard_index < unwind_start
+            || normal_index <= guard_index
+            || handled_index <= normal_index + 1
+            || handled_index >= cold_start
+            || guard_target == exit
+            || [guard, normal, handled]
+                .iter()
+                .any(|instruction| instruction.location.line < 0)
+        {
+            return false;
+        }
+        let mut expected_guard = Instruction::new(
+            POP_JUMP_IF_NONE,
+            Operand::Forward(guard_target),
+            guard.location,
+            Some(depth),
+        );
+        expected_guard
+            .local_policy
+            .add_hidden_exception_owner_slots(3);
+        if guard != expected_guard
+            || provenance
+                .source_none_conditions
+                .iter()
+                .filter(|origin| origin.instruction == guard)
+                .count()
+                != 1
+        {
+            return false;
+        }
+        for instruction in [normal, handled] {
+            let mut expected = Instruction::new(
+                JUMP_FORWARD,
+                Operand::Forward(exit),
+                instruction.location,
+                Some(depth),
+            );
+            expected.jump_policy.prevent_small_exit_inlining();
+            if instruction != expected {
+                return false;
+            }
+        }
+        // Both completed arms jump to the try exit. The None guard skips that try
+        // at a separate alias; RERAISE terminates the physically preceding block.
+        items.get(handled_index - 1)
+            == Some(&Item::Instruction(Instruction::new(
+                POP_EXCEPT,
+                Operand::Value(0),
+                handled.location,
+                Some(depth),
+            )))
+            && items[cold_start..end]
+                == [
+                    Item::Instruction(Instruction::new(
+                        COPY,
+                        Operand::Value(3),
+                        SourceLocation::NONE,
+                        Some(cold_depth),
+                    )),
+                    Item::Instruction(Instruction::new(
+                        POP_EXCEPT,
+                        Operand::Value(0),
+                        SourceLocation::NONE,
+                        Some(cold_depth - 1),
+                    )),
+                    Item::Instruction(Instruction::new(
+                        RERAISE,
+                        Operand::Value(1),
+                        SourceLocation::NONE,
+                        Some(depth),
+                    )),
+                ]
     }
 
     fn original_shared_handler_join(
