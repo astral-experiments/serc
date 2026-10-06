@@ -20024,6 +20024,49 @@ impl<'source> Compiler<'source> {
                 test.is_none_or(|test| early_condition_truthiness(test).is_none());
             if !try_body_normal_exit && !has_else && branch_index + 1 == branch_count {
                 let test = test.expect("last branch without else has a test");
+                if !non_final_branch
+                    && self.context.python_version >= crate::PythonVersion::Py314
+                    && self.unit.flags & CO_COROUTINE != 0
+                    && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+                    && matches!(self.unit.scope, Scope::Function { .. })
+                    && self.control.in_loop_tail_without_nested_cleanup()
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .is_empty()
+                    && !self.control.in_exception_handler()
+                    && self.control.finally.is_inactive_for_return_unwind()
+                    && self.control.loops.contexts.last().is_some_and(|context| {
+                        context.iterator_cleanup == IteratorCleanup::Sync
+                            && !context.has_orelse
+                            && (self.control.withs.active_with_region_exclusions.is_empty()
+                                || context.with_depth > 0)
+                    })
+                    && matches!(test, Expr::BoolOp(_))
+                    && condition_has_linear_runtime_leaves(test)
+                    && condition_has_only_runtime_tests(test)
+                    && !expression_suspends_current_scope(test)
+                    && condition_jump_target_count(test, true) > 1
+                    && condition_jump_target_count(test, false) == 1
+                    && !body.is_empty()
+                    && body.iter().all(|statement| {
+                        matches!(
+                            self.context.optimized_locations.get(&statement.range()),
+                            Some(super::optimization::OptimizedLocation::Elided)
+                        )
+                    })
+                {
+                    let exit = self.assembler.label();
+                    self.compile_jump_if(test, false, exit)?;
+                    self.assembler.mark(exit);
+                    self.set_depth(base_depth);
+                    self.assembler.set_location(SourceLocation::NONE);
+                    let backedge = self.emit_loop_tail_backedge(restart, false)?;
+                    self.assembler.mark_as_artificial_eval_break(backedge);
+                    self.assembler.record_last_original_loop_backedge();
+                    return Ok(LoopBackedge::Emitted);
+                }
                 let copied_loop_branch_exit = non_final_branch
                     && self.control.in_loop_tail_without_nested_cleanup()
                     && (!expression_contains_chained_comparison(test)
