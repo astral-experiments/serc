@@ -15,6 +15,54 @@ use serc::{
 };
 
 #[test]
+fn erased_prefix_preserves_conditional_continue_exit() {
+    let source = r#"async def sample(items, selected, verify):
+    for item in items:
+        if selected(item):
+            if item.kind != "keep":
+                assert verify(item)
+                continue
+            assert verify(item)
+"#;
+    for (name, source) in [
+        ("plain", source.to_owned()),
+        ("synchronous", source.replace("async def", "def")),
+        (
+            "manager",
+            source.replace("\n    ", "\n        ").replace(
+                "verify):\n",
+                "verify, manager):\n    async with manager():\n",
+            ),
+        ),
+        (
+            "multiple_assertions",
+            source.replace(
+                "                assert verify(item)\n",
+                "                assert verify(item)\n                assert selected(item)\n",
+            ),
+        ),
+        (
+            "name_condition",
+            source.replace("item.kind != \"keep\"", "item"),
+        ),
+        (
+            "no_prefix",
+            source.replace("\n                assert verify(item)", ""),
+        ),
+        (
+            "no_suffix",
+            source.replace("\n            assert verify(item)", ""),
+        ),
+    ] {
+        assert_matches_cpython(
+            &source,
+            &format!("erased_continue_prefix_{name}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn erased_generator_guard_preserves_coroutine_loop_exits() {
     let source = r"async def sample(groups, left, right, verify):
     for items in groups:
