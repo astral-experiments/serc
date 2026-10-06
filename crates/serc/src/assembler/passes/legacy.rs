@@ -2100,15 +2100,10 @@ impl OptimizationPipeline {
                 let mut first_instruction = true;
                 for &block in blocks {
                     for instruction in self.graph.instructions_mut(block) {
-                        // A later cold predecessor can locate the leading POP_BLOCK
+                        // A later cold predecessor can locate the first instruction
                         // after this return was visited. The pinned release compiler
                         // still overwrites its line with the exit fallback below.
-                        debug_assert!(
-                            instruction.location.line < 0
-                                || (first_instruction
-                                    && instruction.opcode == NOP
-                                    && instruction.fusion_policy.is_converted_pop_block())
-                        );
+                        debug_assert!(instruction.location.line < 0 || first_instruction);
                         first_instruction = false;
                         instruction.location.line = line;
                     }
@@ -2344,6 +2339,58 @@ fn fuse_legacy_fast_pair(first: &Instruction, second: &Instruction) -> Option<In
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_return_fallback_allows_only_a_late_leading_location() {
+        use crate::target::opcodes::SWAP;
+
+        for located in [None, Some(0), Some(1)] {
+            let items = [(SWAP, 2), (POP_TOP, 0), (RETURN_VALUE, 0)]
+                .into_iter()
+                .enumerate()
+                .map(|(index, (opcode, operand))| {
+                    Item::Instruction(Instruction::new(
+                        opcode,
+                        Operand::Value(operand),
+                        if located == Some(index) {
+                            SourceLocation::new(7, 7, 4, 12)
+                        } else {
+                            SourceLocation::NONE
+                        },
+                        None,
+                    ))
+                })
+                .collect();
+            let mut assembler = Assembler::from_linear_items(items);
+            assembler.python_version = PythonVersion::Py312;
+            let mut pipeline = assembler.into_optimization_pipeline();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pipeline.guarantee_legacy_exit_line_numbers(1);
+            }));
+            assert_eq!(
+                result.is_err(),
+                cfg!(debug_assertions) && located == Some(1)
+            );
+            if result.is_ok() {
+                let locations = pipeline
+                    .graph
+                    .iter_items()
+                    .filter_map(|item| match item {
+                        Item::Instruction(instruction) => Some(instruction.location),
+                        Item::Label(_) => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert!(locations.iter().all(|location| location.line == 1));
+                for (index, location) in locations.iter().enumerate() {
+                    assert_eq!(location.column, if located == Some(index) { 4 } else { -1 });
+                    assert_eq!(
+                        location.end_line,
+                        if located == Some(index) { 7 } else { -1 }
+                    );
+                }
+            }
+        }
+    }
+
     // Add inside assembler/passes/legacy.rs tests. No oracle or source-path dependency.
     #[test]
     fn native_jump_seeds_preserve_exact_captures_and_reject_partial_updates() {
