@@ -19724,8 +19724,7 @@ impl<'source> Compiler<'source> {
                     .contexts
                     .last()
                     .is_some_and(|context| context.with_depth > 0)
-                && matches!(statement.test.as_ref(), Expr::BoolOp(_))
-                && condition_jump_target_count(&statement.test, false) > 1;
+                && matches!(statement.test.as_ref(), Expr::BoolOp(_));
             if ((copied_loop_branch_exit && self.unit.flags & CO_COROUTINE == 0)
                 || (self.unit.flags & CO_COROUTINE != 0
                     && !non_final_branch
