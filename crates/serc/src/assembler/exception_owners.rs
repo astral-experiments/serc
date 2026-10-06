@@ -4522,7 +4522,7 @@ impl LayoutAssembler {
                 let mut retired_jump = *jump;
                 retired_jump.opcode = NOP;
                 retired_jump.set_operand(Operand::Value(0));
-                if self
+                let ownerless_compound_exit = self
                     .exception_owner_provenance
                     .ownerless_compound_try_nops
                     .iter()
@@ -4532,8 +4532,8 @@ impl LayoutAssembler {
                             && start
                                 .checked_sub(2)
                                 .is_some_and(|index| self.items[index] == Item::Label(*source))
-                    })
-                {
+                    });
+                if ownerless_compound_exit {
                     // Redundant-jump removal already restores this captured POP_BLOCK owner.
                     retired_jump.set_exception_owner(NormalizedExceptionOwner::Absent);
                 }
@@ -4556,7 +4556,25 @@ impl LayoutAssembler {
                                 .count()
                                 == 1
                     });
-                located.next().is_none()
+                // A terminating handler can leave a second original jump that is
+                // removed as unreachable. Only the exact recorded compound exit
+                // may replace it, with no surviving jump into this captured prefix.
+                let retired_handler_entry = self.python_version == crate::PythonVersion::Py314
+                    && ownerless_compound_exit
+                    && compound_try_exit
+                    && matches!(origin.incoming.as_slice(), [first, second]
+                        if first == jump
+                            && second.location.line >= 0
+                            && second.depth_after() == jump.depth_after()
+                            && second.exception_policy() == super::ExceptionPolicy::default()
+                            && second.local_policy.hidden_exception_owner_slots() == 0
+                            && second.pre_fold_extra_instructions() == 0
+                            && !second.jump_policy.retains_nop_for(second.operand()))
+                    && !self.items.iter().any(|item| {
+                        matches!(item, Item::Instruction(instruction)
+                        if instruction.jump_target().is_some_and(|target| labels.contains(&target)))
+                    });
+                (located.next().is_none() || retired_handler_entry)
                     && (jump.jump_policy.retains_nop_for(jump.operand()) || compound_try_exit)
                     && previous.opcode == NOP
                     && previous.location == jump.location
@@ -15752,6 +15770,15 @@ mod tests {
         for change in [
             "unchanged",
             "refined owner",
+            "refined dead handler",
+            "refined live handler",
+            "refined interior handler",
+            "refined hidden handler",
+            "refined pre-fold handler",
+            "refined unrecorded handler",
+            "refined changed handler depth",
+            "refined retained handler",
+            "refined py315 handler",
             "refined missing edge",
             "unproven refined owner",
             "different refined record",
@@ -15837,6 +15864,15 @@ mod tests {
             match change {
                 "unchanged" => {}
                 "refined owner"
+                | "refined dead handler"
+                | "refined live handler"
+                | "refined interior handler"
+                | "refined hidden handler"
+                | "refined pre-fold handler"
+                | "refined unrecorded handler"
+                | "refined changed handler depth"
+                | "refined retained handler"
+                | "refined py315 handler"
                 | "refined missing edge"
                 | "unproven refined owner"
                 | "different refined record" => {
@@ -15859,6 +15895,49 @@ mod tests {
                             .exception_owner_provenance
                             .ownerless_compound_try_nops
                             .push((source, entry, original));
+                    }
+                    if change.ends_with("handler") || change == "refined changed handler depth" {
+                        let mut second = plain(JUMP_FORWARD, Operand::Forward(entry));
+                        second.location.line = 7;
+                        if change == "refined changed handler depth" {
+                            second = Instruction::new(
+                                second.opcode,
+                                second.operand(),
+                                second.location,
+                                Some(1),
+                            );
+                        }
+                        if change == "refined retained handler" {
+                            second.jump_policy.retain_nop_for_direct_target();
+                        }
+                        if change == "refined hidden handler" {
+                            second.local_policy.add_hidden_exception_owner_slots(1);
+                        }
+                        if change == "refined pre-fold handler" {
+                            second.add_pre_fold_extra_instructions(1);
+                        }
+                        assembler
+                            .exception_owner_provenance
+                            .original_normal_finally_arrays[0]
+                            .incoming
+                            .push(second);
+                        if matches!(change, "refined live handler" | "refined interior handler") {
+                            if change == "refined interior handler" {
+                                second.set_operand(Operand::Forward(setup_label));
+                            }
+                            assembler.items.push(Item::Label(Label::from_u32(6)));
+                            assembler.items.push(Item::Instruction(second));
+                            assembler.next_label = 7;
+                        }
+                        if change == "refined unrecorded handler" {
+                            assembler
+                                .exception_owner_provenance
+                                .ownerless_compound_try_nops
+                                .clear();
+                        }
+                        if change == "refined py315 handler" {
+                            assembler.python_version = crate::PythonVersion::Py315;
+                        }
                     }
                 }
                 "missing edge" => assembler
@@ -15906,7 +15985,10 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
-            let expected = if matches!(change, "unchanged" | "refined owner") {
+            let expected = if matches!(
+                change,
+                "unchanged" | "refined owner" | "refined dead handler"
+            ) {
                 [0, 5].into_iter().collect()
             } else {
                 rustc_hash::FxHashSet::default()
