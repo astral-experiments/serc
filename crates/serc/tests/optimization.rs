@@ -15,6 +15,64 @@ use serc::{
 };
 
 #[test]
+fn erased_generator_guard_preserves_coroutine_loop_exits() {
+    let source = r"async def sample(groups, left, right, verify):
+    for items in groups:
+        for item in items:
+            values = item
+            if left(item) or any(right(value) for value in values):
+                assert verify(item)
+";
+    for (name, source) in [
+        ("nested", source.to_owned()),
+        (
+            "single_iterator",
+            source
+                .replace(
+                    "    for items in groups:\n        for item in items:",
+                    "    for item in groups:",
+                )
+                .replace("\n            ", "\n        "),
+        ),
+        (
+            "no_prefix",
+            source
+                .replace("            values = item\n", "")
+                .replace(" in values)", " in item)"),
+        ),
+        (
+            "manager",
+            source
+                .replace("\n    ", "\n        ")
+                .replace("verify):\n", "verify, manager):\n    with manager():\n"),
+        ),
+        (
+            "ordinary_calls",
+            source.replace("any(right(value) for value in values)", "right(values)"),
+        ),
+        ("lone_generator", source.replace("left(item) or ", "")),
+        (
+            "conjunction",
+            source.replace("left(item) or ", "left(item) and "),
+        ),
+        (
+            "live_body",
+            source.replace("assert verify(item)", "verify(item)"),
+        ),
+        (
+            "explicit_else",
+            format!("{source}            else:\n                assert verify(item)\n"),
+        ),
+    ] {
+        assert_matches_cpython(
+            &source,
+            &format!("erased_generator_guard_{name}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn erased_nested_else_preserves_coroutine_loop_exits() {
     let source = r"async def sample(items, selected, verify):
     for item in items:
