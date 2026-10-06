@@ -15,6 +15,47 @@ use serc::{
 };
 
 #[test]
+fn return_retires_inner_try_before_iterator_after_finalizer_and_manager() {
+    let source = r"async def sample(items, manager, ready):
+    for item in items:
+        try:
+            async with manager:
+                state = None
+                try:
+                    result = await action()
+                    state = True
+                    return result
+                except Exception as error:
+                    state = False
+                    record()
+                    raise
+                finally:
+                    finish(item, state)
+        except Exception as error:
+            if ready:
+                raise
+            await action()
+    raise RuntimeError()
+";
+    for source in [
+        source.to_owned(),
+        source.replace("async with", "with"),
+        source
+            .replace("async def", "def")
+            .replace("async with", "with")
+            .replace("await ", ""),
+    ] {
+        for returned in ["return result", "return", "return None"] {
+            assert_matches_cpython(
+                &source.replace("return result", returned),
+                "finalizer_manager_iterator_return.py",
+                &LEVELS,
+            );
+        }
+    }
+}
+
+#[test]
 fn conditional_raise_exits_keep_compound_finalizers_ownerless() {
     let source = r"def sample(value):
     try:
