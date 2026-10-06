@@ -7255,8 +7255,9 @@ impl OptimizationPipeline {
                 }
             }
             original_return_locations.extend(copied_return_locations);
-            let inline_exit_copy =
-                inline_small_exit || inline_no_location_block || split_iterator_return;
+            let inline_exit_copy = inline_small_exit
+                || inline_no_location_block
+                || (split_iterator_return && !source_has_fallthrough);
             // A large shared exit can also be copied after an unconditional source.
             // Its original target owners survive even though this is not inlining.
             if inline_exit_copy || !source_has_fallthrough {
@@ -7982,7 +7983,9 @@ impl OptimizationPipeline {
                 }
                 // Exception-region labels can split one original cleanup array. Insert its
                 // copies after the whole array so the original still reaches its own jump.
-                if target != target_exit && target_has_unlocated_jump_eval_check {
+                if target != target_exit
+                    && (target_has_unlocated_jump_eval_check || split_iterator_return)
+                {
                     copied_split_eval_starts.insert(target_exit, target_position);
                 }
                 target_copies.entry(target_exit).or_default().push(copied);
@@ -8545,7 +8548,7 @@ impl OptimizationPipeline {
                 {
                     // The original cleanup's prefix now has its predecessor's location,
                     // but within-block propagation runs later. Cross only the table splits
-                    // already validated when copying this same unlocated eval-check array.
+                    // already validated when copying this same unlocated cleanup array.
                     return order[start..target_position]
                         .iter()
                         .flat_map(|block| graph[*block].items())
