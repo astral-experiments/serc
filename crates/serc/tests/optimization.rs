@@ -328,6 +328,51 @@ fn negated_finally_guard_preserves_copied_continue_owner() {
 }
 
 #[test]
+fn guarded_finalizer_handlers_share_tuple_return_copies() {
+    let source = r"def sample(first, second, condition, callback):
+    try:
+        work()
+    finally:
+        if condition:
+            try:
+                callback()
+            except Exception:
+                if condition:
+                    recover()
+                else:
+                    raise
+    return first, second
+";
+    for (index, source) in [
+        source.to_owned(),
+        source
+            .replace("def sample", "async def sample")
+            .replace("work()", "await work()")
+            .replace("callback()", "await callback()"),
+        source.replace("    finally:", "    except LookupError:\n        raise\n    finally:"),
+        source.replace("                else:\n                    raise\n", ""),
+        source.replace(
+            "                if condition:\n                    recover()\n                else:\n                    raise",
+            "                recover()",
+        ),
+        source.replacen("if condition:", "if condition or first and second:", 1),
+        source
+            .replace("def sample", "async def sample")
+            .replace("callback()", "await callback()")
+            .replacen("if condition:", "if condition or first and second:", 1),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            &source,
+            &format!("guarded_finalizer_tuple_return_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn conditional_manager_preserves_shared_subscript_return() {
     let source = r"def sample(key, root, cache):
     try:
