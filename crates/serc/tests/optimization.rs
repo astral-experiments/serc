@@ -15,6 +15,90 @@ use serc::{
 };
 
 #[test]
+fn erased_nested_else_preserves_coroutine_loop_exits() {
+    let source = r"async def sample(items, selected, verify):
+    for item in items:
+        if selected:
+            assert verify(item)
+        else:
+            assert verify(item)
+            if item is not None and item.matches():
+                assert verify(item)
+            else:
+                assert verify(item)
+            assert verify(item)
+";
+    for (name, source) in [
+        ("nested_else", source.to_owned()),
+        (
+            "no_prefix",
+            source.replace(
+                "        else:\n            assert verify(item)\n",
+                "        else:\n",
+            ),
+        ),
+        (
+            "three_leaves",
+            source.replace("item.matches()", "item.matches() and selected"),
+        ),
+        (
+            "live_else",
+            source.replace(
+                "            else:\n                assert verify(item)",
+                "            else:\n                verify(item)",
+            ),
+        ),
+        (
+            "live_suffix",
+            format!(
+                "{}            verify(item)\n",
+                source
+                    .strip_suffix("            assert verify(item)\n")
+                    .unwrap(),
+            ),
+        ),
+    ] {
+        assert_matches_cpython(&source, &format!("erased_nested_else_{name}.py"), &LEVELS);
+    }
+}
+
+#[test]
+fn erased_final_else_suffix_preserves_coroutine_loop_exits() {
+    let source = r"async def sample(items, selected, prepare, work, verify):
+    for item in items:
+        if selected:
+            value = await prepare(item)
+            assert verify(value)
+        else:
+            value = None
+            if item is not None:
+                work(item)
+                value = item
+            assert await verify(value)
+";
+    for (name, source) in [
+        ("final_else", source.to_owned()),
+        (
+            "no_prefix",
+            source
+                .replace("            value = None\n", "")
+                .replace("                value = item\n", "")
+                .replace("assert await verify(value)", "assert verify(item)"),
+        ),
+        (
+            "synchronous",
+            source.replace("async def ", "def ").replace("await ", ""),
+        ),
+        (
+            "live_suffix",
+            source.replace("assert await verify(value)", "await verify(value)"),
+        ),
+    ] {
+        assert_matches_cpython(&source, &format!("erased_final_else_{name}.py"), &LEVELS);
+    }
+}
+
+#[test]
 fn erased_coroutine_final_elif_preserves_shared_backedge() {
     let source = r"async def sample(items, manager, verify):
     async with manager():
