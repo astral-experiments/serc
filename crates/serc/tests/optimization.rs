@@ -15,6 +15,90 @@ use serc::{
 };
 
 #[test]
+fn boolean_handler_returns_preserve_shared_finally_borrows() {
+    let source = r"def sample(item):
+    target = None
+    try:
+        target = open_value(item)
+        work()
+    except LookupError:
+        if CONDITION:
+            return
+COMPANION    finally:
+        if target is not None:
+            try:
+                close(target)
+            except OSError:
+                pass
+    finish()
+";
+    for (index, (condition, companion)) in [
+        ("ready(item) and valid(target)", ""),
+        ("ready(item)", "    except OSError:\n        pass\n"),
+        (
+            "ready(item)",
+            "    except OSError as error:\n        recover(error)\n",
+        ),
+        (
+            "ready(item) and valid(target)",
+            "    except OSError:\n        pass\n",
+        ),
+        (
+            "ready(item) or valid(target)",
+            "    except OSError:\n        recover()\n",
+        ),
+        (
+            "ready(item) and (valid(target) or item == target)",
+            "    except OSError:\n        pass\n",
+        ),
+        (
+            "ready(item) and valid(target) and item is not None and check(item.value) and target.value == item.value",
+            "    except OSError:\n        pass\n",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let source = source.replace("CONDITION", condition).replace("COMPANION", companion);
+        assert_matches_cpython(&source, &format!("boolean_handler_finally_borrow_{index}.py"), &LEVELS);
+    }
+}
+
+#[test]
+fn conditional_handler_return_preserves_normal_finally_borrows() {
+    let source = r"def sample(item):
+    try:
+        work()
+    except LookupError:
+        if ready(item):
+            return
+    finally:
+        if item is not None:
+            close(item)
+    finish()
+";
+    for (index, source) in [
+        source.to_owned(),
+        source.replace(
+            "            close(item)",
+            "            try:\n                close(item)\n            except OSError:\n                pass",
+        ),
+        source.replace("            return\n", "            return\n        recover()\n"),
+        source.replace("        if ready(item):\n            return", "        return"),
+        source.replace("        if item is not None:\n            close(item)", "        close(item)"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            &source,
+            &format!("conditional_handler_finally_borrow_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn conditional_iterator_return_copies_preserve_locations_and_owners() {
     let source = r"async def sample(items, manager, state):
     try:

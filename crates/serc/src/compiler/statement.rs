@@ -32118,7 +32118,16 @@ impl<'source> Compiler<'source> {
             && statement.handlers.iter().any(|handler| {
                 handler
                     .as_except_handler()
-                    .is_some_and(|handler| suite_has_linear_reraise_guards(&handler.body))
+                    .is_some_and(|handler| {
+                        suite_has_linear_reraise_guards(&handler.body)
+                            || matches!(handler.body.split_last(), Some((Stmt::If(guard), leading))
+                                if (leading.is_empty() || suite_has_linear_borrow_fallthrough(leading))
+                                    && guard.elif_else_clauses.is_empty()
+                                    && condition_has_linear_runtime_leaves(&guard.test)
+                                    && !expression_suspends_current_scope(&guard.test)
+                                    && matches!(guard.body.as_slice(), [Stmt::Return(return_)]
+                                        if return_.value.is_none()))
+                    })
             });
         // A resumed plain yield reaches guarded cleanup through a populated recovery
         // suffix. Keep this certificate local to one synchronous manager and handler.
@@ -32394,12 +32403,11 @@ impl<'source> Compiler<'source> {
                                     && conditional.elif_else_clauses.is_empty()
                                     && ((!expression_contains_inline_branch(&conditional.test)
                                         && matches!(conditional.body.as_slice(), [Stmt::Raise(_)]))
-                                        // The false successor still performs the linear recovery
-                                        // and POP_EXCEPT before entering normal finally cleanup.
+                                        // The false successor still performs POP_EXCEPT
+                                        // before entering normal finally cleanup.
                                         // Copying cleanup into the bare-return arm does not empty it.
                                         || (synchronous_recovery
-                                            && !expression_contains_inline_branch(&conditional.test)
-                                            && !trailing.is_empty()
+                                            && condition_has_linear_runtime_leaves(&conditional.test)
                                             && conditional.body.split_last().is_some_and(|(last, leading)| {
                                                 matches!(last, Stmt::Return(return_) if return_.value.is_none())
                                                     && leading.iter().all(|statement| {
