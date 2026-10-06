@@ -15,6 +15,50 @@ use serc::{
 };
 
 #[test]
+fn continue_copies_inner_cleanup_inside_an_enclosing_finalizer() {
+    let source = r"async def sample(state, cleanup):
+    try:
+        while True:
+            value = None
+            try:
+                if await state.ready():
+                    continue
+                value = await state.next()
+            finally:
+                if value is not None:
+                    try:
+                        await cleanup(value)
+                    except Exception:
+                        pass
+    finally:
+        await state.close()
+";
+    let mut nested_body = String::new();
+    for line in source.lines().skip(1) {
+        writeln!(nested_body, "    {line}").unwrap();
+    }
+    for (index, source) in [
+        source.to_owned(),
+        source.replace("async def", "def").replace("await ", ""),
+        source.replace(
+            "                        await cleanup(value)",
+            "                        cleanup(value)",
+        ),
+        source.replace("value is not None", "value is None"),
+        format!("async def sample(state, cleanup):\n    try:\n{nested_body}    finally:\n        await state.finish()\n"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            &source,
+            &format!("enclosing_finally_continue_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn named_handler_returns_preserve_outer_finalizer_owners() {
     let source = r"def named_nested(choice, item, owner, operation, cleanup, recover):
     value = None
