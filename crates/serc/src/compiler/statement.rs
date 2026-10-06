@@ -16860,6 +16860,33 @@ impl<'source> Compiler<'source> {
         split_short_circuit: bool,
         mode: LoopTailMode,
     ) -> Result<LoopBackedge, CompileError> {
+        let final_coroutine_iterator_arm = split_short_circuit
+            && self.unit.flags & CO_COROUTINE != 0
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.withs.active_with_region_exclusions.is_empty()
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && self.control.loops.contexts.last().is_some_and(|context| {
+                context.iterator_cleanup == IteratorCleanup::Sync
+                    && !context.has_orelse
+                    && context.continue_label == restart
+            });
+        let erased_final_else = |statement: &ruff_python_ast::StmtIf| {
+            !mode.non_final_branch
+                && final_coroutine_iterator_arm
+                && !statement.body.is_empty()
+                && statement
+                    .body
+                    .iter()
+                    .all(|part| self.context.is_elided_statement(part))
+                && matches!(statement.elif_else_clauses.as_slice(), [clause]
+                    if clause.test.is_none()
+                        && !clause.body.is_empty()
+                        && clause.body.iter().all(|part| self.context.is_elided_statement(part)))
+        };
         if self.context.python_version >= crate::PythonVersion::Py314
             && let Some(end) = body.iter().rposition(|statement| {
                 !matches!(statement, Stmt::Global(_) | Stmt::Nonlocal(_))
@@ -16869,7 +16896,7 @@ impl<'source> Compiler<'source> {
                 .iter()
                 .any(|statement| self.context.is_elided_statement(statement))
             && matches!(&body[end], Stmt::If(statement)
-            if statement.elif_else_clauses.is_empty()
+            if (statement.elif_else_clauses.is_empty() || erased_final_else(statement))
                 && condition_has_only_runtime_tests(&statement.test)
                 && !expression_suspends_current_scope(&statement.test)
                 && (matches!(statement.body.as_slice(), [Stmt::Continue(_)])
@@ -16891,9 +16918,9 @@ impl<'source> Compiler<'source> {
                         && original_condition_has_unique_jump_target(&statement.test, true)
                         && original_condition_has_unique_jump_target(&statement.test, false)
                         && body[end + 1..].iter().all(|suffix| self.context.is_elided_statement(suffix)))
-                    // A non-final iterator arm keeps both inner exits even when
-                    // its erased suffix sits under the surrounding loop owner.
-                    || (mode.non_final_branch
+                    // Iterator arms keep both inner exits when their erased
+                    // suffix sits under the surrounding loop owner.
+                    || ((mode.non_final_branch || final_coroutine_iterator_arm)
                         && !mode.try_body_normal_exit
                         && self.has_active_control_flow_region()
                         && !self.control.in_exception_handler()
@@ -16918,7 +16945,8 @@ impl<'source> Compiler<'source> {
                                 })
                                 && !expression_yields_in_current_scope(&statement.test)
                                 && original_condition_has_unique_jump_target(&statement.test, true)
-                                && original_condition_has_unique_jump_target(&statement.test, false)
+                                && (original_condition_has_unique_jump_target(&statement.test, false)
+                                    || erased_final_else(statement))
                                 && !statement.body.is_empty()
                                 && statement.body.iter().all(|part| self.context.is_elided_statement(part)))))
                     // An enclosing finally predates this iterator. Erasing the suffix
