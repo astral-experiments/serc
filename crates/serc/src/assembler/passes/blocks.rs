@@ -17,6 +17,9 @@ use crate::target::opcodes::{
 };
 use crate::target::{is_conditional_jump, is_unconditional_jump};
 
+#[cfg(test)]
+mod copied_backedge_tests;
+
 /// Finds a protected return owner while retaining equal ambient scope fallbacks.
 fn original_protected_return_owner(
     regions: &[ExceptionRegion],
@@ -7347,8 +7350,10 @@ impl OptimizationPipeline {
                         }
                         let end = if membership.contains(&positions[target.index()]) {
                             (target_has_preserved_boundary_alias
-                                || (target_terminal_opcode == Some(RETURN_VALUE)
-                                    && target_chain_end > target_position))
+                                || (matches!(
+                                    target_terminal_opcode,
+                                    Some(RETURN_VALUE | JUMP_BACKWARD)
+                                ) && target_chain_end > target_position))
                                 .then_some(region.end)
                         } else {
                             // A sibling can cover only the beginning of a copied exit.
