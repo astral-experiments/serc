@@ -34930,7 +34930,9 @@ impl<'source> Compiler<'source> {
                             && condition_has_linear_runtime_leaves(&tail.test)
                             && condition_jump_target_count(&tail.test, false) == 1
                             && !expression_suspends_current_scope(&tail.test)
-                            && !suite_contains_abrupt_control_flow(&tail.body)
+                            && (!suite_contains_abrupt_control_flow(&tail.body)
+                                || (self.context.python_version >= crate::PythonVersion::Py314
+                                    && guarded_managed_recovery_preserves_finally_join(&tail.body)))
                             && tail.body.split_last().is_some_and(|(cleanup, leading)| {
                                 // Completed values and ordinary recovery finish before the
                                 // last cleanup, leaving no POP in this later empty array.
@@ -41031,6 +41033,141 @@ fn nested_named_recovery_leaves_empty_borrow_entry(statement: &ruff_python_ast::
             && !suite_contains_yield(&retry.body)
             && suite_has_linear_borrow_fallthrough(&retry.finalbody)
     })
+}
+
+/// A guarded reraise leaves the successful managed recovery at the original join.
+fn guarded_managed_recovery_preserves_finally_join(body: &[Stmt]) -> bool {
+    // The caller separately certifies work completed before this recovery.
+    let Some(Stmt::Try(recovery)) = body.last() else {
+        return false;
+    };
+    let [Stmt::Expr(expression)] = recovery.body.as_slice() else {
+        return false;
+    };
+    let call = match expression.value.as_ref() {
+        Expr::Await(awaited) => awaited.value.as_ref(),
+        value => value,
+    };
+    let [handler] = recovery.handlers.as_slice() else {
+        return false;
+    };
+    let Some(handler) = handler.as_except_handler() else {
+        return false;
+    };
+    let [Stmt::If(guard), Stmt::With(manager)] = handler.body.as_slice() else {
+        return false;
+    };
+    !recovery.is_star
+        && recovery.orelse.is_empty()
+        && recovery.finalbody.is_empty()
+        && matches!(call, Expr::Call(_))
+        && !expression_contains_inline_branch(call)
+        && !expression_suspends_current_scope(call)
+        && !expression_yields_in_current_scope(call)
+        && handler.name.is_none()
+        && handler.type_.as_deref().is_some_and(|kind| {
+            !expression_contains_inline_branch(kind)
+                && !expression_suspends_current_scope(kind)
+                && !expression_yields_in_current_scope(kind)
+        })
+        && guard.elif_else_clauses.is_empty()
+        && condition_has_only_runtime_tests(&guard.test)
+        && condition_has_linear_runtime_leaves(&guard.test)
+        && condition_jump_target_count(&guard.test, false) == 1
+        && !expression_suspends_current_scope(&guard.test)
+        && !expression_yields_in_current_scope(&guard.test)
+        && matches!(guard.body.as_slice(), [Stmt::Raise(raised)]
+            if raised.exc.is_none() && raised.cause.is_none())
+        && matches!(manager.items.as_slice(), [item]
+            if item.optional_vars.is_none()
+                && !expression_contains_inline_branch(&item.context_expr)
+                && !expression_suspends_current_scope(&item.context_expr)
+                && !expression_yields_in_current_scope(&item.context_expr))
+        && is_call_expression_suite(&manager.body)
+        && suite_has_nonsuspending_linear_fallthrough(&manager.body)
+}
+
+#[cfg(test)]
+mod guarded_managed_recovery_tests {
+    use ruff_python_ast::Stmt;
+
+    #[test]
+    fn managed_recovery_join_requires_a_guarded_bare_reraise() {
+        let source = "async def f():\n    try:\n        action()\n    except Exception:\n        if not flag:\n            raise\n        with manager:\n            recover()\n";
+        for (old, new, expected) in [
+            ("not flag", "flag", true),
+            ("with manager:", "async with manager:", true),
+            ("recover()", "recover()\n            finish()", false),
+            ("action()", "await action()", true),
+            ("action()", "await action(await other())", false),
+            ("action()", "await action((yield value))", false),
+            ("action()", "await value", false),
+            ("    try:\n", "    value = action()\n    try:\n", true),
+            ("action()", "action((yield value))", false),
+            ("action()", "action((yield from values))", false),
+            ("action()", "action(flag and value)", false),
+            ("except Exception:", "except Exception as error:", false),
+            ("except Exception:", "except:", false),
+            ("except Exception:", "except* Exception:", false),
+            ("except Exception:", "except (await kind()):", false),
+            ("except Exception:", "except (yield kind):", false),
+            ("except Exception:", "except (yield from kinds):", false),
+            (
+                "except Exception:",
+                "except (First if flag else Second):",
+                false,
+            ),
+            ("not flag", "True", false),
+            ("not flag", "await ready()", false),
+            ("not flag", "(yield flag)", false),
+            ("not flag", "(yield from flags)", false),
+            ("not flag", "first and second", false),
+            ("            raise\n", "            raise Error\n", false),
+            ("            raise\n", "            return\n", false),
+            (
+                "            raise\n",
+                "            raise\n        else:\n            recover()\n",
+                false,
+            ),
+            ("with manager:", "with manager, other:", false),
+            ("with manager:", "with manager as value:", false),
+            ("with manager:", "with (await acquire()):", false),
+            ("with manager:", "with (yield manager):", false),
+            ("with manager:", "with (yield from managers):", false),
+            ("with manager:", "with (first if flag else second):", false),
+            ("recover()", "await recover()", false),
+            ("recover()", "yield value", false),
+            ("recover()", "return", false),
+            ("recover()", "pass", false),
+            ("recover()", "recover(flag and value)", false),
+            (
+                "            recover()\n",
+                "            recover()\n    finally:\n        finish()\n",
+                false,
+            ),
+            (
+                "            recover()\n",
+                "            recover()\n    else:\n        finish()\n",
+                false,
+            ),
+        ] {
+            let variant = source.replace(old, new);
+            let variant = if new.contains("yield from") {
+                variant.replace("async def", "def")
+            } else {
+                variant
+            };
+            let parsed = ruff_python_parser::parse_module(&variant).unwrap();
+            let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+                panic!("expected a function");
+            };
+            assert_eq!(
+                super::guarded_managed_recovery_preserves_finally_join(&function.body),
+                expected,
+                "{variant}",
+            );
+        }
+    }
 }
 
 // A guarded bare reraise keeps the nested recovery cold. Its normal work can

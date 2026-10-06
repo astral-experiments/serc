@@ -964,6 +964,121 @@ fn guarded_finalizer_handlers_share_tuple_return_copies() {
 }
 
 #[test]
+fn managed_handler_finalizer_jump_keeps_enclosing_owner() {
+    let source = r"async def sample(outer, inner, action, recover, flag):
+    with outer:
+        try:
+            await action()
+        except ValueError:
+            raise
+        except RuntimeError as error:
+            recover(error)
+        finally:
+            if flag:
+                try:
+                    action()
+                except Exception:
+                    if not flag:
+                        raise
+                    with inner:
+                        recover()
+    action()
+";
+    for (name, source) in [
+        ("coroutine", source.to_owned()),
+        (
+            "synchronous",
+            source
+                .replace("async def", "def")
+                .replace("await action()", "action()"),
+        ),
+        (
+            "async_inner",
+            source.replace("with inner:", "async with inner:"),
+        ),
+        (
+            "completed_assignment",
+            source.replace(
+                "\n                try:\n",
+                "\n                value = action()\n                try:\n",
+            ),
+        ),
+        (
+            "awaited_recovery",
+            source.replace(
+                "\n                    action()\n",
+                "\n                    await action()\n",
+            ),
+        ),
+        (
+            "assignment_and_await",
+            source
+                .replace(
+                    "\n                try:\n",
+                    "\n                value = action()\n                try:\n",
+                )
+                .replace(
+                    "\n                    action()\n",
+                    "\n                    await action()\n",
+                ),
+        ),
+        (
+            "awaited_assignment",
+            source.replace(
+                "\n                try:\n",
+                "\n                value = await action()\n                try:\n",
+            ),
+        ),
+        (
+            "yield_prefix",
+            source
+                .replace("async def", "def")
+                .replace("await action()", "action()")
+                .replace(
+                    "\n                try:\n",
+                    "\n                yield flag\n                try:\n",
+                ),
+        ),
+        (
+            "yield_from_prefix",
+            source
+                .replace("async def", "def")
+                .replace("await action()", "action()")
+                .replace(
+                    "\n                try:\n",
+                    "\n                yield from recover()\n                try:\n",
+                ),
+        ),
+        (
+            "no_outer_manager",
+            source
+                .replace("    with outer:\n", "")
+                .replace("\n        ", "\n    "),
+        ),
+        (
+            "trailing_finalizer_call",
+            source.replace(
+                "\n    action()\n",
+                "\n            recover()\n    action()\n",
+            ),
+        ),
+        (
+            "no_inner_guard",
+            source.replace(
+                "                    if not flag:\n                        raise\n",
+                "",
+            ),
+        ),
+    ] {
+        assert_matches_cpython(
+            &source,
+            &format!("managed_handler_owner_{name}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn conditional_manager_preserves_shared_subscript_return() {
     let source = r"def sample(key, root, cache):
     try:
