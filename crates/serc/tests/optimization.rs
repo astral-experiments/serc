@@ -15,6 +15,60 @@ use serc::{
 };
 
 #[test]
+fn managed_mixed_erased_iterator_guard_preserves_shared_backedge() {
+    let source = r"def sample(items, manager, check):
+    with manager():
+        for item in items:
+            if item == 1 or item > 2 and item < 5:
+                assert check(item)
+";
+    for (name, source) in [
+        ("synchronous", source.to_owned()),
+        (
+            "coroutine",
+            source.replace("def sample", "async def sample"),
+        ),
+        (
+            "async_manager",
+            source
+                .replace("def sample", "async def sample")
+                .replace("with manager()", "async with manager()"),
+        ),
+        (
+            "conjunction",
+            source.replace(
+                "item == 1 or item > 2 and item < 5",
+                "item > 2 and (item == 1 or item < 5)",
+            ),
+        ),
+        (
+            "three_false_edges",
+            source.replace(
+                "item > 2 and item < 5",
+                "item > 2 and item < 5 and item != 4",
+            ),
+        ),
+        (
+            "disjunction",
+            source.replace("item > 2 and item < 5", "item > 2"),
+        ),
+        (
+            "live_body",
+            source.replace("assert check(item)", "check(item)"),
+        ),
+        (
+            "inner_manager",
+            source.replace(
+                "    with manager():\n        for item in items:",
+                "    for item in items:\n        with manager():",
+            ),
+        ),
+    ] {
+        assert_matches_cpython(&source, &format!("managed_mixed_guard_{name}.py"), &LEVELS);
+    }
+}
+
+#[test]
 fn boolean_handler_returns_preserve_shared_finally_borrows() {
     let source = r"def sample(item):
     target = None
