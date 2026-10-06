@@ -52,6 +52,51 @@ fn conditional_raise_exits_keep_compound_finalizers_ownerless() {
 }
 
 #[test]
+fn coroutine_conditional_stores_preserve_recovery_finalizer_borrowing() {
+    let source = r#"async def sample(value, state, ready):
+    tag = "unset"
+    try:
+        if value is None:
+            tag = "first" if ready else "second"
+        elif value != state.key:
+            action()
+    except Exception:
+        pass
+    finally:
+        try:
+            kind = state.kind or "unset"
+            finish(tag, kind)
+        except Exception:
+            pass
+"#;
+    for later_arm in [
+        "action()",
+        "async with manager():\n                prior = await load(value)\n            if prior is None:\n                return\n            tag = prior.tag",
+    ] {
+        let source = source.replace("action()", later_arm);
+        let mut nonlocal = String::from("def outer():\n    tag = None\n");
+        for line in source
+            .replace("    tag = \"unset\"", "    nonlocal tag")
+            .lines()
+        {
+            writeln!(nonlocal, "    {line}").unwrap();
+        }
+        for source in [
+            source.clone(),
+            source.replace("    tag = \"unset\"", "    global tag\n    tag = \"unset\""),
+            source.replacen(
+                "    try:\n",
+                "    def read_tag():\n        return tag\n    try:\n",
+                1,
+            ),
+            nonlocal,
+        ] {
+            assert_matches_cpython(&source, "coroutine_conditional_store_recovery.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn elif_branches_preserve_recovery_finalizer_borrowing() {
     let source = r"def sample(value, state):
     try:

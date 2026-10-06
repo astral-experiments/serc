@@ -31908,6 +31908,54 @@ impl<'source> Compiler<'source> {
                 && branch.elif_else_clauses.iter().all(|clause| {
                     suite_has_nonsuspending_linear_fallthrough(&clause.body)
                 }));
+        // Both expression arms join at a name store before the first arm jumps to
+        // recovery cleanup. Later elif arms do not retire that populated entry.
+        let coroutine_conditional_store_reaches_finally = self.context.python_version
+            == crate::PythonVersion::Py314
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+            && !statement.is_star
+            && statement.orelse.is_empty()
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.withs.active_with_region_exclusions.is_empty()
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && !self.control.in_exception_handler()
+            && self.control.finally.is_inactive_for_return_unwind()
+            && matches!(statement.handlers.as_slice(), [handler]
+            if handler.as_except_handler().is_some_and(|handler| {
+                handler.type_.is_some()
+                    && handler.name.is_none()
+                    && matches!(handler.body.as_slice(), [Stmt::Pass(_)])
+            }))
+            && self.suite_has_nonempty_borrow_entry(&statement.finalbody)
+            && matches!(statement.finalbody.as_slice(), [Stmt::Try(cleanup)]
+                if !cleanup.is_star
+                    && cleanup.orelse.is_empty()
+                    && cleanup.finalbody.is_empty())
+            && matches!(statement.body.last(), Some(Stmt::If(branch))
+                if condition_has_linear_runtime_leaves(&branch.test)
+                    && !expression_suspends_current_scope(&branch.test)
+                    && branch.elif_else_clauses.last().is_some_and(|clause| clause.test.is_some())
+                    && branch.elif_else_clauses.iter().all(|clause| {
+                        clause.test.as_ref().is_some_and(|test| {
+                            condition_has_linear_runtime_leaves(test)
+                                && !expression_suspends_current_scope(test)
+                        })
+                    })
+                    && matches!(branch.body.as_slice(), [Stmt::Assign(assignment)]
+                        if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                            && matches!(assignment.value.as_ref(), Expr::If(value)
+                                if condition_has_linear_runtime_leaves(&value.test)
+                                    && !expression_suspends_current_scope(&value.test)
+                                    && !expression_contains_inline_branch(&value.body)
+                                    && !expression_suspends_current_scope(&value.body)
+                                    && !expression_contains_inline_branch(&value.orelse)
+                                    && !expression_suspends_current_scope(&value.orelse))));
         // A live linear arm before the final else keeps a reachable jump directly
         // into normal cleanup after handlers move cold. Folded assertions can leave
         // that jump behind an empty block, so a merely nonterminal arm is insufficient.
@@ -33333,6 +33381,7 @@ impl<'source> Compiler<'source> {
             || managed_runtime_while_return_reaches_finally
             || runtime_retry_break_reaches_finally
             || conditional_body_reaches_finally
+            || coroutine_conditional_store_reaches_finally
             || raising_alternative_reaches_finally
             || coroutine_manager_raise_else_reaches_finally
             || conditional_break_reaches_finally
