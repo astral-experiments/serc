@@ -11,6 +11,247 @@ use crate::target::opcodes::*;
 use crate::target::operands::{CommonConstant, Conversion, FunctionAttribute, ResumeLocation};
 
 #[test]
+fn guarded_handler_iterator_join_requires_original_edges() {
+    for version in [
+        crate::PythonVersion::Py313,
+        crate::PythonVersion::Py314,
+        crate::PythonVersion::Py315,
+    ] {
+        for mutation in [
+            "intact",
+            "named handler",
+            "missing source",
+            "missing block",
+            "authored alias",
+            "preserved alias",
+            "omitted alias",
+            "folded alias",
+            "duplicate alias",
+            "third alias",
+            "extra ingress",
+            "outside unwind",
+            "same target",
+            "missing origin",
+            "duplicate origin",
+            "guard opcode",
+            "guard hidden",
+            "guard policy",
+            "normal depth",
+            "handled depth",
+            "normal hidden",
+            "handled hidden",
+            "normal flag",
+            "handled flag",
+            "inline normal",
+            "inline handled",
+            "backward normal",
+            "backward handled",
+            "handled pop",
+            "handled pop depth",
+            "cold opcode",
+            "cold depth",
+            "cold location",
+            "cold owner",
+        ] {
+            let mut assembler = Assembler::with_python_version(version);
+            let start = assembler.label();
+            let guard_target = assembler.label();
+            let exit = assembler.label();
+            let condition = SourceLocation::new(3, 3, 4, 22);
+            let normal_location = SourceLocation::new(5, 5, 8, 20);
+            let handled_location = SourceLocation::new(7, 7, 8, 12);
+            let depth = 2;
+            if mutation == "duplicate alias" {
+                assembler.mark(exit);
+            }
+            assembler.mark(start);
+            assembler.record_exception_owner_block_boundary(start);
+            assembler.set_location(condition);
+            let guard = assembler.linear_items().len();
+            let emitted = assembler.emit_forward_with_depth(
+                POP_JUMP_IF_NONE,
+                guard_target,
+                depth,
+                ExceptionPolicy::default(),
+            );
+            assembler
+                .emitted_jump_mut(emitted, "recording test guard")
+                .local_policy
+                .add_hidden_exception_owner_slots(3);
+            if mutation != "missing origin" {
+                assembler.record_source_none_condition();
+            }
+            if mutation == "duplicate origin" {
+                assembler.record_source_none_condition();
+            }
+            assembler.set_location(normal_location);
+            let normal = assembler.linear_items().len();
+            let emitted = assembler.emit_forward_with_depth(
+                JUMP_FORWARD,
+                exit,
+                depth,
+                ExceptionPolicy::default(),
+            );
+            if mutation != "inline normal" {
+                assembler.prevent_jump_inlining(emitted);
+            }
+            assembler.set_location(handled_location);
+            let pop = assembler.linear_items().len();
+            assembler.emit_with_depth(POP_EXCEPT, 0, depth, ExceptionPolicy::default());
+            let handled = assembler.linear_items().len();
+            let emitted = assembler.emit_forward_with_depth(
+                JUMP_FORWARD,
+                exit,
+                depth,
+                ExceptionPolicy::default(),
+            );
+            if mutation != "inline handled" {
+                assembler.prevent_jump_inlining(emitted);
+            }
+            if mutation == "extra ingress" {
+                assembler.emit_forward_with_depth(
+                    JUMP_FORWARD,
+                    exit,
+                    depth,
+                    ExceptionPolicy::default(),
+                );
+            }
+            assembler.set_location(SourceLocation::NONE);
+            let cold = assembler.linear_items().len();
+            assembler.emit_with_depth(COPY, 3, depth + 4, ExceptionPolicy::default());
+            assembler.emit_with_depth(POP_EXCEPT, 0, depth + 3, ExceptionPolicy::default());
+            assembler.emit_with_depth(RERAISE, 1, depth, ExceptionPolicy::default());
+            assembler.mark(exit);
+            assembler.record_exception_owner_block_boundary(exit);
+            assembler.mark(guard_target);
+            assembler.record_exception_owner_block_boundary(guard_target);
+            match mutation {
+                "missing source" => {
+                    assembler
+                        .exception_owner_provenance
+                        .source_boundaries
+                        .remove(&exit);
+                }
+                "missing block" => {
+                    assembler
+                        .exception_owner_provenance
+                        .block_boundaries
+                        .remove(&exit);
+                }
+                "authored alias" => {
+                    assembler.original_nop_targets.insert(exit);
+                }
+                "preserved alias" => {
+                    assembler.preserved_block_boundaries.insert(exit);
+                }
+                "omitted alias" => {
+                    assembler
+                        .exception_owner_provenance
+                        .omitted_nop_counts
+                        .insert(exit, 1);
+                }
+                "folded alias" => {
+                    assembler.folded_away_condition_targets.insert(exit);
+                }
+                "third alias" => {
+                    let extra = assembler.label();
+                    assembler.mark(extra);
+                    assembler.record_exception_owner_block_boundary(extra);
+                }
+                "same target" | "guard opcode" | "guard hidden" | "guard policy" => {
+                    let Item::Instruction(record) = &mut assembler.linear_items_mut()[guard] else {
+                        unreachable!()
+                    };
+                    match mutation {
+                        "same target" => record.retarget(Operand::Forward(exit)),
+                        "guard opcode" => record.opcode = POP_JUMP_IF_NOT_NONE,
+                        "guard hidden" => record.local_policy.add_hidden_exception_owner_slots(1),
+                        _ => record.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS),
+                    }
+                }
+                "normal depth" | "normal hidden" | "normal flag" | "backward normal"
+                | "handled depth" | "handled hidden" | "handled flag" | "backward handled" => {
+                    let index = if mutation.contains("normal") {
+                        normal
+                    } else {
+                        handled
+                    };
+                    let Item::Instruction(record) = &mut assembler.linear_items_mut()[index] else {
+                        unreachable!()
+                    };
+                    if mutation.ends_with("depth") {
+                        *record = Instruction::new(
+                            JUMP_FORWARD,
+                            Operand::Forward(exit),
+                            record.location,
+                            Some(depth + 1),
+                        );
+                        record.jump_policy.prevent_small_exit_inlining();
+                    } else if mutation.ends_with("hidden") {
+                        record.local_policy.add_hidden_exception_owner_slots(1);
+                    } else if mutation.ends_with("flag") {
+                        record.jump_policy.prevent_threading_target();
+                    } else {
+                        record.retarget(Operand::Backward(exit));
+                    }
+                }
+                "handled pop" | "handled pop depth" => {
+                    let Item::Instruction(record) = &mut assembler.linear_items_mut()[pop] else {
+                        unreachable!()
+                    };
+                    *record = Instruction::new(
+                        if mutation == "handled pop" {
+                            NOP
+                        } else {
+                            POP_EXCEPT
+                        },
+                        Operand::Value(0),
+                        handled_location,
+                        Some(if mutation == "handled pop depth" {
+                            depth + 1
+                        } else {
+                            depth
+                        }),
+                    );
+                }
+                "cold opcode" | "cold depth" | "cold location" | "cold owner" => {
+                    let Item::Instruction(record) = &mut assembler.linear_items_mut()[cold + 2]
+                    else {
+                        unreachable!()
+                    };
+                    match mutation {
+                        "cold opcode" => record.opcode = NOP,
+                        "cold depth" => {
+                            *record = Instruction::new(
+                                RERAISE,
+                                Operand::Value(1),
+                                SourceLocation::NONE,
+                                Some(depth + 1),
+                            );
+                        }
+                        "cold location" => record.location = handled_location,
+                        _ => record.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS),
+                    }
+                }
+                _ => {}
+            }
+            let start = if mutation == "outside unwind" {
+                guard + 1
+            } else {
+                0
+            };
+            assert_eq!(
+                assembler
+                    .at_original_shared_finally_iterator_join(start, mutation == "named handler"),
+                mutation == "intact" && version >= crate::PythonVersion::Py314,
+                "{version:?}: {mutation}",
+            );
+            assert!(!assembler.at_original_guarded_finally_handler_join());
+        }
+    }
+}
+
+#[test]
 fn copied_finally_continue_head_requires_one_original_condition() {
     for mutation in ["false", "true", "opcode", "location", "target", "duplicate"] {
         let mut assembler = Assembler::with_python_version(crate::PythonVersion::Py314);
