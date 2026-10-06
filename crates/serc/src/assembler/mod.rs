@@ -10920,7 +10920,7 @@ impl Assembler {
             Item::Instruction(instruction)
                 if matches!(
                     instruction.opcode,
-                    POP_JUMP_IF_FALSE | POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE
+                    POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE | POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE
                 ) && instruction.location == condition =>
             {
                 match instruction.operand() {

@@ -59,6 +59,48 @@ fn continue_copies_inner_cleanup_inside_an_enclosing_finalizer() {
 }
 
 #[test]
+fn negated_finally_guard_preserves_copied_continue_owner() {
+    let source = r"async def sample(state, cleanup, recover):
+    while True:
+        released = False
+        try:
+            if await state.ready():
+                continue
+            await state.work()
+        finally:
+            if not released:
+                try:
+                    await cleanup()
+                except Exception:
+                    recover()
+";
+    let mut nested_body = String::new();
+    for line in source.lines().skip(1) {
+        writeln!(nested_body, "    {line}").unwrap();
+    }
+    for (index, source) in [
+        source.to_owned(),
+        source.replace("                    recover()", "                    pass"),
+        source.replace("await cleanup()", "cleanup()"),
+        source.replace("await state.ready()", "state.ready()"),
+        format!("async def sample(state, cleanup, recover):\n    try:\n{nested_body}    finally:\n        await state.close()\n"),
+        source.replace(
+            "                    recover()",
+            "                    recover()\n            else:\n                state.finish()",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            &source,
+            &format!("negated_finally_continue_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn conditional_manager_preserves_shared_subscript_return() {
     let source = r"def sample(key, root, cache):
     try:

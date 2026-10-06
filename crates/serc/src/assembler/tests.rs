@@ -11,6 +11,59 @@ use crate::target::opcodes::*;
 use crate::target::operands::{CommonConstant, Conversion, FunctionAttribute, ResumeLocation};
 
 #[test]
+fn copied_finally_continue_head_requires_one_original_condition() {
+    for mutation in ["false", "true", "opcode", "location", "target", "duplicate"] {
+        let mut assembler = Assembler::with_python_version(crate::PythonVersion::Py314);
+        let target = assembler.label();
+        let join = assembler.label();
+        let foreign = assembler.label();
+        assembler.mark(target);
+        assembler.emit(NOP, 0);
+        let unwind_start = assembler.item_count();
+        let location = SourceLocation::new(4, 4, 7, 16);
+        assembler.set_location(location);
+        assembler.emit(LOAD_FAST, 0);
+        let condition = assembler.emit_forward_with_depth(
+            if mutation == "false" {
+                POP_JUMP_IF_FALSE
+            } else {
+                POP_JUMP_IF_TRUE
+            },
+            join,
+            0,
+            ExceptionPolicy::default(),
+        );
+        let condition_index = usize::try_from(condition.instruction().item_index).unwrap();
+        assembler.mark(join);
+        assembler.set_location(SourceLocation::NONE);
+        let jump = assembler.emit_backward(JUMP_BACKWARD, target);
+        match mutation {
+            "opcode" | "location" | "target" => {
+                let Item::Instruction(record) = &mut assembler.linear_items_mut()[condition_index]
+                else {
+                    panic!()
+                };
+                match mutation {
+                    "opcode" => record.opcode = NOP,
+                    "location" => record.location = SourceLocation::NONE,
+                    _ => record.set_operand(Operand::Forward(foreign)),
+                }
+            }
+            "duplicate" => {
+                assembler.linear_items_mut()[condition_index - 1] =
+                    assembler.linear_items()[condition_index];
+            }
+            _ => {}
+        }
+        assert_eq!(
+            assembler.copied_finally_continue_head_label(jump, target, location, unwind_start,),
+            matches!(mutation, "false" | "true").then_some(join),
+            "{mutation}",
+        );
+    }
+}
+
+#[test]
 fn deferred_name_return_requires_a_noncopyable_original_target() {
     for (case, barrier) in [
         ("five slots", true),
