@@ -142,6 +142,56 @@ fn conditional_iterator_return_copies_preserve_locations_and_owners() {
 }
 
 #[test]
+fn continue_copies_cleanup_after_completed_finalizer_prefixes() {
+    let source = r"def sample(manager, resource, work, note, choice):
+    with manager:
+        while True:
+            try:
+                yield work()
+            except ValueError as error:
+                note(error)
+                continue
+            finally:
+                PREFIX
+                if resource is not None:
+                    try:
+                        resource.close()
+                    except Exception:
+                        pass
+            return
+";
+    for (index, prefix) in [
+        "note()",
+        "if choice:\n                    note()\n                else:\n                    work()",
+        "try:\n                    work()\n                except Exception:\n                    note()",
+        "with manager:\n                    note()",
+        "try:\n                    work()\n                except Exception:\n                    with manager:\n                        note()\n                if choice:\n                    note()",
+        "yield note()",
+        "if choice:\n                    return",
+        "if choice:\n                    raise ValueError",
+        "if choice:\n                    break",
+        "if choice:\n                    continue",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let source = source.replace("PREFIX", prefix);
+        assert_matches_cpython(
+            &source,
+            &format!("prefixed_finally_continue_{index}.py"),
+            &LEVELS,
+        );
+    }
+    assert_matches_cpython(
+        &source
+            .replace("PREFIX", "note()")
+            .replace("yield work()", "work()"),
+        "prefixed_finally_continue_sync.py",
+        &LEVELS,
+    );
+}
+
+#[test]
 fn continue_copies_inner_cleanup_inside_an_enclosing_finalizer() {
     let source = r"async def sample(state, cleanup):
     try:
