@@ -28119,7 +28119,10 @@ impl<'source> Compiler<'source> {
                 // Keep this exemption only until its original target width is known.
                 self.assembler.defer_name_return_borrow_exit(normal_exit);
             }
-            if self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR) != 0
+            if (self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR) != 0
+                || (self.context.python_version >= crate::PythonVersion::Py314
+                    && matches!(self.unit.scope, Scope::Function { .. })
+                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0))
                 && statement.orelse.is_empty()
                 && handlers_terminate
                 && direct_exit_location.is_some_and(|exit| !exit.chained_comparison_cleanup)

@@ -15,6 +15,43 @@ use serc::{
 };
 
 #[test]
+fn conditional_raise_exits_keep_compound_finalizers_ownerless() {
+    let source = r"def sample(value):
+    try:
+        if value:
+            raise RuntimeError()
+    except Exception:
+        raise
+    finally:
+        try:
+            action()
+        except Exception:
+            if value:
+                raise
+        finally:
+            action()
+";
+    for (index, source) in [
+        source.to_owned(),
+        source.replacen("if value:", "if value.ready():", 1),
+        source.replace("        except Exception:\n            if value:\n                raise\n", ""),
+        source.replace("        finally:\n            action()\n", ""),
+        source.replace("    except Exception:\n        raise\n", ""),
+        source.replace("        if value:\n            raise RuntimeError()", "        raise RuntimeError()"),
+        source.replace("        try:\n            action()\n        except Exception:\n            if value:\n                raise\n        finally:\n            action()", "        action()"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            &source,
+            &format!("conditional_raise_finalizer_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn elif_branches_preserve_recovery_finalizer_borrowing() {
     let source = r"def sample(value, state):
     try:
