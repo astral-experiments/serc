@@ -1406,6 +1406,51 @@ fn copied_callable_finalizer_preserves_iterator_break_exits() {
 }
 
 #[test]
+fn coroutine_mixed_erased_iterator_guard_preserves_shared_backedge() {
+    let source = r"async def sample(items, check, first, second, flag, work, manager):
+    for item in items:
+        if check(item, first) or (not flag and check(item, second)):
+            assert item
+";
+    for (name, source) in [
+        ("mixed", source.to_owned()),
+        (
+            "three_false_edges",
+            source.replace(
+                "not flag and check(item, second)",
+                "not flag and check(item, second) and first",
+            ),
+        ),
+        (
+            "disjunction",
+            source.replace("(not flag and check(item, second))", "check(item, second)"),
+        ),
+        (
+            "conjunction",
+            source.replace(
+                "check(item, first) or (not flag and check(item, second))",
+                "first and (check(item, first) or check(item, second))",
+            ),
+        ),
+        ("synchronous", source.replace("async def", "def")),
+        ("live_body", source.replace("assert item", "work(item)")),
+        (
+            "live_suffix",
+            source.replace(
+                "            assert item\n",
+                "            assert item\n        work(item)\n",
+            ),
+        ),
+    ] {
+        assert_matches_cpython(
+            &source,
+            &format!("mixed_erased_iterator_guard_{name}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn async_iterator_preserves_shared_try_else_backedges() {
     for (definition, iterator) in [("async def", "async for"), ("def", "for")] {
         for body in [

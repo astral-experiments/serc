@@ -19701,13 +19701,21 @@ impl<'source> Compiler<'source> {
                     || copied_for_else_branch_exit)
                 && (!self.has_active_control_flow_region()
                     || condition_has_only_runtime_tests(&statement.test));
-            if copied_loop_branch_exit
+            if ((copied_loop_branch_exit && self.unit.flags & CO_COROUTINE == 0)
+                || (self.unit.flags & CO_COROUTINE != 0
+                    && !non_final_branch
+                    && self.control.in_loop_tail_without_nested_cleanup()))
                 && self.context.python_version >= crate::PythonVersion::Py314
                 && !try_body_normal_exit
                 && statement.elif_else_clauses.is_empty()
                 && matches!(self.unit.scope, Scope::Function { .. })
-                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
-                && !self.has_active_control_flow_region()
+                && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+                && self.control.withs.active_with_region_exclusions.is_empty()
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty()
                 && !self.control.in_exception_handler()
                 && self.control.finally.is_inactive_for_return_unwind()
                 && self.control.loops.contexts.last().is_some_and(|context| {
@@ -19717,7 +19725,10 @@ impl<'source> Compiler<'source> {
                 && condition_has_only_runtime_tests(&statement.test)
                 && !expression_suspends_current_scope(&statement.test)
                 && condition_jump_target_count(&statement.test, true) > 1
-                && condition_jump_target_count(&statement.test, false) == 1
+                && (condition_jump_target_count(&statement.test, false) == 1
+                    || (self.unit.flags & CO_COROUTINE != 0
+                        && matches!(statement.test.as_ref(), Expr::BoolOp(_))
+                        && condition_jump_target_count(&statement.test, false) > 1))
                 && !statement.body.is_empty()
                 && statement.body.iter().all(|statement| {
                     matches!(
@@ -19726,8 +19737,9 @@ impl<'source> Compiler<'source> {
                     )
                 })
             {
-                // Removed arms share the enclosing branch's original exit. Keep it
-                // unlocated until all incoming edges receive their backedge copies.
+                // Removed arms share the enclosing branch's original exit, even
+                // under a coroutine's implicit handler. Keep it unlocated until
+                // all incoming edges receive their backedge copies.
                 let exit = self.assembler.label();
                 self.compile_jump_if(&statement.test, false, exit)?;
                 self.assembler.mark(exit);
@@ -19735,6 +19747,9 @@ impl<'source> Compiler<'source> {
                 self.assembler.set_location(SourceLocation::NONE);
                 let backedge = self.emit_loop_tail_backedge(restart, false)?;
                 self.assembler.mark_as_artificial_eval_break(backedge);
+                if self.unit.flags & CO_COROUTINE != 0 {
+                    self.assembler.record_last_original_loop_backedge();
+                }
                 return Ok(LoopBackedge::Emitted);
             }
             // CPython keeps a non-final branch's nested condition body before the fallback
