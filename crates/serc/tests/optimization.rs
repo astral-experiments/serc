@@ -1394,6 +1394,44 @@ fn managed_handler_finalizer_jump_keeps_enclosing_owner() {
 }
 
 #[test]
+fn conditional_manager_finally_copies_iterator_cleanup() {
+    let source = r"async def sample(items, first, second, manager, work, cleanup, finish):
+    for item in items:
+        try:
+            await work(item)
+            break
+        except LookupError:
+            pass
+        except ValueError:
+            pass
+        finally:
+            if first:
+                await cleanup()
+            elif second:
+                with manager:
+                    await cleanup()
+    finish(first)
+    finish(second)
+    return finish()
+";
+    for (name, source) in [
+        ("full_shape", source.to_owned()),
+        (
+            "no_handlers",
+            source.replace("        except LookupError:\n            pass\n        except ValueError:\n            pass\n", ""),
+        ),
+        (
+            "direct_manager",
+            source.replace("            if first:\n                await cleanup()\n            elif second:\n                with manager:\n                    await cleanup()", "            with manager:\n                await cleanup()"),
+        ),
+        ("synchronous", source.replace("async def", "def").replace("await ", "")),
+        ("none_guards", source.replace("if first:", "if first is None:").replace("elif second:", "elif second is None:")),
+    ] {
+        assert_matches_cpython(&source, &format!("conditional_manager_cleanup_{name}.py"), &LEVELS);
+    }
+}
+
+#[test]
 fn conditional_manager_preserves_shared_subscript_return() {
     let source = r"def sample(key, root, cache):
     try:

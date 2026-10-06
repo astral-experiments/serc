@@ -573,6 +573,8 @@ pub(super) struct ConditionState {
     // assertion exit is inlined; iterator loops instead copy the complete failure block.
     pub(super) retained_multiline_assert_ifexp_exit: Option<TextRange>,
     pub(super) exclude_condition_not_taken_from_all_exception_regions: bool,
+    // The first condition in a copied conditional-manager finalizer retains its owner.
+    copied_finally_condition_owner: Option<TextRange>,
 }
 
 #[derive(Debug, Default)]
@@ -6519,8 +6521,35 @@ impl<'source> Compiler<'source> {
                         .find(|finally| finally.loop_depth >= self.control.loops.contexts.len())
                         .is_some_and(|finally| {
                             finally.with_depth == context.with_depth
-                                && matches!(finally.body.last(), Some(Stmt::With(_)))
+                                && (matches!(finally.body.last(), Some(Stmt::With(_)))
+                                    || (self.context.python_version >= crate::PythonVersion::Py314
+                                        && context.iterator_cleanup == IteratorCleanup::Sync
+                                        && copied_finally_has_conditional_manager_cleanup(
+                                            finally.body,
+                                            self.unit.flags,
+                                        )))
                         });
+                let copied_finally_condition_owner = (copied_finally_with_join
+                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                        == CO_COROUTINE)
+                    .then(|| {
+                        self.control
+                            .finally
+                            .active_loop_finally_contexts
+                            .iter()
+                            .find(|finally| finally.loop_depth >= self.control.loops.contexts.len())
+                    })
+                    .flatten()
+                    .and_then(|finally| {
+                        let [Stmt::If(guard)] = finally.body else {
+                            return None;
+                        };
+                        copied_finally_has_conditional_manager_cleanup(
+                            finally.body,
+                            self.unit.flags,
+                        )
+                        .then_some(guard.test.range())
+                    });
                 let copied_finally_iterator_handler = (self.unit.flags
                     & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                     == 0
@@ -6723,17 +6752,23 @@ impl<'source> Compiler<'source> {
                     |control| &mut control.finally.active_finally_end_blocks,
                     retained_finally_end_depth,
                     |compiler| {
-                        compiler.emit_loop_control_finally_unwind(
-                            super::legacy_native_labels::WithAwait::Break(statement.range),
-                            context.with_depth,
-                            None,
-                            (copied_break_pop_blocks > 0)
-                                .then_some((copied_break_item, copied_break_pop_blocks)),
-                            None,
-                            defer_finally_end.then_some((
-                                context.finally_end_depth,
-                                copied_finally_exclusion_lengths.as_slice(),
-                            )),
+                        compiler.with_control_override(
+                            |control| &mut control.conditions.copied_finally_condition_owner,
+                            copied_finally_condition_owner,
+                            |compiler| {
+                                compiler.emit_loop_control_finally_unwind(
+                                    super::legacy_native_labels::WithAwait::Break(statement.range),
+                                    context.with_depth,
+                                    None,
+                                    (copied_break_pop_blocks > 0)
+                                        .then_some((copied_break_item, copied_break_pop_blocks)),
+                                    None,
+                                    defer_finally_end.then_some((
+                                        context.finally_end_depth,
+                                        copied_finally_exclusion_lengths.as_slice(),
+                                    )),
+                                )
+                            },
                         )
                     },
                 )?;
@@ -14648,6 +14683,11 @@ impl<'source> Compiler<'source> {
                     self.assembler.set_forced_borrowed_loads(previous);
                 }
                 compile_condition?;
+                if branch_index == 0
+                    && self.control.conditions.copied_finally_condition_owner == Some(test.range())
+                {
+                    self.assembler.preserve_last_not_taken_exception_owner();
+                }
                 if exclude_direct_post_try_coroutine_return_condition {
                     // Keep this marker excluded unless compaction in its own original
                     // array proves that the late append reuses a protected slot.
@@ -43520,6 +43560,52 @@ fn handler_has_prefixed_guarded_linear_conditional_cleanup(body: &[Stmt]) -> boo
         && suite_has_linear_borrow_fallthrough(&otherwise.body)
 }
 
+/// Recognizes conditional calls whose manager exits share a copied iterator cleanup.
+fn copied_finally_has_conditional_manager_cleanup(body: &[Stmt], flags: u32) -> bool {
+    fn condition(test: &Expr) -> bool {
+        (matches!(test, Expr::Name(_)) || is_specialized_none_condition(test))
+            && !expression_contains_inline_branch(test)
+            && !expression_suspends_current_scope(test)
+    }
+
+    fn call(body: &[Stmt]) -> bool {
+        let [Stmt::Expr(expression)] = body else {
+            return false;
+        };
+        let value = match expression.value.as_ref() {
+            Expr::Await(value) => value.value.as_ref(),
+            value => value,
+        };
+        matches!(value, Expr::Call(_))
+            && !expression_contains_inline_branch(value)
+            && !expression_suspends_current_scope(value)
+    }
+
+    let [Stmt::If(guard)] = body else {
+        return false;
+    };
+    let [otherwise] = guard.elif_else_clauses.as_slice() else {
+        return false;
+    };
+    let [Stmt::With(manager)] = otherwise.body.as_slice() else {
+        return false;
+    };
+    let [item] = manager.items.as_slice() else {
+        return false;
+    };
+    matches!(
+        flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR),
+        0 | CO_COROUTINE
+    ) && condition(&guard.test)
+        && otherwise.test.as_ref().is_some_and(condition)
+        && call(&guard.body)
+        && !manager.is_async
+        && item.optional_vars.is_none()
+        && !expression_contains_inline_branch(&item.context_expr)
+        && !expression_suspends_current_scope(&item.context_expr)
+        && call(&manager.body)
+}
+
 /// Recognizes one ordinary cleanup try whose normal exits reach the copied iterator join.
 fn copied_finally_has_joined_try_cleanup(body: &[Stmt]) -> bool {
     let cleanup = match body {
@@ -46767,6 +46853,74 @@ mod tests {
     };
     use ruff_python_ast::Stmt;
     use ruff_python_parser::parse_module;
+
+    #[test]
+    fn conditional_manager_cleanup_requires_linear_calls() {
+        use super::copied_finally_has_conditional_manager_cleanup;
+        use crate::target::code_flags::{CO_ASYNC_GENERATOR, CO_COROUTINE, CO_GENERATOR};
+
+        let source =
+            "if first:\n    cleanup()\nelif second:\n    with manager:\n        cleanup()\n";
+        for source in [
+            source.to_owned(),
+            source.replace("cleanup()", "await cleanup()"),
+            source
+                .replace("first:", "first is None:")
+                .replace("second:", "second is None:"),
+            source
+                .replace("first:", "first is not None:")
+                .replace("second:", "second is not None:"),
+        ] {
+            let parsed = parse_module(&source).unwrap();
+            for flags in [0, CO_COROUTINE] {
+                assert!(
+                    copied_finally_has_conditional_manager_cleanup(parsed.suite(), flags),
+                    "{source}"
+                );
+            }
+            for flags in [
+                CO_GENERATOR,
+                CO_ASYNC_GENERATOR,
+                CO_GENERATOR | CO_COROUTINE,
+            ] {
+                assert!(
+                    !copied_finally_has_conditional_manager_cleanup(parsed.suite(), flags),
+                    "{source}"
+                );
+            }
+        }
+        for source in [
+            source.replace("with manager:", "async with manager:"),
+            source.replace("with manager:", "with manager as value:"),
+            source.replace("with manager:", "with manager, other:"),
+            source.replace("with manager:", "with (manager if first else other):"),
+            source.replace(
+                "        cleanup()",
+                "        for item in items:\n            cleanup()",
+            ),
+            source.replace("        cleanup()", "        return cleanup()"),
+            source.replace("        cleanup()", "        yield cleanup()"),
+            source.replace("        cleanup()", "        break"),
+            source.replace("    cleanup()\nelif", "    cleanup()\n    finish()\nelif"),
+            source.replace("cleanup()", "cleanup(first if second else other)"),
+            source.replace("cleanup()", "cleanup(await other())"),
+            source.replace("first:", "first or second:"),
+            source.replace("first:", "True:"),
+            source.replace("second:", "False:"),
+            source.replace("    cleanup()\nelif", "    yield cleanup()\nelif"),
+            source.replace("first:", "await first():"),
+            source.replace("elif second:", "else:"),
+            format!("{source}else:\n    finish()\n"),
+            format!("{source}elif third:\n    finish()\n"),
+            format!("{source}finish()\n"),
+        ] {
+            let parsed = parse_module(&source).unwrap();
+            assert!(
+                !copied_finally_has_conditional_manager_cleanup(parsed.suite(), CO_COROUTINE),
+                "{source}"
+            );
+        }
+    }
 
     #[test]
     fn managed_break_respects_loop_and_scope_ownership() {
