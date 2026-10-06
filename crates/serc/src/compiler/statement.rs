@@ -23101,7 +23101,8 @@ impl<'source> Compiler<'source> {
         self.compile_suite(&statement.orelse)?;
         if has_break {
             self.assembler.mark(end);
-            let has_conditional_tail_break = statement.orelse.is_empty()
+            let has_conditional_tail_break = (statement.orelse.is_empty()
+                || suite_has_nonsuspending_linear_fallthrough(&statement.orelse))
                 && suite_ends_in_terminal_conditional_break(&statement.body);
             // A terminal manager-wrapped break loses the same normal loop-exit
             // edge. Suppression resumes iteration through the manager's cold handler.

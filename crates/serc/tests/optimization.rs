@@ -15,6 +15,79 @@ use serc::{
 };
 
 #[test]
+fn async_loop_else_preserves_finalizer_borrow_boundary() {
+    let source = r#"async def sample(value):
+    if mode is not None:
+        request = prepare(value)
+        await channel.send(request.key, timeout=1)
+        response = await channel.receive(value, timeout=1)
+        assert response == value
+        return
+    resource = await acquire(options())
+    try:
+        send(value.encode())
+        data = b""
+        async with limit(10):
+            async for part in resource:
+                data += part.payload
+                assert len(data) < 1024
+                if value.encode() in data:
+                    break
+            else:
+                fail("missing")
+    finally:
+        resource.close()
+"#;
+    let early = "    if mode is not None:\n        request = prepare(value)\n        await channel.send(request.key, timeout=1)\n        response = await channel.receive(value, timeout=1)\n        assert response == value\n        return\n";
+    let unprotected = source
+        .replace("    try:\n", "")
+        .replace("    finally:\n        resource.close()\n", "");
+    let (prefix, body) = unprotected
+        .split_once("        send(value.encode())")
+        .unwrap();
+    let unprotected = format!(
+        "{prefix}    send(value.encode()){}",
+        body.replace("\n    ", "\n")
+    );
+    let (prefix, body) = source
+        .split_once("        async with limit(10):\n")
+        .unwrap();
+    let (body, suffix) = body.split_once("    finally:").unwrap();
+    let unmanaged = format!(
+        "{prefix}{}    finally:{suffix}",
+        body.lines()
+            .map(|line| &line[4..])
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n"
+    );
+    for (name, source) in [
+        ("plain", source.to_owned()),
+        (
+            "no_assert",
+            source.replace("                assert len(data) < 1024\n", ""),
+        ),
+        ("no_early_branch", source.replace(early, "")),
+        ("no_finally", unprotected),
+        (
+            "no_loop_else",
+            source.replace("            else:\n                fail(\"missing\")\n", ""),
+        ),
+        ("no_manager", unmanaged),
+        (
+            "no_prefix_call",
+            source.replace("        send(value.encode())\n", ""),
+        ),
+        (
+            "simple_test",
+            source.replace("value.encode() in data", "ready(part)"),
+        ),
+    ] {
+        assert_matches_cpython(&source, &format!("async_loop_else_{name}.py"), &LEVELS);
+    }
+}
+
+#[test]
 fn recovery_finalizer_preserves_local_return_borrow_boundary() {
     let source = r"def sample(items, work, recover, cleanup, valid):
     for item in items:
