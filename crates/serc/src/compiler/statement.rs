@@ -8862,7 +8862,9 @@ impl<'source> Compiler<'source> {
                                     IteratorCleanup::None | IteratorCleanup::Sync
                                 )
                                 && loop_context.exception_region_depth == inner.exception_region_depth
-                                && !suite_contains_abrupt_control_flow(inner.body)
+                                && !suite_any_statement(inner.body, |statement| matches!(
+                                    statement, Stmt::Break(_) | Stmt::Continue(_) | Stmt::Return(_)
+                                ))
                                 && !suite_contains_yield(inner.body)
                                 && !suite_contains_abrupt_control_flow(outer.body)
                                 && !suite_contains_yield(outer.body)
@@ -8870,9 +8872,6 @@ impl<'source> Compiler<'source> {
                 // The handler exits before the inner finalizer, but the ordinary
                 // try between these finalizers remains active until the outer copy.
                 let tracks_handler_between_plain_finalizers = !return_is_overridden
-                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
-                    && preserve_tos
-                    && matches!(statement.value.as_deref(), Some(Expr::Name(_)))
                     && self.control.withs.active_with_exits.is_empty()
                     && self.control.loops.contexts.is_empty()
                     && self.control.exceptions.active_exception_group_handlers == 0
@@ -12174,7 +12173,8 @@ impl<'source> Compiler<'source> {
                         // A manager entered between these finally contexts still owns
                         // this copy. Its existing region supplies the handler and stack
                         // depth; a synthetic outer-finally region would hide that owner.
-                        // Abrupt copies can unwind the manager partway through the body.
+                        // Returns and loop control can unwind it inside the copy, but
+                        // a raise still dispatches through the live manager's handler.
                         let retained_manager_owns_copy = finally_context.with_depth
                             > outer_context.with_depth
                             && self
@@ -12186,7 +12186,12 @@ impl<'source> Compiler<'source> {
                                     manager.exception_region_depth
                                         == finally_context.exception_region_depth
                                 })
-                            && !suite_contains_abrupt_control_flow(finally_context.body)
+                            && !suite_any_statement(finally_context.body, |statement| {
+                                matches!(
+                                    statement,
+                                    Stmt::Break(_) | Stmt::Continue(_) | Stmt::Return(_)
+                                )
+                            })
                             && !suite_contains_yield(finally_context.body);
                         // The intervening ordinary try likewise supplies its existing
                         // owner until the outer finalizer starts. Do not mask that region
@@ -12267,8 +12272,14 @@ impl<'source> Compiler<'source> {
                                         starts.get(outer_context.exception_region_depth + 1)
                                     })
                                     .is_some_and(Option::is_none)
-                                && (!suite_contains_abrupt_control_flow(finally_context.body)
-                                    || guarded_raise_cleanup)
+                                // Raising transfers control through this still-live try;
+                                // only an explicit scope unwind can retire it inside the copy.
+                                && !suite_any_statement(finally_context.body, |statement| {
+                                    matches!(
+                                        statement,
+                                        Stmt::Break(_) | Stmt::Continue(_) | Stmt::Return(_)
+                                    )
+                                })
                                 && !suite_contains_yield(finally_context.body));
                         // This inner finally runs before the enclosing named handler's
                         // POP_EXCEPT and name clearing. Its existing body-cleanup region
@@ -12316,9 +12327,97 @@ impl<'source> Compiler<'source> {
                                             == handler.exception_region_depth + 1
                                         && finally_context.depth == handler.common_cleanup_depth
                             );
+                        // The inner copy precedes this handler's POP_EXCEPT. Ambient
+                        // managers and while loops do not retire that live handler;
+                        // newer ordinary tries must already have recorded their POPs.
+                        let retained_handler_owns_linear_copy = !return_is_overridden
+                            && context_index == 1
+                            && return_finally_contexts.len() == 2
+                            && handler_count == 1
+                            && next_handler == 1
+                            && outer_context.handler_depth == 0
+                            && finally_context.handler_depth == next_handler
+                            && outer_context.try_body_depth == 0
+                            && finally_context.try_body_depth == 0
+                            && outer_context.loop_depth == self.control.loops.contexts.len()
+                            && finally_context.loop_depth == outer_context.loop_depth
+                            && next_loop == finally_context.loop_depth
+                            && outer_context.finally_end_depth == 0
+                            && finally_context.finally_end_depth == 0
+                            && outer_context.with_depth <= finally_context.with_depth
+                            && outer_context.exception_region_depth == 0
+                            && finally_context.with_depth
+                                == self.control.withs.active_with_exits.len()
+                            && next_with == finally_context.with_depth
+                            && self.control.loops.contexts.iter().all(|context| {
+                                context.iterator_cleanup == IteratorCleanup::None
+                                    && context.exception_region_depth == 0
+                                    && context.finally_end_depth == 0
+                                    && context.with_depth <= outer_context.with_depth
+                            })
+                            && self.control.exceptions.active_exception_group_handlers == 0
+                            && self
+                                .control
+                                .exceptions
+                                .active_exception_region_exclusions
+                                .len()
+                                == finally_context.exception_region_depth
+                                    + 1
+                                    + self.control.exceptions.active_try_marker_slots.len()
+                            && self.control.finally.active_finally_end_blocks == 0
+                            && self.control.finally.active_normal_finally_bodies == 0
+                            && self.control.finally.active_copied_finally_bodies == 0
+                            && self.control.finally.copied_return_finally_preserved_values == 0
+                            && self
+                                .control
+                                .finally
+                                .preserved_return_value_contexts
+                                .is_empty()
+                            && self
+                                .control
+                                .finally
+                                .active_pass_finally_locations
+                                .is_empty()
+                            && !suite_contains_yield_with_headers(finally_context.body, true, true)
+                            && (suite_has_nonsuspending_linear_fallthrough(finally_context.body)
+                                || matches!(finally_context.body, [Stmt::With(manager)]
+                                    if !manager.is_async
+                                        && manager.items.iter().all(|item|
+                                            !expression_contains_inline_branch(&item.context_expr)
+                                                && !expression_suspends_current_scope(&item.context_expr)
+                                                && item.optional_vars.as_deref().is_none_or(|target|
+                                                    !expression_suspends_current_scope(target)))
+                                        && suite_has_nonsuspending_linear_fallthrough(&manager.body)))
+                            && self.control.withs.active_with_exits.iter().enumerate().all(
+                                |(index, manager)| {
+                                    !manager.is_async
+                                        && manager.loop_depth <= outer_context.loop_depth
+                                        && (index < outer_context.with_depth
+                                            || manager.loop_depth == outer_context.loop_depth)
+                                        && manager.finally_end_depth == 0
+                                        && manager.normal_finally_depth == 0
+                                        && manager.exception_region_depth
+                                            == usize::from(index >= outer_context.with_depth)
+                                },
+                            )
+                            && matches!(self.control.exceptions.active_exception_handlers.as_slice(),
+                                [handler] if handler.with_depth == finally_context.with_depth
+                                    && handler.loop_depth == finally_context.loop_depth
+                                    && handler.try_body_depth == 0
+                                    && handler.finally_end_depth == 0
+                                    && handler.exception_region_depth
+                                        == outer_context.exception_region_depth + 1
+                                    && finally_context.exception_region_depth
+                                        == handler.exception_region_depth + 1
+                                    && finally_context.depth == handler.common_cleanup_depth
+                                    && handler_region_unwind_starts.as_ref().is_some_and(|starts|
+                                        starts.len() == self.control.exceptions.active_exception_region_exclusions.len()
+                                            && starts[..finally_context.exception_region_depth].iter().all(Option::is_none)
+                                            && starts[finally_context.exception_region_depth..].iter().all(Option::is_some)));
                         if !retained_manager_owns_copy
                             && !retained_try_owns_copy
                             && !retained_named_handler_owns_copy
+                            && !retained_handler_owns_linear_copy
                         {
                             self.add_exception_regions_with_exclusions(
                                 copied_finally_start,

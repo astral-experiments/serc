@@ -88,6 +88,208 @@ fn async_loop_else_preserves_finalizer_borrow_boundary() {
 }
 
 #[test]
+fn copied_finalizers_preserve_live_exception_owners() {
+    let nested = r"async def sample(manager, action, cleanup, value):
+    try:
+        try:
+            async with manager:
+                await action()
+        except ValueError:
+            value = None
+            return
+        finally:
+            value = cleanup()
+    except TypeError:
+        value = None
+        return
+    finally:
+        if value is not None:
+            cleanup(value)
+";
+    let managed = r"def sample(manager, action, cleanup, value, flag):
+    with manager:
+        try:
+            with manager:
+                try:
+                    action()
+                except ValueError as error:
+                    try:
+                        value = cleanup(error)
+                        if flag:
+                            action()
+                        return value
+                    finally:
+                        with manager:
+                            cleanup()
+                except TypeError as error:
+                    return value
+        finally:
+            value = None
+";
+    let iterator = r"def sample(manager, action, cleanup, values, value, flag):
+    try:
+        with manager:
+            for outer in values:
+                for middle in values:
+                    try:
+                        for item in values:
+                            if flag:
+                                value = None
+                                return item.attr
+                    except ValueError:
+                        value = None
+                        raise
+                    finally:
+                        value = [*value.attr, None] if value is not None else None
+                        cleanup(value)
+    except TypeError as error:
+        value = None
+        raise
+    finally:
+        cleanup()
+";
+    let handler = r"def sample(manager, action, cleanup, value, flag):
+    with manager:
+        while flag:
+            try:
+                action()
+            except ValueError as error:
+                if flag:
+                    try:
+                        if not action(value):
+                            return
+                        value = cleanup()
+                    except KeyError:
+                        raise
+                    except TypeError as inner:
+                        value = inner
+                    finally:
+                        value.attr = None
+            finally:
+                cleanup()
+";
+    let synchronous = nested
+        .replace("async def", "def")
+        .replace("async with", "with")
+        .replace("await action()", "action()");
+    for source in [
+        nested.to_owned(),
+        nested.replace("async with manager:", "with manager:"),
+        nested.replace(
+            "            async with manager:\n                await action()",
+            "            await action()",
+        ),
+        synchronous.clone(),
+    ] {
+        assert_matches_cpython_versions(
+            &source,
+            "nested_finalizer_owner.py",
+            &LEVELS,
+            &[
+                PythonVersion::Py312,
+                PythonVersion::Py313,
+                PythonVersion::Py315,
+            ],
+        );
+    }
+    for source in [
+        managed.to_owned(),
+        managed.replace(
+            "                        with manager:\n                            cleanup()",
+            "                        cleanup()",
+        ),
+        managed
+            .replace(" as error", "")
+            .replace("cleanup(error)", "cleanup(value)"),
+    ] {
+        assert_matches_cpython_versions(
+            &source,
+            "managed_handler_finalizer_owner.py",
+            &LEVELS,
+            &[PythonVersion::Py312, PythonVersion::Py313],
+        );
+    }
+    for source in [
+        iterator.to_owned(),
+        iterator.replace(
+            "                        value = [*value.attr, None] if value is not None else None\n",
+            "",
+        ),
+        handler.to_owned(),
+        handler.replace("value.attr = None", "cleanup(value)"),
+        iterator.replace(
+            "                        value = [*value.attr, None] if value is not None else None",
+            "                        if flag:\n                            raise ValueError",
+        ),
+        synchronous
+            .replace("            return\n", "            return value.attr\n")
+            .replace("        return\n", "        return value.attr\n"),
+        synchronous
+            .replace("            return\n", "            return value\n")
+            .replace("        return\n", "        return value\n"),
+    ] {
+        assert_matches_cpython(&source, "copied_finalizer_owner.py", &LEVELS);
+    }
+    for source in [
+        synchronous.replacen("    try:\n", "    yield value\n    try:\n", 1),
+        synchronous.replacen("    try:\n", "    yield from values\n    try:\n", 1),
+        nested.replacen("    try:\n", "    yield value\n    try:\n", 1),
+    ] {
+        assert_matches_cpython_versions(
+            &source,
+            "generator_finalizer_owner.py",
+            &LEVELS,
+            &[
+                PythonVersion::Py312,
+                PythonVersion::Py313,
+                PythonVersion::Py315,
+            ],
+        );
+    }
+}
+
+#[test]
+fn raising_finalizer_preserves_handler_return_iterator_owner() {
+    let source = r"async def sample(items, work, cleanup, recover, finish):
+    try:
+        for item in items:
+            try:
+                await work(item)
+            except ValueError as error:
+                return
+            finally:
+                try:
+                    await cleanup(item)
+                except TypeError:
+                    raise
+    except LookupError:
+        recover()
+    finally:
+        finish()
+";
+    for (name, source) in [
+        ("reraise", source.to_owned()),
+        (
+            "raise_value",
+            source.replace(
+                "                    raise",
+                "                    raise RuntimeError()",
+            ),
+        ),
+        (
+            "no_raise",
+            source.replace("                    raise", "                    recover()"),
+        ),
+    ] {
+        assert_matches_cpython(
+            &source,
+            &format!("raising_finalizer_handler_return_{name}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn recovery_finalizer_preserves_local_return_borrow_boundary() {
     let source = r"def sample(items, work, recover, cleanup, valid):
     for item in items:
