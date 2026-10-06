@@ -16899,7 +16899,8 @@ impl<'source> Compiler<'source> {
             if (statement.elif_else_clauses.is_empty() || erased_final_else(statement))
                 && condition_has_only_runtime_tests(&statement.test)
                 && !expression_suspends_current_scope(&statement.test)
-                && (matches!(statement.body.as_slice(), [Stmt::Continue(_)])
+                && (matches!(statement.body.split_last(), Some((Stmt::Continue(_), prefix))
+                        if prefix.iter().all(|part| self.context.is_elided_statement(part)))
                     // A Pass before an erased suffix still reaches the original
                     // iterator directly, in either arm of an enclosing condition.
                     || (matches!(statement.body.as_slice(), [Stmt::Pass(_)])
