@@ -10515,7 +10515,47 @@ impl<'source> Compiler<'source> {
                     }
                     let iterator_cleanup_end = self.assembler.label();
                     self.assembler.mark(iterator_cleanup_end);
-                    if preserve_tos
+                    // The inner finalizer has finished and the handler has restored
+                    // its state, but the outer try still owns the iterator's POP.
+                    let retained_outer_finally_iterator = !return_is_overridden
+                        && context_index == 0
+                        && next_handler == 0
+                        && next_with == 0
+                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                            == CO_COROUTINE
+                        && self.control.withs.active_with_exits.is_empty()
+                        && self.control.exceptions.active_exception_group_handlers == 0
+                        && self.control.finally.active_finally_end_blocks == 0
+                        && self.control.finally.active_normal_finally_bodies == 0
+                        && self.control.finally.active_copied_finally_bodies == 0
+                        && matches!(
+                            (
+                                self.control.exceptions.active_exception_handlers.as_slice(),
+                                return_finally_contexts.as_slice(),
+                                self.control.loops.contexts.as_slice(),
+                            ),
+                            ([handler], [outer, inner], [iterator])
+                                if outer.handler_depth == 0
+                                    && inner.handler_depth == 0
+                                    && outer.loop_depth == 0
+                                    && inner.loop_depth == 1
+                                    && handler.loop_depth == 1
+                                    && next_loop == 1
+                                    && outer.with_depth == 0
+                                    && inner.with_depth == 0
+                                    && handler.with_depth == 0
+                                    && handler.finally_end_depth == 0
+                                    && outer.exception_region_depth == 0
+                                    && inner.exception_region_depth == 1
+                                    && handler.exception_region_depth == 2
+                                    && iterator.iterator_cleanup == IteratorCleanup::Sync
+                                    && iterator.exception_region_depth == 1
+                                    && iterator.with_depth == 0
+                                    && iterator.finally_end_depth == 0
+                                    && suite_has_nonsuspending_linear_fallthrough(inner.body)
+                        );
+                    if retained_outer_finally_iterator
+                        || (preserve_tos
                         && nested_call_finally_return
                         && self.control.exceptions.active_exception_handlers.is_empty()
                         && matches!(statement.value.as_deref(), Some(Expr::Name(_)))
@@ -10535,7 +10575,7 @@ impl<'source> Compiler<'source> {
                                         > finally_context.exception_region_depth + 1
                                         || (context.with_depth > finally_context.with_depth
                                             && remaining_with >= context.with_depth)
-                                }))
+                                })))
                     {
                         self.assembler.add_exception_region(
                             iterator_cleanup_start,
