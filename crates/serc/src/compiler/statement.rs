@@ -7262,7 +7262,7 @@ impl<'source> Compiler<'source> {
                         }) {
                             return None;
                         }
-                        let [Stmt::If(tail)] = finally.body else {
+                        let Some(Stmt::If(tail)) = finally.body.last() else {
                             return None;
                         };
                         (finally.loop_depth >= self.control.loops.contexts.len()
