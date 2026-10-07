@@ -35690,7 +35690,8 @@ impl<'source> Compiler<'source> {
                             && condition_has_linear_runtime_leaves(&tail.test)
                             && condition_jump_target_count(&tail.test, false) > 1
                             && suite_has_linear_borrow_fallthrough(&tail.body)))
-                || (!preserve_exit_nop
+                // A separate manager POP_BLOCK does not populate this original exit.
+                || ((!preserve_exit_nop || separate_manager_pop)
                     && statement
                         .finalbody
                         .iter()
