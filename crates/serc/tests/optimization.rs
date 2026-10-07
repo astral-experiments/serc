@@ -40,6 +40,68 @@ fn tuple_unpack_prefix_keeps_retained_setup_marker_owner() {
 }
 
 #[test]
+fn erased_coroutine_join_preserves_predating_async_managers() {
+    let source = r"async def sample(value, state, items):
+    async with manager(value):
+        async with manager(state):
+            try:
+                result = next(part for part in items if part.ready)
+                if value == state:
+                    assert result
+                else:
+                    assert result is None
+                action(state)
+                if state:
+                    action(value)
+                await finish(value)
+            finally:
+                await finish(state)
+";
+    for (name, source) in [
+        ("generator_prefix", source.to_owned()),
+        (
+            "plain_prefix",
+            source.replace("next(part for part in items if part.ready)", "fetch(items)"),
+        ),
+        ("truth_test", source.replace("value == state", "value")),
+        (
+            "terminal_join",
+            source.replace(
+                "                action(state)\n                if state:\n                    action(value)\n                await finish(value)\n",
+                "",
+            ),
+        ),
+        (
+            "later_finalizer_manager",
+            source.replace(
+                "                await finish(state)\n",
+                "                await finish(state)\n                with manager(value):\n                    await finish(value)\n",
+            ),
+        ),
+        (
+            "authored_pass",
+            source
+                .replace("assert result is None", "pass")
+                .replace("assert result", "pass"),
+        ),
+        (
+            "live_true_arm",
+            source.replace("assert result\n", "action(result)\n"),
+        ),
+        (
+            "live_false_arm",
+            source.replace("assert result is None", "action(state)"),
+        ),
+    ] {
+        assert_matches_cpython(
+            &source,
+            &format!("erased_coroutine_predating_managers_{name}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn erased_loop_exit_precedes_manager_cleanup() {
     for manager in ["acquire()", "outer(), middle(), inner(), acquire()"] {
         for setup in ["", "            work()\n"] {
