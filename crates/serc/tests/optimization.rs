@@ -15,6 +15,22 @@ use serc::{
 };
 
 #[test]
+fn runtime_while_false_edge_reaches_guarded_finally() {
+    for (prefix, read) in [("def", "read()"), ("async def", "await read()")] {
+        for condition in ["not stop.is_set()", "ready or stop.is_set()"] {
+            for handler in ["pass", "recover(error)"] {
+                for tail in ["", "            tick(value)\n"] {
+                    let source = format!(
+                        "{prefix} probe(stop, value, resource, ready):\n    try:\n        while {condition}:\n            try:\n                value = {read}\n            except LookupError:\n                continue\n            if value is None:\n                break\n{tail}    except Exception as error:\n        {handler}\n    finally:\n        if resource is not None:\n            resource.close()\n        stop.wait()\n"
+                    );
+                    assert_matches_cpython(&source, "runtime_while_guarded_finally.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn runtime_finalizer_while_preserves_entry_and_exit_boundaries() {
     for (prefix, call) in [("def", "wait()"), ("async def", "await wait()")] {
         for protected in ["pass", call] {

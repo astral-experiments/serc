@@ -32497,11 +32497,8 @@ impl<'source> Compiler<'source> {
                     }
                     _ => false,
                 });
-        // A runtime coroutine loop retains the same early break into cleanup.
-        // Its false edge keeps the original loop-exit boundary; only the existing
-        // live-break certificate supplies the independent normal-finally route.
-        let runtime_coroutine_break_context = matches!(self.unit.scope, Scope::Function { .. })
-            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+        // Runtime loop cleanup shares these enclosing-scope constraints.
+        let loop_break_context = matches!(self.unit.scope, Scope::Function { .. })
             && self.control.loops.contexts.is_empty()
             && self.control.withs.active_with_exits.is_empty()
             && self
@@ -32518,6 +32515,29 @@ impl<'source> Compiler<'source> {
                     .is_some_and(|handler| handler.type_.is_some())
             })
             && !suite_contains_abrupt_control_flow(&statement.finalbody);
+        let runtime_coroutine_break_context = loop_break_context
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE;
+        // The sole runtime false edge retains a populated exit into cleanup,
+        // independently of any break edges in the loop body.
+        let runtime_while_false_edge_reaches_finally = self.context.python_version
+            == crate::PythonVersion::Py314
+            && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+            && loop_break_context
+            && conditional_break_cleanup_entry
+            && statement.handlers.iter().all(|handler| {
+                handler.as_except_handler().is_some_and(|handler| {
+                    suite_has_nonsuspending_linear_fallthrough(&handler.body)
+                        || handler
+                            .body
+                            .iter()
+                            .all(|part| matches!(part, Stmt::Pass(_)))
+                })
+            })
+            && matches!(statement.body.last(), Some(Stmt::While(loop_statement))
+                if loop_statement.orelse.is_empty()
+                    && condition_has_linear_runtime_leaves(&loop_statement.test)
+                    && original_condition_has_unique_jump_target(&loop_statement.test, false)
+                    && !expression_suspends_current_scope(&loop_statement.test));
         let conditional_break_reaches_finally = conditional_break_cleanup_entry
             && matches!(statement.body.last(), Some(Stmt::While(loop_statement))
                 if (early_condition_truthiness(&loop_statement.test) == Some(true)
@@ -33537,6 +33557,7 @@ impl<'source> Compiler<'source> {
             || coroutine_await_recovery_reaches_finally
             || raising_alternative_reaches_finally
             || coroutine_manager_raise_else_reaches_finally
+            || runtime_while_false_edge_reaches_finally
             || conditional_break_reaches_finally
             || dispatcher_break_reaches_finally
             || inner_try_break_loop_range.is_some()
