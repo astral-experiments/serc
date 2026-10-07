@@ -15,6 +15,26 @@ use serc::{
 };
 
 #[test]
+fn coroutine_asserted_recovery_preserves_borrowed_continuation() {
+    for call in [
+        "worker.run()",
+        "worker.run(value=first if ready else second)",
+    ] {
+        for handler in [
+            "        assert error is failure\n",
+            "        assert not ready\n        assert error.code == 1\n        assert error.reason == 'invalid'\n",
+        ] {
+            for assertion in ["ready", "failure is None"] {
+                let source = format!(
+                    "async def probe(worker, reader, recorder, ready, failure, first, second):\n    try:\n        await {call}\n    except ValueError as error:\n{handler}    else:\n        assert {assertion}\n    reader.consume(value=first)\n    recorder.finish()\n"
+                );
+                assert_matches_cpython(&source, "coroutine_asserted_recovery.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
 fn finalizer_loop_empty_try_keeps_exception_owner() {
     for manager in ["", "with acquire():", "with acquire(), acquire():"] {
         for prefix in ["def", "async def"] {
