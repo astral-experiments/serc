@@ -11898,3 +11898,34 @@ fn nested_iterator_value_return_preserves_cleanup_exit_locations() {
         assert_matches_cpython(&source, &format!("nested_iterator_exit_{name}.py"), &LEVELS);
     }
 }
+
+#[test]
+fn managed_finalizer_loops_preserve_empty_borrow_exit() {
+    for manager in ["", "with acquire():", "with acquire(), acquire():"] {
+        for prefix in ["def", "async def"] {
+            for tail in [
+                "",
+                "        for item in remaining:\n            pass\n",
+                "        for item in remaining:\n            finish(item)\n",
+                "        for item in remaining:\n            if failure:\n                finish(item)\n",
+            ] {
+                let suite = format!(
+                    "    try:\n        pass\n    except BaseException:\n        pass\n    finally:\n        for item in groups:\n            try:\n                pass\n            except BaseException as error:\n                failure = failure or error\n{tail}"
+                );
+                let suite = if manager.is_empty() {
+                    suite
+                } else {
+                    let indented = suite.lines().fold(String::new(), |mut output, line| {
+                        writeln!(output, "    {line}").unwrap();
+                        output
+                    });
+                    format!("    {manager}\n{indented}")
+                };
+                let source = format!(
+                    "{prefix} probe(groups, remaining, failure):\n{suite}    if failure:\n        raise failure\n"
+                );
+                assert_matches_cpython(&source, "managed_finalizer_loops.py", &LEVELS);
+            }
+        }
+    }
+}
