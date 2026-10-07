@@ -27693,8 +27693,8 @@ impl<'source> Compiler<'source> {
                         .mark_retained_nop_borrow_fallthrough_if_unblocked(normal_exit);
                 }
                 // The one success edge of an asserted else retains this normal
-                // jump as a located NOP. A plain identity assertion in the named
-                // handler supplies no intervening cleanup array or terminal exit.
+                // jump as a located NOP. Linear assertions in the named handler
+                // supply no intervening cleanup array or terminal exit.
                 let coroutine_asserted_else_exit = borrow_exit_has_source_successor
                     && !statement.is_star
                     && statement.finalbody.is_empty()
@@ -27715,7 +27715,7 @@ impl<'source> Compiler<'source> {
                     && self.control.finally.active_normal_finally_bodies == 0
                     && self.control.finally.active_copied_finally_bodies == 0
                     && self.control.finally.active_finally_end_blocks == 0
-                    && coroutine_try_has_asserted_identity_recovery(statement);
+                    && coroutine_try_has_asserted_recovery(statement);
                 // Recovery handlers keep this located normal exit connected to the following
                 // suite. Cold cleanup or an unlocated join can leave an empty block in between.
                 if (pass_only_handlers
@@ -39836,30 +39836,30 @@ fn suite_ends_in_retained_try_exit_join(body: &[Stmt]) -> bool {
     }
     !statement.elif_else_clauses.is_empty() || terminating_if_fallthrough_test(statement).is_some()
 }
-// This assertion pair has one normal success edge and a plain named-handler
-// cleanup. It does not certify folded, short-circuit, or chained assertions.
-fn coroutine_try_has_asserted_identity_recovery(statement: &ruff_python_ast::StmtTry) -> bool {
+
+// Each assertion has one normal success edge and a plain named-handler cleanup.
+// Folded, short-circuit, and chained assertions can leave different cleanup arrays.
+fn coroutine_try_has_asserted_recovery(statement: &ruff_python_ast::StmtTry) -> bool {
+    let linear_assertion = |statement: &Stmt| {
+        matches!(statement, Stmt::Assert(assertion)
+            if assertion.msg.is_none()
+                && assertion_has_only_runtime_tests(&assertion.test)
+                && condition_jump_target_count(&assertion.test, true) == 1
+                && condition_jump_target_count(&assertion.test, false) == 1
+                && !expression_contains_inline_branch(&assertion.test)
+                && !expression_suspends_current_scope(&assertion.test))
+    };
     matches!(statement.body.as_slice(), [Stmt::Expr(expression)]
         if matches!(expression.value.as_ref(), Expr::Await(awaited)
             if matches!(awaited.value.as_ref(), Expr::Call(_))
-                && !expression_contains_inline_branch(&awaited.value)
                 && !expression_suspends_current_scope(&awaited.value)))
-        && matches!(statement.orelse.as_slice(), [Stmt::Assert(assertion)]
-            if assertion.msg.is_none()
-                && matches!(assertion.test.as_ref(), Expr::Compare(comparison)
-                    if matches!(comparison.first_operand(), Expr::Name(_))
-                        && comparison.ops[..] == [CmpOp::Is]
-                        && matches!(comparison.comparators(), [Expr::NoneLiteral(_)])))
+        && matches!(statement.orelse.as_slice(), [assertion] if linear_assertion(assertion))
         && matches!(statement.handlers.as_slice(), [handler]
         if handler.as_except_handler().is_some_and(|handler| {
             handler.type_.is_some()
                 && handler.name.is_some()
-                && matches!(handler.body.as_slice(), [Stmt::Assert(assertion)]
-                    if assertion.msg.is_none()
-                        && matches!(assertion.test.as_ref(), Expr::Compare(comparison)
-                            if matches!(comparison.first_operand(), Expr::Name(_))
-                                && comparison.ops[..] == [CmpOp::Is]
-                                && matches!(comparison.comparators(), [Expr::Name(_)])))
+                && !handler.body.is_empty()
+                && handler.body.iter().all(linear_assertion)
         }))
 }
 
