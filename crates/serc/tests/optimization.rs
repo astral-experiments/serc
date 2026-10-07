@@ -1070,6 +1070,75 @@ fn erased_final_else_suffix_preserves_coroutine_loop_exits() {
 }
 
 #[test]
+fn while_else_nonfinal_condition_preserves_forward_exit() {
+    for coroutine in [false, true] {
+        for loop_else in [false, true] {
+            for condition in [
+                "left and right",
+                "left or right",
+                "ready(left) and ready(right)",
+                "left and right and third",
+            ] {
+                let header = if coroutine { "async def" } else { "def" };
+                let mut source = format!(
+                    "{header} sample(flag, left, right, third):
+    result = None
+    while active():
+        value = obtain()
+        if flag:
+            if {condition}:
+                result = value
+        elif complete(value):
+            break
+"
+                );
+                if loop_else {
+                    source.push_str("    else:\n        raise RuntimeError(flag)\n");
+                }
+                source.push_str("    return result\n");
+                assert_matches_cpython(
+                    &source,
+                    &format!("while_else_{coroutine}_{loop_else}_{condition}.py"),
+                    &LEVELS,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn managed_while_else_preserves_nested_branch_exits() {
+    let source = r"def sample(left, right, flag):
+    with acquire() as worker, acquire() as other:
+        result = None
+        while worker.active():
+            value = worker.obtain()
+            if flag:
+                if CONDITION:
+                    result = value
+            elif other.complete(value):
+                break
+        else:
+            raise RuntimeError(flag)
+    return result
+";
+    for condition in [
+        "left",
+        "left and right",
+        "left or right",
+        "left < value < right",
+    ] {
+        let source = source.replace("CONDITION", condition);
+        assert_matches_cpython(&source, "managed_while_else.py", &LEVELS);
+        assert_matches_cpython(
+            &source.replace("def sample", "async def sample"),
+            "managed_coroutine_while_else.py",
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn coroutine_for_else_return_keeps_shared_branch_exit() {
     let source = r"async def sample(items, step, flag, left, right, third, work):
     for item in items:

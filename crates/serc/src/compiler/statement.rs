@@ -20038,7 +20038,7 @@ impl<'source> Compiler<'source> {
             // exit even when a surrounding exception or suspension region protects both
             // the loop and its backedge.
             // Folded tests have no runtime edge to copy within a protected region.
-            // Exhaustion enters a for-else suite separately from the continuing
+            // Exhaustion enters a loop-else suite separately from the continuing
             // backedge. Keep its unprotected compound false edges on one forward exit.
             // Erased coroutine arms retain that exit under the loop's saved owners.
             // With no intervening cleanup, a live coroutine return keeps the
@@ -20066,10 +20066,10 @@ impl<'source> Compiler<'source> {
                         && !expression_suspends_current_scope(value)
                         && !expression_yields_in_current_scope(value)
                 }));
-            let copied_for_else_branch_exit = non_final_branch
+            let copied_loop_else_branch_exit = non_final_branch
                 && self.control.loops.contexts.last().is_some_and(|context| {
                     context.has_orelse
-                        && context.iterator_cleanup == IteratorCleanup::Sync
+                        && context.iterator_cleanup != IteratorCleanup::Async
                         && context.continue_label == restart
                         && context.with_depth == self.control.withs.active_with_exits.len()
                         && context.finally_end_depth
@@ -20082,8 +20082,14 @@ impl<'source> Compiler<'source> {
                                 .len()
                 })
                 && condition_has_only_runtime_tests(&statement.test)
-                && ((!self.has_active_control_flow_region()
-                    && condition_jump_target_count(&statement.test, false) > 1)
+                && (self
+                    .control
+                    .loops
+                    .contexts
+                    .last()
+                    .is_some_and(|context| context.iterator_cleanup == IteratorCleanup::None)
+                    || (!self.has_active_control_flow_region()
+                        && condition_jump_target_count(&statement.test, false) > 1)
                     || (self.unit.flags & CO_COROUTINE != 0
                         && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
                         && !self.control.in_exception_handler()
@@ -20103,7 +20109,7 @@ impl<'source> Compiler<'source> {
                     || copied_coroutine_for_else_return);
             let copied_loop_branch_exit = non_final_branch
                 && (self.control.in_loop_tail_without_nested_cleanup()
-                    || copied_for_else_branch_exit)
+                    || copied_loop_else_branch_exit)
                 && (!self.has_active_control_flow_region()
                     || condition_has_only_runtime_tests(&statement.test));
             let managed_erased_iterator_exit = !non_final_branch
