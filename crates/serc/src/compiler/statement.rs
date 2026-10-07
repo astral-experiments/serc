@@ -24210,7 +24210,11 @@ impl<'source> Compiler<'source> {
         // the loop backedge, so that backedge can replace the original setup NOP.
         let empty_try_falls_through_to_loop_backedge = self.context.python_version
             >= crate::PythonVersion::Py314
-            && body_has_elided_assertion
+            && (body_has_elided_assertion
+                || statement
+                    .body
+                    .iter()
+                    .all(|statement| matches!(statement, Stmt::Pass(_))))
             && statement.orelse.is_empty()
             && self.control.loops.uncopied_loop_tail_statement == Some(statement.range)
             && self.control.in_loop_tail_without_nested_cleanup();

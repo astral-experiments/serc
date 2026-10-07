@@ -15,6 +15,32 @@ use serc::{
 };
 
 #[test]
+fn finalizer_loop_empty_try_keeps_exception_owner() {
+    for manager in ["", "with acquire():", "with acquire(), acquire():"] {
+        for prefix in ["def", "async def"] {
+            for body in ["pass", "assert ready", "tick()"] {
+                for handler in ["BaseException", "BaseException as error"] {
+                    let suite = format!(
+                        "    try:\n        tick()\n    except {handler}:\n        pass\n    finally:\n        for item, key in groups.items():\n            try:\n                {body}\n            except {handler}:\n                pass\n"
+                    );
+                    let suite = if manager.is_empty() {
+                        suite
+                    } else {
+                        let indented = suite.lines().fold(String::new(), |mut output, line| {
+                            writeln!(output, "    {line}").unwrap();
+                            output
+                        });
+                        format!("    {manager}\n{indented}")
+                    };
+                    let source = format!("{prefix} probe(groups, ready):\n{suite}");
+                    assert_matches_cpython(&source, "finalizer_loop_empty_try.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn compound_finalizer_conditions_preserve_retired_handler_slots() {
     let source = r"def sample(value, state):
     try:
