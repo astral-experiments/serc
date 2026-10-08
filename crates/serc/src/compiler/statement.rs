@@ -39913,6 +39913,14 @@ fn suite_ends_in_retained_try_exit_join(body: &[Stmt]) -> bool {
 
 /// Recognizes a direct asserted success route with only asserted recovery.
 fn ordinary_try_has_asserted_recovery(statement: &ruff_python_ast::StmtTry) -> bool {
+    let linear_assertion = |assertion: &ruff_python_ast::StmtAssert| {
+        assertion.msg.is_none()
+            && assertion_has_only_runtime_tests(&assertion.test)
+            && condition_jump_target_count(&assertion.test, true) == 1
+            && condition_jump_target_count(&assertion.test, false) == 1
+            && !expression_contains_inline_branch(&assertion.test)
+            && !expression_suspends_current_scope(&assertion.test)
+    };
     let body = match statement.body.as_slice() {
         [Stmt::With(manager)]
             if !manager.is_async
@@ -39944,14 +39952,7 @@ fn ordinary_try_has_asserted_recovery(statement: &ruff_python_ast::StmtTry) -> b
                     && !expression_suspends_current_scope(&guard.test)
                     && suite_has_linear_raise_exit(&guard.body)
             }
-            Stmt::Assert(assertion) => {
-                assertion.msg.is_none()
-                    && assertion_has_only_runtime_tests(&assertion.test)
-                    && condition_jump_target_count(&assertion.test, true) == 1
-                    && condition_jump_target_count(&assertion.test, false) == 1
-                    && !expression_contains_inline_branch(&assertion.test)
-                    && !expression_suspends_current_scope(&assertion.test)
-            }
+            Stmt::Assert(assertion) => linear_assertion(assertion),
             _ => false,
         })
         && matches!(statement.orelse.as_slice(), [Stmt::Assert(assertion)]
@@ -39964,11 +39965,7 @@ fn ordinary_try_has_asserted_recovery(statement: &ruff_python_ast::StmtTry) -> b
         if handler.as_except_handler().is_some_and(|handler| {
             matches!(handler.type_.as_deref(), Some(Expr::Name(_)))
                 && matches!(handler.body.as_slice(), [Stmt::Assert(assertion)]
-                    if assertion.msg.is_none()
-                        && matches!(assertion.test.as_ref(), Expr::Compare(comparison)
-                            if matches!(comparison.first_operand(), Expr::Name(_))
-                                && matches!(&comparison.ops[..], [CmpOp::Is | CmpOp::IsNot])
-                                && matches!(comparison.comparators(), [Expr::Name(_) | Expr::NoneLiteral(_)])))
+                    if linear_assertion(assertion))
         }))
 }
 
