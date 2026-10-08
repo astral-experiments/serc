@@ -27462,7 +27462,6 @@ impl<'source> Compiler<'source> {
                     .active_exception_region_exclusions
                     .is_empty()
                 && self.control.finally.active_finally_try_bodies == 0
-                && self.control.finally.active_normal_finally_bodies == 0
                 && self.control.finally.active_copied_finally_bodies == 0
                 && self.control.finally.active_finally_end_blocks == 0
                 && handlers_have_live_guarded_recovery_cleanup(statement);
@@ -42972,11 +42971,15 @@ fn handlers_have_live_guarded_recovery_cleanup(statement: &ruff_python_ast::Stmt
         suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement))
             || matches!(statement, Stmt::Assign(assignment)
                 if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
-                    && matches!(assignment.value.as_ref(), Expr::If(value)
+                    && (matches!(assignment.value.as_ref(), Expr::If(value)
                         if is_specialized_none_condition(&value.test)
                             && !expression_contains_inline_branch(&value.test)
                             && !expression_contains_inline_branch(&value.body)
-                            && !expression_contains_inline_branch(&value.orelse)))
+                            && !expression_contains_inline_branch(&value.orelse))
+                        || (matches!(assignment.value.as_ref(), Expr::BoolOp(_))
+                            && condition_has_linear_runtime_leaves(&assignment.value)
+                            && !expression_suspends_current_scope(&assignment.value)
+                            && !expression_yields_in_current_scope(&assignment.value))))
     }
 
     fn normal_recovery_suite(body: &[Stmt]) -> bool {
@@ -47396,6 +47399,32 @@ mod tests {
     };
     use ruff_python_ast::Stmt;
     use ruff_python_parser::parse_module;
+
+    #[test]
+    fn guarded_recovery_store_requires_completed_runtime_arms() {
+        let source = "try:\n    value = resource.read()\nexcept Error as error:\n    failure = failure or error\n    if ready:\n        try:\n            done = True\n        except Other as inner:\n            record(inner)\n";
+        for (value, expected) in [
+            ("failure or error", true),
+            ("failure and error", true),
+            ("(failure or error) and resource.error", true),
+            ("error if failure is None else failure", true),
+            ("False or error", false),
+            ("failure or await recover(error)", false),
+            ("failure or (yield error)", false),
+            ("failure if ready else error", false),
+        ] {
+            let source = source.replacen("failure or error", value, 1);
+            let parsed = parse_module(&source).unwrap();
+            let Stmt::Try(recovery) = &parsed.suite()[0] else {
+                panic!("expected recovery");
+            };
+            assert_eq!(
+                super::handlers_have_live_guarded_recovery_cleanup(recovery),
+                expected,
+                "{source}"
+            );
+        }
+    }
 
     #[test]
     fn cleanup_drain_exit_requires_a_linear_break_recovery() {
