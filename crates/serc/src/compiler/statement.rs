@@ -32268,6 +32268,13 @@ impl<'source> Compiler<'source> {
                 && (conditional_reraise_entry
                     || suite_has_linear_borrow_fallthrough(&conditional.body)
                     || suite_has_populated_conditional_alternative(&conditional.body)
+                    || matches!(conditional.body.split_last(), Some((Stmt::If(guard), leading))
+                        if (leading.is_empty() || suite_has_nonsuspending_linear_fallthrough(leading))
+                            && guard.elif_else_clauses.is_empty()
+                            && condition_has_completed_call_leaves(&guard.test, self.context.python_version)
+                            && !expression_suspends_current_scope(&guard.test)
+                            && original_condition_has_unique_jump_target(&guard.test, false)
+                            && suite_has_nonsuspending_linear_fallthrough(&guard.body))
                     || synchronous_guarded_recovery_entry
                     || coroutine_guarded_recovery_entry
                     || coroutine_manager_arm_reaches_finally(&conditional.body)

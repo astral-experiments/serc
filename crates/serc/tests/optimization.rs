@@ -15,6 +15,26 @@ use serc::{
 };
 
 #[test]
+fn completed_nested_guard_reaches_recovery_cleanup() {
+    for coroutine in ["", "async "] {
+        for prefix in ["", "            resource.prepare()\n"] {
+            for condition in [
+                "any(item.key not in resource.seen for item in items)",
+                "all(item.key in resource.seen for item in items)",
+                "not any(item.key in resource.seen for item in items)",
+            ] {
+                for handler in ["Error", "Error as error"] {
+                    let source = format!(
+                        "{coroutine}def sample(resource, items):\n    try:\n        if items:\n{prefix}            if {condition}:\n                resource.ready = True\n        else:\n            resource.wait()\n    except LookupError:\n        record(resource)\n    except {handler}:\n        record(resource)\n    finally:\n        resource.pending.pop(items, None)\n"
+                    );
+                    assert_matches_cpython(&source, "nested_guard_cleanup.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn terminal_recovery_scopes_preserve_normal_exits() {
     for header in ["", "class Example:\n"] {
         for handler in ["Error", "Error as error"] {
