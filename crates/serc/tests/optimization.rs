@@ -15,6 +15,22 @@ use serc::{
 };
 
 #[test]
+fn runtime_finalizer_while_preserves_entry_and_exit_boundaries() {
+    for (prefix, call) in [("def", "wait()"), ("async def", "await wait()")] {
+        for protected in ["pass", call] {
+            for condition in ["not done()", "ready or done()", "ready and done()"] {
+                for tail in ["return saved", "finish(saved)"] {
+                    let source = format!(
+                        "{prefix} probe(wait, done, ready, saved):\n    try:\n        {protected}\n    except BaseException as error:\n        saved = error\n    finally:\n        while {condition}:\n            try:\n                {call}\n            except BaseException as error:\n                saved = saved or error\n    {tail}\n"
+                    );
+                    assert_matches_cpython(&source, "runtime_finalizer_while.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn coroutine_asserted_recovery_preserves_borrowed_continuation() {
     for call in [
         "worker.run()",

@@ -31580,6 +31580,11 @@ impl<'source> Compiler<'source> {
                     && suite_has_linear_borrow_fallthrough(tail)
                     && !suite_contains_yield(&statement.body));
         let compound_fallthrough_handlers_reach_finally = !statement.is_star
+            // A leading runtime while starts a new array after the emptied handler join.
+            && (self.context.python_version != crate::PythonVersion::Py314
+                || statement.handlers.is_empty()
+                || !matches!(statement.finalbody.first(), Some(Stmt::While(cleanup))
+                    if early_condition_truthiness(&cleanup.test).is_none()))
             && statement.handlers.iter().all(|handler| {
                 handler.as_except_handler().is_some_and(|handler| {
                     handler.type_.is_some()
@@ -35688,8 +35693,11 @@ impl<'source> Compiler<'source> {
                     && matches!(statement.finalbody.last(), Some(Stmt::While(tail))
                         if tail.orelse.is_empty()
                             && condition_has_linear_runtime_leaves(&tail.test)
-                            && condition_jump_target_count(&tail.test, false) > 1
-                            && suite_has_linear_borrow_fallthrough(&tail.body)))
+                            && ((condition_jump_target_count(&tail.test, false) > 1
+                                && suite_has_linear_borrow_fallthrough(&tail.body))
+                                || (self.context.python_version == crate::PythonVersion::Py314
+                                    && !statement.handlers.is_empty()
+                                    && !suite_contains_loop_break(&tail.body)))))
                 // A separate manager POP_BLOCK does not populate this original exit.
                 || ((!preserve_exit_nop || separate_manager_pop)
                     && statement
@@ -35784,6 +35792,24 @@ impl<'source> Compiler<'source> {
                 // Keep its located jump slot when its direct continuation is copied;
                 // retargeted jumps and the exceptional assertion copy stay unchanged.
                 self.assembler.preserve_direct_inlined_jump_nop(normal_exit);
+            } else if self.context.python_version >= crate::PythonVersion::Py314
+                && !preserve_exit_nop
+                && finalizer_tail_count == 0
+                && !statement.handlers.is_empty()
+                && matches!(statement.finalbody.last(), Some(Stmt::While(tail))
+                    if tail.orelse.is_empty()
+                        && condition_has_linear_runtime_leaves(&tail.test)
+                        && original_condition_has_unique_jump_target(&tail.test, false)
+                        && !suite_contains_loop_break(&tail.body))
+            {
+                // The loop's empty false-edge join retains its copied-return line.
+                // Python 3.14 also keeps the line without a copied continuation.
+                if self.context.python_version == crate::PythonVersion::Py314 {
+                    self.assembler
+                        .preserve_redundant_jump_nop_after_threading(normal_exit);
+                } else {
+                    self.assembler.preserve_direct_inlined_jump_nop(normal_exit);
+                }
             } else if !preserve_exit_nop
                 && finalizer_tail_count == 0
                 && matches!(statement.finalbody.last(), Some(Stmt::For(tail))
