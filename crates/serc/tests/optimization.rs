@@ -15,6 +15,32 @@ use serc::{
 };
 
 #[test]
+fn runtime_asserted_recovery_retains_borrowed_continuation() {
+    for managed in [false, true] {
+        for handler in ["Error", "Error as error"] {
+            for assertion in [
+                "str(failure) == 'expected'",
+                "failure != resource",
+                "ready(failure)",
+            ] {
+                let suite = format!(
+                    "try:\n    result = acquire(resource)\nexcept {handler}:\n    assert {assertion}\nelse:\n    assert result is None\nconsume(resource)\n"
+                );
+                let mut source = String::from("def sample(acquire, resource, failure):\n");
+                if managed {
+                    source.push_str("    with acquire():\n");
+                }
+                let indent = if managed { "        " } else { "    " };
+                for line in suite.lines() {
+                    writeln!(source, "{indent}{line}").unwrap();
+                }
+                assert_matches_cpython(&source, "runtime_asserted_recovery.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
 fn erased_assertion_try_exit_excludes_enclosing_manager() {
     for (handler, recovery) in [
         ("Error", "failure is not None"),
