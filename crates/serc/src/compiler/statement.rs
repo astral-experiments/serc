@@ -15474,7 +15474,11 @@ impl<'source> Compiler<'source> {
                     ) && matches!(
                         self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR),
                         0 | CO_COROUTINE
-                    ) && self.control.loops.contexts.is_empty()
+                    ) && (self.control.loops.contexts.is_empty()
+                        || (async_managers_predate_finally
+                            && finalizers.last().is_some_and(|finalizer| {
+                                finalizer.loop_depth == self.control.loops.contexts.len()
+                            })))
                         && ((self.control.withs.active_with_exits.is_empty()
                             && self.control.withs.active_with_region_exclusions.is_empty())
                             // Managers entered before this try add no predecessor to
@@ -22150,7 +22154,7 @@ impl<'source> Compiler<'source> {
                     .withs
                     .active_with_exits
                     .iter()
-                    .all(|manager| !manager.is_async)
+                    .all(|manager| !manager.is_async || self.unit.flags & CO_COROUTINE != 0)
                 && self.control.withs.active_with_region_exclusions.len()
                     == self.control.withs.active_with_exits.len()
                 && self.control.exceptions.active_exception_handlers.is_empty()
@@ -22196,7 +22200,11 @@ impl<'source> Compiler<'source> {
             if self.context.python_version == crate::PythonVersion::Py314
                 && matches!(self.unit.scope, Scope::Function { .. })
                 && (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
-                    || completed_prefix_context)
+                    || completed_prefix_context
+                    || (break_stays_inside_finally
+                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                            == CO_COROUTINE
+                        && self.control.withs.active_with_exits.last().is_some_and(|manager| manager.is_async)))
                 && (self.control.loops.contexts.is_empty()
                     || (statement.orelse.is_empty()
                         && matches!(self.control.loops.contexts.as_slice(), [outer]
