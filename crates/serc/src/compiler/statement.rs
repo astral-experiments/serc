@@ -32324,7 +32324,12 @@ impl<'source> Compiler<'source> {
                 })
                 && (conditional_reraise_entry
                     || suite_has_linear_borrow_fallthrough(&conditional.body)
-                    || suite_has_populated_conditional_alternative(&conditional.body)
+                    || suite_has_populated_conditional_alternative(
+                        &conditional.body,
+                        self.context.python_version == crate::PythonVersion::Py314
+                            && matches!(self.unit.scope, Scope::Function { .. })
+                            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0,
+                    )
                     || matches!(conditional.body.split_last(), Some((Stmt::If(guard), leading))
                         if (leading.is_empty() || suite_has_nonsuspending_linear_fallthrough(leading))
                             && guard.elif_else_clauses.is_empty()
@@ -41619,9 +41624,9 @@ fn managed_iterator_continue_leaves_empty_borrow_exit(body: &[Stmt]) -> bool {
         })
 }
 
-// A nested complete conditional can retain a located jump from its linear
-// alternative even when the other arm ends in a separate runtime guard.
-fn suite_has_populated_conditional_alternative(body: &[Stmt]) -> bool {
+// A nested complete conditional retains a located jump through a populated
+// alternative, including linear unnamed recovery.
+fn suite_has_populated_conditional_alternative(body: &[Stmt], allow_recovery: bool) -> bool {
     let Some((Stmt::If(branch), prefix)) = body.split_last() else {
         return false;
     };
@@ -41639,16 +41644,48 @@ fn suite_has_populated_conditional_alternative(body: &[Stmt]) -> bool {
                         && suite_has_linear_borrow_fallthrough(&guard.body))
         })
     };
-    (prefix.is_empty() || suite_has_linear_borrow_fallthrough(prefix))
+    let linear_recovery = |statement: &Stmt| {
+        matches!(statement, Stmt::Try(recovery)
+        if !recovery.is_star
+            && recovery.orelse.is_empty()
+            && recovery.finalbody.is_empty()
+            && suite_has_nonsuspending_linear_fallthrough(&recovery.body)
+            && !recovery.handlers.is_empty()
+            && recovery.handlers.iter().all(|handler| {
+                handler.as_except_handler().is_some_and(|handler| {
+                    handler.type_.as_deref().is_some_and(|type_| {
+                        !expression_contains_inline_branch(type_)
+                            && !expression_suspends_current_scope(type_)
+                    }) && handler.name.is_none()
+                        && suite_has_nonsuspending_linear_fallthrough(&handler.body)
+                })
+            }))
+    };
+    let recovery_alternative = allow_recovery
+        && suite_has_nonsuspending_linear_fallthrough(&branch.body)
+        && branch.elif_else_clauses.last().is_some_and(|clause| {
+            clause.test.is_none()
+                && matches!(clause.body.split_last(), Some((recovery, prefix))
+                if linear_recovery(recovery)
+                    && (prefix.is_empty() || suite_has_nonsuspending_linear_fallthrough(prefix)))
+        });
+    (prefix.is_empty()
+        || suite_has_linear_borrow_fallthrough(prefix)
+        || (recovery_alternative
+            && prefix.iter().all(|statement| {
+                suite_has_nonsuspending_linear_fallthrough(std::slice::from_ref(statement))
+                    || linear_recovery(statement)
+            })))
         && runtime(&branch.test)
         && guarded_linear(&branch.body)
         && branch.elif_else_clauses.last().is_some_and(|clause| {
-            clause.test.is_none() && suite_has_linear_borrow_fallthrough(&clause.body)
+            clause.test.is_none()
+                && (suite_has_linear_borrow_fallthrough(&clause.body) || recovery_alternative)
         })
-        && branch
-            .elif_else_clauses
-            .iter()
-            .all(|clause| clause.test.as_ref().is_none_or(runtime) && guarded_linear(&clause.body))
+        && branch.elif_else_clauses.iter().all(|clause| {
+            clause.test.as_ref().is_none_or(runtime)
+                && (guarded_linear(&clause.body) || (clause.test.is_none() && recovery_alternative))
+        })
 }
 
 // These named recovery shapes leave the nested try's original normal exit empty.
