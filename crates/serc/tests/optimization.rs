@@ -15,6 +15,39 @@ use serc::{
 };
 
 #[test]
+fn guarded_recovery_inside_normal_finally_keeps_its_continuation() {
+    for coroutine in ["", "async "] {
+        for manager in [false, true] {
+            for value in [
+                "failure or resource.error",
+                "failure and resource.error",
+                "resource.error if failure is None else failure",
+                "resource.error",
+            ] {
+                for work in ["True", "resource.run()"] {
+                    let suite = format!(
+                        "try:\n    done = {work}\nexcept Error as error:\n    failure = {value}\n    if ready:\n        try:\n            done = {work}\n        except Error as inner:\n            record(inner)\ntry:\n    if done:\n        resource.release()\nexcept Error as error:\n    if error is not None:\n        record(error)\n"
+                    );
+                    let cleanup = if manager {
+                        format!(
+                            "with resource.open():\n    {}",
+                            suite.replace('\n', "\n    ")
+                        )
+                    } else {
+                        suite
+                    };
+                    let source = format!(
+                        "{coroutine}def sample(resource, ready, failure):\n    try:\n        ready = True\n    except Error as error:\n        record(error)\n    finally:\n        {}",
+                        cleanup.replace('\n', "\n        ")
+                    );
+                    assert_matches_cpython(&source, "normal_finally_recovery.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn completed_nested_guard_reaches_recovery_cleanup() {
     for coroutine in ["", "async "] {
         for prefix in ["", "            resource.prepare()\n"] {
