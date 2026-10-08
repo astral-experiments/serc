@@ -15,6 +15,33 @@ use serc::{
 };
 
 #[test]
+fn awaited_reraise_keeps_normal_cleanup_entry() {
+    for condition in ["state is not None", "enabled"] {
+        for handler in ["except:", "except CancelledError:"] {
+            for setup in [
+                "",
+                "task = resource.create_task(resource.release(state))\n                ",
+            ] {
+                for cleanup in [
+                    "resource.record({'state': state.value if state else None, 'failed': failed})",
+                    "resource.record(state, failed)",
+                ] {
+                    for work in [
+                        "if resource.enabled() and resource.ready():\n            await resource.work(state)",
+                        "if enabled:\n            return",
+                    ] {
+                        let source = format!(
+                            "async def sample(resource, state, task, enabled, failed):\n    try:\n        {work}\n    finally:\n        try:\n            if {condition}:\n                {setup}try:\n                    await resource.shield(task)\n                {handler}\n                    raise\n        except Exception:\n            raise\n        finally:\n            {cleanup}\n"
+                        );
+                        assert_matches_cpython(&source, "awaited_recovery_entry.py", &LEVELS);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn guarded_raise_reaches_nested_cleanup_setup() {
     for prefix in ["", "async "] {
         for recovery in ["raise", "return state"] {

@@ -32177,10 +32177,20 @@ impl<'source> Compiler<'source> {
                                                 && clause.body.iter().all(completed_await_recovery_work)))
                         })
                 }));
+        // Awaited recovery retains its success jump in normal and return-copied cleanup.
+        let coroutine_reraise_cleanup =
+            self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+                && self.control.finally.active_normal_finally_bodies
+                    + self.control.finally.active_copied_finally_bodies
+                    == 1
+                && matches!(statement.finalbody.as_slice(), [Stmt::Expr(cleanup)]
+                if matches!(cleanup.value.as_ref(), Expr::Call(_))
+                    && !expression_suspends_current_scope(&cleanup.value));
         // Bare reraising recovery leaves the guard's single false edge populated.
         let conditional_reraise_entry = self.context.python_version == crate::PythonVersion::Py314
             && matches!(self.unit.scope, Scope::Function { .. })
-            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                || coroutine_reraise_cleanup)
             && self.control.loops.contexts.is_empty()
             && self.control.withs.active_with_exits.is_empty()
             && self
@@ -32190,18 +32200,31 @@ impl<'source> Compiler<'source> {
                 .is_empty()
             && !self.control.in_exception_handler()
             && self.control.finally.active_finally_try_bodies == 0
-            && self.control.finally.active_copied_finally_bodies == 0
+            && (self.control.finally.active_copied_finally_bodies == 0
+                || coroutine_reraise_cleanup)
             && matches!(statement.body.last(), Some(Stmt::If(conditional))
             if conditional.elif_else_clauses.is_empty()
                 && original_condition_has_unique_jump_target(&conditional.test, false)
-                && matches!(conditional.body.as_slice(), [Stmt::Try(recovery)]
-                    if !recovery.is_star
+                && matches!(conditional.body.split_last(), Some((Stmt::Try(recovery), prefix))
+                    if (prefix.is_empty()
+                            || (coroutine_reraise_cleanup
+                                && suite_has_nonsuspending_linear_fallthrough(prefix)))
+                        && !recovery.is_star
                         && recovery.orelse.is_empty()
                         && recovery.finalbody.is_empty()
-                        && suite_has_nonsuspending_linear_fallthrough(&recovery.body)
+                        && (suite_has_nonsuspending_linear_fallthrough(&recovery.body)
+                            || (coroutine_reraise_cleanup
+                                && matches!(recovery.body.as_slice(), [Stmt::Expr(work)]
+                                    if matches!(work.value.as_ref(), Expr::Await(awaited)
+                                        if matches!(awaited.value.as_ref(), Expr::Call(_))
+                                            && !expression_contains_inline_branch(&awaited.value)
+                                            && !expression_suspends_current_scope(&awaited.value)))))
                         && matches!(recovery.handlers.as_slice(), [handler]
                             if handler.as_except_handler().is_some_and(|handler| {
-                                handler.type_.is_none()
+                                (handler.type_.is_none()
+                                    || (coroutine_reraise_cleanup
+                                        && handler.name.is_none()
+                                        && matches!(handler.type_.as_deref(), Some(Expr::Name(_) | Expr::Attribute(_)))))
                                     && suite_has_linear_raise_exit(&handler.body)
                                     && matches!(handler.body.last(), Some(Stmt::Raise(raised))
                                         if raised.exc.is_none() && raised.cause.is_none())
@@ -32215,10 +32238,12 @@ impl<'source> Compiler<'source> {
         let conditional_body_reaches_finally = !statement.is_star
             && statement.orelse.is_empty()
             && self.control.withs.active_with_region_exclusions.is_empty()
-            && self.control.finally.active_normal_finally_bodies == 0
+            && (self.control.finally.active_normal_finally_bodies == 0
+                || (coroutine_reraise_cleanup && conditional_reraise_entry))
             && self.control.finally.active_finally_end_blocks == 0
             && !suite_contains_loop_break(&statement.body)
             && (self.suite_has_nonempty_borrow_entry(&statement.finalbody)
+                || (coroutine_reraise_cleanup && conditional_reraise_entry)
                 || coroutine_guarded_recovery_entry
                 || statement.finalbody.iter().all(|statement| match statement {
                     Stmt::Expr(expression) => {
