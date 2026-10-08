@@ -26106,7 +26106,7 @@ impl<'source> Compiler<'source> {
                 && let Some(range) = suite_assert_success_fallthrough_range(normal_exit_suite)
             {
                 self.assembler.set_location(self.source_location(range));
-            } else if terminal_for_break_exit_inherits_predecessor(normal_exit_suite) {
+            } else if self.terminal_for_break_exit_inherits_predecessor(normal_exit_suite) {
                 // The try's terminal footer is shared by loop exhaustion and break
                 // edges, including loops in its else suite. Copies inherit each
                 // predecessor's own authored location.
