@@ -15,6 +15,33 @@ use serc::{
 };
 
 #[test]
+fn terminal_nested_recovery_else_stops_borrowed_continuation() {
+    let indent = |body: &str| {
+        body.lines().fold(String::new(), |mut output, line| {
+            writeln!(output, "    {line}").unwrap();
+            output
+        })
+    };
+    for (header, operation, continuation) in [
+        ("def", "worker.wait()", "consume(value)"),
+        ("async def", "await worker.wait()", "await worker"),
+    ] {
+        for context in ["", "for index in range(3):", "with acquire():"] {
+            for terminal in ["return", "raise RuntimeError(value) from None"] {
+                let mut body = format!(
+                    "try:\n    value = {operation}\nexcept TimeoutError:\n    try:\n        {operation}\n    except LookupError:\n        pass\n    except RuntimeError as caught:\n        if not allowed(caught):\n            raise\n    else:\n        {terminal}\n    value = recover(value)\n{continuation}\n"
+                );
+                if !context.is_empty() {
+                    body = format!("{context}\n{}", indent(&body));
+                }
+                let source = format!("{header} sample(worker, value):\n{}", indent(&body));
+                assert_matches_cpython(&source, "terminal_recovery_else.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
 fn asserted_try_else_retains_borrowed_continuation() {
     let indent = |source: &str| {
         let mut result = String::new();
