@@ -33450,9 +33450,9 @@ impl<'source> Compiler<'source> {
                             && suite_has_linear_borrow_fallthrough(&cleanup.body))
             });
         // Natural for-loop exhaustion retains its original END_FOR/POP_ITER array.
-        // That live normal edge reaches linear cleanup independently of abrupt
-        // handlers. A break or else suite can introduce a separate exit array;
-        // copied finalizers and structured cleanup need their own certificates.
+        // That live normal edge reaches linear or guarded cleanup independently
+        // of handlers and earlier copied returns. Breaks, loop-body returns and
+        // else suites can introduce a separate exit array.
         let for_exhaustion_reaches_finally = !statement.is_star
             && statement.orelse.is_empty()
             && !statement.handlers.is_empty()
@@ -33463,10 +33463,12 @@ impl<'source> Compiler<'source> {
             && self.control.finally.active_normal_finally_bodies == 0
             && self.control.finally.active_finally_end_blocks == 0
             && self.control.finally.active_finally_try_bodies == 0
-            && matches!(statement.body.last(), Some(Stmt::For(loop_statement))
+            && matches!(statement.body.split_last(), Some((Stmt::For(loop_statement), prefix))
                 if !loop_statement.is_async
                     && loop_statement.orelse.is_empty()
                     && !suite_contains_loop_break(&loop_statement.body)
+                    && !suite_contains_return(&loop_statement.body)
+                    && (!suite_contains_return(prefix) || suite_has_normal_fallthrough(prefix))
                     && !expression_contains_inline_branch(&loop_statement.iter)
                     && !expression_suspends_current_scope(&loop_statement.iter)
                     && !expression_contains_inline_branch(&loop_statement.target)
@@ -33476,35 +33478,21 @@ impl<'source> Compiler<'source> {
                     .as_except_handler()
                     .is_some_and(|handler| handler.type_.is_some())
             })
-            && !suite_contains_return(&statement.body)
-            && (matches!(statement.finalbody.as_slice(), [Stmt::Expr(cleanup)]
-                if matches!(cleanup.value.as_ref(), Expr::Call(_))
-                    && !expression_contains_inline_branch(&cleanup.value)
-                    && !expression_suspends_current_scope(&cleanup.value))
-                // The primitive guard precedes the set-comprehension call. Natural
-                // exhaustion enters that populated original array before branching
-                // inside the call's arguments; exceptional cleanup remains separate.
-                || (self.unit.flags & CO_COROUTINE == 0
-                    && !has_empty_handler_or_else_exit
-                    && self.control.withs.active_with_exits.is_empty()
-                    && self.control.withs.active_with_region_exclusions.is_empty()
-                    && self.control.exceptions.active_exception_region_exclusions.is_empty()
-                    && matches!(self.control.loops.contexts.as_slice(), [context]
-                        if context.iterator_cleanup == IteratorCleanup::Sync
-                            && !context.has_orelse)
-                    && matches!(statement.handlers.as_slice(), [handler]
-                        if handler.as_except_handler().is_some_and(|handler| {
-                            handler.name.is_some()
-                                && suite_has_linear_reraise_guards(&handler.body)
-                        }))
-                    && matches!(statement.finalbody.as_slice(), [Stmt::If(cleanup)]
-                        if cleanup.elif_else_clauses.is_empty()
-                            && matches!(cleanup.test.as_ref(), Expr::Compare(comparison)
-                                if matches!(comparison.first_operand(), Expr::Name(_))
-                                    && comparison.ops[..] == [CmpOp::IsNot]
-                                    && matches!(comparison.comparators(), [Expr::NoneLiteral(_)]))
-                            && matches!(cleanup.body.as_slice(), [Stmt::Expr(call)]
-                                if cleanup_set_count_call_has_eager_entry(&call.value)))));
+            && (suite_has_nonsuspending_linear_fallthrough(&statement.finalbody)
+                || statement.finalbody.iter().all(|part| {
+                    suite_has_nonsuspending_linear_fallthrough(std::slice::from_ref(part))
+                        || matches!(part, Stmt::Assign(assignment)
+                            if assignment.targets.iter().all(|target| {
+                                !expression_contains_inline_branch(target)
+                                    && !expression_suspends_current_scope(target)
+                            }) && expression_has_linear_generator_creation(
+                                &assignment.value, self.context.python_version))
+                })
+                || (matches!(statement.finalbody.first(), Some(Stmt::If(cleanup))
+                    if condition_has_only_runtime_tests(&cleanup.test)
+                        && !expression_contains_inline_branch(&cleanup.test)
+                        && !expression_suspends_current_scope(&cleanup.test))
+                    && !suite_contains_abrupt_control_flow(&statement.finalbody)));
         // An else-suite break can enter the same nonempty normal cleanup as a
         // protected-body break. Keep the certificate bound to this exact loop.
         let generator_else_break_loop_range = if !statement.is_star
@@ -42201,6 +42189,46 @@ fn suite_contains_yield_with_scope_options(
     collector.found
 }
 
+/// Certifies generator creation whose current-scope evaluation stays linear.
+fn expression_has_linear_generator_creation(
+    expression: &Expr,
+    python_version: crate::PythonVersion,
+) -> bool {
+    if crate::stack_growth_required() {
+        return crate::grow_stack(|| {
+            expression_has_linear_generator_creation(expression, python_version)
+        });
+    }
+    match expression {
+        Expr::Generator(generator) => {
+            // Only the first iterable is evaluated before entering the generator.
+            generator
+                .generators
+                .first()
+                .is_some_and(|first| !expression_contains_inline_branch(&first.iter))
+                && !expression_suspends_current_scope(&generator.elt)
+                && generator.generators.iter().all(|iterator| {
+                    !iterator.is_async
+                        && !expression_suspends_current_scope(&iterator.iter)
+                        && !expression_suspends_current_scope(&iterator.target)
+                        && iterator
+                            .ifs
+                            .iter()
+                            .all(|test| !expression_suspends_current_scope(test))
+                })
+        }
+        Expr::Call(call) => {
+            optimized_generator_callable_for_target(call, python_version).is_none()
+                && call.arguments.keywords.is_empty()
+                && !expression_contains_inline_branch(&call.func)
+                && !expression_suspends_current_scope(&call.func)
+                && matches!(call.arguments.args.as_ref(), [argument]
+                    if expression_has_linear_generator_creation(argument, python_version))
+        }
+        _ => false,
+    }
+}
+
 fn expression_contains_inline_branch(expression: &Expr) -> bool {
     #[derive(Default)]
     struct InlineBranchDetector {
@@ -46120,53 +46148,6 @@ fn cleanup_dictionary_call_has_live_join(expression: &Expr) -> bool {
                 && !expression_suspends_current_scope(&item.value)
         }
     }) && conditional_values == 1
-}
-
-// A single synchronous set comprehension follows the ordinary callable prefix.
-// Filtered, nested, unpacking and suspending arguments keep their existing entry rules.
-fn cleanup_set_count_call_has_eager_entry(expression: &Expr) -> bool {
-    let Expr::Call(call) = expression else {
-        return false;
-    };
-    if !(matches!(call.func.as_ref(), Expr::Name(_))
-        || matches!(call.func.as_ref(), Expr::Attribute(attribute)
-            if matches!(attribute.value.as_ref(), Expr::Name(_))))
-        || expression_suspends_current_scope(expression)
-        || call
-            .arguments
-            .keywords
-            .iter()
-            .any(|keyword| keyword.arg.is_none())
-    {
-        return false;
-    }
-    let mut set_counts = 0;
-    call.arguments
-        .args
-        .iter()
-        .chain(call.arguments.keywords.iter().map(|keyword| &keyword.value))
-        .all(|argument| {
-            if !expression_contains_inline_branch(argument) {
-                return !matches!(argument, Expr::Starred(_));
-            }
-            let Expr::Call(count) = argument else {
-                return false;
-            };
-            let [Expr::SetComp(comprehension)] = &count.arguments.args[..] else {
-                return false;
-            };
-            set_counts += 1;
-            set_counts == 1
-                && matches!(count.func.as_ref(), Expr::Name(_))
-                && count.arguments.keywords.is_empty()
-                && !expression_contains_inline_branch(&comprehension.elt)
-                && matches!(&comprehension.generators[..], [generator]
-                    if !generator.is_async
-                        && generator.ifs.is_empty()
-                        && matches!(generator.target, Expr::Name(_))
-                        && !expression_contains_inline_branch(&generator.iter))
-        })
-        && set_counts == 1
 }
 
 // A plain recovery call has no branching or suspending argument evaluation.
