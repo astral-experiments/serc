@@ -15,6 +15,28 @@ use serc::{
 };
 
 #[test]
+fn recovery_break_cleanup_keeps_its_empty_exit() {
+    for handler in ["Empty", "errors.Empty", "errors.Empty as error"] {
+        for suffix in [
+            "",
+            "                        item.cancel()\n                        resource.release(item)\n",
+        ] {
+            for work in [
+                "                resource.run()\n",
+                "                for worker in workers:\n                    worker.result()\n",
+            ] {
+                for iterator in ["queues", "(resource.queue, *queues.values())"] {
+                    let source = format!(
+                        "def sample(resource, workers, queues, previous):\n    try:\n        with resource.open():\n            try:\n{work}            finally:\n                for queue in {iterator}:\n                    while True:\n                        try:\n                            item = queue.get()\n                        except {handler}:\n                            break\n{suffix}    finally:\n        for key, value in previous.items():\n            restore(key, value)\n"
+                    );
+                    assert_matches_cpython(&source, "recovery_break_cleanup.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn runtime_nonterminal_break_preserves_cleanup_entry() {
     for condition in [
         "ready and other",

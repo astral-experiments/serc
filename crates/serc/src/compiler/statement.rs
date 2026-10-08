@@ -43659,6 +43659,26 @@ fn finally_loop_leaves_empty_borrow_exit(statement: &Stmt) -> bool {
                     .iter()
                     .any(finally_loop_leaves_empty_borrow_exit)
         }
+        Stmt::While(statement) => {
+            // The recovery break moves cold, leaving its original loop exit empty.
+            early_condition_truthiness(&statement.test) == Some(true)
+                && statement.orelse.is_empty()
+                && matches!(statement.body.split_first(), Some((Stmt::Try(recovery), trailing))
+                if !recovery.is_star
+                    && recovery.orelse.is_empty()
+                    && recovery.finalbody.is_empty()
+                    && suite_has_nonsuspending_linear_fallthrough(&recovery.body)
+                    && (trailing.is_empty()
+                        || suite_has_nonsuspending_linear_fallthrough(trailing))
+                    && matches!(recovery.handlers.as_slice(), [handler]
+                        if handler.as_except_handler().is_some_and(|handler| {
+                            handler.type_.as_deref().is_some_and(|type_| {
+                                !expression_contains_inline_branch(type_)
+                                    && !expression_suspends_current_scope(type_)
+                            })
+                                && matches!(handler.body.as_slice(), [Stmt::Break(_)])
+                        })))
+        }
         Stmt::If(statement) => {
             let truth = early_condition_truthiness(&statement.test);
             if truth != Some(false)
@@ -47363,6 +47383,33 @@ mod tests {
     };
     use ruff_python_ast::Stmt;
     use ruff_python_parser::parse_module;
+
+    #[test]
+    fn cleanup_drain_exit_requires_a_linear_break_recovery() {
+        let source = "while True:\n    try:\n        item = queue.get()\n    except errors.Empty:\n        break\n    consume(item)\n";
+        for (from, to, expected) in [
+            ("True", "True", true),
+            ("errors.Empty", "Empty", true),
+            ("    consume(item)\n", "", true),
+            ("True", "ready", false),
+            ("errors.Empty", "errors.Empty as error", true),
+            ("errors.Empty", "Error if flag else Other", false),
+            ("except errors.Empty", "except* errors.Empty", false),
+            ("queue.get()", "await queue.get()", false),
+            ("queue.get()", "queue.get(left if flag else right)", false),
+            ("break", "continue", false),
+            ("consume(item)", "await consume(item)", false),
+            ("consume(item)", "consume((yield item))", false),
+        ] {
+            let source = source.replacen(from, to, 1);
+            let parsed = parse_module(&source).unwrap();
+            assert_eq!(
+                super::finally_loop_leaves_empty_borrow_exit(&parsed.suite()[0]),
+                expected,
+                "{source}"
+            );
+        }
+    }
 
     #[test]
     fn conditional_manager_cleanup_requires_linear_calls() {
