@@ -33653,7 +33653,9 @@ impl<'source> Compiler<'source> {
         // Nested protection and managers are safe only without copied break exits.
         let loop_guarded_recovery_reaches_finally = !statement.is_star
             && matches!(self.unit.scope, Scope::Function { .. })
-            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+            && (self.unit.flags & CO_COROUTINE == 0
+                || self.context.python_version == crate::PythonVersion::Py314)
             && !self.control.loops.contexts.is_empty()
             && self.control.withs.active_with_exits.is_empty()
             && self
@@ -33666,7 +33668,8 @@ impl<'source> Compiler<'source> {
             && self.control.finally.active_normal_finally_bodies == 0
             && self.control.finally.active_finally_end_blocks == 0
             && self.control.finally.active_copied_finally_bodies == 0
-            && ((self.control.finally.active_finally_try_bodies == 0
+            && ((self.unit.flags & CO_COROUTINE == 0
+                && self.control.finally.active_finally_try_bodies == 0
                 && !suite_any_statement(&statement.finalbody, |part| {
                     matches!(part, Stmt::With(_))
                 }))
@@ -46241,35 +46244,49 @@ fn recovery_comprehension_call_has_nonempty_exit(expression: &Expr) -> bool {
     }) && comprehensions == 1
 }
 
-/// Recognize ordinary loop recovery whose normal and guarded handler exits remain populated.
+/// Recognize loop recovery with populated normal and guarded handler exits.
 fn loop_recovery_has_nonempty_finally_route(
     statement: &ruff_python_ast::StmtTry,
     version: crate::PythonVersion,
 ) -> bool {
     fn runtime_test(test: &Expr) -> bool {
-        condition_has_only_runtime_tests(test)
-            && !expression_contains_inline_branch(test)
-            && !expression_suspends_current_scope(test)
+        condition_has_linear_runtime_leaves(test) && !expression_suspends_current_scope(test)
     }
 
     fn linear(statement: &Stmt) -> bool {
         matches!(statement, Stmt::Pass(_))
-            || suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement))
+            || suite_has_nonsuspending_linear_fallthrough(std::slice::from_ref(statement))
     }
 
-    fn recovery(body: &[Stmt], allow_break: bool, has_guard: &mut bool) -> bool {
+    fn recovery(body: &[Stmt], is_handler: bool, has_guard: &mut bool) -> bool {
         body.iter().all(|statement| {
-            if linear(statement) {
+            if linear(statement)
+                || (!is_handler
+                    && matches!(statement, Stmt::Assign(assignment)
+                        if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                            && matches!(assignment.value.as_ref(), Expr::Await(awaited)
+                                if !expression_contains_inline_branch(&awaited.value)
+                                    && !expression_suspends_current_scope(&awaited.value))))
+            {
                 return true;
             }
             let Stmt::If(guard) = statement else {
                 return false;
             };
-            if !runtime_test(&guard.test) || !guard.elif_else_clauses.is_empty() {
+            if !runtime_test(&guard.test) {
                 return false;
             }
-            if suite_has_linear_raise_exit(&guard.body)
-                || (allow_break && matches!(guard.body.as_slice(), [Stmt::Break(_)]))
+            if !guard.elif_else_clauses.is_empty() {
+                return !is_handler
+                    && guard.body.iter().all(linear)
+                    && guard.elif_else_clauses.iter().all(|clause| {
+                        clause.test.as_ref().is_none_or(runtime_test)
+                            && clause.body.iter().all(linear)
+                    });
+            }
+            if (suite_has_linear_raise_exit(&guard.body)
+                && suite_has_nonsuspending_raise_work(&guard.body))
+                || (is_handler && matches!(guard.body.as_slice(), [Stmt::Break(_)]))
             {
                 *has_guard = true;
                 true
