@@ -33650,7 +33650,7 @@ impl<'source> Compiler<'source> {
         let loop_guarded_recovery_reaches_finally = !statement.is_star
             && matches!(self.unit.scope, Scope::Function { .. })
             && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
-            && self.control.loops.contexts.len() == 1
+            && !self.control.loops.contexts.is_empty()
             && self.control.withs.active_with_exits.is_empty()
             && self
                 .control
@@ -33662,7 +33662,7 @@ impl<'source> Compiler<'source> {
             && self.control.finally.active_normal_finally_bodies == 0
             && self.control.finally.active_finally_end_blocks == 0
             && self.control.finally.active_copied_finally_bodies == 0
-            && loop_recovery_has_nonempty_finally_route(statement);
+            && loop_recovery_has_nonempty_finally_route(statement, self.context.python_version);
         // A guarded named handler has a populated exit into normal cleanup,
         // even when the protected body or an earlier handler is only `pass`.
         let guarded_named_handler_reaches_finally = !statement.is_star
@@ -46229,7 +46229,10 @@ fn recovery_comprehension_call_has_nonempty_exit(expression: &Expr) -> bool {
 }
 
 /// Recognize ordinary loop recovery whose normal and guarded handler exits remain populated.
-fn loop_recovery_has_nonempty_finally_route(statement: &ruff_python_ast::StmtTry) -> bool {
+fn loop_recovery_has_nonempty_finally_route(
+    statement: &ruff_python_ast::StmtTry,
+    version: crate::PythonVersion,
+) -> bool {
     fn runtime_test(test: &Expr) -> bool {
         condition_has_only_runtime_tests(test)
             && !expression_contains_inline_branch(test)
@@ -46263,19 +46266,43 @@ fn loop_recovery_has_nonempty_finally_route(statement: &ruff_python_ast::StmtTry
         })
     }
 
-    fn cleanup(body: &[Stmt]) -> bool {
-        !body.is_empty()
-            && body.iter().all(|statement| {
-                if linear(statement) {
-                    return true;
-                }
-                matches!(statement, Stmt::If(branch)
-                if runtime_test(&branch.test)
-                    && cleanup(&branch.body)
-                    && branch.elif_else_clauses.iter().all(|clause| {
-                        clause.test.as_ref().is_none_or(runtime_test) && cleanup(&clause.body)
-                    }))
-            })
+    fn cleanup(body: &[Stmt], version: crate::PythonVersion) -> bool {
+        !body.is_empty() && body.iter().all(|statement| {
+            if linear(statement) {
+                return true;
+            }
+            if matches!(statement, Stmt::Assign(assignment)
+            if condition_has_completed_call_leaves(&assignment.value, version)
+                && !expression_suspends_current_scope(&assignment.value)
+                && assignment.targets.iter().all(|target| {
+                    !expression_contains_inline_branch(target)
+                        && !expression_suspends_current_scope(target)
+                }))
+            {
+                return true;
+            }
+            if let Stmt::Try(cleanup) = statement {
+                return !cleanup.is_star
+                    && cleanup.orelse.is_empty()
+                    && cleanup.finalbody.is_empty()
+                    && suite_has_nonsuspending_linear_fallthrough(&cleanup.body)
+                    && !cleanup.handlers.is_empty()
+                    && cleanup.handlers.iter().all(|handler| {
+                        handler.as_except_handler().is_some_and(|handler| {
+                            handler.type_.as_deref().is_some_and(|type_| {
+                                !expression_contains_inline_branch(type_)
+                                    && !expression_suspends_current_scope(type_)
+                            }) && suite_has_nonsuspending_linear_fallthrough(&handler.body)
+                        })
+                    });
+            }
+            matches!(statement, Stmt::If(branch)
+            if runtime_test(&branch.test)
+                && cleanup(&branch.body, version)
+                && branch.elif_else_clauses.iter().all(|clause| {
+                    clause.test.as_ref().is_none_or(runtime_test) && cleanup(&clause.body, version)
+                }))
+        })
     }
 
     let normal_source = if statement.orelse.is_empty() {
@@ -46299,7 +46326,7 @@ fn loop_recovery_has_nonempty_finally_route(statement: &ruff_python_ast::StmtTry
             })
         })
         && has_handler_guard
-        && cleanup(&statement.finalbody)
+        && cleanup(&statement.finalbody, version)
 }
 
 // Runtime re-raise guards keep their false successors connected to handler cleanup.
