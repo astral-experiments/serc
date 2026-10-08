@@ -26853,7 +26853,10 @@ impl<'source> Compiler<'source> {
                 && (exclude_nested_normal_exit
                     || (body_has_elided_assertion
                         && body_noop_location.is_some()
-                        && statement.orelse.is_empty()
+                        && statement
+                            .orelse
+                            .iter()
+                            .all(|part| self.context.is_elided_statement(part))
                         && self.context.python_version >= crate::PythonVersion::Py314)
                     || (body_noop_location.is_some()
                         && self.context.python_version >= crate::PythonVersion::Py314
