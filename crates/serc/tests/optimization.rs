@@ -25,6 +25,39 @@ fn conditional_retry_else_keeps_live_continuation() {
 }
 
 #[test]
+fn manager_setup_tail_keeps_none_marker_unprotected() {
+    for managers in [
+        ["resource.open()", "resource.open()"],
+        ["resource.open() as first", "resource.open() as second"],
+        [
+            "resource.open() as (first, other)",
+            "resource.open() as (second, extra)",
+        ],
+    ] {
+        for comma in [false, true] {
+            for condition in ["payload is None", "payload is not None"] {
+                let mut suite = format!(
+                    "try:\n    if {condition}:\n        resource.close()\nexcept Error as error:\n    if resource.poll() is None:\n        try:\n            resource.wait()\n        except LookupError:\n            resource.wait()\nfinally:\n    with resource.lock:\n        resource.release()\n"
+                );
+                let managers = if comma {
+                    vec![managers.join(", ")]
+                } else {
+                    managers.map(str::to_owned).to_vec()
+                };
+                for manager in managers.iter().rev() {
+                    suite = format!("with {manager}:\n    {}", suite.replace('\n', "\n    "));
+                }
+                let source = format!(
+                    "def sample(resource, payload):\n    {}",
+                    suite.replace('\n', "\n    ")
+                );
+                assert_matches_cpython(&source, "manager_setup_tail.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
 fn linear_retry_else_stops_borrowed_continuation() {
     for coroutine in ["", "async "] {
         for handler in ["Error", "Error as error"] {
