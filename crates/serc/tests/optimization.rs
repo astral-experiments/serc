@@ -15,6 +15,33 @@ use serc::{
 };
 
 #[test]
+fn completed_loop_work_reaches_boolean_cleanup() {
+    for (prefix, awaited) in [("", false), ("async ", false), ("async ", true)] {
+        for work in [
+            "pending = state.request(payload)",
+            "if enabled:\n                pending = state.request(payload)",
+            "if enabled:\n                pending = state.request(payload)\n            else:\n                pending = state.request(other)",
+        ] {
+            for guard in [
+                "pending is not None",
+                "pending is not None and not pending.done()",
+                "pending is None or not pending.done()",
+            ] {
+                let completion = if awaited {
+                    "response = await pending.wait()\n            counts.misses += misses"
+                } else {
+                    "counts.misses += misses"
+                };
+                let source = format!(
+                    "{prefix}def sample(state):\n    while clock.time() < deadline:\n        try:\n            {work}\n            {completion}\n        except ServerError as error:\n            if code in ('DENIED', 'INVALID'):\n                raise RuntimeError(code) from None\n        finally:\n            if {guard}:\n                pending.cancel()\n"
+                );
+                assert_matches_cpython(&source, "loop_boolean_cleanup.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
 fn async_iterator_early_break_survives_later_continues() {
     for setup in ["", "            assert channel is not None\n"] {
         for alternate in ["continue", "return value"] {
