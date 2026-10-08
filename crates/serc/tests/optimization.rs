@@ -15,6 +15,25 @@ use serc::{
 };
 
 #[test]
+fn erased_async_finalizer_keeps_empty_borrow_exit() {
+    for binding in ["", " as entered"] {
+        for work in ["await wait()", "value = await receive()\nconsume(value)"] {
+            for cleanup in [
+                "assert cleanup() is state",
+                "assert state\nassert cleanup() is state",
+            ] {
+                let work = work.replace('\n', "\n                    ");
+                let cleanup = cleanup.replace('\n', "\n                ");
+                let source = format!(
+                    "async def sample(state):\n    token = store.set(state)\n    try:\n        async with owner():\n            try:\n                async with connection(){binding}:\n                    {work}\n            finally:\n                {cleanup}\n    finally:\n        store.reset(token)\n"
+                );
+                assert_matches_cpython(&source, "erased_async_finalizer.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
 fn nested_recovery_alternative_keeps_cleanup_live() {
     for class in [false, true] {
         for condition in ["outer", "ready(state)"] {
