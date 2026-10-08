@@ -15,6 +15,43 @@ use serc::{
 };
 
 #[test]
+fn async_iterator_early_break_survives_later_continues() {
+    for setup in ["", "            assert channel is not None\n"] {
+        for alternate in ["continue", "return value"] {
+            let source = format!(
+                "async def sample(channel, notify):\n    failure = None\n    try:\n        while True:\n{setup}            async for message in channel:\n                if message.closed:\n                    break\n                value = decode(message)\n                if value.skip:\n                    {alternate}\n                await deliver(value)\n                if value.failed:\n                    break\n            if not channel.active:\n                break\n            await channel.reconnect()\n    except Cancelled:\n        raise\n    except Error as error:\n        failure = error\n    finally:\n        if not channel.stopping:\n            await notify(failure or RuntimeError('disconnected'))\n"
+            );
+            assert_matches_cpython(&source, "async_iterator_early_break_cleanup.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
+fn async_iterator_break_reaches_outer_loop_cleanup() {
+    for guarded in [false, true] {
+        for reconnect in ["channel.reconnect()", "await channel.reconnect()"] {
+            for argument in ["failure", "failure or RuntimeError('disconnected')"] {
+                let inner =
+                    "if not await channel.acknowledge(channel.position):\n    break\ncontinue\n";
+                let inner = if guarded {
+                    format!(
+                        "if channel.active and position <= channel.position:\n    {}\n",
+                        inner.trim_end().replace('\n', "\n    ")
+                    )
+                } else {
+                    inner.to_string()
+                };
+                let source = format!(
+                    "async def sample(channel, notify):\n    try:\n        while True:\n            async for message in channel:\n                {}\n            if not channel.active:\n                break\n            {reconnect}\n    except Cancelled:\n        raise\n    except Error as error:\n        failure = error\n    finally:\n        if not channel.stopping:\n            await notify({argument})\n",
+                    inner.trim_end().replace('\n', "\n                ")
+                );
+                assert_matches_cpython(&source, "async_iterator_outer_cleanup.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
 fn guarded_break_keeps_outer_finalizer_boundary() {
     for depth in [1, 2] {
         for binding in ["", " as error"] {
