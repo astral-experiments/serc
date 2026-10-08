@@ -15,6 +15,23 @@ use serc::{
 };
 
 #[test]
+fn guarded_recovery_preserves_named_cleanup_entry() {
+    for prefix in [
+        "        if ready:\n            resource.prepare()\n",
+        "        try:\n            resource.prepare()\n        except LookupError as problem:\n            report(problem)\n",
+    ] {
+        for work in ["result = 0", "result = resource.run()"] {
+            for condition in ["ready", "ready and other is not None"] {
+                let source = format!(
+                    "def sample(resource, ready, other):\n    result = None\n    try:\n{prefix}        {work}\n    except Error as error:\n        if {condition}:\n            if other is None:\n                report(resource)\n        elif resource.active:\n            try:\n                resource.save()\n            except Error as failure:\n                report(failure)\n    finally:\n        try:\n            resource.close()\n        except Error as failure:\n            result = 1\n    return result\n"
+                );
+                assert_matches_cpython(&source, "guarded_named_cleanup.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
 fn guarded_reraise_retains_normal_cleanup_entry() {
     for prefix in [
         "",
