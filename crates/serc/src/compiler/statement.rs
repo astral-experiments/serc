@@ -43334,7 +43334,9 @@ fn suite_ends_in_nested_handler_cold_join(body: &[Stmt]) -> bool {
         Some(Stmt::Try(statement))
             if statement.handlers.iter().any(|handler| {
                 handler.as_except_handler().is_some_and(|handler| {
-                    handler
+                    (!statement.orelse.is_empty()
+                        && suite_has_nonsuspending_linear_fallthrough(&statement.orelse))
+                    || handler
                         .body
                         .iter()
                         .any(|statement| !matches!(statement, Stmt::Assign(_) | Stmt::Pass(_)))

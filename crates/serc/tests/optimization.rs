@@ -15,6 +15,34 @@ use serc::{
 };
 
 #[test]
+fn linear_retry_else_stops_borrowed_continuation() {
+    for coroutine in ["", "async "] {
+        for handler in ["Error", "Error as error"] {
+            for recovery in ["pass", "upper = middle - 1"] {
+                for otherwise in ["lower = middle + 1", "resource.advance()"] {
+                    for nested in [false, true] {
+                        let mut body = format!(
+                            "try:\n    resource.read(item, setting=configure(resource))\nexcept {handler}:\n    while lower <= upper:\n        try:\n            resource.read(item)\n        except LookupError:\n            {recovery}\n        else:\n            {otherwise}\nif upper - lower <= resource.minimum:\n    raise Error('stop')\nlower = upper - resource.overlap\n"
+                        );
+                        if nested {
+                            body = format!(
+                                "for index, item in enumerate(items):\n    while lower < len(item):\n        {}",
+                                body.replace('\n', "\n        ")
+                            );
+                        }
+                        let source = format!(
+                            "{coroutine}def sample(resource, items, item, lower, upper):\n    {}",
+                            body.replace('\n', "\n    ")
+                        );
+                        assert_matches_cpython(&source, "linear_retry_else.py", &LEVELS);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn surviving_break_reaches_cleanup_inside_nested_managers() {
     for (header, manager, work) in [
         ("def", "with", "resource.run()"),
