@@ -35996,14 +35996,14 @@ impl<'source> Compiler<'source> {
                     .withs
                     .active_with_exits
                     .last()
-                    .is_some_and(|manager| manager.is_async)
+                    .is_none_or(|manager| manager.is_async)
                 && !self.control.in_exception_handler()
                 && self.control.finally.active_normal_finally_bodies == 0
                 && self.control.finally.active_copied_finally_bodies == 0
                 && self.control.finally.active_finally_end_blocks == 0
                 && matches!(statement.body.as_slice(), [Stmt::With(manager)]
                     if manager.is_async
-                        && suite_has_linear_borrow_fallthrough(&manager.body));
+                        && suite_has_populated_try_exit(&manager.body));
             // A folded true terminal conditional also retains its original empty exit,
             // even when its selected body has a nested handler or manager bypass.
             if erased_async_manager_finally_exit
