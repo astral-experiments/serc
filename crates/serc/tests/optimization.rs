@@ -15,6 +15,41 @@ use serc::{
 };
 
 #[test]
+fn guarded_iterator_break_reaches_recovery_cleanup() {
+    for iterator in ["(1, 2)", "items"] {
+        for setup in [
+            "",
+            "            value = run(attempt)\n            attempts.append(value)\n            assert ready(value)\n",
+        ] {
+            let source = format!(
+                "def sample(result, items):\n    attempts = []\n    failure = None\n    try:\n        for attempt in {iterator}:\n{setup}            if not result.ready():\n                break\n            if attempt == 1:\n                report(result)\n        assert ready(attempts)\n    except BaseException as error:\n        failure = f'{{type(error).__name__}}: {{error}}'\n        raise\n    finally:\n        try:\n            upload(payload(attempts, failure=failure))\n        except Error:\n            report()\n"
+            );
+            assert_matches_cpython(&source, "guarded_iterator_cleanup.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
+fn erased_assertions_preserve_iterator_cleanup_marker() {
+    for prefix in ["", "async "] {
+        for iterator in ["(1, 2)", "items"] {
+            for binding in ["", " as error"] {
+                for cleanup in [
+                    "finish()",
+                    "try:\n    finish()\nexcept Error:\n    recover()",
+                ] {
+                    let cleanup = cleanup.replace('\n', "\n        ");
+                    let source = format!(
+                        "{prefix}def sample(result, attempts, items):\n    try:\n        for attempt in {iterator}:\n            if not result.ready():\n                break\n        assert not attempts[-1].ready(), 'failed'\n    except BaseException{binding}:\n        raise\n    finally:\n        {cleanup}\n"
+                    );
+                    assert_matches_cpython(&source, "erased_iterator_cleanup.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn erased_async_finalizer_keeps_empty_borrow_exit() {
     for binding in ["", " as entered"] {
         for work in ["await wait()", "value = await receive()\nconsume(value)"] {
