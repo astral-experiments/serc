@@ -15,6 +15,18 @@ use serc::{
 };
 
 #[test]
+fn awaited_else_assertion_keeps_following_loads_live() {
+    for operator in ["is", "is not"] {
+        for arguments in ["index.id", "index.id, bypass=True"] {
+            let source = format!(
+                "async def sample(index, account, created):\n    try:\n        await cleanup()\n    except RetryError:\n        pass\n    else:\n        assert await get_index({arguments}) {operator} None\n    replacement = await load(account)\n    assert await exists(replacement.id, created.id)\n"
+            );
+            assert_matches_cpython(&source, "awaited_else_assertion.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn completed_loop_work_reaches_boolean_cleanup() {
     for (prefix, awaited) in [("", false), ("async ", false), ("async ", true)] {
         for work in [
