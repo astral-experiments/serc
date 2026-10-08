@@ -22315,16 +22315,19 @@ impl<'source> Compiler<'source> {
                     && self.control.finally.active_normal_finally_bodies == 0
                     && self.control.finally.active_finally_end_blocks == 0
                     && self.control.finally.active_copied_finally_bodies == 0
-                    && self.control.withs.active_with_region_exclusions.len() == 1
+                    && !self.control.withs.active_with_exits.is_empty()
+                    && self.control.withs.active_with_region_exclusions.len()
+                        == self.control.withs.active_with_exits.len()
                     && self.control.finally.innermost_finally_exception_exclusion_depth
                         == Some(self.control.exceptions.active_exception_region_exclusions.len())
-                    && matches!(self.control.withs.active_with_exits.as_slice(), [manager]
-                        if manager.loop_depth == 0
+                    && self.control.withs.active_with_exits.iter().all(|manager| {
+                        manager.loop_depth == 0
                             && manager.exception_region_depth + 1
-                                == self.control.exceptions.active_exception_region_exclusions.len())
+                                == self.control.exceptions.active_exception_region_exclusions.len()
+                    })
                     && self.control.finally.active_return_finally_contexts.last().is_some_and(|context| {
                         context.loop_depth == 0
-                            && context.with_depth == 1
+                            && context.with_depth == self.control.withs.active_with_exits.len()
                             && context.handler_depth == 0
                             && context.exception_region_depth + 1
                                 == self.control.exceptions.active_exception_region_exclusions.len()
