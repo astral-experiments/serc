@@ -15,6 +15,54 @@ use serc::{
 };
 
 #[test]
+fn nested_loop_cleanup_recovery_keeps_following_loads_live() {
+    for depth in [1, 2, 3] {
+        for binding in ["", " as error"] {
+            let mut body = format!(
+                "try:\n    result['ready'] = True\nexcept (Error, Interrupt) as error:\n    if isinstance(error, Interrupt):\n        raise\nfinally:\n    try:\n        result['released'] = resource.release()\n    except Error{binding}:\n        resource.report()\n    record(item, result)\n"
+            );
+            for _ in 0..depth {
+                body = format!(
+                    "for item in resource.items:\n    {}",
+                    body.replace('\n', "\n    ")
+                );
+            }
+            let source = format!(
+                "def sample(resource, result):\n    {}\n",
+                body.replace('\n', "\n    ")
+            );
+            assert_matches_cpython(&source, "nested_loop_cleanup_recovery.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
+fn nested_loop_cleanup_store_keeps_following_loads_live() {
+    for depth in [1, 2, 3] {
+        for value in [
+            "resource.ready and resource.enabled",
+            "all(item['passed'] for item in report['cases'])",
+            "len(report['cases']) == len(resource.items) and all(item['passed'] for item in report['cases'])",
+        ] {
+            let mut body = format!(
+                "try:\n    result['passed'] = True\nexcept (Error, Interrupt) as error:\n    if isinstance(error, Interrupt):\n        raise\nfinally:\n    report['passed'] = {value}\n    record(item, result)\n"
+            );
+            for _ in 0..depth {
+                body = format!(
+                    "for item in resource.items:\n    {}",
+                    body.replace('\n', "\n    ")
+                );
+            }
+            let source = format!(
+                "def sample(resource, result, report):\n    {}\n",
+                body.replace('\n', "\n    ")
+            );
+            assert_matches_cpython(&source, "nested_loop_cleanup_store.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn pre_iterator_return_keeps_normal_cleanup_entry() {
     for prefix in ["", "async "] {
         let awaited = if prefix.is_empty() { "" } else { "await " };
