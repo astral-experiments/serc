@@ -27720,14 +27720,13 @@ impl<'source> Compiler<'source> {
                     && self.control.finally.active_copied_finally_bodies == 0
                     && self.control.finally.active_finally_end_blocks == 0
                     && coroutine_try_has_asserted_recovery(statement);
-                let ordinary_asserted_else_exit = borrow_exit_has_source_successor
+                let ordinary_asserted_else_exit = borrow_exit_has_successor
                     && self.context.python_version == crate::PythonVersion::Py314
                     && !statement.is_star
                     && statement.finalbody.is_empty()
                     && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                     && self.control.loops.contexts.is_empty()
-                    // An enclosing manager stays active across this continuation.
-                    && self.control.withs.active_with_exits.len() <= 1
+                    // Enclosing managers stay active across this continuation.
                     && self.control.withs.active_with_exits.len()
                         == self.control.withs.active_with_region_exclusions.len()
                     && self.control.exceptions.active_exception_handlers.is_empty()

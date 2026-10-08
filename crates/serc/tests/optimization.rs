@@ -15,6 +15,19 @@ use serc::{
 };
 
 #[test]
+fn asserted_recovery_retains_enclosing_manager_successor() {
+    for managers in 1..=3 {
+        for context in ["acquire()", "acquire() as holder"] {
+            let contexts = vec![context; managers].join(", ");
+            let source = format!(
+                "def sample(acquire, resource, failure):\n    with {contexts}:\n        try:\n            with resource.open():\n                if failure is not None:\n                    raise failure\n        except Error as error:\n            assert error is failure\n        else:\n            assert failure is None\n    consume(resource)\n"
+            );
+            assert_matches_cpython(&source, "asserted_manager_successor.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn runtime_asserted_recovery_retains_borrowed_continuation() {
     for managed in [false, true] {
         for handler in ["Error", "Error as error"] {
