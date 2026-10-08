@@ -15,6 +15,19 @@ use serc::{
 };
 
 #[test]
+fn erased_assertion_try_exit_excludes_enclosing_manager() {
+    for (handler, recovery) in [
+        ("Error", "failure is not None"),
+        ("Error as error", "error is failure"),
+    ] {
+        let source = format!(
+            "def sample(acquire, resource, failure):\n    with acquire():\n        try:\n            assert resource.state is current()\n        except {handler}:\n            assert {recovery}\n        else:\n            assert failure is None\n        saved = resource.state\n        consume(saved)\n"
+        );
+        assert_matches_cpython(&source, "erased_assertion_try_exit.py", &LEVELS);
+    }
+}
+
+#[test]
 fn terminal_nested_recovery_else_stops_borrowed_continuation() {
     let indent = |body: &str| {
         body.lines().fold(String::new(), |mut output, line| {
