@@ -15,6 +15,16 @@ use serc::{
 };
 
 #[test]
+fn conditional_retry_else_keeps_live_continuation() {
+    for source in [
+        "def sample(resource, items, enabled, ready):\n    try:\n        if enabled:\n            try:\n                result = False\n            except Error as error:\n                if any(items) and ready:\n                    try:\n                        value = resource.read(items)\n                    except LookupError:\n                        pass\n                    else:\n                        result = True\n            resource.record(result, items, ready)\n    except Error as error:\n        raise\n",
+        "def sample(resource, items, ready):\n    with resource.open():\n        for item in items:\n            try:\n                result = resource.read(item, setting=ready if items else None)\n            except Error as error:\n                if ready and items:\n                    try:\n                        result = resource.read(item)\n                    except LookupError as error:\n                        failure = error\n                    else:\n                        failure = None\n            resource.record(result, item, ready)\n",
+    ] {
+        assert_matches_cpython(source, "conditional_retry_else.py", &LEVELS);
+    }
+}
+
+#[test]
 fn linear_retry_else_stops_borrowed_continuation() {
     for coroutine in ["", "async "] {
         for handler in ["Error", "Error as error"] {
