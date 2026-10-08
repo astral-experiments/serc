@@ -15,6 +15,25 @@ use serc::{
 };
 
 #[test]
+fn guarded_reraise_retains_normal_cleanup_entry() {
+    for prefix in [
+        "",
+        "        resource.prepare()\n",
+        "        if ready:\n            resource.prepare()\n        else:\n            resource.wait()\n",
+        "        try:\n            resource.prepare()\n        except LookupError:\n            pass\n",
+    ] {
+        for recovery in ["", "                report(resource)\n"] {
+            for exit in ["raise Failure(resource.code) from error", "report(error)"] {
+                let source = format!(
+                    "def sample(resource, callback, ready):\n    try:\n{prefix}        if callback is not None:\n            try:\n                callback(resource)\n            except:\n{recovery}                raise\n    except Exception as error:\n        {exit}\n    finally:\n        if resource.pool is not None:\n            resource.stop()\n"
+                );
+                assert_matches_cpython(&source, "guarded_reraise_cleanup.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
 fn wrapped_terminal_recovery_stops_borrowed_continuation() {
     let indent = |body: &str| {
         body.lines().fold(String::new(), |mut output, line| {

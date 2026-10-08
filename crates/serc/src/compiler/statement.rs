@@ -32131,6 +32131,35 @@ impl<'source> Compiler<'source> {
                                                 && clause.body.iter().all(completed_await_recovery_work)))
                         })
                 }));
+        // Bare reraising recovery leaves the guard's single false edge populated.
+        let conditional_reraise_entry = self.context.python_version == crate::PythonVersion::Py314
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && !self.control.in_exception_handler()
+            && self.control.finally.active_finally_try_bodies == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && matches!(statement.body.last(), Some(Stmt::If(conditional))
+            if conditional.elif_else_clauses.is_empty()
+                && original_condition_has_unique_jump_target(&conditional.test, false)
+                && matches!(conditional.body.as_slice(), [Stmt::Try(recovery)]
+                    if !recovery.is_star
+                        && recovery.orelse.is_empty()
+                        && recovery.finalbody.is_empty()
+                        && suite_has_nonsuspending_linear_fallthrough(&recovery.body)
+                        && matches!(recovery.handlers.as_slice(), [handler]
+                            if handler.as_except_handler().is_some_and(|handler| {
+                                handler.type_.is_none()
+                                    && suite_has_linear_raise_exit(&handler.body)
+                                    && matches!(handler.body.last(), Some(Stmt::Raise(raised))
+                                        if raised.exc.is_none() && raised.cause.is_none())
+                            }))));
         // A live linear arm before the final else keeps a reachable jump directly
         // into normal cleanup after handlers move cold. Folded assertions can leave
         // that jump behind an empty block, so a merely nonterminal arm is insufficient.
@@ -32185,17 +32214,20 @@ impl<'source> Compiler<'source> {
             && matches!(statement.body.last(), Some(Stmt::If(conditional))
             if condition_has_only_runtime_tests(&conditional.test)
                 && !expression_contains_inline_branch(&conditional.test)
-                && conditional.elif_else_clauses.last().is_some_and(|clause| {
-                    clause.test.is_none() || elif_recovery_entry
-                })
-                && !suite_contains_abrupt_control_flow(&conditional.body)
+                && (conditional_reraise_entry
+                    || conditional.elif_else_clauses.last().is_some_and(|clause| {
+                        clause.test.is_none() || elif_recovery_entry
+                    }))
+                && (conditional_reraise_entry
+                    || !suite_contains_abrupt_control_flow(&conditional.body))
                 && conditional.elif_else_clauses.iter().all(|clause| {
                     clause.test.as_ref().is_none_or(|test| {
                         condition_has_only_runtime_tests(test)
                             && !expression_contains_inline_branch(test)
                     }) && !suite_contains_abrupt_control_flow(&clause.body)
                 })
-                && (suite_has_linear_borrow_fallthrough(&conditional.body)
+                && (conditional_reraise_entry
+                    || suite_has_linear_borrow_fallthrough(&conditional.body)
                     || suite_has_populated_conditional_alternative(&conditional.body)
                     || synchronous_guarded_recovery_entry
                     || coroutine_guarded_recovery_entry
