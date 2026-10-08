@@ -48,6 +48,32 @@ fn runtime_nonterminal_break_preserves_cleanup_entry() {
 }
 
 #[test]
+fn guarded_runtime_break_retains_its_line_before_cleanup() {
+    for prefix in ["", "        resource.prepare()\n"] {
+        for condition in [
+            "ready and other",
+            "not resource.stopped() and clock() < deadline",
+        ] {
+            for handler in ["Exception", "Exception as error"] {
+                let source = format!(
+                    "def sample(resource, deadline, ready, other):\n    try:\n{prefix}        while {condition}:\n            if ready and (other or resource.done()):\n                if resource.disabled or resource.complete:\n                    break\n    except {handler}:\n        report(resource)\n    finally:\n        resource.finish()\n"
+                );
+                assert_matches_cpython_versions(
+                    &source,
+                    "guarded_runtime_break.py",
+                    &LEVELS,
+                    &[
+                        PythonVersion::Py312,
+                        PythonVersion::Py313,
+                        PythonVersion::Py314,
+                    ],
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn guarded_recovery_preserves_named_cleanup_entry() {
     for prefix in [
         "        if ready:\n            resource.prepare()\n",

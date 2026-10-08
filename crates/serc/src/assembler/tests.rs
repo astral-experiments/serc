@@ -9152,6 +9152,91 @@ fn late_jump_retries_require_proven_empty_line_blocks() {
 }
 
 #[test]
+fn late_break_retry_requires_original_same_span_try_exit() {
+    for version in [crate::PythonVersion::Py314, crate::PythonVersion::Py315] {
+        for case in [
+            "intact",
+            "uncertified",
+            "copied",
+            "wrong entry",
+            "wrong exit",
+            "different span",
+            "different depth",
+            "unknown depth",
+            "hidden slot",
+            "pre-fold slot",
+            "exception policy",
+            "ordinary jump",
+        ] {
+            let entry = super::Label::from_u32(0);
+            let target = super::Label::from_u32(1);
+            let other = super::Label::from_u32(2);
+            let location = SourceLocation::new(7, 7, 3, 9);
+            let depth = (case != "unknown depth").then_some(0);
+            let mut jump =
+                Instruction::new(JUMP_FORWARD, Operand::Forward(target), location, depth);
+            if case != "ordinary jump" {
+                jump.fusion_policy.mark_authored_break();
+            }
+            let mut middle =
+                Instruction::new(JUMP_FORWARD, Operand::Forward(target), location, depth);
+            match case {
+                "different span" => middle.location = SourceLocation::new(7, 7, 4, 9),
+                "different depth" => {
+                    middle =
+                        Instruction::new(JUMP_FORWARD, Operand::Forward(target), location, Some(1));
+                }
+                "hidden slot" => middle.local_policy.add_hidden_exception_owner_slots(1),
+                "pre-fold slot" => middle.add_pre_fold_extra_instructions(1),
+                "exception policy" => middle.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS),
+                _ => {}
+            }
+            let mut assembler = optimization_pipeline(vec![
+                pass_instruction(POP_TOP, 0, 1),
+                Item::Instruction(jump),
+                Item::Label(entry),
+                Item::Instruction(middle),
+                Item::Label(target),
+                pass_instruction(RETURN_VALUE, 0, 8),
+            ]);
+            assembler.python_version = version;
+            if case != "uncertified" {
+                assembler
+                    .exception_owner_provenance
+                    .compound_try_owner_exits
+                    .push((
+                        if case == "wrong entry" { other } else { entry },
+                        if case == "wrong exit" { other } else { target },
+                    ));
+            }
+            if case == "copied" {
+                assembler.borrow_block_aliases.insert(entry);
+            }
+            assembler.remove_redundant_forward_jumps(true);
+            let instructions = assembler
+                .graph
+                .iter_items()
+                .filter_map(|item| match item {
+                    Item::Instruction(instruction) => Some(instruction),
+                    Item::Label(_) => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(instructions.len(), 3, "{version:?}: {case}");
+            assert_eq!(instructions[1].location, location, "{version:?}: {case}");
+            assert_eq!(
+                instructions[1].opcode,
+                if version == crate::PythonVersion::Py314 && case == "intact" {
+                    NOP
+                } else {
+                    JUMP_FORWARD
+                },
+                "{version:?}: {case}"
+            );
+        }
+    }
+}
+
+#[test]
 fn shared_unlocated_jump_retries_require_original_conditional_predecessors() {
     for case in [
         "shared",
