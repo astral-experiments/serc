@@ -15,6 +15,49 @@ use serc::{
 };
 
 #[test]
+fn wrapped_terminal_recovery_stops_borrowed_continuation() {
+    let indent = |body: &str| {
+        body.lines().fold(String::new(), |mut output, line| {
+            writeln!(output, "    {line}").unwrap();
+            output
+        })
+    };
+    for (handler, terminal) in [
+        ("OSError", "raise Failure(value) from None"),
+        ("OSError as error", "raise Failure(value) from None"),
+        ("OSError as error", "return"),
+    ] {
+        for wrapper in [
+            "with resource.capture():",
+            "with resource.capture(), acquire():",
+            "try:",
+        ] {
+            for context in ["", "with acquire():", "for item in values:"] {
+                let recovery = format!(
+                    "try:\n    resource.kill()\nexcept {handler}:\n    {terminal}\nresource.record(value)\n"
+                );
+                let mut recovery = format!("{wrapper}\n{}", indent(&recovery));
+                if wrapper == "try:" {
+                    recovery.push_str("finally:\n    resource.close()\n");
+                }
+                let mut body = format!(
+                    "try:\n    resource.wait(value)\nexcept TimeoutError:\n{}    resource.wait(value)\nconsume(value)\n",
+                    indent(&recovery)
+                );
+                if !context.is_empty() {
+                    body = format!("{context}\n{}", indent(&body));
+                }
+                let source = format!(
+                    "def sample(resource, value, acquire, values):\n{}",
+                    indent(&body)
+                );
+                assert_matches_cpython(&source, "wrapped_terminal_recovery.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
 fn asserted_recovery_retains_enclosing_manager_successor() {
     for managers in 1..=3 {
         for context in ["acquire()", "acquire() as holder"] {
