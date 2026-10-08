@@ -15,6 +15,66 @@ use serc::{
 };
 
 #[test]
+fn pre_iterator_return_keeps_normal_cleanup_entry() {
+    for prefix in ["", "async "] {
+        let awaited = if prefix.is_empty() { "" } else { "await " };
+        for value in ["", " resource"] {
+            for cleanup in [
+                "samples = (item for group in resource.groups for item in group.items)\n        all_samples = list(samples)".to_owned(),
+                format!("if not resource.dry_run:\n            if resource.ready:\n                {awaited}resource.release(state)"),
+            ] {
+                let source = format!(
+                    "{prefix}def sample(resource, kinds, state):\n    try:\n        if resource.cleanup_only:\n            return{value}\n        for kind in (None, *kinds):\n            if kind is not None and resource.enabled(kind):\n                del state\n    except Exception as error:\n        if resource.cancelled(error):\n            raise\n    finally:\n        {cleanup}\n"
+                );
+                assert_matches_cpython(&source, "pre_iterator_return_cleanup.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn exhausted_iterator_reaches_guarded_cleanup() {
+    for prefix in ["", "async "] {
+        let awaited = if prefix.is_empty() { "" } else { "await " };
+        for condition in ["enabled", "not resource.dry_run"] {
+            for nested in [false, true] {
+                let cleanup = if nested {
+                    format!("if resource.ready:\n                {awaited}resource.release(state)")
+                } else {
+                    format!("{awaited}resource.release(state)")
+                };
+                let source = format!(
+                    "{prefix}def sample(resource, kinds, state, enabled):\n    try:\n        for kind in (None, *kinds):\n            if kind is not None and resource.enabled(kind):\n                del state\n    except Exception as error:\n        if resource.cancelled(error):\n            raise\n    finally:\n        if {condition}:\n            {cleanup}\n"
+                );
+                assert_matches_cpython(&source, "iterator_guarded_cleanup.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn exhausted_iterator_reaches_linear_cleanup_stores() {
+    for prefix in ["", "async "] {
+        for value in [
+            "resource.samples()",
+            "(sample for group in resource.groups for sample in group.samples)",
+        ] {
+            for handler in ["pass", "if resource.cancelled(error):\n            raise"] {
+                for tail in [
+                    "",
+                    "        resource.total = sum(item.count for item in all_samples)\n",
+                ] {
+                    let source = format!(
+                        "{prefix}def sample(resource, kinds, state, metadata):\n    try:\n        for kind in (None, *kinds):\n            if kind is not None and resource.enabled(kind):\n                del state, metadata\n    except Exception as error:\n        {handler}\n    finally:\n        samples = {value}\n        all_samples = list(samples)\n{tail}"
+                    );
+                    assert_matches_cpython(&source, "iterator_cleanup_stores.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn awaited_while_reaches_nested_cleanup_setup() {
     for condition in [
         "await resource.ready(state)",
