@@ -15,6 +15,86 @@ use serc::{
 };
 
 #[test]
+fn raising_async_iterator_else_keeps_empty_break_exit() {
+    for generator in [false, true] {
+        for depth in [0, 1, 3] {
+            for otherwise in [
+                "raise Error()\n",
+                "raise Error() from cause\n",
+                "resource.record()\nraise Error()\n",
+                "await resource.record()\nraise Error()\n",
+            ] {
+                let work = if generator {
+                    "yield item"
+                } else {
+                    "await resource.consume(item)"
+                };
+                let mut suite = format!(
+                    "async with resource.timer():\n    async for item in items:\n        if ready:\n            break\n    else:\n        {}\nasync for item in items:\n    if active:\n        {work}\n",
+                    otherwise.replace('\n', "\n        ")
+                );
+                for _ in 0..depth {
+                    suite = format!(
+                        "async with resource.open():\n    {}",
+                        suite.replace('\n', "\n    ")
+                    );
+                }
+                let source = format!(
+                    "async def sample(resource, items, ready, active):\n    try:\n        {}\n    except Error:\n        raise\n",
+                    suite.replace('\n', "\n        ")
+                );
+                assert_matches_cpython(&source, "raising_async_iterator_else.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn async_for_else_returns_preserve_cleanup_borrow_boundaries() {
+    let source = r"async def sample(source, task):
+    try:
+        async for item in source:
+            yield item
+            if ready():
+                task = make_task()
+                break
+        else:
+            return
+    finally:
+        await task
+";
+    for yielding in [true, false] {
+        let source = if yielding {
+            source.to_owned()
+        } else {
+            source.replace("yield item", "consume(item)")
+        };
+        for cleanup in [
+            "await task",
+            "finish(task)",
+            "with guard():\n            await task",
+            "try:\n            await task\n        finally:\n            finish(task)",
+        ] {
+            assert_matches_cpython(
+                &source.replace("await task", cleanup),
+                "async_for_else_cleanup.py",
+                &LEVELS,
+            );
+        }
+    }
+    for source in [
+        source.replace("        else:\n            return\n", ""),
+        source.replace("async for", "for"),
+        source
+            .replace("    try:\n", "")
+            .replace("    finally:\n        await task\n", "")
+            .replace("\n    ", "\n"),
+    ] {
+        assert_matches_cpython(&source, "async_for_else_boundary.py", &LEVELS);
+    }
+}
+
+#[test]
 fn conditional_retry_else_keeps_live_continuation() {
     for source in [
         "def sample(resource, items, enabled, ready):\n    try:\n        if enabled:\n            try:\n                result = False\n            except Error as error:\n                if any(items) and ready:\n                    try:\n                        value = resource.read(items)\n                    except LookupError:\n                        pass\n                    else:\n                        result = True\n            resource.record(result, items, ready)\n    except Error as error:\n        raise\n",
