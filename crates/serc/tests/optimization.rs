@@ -15,6 +15,29 @@ use serc::{
 };
 
 #[test]
+fn guarded_raise_reaches_nested_cleanup_setup() {
+    for prefix in ["", "async "] {
+        for recovery in ["raise", "return state"] {
+            let awaited = if prefix.is_empty() { "" } else { "await " };
+            for cleanup in [
+                format!("try:\n    {awaited}resource.release(state)\nexcept Error:\n    pass\n"),
+                format!(
+                    "try:\n    if state is not None:\n        cleanup = resource.create_task(resource.release(state))\n        try:\n            {awaited}resource.shield(cleanup)\n        except CancelledError:\n            raise\nexcept Exception:\n    resource.warn(state)\n"
+                ),
+                "try:\n    resource.release(state)\nfinally:\n    resource.record(state)\n"
+                    .to_owned(),
+            ] {
+                let source = format!(
+                    "{prefix}def sample(resource, state):\n    try:\n        pass\n    except BaseException as error:\n        if not isinstance(error, Exception):\n            {recovery}\n    finally:\n        {}\n",
+                    cleanup.replace('\n', "\n        ")
+                );
+                assert_matches_cpython(&source, "nested_cleanup_setup.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
 fn branching_finally_call_keeps_following_return_boundary() {
     for (prefix, work) in [
         ("", "resource.refresh(key)"),
