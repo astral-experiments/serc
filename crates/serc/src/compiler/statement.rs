@@ -24504,7 +24504,7 @@ impl<'source> Compiler<'source> {
                                 && matches!(clause.body.as_slice(), [Stmt::Expr(_)]))
             ))
         .then(|| statement.body.last().expect("matched final if").range());
-        // A direct nested try with a terminating handler leaves the outer try body followed by
+        // A direct nested try with a terminating arm leaves the outer try body followed by
         // an empty normal-exit block after CPython reorders the cold handler blocks.
         let handler_contains_terminal_nested_try = statement.handlers.iter().any(|handler| {
             handler.as_except_handler().is_some_and(|handler| {
@@ -24516,7 +24516,8 @@ impl<'source> Compiler<'source> {
                         handler
                             .as_except_handler()
                             .is_some_and(|handler| suite_terminates(&handler.body))
-                    })
+                    }) || (self.context.python_version == crate::PythonVersion::Py314
+                        && suite_terminates(&statement.orelse))
                 })
             })
         });
