@@ -32711,6 +32711,9 @@ impl<'source> Compiler<'source> {
                         || (runtime_coroutine_break_context
                             && condition_has_linear_runtime_leaves(&loop_statement.test)
                             && suite_has_generator_prefix_live_break(&loop_statement.body))
+                        || (runtime_coroutine_break_context
+                            && self.context.python_version == crate::PythonVersion::Py314
+                            && suite_has_async_iterator_prefix_live_break(&loop_statement.body))
                         || (matches!(self.unit.scope, Scope::Function { .. })
                             && self.control.loops.contexts.is_empty()
                             && self.control.withs.active_with_exits.is_empty()
@@ -46659,6 +46662,49 @@ fn suite_has_generator_prefix_live_break(body: &[Stmt]) -> bool {
                                 && !expression_contains_inline_branch(&comprehension.iter)
                                 && !expression_suspends_current_scope(&comprehension.iter))))
         && suite_has_linear_live_conditional_break(&body[index + 1..])
+}
+
+/// A surviving async-iterator break reaches the later outer-loop break guard.
+fn suite_has_async_iterator_prefix_live_break(body: &[Stmt]) -> bool {
+    let mut statements = body.iter();
+    let iterator = loop {
+        match statements.next() {
+            Some(Stmt::For(iterator)) => break iterator,
+            Some(Stmt::Global(_) | Stmt::Nonlocal(_)) => {}
+            Some(Stmt::Assert(assertion))
+                if condition_has_only_runtime_tests(&assertion.test)
+                    && !expression_contains_inline_branch(&assertion.test)
+                    && !expression_suspends_current_scope(&assertion.test) => {}
+            Some(statement)
+                if suite_has_nonsuspending_linear_fallthrough(std::slice::from_ref(statement)) => {}
+            _ => return false,
+        }
+    };
+    if !iterator.is_async
+        || !iterator.orelse.is_empty()
+        || !matches!(iterator.target.as_ref(), Expr::Name(_))
+        || expression_contains_inline_branch(&iterator.iter)
+        || expression_suspends_current_scope(&iterator.iter)
+        || !suite_has_linear_live_conditional_break(statements.as_slice())
+    {
+        return false;
+    }
+    // Later continues do not remove this earlier break's populated successor.
+    if suite_has_linear_live_conditional_break(&iterator.body) {
+        return true;
+    }
+    let mut body = iterator.body.as_slice();
+    while let [Stmt::If(guard)] = body {
+        if !condition_reaches_async_break_entry(&guard.test) || !guard.elif_else_clauses.is_empty()
+        {
+            return false;
+        }
+        body = &guard.body;
+    }
+    matches!(body, [Stmt::If(guard), Stmt::Continue(_)]
+        if condition_reaches_async_break_entry(&guard.test)
+            && guard.elif_else_clauses.is_empty()
+            && matches!(guard.body.as_slice(), [Stmt::Break(_)]))
 }
 
 // This certificate is used only for a terminal loop in a finally-protected suite.
