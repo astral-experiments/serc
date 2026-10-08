@@ -15,6 +15,37 @@ use serc::{
 };
 
 #[test]
+fn completed_comparison_keeps_async_break_boundary() {
+    for manager in ["with", "async with"] {
+        for prefix in [false, true] {
+            for condition in [
+                "str(item.get('status') or '').lower() != 'ready'",
+                "'ready' != normalize(item.flag or item.backup)",
+                "normalize(item.flag or item.backup) == transform(item.kind or item.other)",
+                "normalize(await item.check() or item.flag) == value",
+                "normalize(item.flag if active else item.other) is None",
+                "normalize(item.flag or item.backup) in values",
+                "(item.flag or item.backup) == item.ready",
+                "await normalize(item.flag or item.backup) != value",
+            ] {
+                let body = if prefix {
+                    format!(
+                        "if item.ready():\n    if {condition}:\n        raise Error()\n    break\n"
+                    )
+                } else {
+                    format!("if {condition}:\n    break\n")
+                };
+                let source = format!(
+                    "async def sample(resource, items):\n    try:\n        {manager} resource.open():\n            async for item in items:\n                {}\n            result = resource.value()\n            return build(result)\n    except TimeoutError as error:\n        raise Error() from error\n",
+                    body.replace('\n', "\n                ")
+                );
+                assert_matches_cpython(&source, "completed_comparison_break.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
 fn raising_async_iterator_else_keeps_empty_break_exit() {
     for generator in [false, true] {
         for depth in [0, 1, 3] {

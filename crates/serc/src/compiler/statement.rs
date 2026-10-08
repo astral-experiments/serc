@@ -46627,6 +46627,8 @@ fn condition_reaches_async_break_entry(expression: &Expr) -> bool {
         // outgoing jump. They cannot bypass it and enter the following empty exit.
         // Call argument branches also finish before the result's condition jump.
         Expr::Call(_) => true,
+        // Operand branches merge before a single comparison's result test.
+        Expr::Compare(comparison) if comparison.ops.len() == 1 => true,
         _ => !expression_contains_inline_branch(expression),
     }
 }
@@ -47638,6 +47640,35 @@ mod tests {
                 super::handler_ends_in_raising_while_break(parsed.suite()),
                 expected,
                 "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn single_comparisons_finish_before_async_breaks() {
+        for (condition, expected) in [
+            ("normalize(value or fallback) == expected", true),
+            ("expected == normalize(value or fallback)", true),
+            ("normalize(value if flag else fallback) is None", true),
+            ("normalize(value or fallback) in values", true),
+            ("normalize(value or fallback) < other < upper", false),
+            ("(value or fallback) == expected", true),
+            ("normalize(value or fallback) == (left or right)", true),
+            ("await normalize(value or fallback) == expected", true),
+            ("True or normalize(value or fallback) == expected", false),
+        ] {
+            let source = format!("async def sample():\n    if {condition}:\n        pass\n");
+            let parsed = parse_module(&source).unwrap();
+            let Stmt::FunctionDef(function) = &parsed.suite()[0] else {
+                panic!()
+            };
+            let Stmt::If(guard) = &function.body[0] else {
+                panic!()
+            };
+            assert_eq!(
+                super::condition_reaches_async_break_entry(&guard.test),
+                expected,
+                "{condition}"
             );
         }
     }
