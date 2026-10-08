@@ -31666,11 +31666,31 @@ impl<'source> Compiler<'source> {
             && (!suite_contains_loop_break(&statement.body) || linear_tail_after_guarded_break)
             // A populated linear else suite supplies the normal source array
             // after the protected body, including a terminal manager or join.
+            // A single runtime assertion can retain that exit into awaited cleanup.
             // Keep the existing structured-else routes and their empty-exit vetoes.
             && (!matches!(
                 effective_body_tail,
                 Some(Stmt::If(_) | Stmt::Try(_) | Stmt::While(_) | Stmt::With(_))
-            ) || suite_has_linear_borrow_fallthrough(&statement.orelse));
+            ) || suite_has_linear_borrow_fallthrough(&statement.orelse)
+                || (self.context.python_version == crate::PythonVersion::Py314
+                    && matches!(self.unit.scope, Scope::Function { .. })
+                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+                    && self.control.loops.contexts.is_empty()
+                    && self.control.withs.active_with_exits.is_empty()
+                    && self.control.exceptions.active_exception_region_exclusions.is_empty()
+                    && !self.control.in_exception_handler()
+                    && self.control.finally.is_inactive_for_return_unwind()
+                    && matches!(statement.orelse.as_slice(), [Stmt::Assert(assertion)]
+                        if assertion.msg.is_none()
+                            && condition_has_only_runtime_tests(&assertion.test)
+                            && !expression_contains_inline_branch(&assertion.test)
+                            && !expression_suspends_current_scope(&assertion.test))
+                    && matches!(statement.finalbody.split_last(), Some((Stmt::Expr(cleanup), prefix))
+                        if (prefix.is_empty() || suite_has_nonsuspending_linear_fallthrough(prefix))
+                            && matches!(cleanup.value.as_ref(), Expr::Await(awaited)
+                            if matches!(awaited.value.as_ref(), Expr::Call(_))
+                                && !expression_contains_inline_branch(&awaited.value)
+                                && !expression_suspends_current_scope(&awaited.value)))));
         let nested_cleanup_has_located_setup = matches!(statement.finalbody.as_slice(), [Stmt::Try(cleanup)]
         if !cleanup.is_star
             && cleanup.body.first().is_some_and(|first| {
