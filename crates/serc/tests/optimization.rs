@@ -34,6 +34,20 @@ fn erased_async_finalizer_keeps_empty_borrow_exit() {
 }
 
 #[test]
+fn optimized_try_iterator_break_inherits_location() {
+    for prefix in ["", "async "] {
+        for iterator in ["(1, 2)", "items"] {
+            for binding in ["", " as error"] {
+                let source = format!(
+                    "{prefix}def sample(result, attempts, items):\n    try:\n        for attempt in {iterator}:\n            if not result.ready():\n                break\n        assert not attempts[-1].ready(), 'failed'\n    except BaseException{binding}:\n        raise\n"
+                );
+                assert_matches_cpython(&source, "optimized_try_iterator.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
 fn nested_recovery_alternative_keeps_cleanup_live() {
     for class in [false, true] {
         for condition in ["outer", "ready(state)"] {
