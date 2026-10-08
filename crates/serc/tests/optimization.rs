@@ -49,6 +49,23 @@ fn nested_recovery_alternative_keeps_cleanup_live() {
 }
 
 #[test]
+fn asserted_manager_else_reaches_awaited_cleanup() {
+    for body in [
+        "        async with client as entered:\n            if failed:\n                raise failure\n",
+        "        async with acquire():\n            async with client as entered:\n                if failed:\n                    raise failure\n",
+    ] {
+        for condition in ["not failed", "failed is False"] {
+            for prefix in ["", "        finish()\n"] {
+                let source = format!(
+                    "async def sample(client, backends, failed):\n    try:\n{body}    except RuntimeError as error:\n        assert failed and error is failure\n    else:\n        assert {condition}\n    finally:\n{prefix}        await client.close()\n    for backend in backends.values():\n        backend.close()\n"
+                );
+                assert_matches_cpython(&source, "asserted_manager_cleanup.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
 fn awaited_else_assertion_keeps_following_loads_live() {
     for operator in ["is", "is not"] {
         for arguments in ["index.id", "index.id, bypass=True"] {
