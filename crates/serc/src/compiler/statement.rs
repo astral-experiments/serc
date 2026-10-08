@@ -33663,15 +33663,31 @@ impl<'source> Compiler<'source> {
                                     || matches!(guard.body.as_slice(), [Stmt::Return(return_)]
                                         if return_.value.as_deref().is_none_or(|value| matches!(value, Expr::Name(_))))))
                 })})
-            && suite_has_linear_borrow_fallthrough(&statement.finalbody)
-            && (matches!(statement.finalbody.as_slice(), [Stmt::Expr(cleanup)]
+            // Raising recovery keeps the multiline cleanup setup populated.
+            // A returning handler can copy that setup onto a separate exit.
+            && ((matches!(statement.finalbody.as_slice(), [Stmt::Try(cleanup)]
+                    if !cleanup.is_star
+                        && cleanup.body.first().is_some_and(|first| {
+                            self.source_location(first.range()).line
+                                != self.source_location(cleanup.range).line
+                        }))
+                    && !suite_any_statement(&statement.finalbody, |part| {
+                        matches!(part, Stmt::Return(_) | Stmt::Break(_) | Stmt::Continue(_))
+                    })
+                    && statement.handlers.iter().all(|handler| {
+                        handler.as_except_handler().is_some_and(|handler| {
+                            !suite_contains_return(&handler.body)
+                        })
+                    }))
+                || (suite_has_linear_borrow_fallthrough(&statement.finalbody)
+                && (matches!(statement.finalbody.as_slice(), [Stmt::Expr(cleanup)]
                 if !expression_suspends_current_scope(&cleanup.value))
                 || matches!(statement.finalbody.as_slice(), [Stmt::AugAssign(cleanup)]
                     if !expression_suspends_current_scope(&cleanup.target)
                         && !expression_suspends_current_scope(&cleanup.value))
                 || matches!(statement.finalbody.as_slice(), [Stmt::Assign(cleanup)]
                     if cleanup.targets.iter().all(|target| !expression_suspends_current_scope(target))
-                        && !expression_suspends_current_scope(&cleanup.value)));
+                        && !expression_suspends_current_scope(&cleanup.value)))));
         let normal_finally_is_borrow_reachable = (simple_fallthrough_handlers_reach_finally
             || compound_fallthrough_handlers_reach_finally
             || runtime_while_handlers_reach_finally)
