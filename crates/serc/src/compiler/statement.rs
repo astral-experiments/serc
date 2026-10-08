@@ -26898,22 +26898,60 @@ impl<'source> Compiler<'source> {
                     self.assembler.mark(start);
                     start
                 });
-            // The nested recovery's cold join does not empty this normal source:
-            // its original CALL/POP_TOP survives before the jump, and the jump's
-            // own finally array begins with runtime work. Borrowing still checks
-            // the exact original endpoints if the normal jump later disappears.
+            // Named cleanup starts in a populated array even when a guarded
+            // recovery moves its separate handler exit cold.
+            let named_recovery_finally_source = self.context.python_version
+                == crate::PythonVersion::Py314
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                && self.control.loops.contexts.is_empty()
+                && self.control.withs.active_with_exits.is_empty()
+                && self.control.finally.active_finally_try_bodies == 1
+                && self.control.finally.active_normal_finally_bodies == 0
+                && self.control.finally.active_copied_finally_bodies == 0
+                && statement.body.last().is_some_and(|last| {
+                    suite_has_nonsuspending_linear_fallthrough(std::slice::from_ref(last))
+                })
+                && statement.handlers.iter().all(|handler| {
+                    handler.as_except_handler().is_some_and(|handler| {
+                        handler.name.is_some()
+                            && matches!(handler.type_.as_deref(), Some(Expr::Name(_)))
+                            && matches!(handler.body.as_slice(), [Stmt::If(_)])
+                            && !suite_contains_conditional_nested_recovery(&handler.body)
+                            && suite_has_nonterminal_recovery_work(&handler.body)
+                    })
+                })
+                && matches!(statement.finalbody.as_slice(), [Stmt::Try(cleanup)]
+                if !cleanup.is_star
+                    && cleanup.orelse.is_empty()
+                    && cleanup.finalbody.is_empty()
+                    && suite_has_nonsuspending_linear_fallthrough(&cleanup.body)
+                    && cleanup.body.first().is_some_and(|first| {
+                        self.source_location(first.range()).line
+                            != self.source_location(cleanup.range).line
+                    })
+                    && matches!(cleanup.handlers.as_slice(), [handler]
+                        if handler.as_except_handler().is_some_and(|handler| {
+                            handler.name.is_some()
+                                && matches!(handler.type_.as_deref(), Some(Expr::Name(_)))
+                                && suite_has_nonsuspending_linear_fallthrough(&handler.body)
+                        })))
+                && self
+                    .assembler
+                    .current_original_block_has_nonempty_borrow_source();
+            // Borrowing still checks the original endpoints when the jump disappears.
             let nonempty_finally_normal_source = !statement.is_star
                 && statement.orelse.is_empty()
                 && handler_contains_nested_handler_cold_join
                 && !handler_contains_terminal_nested_try
                 && !suite_ends_in_empty_try_exit_block(normal_exit_suite, loop_tail.is_some())
-                && matches!(statement.finalbody.first(), Some(Stmt::Expr(expression))
+                && (named_recovery_finally_source
+                    || (matches!(statement.finalbody.first(), Some(Stmt::Expr(expression))
                     if matches!(expression.value.as_ref(), Expr::Call(_))
                         && !expression_contains_inline_branch(&expression.value))
-                && self.suite_has_nonempty_borrow_entry(&statement.finalbody)
-                && self
-                    .assembler
-                    .current_original_block_ends_with_discarded_call();
+                        && self.suite_has_nonempty_borrow_entry(&statement.finalbody)
+                        && self
+                            .assembler
+                            .current_original_block_ends_with_discarded_call()));
             let retained_finally_normal_source = !statement.is_star
                 && statement.orelse.is_empty()
                 && !statement.finalbody.is_empty()
@@ -44632,6 +44670,39 @@ mod protected_iterator_erased_else_tests {
             }
         }
     }
+}
+
+/// Certifies conditional work with nonterminating, linear nested recoveries.
+fn suite_has_nonterminal_recovery_work(body: &[Stmt]) -> bool {
+    if crate::stack_growth_required() {
+        return crate::grow_stack(|| suite_has_nonterminal_recovery_work(body));
+    }
+    body.iter().all(|part| match part {
+        Stmt::If(branch) => {
+            condition_has_linear_runtime_leaves(&branch.test)
+                && !expression_suspends_current_scope(&branch.test)
+                && suite_has_nonterminal_recovery_work(&branch.body)
+                && branch.elif_else_clauses.iter().all(|clause| {
+                    clause.test.as_ref().is_none_or(|test| {
+                        condition_has_linear_runtime_leaves(test)
+                            && !expression_suspends_current_scope(test)
+                    }) && suite_has_nonterminal_recovery_work(&clause.body)
+                })
+        }
+        Stmt::Try(recovery) => {
+            !recovery.is_star
+                && recovery.orelse.is_empty()
+                && recovery.finalbody.is_empty()
+                && suite_has_nonsuspending_linear_fallthrough(&recovery.body)
+                && matches!(recovery.handlers.as_slice(), [handler]
+                if handler.as_except_handler().is_some_and(|handler| {
+                    matches!(handler.type_.as_deref(), Some(Expr::Name(_)))
+                        && (suite_has_nonsuspending_linear_fallthrough(&handler.body)
+                            || handler.body.iter().all(|part| matches!(part, Stmt::Pass(_))))
+                }))
+        }
+        _ => suite_has_nonsuspending_conditional_work(std::slice::from_ref(part)),
+    })
 }
 
 /// Certifies normal exits from conditional work under a coroutine's synthetic owner.
