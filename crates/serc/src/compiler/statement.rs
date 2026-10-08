@@ -31671,6 +31671,29 @@ impl<'source> Compiler<'source> {
                 effective_body_tail,
                 Some(Stmt::If(_) | Stmt::Try(_) | Stmt::While(_) | Stmt::With(_))
             ) || suite_has_linear_borrow_fallthrough(&statement.orelse));
+        let nested_cleanup_has_located_setup = matches!(statement.finalbody.as_slice(), [Stmt::Try(cleanup)]
+        if !cleanup.is_star
+            && cleanup.body.first().is_some_and(|first| {
+                self.source_location(first.range()).line
+                    != self.source_location(cleanup.range).line
+            }))
+            && !suite_any_statement(&statement.finalbody, |part| {
+                matches!(part, Stmt::Return(_) | Stmt::Break(_) | Stmt::Continue(_))
+            });
+        let coroutine_while_nested_cleanup = self.context.python_version
+            == crate::PythonVersion::Py314
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && !self.control.in_exception_handler()
+            && self.control.finally.is_inactive_for_return_unwind()
+            && nested_cleanup_has_located_setup;
         // A runtime while with one false edge and no else suite leaves a located normal-exit
         // jump, retained as a NOP after cold handlers move. Linear cleanup or a
         // certified runtime condition keeps its entry nonempty. Branching tests
@@ -31682,7 +31705,7 @@ impl<'source> Compiler<'source> {
             && statement.handlers.iter().all(|handler| {
                 handler.as_except_handler().is_some_and(|handler| {
                     handler.type_.is_some()
-                        && handler.body.iter().all(|statement| match statement {
+                        && (handler.body.iter().all(|statement| match statement {
                             Stmt::If(conditional) => {
                                 condition_has_only_runtime_tests(&conditional.test)
                                     && !expression_contains_inline_branch(&conditional.test)
@@ -31697,11 +31720,13 @@ impl<'source> Compiler<'source> {
                                     | Stmt::AugAssign(_)
                                     | Stmt::Expr(_)
                             ),
-                        })
+                        }) || (coroutine_while_nested_cleanup
+                            && handler.name.is_some()
+                            && suite_has_linear_reraise_guards(&handler.body)))
                 })
             })
             && !suite_contains_loop_break(&statement.body)
-            && (statement.finalbody.iter().all(|statement| match statement {
+            && (coroutine_while_nested_cleanup || statement.finalbody.iter().all(|statement| match statement {
                 Stmt::Expr(expression) => {
                     self.context.fold_constant(&expression.value).is_none()
                         && !expression_contains_inline_branch(&expression.value)
@@ -33669,7 +33694,21 @@ impl<'source> Compiler<'source> {
             && (matches!(statement.body.as_slice(), [Stmt::Pass(_)])
                 || matches!(statement.body.as_slice(), [Stmt::Expr(work)]
                     if suite_has_linear_borrow_fallthrough(&statement.body)
-                        && !expression_suspends_current_scope(&work.value)))
+                        && !expression_suspends_current_scope(&work.value))
+                || (coroutine_while_nested_cleanup
+                    && statement.body.split_last().is_some_and(|(last, prefix)| {
+                        !suite_contains_loop_break(prefix)
+                            && !suite_contains_return(prefix)
+                            && matches!(prefix.last(), Some(Stmt::While(loop_))
+                                if loop_.orelse.is_empty()
+                                    && self.context.fold_constant(&loop_.test).is_none()
+                                    && condition_has_linear_runtime_leaves(&loop_.test)
+                                    && original_condition_has_unique_jump_target(&loop_.test, false))
+                            && matches!(last, Stmt::Assign(work)
+                                if matches!(work.targets.as_slice(), [Expr::Name(_)])
+                                    && !expression_contains_inline_branch(&work.value)
+                                    && !expression_suspends_current_scope(&work.value))
+                    })))
             && statement.handlers.split_last().is_some_and(|(guarded, preceding)| {
                 preceding.len() <= 1 && preceding.iter().all(|plain| plain.as_except_handler().is_some_and(|handler| {
                     handler.type_.is_some()
@@ -33678,7 +33717,7 @@ impl<'source> Compiler<'source> {
                 })) && guarded.as_except_handler().is_some_and(|handler| {
                     handler.type_.is_some()
                         && handler.name.is_some()
-                        && matches!(handler.body.as_slice(), [Stmt::If(guard)]
+                        && (matches!(handler.body.as_slice(), [Stmt::If(guard)]
                             if condition_has_linear_runtime_leaves(&guard.test)
                                 && !expression_suspends_current_scope(&guard.test)
                                 && guard.elif_else_clauses.is_empty()
@@ -33687,18 +33726,12 @@ impl<'source> Compiler<'source> {
                                         && raise.cause.as_deref().is_none_or(|value| matches!(value, Expr::Name(_))))
                                     || matches!(guard.body.as_slice(), [Stmt::Return(return_)]
                                         if return_.value.as_deref().is_none_or(|value| matches!(value, Expr::Name(_))))))
+                            || (coroutine_while_nested_cleanup
+                                && suite_has_linear_reraise_guards(&handler.body)))
                 })})
             // Raising recovery keeps the multiline cleanup setup populated.
             // A returning handler can copy that setup onto a separate exit.
-            && ((matches!(statement.finalbody.as_slice(), [Stmt::Try(cleanup)]
-                    if !cleanup.is_star
-                        && cleanup.body.first().is_some_and(|first| {
-                            self.source_location(first.range()).line
-                                != self.source_location(cleanup.range).line
-                        }))
-                    && !suite_any_statement(&statement.finalbody, |part| {
-                        matches!(part, Stmt::Return(_) | Stmt::Break(_) | Stmt::Continue(_))
-                    })
+            && ((nested_cleanup_has_located_setup
                     && statement.handlers.iter().all(|handler| {
                         handler.as_except_handler().is_some_and(|handler| {
                             !suite_contains_return(&handler.body)

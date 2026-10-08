@@ -15,6 +15,39 @@ use serc::{
 };
 
 #[test]
+fn awaited_while_reaches_nested_cleanup_setup() {
+    for condition in [
+        "await resource.ready(state)",
+        "not await resource.ready(state)",
+    ] {
+        for setup in ["", "state = await resource.obtain()\n"] {
+            for tail in ["", "outcome = 'ready'\n"] {
+                for handler in [
+                    "resource.warn(error)\n",
+                    "if resource.cancelled(error):\n    raise\nif not isinstance(error, Exception):\n    raise\nresource.warn(error)\n",
+                ] {
+                    for cleanup in [
+                        "try:\n    await resource.release(state)\nexcept Error:\n    pass\n",
+                        "try:\n    if state is not None:\n        task = resource.create_task(resource.release(state))\n        try:\n            await resource.shield(task)\n        except CancelledError:\n            raise\nexcept Exception:\n    resource.warn(state)\n",
+                    ] {
+                        let body = format!(
+                            "{setup}while {condition}:\n    await resource.pause()\n{tail}"
+                        );
+                        let source = format!(
+                            "async def sample(resource, state):\n    try:\n        {}\n    except BaseException as error:\n        {}\n    finally:\n        {}\n",
+                            body.replace('\n', "\n        "),
+                            handler.replace('\n', "\n        "),
+                            cleanup.replace('\n', "\n        "),
+                        );
+                        assert_matches_cpython(&source, "awaited_loop_cleanup.py", &LEVELS);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn awaited_reraise_keeps_normal_cleanup_entry() {
     for condition in ["state is not None", "enabled"] {
         for handler in ["except:", "except CancelledError:"] {
