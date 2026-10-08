@@ -40,6 +40,34 @@ fn tuple_unpack_prefix_keeps_retained_setup_marker_owner() {
 }
 
 #[test]
+fn erased_loop_exit_precedes_manager_cleanup() {
+    for manager in ["acquire()", "outer(), middle(), inner(), acquire()"] {
+        for setup in ["", "            work()\n"] {
+            for condition in ["ready(cursor)", "cursor.poll() == (True,)"] {
+                let source = format!(
+                    "def sample(store, dispatch):\n    with {manager} as cursor:\n        while True:\n{setup}            if {condition}:\n                break\n            assert waiting()\n    persisted = store.load(dispatch.id)\n"
+                );
+                assert_matches_cpython(&source, "manager_loop_exit.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn erased_loop_exit_stays_inside_managed_finally() {
+    for manager in ["acquire()", "outer(), acquire()"] {
+        for setup in ["", "                    work()\n"] {
+            for condition in ["ready()", "cursor.poll() == (True,)"] {
+                let source = format!(
+                    "def sample(cursor):\n    try:\n        with {manager} as executor:\n            future = executor.submit(work)\n            try:\n                while True:\n{setup}                    if {condition}:\n                        break\n                    assert waiting()\n                with expecting() as error:\n                    future.result()\n            finally:\n                rollback()\n    finally:\n        close()\n"
+                );
+                assert_matches_cpython(&source, "managed_finally_loop_exit.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
 fn copied_return_through_nested_loops_keeps_none_guard_owner() {
     let source = r#"async def sample(client, response):
     for attempt in range(client.attempts):

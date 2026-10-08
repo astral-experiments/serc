@@ -22119,17 +22119,17 @@ impl<'source> Compiler<'source> {
             let break_stays_inside_finally = statement.orelse.is_empty()
                 && self.control.statements.context.has_following
                 && self.control.loops.contexts.is_empty()
-                && self.control.withs.active_with_exits.is_empty()
-                && self.control.withs.active_with_region_exclusions.is_empty()
-                && self.control.exceptions.active_exception_handlers.is_empty()
-                && self.control.exceptions.active_exception_group_handlers == 0
                 && self
                     .control
-                    .exceptions
-                    .active_exception_region_exclusions
-                    .len()
-                    == 1
-                && self.control.finally.active_finally_try_bodies == 1
+                    .withs
+                    .active_with_exits
+                    .iter()
+                    .all(|manager| !manager.is_async)
+                && self.control.withs.active_with_region_exclusions.len()
+                    == self.control.withs.active_with_exits.len()
+                && self.control.exceptions.active_exception_handlers.is_empty()
+                && self.control.exceptions.active_exception_group_handlers == 0
+                && self.control.finally.active_finally_try_bodies > 0
                 && self.control.finally.active_normal_finally_bodies == 0
                 && self.control.finally.active_finally_end_blocks == 0
                 && self.control.finally.active_copied_finally_bodies == 0
@@ -22137,12 +22137,18 @@ impl<'source> Compiler<'source> {
                     .control
                     .finally
                     .innermost_finally_exception_exclusion_depth
-                    == Some(1)
-                && matches!(self.control.finally.active_return_finally_contexts.as_slice(), [context]
+                    == Some(
+                        self.control
+                            .exceptions
+                            .active_exception_region_exclusions
+                            .len(),
+                    )
+                && matches!(self.control.finally.active_return_finally_contexts.last(), Some(context)
                     if context.loop_depth == 0
-                        && context.with_depth == 0
+                        && context.with_depth == self.control.withs.active_with_exits.len()
                         && context.handler_depth == 0
-                        && context.exception_region_depth == 0);
+                        && context.exception_region_depth + 1
+                            == self.control.exceptions.active_exception_region_exclusions.len());
             // Completed awaits and deferred generator creation can precede the
             // same erased tail without reconnecting its empty original exit.
             let completed_prefix_context = matches!(
@@ -22182,7 +22188,11 @@ impl<'source> Compiler<'source> {
                     // break. Erased assertions still leave an empty tail array.
                     || (statement.orelse.is_empty()
                         && self.control.loops.contexts.is_empty()
-                        && self.control.statements.context.has_following
+                        && (self.control.statements.context.has_following
+                            || self.control.withs.active_with_exits.last().is_some_and(|manager|
+                                matches!(manager.normal_exit,
+                                    WithBodyNormalExit::While(range) | WithBodyNormalExit::WhileBeforeElided(range)
+                                        if range == statement.range)))
                         && !self.control.withs.active_with_exits.is_empty()
                         && self.control.withs.active_with_region_exclusions.len()
                             == self.control.withs.active_with_exits.len()
