@@ -5038,6 +5038,7 @@ impl OptimizationPipeline {
                     let mut crosses_only_original_cleanup = true;
                     let mut crosses_removed_line_event = false;
                     let mut removed_line_events_are_unlocated = true;
+                    let mut removed_line_events_are_same_break_exit = true;
                     let mut next = None;
                     'next: for (next_block_index, next_block) in
                         order.iter().copied().enumerate().skip(block_index)
@@ -5142,6 +5143,36 @@ impl OptimizationPipeline {
                                         removed_line_events_are_unlocated &= removed.location.line
                                             < 0
                                             && removed.no_location_policy.preserves_location();
+                                        removed_line_events_are_same_break_exit &= self
+                                            .python_version
+                                            == crate::PythonVersion::Py314
+                                            && removed.opcode == JUMP_FORWARD
+                                            && removed.forward_target() == Some(target)
+                                            && removed.location == instruction.location
+                                            && instruction.depth_after().is_some()
+                                            && removed.depth_after() == instruction.depth_after()
+                                            && removed.pre_fold_extra_instructions() == 0
+                                            && removed.local_policy.hidden_exception_owner_slots()
+                                                == 0
+                                            && removed.exception_policy()
+                                                == super::super::ExceptionPolicy::default()
+                                            && !removed.fusion_policy.is_authored_break()
+                                            && !removed.jump_policy.always_retains_nop()
+                                            && graph[next_block].items()[..next_offset]
+                                                .iter()
+                                                .all(|item| matches!(item, Item::Label(_)))
+                                            && self
+                                                .exception_owner_provenance
+                                                .compound_try_owner_exits
+                                                .iter()
+                                                .any(|(entry, exit)| {
+                                                    *exit == target
+                                                        && !self
+                                                            .borrow_block_aliases
+                                                            .contains(entry)
+                                                        && graph[next_block].items()[..next_offset]
+                                                            .contains(&Item::Label(*entry))
+                                                });
                                     }
                                 }
                             }
@@ -5159,18 +5190,23 @@ impl OptimizationPipeline {
                         // An emptied original array can carry a separate line event.
                         // Ordinary jumps wait for that event to be represented.
                         if !instruction.fusion_policy.is_authored_break()
-                            || !removed_line_events_are_unlocated
+                            || !(removed_line_events_are_unlocated
+                                || removed_line_events_are_same_break_exit)
                         {
                             previous = Some(position);
                             continue;
                         }
-                        // Preserve the authored break's own line through normal NOP cleanup,
-                        // while its erased successor still stops borrowed-load fallthrough.
-                        instruction
-                            .no_location_policy
-                            .set_borrow_fallthrough(BorrowFallthrough::Barrier);
-                        graph.instruction_mut(position).unwrap().no_location_policy =
-                            instruction.no_location_policy;
+                        // A compound try exit with this exact break span inherited
+                        // the break's line; removing it creates no separate line event.
+                        if removed_line_events_are_unlocated {
+                            // An erased unlocated successor still stops borrowed-load
+                            // fallthrough while the break retains its own line.
+                            instruction
+                                .no_location_policy
+                                .set_borrow_fallthrough(BorrowFallthrough::Barrier);
+                            graph.instruction_mut(position).unwrap().no_location_policy =
+                                instruction.no_location_policy;
+                        }
                     }
                     if !finalize_borrow_empty_blocks
                         && !crosses_exception_boundary
