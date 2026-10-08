@@ -27716,6 +27716,28 @@ impl<'source> Compiler<'source> {
                     && self.control.finally.active_copied_finally_bodies == 0
                     && self.control.finally.active_finally_end_blocks == 0
                     && coroutine_try_has_asserted_recovery(statement);
+                let ordinary_asserted_else_exit = borrow_exit_has_source_successor
+                    && self.context.python_version == crate::PythonVersion::Py314
+                    && !statement.is_star
+                    && statement.finalbody.is_empty()
+                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    && self.control.loops.contexts.is_empty()
+                    // An enclosing manager stays active across this continuation.
+                    && self.control.withs.active_with_exits.len() <= 1
+                    && self.control.withs.active_with_exits.len()
+                        == self.control.withs.active_with_region_exclusions.len()
+                    && self.control.exceptions.active_exception_handlers.is_empty()
+                    && self.control.exceptions.active_exception_group_handlers == 0
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .is_empty()
+                    && self.control.finally.active_finally_try_bodies == 0
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_copied_finally_bodies == 0
+                    && self.control.finally.active_finally_end_blocks == 0
+                    && ordinary_try_has_asserted_recovery(statement);
                 // Recovery handlers keep this located normal exit connected to the following
                 // suite. Cold cleanup or an unlocated join can leave an empty block in between.
                 if (pass_only_handlers
@@ -27743,7 +27765,8 @@ impl<'source> Compiler<'source> {
                     && matches!(self.unit.scope, Scope::Function { .. })
                     && (suite_retained_try_exit_has_normal_fallthrough(&statement.orelse)
                         || suite_retained_try_exit_has_terminal_normal_path(&statement.orelse)
-                        || coroutine_asserted_else_exit)
+                        || coroutine_asserted_else_exit
+                        || ordinary_asserted_else_exit)
                 {
                     if pass_only_handlers {
                         self.assembler
@@ -39882,6 +39905,67 @@ fn suite_ends_in_retained_try_exit_join(body: &[Stmt]) -> bool {
         return suite_ends_in_retained_try_exit_join(selected);
     }
     !statement.elif_else_clauses.is_empty() || terminating_if_fallthrough_test(statement).is_some()
+}
+
+/// Recognizes a direct asserted success route with only asserted recovery.
+fn ordinary_try_has_asserted_recovery(statement: &ruff_python_ast::StmtTry) -> bool {
+    let body = match statement.body.as_slice() {
+        [Stmt::With(manager)]
+            if !manager.is_async
+                && matches!(manager.items.as_slice(), [item]
+                    if !expression_suspends_current_scope(&item.context_expr)
+                        && !expression_contains_inline_branch(&item.context_expr)
+                        && item.optional_vars.as_deref().is_none_or(|target| matches!(target, Expr::Name(_)))) =>
+        {
+            manager.body.as_slice()
+        }
+        body => body,
+    };
+    !body.is_empty()
+        && body.iter().all(|part| match part {
+            Stmt::Expr(expression) => {
+                !expression_suspends_current_scope(&expression.value)
+                    && !expression_contains_inline_branch(&expression.value)
+            }
+            Stmt::Assign(assignment) => {
+                !expression_suspends_current_scope(&assignment.value)
+                    && assignment.targets.iter().all(|target| {
+                        !expression_suspends_current_scope(target)
+                            && !expression_contains_inline_branch(target)
+                    })
+            }
+            Stmt::If(guard) => {
+                guard.elif_else_clauses.is_empty()
+                    && condition_has_linear_runtime_leaves(&guard.test)
+                    && !expression_suspends_current_scope(&guard.test)
+                    && suite_has_linear_raise_exit(&guard.body)
+            }
+            Stmt::Assert(assertion) => {
+                assertion.msg.is_none()
+                    && assertion_has_only_runtime_tests(&assertion.test)
+                    && condition_jump_target_count(&assertion.test, true) == 1
+                    && condition_jump_target_count(&assertion.test, false) == 1
+                    && !expression_contains_inline_branch(&assertion.test)
+                    && !expression_suspends_current_scope(&assertion.test)
+            }
+            _ => false,
+        })
+        && matches!(statement.orelse.as_slice(), [Stmt::Assert(assertion)]
+            if assertion.msg.is_none()
+                && matches!(assertion.test.as_ref(), Expr::Compare(comparison)
+                    if matches!(comparison.first_operand(), Expr::Name(_))
+                        && comparison.ops[..] == [CmpOp::Is]
+                        && matches!(comparison.comparators(), [Expr::NoneLiteral(_)])))
+        && matches!(statement.handlers.as_slice(), [handler]
+        if handler.as_except_handler().is_some_and(|handler| {
+            matches!(handler.type_.as_deref(), Some(Expr::Name(_)))
+                && matches!(handler.body.as_slice(), [Stmt::Assert(assertion)]
+                    if assertion.msg.is_none()
+                        && matches!(assertion.test.as_ref(), Expr::Compare(comparison)
+                            if matches!(comparison.first_operand(), Expr::Name(_))
+                                && matches!(&comparison.ops[..], [CmpOp::Is | CmpOp::IsNot])
+                                && matches!(comparison.comparators(), [Expr::Name(_) | Expr::NoneLiteral(_)])))
+        }))
 }
 
 // Each assertion has one normal success edge and a plain named-handler cleanup.

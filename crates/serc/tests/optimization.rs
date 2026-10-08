@@ -15,6 +15,70 @@ use serc::{
 };
 
 #[test]
+fn asserted_try_else_retains_borrowed_continuation() {
+    let indent = |source: &str| {
+        let mut result = String::new();
+        for line in source.lines() {
+            writeln!(result, "    {line}").unwrap();
+        }
+        result
+    };
+    for managed in [false, true] {
+        for assignment in [false, true] {
+            for named in [false, true] {
+                for raises in [false, true] {
+                    let mut work = String::new();
+                    if assignment {
+                        work.push_str("holder.value = \"left\" if flag else \"right\"\n");
+                    }
+                    work.push_str(if raises {
+                        "if failure is not None:\n    raise failure\n"
+                    } else {
+                        "consume(holder)\n"
+                    });
+                    if managed {
+                        work = format!("with acquire() as holder:\n{}", indent(&work));
+                    }
+                    let mut body = format!("try:\n{}", indent(&work));
+                    body.push_str(if named {
+                        "except Error as caught:\n    assert caught is failure\n"
+                    } else {
+                        "except Error:\n    assert failure is not None\n"
+                    });
+                    body.push_str("else:\n    assert failure is None\nkind = first if flag else second\nlabels = [\"sample\", f\"kind:{kind}\"]\nrecord(labels)\nselected = [entry for entry in events if entry.key == \"ready\"]\nassert selected == ([build(0, labels)] if flag else [])\n");
+                    let source = format!(
+                        "def sample(acquire, holder, flag, failure, first, second, events):\n{}",
+                        indent(&body)
+                    );
+                    assert_matches_cpython(&source, "asserted_recovery.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn managed_asserted_try_else_retains_borrowed_continuation() {
+    for work in [
+        "consume(resource)\n",
+        "with resource.open():\n                consume(resource)\n",
+        "with resource.open():\n                if failure is not None:\n                    raise failure\n",
+        "consume(resource)\n            assert resource.state is current()\n",
+        "with resource.open():\n                assert resource.state is current()\n",
+    ] {
+        for (handler, recovery) in [
+            ("Error", "failure is not None"),
+            ("Error as error", "error is failure"),
+        ] {
+            let source = format!(
+                "def sample(acquire, resource, failure):\n    with acquire():\n        try:\n            {work}        except {handler}:\n            assert {recovery}\n        else:\n            assert failure is None\n        saved = resource.state\n        consume(saved)\n"
+            );
+            assert_matches_cpython(&source, "managed_asserted_recovery.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn runtime_while_false_edge_reaches_guarded_finally() {
     for (prefix, read) in [("def", "read()"), ("async def", "await read()")] {
         for condition in ["not stop.is_set()", "ready or stop.is_set()"] {
