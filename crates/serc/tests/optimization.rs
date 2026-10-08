@@ -15,6 +15,55 @@ use serc::{
 };
 
 #[test]
+fn guarded_break_keeps_outer_finalizer_boundary() {
+    for depth in [1, 2] {
+        for binding in ["", " as error"] {
+            let mut body = format!(
+                "while enabled(runtime) or state.index < runtime['limit']:\n    try:\n        completed = work(**options)\n    except (Error, RuntimeError){binding}:\n        if not ready():\n            break\n    finally:\n        if ready():\n            copy(state, runtime)\n"
+            );
+            for _ in 0..depth {
+                body = format!(
+                    "try:\n    {}\nfinally:\n    state.restore()\n",
+                    body.trim_end().replace('\n', "\n    ")
+                );
+            }
+            let source = format!(
+                "def sample(runtime, state, **options):\n    {}\n",
+                body.trim_end().replace('\n', "\n    ")
+            );
+            assert_matches_cpython(&source, "guarded_break_outer_finalizer.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
+fn loop_recovery_reaches_managed_cleanup_under_finalizers() {
+    for depth in [0, 1, 2] {
+        for managers in [
+            "left() as source",
+            "left() as source, right() as destination",
+        ] {
+            for binding in ["", " as error"] {
+                let mut body = format!(
+                    "while enabled(runtime) or state.index < runtime['limit']:\n    try:\n        completed = work(**options)\n    except (Error, RuntimeError){binding}:\n        if not ready():\n            raise\n    finally:\n        if ready():\n            with {managers}:\n                copy(source, state)\n"
+                );
+                for _ in 0..depth {
+                    body = format!(
+                        "try:\n    {}\nfinally:\n    state.restore()\n",
+                        body.trim_end().replace('\n', "\n    ")
+                    );
+                }
+                let source = format!(
+                    "def sample(runtime, state, **options):\n    {}\n",
+                    body.trim_end().replace('\n', "\n    ")
+                );
+                assert_matches_cpython(&source, "loop_managed_cleanup.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
 fn nested_loop_cleanup_recovery_keeps_following_loads_live() {
     for depth in [1, 2, 3] {
         for binding in ["", " as error"] {
