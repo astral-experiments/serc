@@ -24334,7 +24334,10 @@ impl<'source> Compiler<'source> {
         }
         let body_ends_with_break_loop = statement.orelse.is_empty()
             && matches!(
-                statement.body.last(),
+                statement.body.iter().rev().find(|part| {
+                    self.context.python_version < crate::PythonVersion::Py314
+                        || !self.context.is_elided_statement(part)
+                }),
                 Some(Stmt::For(statement))
                     if (statement.orelse.is_empty()
                         || suite_has_linear_borrow_fallthrough(&statement.orelse))
@@ -28062,7 +28065,7 @@ impl<'source> Compiler<'source> {
                     .preserve_redundant_jump_nop_after_threading(normal_exit);
                 if else_ends_with_sync_break_loop
                     || body_ends_with_runtime_while_else
-                    || matches!(statement.body.last(), Some(Stmt::For(loop_statement))
+                    || matches!(normal_exit_join_suite.last(), Some(Stmt::For(loop_statement))
                         if !loop_statement.is_async
                             || (!loop_statement.orelse.is_empty()
                                 && suite_has_linear_borrow_fallthrough(&loop_statement.orelse)))
@@ -32750,6 +32753,37 @@ impl<'source> Compiler<'source> {
                                 handler.as_except_handler().is_some_and(|handler| handler.type_.is_some())
                             })
                             && suite_has_structured_live_break(&loop_statement.body))));
+        // A guarded iterator break bypasses the emptied normal exit into populated cleanup.
+        let for_guarded_break_reaches_finally = self.context.python_version
+            == crate::PythonVersion::Py314
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && loop_break_context
+            && conditional_break_cleanup_entry
+            && statement.handlers.iter().all(|handler| {
+                handler
+                    .as_except_handler()
+                    .is_some_and(|handler| suite_has_linear_raise_exit(&handler.body))
+            })
+            && matches!(statement.body.as_slice(), [Stmt::For(iterator), suffix @ ..]
+            if suffix.iter().all(|part| self.context.is_elided_statement(part))
+                && !iterator.is_async
+                && iterator.orelse.is_empty()
+                && matches!(iterator.target.as_ref(), Expr::Name(_))
+                && !expression_contains_inline_branch(&iterator.iter)
+                && !expression_suspends_current_scope(&iterator.iter)
+                && suite_contains_loop_break(&iterator.body)
+                && iterator.body.iter().all(|part| {
+                    self.context.is_elided_statement(part)
+                        || suite_has_nonsuspending_linear_fallthrough(std::slice::from_ref(part))
+                        || matches!(part, Stmt::If(guard)
+                            if guard.elif_else_clauses.is_empty()
+                                && condition_has_only_runtime_tests(&guard.test)
+                                && !expression_contains_inline_branch(&guard.test)
+                                && !expression_suspends_current_scope(&guard.test)
+                                && (suite_has_nonsuspending_linear_fallthrough(&guard.body)
+                                    || matches!(guard.body.split_last(), Some((Stmt::Break(_), prefix))
+                                        if prefix.is_empty() || suite_has_nonsuspending_linear_fallthrough(prefix))))
+                }));
         // A nonterminal authored break reaches normal cleanup independently of
         // the runtime condition's shared false exit. Its linear loop suffix
         // keeps the break's continuing arm distinct from that empty join.
@@ -33789,6 +33823,7 @@ impl<'source> Compiler<'source> {
             || runtime_while_false_edge_reaches_finally
             || runtime_nonterminal_break_reaches_finally
             || conditional_break_reaches_finally
+            || for_guarded_break_reaches_finally
             || dispatcher_break_reaches_finally
             || inner_try_break_loop_range.is_some()
             || conditional_handler_reaches_finally
