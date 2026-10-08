@@ -32657,6 +32657,24 @@ impl<'source> Compiler<'source> {
                                 handler.as_except_handler().is_some_and(|handler| handler.type_.is_some())
                             })
                             && suite_has_structured_live_break(&loop_statement.body))));
+        // A nonterminal authored break reaches normal cleanup independently of
+        // the runtime condition's shared false exit. Its linear loop suffix
+        // keeps the break's continuing arm distinct from that empty join.
+        let runtime_nonterminal_break_reaches_finally = self.context.python_version
+            == crate::PythonVersion::Py314
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && loop_break_context
+            && conditional_break_cleanup_entry
+            && matches!(statement.body.last(), Some(Stmt::While(body))
+            if body.orelse.is_empty()
+                && condition_has_only_runtime_tests(&body.test)
+                && condition_has_linear_runtime_leaves(&body.test)
+                && !expression_suspends_current_scope(&body.test)
+                && !suite_contains_yield(&body.body)
+                && suite_contains_borrow_reachable_conditional_loop_break(&body.body)
+                && body.body.last().is_some_and(|last| {
+                    suite_has_nonsuspending_linear_fallthrough(std::slice::from_ref(last))
+                }));
         // A dispatcher has one authored break into normal cleanup. Unrelated
         // structured arms do not sever that edge when the break's own prefix is linear.
         let dispatcher_break_reaches_finally = conditional_break_cleanup_entry
@@ -33651,6 +33669,7 @@ impl<'source> Compiler<'source> {
             || raising_alternative_reaches_finally
             || coroutine_manager_raise_else_reaches_finally
             || runtime_while_false_edge_reaches_finally
+            || runtime_nonterminal_break_reaches_finally
             || conditional_break_reaches_finally
             || dispatcher_break_reaches_finally
             || inner_try_break_loop_range.is_some()

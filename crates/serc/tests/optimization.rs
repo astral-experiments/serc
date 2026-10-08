@@ -15,6 +15,39 @@ use serc::{
 };
 
 #[test]
+fn runtime_nonterminal_break_preserves_cleanup_entry() {
+    for condition in [
+        "ready and other",
+        "not resource.stopped() and clock() < deadline",
+    ] {
+        for prefix in [
+            "",
+            "            for item in resource.items:\n                try:\n                    item.poll()\n                except LookupError:\n                    item.cancel()\n",
+        ] {
+            for guard in [
+                "            if ready:\n                break\n",
+                "            if ready and other:\n                if resource.complete:\n                    break\n                for item in resource.items:\n                    item.cancel()\n            elif resource.active:\n                resource.poll()\n",
+            ] {
+                for handler in [
+                    "    except Error as error:\n        report(error)\n",
+                    "    except (Error, Stop):\n        return 1\n",
+                ] {
+                    for cleanup in [
+                        "        resource.finish()\n        for item in resource.items:\n            item.close()\n",
+                        "        if resource.pool is not None:\n            resource.close()\n        resource.finish(missing_ok=True)\n",
+                    ] {
+                        let source = format!(
+                            "def sample(resource, deadline, ready, other):\n    try:\n        while {condition}:\n{prefix}{guard}            resource.wait()\n{handler}    finally:\n{cleanup}"
+                        );
+                        assert_matches_cpython(&source, "runtime_nonterminal_cleanup.py", &LEVELS);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn guarded_recovery_preserves_named_cleanup_entry() {
     for prefix in [
         "        if ready:\n            resource.prepare()\n",
