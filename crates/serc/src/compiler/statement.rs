@@ -27596,8 +27596,7 @@ impl<'source> Compiler<'source> {
                 .last()
                 .is_some_and(|context| {
                     matches!(context.body, [Stmt::Expr(expression)]
-                        if matches!(expression.value.as_ref(), Expr::Call(_))
-                            && !expression_contains_inline_branch(&expression.value))
+                        if matches!(expression.value.as_ref(), Expr::Call(_)))
                         || (self.context.python_version == crate::PythonVersion::Py314
                             && matches!(self.unit.scope, Scope::Function { .. })
                             && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0

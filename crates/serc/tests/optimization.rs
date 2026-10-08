@@ -15,6 +15,39 @@ use serc::{
 };
 
 #[test]
+fn branching_finally_call_keeps_following_return_boundary() {
+    for (prefix, work) in [
+        ("", "resource.refresh(key)"),
+        ("", "(yield resource.refresh(key))"),
+        ("async ", "await resource.refresh(key)"),
+    ] {
+        for recovery in [false, true] {
+            for cleanup in [
+                "resource.record(f\"status:{'good' if not failed else 'bad'}\", f\"error:{failed}\")",
+                "resource.record(failed or key, cached)",
+                "(resource.record if failed else resource.other)(key, cached)",
+                "resource.record(*(cached if failed else items))",
+            ] {
+                let mut body = format!(
+                    "try:\n    fresh = {work}\nexcept TimeoutError:\n    return cached.value\nexcept Error:\n    return cached.value\nreturn fresh\n"
+                );
+                if recovery {
+                    body = format!(
+                        "try:\n    {}\nexcept Error as error:\n    resource.report(error)\n",
+                        body.replace('\n', "\n    ")
+                    );
+                }
+                let source = format!(
+                    "{prefix}def sample(resource, key, failed, cached, items):\n    try:\n        {}\n    finally:\n        {cleanup}\n",
+                    body.replace('\n', "\n        ")
+                );
+                assert_matches_cpython(&source, "branching_call_cleanup.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
 fn completed_comparison_keeps_async_break_boundary() {
     for manager in ["with", "async with"] {
         for prefix in [false, true] {
