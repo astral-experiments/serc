@@ -24504,21 +24504,18 @@ impl<'source> Compiler<'source> {
                                 && matches!(clause.body.as_slice(), [Stmt::Expr(_)]))
             ))
         .then(|| statement.body.last().expect("matched final if").range());
-        // A direct nested try with a terminating arm leaves the outer try body followed by
-        // an empty normal-exit block after CPython reorders the cold handler blocks.
+        // A terminating nested recovery can leave an empty normal-exit block after
+        // cold handlers move away, including through synchronous cleanup wrappers.
         let handler_contains_terminal_nested_try = statement.handlers.iter().any(|handler| {
             handler.as_except_handler().is_some_and(|handler| {
-                handler.body.iter().any(|statement| {
-                    let Stmt::Try(statement) = statement else {
-                        return false;
-                    };
-                    statement.handlers.iter().any(|handler| {
-                        handler
-                            .as_except_handler()
-                            .is_some_and(|handler| suite_terminates(&handler.body))
-                    }) || (self.context.python_version == crate::PythonVersion::Py314
-                        && suite_terminates(&statement.orelse))
-                })
+                let through_cleanup = self.context.python_version == crate::PythonVersion::Py314
+                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    && statement.finalbody.is_empty();
+                suite_contains_terminal_nested_try(
+                    &handler.body,
+                    self.context.python_version,
+                    through_cleanup,
+                )
             })
         });
         let handler_contains_nested_handler_cold_join = !handlers_terminate
@@ -43184,6 +43181,42 @@ fn nested_pass_recovery_has_populated_call_arm(statement: &ruff_python_ast::Stmt
                                 && matches!(handler.body.as_slice(), [Stmt::Pass(_)])
                         })))
     }))
+}
+
+fn suite_contains_terminal_nested_try(
+    body: &[Stmt],
+    version: crate::PythonVersion,
+    through_cleanup: bool,
+) -> bool {
+    if crate::stack_growth_required() {
+        return crate::grow_stack(|| {
+            suite_contains_terminal_nested_try(body, version, through_cleanup)
+        });
+    }
+    body.iter().any(|part| match part {
+        Stmt::Try(recovery) => {
+            recovery.handlers.iter().any(|handler| {
+                handler
+                    .as_except_handler()
+                    .is_some_and(|handler| suite_terminates(&handler.body))
+            }) || (version == crate::PythonVersion::Py314 && suite_terminates(&recovery.orelse))
+                || (through_cleanup
+                    && recovery.handlers.is_empty()
+                    && recovery.orelse.is_empty()
+                    && suite_has_linear_borrow_fallthrough(&recovery.finalbody)
+                    && suite_contains_terminal_nested_try(&recovery.body, version, true))
+        }
+        Stmt::With(manager) => {
+            through_cleanup
+                && !manager.is_async
+                && manager.items.iter().all(|item| {
+                    !expression_suspends_current_scope(&item.context_expr)
+                        && !expression_contains_inline_branch(&item.context_expr)
+                })
+                && suite_contains_terminal_nested_try(&manager.body, version, true)
+        }
+        _ => false,
+    })
 }
 
 // A direct tail nested handler leaves the containing suite's normal-exit join empty.
