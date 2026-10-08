@@ -11164,7 +11164,8 @@ impl LayoutAssembler {
                         if original_array_start == 0
                             && owner_history_exact
                             && tail.late_removals == late_setup_positions.len()
-                            && tail.post_compaction_fusions == 0
+                            && (tail.post_compaction_fusions == 0
+                                || late_setup_positions.last() == Some(&instruction_index))
                             && instruction.exception_policy().exclusion()
                                 == super::ExceptionExclusion::None
                             && instruction.exception_policy().owner()
@@ -12758,7 +12759,7 @@ impl LayoutAssembler {
         )
     }
 
-    /// Locates a retained NULL SETUP record in an entry array's last compacted tail.
+    /// Locates a NULL SETUP record in an entry array's last compacted tail.
     fn entry_retained_setup_null_marker(
         &self,
         marker: usize,
@@ -12783,7 +12784,7 @@ impl LayoutAssembler {
         if removed_positions.is_empty()
             || removed_positions
                 .last()
-                .is_none_or(|position| *position >= marker)
+                .is_none_or(|position| *position > marker)
             || !matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
             || condition.forward_target().is_none()
             || condition.local_policy.hidden_exception_owner_slots() != 3
@@ -12883,6 +12884,18 @@ impl LayoutAssembler {
                     return false;
                 }
             } else if provenance.synchronous_with_setups.contains(label)
+                || provenance
+                    .ordinary_try_setups
+                    .get(label)
+                    .is_some_and(|handler| {
+                        self.exception_regions.iter().any(|region| {
+                            positions.get(&region.start) == Some(&position)
+                                && region.target == *handler
+                                && !region.is_scope_fallback
+                                && !region.preserve_lasti
+                                && positions.get(&region.end).is_some_and(|end| marker < *end)
+                        })
+                    })
                 || self
                     .exception_regions
                     .iter()
@@ -12899,13 +12912,18 @@ impl LayoutAssembler {
             .enumerate()
             .map(|(offset, position)| position + offset)
             .ne(removed_positions.iter().copied())
-            || !retained.contains(&source)
+            || (!retained.contains(&source) && removed_positions.last() != Some(&marker))
             || instructions[..marker]
                 .iter()
                 .enumerate()
                 .any(|(index, instruction)| instruction.opcode == NOP && !retained.contains(&index))
         {
             return false;
+        }
+        if removed_positions.last() == Some(&marker) {
+            // Earlier load fusion precedes this compaction. The removed SETUP's
+            // physical slot still holds its NULL owner when the marker is appended.
+            return true;
         }
         // Earlier POP compaction can annotate this surviving SETUP with one hidden
         // record. It does not change the SETUP's NULL owner or its final live slot.
@@ -17488,7 +17506,7 @@ mod tests {
         };
         use crate::target::opcodes::{
             CALL, LOAD_CONST, LOAD_FAST, NOP, NOT_TAKEN, POP_JUMP_IF_NONE, POP_TOP, RESUME,
-            RETURN_GENERATOR, RETURN_VALUE, YIELD_VALUE,
+            RETURN_GENERATOR, RETURN_VALUE, STORE_FAST_LOAD_FAST, YIELD_VALUE,
         };
 
         fn fixture(intervening_call: bool) -> LayoutAssembler {
@@ -17612,6 +17630,10 @@ mod tests {
         }
 
         fn recognizes(assembler: &LayoutAssembler) -> bool {
+            recognizes_slots(assembler, &[2, 5, 7])
+        }
+
+        fn recognizes_slots(assembler: &LayoutAssembler, removed: &[usize]) -> bool {
             let mut instructions = Vec::new();
             let mut positions =
                 crate::assembler::exception_owners::OwnerLabelPositions::new(assembler.items.len());
@@ -17628,8 +17650,70 @@ mod tests {
                 &instructions,
                 &positions,
                 &[Label::from_u32(12)].into_iter().collect(),
-                &[2, 5, 7],
+                removed,
             )
+        }
+
+        #[test]
+        fn last_setup_compaction_recognizes_removed_ordinary_setup_slot() {
+            for mutation in [
+                "none",
+                "fused prefix",
+                "unknown setup",
+                "wrong handler",
+                "moved start",
+                "short owner",
+                "scope owner",
+                "lasti owner",
+            ] {
+                let mut assembler = fixture(false);
+                let setup = Label::from_u32(8);
+                let handler = Label::from_u32(14);
+                assembler
+                    .exception_owner_provenance
+                    .setups
+                    .push((setup, None));
+                assembler
+                    .exception_owner_provenance
+                    .ordinary_try_setups
+                    .insert(setup, handler);
+                let mut region = ExceptionRegion {
+                    is_scope_fallback: false,
+                    priority: ExceptionRegionPriority::OriginalRange(setup, Label::from_u32(12)),
+                    start: Label::from_u32(7), // An alias at the same instruction position.
+                    end: Label::from_u32(12),
+                    target: handler,
+                    depth: 0,
+                    preserve_lasti: false,
+                };
+                match mutation {
+                    "none" => {}
+                    "fused prefix" => {
+                        let Item::Instruction(instruction) = &mut assembler.items[5] else {
+                            panic!("expected prefix instruction");
+                        };
+                        instruction.opcode = STORE_FAST_LOAD_FAST;
+                    }
+                    "unknown setup" => {
+                        assembler
+                            .exception_owner_provenance
+                            .ordinary_try_setups
+                            .clear();
+                    }
+                    "wrong handler" => region.target = Label::from_u32(13),
+                    "moved start" => region.start = Label::from_u32(9),
+                    "short owner" => region.end = Label::from_u32(11),
+                    "scope owner" => region.is_scope_fallback = true,
+                    "lasti owner" => region.preserve_lasti = true,
+                    _ => unreachable!(),
+                }
+                assembler.exception_regions.push(region);
+                assert_eq!(
+                    recognizes_slots(&assembler, &[2, 5, 7, 13]),
+                    matches!(mutation, "none" | "fused prefix"),
+                    "{mutation}",
+                );
+            }
         }
 
         #[test]
