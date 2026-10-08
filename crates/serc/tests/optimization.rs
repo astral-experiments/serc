@@ -15,6 +15,22 @@ use serc::{
 };
 
 #[test]
+fn erased_async_cleanup_after_comprehension_keeps_empty_exit() {
+    for work in [
+        "tasks = build()",
+        "tasks = [requests.create_task(request(index)) for index in range(count)]",
+    ] {
+        for cleanup in ["assert healthy()", "assert healthy()\nassert complete()"] {
+            let cleanup = cleanup.replace('\n', "\n        ");
+            let source = format!(
+                "async def sample(count):\n    try:\n        async with acquire() as requests:\n            {work}\n    finally:\n        {cleanup}\n    for task in tasks:\n        for subject in payload['history']:\n            result = int(subject['id']) if subject['id'] else None\n"
+            );
+            assert_matches_cpython(&source, "erased_async_comprehension_cleanup.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn guarded_iterator_break_reaches_recovery_cleanup() {
     for iterator in ["(1, 2)", "items"] {
         for setup in [
