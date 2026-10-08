@@ -15,6 +15,40 @@ use serc::{
 };
 
 #[test]
+fn nested_recovery_alternative_keeps_cleanup_live() {
+    for class in [false, true] {
+        for condition in ["outer", "ready(state)"] {
+            for binding in ["", " as error"] {
+                for setup in ["", "                pending = prepare(state)\n"] {
+                    for prefix in [
+                        "",
+                        "            try:\n                active = current(state)\n            except Error:\n                active = None\n",
+                    ] {
+                        let cleanup = if class {
+                            "super().close()"
+                        } else {
+                            "cleanup(state)"
+                        };
+                        let source = format!(
+                            "def sample(state):\n    try:\n        if {condition}:\n{prefix}            if inner:\n                work(state)\n            else:\n{setup}                try:\n                    finish(state)\n                except RecoveryError:\n                    recover(state)\n        else:\n            finish(state)\n    except Error{binding}:\n        report(state)\n    finally:\n        {cleanup}\n"
+                        );
+                        let source = if class {
+                            format!(
+                                "class Worker(Parent):\n    {}\n",
+                                source.trim_end().replace('\n', "\n    ")
+                            )
+                        } else {
+                            source
+                        };
+                        assert_matches_cpython(&source, "nested_recovery_alternative.py", &LEVELS);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn awaited_else_assertion_keeps_following_loads_live() {
     for operator in ["is", "is not"] {
         for arguments in ["index.id", "index.id, bypass=True"] {
