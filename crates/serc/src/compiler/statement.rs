@@ -43485,6 +43485,22 @@ fn suite_contains_nested_handler_cold_join(body: &[Stmt]) -> bool {
             if matches!(statement, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
                 return;
             }
+            // A linear retry else returns to the loop header. Its cold handler
+            // exit stays empty; a conditional recovery can instead join live work.
+            if matches!(statement, Stmt::While(loop_)
+                if loop_.orelse.is_empty()
+                    && condition_has_linear_runtime_leaves(&loop_.test)
+                    && !expression_suspends_current_scope(&loop_.test)
+                    && matches!(loop_.body.last(), Some(Stmt::Try(recovery))
+                        if !recovery.is_star
+                            && recovery.finalbody.is_empty()
+                            && !recovery.handlers.is_empty()
+                            && !recovery.orelse.is_empty()
+                            && suite_has_nonsuspending_linear_fallthrough(&recovery.orelse)))
+            {
+                self.found = true;
+                return;
+            }
             if !self.found {
                 walk_stmt(self, statement);
             }

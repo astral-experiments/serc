@@ -15,6 +15,44 @@ use serc::{
 };
 
 #[test]
+fn conditional_retry_else_keeps_live_continuation() {
+    for source in [
+        "def sample(resource, items, enabled, ready):\n    try:\n        if enabled:\n            try:\n                result = False\n            except Error as error:\n                if any(items) and ready:\n                    try:\n                        value = resource.read(items)\n                    except LookupError:\n                        pass\n                    else:\n                        result = True\n            resource.record(result, items, ready)\n    except Error as error:\n        raise\n",
+        "def sample(resource, items, ready):\n    with resource.open():\n        for item in items:\n            try:\n                result = resource.read(item, setting=ready if items else None)\n            except Error as error:\n                if ready and items:\n                    try:\n                        result = resource.read(item)\n                    except LookupError as error:\n                        failure = error\n                    else:\n                        failure = None\n            resource.record(result, item, ready)\n",
+    ] {
+        assert_matches_cpython(source, "conditional_retry_else.py", &LEVELS);
+    }
+}
+
+#[test]
+fn linear_retry_else_stops_borrowed_continuation() {
+    for coroutine in ["", "async "] {
+        for handler in ["Error", "Error as error"] {
+            for recovery in ["pass", "upper = middle - 1"] {
+                for otherwise in ["lower = middle + 1", "resource.advance()"] {
+                    for nested in [false, true] {
+                        let mut body = format!(
+                            "try:\n    resource.read(item, setting=configure(resource))\nexcept {handler}:\n    while lower <= upper:\n        try:\n            resource.read(item)\n        except LookupError:\n            {recovery}\n        else:\n            {otherwise}\nif upper - lower <= resource.minimum:\n    raise Error('stop')\nlower = upper - resource.overlap\n"
+                        );
+                        if nested {
+                            body = format!(
+                                "for index, item in enumerate(items):\n    while lower < len(item):\n        {}",
+                                body.replace('\n', "\n        ")
+                            );
+                        }
+                        let source = format!(
+                            "{coroutine}def sample(resource, items, item, lower, upper):\n    {}",
+                            body.replace('\n', "\n    ")
+                        );
+                        assert_matches_cpython(&source, "linear_retry_else.py", &LEVELS);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn surviving_break_reaches_cleanup_inside_nested_managers() {
     for (header, manager, work) in [
         ("def", "with", "resource.run()"),
