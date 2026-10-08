@@ -33647,6 +33647,7 @@ impl<'source> Compiler<'source> {
         // Runtime raise/break guards retain their false path through ordinary
         // handler cleanup. A populated normal source reaches the same finalizer,
         // including alongside plain handlers and linear try-else work.
+        // Nested protection and managers are safe only without copied break exits.
         let loop_guarded_recovery_reaches_finally = !statement.is_star
             && matches!(self.unit.scope, Scope::Function { .. })
             && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
@@ -33656,12 +33657,21 @@ impl<'source> Compiler<'source> {
                 .control
                 .exceptions
                 .active_exception_region_exclusions
-                .is_empty()
+                .len()
+                == self.control.finally.active_finally_try_bodies
             && !self.control.in_exception_handler()
-            && self.control.finally.active_finally_try_bodies == 0
             && self.control.finally.active_normal_finally_bodies == 0
             && self.control.finally.active_finally_end_blocks == 0
             && self.control.finally.active_copied_finally_bodies == 0
+            && ((self.control.finally.active_finally_try_bodies == 0
+                && !suite_any_statement(&statement.finalbody, |part| {
+                    matches!(part, Stmt::With(_))
+                }))
+                || statement.handlers.iter().all(|handler| {
+                    handler
+                        .as_except_handler()
+                        .is_some_and(|handler| !suite_contains_loop_break(&handler.body))
+                }))
             && loop_recovery_has_nonempty_finally_route(statement, self.context.python_version);
         // A guarded named handler has a populated exit into normal cleanup,
         // even when the protected body or an earlier handler is only `pass`.
@@ -46280,6 +46290,18 @@ fn loop_recovery_has_nonempty_finally_route(
                 }))
             {
                 return true;
+            }
+            if let Stmt::With(manager) = statement {
+                return !manager.is_async
+                    && manager.items.iter().all(|item| {
+                        !expression_contains_inline_branch(&item.context_expr)
+                            && !expression_suspends_current_scope(&item.context_expr)
+                            && item.optional_vars.as_deref().is_none_or(|target| {
+                                !expression_contains_inline_branch(target)
+                                    && !expression_suspends_current_scope(target)
+                            })
+                    })
+                    && cleanup(&manager.body, version);
             }
             if let Stmt::Try(cleanup) = statement {
                 return !cleanup.is_star
