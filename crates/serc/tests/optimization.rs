@@ -15,6 +15,39 @@ use serc::{
 };
 
 #[test]
+fn surviving_break_reaches_cleanup_inside_nested_managers() {
+    for (header, manager, work) in [
+        ("def", "with", "resource.run()"),
+        ("def", "with", "yield resource.value"),
+        ("async def", "async with", "await resource.run()"),
+        ("async def", "async with", "yield resource.value"),
+    ] {
+        for depth in 1..=3 {
+            for cleanup in [
+                "for item in items:\n    item.close()\n",
+                "if items:\n    resource.close()\n",
+            ] {
+                let mut suite = format!(
+                    "try:\n    while True:\n        if not items:\n            break\n        try:\n            {work}\n        finally:\n            resource.count -= 1\nfinally:\n    {}",
+                    cleanup.replace('\n', "\n    ")
+                );
+                for _ in 0..depth {
+                    suite = format!(
+                        "{manager} resource.open():\n    {}",
+                        suite.replace('\n', "\n    ")
+                    );
+                }
+                let source = format!(
+                    "{header} sample(resource, items):\n    {}",
+                    suite.replace('\n', "\n    ")
+                );
+                assert_matches_cpython(&source, "nested_manager_break.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
 fn guarded_recovery_inside_normal_finally_keeps_its_continuation() {
     for coroutine in ["", "async "] {
         for manager in [false, true] {
