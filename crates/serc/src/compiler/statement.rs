@@ -40147,7 +40147,7 @@ fn ordinary_try_has_asserted_recovery(statement: &ruff_python_ast::StmtTry) -> b
         }))
 }
 
-// Each assertion has one normal success edge and a plain named-handler cleanup.
+// A single asserted success edge retains the normal exit past simple recovery.
 // Folded, short-circuit, and chained assertions can leave different cleanup arrays.
 fn coroutine_try_has_asserted_recovery(statement: &ruff_python_ast::StmtTry) -> bool {
     let linear_assertion = |statement: &Stmt| {
@@ -40159,17 +40159,32 @@ fn coroutine_try_has_asserted_recovery(statement: &ruff_python_ast::StmtTry) -> 
                 && !expression_contains_inline_branch(&assertion.test)
                 && !expression_suspends_current_scope(&assertion.test))
     };
+    let awaited_success = matches!(statement.orelse.as_slice(), [Stmt::Assert(assertion)]
+        if assertion.msg.is_none()
+            && matches!(assertion.test.as_ref(), Expr::Compare(comparison)
+                if matches!(&comparison.ops[..], [CmpOp::Is | CmpOp::IsNot])
+                    && matches!(comparison.comparators(), [Expr::NoneLiteral(_)])
+                    && matches!(comparison.first_operand(), Expr::Await(awaited)
+                        if matches!(awaited.value.as_ref(), Expr::Call(_))
+                            && !expression_contains_inline_branch(&awaited.value)
+                            && !expression_suspends_current_scope(&awaited.value))));
     matches!(statement.body.as_slice(), [Stmt::Expr(expression)]
         if matches!(expression.value.as_ref(), Expr::Await(awaited)
             if matches!(awaited.value.as_ref(), Expr::Call(_))
                 && !expression_suspends_current_scope(&awaited.value)))
-        && matches!(statement.orelse.as_slice(), [assertion] if linear_assertion(assertion))
+        && (awaited_success
+            || matches!(statement.orelse.as_slice(), [assertion] if linear_assertion(assertion)))
         && matches!(statement.handlers.as_slice(), [handler]
         if handler.as_except_handler().is_some_and(|handler| {
             handler.type_.is_some()
-                && handler.name.is_some()
-                && !handler.body.is_empty()
-                && handler.body.iter().all(linear_assertion)
+                && if awaited_success {
+                    handler.name.is_none()
+                        && matches!(handler.body.as_slice(), [Stmt::Pass(_)])
+                } else {
+                    handler.name.is_some()
+                        && !handler.body.is_empty()
+                        && handler.body.iter().all(linear_assertion)
+                }
         }))
 }
 
