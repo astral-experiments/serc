@@ -1893,7 +1893,8 @@ impl Assembler {
                 }
             }
         }
-        false
+        // The entry prologue belongs to the original source array without a label.
+        first.is_some()
     }
 
     /// Finds the last located record in the current original instruction array.

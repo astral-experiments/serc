@@ -11,6 +11,67 @@ use crate::target::opcodes::*;
 use crate::target::operands::{CommonConstant, Conversion, FunctionAttribute, ResumeLocation};
 
 #[test]
+fn normal_finally_borrow_source_includes_unlabeled_entry() {
+    for (case, expected) in [
+        ("entry", true),
+        ("source", true),
+        ("empty", false),
+        ("boundary", false),
+        ("preserved", false),
+        ("barrier", false),
+        ("jump", false),
+        ("return", false),
+    ] {
+        let mut assembler = Assembler::with_python_version(crate::PythonVersion::Py314);
+        if case != "empty" {
+            assembler.emit(RESUME, ResumeLocation::AT_FUNC_START.argument());
+        }
+        if matches!(case, "source" | "boundary" | "preserved") {
+            let label = assembler.label();
+            assembler.mark(label);
+            if case == "preserved" {
+                assembler.preserved_block_boundaries.insert(label);
+            } else {
+                assembler
+                    .exception_owner_provenance
+                    .block_boundaries
+                    .insert(label);
+                if case == "source" {
+                    assembler
+                        .exception_owner_provenance
+                        .source_boundaries
+                        .insert(label);
+                }
+            }
+        }
+        if case != "empty" {
+            assembler.emit(LOAD_CONST, 0);
+            assembler.emit(STORE_FAST, 0);
+        }
+        match case {
+            "barrier" => {
+                let emitted = assembler.emit(NOP, 0);
+                assembler.mark_borrow_fallthrough_barrier(emitted);
+            }
+            "jump" => {
+                let target = assembler.label();
+                assembler.emit_operand(JUMP_FORWARD, Operand::Forward(target));
+            }
+            "return" => {
+                assembler.emit(LOAD_CONST, 0);
+                assembler.emit(RETURN_VALUE, 0);
+            }
+            _ => {}
+        }
+        assert_eq!(
+            assembler.current_original_block_has_nonempty_borrow_source(),
+            expected,
+            "{case}"
+        );
+    }
+}
+
+#[test]
 fn guarded_handler_iterator_join_requires_original_edges() {
     for version in [
         crate::PythonVersion::Py313,

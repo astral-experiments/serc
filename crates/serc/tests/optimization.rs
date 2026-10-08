@@ -15,6 +15,20 @@ use serc::{
 };
 
 #[test]
+fn unlabeled_try_entry_reaches_named_cleanup() {
+    for work in ["result = 0", "result = resource.run()"] {
+        for condition in ["ready", "ready and other is not None"] {
+            for continuation in ["return result", "consume(result)\n    return result"] {
+                let source = format!(
+                    "def sample(resource, ready, other):\n    try:\n        {work}\n    except Error as error:\n        if {condition}:\n            if other is None:\n                report(resource)\n        elif resource.active:\n            try:\n                resource.save()\n            except Error as failure:\n                report(failure)\n    finally:\n        try:\n            resource.close()\n        except Error as failure:\n            result = 1\n    {continuation}\n"
+                );
+                assert_matches_cpython(&source, "unlabeled_try_cleanup.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
 fn recovery_break_cleanup_keeps_its_empty_exit() {
     for handler in ["Empty", "errors.Empty", "errors.Empty as error"] {
         for suffix in [
