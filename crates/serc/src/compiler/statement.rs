@@ -24509,6 +24509,7 @@ impl<'source> Compiler<'source> {
         let handler_contains_terminal_nested_try = statement.handlers.iter().any(|handler| {
             handler.as_except_handler().is_some_and(|handler| {
                 let through_cleanup = self.context.python_version == crate::PythonVersion::Py314
+                    && matches!(self.unit.scope, Scope::Function { .. })
                     && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                     && statement.finalbody.is_empty();
                 suite_contains_terminal_nested_try(
@@ -43289,6 +43290,11 @@ fn suite_contains_terminal_nested_try(
                     .as_except_handler()
                     .is_some_and(|handler| suite_terminates(&handler.body))
             }) || (version == crate::PythonVersion::Py314 && suite_terminates(&recovery.orelse))
+                || (through_cleanup
+                    && !recovery.is_star
+                    && recovery.orelse.is_empty()
+                    && recovery.finalbody.is_empty()
+                    && suite_terminates(&recovery.body))
                 || (through_cleanup
                     && recovery.handlers.is_empty()
                     && recovery.orelse.is_empty()

@@ -15,6 +15,41 @@ use serc::{
 };
 
 #[test]
+fn terminal_recovery_scopes_preserve_normal_exits() {
+    for header in ["", "class Example:\n"] {
+        for handler in ["Error", "Error as error"] {
+            for suffix in ["", "record()\n"] {
+                let body = format!(
+                    "try:\n    pass\nexcept {handler}:\n    try:\n        raise Error()\n    except Other:\n        pass\n{suffix}"
+                );
+                let source = if header.is_empty() {
+                    body
+                } else {
+                    format!("{header}    {}", body.replace('\n', "\n    "))
+                };
+                assert_matches_cpython(&source, "terminal_recovery_scope.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn terminal_recovery_body_stops_borrowed_continuation() {
+    for prefix in ["", "            resource.prepare()\n"] {
+        for terminal in ["return", "return resource", "raise Error(resource)"] {
+            for outer in ["Error", "Error as error"] {
+                for inner in ["Error", "Error as inner"] {
+                    let source = format!(
+                        "def sample(resource):\n    try:\n        value = resource.read()\n    except {outer}:\n        try:\n{prefix}            {terminal}\n        except {inner}:\n            if resource.failed:\n                raise\n        value = resource.read()\n    resource.write(value)\n"
+                    );
+                    assert_matches_cpython(&source, "terminal_recovery_body.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn unlabeled_try_entry_reaches_named_cleanup() {
     for work in ["result = 0", "result = resource.run()"] {
         for condition in ["ready", "ready and other is not None"] {
