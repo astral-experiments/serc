@@ -50,6 +50,22 @@ fn erased_assertions_preserve_iterator_cleanup_marker() {
 }
 
 #[test]
+fn erased_loop_keeps_manager_cleanup_join_unlocated() {
+    for binding in ["", " as executor"] {
+        for body in ["assert ready()", "assert ready()\nassert pending()"] {
+            for cleanup in ["writer.rollback()", "record()\nwriter.rollback()"] {
+                let body = body.replace('\n', "\n                    ");
+                let cleanup = cleanup.replace('\n', "\n                ");
+                let source = format!(
+                    "def sample(writer):\n    try:\n        with acquire(){binding}:\n            try:\n                while True:\n                    {body}\n            finally:\n                {cleanup}\n    finally:\n        writer.close()\n"
+                );
+                assert_matches_cpython(&source, "erased_loop_manager_cleanup.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
 fn erased_async_finalizer_keeps_empty_borrow_exit() {
     for binding in ["", " as entered"] {
         for work in ["await wait()", "value = await receive()\nconsume(value)"] {

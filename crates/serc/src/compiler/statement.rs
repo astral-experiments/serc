@@ -34772,6 +34772,26 @@ impl<'source> Compiler<'source> {
             // before constant folding removes the infinite loop's normal exit.
             self.assembler.preserve_last_no_location();
         }
+        if self.context.python_version >= crate::PythonVersion::Py314
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && statement.handlers.is_empty()
+            && statement.orelse.is_empty()
+            && !overriding_return
+            && matches!(statement.body.last(), Some(Stmt::With(manager))
+                if !manager.is_async
+                    && matches!(manager.body.as_slice(), [Stmt::Try(cleanup)]
+                        if cleanup.handlers.is_empty()
+                            && cleanup.orelse.is_empty()
+                            && suite_has_linear_borrow_fallthrough(&cleanup.finalbody)
+                            && matches!(cleanup.body.as_slice(), [Stmt::While(tail)]
+                                if early_condition_truthiness(&tail.test) == Some(true)
+                                    && tail.orelse.is_empty()
+                                    && tail.body.iter().all(|part| self.context.is_elided_statement(part)))))
+        {
+            // The manager's normal and suppression exits share this original join,
+            // even when folding the empty loop later removes its normal exit.
+            self.assembler.preserve_last_no_location();
+        }
         if !suite_terminates(&statement.orelse)
             && matches!(statement.body.last(), Some(Stmt::While(tail))
                 if early_condition_truthiness(&tail.test) == Some(true)
