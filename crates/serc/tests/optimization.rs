@@ -15,6 +15,17 @@ use serc::{
 };
 
 #[test]
+fn runtime_break_keeps_guarded_cleanup_reachable() {
+    let source = "def sample(owner):\n    try:\n        while not owner.stop.is_set() or completed:\n            if drain:\n                break\n            if waiting and reservation is None:\n                try:\n                    if owner.external:\n                        if owner.stop.is_set():\n                            break\n                    else:\n                        reservation, placement = reserve(native, owner.limits, owner.stop)\n                except BaseException:\n                    raise\n            for unused in range(len(waiting)):\n                try:\n                    if key in cancelled:\n                        continue\n                    if owner.paused() or (placement is not None and len(placement.busy) == len(placement.nodes)):\n                        continue\n                    if bundle is None:\n                        continue\n                finally:\n                    del manifest, payload\n            for receipt in ready:\n                try:\n                    if receipt in retiring or key[0] in retired:\n                        continue\n                    try:\n                        value = runtime.get(receipt)\n                    except Exception as error:\n                        failure = error\n                    else:\n                        continue\n                finally:\n                    del result, receipt\n    except BaseException as error:\n        try:\n            runtime.get(owner.actor.fail.remote())\n        except Exception:\n            pass\n    finally:\n        if reservation is not None and not owner.external:\n            owner.report()\n";
+    for source in [
+        source.to_owned(),
+        source.replace("def sample(owner):", "def sample(owner, completed, drain, waiting, reservation, placement, native, cancelled, key, bundle, manifest, payload, ready, retiring, retired, runtime, result):"),
+    ] {
+        assert_matches_cpython(&source, "runtime_guarded_cleanup.py", &LEVELS);
+    }
+}
+
+#[test]
 fn nested_async_iterator_else_break_keeps_continuation_cold() {
     let source = "async def sample(owner, params, limit, content):\n    try:\n        async with owner.session() as session:\n            async with session.request(params=dict(params or {})) as response:\n                async for chunk in response.chunks():\n                    if limit is None:\n                        content.extend(chunk)\n                    else:\n                        content.extend(chunk[:limit])\n                        if len(content) > limit:\n                            break\n                return Result(response.status, dict(response.headers), response.charset, bytes(content))\n    except TimeoutError:\n        raise RequestTimeout('request timed out') from None\n    except RequestError as error:\n        raise WrappedError(error) from None\n    finally:\n        await owner.close()\n";
     for source in [
