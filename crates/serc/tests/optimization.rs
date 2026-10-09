@@ -15,6 +15,31 @@ use serc::{
 };
 
 #[test]
+fn tuple_unpack_prefix_keeps_retained_setup_marker_owner() {
+    let source = r#"async def sample(healthy):
+    group = attach({**originals, **({"peer": peer} if healthy else {})})
+    waiting, release = event(), event()
+    started, resume, finished = event(), event(), event()
+    failed, retry = event(), event()
+
+    async def stage():
+        await resume.wait()
+        await retry.wait()
+
+    async def close():
+        await release.wait()
+
+    initial = create_task(stage(inputs=[bundle()]))
+    try:
+        if healthy:
+            assert ready()
+    finally:
+        await pool.close()
+"#;
+    assert_matches_cpython(source, "tuple_unpack_cleanup_owner.py", &LEVELS);
+}
+
+#[test]
 fn copied_return_through_nested_loops_keeps_none_guard_owner() {
     let source = r#"async def sample(client, response):
     for attempt in range(client.attempts):
