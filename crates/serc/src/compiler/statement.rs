@@ -34168,6 +34168,62 @@ impl<'source> Compiler<'source> {
             || generator_else_break_loop_range.is_some()
             || runtime_while_else_break_reaches_finally
             || loop_guarded_recovery_reaches_finally;
+        // A runtime loop's surviving break enters the iterator cleanup without
+        // crossing the enclosing synchronous managers' exits.
+        let runtime_while_iterator_cleanup_break = self.context.python_version
+            == crate::PythonVersion::Py314
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && !suite_contains_return(&statement.finalbody)
+            && self.control.loops.contexts.is_empty()
+            && self
+                .control
+                .withs
+                .active_with_exits
+                .iter()
+                .all(|owner| !owner.is_async)
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && !self.control.in_exception_handler()
+            && self.control.finally.active_finally_try_bodies == 0
+            && statement.handlers.iter().all(|handler| {
+                handler
+                    .as_except_handler()
+                    .is_some_and(|handler| handler.type_.is_some())
+            })
+            && matches!(statement.finalbody.first(), Some(Stmt::For(cleanup))
+                if !cleanup.is_async
+                    && !expression_contains_inline_branch(&cleanup.iter)
+                    && !expression_contains_inline_branch(&cleanup.target))
+            && statement
+                .body
+                .last()
+                .and_then(|part| match part {
+                    Stmt::If(guard)
+                        if guard.elif_else_clauses.is_empty()
+                            && condition_has_linear_runtime_leaves(&guard.test)
+                            && !expression_suspends_current_scope(&guard.test) =>
+                    {
+                        guard.body.last()
+                    }
+                    part => Some(part),
+                })
+                .and_then(Stmt::as_while_stmt)
+                .is_some_and(|loop_| {
+                    loop_.orelse.is_empty()
+                        && early_condition_truthiness(&loop_.test).is_none()
+                        && condition_has_linear_runtime_leaves(&loop_.test)
+                        && !expression_suspends_current_scope(&loop_.test)
+                        && (suite_has_direct_nonterminal_break_guard(&loop_.body)
+                            || (matches!(statement.body.last(), Some(Stmt::While(_)))
+                                && self.suite_has_nonempty_borrow_entry(&statement.finalbody)
+                                && (suite_contains_borrow_reachable_conditional_loop_break(
+                                    &loop_.body,
+                                ) || suite_ends_in_terminal_conditional_break(&loop_.body))))
+                });
         // A surviving nonterminal break can enter a short-circuit cleanup test.
         // Its runtime leaves remain populated even when normal fallthrough is empty.
         let runtime_guarded_cleanup_break = self.context.python_version
@@ -34190,11 +34246,14 @@ impl<'source> Compiler<'source> {
             && self.control.finally.active_copied_finally_bodies == 0
             && self.control.finally.active_normal_finally_bodies == 0
             && self.control.finally.active_finally_end_blocks == 0
-            && self.control.withs.active_with_exits.is_empty()
+            && (self.control.withs.active_with_exits.is_empty()
+                || runtime_while_iterator_cleanup_break)
             && (self.suite_has_nonempty_borrow_entry(&statement.finalbody)
                 || coroutine_conditional_cleanup_entry
+                || runtime_while_iterator_cleanup_break
                 || runtime_guarded_cleanup_break)
-            && (runtime_guarded_cleanup_break
+            && (runtime_while_iterator_cleanup_break
+                || runtime_guarded_cleanup_break
                 || (self.context.python_version == crate::PythonVersion::Py314
                     && runtime_coroutine_break_context
                     && matches!(statement.finalbody.first(), Some(Stmt::Try(_)))
