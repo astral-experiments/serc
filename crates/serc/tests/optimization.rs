@@ -15,6 +15,19 @@ use serc::{
 };
 
 #[test]
+fn nested_recovery_else_keeps_loop_cleanup_reachable() {
+    let source = "async def sample(owner, entry, queue):\n    while True:\n        try:\n            if entry.observed == entry.subscribed:\n                continue\n            if entry.observed:\n                try:\n                    result = await owner.request('resume', entry.identifier, empty=True)\n                except Exception:\n                    raise\n                else:\n                    owner.publish()\n                finally:\n                    entry.resumed.set()\n            else:\n                entry.subscribed = False\n        except Exception:\n            owner.logger.error('unable to update', details=owner.details(entry))\n        finally:\n            queue.task_done()\n";
+    for source in [
+        source.to_owned(),
+        source
+            .replace("                except Exception:\n                    raise", "                except Exception:\n                    entry.observed = False\n                    raise")
+            .replace("            else:\n                entry.subscribed = False", "            else:\n                await owner.request('stop', entry.identifier)\n                entry.subscribed = False"),
+    ] {
+        assert_matches_cpython(&source, "nested_recovery_else.py", &LEVELS);
+    }
+}
+
+#[test]
 fn nested_loop_recovery_keeps_cleanup_entry_cold() {
     let source = "def sample(owner, outcome, errors):\n    for identifier, session in reversed(tuple(owner.sessions.items())):\n        try:\n            if outcome.handle != session.process or outcome.status != 0:\n                raise TransportError('unexpected process exit')\n        except Exception as error:\n            try:\n                owner.transport.wait(session.process, timeout=owner.timeout)\n            except Exception as recovery_error:\n                errors.append(recovery_error)\n        finally:\n            owner.sessions.pop(identifier, None)\n";
     assert_matches_cpython(source, "nested_loop_recovery.py", &LEVELS);
