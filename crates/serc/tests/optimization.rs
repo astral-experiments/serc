@@ -15,6 +15,17 @@ use serc::{
 };
 
 #[test]
+fn conditional_value_cleanup_keeps_live_loop_break() {
+    let source = "async def sample(owner, stopped, pending, deadline, now):\n    try:\n        while True:\n            if stopped and not pending:\n                break\n            if stopped:\n                if deadline is None:\n                    deadline = now + owner.timeout\n                elif now >= deadline:\n                    break\n    except Cancelled:\n        raise\n    except Exception:\n        raise\n    finally:\n        payload = {'started': owner.started.isoformat() if owner.started is not None else None, 'elapsed': clock() - now}\n";
+    for source in [
+        source.to_owned(),
+        source.replace("payload = {'started': owner.started.isoformat() if owner.started is not None else None, 'elapsed': clock() - now}", "budget = owner.timeout if deadline is None else max(1, deadline - clock())"),
+    ] {
+        assert_matches_cpython(&source, "conditional_loop_cleanup.py", &LEVELS);
+    }
+}
+
+#[test]
 fn managed_async_retry_break_keeps_continuation_cold() {
     let source = "async def sample(owner, kind, item, created):\n    try:\n        changed = True\n    except Conflict:\n        if kind == 'primary':\n            async for attempt in owner.retry():\n                with attempt:\n                    if item is None or item.removed():\n                        break\n                    if item.kind == 'primary':\n                        break\n                    break\n        else:\n            owner.record({'kind': kind, **details(item)})\n    return owner.result(item, created)\n";
     for source in [

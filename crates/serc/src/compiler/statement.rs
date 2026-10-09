@@ -32849,6 +32849,19 @@ impl<'source> Compiler<'source> {
             }
             _ => false,
         };
+        let coroutine_conditional_cleanup_entry = self.context.python_version
+            == crate::PythonVersion::Py314
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+            && matches!(statement.finalbody.first(), Some(Stmt::Assign(assignment))
+            if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                && expression_contains_inline_branch(&assignment.value)
+                && (expression_has_completed_conditional_value(&assignment.value)
+                    || matches!(assignment.value.as_ref(), Expr::Dict(dictionary)
+                        if dictionary.items.iter().all(|item| {
+                            item.key.as_ref().is_some_and(|key| fold_constant(key).is_some())
+                                && expression_has_completed_conditional_value(&item.value)
+                        }))));
         // A surviving conditional break jumps directly into normal cleanup, bypassing the
         // emptied normal exit left behind when except handlers move cold.
         let conditional_break_cleanup_entry = !statement.is_star
@@ -32867,6 +32880,7 @@ impl<'source> Compiler<'source> {
                     }
                     Stmt::Assign(assignment) => {
                         !expression_contains_inline_branch(&assignment.value)
+                            || coroutine_conditional_cleanup_entry
                     }
                     Stmt::If(conditional) => {
                         early_condition_truthiness(&conditional.test).is_none()
@@ -34093,7 +34107,8 @@ impl<'source> Compiler<'source> {
             && self.control.finally.active_normal_finally_bodies == 0
             && self.control.finally.active_finally_end_blocks == 0
             && self.control.withs.active_with_exits.is_empty()
-            && self.suite_has_nonempty_borrow_entry(&statement.finalbody)
+            && (self.suite_has_nonempty_borrow_entry(&statement.finalbody)
+                || coroutine_conditional_cleanup_entry)
             && ((self.context.python_version == crate::PythonVersion::Py314
                 && runtime_coroutine_break_context
                 && matches!(statement.finalbody.first(), Some(Stmt::Try(_)))
@@ -34111,7 +34126,25 @@ impl<'source> Compiler<'source> {
                     && !expression_contains_inline_branch(&loop_statement.target)
                     && suite_has_linear_live_conditional_break(&loop_statement.body)
                     && suite_contains_borrow_reachable_conditional_loop_break(
-                        &loop_statement.body)));
+                        &loop_statement.body))
+                || (coroutine_conditional_cleanup_entry
+                    && loop_break_context
+                    && conditional_break_cleanup_entry
+                    && matches!(statement.body.last(), Some(Stmt::While(loop_statement))
+                        if loop_statement.orelse.is_empty()
+                            && early_condition_truthiness(&loop_statement.test) == Some(true)
+                            && !loop_statement.body.iter().rev().find(|part| {
+                                !self.context.is_elided_statement(part)
+                                    && !matches!(part, Stmt::Pass(_) | Stmt::Global(_) | Stmt::Nonlocal(_))
+                                    && !matches!(part, Stmt::Expr(expression)
+                                        if self.context.fold_constant(&expression.value).is_some())
+                                    && !matches!(part, Stmt::AnnAssign(assignment)
+                                        if assignment.value.is_none() && matches!(assignment.target.as_ref(), Expr::Name(_)))
+                            }).is_some_and(|tail| {
+                                suite_contains_loop_break_with_manager(std::slice::from_ref(tail))
+                            })
+                            && suite_contains_borrow_reachable_conditional_loop_break(
+                                &loop_statement.body))));
         // A trailing nested try has its own emptied normal exit even when the
         // enclosing finally has no handlers. Straight-line recovery shares that empty exit.
         let nested_handler_exit = statement.handlers.is_empty()
@@ -42772,6 +42805,25 @@ fn suite_contains_yield_with_scope_options(
     };
     collector.visit_body(body);
     collector.found
+}
+
+/// Certifies conditional value arms that merge before their enclosing name store.
+fn expression_has_completed_conditional_value(expression: &Expr) -> bool {
+    if crate::stack_growth_required() {
+        return crate::grow_stack(|| expression_has_completed_conditional_value(expression));
+    }
+    match expression {
+        Expr::If(value) => {
+            condition_has_linear_runtime_leaves(&value.test)
+                && !expression_suspends_current_scope(&value.test)
+                && expression_has_completed_conditional_value(&value.body)
+                && expression_has_completed_conditional_value(&value.orelse)
+        }
+        _ => {
+            !expression_contains_inline_branch(expression)
+                && !expression_suspends_current_scope(expression)
+        }
+    }
 }
 
 /// Certifies generator creation whose current-scope evaluation stays linear.
