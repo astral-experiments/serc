@@ -15,6 +15,22 @@ use serc::{
 };
 
 #[test]
+fn stored_call_before_recovery_keeps_iterator_cleanup_reachable() {
+    let source = "def sample(owner, prepared, paths, opened, failure):\n    try:\n        owner.prepare(paths)\n        for path in paths:\n            owner.register(path)\n        while owner.active() or owner.poll() is None:\n            if owner.expired() and owner.active():\n                continue\n            try:\n                events = owner.select()\n            except BaseException as error:\n                continue\n            for key, item in events:\n                if not isinstance(item, Entry):\n                    continue\n                try:\n                    data = owner.read(item.name, key.fd)\n                except RetryError:\n                    continue\n                except BaseException as error:\n                    continue\n                if not data:\n                    continue\n                if item.failed:\n                    continue\n        returncode = owner.wait(timeout=0)\n    except BaseException as error:\n        owner.record(error)\n        if owner.process is not None and owner.process.poll() is None:\n            owner.terminate()\n            try:\n                owner.process.wait(timeout=1)\n            except TimeoutError:\n                owner.process.wait()\n        returncode = None if owner.process is None else owner.returncode\n    finally:\n        owner.release()\n        owner.close()\n        if not prepared:\n            for path in paths:\n                if path in opened:\n                    continue\n    complete(0 if failure is None else 1)\n";
+    assert_matches_cpython(source, "poll_recovery_cleanup.py", &LEVELS);
+
+    let dispatch = "def sample(owner, value, values, flag):\n    try:\n        for item in values:\n            owner.process(item)\n        result = owner.wait(value)\n    except Error as error:\n        owner.before(error)\n        if owner.available():\n            try:\n                owner.recover(error)\n            except RecoverError:\n                owner.fix()\n        else:\n            owner.skip()\n        result = None if flag else value\n    finally:\n        owner.release()\n    owner.after(value)\n";
+    for source in [
+        dispatch.to_owned(),
+        dispatch
+            .replace("                owner.fix()", "                return")
+            .replace("        else:\n            owner.skip()\n", ""),
+    ] {
+        assert_matches_cpython(&source, "conditional_recovery_cleanup.py", &LEVELS);
+    }
+}
+
+#[test]
 fn runtime_while_break_reaches_finalizer_iteration() {
     for manager in ["", "with acquire():", "with acquire(), acquire():"] {
         for nested in [false, true] {

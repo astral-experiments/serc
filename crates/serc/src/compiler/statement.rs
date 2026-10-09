@@ -25,6 +25,7 @@ use crate::code_object::Constant;
 use crate::target::code_flags::{
     CO_ASYNC_GENERATOR, CO_COROUTINE, CO_FUTURE_ANNOTATIONS, CO_GENERATOR,
 };
+use crate::target::opcodes::STORE_FAST;
 use crate::target::operands::{
     BinaryIntrinsic, BinaryOperation, CommonConstant, ResumeLocation, SpecialMethod, UnaryIntrinsic,
 };
@@ -27118,6 +27119,34 @@ impl<'source> Compiler<'source> {
                 && self
                     .assembler
                     .current_original_block_has_nonempty_borrow_source();
+            let stored_call_finally_source =
+                self.context.python_version == crate::PythonVersion::Py314
+                    && matches!(self.unit.scope, Scope::Function { .. })
+                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    && self.control.loops.contexts.is_empty()
+                    && self.control.withs.active_with_exits.is_empty()
+                    && self.control.exceptions.active_exception_handlers.is_empty()
+                    && self.control.finally.active_finally_try_bodies == 1
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_copied_finally_bodies == 0
+                    && self.control.finally.active_finally_end_blocks == 0
+                    && statement.handlers.iter().all(|handler| {
+                        handler.as_except_handler().is_some_and(|handler| {
+                            !suite_contains_conditional_nested_recovery(&handler.body)
+                        })
+                    })
+                    && !suite_contains_return(&statement.finalbody)
+                    && !suite_contains_loop_break(&statement.finalbody)
+                    && !suite_contains_loop_continue(&statement.finalbody)
+                    && matches!(normal_exit_suite.last(), Some(Stmt::Assign(store))
+                    if matches!(store.targets.as_slice(), [Expr::Name(_)])
+                        && simple_cleanup_call(&store.value))
+                    && self
+                        .assembler
+                        .current_original_block_has_nonempty_borrow_source()
+                    && self.assembler.instruction_opcode_at(
+                        self.assembler.instruction_count().saturating_sub(1),
+                    ) == Some(STORE_FAST);
             // Borrowing still checks the original endpoints when the jump disappears.
             let nonempty_finally_normal_source = !statement.is_star
                 && statement.orelse.is_empty()
@@ -27128,10 +27157,11 @@ impl<'source> Compiler<'source> {
                     || (matches!(statement.finalbody.first(), Some(Stmt::Expr(expression))
                     if matches!(expression.value.as_ref(), Expr::Call(_))
                         && !expression_contains_inline_branch(&expression.value))
-                        && self.suite_has_nonempty_borrow_entry(&statement.finalbody)
-                        && self
-                            .assembler
-                            .current_original_block_ends_with_discarded_call()));
+                        && ((self.suite_has_nonempty_borrow_entry(&statement.finalbody)
+                            && self
+                                .assembler
+                                .current_original_block_ends_with_discarded_call())
+                            || stored_call_finally_source)));
             let retained_finally_normal_source = !statement.is_star
                 && statement.orelse.is_empty()
                 && !statement.finalbody.is_empty()
