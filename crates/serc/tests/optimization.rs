@@ -15,6 +15,19 @@ use serc::{
 };
 
 #[test]
+fn awaited_branch_keeps_nested_cleanup_reachable() {
+    let source = "async def sample(owner, token, checkpoint, error):\n    try:\n        if owner.cancelled:\n            await owner.abort(token)\n        elif checkpoint is None:\n            raise RuntimeError('missing checkpoint')\n    except BaseException as failure:\n        if token is not None:\n            try:\n                await owner.abort(token)\n            except Exception:\n                log('abort failed', extra={'token': token})\n    finally:\n        try:\n            await owner.close()\n        except BaseException as failure:\n            log('close failed', extra={'token': token})\n        finally:\n            if not owner.result.done():\n                if error is None:\n                    owner.result.set_result(None)\n                else:\n                    owner.result.set_exception(error)\n";
+    for source in [
+        source.to_owned(),
+        source
+            .replace("    try:\n        if owner.cancelled:", "    try:\n        if token is None:\n            raise RuntimeError('missing token')\n        await owner.ready.wait()\n        if owner.cancelled:")
+            .replace("        elif checkpoint is None:\n            raise RuntimeError('missing checkpoint')", "        else:\n            checkpoint = owner.checkpoint\n            if checkpoint is None:\n                raise RuntimeError('missing checkpoint')\n            await owner.transfer(checkpoint)"),
+    ] {
+        assert_matches_cpython(&source, "awaited_nested_cleanup.py", &LEVELS);
+    }
+}
+
+#[test]
 fn nested_recovery_else_keeps_loop_cleanup_reachable() {
     let source = "async def sample(owner, entry, queue):\n    while True:\n        try:\n            if entry.observed == entry.subscribed:\n                continue\n            if entry.observed:\n                try:\n                    result = await owner.request('resume', entry.identifier, empty=True)\n                except Exception:\n                    raise\n                else:\n                    owner.publish()\n                finally:\n                    entry.resumed.set()\n            else:\n                entry.subscribed = False\n        except Exception:\n            owner.logger.error('unable to update', details=owner.details(entry))\n        finally:\n            queue.task_done()\n";
     for source in [
