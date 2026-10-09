@@ -15448,6 +15448,23 @@ impl<'source> Compiler<'source> {
                                         && finalizer.body.iter().all(linear_finalizer_entry)
                                 })
                         });
+                    let async_managers_predate_finally = self.unit.flags
+                        & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                        == CO_COROUTINE
+                        && self.control.generators.generator_region_start.is_some()
+                        && !self.control.withs.active_with_exits.is_empty()
+                        && self.control.withs.active_with_exits.len()
+                            == self.control.withs.active_with_region_exclusions.len()
+                        && self
+                            .control
+                            .withs
+                            .active_with_exits
+                            .iter()
+                            .all(|manager| manager.is_async && manager.exception_region_depth == 0)
+                        && matches!(finalizers.as_slice(), [finalizer]
+                            if finalizer.exception_region_depth == 0
+                                && finalizer.enclosing_finally_try_depth == 0
+                                && finalizer.with_depth == self.control.withs.active_with_exits.len());
                     // A direct try-body join precedes live work or POP_BLOCK and
                     // a separate finalizer array. Its empty true-arm jump receives
                     // the condition's line before redundant-jump removal.
@@ -15457,7 +15474,11 @@ impl<'source> Compiler<'source> {
                     ) && matches!(
                         self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR),
                         0 | CO_COROUTINE
-                    ) && self.control.loops.contexts.is_empty()
+                    ) && (self.control.loops.contexts.is_empty()
+                        || (async_managers_predate_finally
+                            && finalizers.last().is_some_and(|finalizer| {
+                                finalizer.loop_depth == self.control.loops.contexts.len()
+                            })))
                         && ((self.control.withs.active_with_exits.is_empty()
                             && self.control.withs.active_with_region_exclusions.is_empty())
                             // Managers entered before this try add no predecessor to
@@ -15472,7 +15493,8 @@ impl<'source> Compiler<'source> {
                                         && (manager.exception_region_depth == 0
                                             || (nested_finally_contexts
                                                 && manager.exception_region_depth < finalizers.len()))
-                                })))
+                                }))
+                            || async_managers_predate_finally)
                         && ((self
                             .control
                             .exceptions
@@ -15513,9 +15535,17 @@ impl<'source> Compiler<'source> {
                         && matches!(statement.elif_else_clauses.get(branch_index..), Some([clause])
                             if clause.test.is_none())
                         && (finalizers.len() == 1 || nested_finally_contexts)
-                        && finalizers
-                            .last()
-                            .is_some_and(|finalizer| finalizer_has_located_entry(finalizer.body));
+                        && finalizers.last().is_some_and(|finalizer| {
+                            finalizer_has_located_entry(finalizer.body)
+                                // Live work fixes the join's line before the finalizer
+                                // starts, even when its later cleanup introduces branches.
+                                || (async_managers_predate_finally
+                                    && self
+                                        .control
+                                        .statements
+                                        .context
+                                        .elided_join_has_live_successor)
+                        });
                     // An enclosing finalizer runs after the loop leaves this region.
                     // Live work precedes both cleanup and the backedge, so the manager
                     // still owns the erased conditional's forward join.
@@ -22124,7 +22154,7 @@ impl<'source> Compiler<'source> {
                     .withs
                     .active_with_exits
                     .iter()
-                    .all(|manager| !manager.is_async)
+                    .all(|manager| !manager.is_async || self.unit.flags & CO_COROUTINE != 0)
                 && self.control.withs.active_with_region_exclusions.len()
                     == self.control.withs.active_with_exits.len()
                 && self.control.exceptions.active_exception_handlers.is_empty()
@@ -22170,7 +22200,11 @@ impl<'source> Compiler<'source> {
             if self.context.python_version == crate::PythonVersion::Py314
                 && matches!(self.unit.scope, Scope::Function { .. })
                 && (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
-                    || completed_prefix_context)
+                    || completed_prefix_context
+                    || (break_stays_inside_finally
+                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                            == CO_COROUTINE
+                        && self.control.withs.active_with_exits.last().is_some_and(|manager| manager.is_async)))
                 && (self.control.loops.contexts.is_empty()
                     || (statement.orelse.is_empty()
                         && matches!(self.control.loops.contexts.as_slice(), [outer]

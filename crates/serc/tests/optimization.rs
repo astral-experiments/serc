@@ -15,6 +15,36 @@ use serc::{
 };
 
 #[test]
+fn erased_conditional_join_inside_async_manager_loop_keeps_marker() {
+    for iterator in ["for", "async for"] {
+        for binding in ["", " as (channel, identity)"] {
+            for cleanup in ["release.set()", "record()\nrelease.set()"] {
+                let cleanup = cleanup.replace('\n', "\n                ");
+                let source = format!(
+                    "async def sample(flag, items):\n    {iterator} gate in items:\n        async with acquire(){binding}:\n            try:\n                if flag:\n                    assert ready()\n                else:\n                    assert complete()\n            finally:\n                {cleanup}\n"
+                );
+                assert_matches_cpython(&source, "async_loop_conditional_join.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn erased_loop_break_keeps_async_manager_finally_boundary() {
+    for setup in ["", "                event = await next_event(channel)\n"] {
+        for condition in [
+            "event['kind'].startswith('done')",
+            "event['kind'] in {'done', 'failed'}",
+        ] {
+            let source = format!(
+                "async def sample():\n    async with acquire() as (channel, identity):\n        try:\n            while True:\n{setup}                if {condition}:\n                    break\n                assert waiting()\n            assert complete()\n        finally:\n            release.set()\n        events = await receive(channel)\n"
+            );
+            assert_matches_cpython(&source, "async_loop_finally_boundary.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn tuple_unpack_prefix_keeps_retained_setup_marker_owner() {
     let source = r#"async def sample(healthy):
     group = attach({**originals, **({"peer": peer} if healthy else {})})
@@ -37,6 +67,68 @@ fn tuple_unpack_prefix_keeps_retained_setup_marker_owner() {
         await pool.close()
 "#;
     assert_matches_cpython(source, "tuple_unpack_cleanup_owner.py", &LEVELS);
+}
+
+#[test]
+fn erased_coroutine_join_preserves_predating_async_managers() {
+    let source = r"async def sample(value, state, items):
+    async with manager(value):
+        async with manager(state):
+            try:
+                result = next(part for part in items if part.ready)
+                if value == state:
+                    assert result
+                else:
+                    assert result is None
+                action(state)
+                if state:
+                    action(value)
+                await finish(value)
+            finally:
+                await finish(state)
+";
+    for (name, source) in [
+        ("generator_prefix", source.to_owned()),
+        (
+            "plain_prefix",
+            source.replace("next(part for part in items if part.ready)", "fetch(items)"),
+        ),
+        ("truth_test", source.replace("value == state", "value")),
+        (
+            "terminal_join",
+            source.replace(
+                "                action(state)\n                if state:\n                    action(value)\n                await finish(value)\n",
+                "",
+            ),
+        ),
+        (
+            "later_finalizer_manager",
+            source.replace(
+                "                await finish(state)\n",
+                "                await finish(state)\n                with manager(value):\n                    await finish(value)\n",
+            ),
+        ),
+        (
+            "authored_pass",
+            source
+                .replace("assert result is None", "pass")
+                .replace("assert result", "pass"),
+        ),
+        (
+            "live_true_arm",
+            source.replace("assert result\n", "action(result)\n"),
+        ),
+        (
+            "live_false_arm",
+            source.replace("assert result is None", "action(state)"),
+        ),
+    ] {
+        assert_matches_cpython(
+            &source,
+            &format!("erased_coroutine_predating_managers_{name}.py"),
+            &LEVELS,
+        );
+    }
 }
 
 #[test]
