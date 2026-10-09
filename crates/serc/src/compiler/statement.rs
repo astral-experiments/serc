@@ -32268,13 +32268,18 @@ impl<'source> Compiler<'source> {
         let completed_await_recovery_work = |part: &Stmt| {
             self.context.is_elided_statement(part)
                 || suite_has_linear_borrow_fallthrough(std::slice::from_ref(part))
+                || matches!(part, Stmt::If(guard)
+                    if guard.elif_else_clauses.is_empty()
+                        && condition_has_linear_runtime_leaves(&guard.test)
+                        && !expression_suspends_current_scope(&guard.test)
+                        && suite_has_linear_raise_exit(&guard.body))
                 || matches!(part, Stmt::Assert(assertion)
                     if self.context.fold_constant(&assertion.test).is_none()
                         && !expression_contains_inline_branch(&assertion.test)
                         && !expression_suspends_current_scope(&assertion.test))
         };
         // The completed await retains the first arm's jump into the separate-line
-        // recovery entry. Its cold guarded re-raise does not retire that normal jump.
+        // recovery entry. Non-copying handler exits do not retire that normal jump.
         let coroutine_await_recovery_reaches_finally = self.context.python_version
             == crate::PythonVersion::Py314
             && matches!(self.unit.scope, Scope::Function { .. })
@@ -32294,50 +32299,35 @@ impl<'source> Compiler<'source> {
             && matches!(statement.handlers.as_slice(), [handler]
             if handler.as_except_handler().is_some_and(|handler| {
                 matches!(handler.type_.as_deref(), Some(Expr::Name(_)))
-                    && handler.name.is_none()
-                    && (matches!(handler.body.as_slice(), [Stmt::Pass(_)])
-                        || handler.body.split_last().is_some_and(|(last, leading)| {
-                            matches!(last, Stmt::Raise(raise)
-                                if raise.exc.is_none() && raise.cause.is_none())
-                                && (leading.is_empty() || suite_has_linear_borrow_fallthrough(leading))
-                        }))
+                    && !suite_any_statement(&handler.body, |part| {
+                        matches!(part, Stmt::Return(_) | Stmt::Break(_) | Stmt::Continue(_))
+                    })
             }))
             && matches!(statement.finalbody.as_slice(), [Stmt::Try(cleanup)]
             if !cleanup.is_star
                 && cleanup.orelse.is_empty()
-                && cleanup.finalbody.is_empty()
+                && self.suite_has_nonempty_borrow_entry(&statement.finalbody)
+                && !suite_contains_yield(&statement.finalbody)
                 && matches!(cleanup.body.as_slice(), [Stmt::Expr(work)]
-                    if self.source_location(work.range).line != self.source_location(cleanup.range).line
-                        && !expression_contains_inline_branch(&work.value)
+                    if !expression_contains_inline_branch(&work.value)
                         && ((matches!(work.value.as_ref(), Expr::Call(_))
                                 && !expression_suspends_current_scope(&work.value))
                             || matches!(work.value.as_ref(), Expr::Await(awaited)
                                 if matches!(awaited.value.as_ref(), Expr::Call(_))
-                                    && !expression_suspends_current_scope(&awaited.value))))
-                && matches!(cleanup.handlers.as_slice(), [handler]
-                    if handler.as_except_handler().is_some_and(|handler| {
-                        matches!(handler.type_.as_deref(), Some(Expr::Name(_)))
-                            && handler.name.is_none()
-                            && (matches!(handler.body.as_slice(), [Stmt::Pass(_)])
-                                || matches!(handler.body.as_slice(), [Stmt::If(guard), tail @ ..]
-                                    if guard.elif_else_clauses.is_empty()
-                                        && condition_has_linear_runtime_leaves(&guard.test)
-                                        && !expression_contains_inline_branch(&guard.test)
-                                        && !expression_suspends_current_scope(&guard.test)
-                                        && matches!(guard.body.as_slice(), [Stmt::Raise(raise)]
-                                            if raise.exc.is_none() && raise.cause.is_none())
-                                        && suite_has_nonsuspending_linear_fallthrough(tail)))
-                    })))
+                                    && !expression_suspends_current_scope(&awaited.value)))))
             && matches!(statement.body.split_last(), Some((Stmt::If(branch), prefix))
             if prefix.iter().all(completed_await_recovery_work)
                 && condition_has_linear_runtime_leaves(&branch.test)
                 && !expression_suspends_current_scope(&branch.test)
-                && branch.elif_else_clauses.last().is_some_and(|clause| clause.test.is_some())
+                && !branch.elif_else_clauses.is_empty()
                 && branch.elif_else_clauses.iter().all(|clause| {
-                    clause.test.as_ref().is_some_and(|test| {
+                    clause.test.as_ref().is_none_or(|test| {
                         condition_has_linear_runtime_leaves(test)
                             && !expression_suspends_current_scope(test)
                     })
+                        && (clause.test.is_some() || !suite_any_statement(&clause.body, |part| {
+                            matches!(part, Stmt::Return(_) | Stmt::Break(_) | Stmt::Continue(_))
+                        }))
                 })
                 && branch.body.split_last().is_some_and(|(last, leading)| {
                     matches!(last, Stmt::Expr(work)
