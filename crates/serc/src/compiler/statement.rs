@@ -32416,7 +32416,16 @@ impl<'source> Compiler<'source> {
                     clause.test.as_ref().is_none_or(|test| {
                         condition_has_only_runtime_tests(test)
                             && !expression_contains_inline_branch(test)
-                    }) && !suite_contains_abrupt_control_flow(&clause.body)
+                    }) && (!suite_contains_abrupt_control_flow(&clause.body)
+                        || (self.context.python_version == crate::PythonVersion::Py314
+                            && matches!(self.unit.scope, Scope::Function { .. })
+                            && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+                            && clause.test.is_none()
+                            && matches!(clause.body.as_slice(), [Stmt::Return(returned)]
+                                if returned.value.as_deref().is_none_or(|value| {
+                                    !expression_contains_inline_branch(value)
+                                        && !expression_suspends_current_scope(value)
+                                }))))
                 })
                 && (conditional_reraise_entry
                     || suite_has_linear_borrow_fallthrough(&conditional.body)
