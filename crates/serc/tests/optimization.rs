@@ -15,6 +15,18 @@ use serc::{
 };
 
 #[test]
+fn asserted_async_iterator_break_keeps_cleanup_cold() {
+    let source = "async def sample(processor, owner):\n    stream = processor.open(owner=owner, events=events())\n    try:\n        async with timeout(1):\n            async for item in stream:\n                if item.channel == 'final':\n                    assert item.parts == ['ready']\n                    break\n    finally:\n        await stream.close()\n";
+    for source in [
+        source.to_owned(),
+        source.replace("item.parts == ['ready']", "ready(item)"),
+        source.replace("item.parts == ['ready']", "item is not None"),
+    ] {
+        assert_matches_cpython(&source, "asserted_async_iterator_break.py", &LEVELS);
+    }
+}
+
+#[test]
 fn nested_reraise_cleanup_keeps_awaited_store_reachable() {
     let source = "async def sample():\n    try:\n        if native:\n            await session.close()\n        else:\n            await session.detach()\n    except CancelledError as error:\n        raise\n    except OwnershipError as error:\n        recovered = error\n    finally:\n        try:\n            if not native:\n                if session.reusable:\n                    await pool.release(lease)\n                else:\n                    retired = await replace(pool, name=lease.name, expected=lease.backend, lease=lease)\n                    if retired and isinstance(pool, Pool):\n                        disposition = 'retired'\n        except BaseException as failure:\n            raise\n";
     assert_matches_cpython(source, "nested_reraise_cleanup.py", &LEVELS);

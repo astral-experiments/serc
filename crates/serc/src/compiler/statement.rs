@@ -47358,6 +47358,13 @@ fn suite_ends_in_terminal_conditional_break(body: &[Stmt]) -> bool {
                 {
                     true
                 }
+                // Assertion failure exits the loop; success still reaches the
+                // terminal break. Erased assertions add no alternate entry.
+                Stmt::Assert(assertion) => {
+                    !expression_suspends_current_scope(&assertion.test)
+                        && !expression_yields_in_current_scope(&assertion.test)
+                }
+                Stmt::Global(global) if global.names.is_empty() => true,
                 Stmt::Assign(assignment)
                     if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
                         && matches!(assignment.value.as_ref(), Expr::Call(call)
