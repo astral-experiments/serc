@@ -15,6 +15,12 @@ use serc::{
 };
 
 #[test]
+fn coroutine_raising_guard_keeps_nested_cleanup_reachable() {
+    let source = "async def sample(owner, completed, state, output, validated):\n    try:\n        while True:\n            if completed:\n                break\n            await owner.step(timeout=60)\n        if state.strip():\n            raise RuntimeError('Unexpected state: ' + state.decode(errors='replace')[-100:])\n    except Exception as error:\n        failure = error\n    finally:\n        try:\n            inventory = await owner.capture(timeout=60)\n        except Exception:\n            inventory = b''\n        await owner.close()\n    save(output, (encode(validated, indent=2, sort_keys=True) + '\\n').encode(), label='result')\n";
+    assert_matches_cpython(source, "coroutine_raise_cleanup.py", &LEVELS);
+}
+
+#[test]
 fn runtime_break_keeps_guarded_cleanup_reachable() {
     let source = "def sample(owner):\n    try:\n        while not owner.stop.is_set() or completed:\n            if drain:\n                break\n            if waiting and reservation is None:\n                try:\n                    if owner.external:\n                        if owner.stop.is_set():\n                            break\n                    else:\n                        reservation, placement = reserve(native, owner.limits, owner.stop)\n                except BaseException:\n                    raise\n            for unused in range(len(waiting)):\n                try:\n                    if key in cancelled:\n                        continue\n                    if owner.paused() or (placement is not None and len(placement.busy) == len(placement.nodes)):\n                        continue\n                    if bundle is None:\n                        continue\n                finally:\n                    del manifest, payload\n            for receipt in ready:\n                try:\n                    if receipt in retiring or key[0] in retired:\n                        continue\n                    try:\n                        value = runtime.get(receipt)\n                    except Exception as error:\n                        failure = error\n                    else:\n                        continue\n                finally:\n                    del result, receipt\n    except BaseException as error:\n        try:\n            runtime.get(owner.actor.fail.remote())\n        except Exception:\n            pass\n    finally:\n        if reservation is not None and not owner.external:\n            owner.report()\n";
     for source in [

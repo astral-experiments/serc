@@ -33736,10 +33736,15 @@ impl<'source> Compiler<'source> {
                         && call.arguments.keywords.iter().all(|keyword| keyword.arg.is_some())));
         // The false edge of one terminal raising guard reaches a nonempty normal
         // cleanup. Raising does not create the copied cleanup exits of a return.
+        let coroutine_terminal_raise_cleanup =
+            self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+                && matches!(statement.finalbody.first(), Some(Stmt::Try(_)))
+                && self.suite_has_nonempty_borrow_entry(&statement.finalbody);
         let terminal_raise_if_reaches_finally = !statement.is_star
             && statement.orelse.is_empty()
             && matches!(self.unit.scope, Scope::Function { .. })
-            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                || coroutine_terminal_raise_cleanup)
             && self.control.loops.contexts.is_empty()
             && self.control.withs.active_with_exits.is_empty()
             && self
@@ -33764,14 +33769,18 @@ impl<'source> Compiler<'source> {
                     && matches!(last, Stmt::If(guard)
                         if condition_has_only_runtime_tests(&guard.test)
                             && !expression_contains_inline_branch(&guard.test)
+                            && !expression_suspends_current_scope(&guard.test)
                             && original_condition_has_unique_jump_target(&guard.test, false)
                             && guard.elif_else_clauses.is_empty()
-                            && matches!(guard.body.as_slice(), [Stmt::Raise(_)])
+                            && matches!(guard.body.as_slice(), [Stmt::Raise(raise)]
+                                if raise.exc.as_deref().is_none_or(|value| !expression_suspends_current_scope(value))
+                                    && raise.cause.as_deref().is_none_or(|value| !expression_suspends_current_scope(value)))
                             && suite_has_linear_raise_exit(&guard.body))
             })
             && !suite_contains_abrupt_control_flow(&statement.finalbody)
             && statement.finalbody.first().is_some_and(|entry| {
                 suite_has_linear_borrow_fallthrough(std::slice::from_ref(entry))
+                    || coroutine_terminal_raise_cleanup
                     || matches!(entry, Stmt::If(cleanup)
                         if condition_has_only_runtime_tests(&cleanup.test)
                             && !expression_contains_inline_branch(&cleanup.test)
