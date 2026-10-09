@@ -43392,7 +43392,15 @@ fn suite_contains_orphan_cold_cleanup(body: &[Stmt]) -> bool {
                         })
                         && handler.body.split_last().is_some_and(|(last, prefix)| {
                             matches!(last, Stmt::Continue(_))
-                                && (prefix.is_empty() || linear_nonsuspending(prefix))
+                                && prefix.iter().all(|part| {
+                                    linear_nonsuspending(std::slice::from_ref(part))
+                                        || matches!(part, Stmt::If(guard)
+                                            if guard.elif_else_clauses.is_empty()
+                                                && condition_has_linear_runtime_leaves(&guard.test)
+                                                && !expression_suspends_current_scope(&guard.test)
+                                                && matches!(guard.body.as_slice(), [Stmt::Raise(raised)]
+                                                    if raised.exc.is_none() && raised.cause.is_none()))
+                                })
                         })
                 }))
         })
