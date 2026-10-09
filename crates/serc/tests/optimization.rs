@@ -15,6 +15,21 @@ use serc::{
 };
 
 #[test]
+fn coroutine_nested_breaks_reach_located_cleanup() {
+    let source = "async def sample(owner, ready, running, abort, failure, scheduled, item, executed):\n    try:\n        while ready or running:\n            if abort is not None or failure is not None:\n                if abort is not None and abort.ready():\n                    break\n                if failure is not None and failure.ready():\n                    break\n            while ready:\n                if item in scheduled:\n                    continue\n            if not running:\n                break\n    except BaseException:\n        raise\n    finally:\n        try:\n            owner.slowest = compute(owner, executed)\n        finally:\n            owner.clear()\n";
+    for source in [
+        source.to_owned(),
+        source
+            .replace("            if abort is not None or failure is not None:\n", "            if abort is not None or failure is not None:\n                await owner.yield_control()\n")
+            .replace("            while ready:\n", "            while ready:\n                item = ready.pop()\n")
+            .replace("                    continue\n", "                    continue\n                owner.schedule(item)\n")
+            .replace("    except BaseException:\n", "    except BaseException:\n        await owner.cancel()\n"),
+    ] {
+        assert_matches_cpython(&source, "coroutine_nested_breaks.py", &LEVELS);
+    }
+}
+
+#[test]
 fn reraised_async_manager_keeps_recovery_continuation_cold() {
     let source = "async def sample(owner, lock, records, value, rounds):\n    for iteration in range(rounds):\n        try:\n            value['status'] = 'rejected'\n        except OwnerError as error:\n            if not owner.recoverable(error):\n                async with lock:\n                    records.append(value)\n                raise\n        except (ValueError, TypeError) as error:\n            value['error'] = error\n        async with lock:\n            records.append(value)\n";
     for source in [

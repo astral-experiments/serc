@@ -34060,7 +34060,7 @@ impl<'source> Compiler<'source> {
             || generator_else_break_loop_range.is_some()
             || runtime_while_else_break_reaches_finally
             || loop_guarded_recovery_reaches_finally;
-        let for_break_reaches_finally = !statement.handlers.is_empty()
+        let loop_break_reaches_finally = !statement.handlers.is_empty()
             && !normal_finally_is_borrow_reachable
             && !statement.is_star
             && statement.orelse.is_empty()
@@ -34069,14 +34069,24 @@ impl<'source> Compiler<'source> {
             && self.control.finally.active_finally_end_blocks == 0
             && self.control.withs.active_with_exits.is_empty()
             && self.suite_has_nonempty_borrow_entry(&statement.finalbody)
-            && matches!(statement.body.last(), Some(Stmt::For(loop_statement))
+            && ((self.context.python_version == crate::PythonVersion::Py314
+                && runtime_coroutine_break_context
+                && matches!(statement.finalbody.first(), Some(Stmt::Try(_)))
+                && matches!(statement.body.last(), Some(Stmt::While(loop_statement))
+                        if loop_statement.orelse.is_empty()
+                            && early_condition_truthiness(&loop_statement.test).is_none()
+                            && condition_has_linear_runtime_leaves(&loop_statement.test)
+                            && !expression_suspends_current_scope(&loop_statement.test)
+                            && suite_contains_borrow_reachable_conditional_loop_break(
+                                &loop_statement.body)))
+                || matches!(statement.body.last(), Some(Stmt::For(loop_statement))
                 if !loop_statement.is_async
                     && loop_statement.orelse.is_empty()
                     && !expression_contains_inline_branch(&loop_statement.iter)
                     && !expression_contains_inline_branch(&loop_statement.target)
                     && suite_has_linear_live_conditional_break(&loop_statement.body)
                     && suite_contains_borrow_reachable_conditional_loop_break(
-                        &loop_statement.body));
+                        &loop_statement.body)));
         // A trailing nested try has its own emptied normal exit even when the
         // enclosing finally has no handlers. Straight-line recovery shares that empty exit.
         let nested_handler_exit = statement.handlers.is_empty()
@@ -34228,8 +34238,8 @@ impl<'source> Compiler<'source> {
                 .prevent_borrow_finally_fallthrough(protected_end);
             self.assembler
                 .prevent_borrow_fallthrough_reachability(protected_end);
-            if for_break_reaches_finally {
-                // A surviving for-loop break can enter this certified nonempty
+            if loop_break_reaches_finally {
+                // A surviving loop break can enter this certified nonempty
                 // cleanup. Keep fallthrough blocked while the existing policy
                 // permits surviving break jumps and other independent jump edges.
                 self.assembler
@@ -34245,7 +34255,7 @@ impl<'source> Compiler<'source> {
             // normal-exit NOP that precedes it.
             // The certified break enters the nonempty cleanup through the
             // preceding handler join; this protection boundary aliases it.
-            if normal_finally_is_borrow_reachable || for_break_reaches_finally {
+            if normal_finally_is_borrow_reachable || loop_break_reaches_finally {
                 self.assembler.preserve_block_boundary_alias(protected_end);
             } else {
                 self.assembler.preserve_block_boundary(protected_end);
