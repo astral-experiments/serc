@@ -47776,7 +47776,7 @@ fn suite_ends_in_terminal_conditional_break(body: &[Stmt]) -> bool {
                         clause
                             .test
                             .as_ref()
-                            .is_none_or(|test| !condition_reaches_async_break_entry(test))
+                            .is_some_and(|test| !condition_reaches_async_break_entry(test))
                     })
                     || earlier
                         .iter()
