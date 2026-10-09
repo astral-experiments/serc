@@ -15,6 +15,12 @@ use serc::{
 };
 
 #[test]
+fn managed_iterator_inner_break_keeps_cleanup_reachable() {
+    let source = "def sample(owner, protected):\n    with owner.temporary() as directory:\n        with owner.open(directory) as stream:\n            for member in stream:\n                if member.name == 'index':\n                    continue\n                target = owner.output(member.path) if member.kind == 'data' else None\n                try:\n                    while True:\n                        if not chunk:\n                            break\n                        if target is not None:\n                            if protected:\n                                tail = searchable[-overlap:] if overlap else b''\n                finally:\n                    if target is not None:\n                        target.close()\n";
+    assert_matches_cpython(source, "managed_iterator_cleanup.py", &LEVELS);
+}
+
+#[test]
 fn coroutine_raising_guard_keeps_nested_cleanup_reachable() {
     let source = "async def sample(owner, completed, state, output, validated):\n    try:\n        while True:\n            if completed:\n                break\n            await owner.step(timeout=60)\n        if state.strip():\n            raise RuntimeError('Unexpected state: ' + state.decode(errors='replace')[-100:])\n    except Exception as error:\n        failure = error\n    finally:\n        try:\n            inventory = await owner.capture(timeout=60)\n        except Exception:\n            inventory = b''\n        await owner.close()\n    save(output, (encode(validated, indent=2, sort_keys=True) + '\\n').encode(), label='result')\n";
     assert_matches_cpython(source, "coroutine_raise_cleanup.py", &LEVELS);

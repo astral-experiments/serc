@@ -22431,7 +22431,15 @@ impl<'source> Compiler<'source> {
                 // Suspension changes the manager exit, not this direct cleanup edge.
                 if matches!(self.unit.scope, Scope::Function { .. })
                     && !self.control.statements.context.has_following
-                    && self.control.loops.contexts.is_empty()
+                    && (self.control.loops.contexts.is_empty()
+                        || (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                            && matches!(self.control.loops.contexts.as_slice(), [outer]
+                                if outer.iterator_cleanup == IteratorCleanup::Sync
+                                    && !outer.has_orelse
+                                    && outer.with_depth == self.control.withs.active_with_exits.len()
+                                    && outer.exception_region_depth + 1
+                                        == self.control.exceptions.active_exception_region_exclusions.len()
+                                    && outer.finally_end_depth == self.control.finally.active_finally_end_blocks)))
                     && self.control.exceptions.active_exception_handlers.is_empty()
                     && self.control.exceptions.active_exception_group_handlers == 0
                     && self.control.finally.active_normal_finally_bodies == 0
@@ -22448,7 +22456,7 @@ impl<'source> Compiler<'source> {
                                 == self.control.exceptions.active_exception_region_exclusions.len()
                     })
                     && self.control.finally.active_return_finally_contexts.last().is_some_and(|context| {
-                        context.loop_depth == 0
+                        context.loop_depth == self.control.loops.contexts.len()
                             && context.with_depth == self.control.withs.active_with_exits.len()
                             && context.handler_depth == 0
                             && context.exception_region_depth + 1
