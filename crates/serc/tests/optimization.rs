@@ -59,6 +59,25 @@ fn nested_raising_cleanup_keeps_enclosing_pop_location() {
 }
 
 #[test]
+fn recovery_loop_comprehension_keeps_continuation_cold() {
+    for (scope, suspend) in [("def", ""), ("async def", "await ")] {
+        let source = format!(
+            "{scope} sample(owner, groups, optional):\n    try:\n        value = {suspend}owner.query()\n    except (LoadError, ValueError):\n        value = project(owner.default, ())\n        for group in groups:\n            try:\n                extra = {suspend}owner.query(group)\n            except (LoadError, ValueError):\n                continue\n            value.update({{field: extra.get(field) for field in group}})\n    return project(value, optional)\n"
+        );
+        for source in [
+            source.clone(),
+            source
+                .replace("        value = project(owner.default, ())", &format!("        if not optional:\n            raise\n        value = {suspend}owner.query()\n        validate(value)\n        value = project(value, ())"))
+                .replace("            value.update(", "            validate(extra)\n            value.update("),
+            source.replace("            except (LoadError, ValueError):\n                continue", "            except (LoadError, ValueError) as error:\n                record(error)\n                continue"),
+            source.replace("{field: extra.get(field) for field in group}", "{field for field in group}"),
+        ] {
+            assert_matches_cpython(&source, "recovery_loop_comprehension.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn conditional_deletion_keeps_cleanup_reachable() {
     for scope in ["def", "async def"] {
         for target in ["pending[item]", "owner.slot", "started"] {

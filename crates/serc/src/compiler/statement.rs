@@ -43332,6 +43332,11 @@ fn suite_contains_orphan_cold_cleanup(body: &[Stmt]) -> bool {
             };
             let suffix = &body[index + 1..];
             let live_suffix = linear_nonsuspending(suffix)
+                || suffix.split_last().is_some_and(|(last, prefix)| {
+                    (prefix.is_empty() || linear_nonsuspending(prefix))
+                        && matches!(last, Stmt::Expr(work)
+                            if recovery_comprehension_call_has_nonempty_exit(&work.value))
+                })
                 || matches!(suffix, [Stmt::For(tail)]
                     if !tail.is_async
                         && tail.orelse.is_empty()
@@ -43344,7 +43349,8 @@ fn suite_contains_orphan_cold_cleanup(body: &[Stmt]) -> bool {
                 && recovery.orelse.is_empty()
                 && recovery.finalbody.is_empty()
                 && live_suffix
-                && linear_nonsuspending(&recovery.body)
+                && suite_has_linear_borrow_fallthrough(&recovery.body)
+                && !suite_contains_yield(&recovery.body)
                 && body[..index].iter().all(|prefix| {
                     linear_nonsuspending(std::slice::from_ref(prefix))
                         || matches!(prefix, Stmt::If(guard)
@@ -43355,8 +43361,7 @@ fn suite_contains_orphan_cold_cleanup(body: &[Stmt]) -> bool {
                 })
                 && matches!(recovery.handlers.as_slice(), [handler]
                 if handler.as_except_handler().is_some_and(|handler| {
-                    handler.name.is_none()
-                        && handler.type_.as_ref().is_some_and(|type_| {
+                    handler.type_.as_ref().is_some_and(|type_| {
                             !expression_contains_inline_branch(type_)
                                 && !expression_suspends_current_scope(type_)
                         })
@@ -46807,7 +46812,7 @@ fn recovery_assignment_has_nonempty_join(assignment: &ruff_python_ast::StmtAssig
     }
 }
 
-// The terminal call and POP_TOP remain after a simple list comprehension rejoins.
+// The terminal call and POP_TOP remain after a simple comprehension rejoins.
 // Do not infer this exit for filtered, nested, unpacking, or asynchronous loops.
 fn recovery_comprehension_call_has_nonempty_exit(expression: &Expr) -> bool {
     let Expr::Call(call) = expression else {
@@ -46822,12 +46827,18 @@ fn recovery_comprehension_call_has_nonempty_exit(expression: &Expr) -> bool {
     }
     let mut comprehensions = 0;
     call.arguments.args.iter().all(|argument| {
-        if let Expr::ListComp(comprehension) = argument {
+        if matches!(
+            argument,
+            Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_)
+        ) && let Some((iterators, key, element)) = super::comprehension_parts(argument)
+        {
             comprehensions += 1;
-            (matches!(comprehension.elt.as_ref(), Expr::Name(_))
-                || matches!(comprehension.elt.as_ref(), Expr::Attribute(attribute)
-                    if matches!(attribute.value.as_ref(), Expr::Name(_))))
-                && matches!(&comprehension.generators[..], [generator]
+            key.is_none_or(|key| matches!(key, Expr::Name(_)))
+                && (matches!(element, Expr::Name(_))
+                    || matches!(element, Expr::Attribute(attribute)
+                        if matches!(attribute.value.as_ref(), Expr::Name(_)))
+                    || (key.is_some() && simple_cleanup_call(element)))
+                && matches!(iterators, [generator]
                     if !generator.is_async
                         && generator.ifs.is_empty()
                         && matches!(generator.target, Expr::Name(_))
