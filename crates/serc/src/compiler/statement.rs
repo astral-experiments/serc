@@ -32421,8 +32421,9 @@ impl<'source> Compiler<'source> {
                             && matches!(self.unit.scope, Scope::Function { .. })
                             && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
                             && clause.test.is_none()
-                            && matches!(clause.body.as_slice(), [Stmt::Return(returned)]
-                                if returned.value.as_deref().is_none_or(|value| {
+                            && matches!(clause.body.split_last(), Some((Stmt::Return(returned), prefix))
+                                if (prefix.is_empty() || suite_has_nonsuspending_linear_fallthrough(prefix))
+                                    && returned.value.as_deref().is_none_or(|value| {
                                     !expression_contains_inline_branch(value)
                                         && !expression_suspends_current_scope(value)
                                 }))))
@@ -36089,14 +36090,19 @@ impl<'source> Compiler<'source> {
                 && self.control.finally.active_normal_finally_bodies == 0
                 && self.control.finally.active_copied_finally_bodies == 0
                 && self.control.finally.active_finally_end_blocks == 0
-                && matches!(statement.body.as_slice(), [Stmt::With(manager), suffix @ ..]
-                if manager.is_async == (self.unit.flags & CO_COROUTINE != 0)
-                    && suffix.iter().all(|part| self.context.is_elided_statement(part))
-                    && (suite_has_populated_try_exit(&manager.body)
-                        || manager.body.iter().all(|part| {
-                            self.context.is_elided_statement(part)
-                                || suite_has_populated_try_exit(std::slice::from_ref(part))
-                        })));
+                && {
+                    let mut body = statement
+                        .body
+                        .iter()
+                        .filter(|part| !self.context.is_elided_statement(part));
+                    matches!((body.next(), body.next()), (Some(Stmt::With(manager)), None)
+                    if manager.is_async == (self.unit.flags & CO_COROUTINE != 0)
+                        && (suite_has_populated_try_exit(&manager.body)
+                            || manager.body.iter().all(|part| {
+                                self.context.is_elided_statement(part)
+                                    || suite_has_populated_try_exit(std::slice::from_ref(part))
+                            })))
+                };
             // A folded true terminal conditional also retains its original empty exit,
             // even when its selected body has a nested handler or manager bypass.
             if erased_manager_finally_exit
