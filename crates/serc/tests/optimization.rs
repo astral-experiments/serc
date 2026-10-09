@@ -15,6 +15,12 @@ use serc::{
 };
 
 #[test]
+fn nested_reraise_cleanup_keeps_awaited_store_reachable() {
+    let source = "async def sample():\n    try:\n        if native:\n            await session.close()\n        else:\n            await session.detach()\n    except CancelledError as error:\n        raise\n    except OwnershipError as error:\n        recovered = error\n    finally:\n        try:\n            if not native:\n                if session.reusable:\n                    await pool.release(lease)\n                else:\n                    retired = await replace(pool, name=lease.name, expected=lease.backend, lease=lease)\n                    if retired and isinstance(pool, Pool):\n                        disposition = 'retired'\n        except BaseException as failure:\n            raise\n";
+    assert_matches_cpython(source, "nested_reraise_cleanup.py", &LEVELS);
+}
+
+#[test]
 fn erased_finalizer_keeps_managed_return_copy() {
     let source = "async def sample(owner):\n    try:\n        with prepare_scope(owner, search=False):\n            return await prepare(owner, Context())\n    finally:\n        assert enabled()\n";
     assert_matches_cpython(source, "erased_managed_return.py", &LEVELS);

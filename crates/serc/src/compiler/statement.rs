@@ -31384,8 +31384,10 @@ impl<'source> Compiler<'source> {
 
     /// Certify a nonempty normal-cleanup entry with supported continuation boundaries.
     fn suite_has_nonempty_borrow_entry(&self, body: &[Stmt]) -> bool {
-        // Abrupt cleanup can leave additional copied exits outside this entry certificate.
-        if suite_contains_abrupt_control_flow(body) {
+        // Returns and loop transfers copy cleanup exits; raises use exception dispatch.
+        if suite_any_statement(body, |part| {
+            matches!(part, Stmt::Return(_) | Stmt::Break(_) | Stmt::Continue(_))
+        }) {
             return false;
         }
         let Some(entry) = body.first() else {
