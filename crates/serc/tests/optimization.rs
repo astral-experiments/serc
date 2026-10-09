@@ -15,6 +15,18 @@ use serc::{
 };
 
 #[test]
+fn conditional_deletion_keeps_cleanup_reachable() {
+    for scope in ["def", "async def"] {
+        for target in ["pending[item]", "owner.slot", "started"] {
+            let source = format!(
+                "{scope} sample(owner, pending, item, response, attempt, started):\n    try:\n        if response.status == 200:\n            if owner.ready(pending[item], owner.view(response)):\n                del {target}\n        else:\n            ensure(response.status in {{None, 503}}, 'unexpected response')\n    except Cancelled:\n        if attempt.started is not None and attempt.value is None:\n            attempt.elapsed = (clock() - started) * 1000\n    finally:\n        record(owner.path, {{'kind': 'attempt', **attempt.summary()}})\n"
+            );
+            assert_matches_cpython(&source, "conditional_delete_cleanup.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn async_iterator_recovery_keeps_cleanup_cold() {
     let source = "async def sample(owner, stream, payload, kind, close):\n    try:\n        async for event in stream:\n            if not isinstance(payload, dict):\n                continue\n            if kind in {'finished', 'failed', 'incomplete'}:\n                break\n    except Exception as error:\n        result = {'type': type(error).__name__, 'message': str(error), 'identifier': getattr(error, 'identifier', None)}\n    finally:\n        if callable(close):\n            maybe = close()\n            if maybe is not None:\n                await maybe\n";
     for source in [
