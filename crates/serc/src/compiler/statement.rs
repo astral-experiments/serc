@@ -24722,7 +24722,14 @@ impl<'source> Compiler<'source> {
                 });
         let borrow_exit_has_successor = borrow_exit_has_source_successor
             || normal_exit_reaches_enclosing_manager
-            || normal_exit_reaches_enclosing_finally;
+            || normal_exit_reaches_enclosing_finally
+            || (!statement.is_star
+                && !statement.finalbody.is_empty()
+                && statement.handlers.iter().any(|handler| {
+                    handler.as_except_handler().is_some_and(|handler| {
+                        suite_ends_in_nested_handler_cold_join(&handler.body)
+                    })
+                }));
         let handler_has_orphan_cold_cleanup = statement.handlers.iter().any(|handler| {
             handler
                 .as_except_handler()
