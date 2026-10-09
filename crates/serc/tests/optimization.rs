@@ -15,6 +15,21 @@ use serc::{
 };
 
 #[test]
+fn managed_coroutine_recovery_keeps_guarded_cleanup_reachable() {
+    let source = "async def sample(owner, item, outcome, persisted):\n    with owner.context():\n        try:\n            outcome = await owner.route()\n        except Exception as error:\n            if item is None or item.status != Status.PENDING:\n                raise\n        finally:\n            if outcome is not None:\n                if not persisted:\n                    await owner.persist()\n";
+    for source in [
+        source.to_owned(),
+        source
+            .replace("        try:\n            outcome", "        try:\n            await owner.persist()\n            persisted = True\n            outcome")
+            .replace("        except Exception as error:\n", "        except Exception as error:\n            if owner.cancelled(error):\n                raise\n            outcome = 'failed'\n            with owner.refresh():\n                item = await owner.reload()\n")
+            .replace("                raise\n        finally:", "                raise\n            outcome = await owner.recover(item)\n        finally:")
+            .replace("            if outcome is not None:\n", "            if outcome is not None:\n                await owner.record(outcome)\n"),
+    ] {
+        assert_matches_cpython(&source, "managed_coroutine_cleanup.py", &LEVELS);
+    }
+}
+
+#[test]
 fn returning_recovery_keeps_linear_else_cleanup_reachable() {
     for (scope, suspend) in [("def", ""), ("async def", "await ")] {
         for suffix in ["", "        progress.failed += 1\n"] {

@@ -33984,6 +33984,45 @@ impl<'source> Compiler<'source> {
                 || matches!(statement.finalbody.as_slice(), [Stmt::Assign(cleanup)]
                     if cleanup.targets.iter().all(|target| !expression_suspends_current_scope(target))
                         && !expression_suspends_current_scope(&cleanup.value)))));
+        // Completed awaits retain the normal entry before guarded cleanup. Raising
+        // recovery does not copy this entry across the enclosing manager's exit.
+        let managed_coroutine_recovery_reaches_finally = self.context.python_version
+            == crate::PythonVersion::Py314
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+            && self.control.in_synchronous_with()
+            && self.control.withs.active_with_exits.len() == 1
+            && !self.control.in_synchronous_with_nested_exception_region()
+            && self.control.loops.contexts.is_empty()
+            && !self.control.in_exception_handler()
+            && self.control.exceptions.active_exception_group_handlers == 0
+            && self.control.exceptions.active_try_marker_slots.is_empty()
+            && self.control.finally.active_finally_try_bodies == 0
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && !statement.is_star
+            && statement.orelse.is_empty()
+            && suite_has_linear_borrow_fallthrough(&statement.body)
+            && matches!(statement.handlers.as_slice(), [handler]
+            if handler.as_except_handler().is_some_and(|handler| {
+                matches!(handler.type_.as_deref(), Some(Expr::Name(_)))
+                    && handler.name.is_some()
+                    && !suite_any_statement(&handler.body, |part| {
+                        matches!(part, Stmt::Return(_) | Stmt::Break(_) | Stmt::Continue(_))
+                    })
+                    && handler.body.iter().any(|part| matches!(part, Stmt::If(guard)
+                        if guard.elif_else_clauses.is_empty()
+                            && condition_has_linear_runtime_leaves(&guard.test)
+                            && !expression_suspends_current_scope(&guard.test)
+                            && suite_has_linear_raise_exit(&guard.body)))
+            }))
+            && !suite_any_statement(&statement.finalbody, |part| {
+                matches!(part, Stmt::Return(_) | Stmt::Break(_) | Stmt::Continue(_))
+            })
+            && matches!(statement.finalbody.first(), Some(Stmt::If(cleanup))
+                if condition_has_linear_runtime_leaves(&cleanup.test)
+                    && !expression_suspends_current_scope(&cleanup.test));
         let normal_finally_is_borrow_reachable = (simple_fallthrough_handlers_reach_finally
             || compound_fallthrough_handlers_reach_finally
             || runtime_while_handlers_reach_finally)
@@ -34002,6 +34041,7 @@ impl<'source> Compiler<'source> {
             || dispatcher_break_reaches_finally
             || inner_try_break_loop_range.is_some()
             || conditional_handler_reaches_finally
+            || managed_coroutine_recovery_reaches_finally
             || guarded_named_handler_reaches_finally
             || named_iterator_break_reaches_finally
             || iterator_continue_recovery_reaches_finally
