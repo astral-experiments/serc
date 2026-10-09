@@ -15,6 +15,29 @@ use serc::{
 };
 
 #[test]
+fn conditional_call_before_reraise_keeps_cleanup_reachable() {
+    let source = "async def sample(items, values, logger, metrics, optional):\n    for item in items:\n        try:\n            values[item.name] = item.value\n        except BaseException as error:\n            logger.warning('optional item unavailable' if optional else 'item unavailable', extra=details(item=item, name=item.name))\n            if not optional:\n                raise\n        finally:\n            metrics.record('duration', elapsed, tags=tags)\n";
+    for source in [
+        source.to_owned(),
+        source.replace(
+            "            logger.warning",
+            "            status = 'optional' if optional else 'required'\n            logger.warning",
+        ),
+        source.replace(
+            "            logger.warning",
+            "            optional = item.optional and isinstance(error, ValueError)\n            status = 'optional' if optional else 'required'\n            logger.warning",
+        ),
+    ] {
+        assert_matches_cpython(&source, "conditional_handler_call.py", &LEVELS);
+        assert_matches_cpython(
+            &source.replace("async def", "def"),
+            "ordinary_handler_call.py",
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn asserted_async_iterator_break_keeps_cleanup_cold() {
     let source = "async def sample(processor, owner):\n    stream = processor.open(owner=owner, events=events())\n    try:\n        async with timeout(1):\n            async for item in stream:\n                if item.channel == 'final':\n                    assert item.parts == ['ready']\n                    break\n    finally:\n        await stream.close()\n";
     for source in [

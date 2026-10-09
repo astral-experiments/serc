@@ -33500,9 +33500,19 @@ impl<'source> Compiler<'source> {
                                                                 })
                                                         }))
                                             }))))
-                                && (leading.is_empty()
-                                    || suite_has_linear_borrow_fallthrough(leading)
-                                    || (generator_manager_recovery_context
+                                && (suite_has_linear_borrow_fallthrough(leading)
+                                    || leading.iter().all(|part| {
+                                        // Stores and discarded calls complete before the guard.
+                                        suite_has_linear_borrow_fallthrough(std::slice::from_ref(part))
+                                            || matches!(part, Stmt::Assign(assignment)
+                                                if recovery_assignment_has_nonempty_join(assignment)
+                                                    || (matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                                                        && matches!(assignment.value.as_ref(), Expr::BoolOp(_))
+                                                        && expression_has_completed_boolean_value(&assignment.value)))
+                                            || matches!(part, Stmt::Expr(expression)
+                                                if !expression_yields_in_current_scope(&expression.value)
+                                                    && cleanup_conditional_argument_has_eager_call_prefix(&expression.value))
+                                    }) || (generator_manager_recovery_context
                                         && trailing.is_empty()
                                         && matches!(handler_statement, Stmt::If(conditional)
                                             if matches!(conditional.body.as_slice(), [Stmt::Raise(raise)]
