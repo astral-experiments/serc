@@ -32913,6 +32913,52 @@ impl<'source> Compiler<'source> {
             && !suite_contains_abrupt_control_flow(&statement.finalbody);
         let runtime_coroutine_break_context = loop_break_context
             && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE;
+        let coroutine_nested_recovery_loop = self.context.python_version
+            == crate::PythonVersion::Py314
+            && runtime_coroutine_break_context
+            && conditional_break_cleanup_entry
+            && statement.handlers.iter().all(|handler| {
+                handler.as_except_handler().is_some_and(|handler| {
+                    !suite_any_statement(&handler.body, |part| {
+                        matches!(
+                            part,
+                            Stmt::Return(_)
+                                | Stmt::Break(_)
+                                | Stmt::Continue(_)
+                                | Stmt::For(_)
+                                | Stmt::While(_)
+                                | Stmt::With(_)
+                        ) || matches!(part, Stmt::Try(recovery)
+                                if recovery.is_star || !recovery.finalbody.is_empty()
+                                    || !recovery.orelse.is_empty())
+                    })
+                })
+            })
+            && statement.handlers.iter().any(|handler| {
+                handler.as_except_handler().is_some_and(|handler| {
+                    handler.name.is_some()
+                        && suite_any_statement(&handler.body, |part| {
+                            matches!(part, Stmt::Try(recovery) if !recovery.handlers.is_empty())
+                        })
+                })
+            })
+            && matches!(statement.finalbody.as_slice(), [Stmt::If(cleanup)]
+                if cleanup.elif_else_clauses.is_empty()
+                    && !expression_suspends_current_scope(&cleanup.test))
+            && matches!(statement.body.as_slice(), [Stmt::While(loop_), suffix @ ..]
+            if loop_.orelse.is_empty()
+                && condition_has_linear_runtime_leaves(&loop_.test)
+                && original_condition_has_unique_jump_target(&loop_.test, false)
+                && !expression_suspends_current_scope(&loop_.test)
+                && !suite_contains_loop_break(&loop_.body)
+                && suffix.iter().all(|part| {
+                    suite_has_nonsuspending_linear_fallthrough(std::slice::from_ref(part))
+                        || matches!(part, Stmt::Assign(assignment)
+                            if assignment.targets.iter().all(|target| {
+                                !expression_contains_inline_branch(target)
+                                    && !expression_suspends_current_scope(target)
+                            }) && expression_has_completed_conditional_value(&assignment.value))
+                }));
         // The sole runtime false edge retains a populated exit into cleanup,
         // independently of any break edges in the loop body.
         let runtime_while_false_edge_reaches_finally = self.context.python_version
@@ -34082,6 +34128,7 @@ impl<'source> Compiler<'source> {
             || raising_alternative_reaches_finally
             || coroutine_manager_raise_else_reaches_finally
             || runtime_while_false_edge_reaches_finally
+            || coroutine_nested_recovery_loop
             || runtime_nonterminal_break_reaches_finally
             || conditional_break_reaches_finally
             || for_guarded_break_reaches_finally
