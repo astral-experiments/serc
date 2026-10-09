@@ -15,6 +15,18 @@ use serc::{
 };
 
 #[test]
+fn returning_recovery_keeps_linear_else_cleanup_reachable() {
+    for (scope, suspend) in [("def", ""), ("async def", "await ")] {
+        for suffix in ["", "        progress.failed += 1\n"] {
+            let source = format!(
+                "{scope} sample(owner, progress, identifier, tags):\n    try:\n        {suspend}owner.remove(identifier)\n    except Missing as error:\n        if error.status == Status.ABSENT:\n            return\n{suffix}    except Exception as error:\n        owner.log(error)\n    else:\n        owner.record('removed', tags=tags + ['success'])\n    finally:\n        progress.completed += 1\n"
+            );
+            assert_matches_cpython(&source, "returning_recovery_else.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn awaited_branch_keeps_nested_cleanup_reachable() {
     let source = "async def sample(owner, token, checkpoint, error):\n    try:\n        if owner.cancelled:\n            await owner.abort(token)\n        elif checkpoint is None:\n            raise RuntimeError('missing checkpoint')\n    except BaseException as failure:\n        if token is not None:\n            try:\n                await owner.abort(token)\n            except Exception:\n                log('abort failed', extra={'token': token})\n    finally:\n        try:\n            await owner.close()\n        except BaseException as failure:\n            log('close failed', extra={'token': token})\n        finally:\n            if not owner.result.done():\n                if error is None:\n                    owner.result.set_result(None)\n                else:\n                    owner.result.set_exception(error)\n";
     for source in [

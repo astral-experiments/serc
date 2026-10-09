@@ -33135,10 +33135,12 @@ impl<'source> Compiler<'source> {
                     })
                 }));
         // Linear else work remains in the protected body's original normal array.
-        // A returning handler's false edge retains its populated recovery suffix,
+        // A returning handler's false edge retains its normal recovery exit,
         // including when other handlers have independent plain cleanup exits.
-        let linear_else_returning_recovery = synchronous_recovery
-            && matches!(self.unit.scope, Scope::Function { .. })
+        let linear_else_returning_recovery = matches!(
+            self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR),
+            0 | CO_COROUTINE
+        ) && matches!(self.unit.scope, Scope::Function { .. })
             && !statement.is_star
             && self.control.loops.contexts.is_empty()
             && self.control.withs.active_with_exits.is_empty()
@@ -33480,7 +33482,7 @@ impl<'source> Compiler<'source> {
                                         // The false successor still performs POP_EXCEPT
                                         // before entering normal finally cleanup.
                                         // Copying cleanup into the bare-return arm does not empty it.
-                                        || (synchronous_recovery
+                                        || ((synchronous_recovery || linear_else_returning_recovery)
                                             && condition_has_linear_runtime_leaves(&conditional.test)
                                             && conditional.body.split_last().is_some_and(|(last, leading)| {
                                                 matches!(last, Stmt::Return(return_) if return_.value.is_none())
@@ -43655,13 +43657,13 @@ fn async_recovery_has_populated_handler_suffix(body: &[Stmt]) -> bool {
         }))
 }
 
-// A bare-return guard leaves a populated false recovery suffix. The return's
+// A bare-return guard leaves a normal recovery exit. The return's
 // separately copied cleanup does not consume that original normal exit.
 fn suite_has_linear_bare_return_recovery(body: &[Stmt]) -> bool {
     let linear = |body: &[Stmt]| body.is_empty() || suite_has_linear_borrow_fallthrough(body);
     body.iter().enumerate().any(|(index, part)| {
         linear(&body[..index])
-            && suite_has_linear_borrow_fallthrough(&body[index + 1..])
+            && linear(&body[index + 1..])
             && matches!(part, Stmt::If(guard)
             if guard.elif_else_clauses.is_empty()
                 && condition_has_only_runtime_tests(&guard.test)
