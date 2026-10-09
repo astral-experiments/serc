@@ -41768,6 +41768,7 @@ pub(super) fn suite_has_linear_borrow_fallthrough(body: &[Stmt]) -> bool {
             {
                 true
             }
+            Stmt::Delete(_) if is_linear_delete(statement) => true,
             _ => return false,
         };
         has_runtime_work |= has_work;
