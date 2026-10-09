@@ -37717,6 +37717,18 @@ impl<'source> Compiler<'source> {
             }
         }
 
+        // One erased finalizer leaves only its POP_BLOCK before the short return.
+        // The assembler still applies its original-array budget to either exit.
+        let inline_erased_finalizer_exit = self.context.python_version
+            >= crate::PythonVersion::Py314
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+            && self.control.finally.active_finally_try_bodies == 1
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && matches!(self.control.finally.active_return_finally_contexts.as_slice(), [context]
+                if context.with_depth == self.control.withs.active_with_exits.len()
+                    && context.loop_depth == self.control.loops.contexts.len()
+                    && context.body.iter().all(|part| self.context.is_elided_statement(part)));
         self.assembler
             .set_location(self.source_location(item.context_expr.range()));
         let none = self.add_constant(Constant::None)?;
@@ -37747,6 +37759,7 @@ impl<'source> Compiler<'source> {
                 // can be copied when its original array fits the assembler's exit budget.
                 if self.control.finally.active_finally_try_bodies > 0
                     && self.control.finally.active_finally_end_blocks == 0
+                    && !inline_erased_finalizer_exit
                 {
                     self.assembler.prevent_jump_inlining(normal_exit);
                 }
@@ -37861,6 +37874,7 @@ impl<'source> Compiler<'source> {
                 // onto suppression while retaining the enclosing cleanup's owner.
                 if self.control.finally.active_finally_try_bodies > 0
                     && self.control.finally.active_finally_end_blocks == 0
+                    && !inline_erased_finalizer_exit
                 {
                     self.assembler.prevent_jump_inlining(handler_exit);
                 }

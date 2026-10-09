@@ -15,6 +15,12 @@ use serc::{
 };
 
 #[test]
+fn erased_finalizer_keeps_managed_return_copy() {
+    let source = "async def sample(owner):\n    try:\n        with prepare_scope(owner, search=False):\n            return await prepare(owner, Context())\n    finally:\n        assert enabled()\n";
+    assert_matches_cpython(source, "erased_managed_return.py", &LEVELS);
+}
+
+#[test]
 fn pass_recovery_in_handler_iterator_keeps_cold_exit() {
     let source = r#"def sample(storage, root, label, owner, prefix=None, prompt=None, replacement=None, *, register=None):
     with archive.open(fileobj=stream, mode="w:gz") as bundle:
