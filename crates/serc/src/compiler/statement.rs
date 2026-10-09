@@ -13349,6 +13349,7 @@ impl<'source> Compiler<'source> {
                 if !emit_tuple_nop {
                     // A real NOP already counts as the original tuple-build record.
                     self.assembler.add_last_constant_fold_slots(1);
+                    self.assembler.record_last_uniform_fold_owner_slots(1);
                 }
             }
             let target_start = self.assembler.item_count();
