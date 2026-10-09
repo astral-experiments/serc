@@ -32408,6 +32408,36 @@ impl<'source> Compiler<'source> {
                                     && matches!(handler.body.last(), Some(Stmt::Raise(raised))
                                         if raised.exc.is_none() && raised.cause.is_none())
                             }))));
+        // A completed recovery arm threads past the final else's located normal exit.
+        let recovered_arm_has_live_else_exit = self.context.python_version
+            == crate::PythonVersion::Py314
+            && matches!(
+                self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR),
+                0 | CO_COROUTINE
+            )
+            && matches!(statement.body.last(), Some(Stmt::If(branch))
+            if matches!(branch.elif_else_clauses.as_slice(), [otherwise]
+                if otherwise.test.is_none()
+                    && otherwise.body.split_last().is_some_and(|(last, prefix)| {
+                        suite_has_nonsuspending_linear_fallthrough(std::slice::from_ref(last))
+                            && (prefix.is_empty() || suite_has_linear_borrow_fallthrough(prefix))
+                            && !suite_contains_yield(prefix)
+                    }))
+                && matches!(branch.body.as_slice(), [Stmt::Try(recovery)]
+                    if !recovery.is_star
+                        && suite_has_linear_borrow_fallthrough(&recovery.body)
+                        && !suite_contains_yield(&recovery.body)
+                        && suite_has_nonsuspending_linear_fallthrough(&recovery.orelse)
+                        && suite_has_nonsuspending_linear_fallthrough(&recovery.finalbody)
+                        && !recovery.handlers.is_empty()
+                        && recovery.handlers.iter().all(|handler| {
+                            handler.as_except_handler().is_some_and(|handler| {
+                                handler.type_.is_some()
+                                    && matches!(handler.body.split_last(), Some((Stmt::Raise(raised), prefix))
+                                        if raised.exc.is_none() && raised.cause.is_none()
+                                            && (prefix.is_empty() || suite_has_nonsuspending_linear_fallthrough(prefix)))
+                            })
+                        })));
         // A live linear arm before the final else keeps a reachable jump directly
         // into normal cleanup after handlers move cold. Folded assertions can leave
         // that jump behind an empty block, so a merely nonterminal arm is insufficient.
@@ -32469,6 +32499,7 @@ impl<'source> Compiler<'source> {
                         clause.test.is_none() || elif_recovery_entry
                     }))
                 && (conditional_reraise_entry
+                    || recovered_arm_has_live_else_exit
                     || !suite_contains_abrupt_control_flow(&conditional.body))
                 && conditional.elif_else_clauses.iter().all(|clause| {
                     clause.test.as_ref().is_none_or(|test| {
@@ -32487,6 +32518,7 @@ impl<'source> Compiler<'source> {
                                 }))))
                 })
                 && (conditional_reraise_entry
+                    || recovered_arm_has_live_else_exit
                     || suite_has_linear_borrow_fallthrough(&conditional.body)
                     || suite_has_populated_conditional_alternative(
                         &conditional.body,
