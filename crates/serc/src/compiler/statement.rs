@@ -22463,6 +22463,11 @@ impl<'source> Compiler<'source> {
                                 == self.control.exceptions.active_exception_region_exclusions.len()
                             && !suite_contains_yield(context.body)
                             && (self.suite_has_nonempty_borrow_entry(context.body)
+                                || matches!(context.body, [Stmt::Assign(assignment), suffix @ ..]
+                                    if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                                        && cleanup_conditional_argument_has_eager_call_prefix(&assignment.value)
+                                        && (suffix.is_empty()
+                                            || suite_has_nonsuspending_linear_fallthrough(suffix)))
                                 // This surviving jump enters the retained setup NOP,
                                 // even when a later cleanup handler exits abruptly.
                                 || matches!(context.body.first(), Some(Stmt::Try(cleanup))
@@ -46874,7 +46879,7 @@ fn cleanup_conditional_callable_has_runtime_entry(expression: &Expr) -> bool {
 }
 
 /// A callable is loaded before one runtime conditional argument starts branching.
-/// Both value arms rejoin at the discarded call, so its original entry stays nonempty.
+/// Both value arms rejoin at the call, so its original entry stays nonempty.
 fn cleanup_conditional_argument_has_eager_call_prefix(expression: &Expr) -> bool {
     let Expr::Call(call) = expression else {
         return false;

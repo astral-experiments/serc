@@ -15,6 +15,20 @@ use serc::{
 };
 
 #[test]
+fn managed_loop_conditional_call_store_keeps_cleanup_reachable() {
+    let source = "def sample(owner, pending, remaining, checked, filtered, complete, offsets):\n    try:\n        with owner.stage() as staged, owner.filtered() as stream, owner.workers() as workers:\n            try:\n                while True:\n                    if not pending:\n                        selected = owner.select(remaining, version=owner.version)\n                        break\n                    for outcome in owner.check(pending, workers=workers):\n                        if isinstance(outcome, Accepted):\n                            staged.write(outcome.encode() + '\\n')\n                        else:\n                            stream.flush()\n            finally:\n                report = summarize(checked=checked, filtered=filtered, complete=complete, missing=len(offsets) - len(selected) if complete else None)\n    finally:\n        owner.close()\n";
+    for source in [
+        source.to_owned(),
+        source.replace(
+            "    finally:\n        owner.close()",
+            "                owner.record(report.encode())\n    finally:\n        owner.close()",
+        ),
+    ] {
+        assert_matches_cpython(&source, "managed_conditional_report.py", &LEVELS);
+    }
+}
+
+#[test]
 fn managed_iterator_inner_break_keeps_cleanup_reachable() {
     let source = "def sample(owner, protected):\n    with owner.temporary() as directory:\n        with owner.open(directory) as stream:\n            for member in stream:\n                if member.name == 'index':\n                    continue\n                target = owner.output(member.path) if member.kind == 'data' else None\n                try:\n                    while True:\n                        if not chunk:\n                            break\n                        if target is not None:\n                            if protected:\n                                tail = searchable[-overlap:] if overlap else b''\n                finally:\n                    if target is not None:\n                        target.close()\n";
     assert_matches_cpython(source, "managed_iterator_cleanup.py", &LEVELS);
