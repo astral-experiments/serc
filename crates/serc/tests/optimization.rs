@@ -15,6 +15,19 @@ use serc::{
 };
 
 #[test]
+fn reraised_async_manager_keeps_recovery_continuation_cold() {
+    let source = "async def sample(owner, lock, records, value, rounds):\n    for iteration in range(rounds):\n        try:\n            value['status'] = 'rejected'\n        except OwnerError as error:\n            if not owner.recoverable(error):\n                async with lock:\n                    records.append(value)\n                raise\n        except (ValueError, TypeError) as error:\n            value['error'] = error\n        async with lock:\n            records.append(value)\n";
+    for source in [
+        source.to_owned(),
+        source
+            .replace("            value['status'] = 'rejected'", "            proposal = await owner.propose(value)\n            if owner.approved(proposal):\n                async with lock:\n                    records.append(value)\n                return owner.result(proposal)\n            value['status'] = 'rejected'")
+            .replace("            if not owner.recoverable(error):\n", "            if not owner.recoverable(error):\n                value['status'] = 'failed'\n                value['error'] = str(error)\n"),
+    ] {
+        assert_matches_cpython(&source, "reraised_async_manager.py", &LEVELS);
+    }
+}
+
+#[test]
 fn nested_raising_cleanup_keeps_enclosing_pop_location() {
     let source = "def sample(owner, handle, value, before, after):\n    try:\n        try:\n            with owner.open(handle) as source:\n                try:\n                    yield value\n                finally:\n                    value.close()\n        finally:\n            if after != before:\n                raise ValueError('resource changed')\n    finally:\n        owner.release(handle)\n";
     for source in [
