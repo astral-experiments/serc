@@ -15,6 +15,12 @@ use serc::{
 };
 
 #[test]
+fn nested_loop_recovery_keeps_cleanup_entry_cold() {
+    let source = "def sample(owner, outcome, errors):\n    for identifier, session in reversed(tuple(owner.sessions.items())):\n        try:\n            if outcome.handle != session.process or outcome.status != 0:\n                raise TransportError('unexpected process exit')\n        except Exception as error:\n            try:\n                owner.transport.wait(session.process, timeout=owner.timeout)\n            except Exception as recovery_error:\n                errors.append(recovery_error)\n        finally:\n            owner.sessions.pop(identifier, None)\n";
+    assert_matches_cpython(source, "nested_loop_recovery.py", &LEVELS);
+}
+
+#[test]
 fn conditional_call_before_reraise_keeps_cleanup_reachable() {
     let source = "async def sample(items, values, logger, metrics, optional):\n    for item in items:\n        try:\n            values[item.name] = item.value\n        except BaseException as error:\n            logger.warning('optional item unavailable' if optional else 'item unavailable', extra=details(item=item, name=item.name))\n            if not optional:\n                raise\n        finally:\n            metrics.record('duration', elapsed, tags=tags)\n";
     for source in [
