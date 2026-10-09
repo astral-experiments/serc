@@ -15,6 +15,45 @@ use serc::{
 };
 
 #[test]
+fn copied_return_through_nested_loops_keeps_none_guard_owner() {
+    let source = r#"async def sample(client, response):
+    for attempt in range(client.attempts):
+        for redirect in range(limit):
+            try:
+                if response.status in redirects:
+                    continue
+                if response.status < 200 or response.status >= 300:
+                    if response.status in retryable:
+                        if attempt < client.attempts:
+                            break
+                return bytes(content)
+            except TransportError as error:
+                break
+            finally:
+                if response is not None:
+                    await response.close()
+        else:
+            raise AssertionError("unreachable")
+"#;
+    for (outer, inner) in [
+        (
+            "for attempt in range(client.attempts):",
+            "for redirect in range(limit):",
+        ),
+        (
+            "for attempt in range(client.attempts):",
+            "while redirected():",
+        ),
+        ("while active():", "while redirected():"),
+    ] {
+        let source = source
+            .replace("for attempt in range(client.attempts):", outer)
+            .replace("for redirect in range(limit):", inner);
+        assert_matches_cpython(&source, "nested_loop_return_owner.py", &LEVELS);
+    }
+}
+
+#[test]
 fn erased_outer_finalizer_keeps_completed_cleanup_exit() {
     for source in [
         "def sample(staged, engine):\n    settings = get_settings()\n    with holder():\n        try:\n            try:\n                status = cleanup(settings, stage=make_stage() if staged else None)\n            finally:\n                remove_listener(engine, 'event', listener)\n        finally:\n            assert release(settings)\n    inspect_settings(settings)\n",

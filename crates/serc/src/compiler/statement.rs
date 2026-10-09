@@ -10692,8 +10692,8 @@ impl<'source> Compiler<'source> {
                     let shared_copied_cleanup_join = unwind_location == SourceLocation::NONE
                         && self.assembler.at_original_shared_cleanup_join();
                     self.assembler.set_location(unwind_location);
-                    // This surrounding loop stays live until after the copied finally.
-                    // A while and a retained iterator both contribute no unwind record
+                    // Surrounding loops stay live until after the copied finally.
+                    // Whiles and retained iterators contribute no unwind records
                     // between this value return and the ordinary-try/finally POP pair.
                     let copied_return_keeps_outer_loop = self.unit.flags
                         & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
@@ -10701,16 +10701,20 @@ impl<'source> Compiler<'source> {
                         && preserve_tos
                         && !return_is_overridden
                         && context_index == 0
-                        && finally_context.loop_depth == 1
-                        && next_loop == 1
+                        && finally_context.loop_depth > 0
+                        && finally_context.loop_depth == self.control.loops.contexts.len()
+                        && next_loop == finally_context.loop_depth
                         && self.control.finally.active_copied_finally_bodies == 0
                         && self.control.withs.active_with_exits.is_empty()
-                        && matches!(self.control.loops.contexts.as_slice(), [loop_context]
-                            if matches!(loop_context.iterator_cleanup, IteratorCleanup::None | IteratorCleanup::Sync)
-                                && loop_context.with_depth == 0
+                        && self.control.loops.contexts.iter().all(|loop_context| {
+                            matches!(
+                                loop_context.iterator_cleanup,
+                                IteratorCleanup::None | IteratorCleanup::Sync
+                            ) && loop_context.with_depth == 0
                                 && loop_context.finally_end_depth == 0
                                 && loop_context.exception_region_depth
-                                    == finally_context.exception_region_depth);
+                                    == finally_context.exception_region_depth
+                        });
                     // This manager surrounds the entire try/finally and remains live
                     // during the copied finalizer. Only the ordinary try and finally
                     // contribute POP_BLOCK records before the copied condition.
