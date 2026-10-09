@@ -15,6 +15,16 @@ use serc::{
 };
 
 #[test]
+fn erased_outer_finalizer_keeps_completed_cleanup_exit() {
+    for source in [
+        "def sample(staged, engine):\n    settings = get_settings()\n    with holder():\n        try:\n            try:\n                status = cleanup(settings, stage=make_stage() if staged else None)\n            finally:\n                remove_listener(engine, 'event', listener)\n        finally:\n            assert release(settings)\n    inspect_settings(settings)\n",
+        "def sample(staged, engine):\n    settings = get_settings()\n    with holder():\n        try:\n            prepare(settings)\n            with first_session():\n                assert ready()\n            register_listener(engine)\n            try:\n                status = cleanup(settings, stage=make_stage() if staged else None)\n            finally:\n                remove_listener(engine, 'event', listener)\n            assert complete(status)\n            with last_session():\n                state = snapshot()\n                assert stable(state)\n        finally:\n            assert release(settings)\n    inspect_settings(settings)\n",
+    ] {
+        assert_matches_cpython(source, "erased_outer_cleanup.py", &LEVELS);
+    }
+}
+
+#[test]
 fn returning_else_prefix_keeps_live_cleanup_entry() {
     let source = r#"async def sample(client, path):
     for attempt in range(client.attempts):
