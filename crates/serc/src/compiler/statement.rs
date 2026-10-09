@@ -24720,7 +24720,32 @@ impl<'source> Compiler<'source> {
                             && !expression_contains_inline_branch(&cleanup.value)
                             && !expression_suspends_current_scope(&cleanup.value))
                 });
+        // A conditional retry copies its unlocated join onto the recovery exits.
+        // A linear else still falls through that empty array before this cleanup.
+        let conditional_recovery_else_exit = self.context.python_version
+            == crate::PythonVersion::Py314
+            && !statement.is_star
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.exceptions.active_exception_handlers.is_empty()
+            && self.control.finally.active_finally_try_bodies == 1
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && suite_has_nonsuspending_linear_fallthrough(&statement.orelse)
+            && matches!(statement.finalbody.as_slice(), [Stmt::Expr(cleanup)]
+                if matches!(cleanup.value.as_ref(), Expr::Call(_))
+                    && !expression_contains_inline_branch(&cleanup.value)
+                    && !expression_suspends_current_scope(&cleanup.value))
+            && statement.handlers.iter().any(|handler| {
+                handler.as_except_handler().is_some_and(|handler| {
+                    handler.name.is_some()
+                        && suite_contains_conditional_nested_recovery(&handler.body)
+                })
+            });
         let borrow_exit_has_successor = borrow_exit_has_source_successor
+            || conditional_recovery_else_exit
             || normal_exit_reaches_enclosing_manager
             || normal_exit_reaches_enclosing_finally
             || (!statement.is_star
@@ -28299,7 +28324,7 @@ impl<'source> Compiler<'source> {
                                         handler.as_except_handler().is_some()
                                     })
                             ))
-                            || (statement.finalbody.is_empty()
+                            || ((statement.finalbody.is_empty() || conditional_recovery_else_exit)
                                 && (suite_contains_conditional_nested_recovery(&handler.body)
                                     || suite_ends_in_recovery_cleanup(&handler.body)))
                     })

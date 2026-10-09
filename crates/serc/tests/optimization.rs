@@ -15,6 +15,19 @@ use serc::{
 };
 
 #[test]
+fn conditional_retry_else_keeps_cleanup_cold() {
+    let source = "async def sample(owner, merged, token):\n    try:\n        owner.verify()\n    except (FirstError, SecondError) as error:\n        if merged and not (isinstance(error, RemoteError) and error.code == 'unavailable'):\n            try:\n                owner.verify()\n            except (FirstError, SecondError) as retry_error:\n                saved_error = retry_error\n            else:\n                saved_error = None\n        else:\n            saved_error = error\n    else:\n        saved_error = None\n    finally:\n        owner.contracts.reset(token)\n    return Result(error=saved_error)\n";
+    for source in [
+        source.to_owned(),
+        source
+            .replacen("        owner.verify()\n", "        value = await owner.prepare()\n        owner.verify()\n", 1)
+            .replace("                owner.verify()\n", "                value = await owner.retry(value)\n                owner.verify()\n"),
+    ] {
+        assert_matches_cpython(&source, "conditional_retry_else.py", &LEVELS);
+    }
+}
+
+#[test]
 fn coroutine_nested_breaks_reach_located_cleanup() {
     let source = "async def sample(owner, ready, running, abort, failure, scheduled, item, executed):\n    try:\n        while ready or running:\n            if abort is not None or failure is not None:\n                if abort is not None and abort.ready():\n                    break\n                if failure is not None and failure.ready():\n                    break\n            while ready:\n                if item in scheduled:\n                    continue\n            if not running:\n                break\n    except BaseException:\n        raise\n    finally:\n        try:\n            owner.slowest = compute(owner, executed)\n        finally:\n            owner.clear()\n";
     for source in [
