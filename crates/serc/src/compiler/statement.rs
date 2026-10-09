@@ -6471,7 +6471,7 @@ impl<'source> Compiler<'source> {
                         self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR),
                         0 | CO_COROUTINE
                     )
-                    && context.iterator_cleanup == IteratorCleanup::None
+                    && matches!(context.iterator_cleanup, IteratorCleanup::None | IteratorCleanup::Sync)
                     && self.control.withs.active_with_exits.is_empty()
                     && self.control.exceptions.active_try_marker_slots.is_empty()
                     && self.control.exceptions.active_exception_group_handlers == 0
