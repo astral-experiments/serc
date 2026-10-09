@@ -15,6 +15,16 @@ use serc::{
 };
 
 #[test]
+fn guarded_continue_recovery_keeps_continuation_cold() {
+    for (scope, suspend) in [("def", ""), ("async def", "await ")] {
+        let source = format!(
+            "{scope} sample(owner, names, pending):\n    known = {{}}\n    try:\n        response = {suspend}owner.fetch(names)\n    except FetchError as error:\n        if error.code() != owner.missing:\n            raise\n        if len(names) == 1:\n            owner.warn(names[0])\n            return []\n        for name in names:\n            try:\n                response = {suspend}owner.fetch([name])\n            except FetchError as failure:\n                if failure.code() != owner.missing:\n                    raise\n                owner.warn(name)\n                continue\n            known.update({{item.name: item for item in response.items}})\n    else:\n        known = {{item.name: item for item in response.items}}\n    for name in pending:\n        if owner.find(name) is None:\n            owner.warn(name)\n            continue\n"
+        );
+        assert_matches_cpython(&source, "guarded_continue_recovery.py", &LEVELS);
+    }
+}
+
+#[test]
 fn attribute_key_recovery_loop_keeps_continuation_cold() {
     for (scope, suspend) in [("def", ""), ("async def", "await ")] {
         let source = format!(
