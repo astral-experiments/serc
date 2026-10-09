@@ -34146,6 +34146,21 @@ impl<'source> Compiler<'source> {
             || generator_else_break_loop_range.is_some()
             || runtime_while_else_break_reaches_finally
             || loop_guarded_recovery_reaches_finally;
+        // A surviving nonterminal break can enter a short-circuit cleanup test.
+        // Its runtime leaves remain populated even when normal fallthrough is empty.
+        let runtime_guarded_cleanup_break = self.context.python_version
+            == crate::PythonVersion::Py314
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && loop_break_context
+            && matches!(statement.finalbody.first(), Some(Stmt::If(cleanup))
+                if condition_has_linear_runtime_leaves(&cleanup.test)
+                    && !expression_suspends_current_scope(&cleanup.test))
+            && matches!(statement.body.last(), Some(Stmt::While(loop_))
+                if loop_.orelse.is_empty()
+                    && early_condition_truthiness(&loop_.test).is_none()
+                    && condition_has_linear_runtime_leaves(&loop_.test)
+                    && !expression_suspends_current_scope(&loop_.test)
+                    && suite_has_direct_nonterminal_break_guard(&loop_.body));
         let loop_break_reaches_finally = !statement.handlers.is_empty()
             && !normal_finally_is_borrow_reachable
             && !statement.is_star
@@ -34155,11 +34170,13 @@ impl<'source> Compiler<'source> {
             && self.control.finally.active_finally_end_blocks == 0
             && self.control.withs.active_with_exits.is_empty()
             && (self.suite_has_nonempty_borrow_entry(&statement.finalbody)
-                || coroutine_conditional_cleanup_entry)
-            && ((self.context.python_version == crate::PythonVersion::Py314
-                && runtime_coroutine_break_context
-                && matches!(statement.finalbody.first(), Some(Stmt::Try(_)))
-                && matches!(statement.body.last(), Some(Stmt::While(loop_statement))
+                || coroutine_conditional_cleanup_entry
+                || runtime_guarded_cleanup_break)
+            && (runtime_guarded_cleanup_break
+                || (self.context.python_version == crate::PythonVersion::Py314
+                    && runtime_coroutine_break_context
+                    && matches!(statement.finalbody.first(), Some(Stmt::Try(_)))
+                    && matches!(statement.body.last(), Some(Stmt::While(loop_statement))
                         if loop_statement.orelse.is_empty()
                             && early_condition_truthiness(&loop_statement.test).is_none()
                             && condition_has_linear_runtime_leaves(&loop_statement.test)
