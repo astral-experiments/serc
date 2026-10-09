@@ -15,6 +15,20 @@ use serc::{
 };
 
 #[test]
+fn runtime_loop_nested_recovery_keeps_cleanup_reachable() {
+    let source = "async def sample(owner, kind, stage, payload, partial, name):\n    try:\n        while owner.state['next'] != 'done':\n            try:\n                if kind == 'target':\n                    owner.complete(stage, payload)\n                elif kind == 'extract':\n                    owner.extract(stage)\n                elif kind in {'merge', 'initial', 'revision'}:\n                    owner.finish(stage, 'initial' if kind == 'merge' else 'validate')\n                elif kind == 'validate':\n                    owner.finish(stage, 'review')\n                elif kind == 'review':\n                    owner.review(stage, payload)\n                else:\n                    raise ValueError(kind)\n            except Exception as error:\n                if kind == 'target' and 'recovery' in owner.state and 'hash' in stage:\n                    if owner.invalid(payload):\n                        continue\n                continue\n    except (Exception, Cancelled) as error:\n        if owner.workspace is not None and not isinstance(error, Unresolved):\n            if partial is not None:\n                try:\n                    owner.state['partial'] = {'path': name, 'hash': save(owner.directory / name, partial)}\n                except Exception as failure:\n                    owner.state['error'] = str(failure)\n    finally:\n        if owner.workspace is not None:\n            owner.save()\n";
+    for source in [
+        source.to_owned(),
+        source
+            .replace("    except (Exception, Cancelled) as error:\n", "        owner.state['status'] = 'complete'\n        owner.state['reason'] = 'ok' if owner.accepted else 'retry'\n        owner.save()\n    except (Exception, Cancelled) as error:\n")
+            .replace("            if partial is not None:\n", "            try:\n                partial = await owner.capture()\n            except CaptureError as failure:\n                partial = failure.partial\n            except Exception as failure:\n                partial = None\n            if partial is not None:\n")
+            .replace("    finally:\n        if owner.workspace is not None:\n            owner.save()\n", "    finally:\n        if owner.workspace is not None:\n            try:\n                owner.state['cleanup'] = await owner.close()\n            except (Exception, Cancelled) as failure:\n                owner.state['cleanup'] = {'error': str(failure)}\n            owner.save()\n"),
+    ] {
+        assert_matches_cpython(&source, "runtime_loop_nested_recovery.py", &LEVELS);
+    }
+}
+
+#[test]
 fn conditional_value_cleanup_keeps_live_loop_break() {
     let source = "async def sample(owner, stopped, pending, deadline, now):\n    try:\n        while True:\n            if stopped and not pending:\n                break\n            if stopped:\n                if deadline is None:\n                    deadline = now + owner.timeout\n                elif now >= deadline:\n                    break\n    except Cancelled:\n        raise\n    except Exception:\n        raise\n    finally:\n        payload = {'started': owner.started.isoformat() if owner.started is not None else None, 'elapsed': clock() - now}\n";
     for source in [
