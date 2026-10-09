@@ -36051,11 +36051,15 @@ impl<'source> Compiler<'source> {
             {
                 self.assembler.record_folded_condition_borrow_entry(end);
             }
-            // An erased finalizer after async-manager cleanup leaves a separate empty array.
-            let erased_async_manager_finally_exit = self.context.python_version
+            // An erased finalizer after manager cleanup leaves a separate empty array.
+            let erased_manager_finally_exit = self.context.python_version
                 == crate::PythonVersion::Py314
-                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                    == CO_COROUTINE
+                && matches!(
+                    self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR),
+                    0 | CO_COROUTINE
+                )
+                && (self.unit.flags & CO_COROUTINE != 0
+                    || matches!(self.unit.scope, Scope::Function { .. }))
                 && statement.handlers.is_empty()
                 && statement.orelse.is_empty()
                 && !statement.finalbody.is_empty()
@@ -36069,17 +36073,24 @@ impl<'source> Compiler<'source> {
                     .withs
                     .active_with_exits
                     .last()
-                    .is_none_or(|manager| manager.is_async)
+                    .is_none_or(|manager| {
+                        manager.is_async == (self.unit.flags & CO_COROUTINE != 0)
+                    })
                 && !self.control.in_exception_handler()
                 && self.control.finally.active_normal_finally_bodies == 0
                 && self.control.finally.active_copied_finally_bodies == 0
                 && self.control.finally.active_finally_end_blocks == 0
-                && matches!(statement.body.as_slice(), [Stmt::With(manager)]
-                    if manager.is_async
-                        && suite_has_populated_try_exit(&manager.body));
+                && matches!(statement.body.as_slice(), [Stmt::With(manager), suffix @ ..]
+                if manager.is_async == (self.unit.flags & CO_COROUTINE != 0)
+                    && suffix.iter().all(|part| self.context.is_elided_statement(part))
+                    && (suite_has_populated_try_exit(&manager.body)
+                        || manager.body.iter().all(|part| {
+                            self.context.is_elided_statement(part)
+                                || suite_has_populated_try_exit(std::slice::from_ref(part))
+                        })));
             // A folded true terminal conditional also retains its original empty exit,
             // even when its selected body has a nested handler or manager bypass.
-            if erased_async_manager_finally_exit
+            if erased_manager_finally_exit
                 || (suite_ends_in_empty_try_exit_block(&statement.finalbody, false)
                     && matches!(statement.finalbody.last(), Some(Stmt::If(tail))
                     if early_condition_truthiness(&tail.test).is_none()))

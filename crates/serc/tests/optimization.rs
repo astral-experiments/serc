@@ -79,6 +79,20 @@ fn completed_while_prefixes_preserve_erased_exit_borrow_boundaries() {
 }
 
 #[test]
+fn erased_sync_manager_finalizer_keeps_empty_exit() {
+    for source in [
+        "def sample():\n    try:\n        with expecting(Failure) as error:\n            second.start()\n    finally:\n        assert first.close(1)\n    restarted = factory(lambda: store)\n    restarted.start()\n",
+        "def sample():\n    try:\n        with expecting(Failure) as error:\n            second.start()\n        assert 'expected' in str(error.value)\n    finally:\n        assert first.close(1)\n    restarted = factory(lambda: store)\n    restarted.start()\n",
+        "def sample(environment):\n    try:\n        with listen() as listener, pool() as executor:\n            try:\n                with publish():\n                    server.start()\n            finally:\n                assert server.stop().wait()\n    finally:\n        for key, value in environment.items():\n            if value is None:\n                reset(key)\n            else:\n                set_value(key, value)\n",
+        "def sample(environment):\n    try:\n        with listen() as listener, pool() as executor:\n            try:\n                with publish():\n                    assert server.start() > 0\n            finally:\n                assert server.stop().wait()\n    finally:\n        for key, value in environment.items():\n            if value is None:\n                reset(key)\n            else:\n                set_value(key, value)\n",
+        "def sample(environment):\n    try:\n        with listen() as listener, pool() as executor:\n            try:\n                with publish():\n                    assert server.start() > 0\n                    server.run()\n            finally:\n                assert server.stop().wait()\n    finally:\n        for key, value in environment.items():\n            if value is None:\n                reset(key)\n            else:\n                set_value(key, value)\n",
+        "def sample(invalid, original, retained, policy):\n    with client() as connection:\n        with session(connection) as service:\n            try:\n                with expecting():\n                    release(invalid)\n            finally:\n                assert invalid == original\n            repaired = redact(retained, policy=policy)\n            with expecting():\n                validate(repaired)\n",
+    ] {
+        assert_matches_cpython(source, "erased_sync_manager_finalizer.py", &LEVELS);
+    }
+}
+
+#[test]
 fn guarded_iterator_break_reaches_recovery_cleanup() {
     for iterator in ["(1, 2)", "items"] {
         for setup in [
