@@ -30,11 +30,11 @@ fn runtime_while_break_reaches_finalizer_iteration() {
                 let source = if manager.is_empty() {
                     format!("def probe():\n{suite}")
                 } else {
-                    let suite = suite
-                        .lines()
-                        .map(|line| format!("    {line}\n"))
-                        .collect::<String>();
-                    format!("def probe():\n    {manager}\n{suite}")
+                    let mut indented = String::new();
+                    for line in suite.lines() {
+                        writeln!(indented, "    {line}").unwrap();
+                    }
+                    format!("def probe():\n    {manager}\n{indented}")
                 };
                 assert_matches_cpython(&source, "runtime_while_finalizer_iteration.py", &LEVELS);
             }
