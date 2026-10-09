@@ -15,6 +15,22 @@ use serc::{
 };
 
 #[test]
+fn nested_raising_cleanup_keeps_enclosing_pop_location() {
+    let source = "def sample(owner, handle, value, before, after):\n    try:\n        try:\n            with owner.open(handle) as source:\n                try:\n                    yield value\n                finally:\n                    value.close()\n        finally:\n            if after != before:\n                raise ValueError('resource changed')\n    finally:\n        owner.release(handle)\n";
+    for source in [
+        source.to_owned(),
+        source.replace(
+            "        finally:\n            if after",
+            "        finally:\n            after = owner.state(handle)\n            if after",
+        ),
+        source.replace("after != before", "before < value < after"),
+        source.replace("    finally:\n        owner.release", "    except Exception:\n        owner.report(value)\n    finally:\n        owner.release"),
+    ] {
+        assert_matches_cpython(&source, "nested_raising_cleanup.py", &LEVELS);
+    }
+}
+
+#[test]
 fn conditional_deletion_keeps_cleanup_reachable() {
     for scope in ["def", "async def"] {
         for target in ["pending[item]", "owner.slot", "started"] {
