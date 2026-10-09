@@ -31,6 +31,54 @@ fn erased_async_cleanup_after_comprehension_keeps_empty_exit() {
 }
 
 #[test]
+fn completed_while_prefixes_preserve_erased_exit_borrow_boundaries() {
+    for coroutine in [false, true] {
+        for generator in [false, true] {
+            for prefix_assert in [false, true] {
+                for suffix_assert in [false, true] {
+                    for following in [false, true] {
+                        let header = if coroutine { "async def" } else { "def" };
+                        let operation = if coroutine {
+                            "await obtain(cursor)"
+                        } else {
+                            "obtain(cursor)"
+                        };
+                        let mut source = format!(
+                            "{header} sample(seed):\n    collected = []\n    cursor = seed\n    while True:\n        chunk = {operation}\n"
+                        );
+                        if prefix_assert {
+                            source.push_str("        assert chunk is not None\n");
+                        }
+                        let payload = if generator {
+                            "(element for element in chunk)"
+                        } else {
+                            "chunk"
+                        };
+                        writeln!(source, "        collected.extend({payload})").unwrap();
+                        source.push_str(
+                            "        cursor = next_cursor(chunk)\n        if cursor is None:\n            break\n",
+                        );
+                        if suffix_assert {
+                            source.push_str("        assert chunk\n");
+                        }
+                        source.push_str("    assert collected\n");
+                        if following {
+                            source.push_str(if coroutine {
+                                "    outcome = await finish(collected)\n"
+                            } else {
+                                "    outcome = finish(collected)\n"
+                            });
+                            source.push_str("    assert outcome\n");
+                        }
+                        assert_matches_cpython(&source, "completed_while_prefix.py", &LEVELS);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn guarded_iterator_break_reaches_recovery_cleanup() {
     for iterator in ["(1, 2)", "items"] {
         for setup in [
@@ -7649,6 +7697,45 @@ fn erased_inner_while_tail_preserves_borrow_boundary() {
             body.replace('\n', "\n    ")
         );
         assert_matches_cpython(&source, &format!("erased_inner_while_{index}.py"), &LEVELS);
+    }
+}
+
+#[test]
+fn erased_protected_while_tail_preserves_borrow_boundary() {
+    let source = r"def sample(items, state, limit):
+    try:
+        while True:
+            value = update(items)
+            for key, item in pairs(items):
+                consume(item)
+            values = [transform(item) for item in items]
+            publish({'values': [transform(item) for item in items]}, ready=True)
+            state['value'] = value
+            if value > limit and ready(items):
+                break
+            assert value < limit
+        for item in items:
+            finish(item)
+            assert item
+    finally:
+        release(items)
+    observe(items)
+    return value
+";
+    for (index, source) in [
+        source.to_owned(),
+        source.replace("if value > limit and ready(items):", "if value > limit:"),
+        source.replace("            for key, item in pairs(items):\n                consume(item)\n", ""),
+        source.replace("            values = [transform(item) for item in items]\n", ""),
+        source.replace("            publish({'values': [transform(item) for item in items]}, ready=True)\n", ""),
+        source.replace("            assert value < limit", "            check(value)"),
+        source.replace("while True:", "while ready(items):"),
+        source.replace("        release(items)", "        for item in items:\n            if active(item):\n                release(item)"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(&source, &format!("erased_protected_while_tail_{index}.py"), &LEVELS);
     }
 }
 

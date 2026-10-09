@@ -22111,10 +22111,55 @@ impl<'source> Compiler<'source> {
                     && statement.body.last().is_some_and(|statement| {
                         suite_contains_loop_break(std::slice::from_ref(statement))
                     });
+            let break_stays_inside_finally = statement.orelse.is_empty()
+                && self.control.statements.context.has_following
+                && self.control.loops.contexts.is_empty()
+                && self.control.withs.active_with_exits.is_empty()
+                && self.control.withs.active_with_region_exclusions.is_empty()
+                && self.control.exceptions.active_exception_handlers.is_empty()
+                && self.control.exceptions.active_exception_group_handlers == 0
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .len()
+                    == 1
+                && self.control.finally.active_finally_try_bodies == 1
+                && self.control.finally.active_normal_finally_bodies == 0
+                && self.control.finally.active_finally_end_blocks == 0
+                && self.control.finally.active_copied_finally_bodies == 0
+                && self
+                    .control
+                    .finally
+                    .innermost_finally_exception_exclusion_depth
+                    == Some(1)
+                && matches!(self.control.finally.active_return_finally_contexts.as_slice(), [context]
+                    if context.loop_depth == 0
+                        && context.with_depth == 0
+                        && context.handler_depth == 0
+                        && context.exception_region_depth == 0);
+            // Completed awaits and deferred generator creation can precede the
+            // same erased tail without reconnecting its empty original exit.
+            let completed_prefix_context = matches!(
+                self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR),
+                0 | CO_COROUTINE
+            ) && statement.orelse.is_empty()
+                && self.control.statements.context.has_following
+                && self.control.loops.contexts.is_empty()
+                && self.control.withs.active_with_exits.is_empty()
+                && self.control.withs.active_with_region_exclusions.is_empty()
+                && self.control.exceptions.active_exception_handlers.is_empty()
+                && self.control.exceptions.active_exception_group_handlers == 0
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty();
             let mut borrow_body = statement.body.as_slice();
             if self.context.python_version == crate::PythonVersion::Py314
                 && matches!(self.unit.scope, Scope::Function { .. })
-                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                && (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    || completed_prefix_context)
                 && (self.control.loops.contexts.is_empty()
                     || (statement.orelse.is_empty()
                         && matches!(self.control.loops.contexts.as_slice(), [outer]
@@ -22126,6 +22171,8 @@ impl<'source> Compiler<'source> {
                                 && outer.finally_end_depth
                                     == self.control.finally.active_finally_end_blocks)))
                 && (!self.has_active_control_flow_region()
+                    || break_stays_inside_finally
+                    || completed_prefix_context
                     // A manager entered before the loop is not unwound by its
                     // break. Erased assertions still leave an empty tail array.
                     || (statement.orelse.is_empty()
@@ -22146,7 +22193,8 @@ impl<'source> Compiler<'source> {
                             .active_exception_region_exclusions
                             .is_empty()))
                 && !self.control.in_exception_handler()
-                && self.control.finally.is_inactive_for_return_unwind()
+                && (self.control.finally.is_inactive_for_return_unwind()
+                    || break_stays_inside_finally)
             {
                 // Removed assertions do not keep a terminal break jump alive. Its
                 // empty original successor still stops 3.14's borrow traversal.
@@ -22157,13 +22205,38 @@ impl<'source> Compiler<'source> {
                     borrow_body = leading;
                 }
                 if !borrow_body.split_last().is_some_and(|(last, leading)| {
+                    let linear_or_elided = |part: &Stmt| {
+                        suite_has_linear_borrow_fallthrough(std::slice::from_ref(part))
+                            || (matches!(part, Stmt::Global(declaration) if declaration.names.is_empty())
+                                && self.context.is_elided_statement(part))
+                    };
                     (leading.is_empty()
                         || suite_has_linear_borrow_fallthrough(leading)
-                        || leading.iter().all(|part| {
-                            suite_has_linear_borrow_fallthrough(std::slice::from_ref(part))
-                                || (matches!(part, Stmt::Global(declaration) if declaration.names.is_empty())
-                                    && self.context.is_elided_statement(part))
-                        }))
+                        || (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                            && leading.iter().all(|part| {
+                                linear_or_elided(part)
+                                    || statement_has_completed_iterator_prefix(part)
+                            }))
+                        || (completed_prefix_context
+                            && leading.iter().all(|part| {
+                                linear_or_elided(part)
+                                    || match part {
+                                        Stmt::Expr(expression) => {
+                                            expression_has_linear_generator_creation(
+                                                &expression.value,
+                                                self.context.python_version,
+                                            )
+                                        }
+                                        Stmt::Assign(assignment) => {
+                                            matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                                                && expression_has_linear_generator_creation(
+                                                    &assignment.value,
+                                                    self.context.python_version,
+                                                )
+                                        }
+                                        _ => false,
+                                    }
+                            })))
                         && matches!(last, Stmt::If(branch)
                         if branch.elif_else_clauses.is_empty()
                             && branch.body.split_last().is_some_and(|(last, leading)| {
@@ -41516,6 +41589,75 @@ fn suite_has_populated_try_exit(body: &[Stmt]) -> bool {
                                 && iterator.ifs.is_empty()
                                 && matches!(iterator.target, Expr::Name(_))
                                 && !expression_contains_inline_branch(&iterator.iter))))
+}
+
+/// Completed synchronous iterators cannot enter a later erased while-loop tail.
+fn statement_has_completed_iterator_prefix(statement: &Stmt) -> bool {
+    fn linear(expression: &Expr) -> bool {
+        !expression_contains_inline_branch(expression)
+            && !expression_suspends_current_scope(expression)
+            && !expression_yields_in_current_scope(expression)
+    }
+    fn value(expression: &Expr) -> bool {
+        if crate::stack_growth_required() {
+            return crate::grow_stack(|| value(expression));
+        }
+        if linear(expression) {
+            return true;
+        }
+        if let Some((iterators, key, element)) = super::comprehension_parts(expression) {
+            return matches!(iterators, [iterator]
+                if !iterator.is_async
+                    && iterator.ifs.is_empty()
+                    && matches!(iterator.target, Expr::Name(_))
+                    && linear(&iterator.iter)
+                    && key.is_none_or(linear)
+                    && (!matches!(expression, Expr::DictComp(_)) || key.is_some())
+                    && linear(element));
+        }
+        match expression {
+            Expr::Call(call) => {
+                linear(&call.func)
+                    && call.arguments.args.iter().all(value)
+                    && call
+                        .arguments
+                        .keywords
+                        .iter()
+                        .all(|keyword| value(&keyword.value))
+            }
+            Expr::Dict(dictionary) => dictionary
+                .items
+                .iter()
+                .all(|item| item.key.as_ref().is_some_and(linear) && value(&item.value)),
+            _ => false,
+        }
+    }
+    if crate::stack_growth_required() {
+        return crate::grow_stack(|| statement_has_completed_iterator_prefix(statement));
+    }
+    match statement {
+        Stmt::For(iterator) => {
+            !iterator.is_async
+                && iterator.orelse.is_empty()
+                && (matches!(iterator.target.as_ref(), Expr::Name(_))
+                    || matches!(iterator.target.as_ref(), Expr::Tuple(tuple)
+                        if !tuple.elts.is_empty()
+                            && tuple.elts.iter().all(|item| matches!(item, Expr::Name(_)))))
+                && linear(&iterator.iter)
+                && iterator.body.iter().all(|part| {
+                    (suite_has_linear_borrow_fallthrough(std::slice::from_ref(part))
+                        && !suite_contains_yield(std::slice::from_ref(part)))
+                        || statement_has_completed_iterator_prefix(part)
+                })
+        }
+        Stmt::Assign(assignment) => {
+            matches!(assignment.targets.as_slice(), [Expr::Name(_)]) && value(&assignment.value)
+        }
+        Stmt::Expr(expression) => {
+            expression_contains_inline_branch(&expression.value) && value(&expression.value)
+        }
+        _ => false,
+    }
 }
 
 /// Certifies work that returns to its original owner after nested managers and loops.
