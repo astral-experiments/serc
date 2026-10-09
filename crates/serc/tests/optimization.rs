@@ -15,6 +15,20 @@ use serc::{
 };
 
 #[test]
+fn nested_async_iterator_else_break_keeps_continuation_cold() {
+    let source = "async def sample(owner, params, limit, content):\n    try:\n        async with owner.session() as session:\n            async with session.request(params=dict(params or {})) as response:\n                async for chunk in response.chunks():\n                    if limit is None:\n                        content.extend(chunk)\n                    else:\n                        content.extend(chunk[:limit])\n                        if len(content) > limit:\n                            break\n                return Result(response.status, dict(response.headers), response.charset, bytes(content))\n    except TimeoutError:\n        raise RequestTimeout('request timed out') from None\n    except RequestError as error:\n        raise WrappedError(error) from None\n    finally:\n        await owner.close()\n";
+    for source in [
+        source.to_owned(),
+        source
+            .replace("                async for chunk", "                status = response.status\n                async for chunk")
+            .replace("content.extend(chunk[:limit])", "remaining = limit + 1 - len(content)\n                        content.extend(chunk[:remaining])")
+            .replace("return Result(response.status,", "return Result(status,"),
+    ] {
+        assert_matches_cpython(&source, "nested_async_iterator_else.py", &LEVELS);
+    }
+}
+
+#[test]
 fn runtime_loop_nested_recovery_keeps_cleanup_reachable() {
     let source = "async def sample(owner, kind, stage, payload, partial, name):\n    try:\n        while owner.state['next'] != 'done':\n            try:\n                if kind == 'target':\n                    owner.complete(stage, payload)\n                elif kind == 'extract':\n                    owner.extract(stage)\n                elif kind in {'merge', 'initial', 'revision'}:\n                    owner.finish(stage, 'initial' if kind == 'merge' else 'validate')\n                elif kind == 'validate':\n                    owner.finish(stage, 'review')\n                elif kind == 'review':\n                    owner.review(stage, payload)\n                else:\n                    raise ValueError(kind)\n            except Exception as error:\n                if kind == 'target' and 'recovery' in owner.state and 'hash' in stage:\n                    if owner.invalid(payload):\n                        continue\n                continue\n    except (Exception, Cancelled) as error:\n        if owner.workspace is not None and not isinstance(error, Unresolved):\n            if partial is not None:\n                try:\n                    owner.state['partial'] = {'path': name, 'hash': save(owner.directory / name, partial)}\n                except Exception as failure:\n                    owner.state['error'] = str(failure)\n    finally:\n        if owner.workspace is not None:\n            owner.save()\n";
     for source in [
