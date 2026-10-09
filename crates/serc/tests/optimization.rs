@@ -15,6 +15,20 @@ use serc::{
 };
 
 #[test]
+fn erased_manager_prefix_keeps_empty_finalizer_exit() {
+    for prefix in [
+        "",
+        "            assert held()\n",
+        "            assert held()\n            assert stable()\n",
+    ] {
+        let source = format!(
+            "def sample(settings):\n    with acquire() as holder:\n        try:\n{prefix}            with session() as connection, connection.begin():\n                assert ready()\n        finally:\n            assert release(holder)\n    inspect(settings)\n"
+        );
+        assert_matches_cpython(&source, "erased_manager_prefix.py", &LEVELS);
+    }
+}
+
+#[test]
 fn copied_named_iterator_break_keeps_none_guard_owner() {
     let source = r#"async def sample(client, response):
     for attempt in range(client.attempts):
