@@ -46850,6 +46850,11 @@ fn recovery_comprehension_call_has_nonempty_exit(expression: &Expr) -> bool {
     {
         return false;
     }
+    let is_name_value = |value: &Expr| {
+        matches!(value, Expr::Name(_))
+            || matches!(value, Expr::Attribute(attribute)
+                if matches!(attribute.value.as_ref(), Expr::Name(_)))
+    };
     let mut comprehensions = 0;
     call.arguments.args.iter().all(|argument| {
         if matches!(
@@ -46858,16 +46863,13 @@ fn recovery_comprehension_call_has_nonempty_exit(expression: &Expr) -> bool {
         ) && let Some((iterators, key, element)) = super::comprehension_parts(argument)
         {
             comprehensions += 1;
-            key.is_none_or(|key| matches!(key, Expr::Name(_)))
-                && (matches!(element, Expr::Name(_))
-                    || matches!(element, Expr::Attribute(attribute)
-                        if matches!(attribute.value.as_ref(), Expr::Name(_)))
-                    || (key.is_some() && simple_cleanup_call(element)))
+            key.is_none_or(is_name_value)
+                && (is_name_value(element) || (key.is_some() && simple_cleanup_call(element)))
                 && matches!(iterators, [generator]
                     if !generator.is_async
                         && generator.ifs.is_empty()
                         && matches!(generator.target, Expr::Name(_))
-                        && matches!(generator.iter, Expr::Name(_)))
+                        && is_name_value(&generator.iter))
         } else {
             matches!(argument, Expr::Name(_)) || fold_constant(argument).is_some()
         }
