@@ -15,6 +15,67 @@ use serc::{
 };
 
 #[test]
+fn copied_named_iterator_break_keeps_none_guard_owner() {
+    let source = r#"async def sample(client, response):
+    for attempt in range(client.attempts):
+        for redirect in range(limit):
+            try:
+                if response.status in redirects:
+                    continue
+                if response.status < 200 or response.status >= 300:
+                    if response.status in retryable:
+                        if attempt < client.attempts:
+                            break
+            except TransportError as error:
+                if attempt < client.attempts:
+                    with phase():
+                        await client.sleep(client.delay(attempt))
+                break
+            finally:
+                if response is not None:
+                    await response.close()
+        else:
+            raise AssertionError("unreachable")
+"#;
+    for (index, source) in [
+        source.to_owned(),
+        source.replace("await response.close()", "response.close()"),
+        source.replace("await client.sleep", "client.sleep"),
+        source.replace("async def", "def").replace("await ", ""),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            &source,
+            &format!("iterator_handler_break_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
+fn returning_else_keeps_live_cleanup_entry() {
+    for scope in ["def", "async def"] {
+        for (binding, recovery) in [("", "report()"), (" as error", "last_error = error")] {
+            for condition in ["not complete", "path is not None"] {
+                for work in ["response.headers.get('retry')", "client.wait()"] {
+                    let suspend = if scope == "async def" && work == "client.wait()" {
+                        "await "
+                    } else {
+                        ""
+                    };
+                    let source = format!(
+                        "{scope} sample(client, path):\n    for attempt in range(client.attempts):\n        try:\n            if response.status in retryable_statuses:\n                retry_after = {suspend}{work}\n            else:\n                return result(attempt, size, response.headers.get('tag'), digest)\n        except (TransportError, ValidationError){binding}:\n            {recovery}\n        finally:\n            if {condition}:\n                path.unlink(missing_ok=True)\n"
+                    );
+                    assert_matches_cpython(&source, "returning_else_cleanup.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn nested_handler_raise_keeps_empty_outer_exit() {
     for scope in ["def", "async def"] {
         for binding in ["", " as parse_error"] {
