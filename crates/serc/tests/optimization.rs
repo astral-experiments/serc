@@ -15,6 +15,49 @@ use serc::{
 };
 
 #[test]
+fn runtime_while_break_reaches_finalizer_iteration() {
+    for manager in ["", "with acquire():", "with acquire(), acquire():"] {
+        for nested in [false, true] {
+            for tail in ["", "            tick()\n"] {
+                let guard = if nested {
+                    "            if not waiting:\n                if closed or cancelled():\n                    break\n"
+                } else {
+                    "            if closed or cancelled():\n                break\n"
+                };
+                let suite = format!(
+                    "    try:\n        while waiting or not closed:\n{guard}{tail}    except BaseException as error:\n        pass\n    finally:\n        for item in groups.values():\n            finish(item, state)\n"
+                );
+                let source = if manager.is_empty() {
+                    format!("def probe():\n{suite}")
+                } else {
+                    let suite = suite
+                        .lines()
+                        .map(|line| format!("    {line}\n"))
+                        .collect::<String>();
+                    format!("def probe():\n    {manager}\n{suite}")
+                };
+                assert_matches_cpython(&source, "runtime_while_finalizer_iteration.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn managed_guarded_runtime_break_keeps_iterator_cleanup_reachable() {
+    let source = "def sample(owner, required, deadline, runner):\n    with owner.temporary() as directory:\n        with owner.log(directory) as stream:\n            try:\n                if required:\n                    while pending:\n                        if clock() >= deadline:\n                            break\n                        pause(0.01)\n            except TimeoutError:\n                timed_out = True\n            finally:\n                for signal, timeout in ((1, 3), (2, 1)):\n                    if runner.poll() is not None:\n                        break\n                for signal in (1, 2):\n                    while remaining:\n                        remaining = alive\n                        if not remaining or clock() >= deadline:\n                            break\n";
+    for source in [
+        source.to_owned(),
+        source
+            .replace("                if required:", "                runner.wait(timeout=20)\n                if required:")
+            .replace("                    while pending:", "                    pending = {item.key for item in owner.items()}\n                    deadline = clock() + 5\n                    while pending:")
+            .replace("                        if clock()", "                        for item in tuple(pending):\n                            try:\n                                owner.check(item)\n                            except Missing:\n                                pending.remove(item)\n                        if clock()"),
+        "def sample(owner, ready, stopped, values):\n    try:\n        if ready:\n            while owner.active():\n                owner.step()\n                if stopped:\n                    break\n    except Error:\n        failed = True\n    finally:\n        for token in values:\n            if owner.done(token):\n                break\n            owner.record(token)\n".to_owned(),
+    ] {
+        assert_matches_cpython(&source, "managed_guarded_watch.py", &LEVELS);
+    }
+}
+
+#[test]
 fn managed_loop_conditional_call_store_keeps_cleanup_reachable() {
     let source = "def sample(owner, pending, remaining, checked, filtered, complete, offsets):\n    try:\n        with owner.stage() as staged, owner.filtered() as stream, owner.workers() as workers:\n            try:\n                while True:\n                    if not pending:\n                        selected = owner.select(remaining, version=owner.version)\n                        break\n                    for outcome in owner.check(pending, workers=workers):\n                        if isinstance(outcome, Accepted):\n                            staged.write(outcome.encode() + '\\n')\n                        else:\n                            stream.flush()\n            finally:\n                report = summarize(checked=checked, filtered=filtered, complete=complete, missing=len(offsets) - len(selected) if complete else None)\n    finally:\n        owner.close()\n";
     for source in [
