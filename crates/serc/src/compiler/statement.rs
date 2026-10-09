@@ -32701,7 +32701,15 @@ impl<'source> Compiler<'source> {
                 handler.as_except_handler().is_some_and(|handler| {
                     suite_contains_conditional_nested_recovery(&handler.body)
                 })
-            }));
+            }))
+            // Async exhaustion moves cold; a break still crosses the emptied
+            // normal handler exit before entering the finalizer.
+            || (self.context.python_version == crate::PythonVersion::Py314
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                    == CO_COROUTINE
+                && statement.orelse.is_empty()
+                && matches!(effective_body_tail, Some(Stmt::For(iterator))
+                    if iterator.is_async && iterator.orelse.is_empty()));
         // A terminal raising guard gives the else-exit jump one runtime predecessor.
         // CPython lends that condition's location to the jump before moving handlers;
         // its retained NOP keeps the normal cleanup entry reachable for borrowed loads.

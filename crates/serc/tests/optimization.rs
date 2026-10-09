@@ -15,6 +15,20 @@ use serc::{
 };
 
 #[test]
+fn async_iterator_recovery_keeps_cleanup_cold() {
+    let source = "async def sample(owner, stream, payload, kind, close):\n    try:\n        async for event in stream:\n            if not isinstance(payload, dict):\n                continue\n            if kind in {'finished', 'failed', 'incomplete'}:\n                break\n    except Exception as error:\n        result = {'type': type(error).__name__, 'message': str(error), 'identifier': getattr(error, 'identifier', None)}\n    finally:\n        if callable(close):\n            maybe = close()\n            if maybe is not None:\n                await maybe\n";
+    for source in [
+        source.to_owned(),
+        source
+            .replace("        async for event in stream:", "        stream = await owner.open()\n        async for event in stream:\n            payload = owner.convert(event)")
+            .replace("    finally:\n", "    finally:\n        close = getattr(stream, 'close', None)\n")
+            + "    return owner.result(payload)\n",
+    ] {
+        assert_matches_cpython(&source, "async_iterator_cleanup.py", &LEVELS);
+    }
+}
+
+#[test]
 fn managed_coroutine_recovery_keeps_guarded_cleanup_reachable() {
     let source = "async def sample(owner, item, outcome, persisted):\n    with owner.context():\n        try:\n            outcome = await owner.route()\n        except Exception as error:\n            if item is None or item.status != Status.PENDING:\n                raise\n        finally:\n            if outcome is not None:\n                if not persisted:\n                    await owner.persist()\n";
     for source in [
