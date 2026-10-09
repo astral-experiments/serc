@@ -15,6 +15,28 @@ use serc::{
 };
 
 #[test]
+fn loop_raise_comparison_chain_reaches_cleanup() {
+    for scope in ["def", "async def"] {
+        for condition in [
+            "300 <= error.status < 400",
+            "error.status in {401, 403} or 300 <= error.status < 400",
+            "not (300 <= error.status < 400)",
+        ] {
+            for handler in [
+                "",
+                "        except (ClientError, TimeoutError) as error:\n            retryable = True\n",
+            ] {
+                let suspend = if scope == "async def" { "await " } else { "" };
+                let source = format!(
+                    "{scope} sample(row, path, manifest):\n    while row.attempts < limit:\n        try:\n            retryable = result.outcome == 'failed'\n        except RequestError as error:\n            if {condition}:\n                raise\n{handler}        finally:\n            save(path, manifest)\n        {suspend}sleep(2 ** (row.attempts - 1))\n"
+                );
+                assert_matches_cpython(&source, "loop_comparison_recovery.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
 fn erased_async_cleanup_after_comprehension_keeps_empty_exit() {
     for work in [
         "tasks = build()",

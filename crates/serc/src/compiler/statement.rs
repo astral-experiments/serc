@@ -46560,6 +46560,21 @@ fn loop_recovery_has_nonempty_finally_route(
         condition_has_linear_runtime_leaves(test) && !expression_suspends_current_scope(test)
     }
 
+    fn handler_test(test: &Expr) -> bool {
+        if crate::stack_growth_required() {
+            return crate::grow_stack(|| handler_test(test));
+        }
+        match test {
+            Expr::BoolOp(boolean) => boolean.values.iter().all(handler_test),
+            Expr::UnaryOp(unary) if unary.op == UnaryOp::Not => handler_test(&unary.operand),
+            Expr::Compare(comparison) => comparison.operands.iter().all(|operand| {
+                !expression_contains_inline_branch(operand)
+                    && !expression_suspends_current_scope(operand)
+            }),
+            _ => runtime_test(test),
+        }
+    }
+
     fn linear(statement: &Stmt) -> bool {
         matches!(statement, Stmt::Pass(_))
             || suite_has_nonsuspending_linear_fallthrough(std::slice::from_ref(statement))
@@ -46580,7 +46595,13 @@ fn loop_recovery_has_nonempty_finally_route(
             let Stmt::If(guard) = statement else {
                 return false;
             };
-            if !runtime_test(&guard.test) {
+            // Shared raise targets can keep cleanup reachable after a comparison
+            // chain; single-target chains retain their empty-exit barrier.
+            if !(runtime_test(&guard.test)
+                || (is_handler
+                    && condition_jump_target_count(&guard.test, true) > 1
+                    && handler_test(&guard.test)))
+            {
                 return false;
             }
             if !guard.elif_else_clauses.is_empty() {
