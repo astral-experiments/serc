@@ -43090,6 +43090,27 @@ fn suite_contains_orphan_cold_cleanup(body: &[Stmt]) -> bool {
     }
 
     impl<'ast> Visitor<'ast> for Detector {
+        fn visit_body(&mut self, body: &'ast [Stmt]) {
+            // A re-raise after an async manager can leave its unused normal
+            // cleanup array behind when the surrounding handler moves cold.
+            if matches!(body, [prefix @ .., Stmt::With(manager), Stmt::Raise(raised)]
+                if manager.is_async
+                    && manager.items.len() == 1
+                    && raised.exc.is_none() && raised.cause.is_none()
+                    && (prefix.is_empty() || suite_has_nonsuspending_linear_fallthrough(prefix))
+                    && suite_has_nonsuspending_linear_fallthrough(&manager.body))
+            {
+                self.found = true;
+                return;
+            }
+            for statement in body {
+                if self.found {
+                    return;
+                }
+                self.visit_stmt(statement);
+            }
+        }
+
         fn visit_stmt(&mut self, statement: &'ast Stmt) {
             if self.found || matches!(statement, Stmt::TypeAlias(_)) {
                 return;
