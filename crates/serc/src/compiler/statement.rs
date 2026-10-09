@@ -43729,9 +43729,14 @@ fn suite_contains_terminal_nested_try(
     body.iter().any(|part| match part {
         Stmt::Try(recovery) => {
             recovery.handlers.iter().any(|handler| {
-                handler
-                    .as_except_handler()
-                    .is_some_and(|handler| suite_terminates(&handler.body))
+                handler.as_except_handler().is_some_and(|handler| {
+                    suite_terminates(&handler.body)
+                        || suite_contains_terminal_nested_try(
+                            &handler.body,
+                            version,
+                            through_cleanup,
+                        )
+                })
             }) || (version == crate::PythonVersion::Py314 && suite_terminates(&recovery.orelse))
                 || (through_cleanup
                     && !recovery.is_star

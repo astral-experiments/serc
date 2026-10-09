@@ -15,6 +15,21 @@ use serc::{
 };
 
 #[test]
+fn nested_handler_raise_keeps_empty_outer_exit() {
+    for scope in ["def", "async def"] {
+        for binding in ["", " as parse_error"] {
+            for cause in ["", " from None"] {
+                let suspend = if scope == "async def" { "await " } else { "" };
+                let source = format!(
+                    "{scope} sample(client, resource):\n    try:\n        loaded = {suspend}client.load(resource)\n    except StatusError as error:\n        try:\n            client.ensure(response)\n        except StatusError as registration_error:\n            try:\n                payload = decode(registration_error.body or '{{}}')\n            except ValueError{binding}:\n                raise registration_error{cause}\n            created = False\n        else:\n            created = True\n        loaded = {suspend}client.load(resource)\n    else:\n        created = False\n    if created and refresh.status != 'skipped':\n        return output(resource, refresh.version)\n"
+                );
+                assert_matches_cpython(&source, "nested_handler_exit.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
 fn loop_raise_comparison_chain_reaches_cleanup() {
     for scope in ["def", "async def"] {
         for condition in [
