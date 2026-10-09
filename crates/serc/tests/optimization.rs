@@ -15,6 +15,21 @@ use serc::{
 };
 
 #[test]
+fn guarded_break_preserves_normal_cleanup_ownership() {
+    let source = "def sample(owner, values):\n    try:\n        while owner.ready():\n            try:\n                value = owner.next()\n                if (value or {}).get('ready', 0) > 0:\n                    owner.record(value)\n                    break\n            except Error as error:\n                owner.problem(error)\n            finally:\n                if not owner.done():\n                    owner.cancel()\n            owner.pause()\n        else:\n            raise Error()\n        owner.finish()\n    finally:\n        owner.close()\n";
+    for source in [
+        source.to_owned(),
+        source.replace("(value or {}).get('ready', 0) > 0", "values"),
+        source.replace(
+            "    finally:\n        owner.close()",
+            "    except Error as error:\n        owner.record(error)\n        raise\n    finally:\n        try:\n            owner.close()\n        finally:\n            owner.finish()",
+        ),
+    ] {
+        assert_matches_cpython(&source, "guarded_break_cleanup.py", &LEVELS);
+    }
+}
+
+#[test]
 fn stored_call_before_recovery_keeps_iterator_cleanup_reachable() {
     let source = "def sample(owner, prepared, paths, opened, failure):\n    try:\n        owner.prepare(paths)\n        for path in paths:\n            owner.register(path)\n        while owner.active() or owner.poll() is None:\n            if owner.expired() and owner.active():\n                continue\n            try:\n                events = owner.select()\n            except BaseException as error:\n                continue\n            for key, item in events:\n                if not isinstance(item, Entry):\n                    continue\n                try:\n                    data = owner.read(item.name, key.fd)\n                except RetryError:\n                    continue\n                except BaseException as error:\n                    continue\n                if not data:\n                    continue\n                if item.failed:\n                    continue\n        returncode = owner.wait(timeout=0)\n    except BaseException as error:\n        owner.record(error)\n        if owner.process is not None and owner.process.poll() is None:\n            owner.terminate()\n            try:\n                owner.process.wait(timeout=1)\n            except TimeoutError:\n                owner.process.wait()\n        returncode = None if owner.process is None else owner.returncode\n    finally:\n        owner.release()\n        owner.close()\n        if not prepared:\n            for path in paths:\n                if path in opened:\n                    continue\n    complete(0 if failure is None else 1)\n";
     assert_matches_cpython(source, "poll_recovery_cleanup.py", &LEVELS);

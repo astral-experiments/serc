@@ -17690,11 +17690,22 @@ impl<'source> Compiler<'source> {
                 if manager.is_async
                     && manager.exception_region_depth == 0
                     && manager.loop_depth + 1 == self.control.loops.contexts.len());
+        // An ordinary break can leave an outer finalizer active while copying
+        // the inner cleanup. Its original POP_BLOCKs still precede that copy.
+        let retained_outer_finally_break = retained_manager_break
+            && self.context.python_version == crate::PythonVersion::Py314
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && context.iterator_cleanup == IteratorCleanup::None
+            && context.exception_region_depth > 0
+            && self.control.loops.contexts.len() == 1
+            && self.control.finally.active_loop_finally_contexts.len() == 2;
         // Each ordinary try and the single finalizer contribute one original record.
         // An exited manager, handler, or pending exit would interleave other cleanup.
         // Continue stops at its loop, leaving outer finalizers and regions active.
         if !(self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
             || generator_break
+            || retained_outer_finally_break
             || (!retained_manager_break
                 && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0))
             || !(matches!(
@@ -17703,6 +17714,7 @@ impl<'source> Compiler<'source> {
             ) || (retained_manager_break
                 && context.iterator_cleanup == IteratorCleanup::Async))
             || (retained_manager_break
+                && !retained_outer_finally_break
                 && (context.exception_region_depth != 0
                     || self.control.finally.active_loop_finally_contexts.len() != 1))
             || (!retained_manager && !self.control.withs.active_with_exits.is_empty())
@@ -33700,7 +33712,20 @@ impl<'source> Compiler<'source> {
                                         })))))
                 })
             });
-        // A single false edge around a terminal return keeps a located normal
+        let terminal_break_false_edge = self.context.python_version == crate::PythonVersion::Py314
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.control.withs.active_with_exits.is_empty()
+            && !self.control.in_exception_handler()
+            && matches!(self.control.loops.contexts.as_slice(), [context]
+                if context.iterator_cleanup == IteratorCleanup::None && context.with_depth == 0)
+            && matches!(statement.body.last(), Some(Stmt::If(guard))
+                if (condition_has_linear_runtime_leaves(&guard.test)
+                    || matches!(guard.test.as_ref(), Expr::Compare(comparison) if comparison.ops.len() == 1))
+                    && !expression_suspends_current_scope(&guard.test)
+                    && matches!(guard.body.split_last(), Some((Stmt::Break(_), prefix))
+                        if prefix.is_empty() || suite_has_nonsuspending_linear_fallthrough(prefix)));
+        // A single false edge around a terminal return or break keeps a located normal
         // try exit. Unlike a shared conditional join, removing that exit does not
         // leave an empty block between the condition and ordinary recovery cleanup.
         let terminal_if_false_edge_reaches_finally = !statement.is_star
@@ -33737,10 +33762,12 @@ impl<'source> Compiler<'source> {
                         && suite_has_linear_borrow_fallthrough(&cleanup.body)))
             && matches!(statement.body.last(), Some(Stmt::If(conditional))
                 if condition_has_only_runtime_tests(&conditional.test)
-                    && condition_has_linear_runtime_leaves(&conditional.test)
+                    && (condition_has_linear_runtime_leaves(&conditional.test)
+                        || terminal_break_false_edge)
                     && original_condition_has_unique_jump_target(&conditional.test, false)
                     && conditional.elif_else_clauses.is_empty()
-                    && matches!(conditional.body.as_slice(), [Stmt::Return(_)]));
+                    && (matches!(conditional.body.as_slice(), [Stmt::Return(_)])
+                        || terminal_break_false_edge));
         // An awaited runtime test still has one false edge after END_SEND. When
         // every successful path returns, that edge reaches the normal cleanup's
         // located normal-exit marker, including when a return copies the finalizer.
