@@ -36354,6 +36354,44 @@ impl<'source> Compiler<'source> {
                 // a differently located return.
                 self.assembler.preserve_authored_pass_jump_nop(normal_exit);
             } else if !preserve_exit_nop
+                && self.context.python_version >= crate::PythonVersion::Py314
+                && matches!(self.unit.scope, Scope::Function { .. })
+                && self.control.finally.active_finally_try_bodies == 1
+                && self.control.finally.active_normal_finally_bodies == 0
+                && self.control.finally.active_copied_finally_bodies == 0
+                && self.control.finally.active_finally_end_blocks == 0
+                && self.control.withs.active_with_exits.is_empty()
+                && self.control.loops.contexts.is_empty()
+                && !self.control.in_exception_handler()
+                && self.control.exceptions.active_try_marker_slots.is_empty()
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .len()
+                    == 1
+                && !self.control.statements.context.has_following
+                && self
+                    .control
+                    .exceptions
+                    .direct_try_body_statements
+                    .contains(&statement.range)
+                && statement.handlers.is_empty()
+                && statement.orelse.is_empty()
+                && matches!(conditional_exit, Some(NestedIfExitLocation::Located(_)))
+                && matches!(statement.finalbody.last(), Some(Stmt::If(guard))
+                    if guard.elif_else_clauses.is_empty()
+                        && original_condition_has_unique_jump_target(&guard.test, false)
+                        && suite_has_linear_raise_exit(&guard.body))
+                && matches!(self.control.finally.active_return_finally_contexts.as_slice(), [owner]
+                    if matches!(owner.body, [Stmt::Expr(cleanup)]
+                        if simple_cleanup_call(&cleanup.value)))
+            {
+                // The enclosing finalizer's POP_BLOCK owns the donated line. Removing this
+                // separate jump leaves its original array empty for borrowing.
+                self.assembler.defer_jump_removal(normal_exit);
+                self.assembler.mark_borrow_empty_block(normal_exit);
+            } else if !preserve_exit_nop
                 && (matches!(conditional_exit, Some(NestedIfExitLocation::Located(_)))
                     || matches!(statement.finalbody.last(), Some(Stmt::If(tail))
                     if early_condition_truthiness(&tail.test).is_none()
