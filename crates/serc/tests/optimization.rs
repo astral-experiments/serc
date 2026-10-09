@@ -15,6 +15,39 @@ use serc::{
 };
 
 #[test]
+fn pass_recovery_in_handler_iterator_keeps_cold_exit() {
+    let source = r#"def sample(storage, root, label, owner, prefix=None, prompt=None, replacement=None, *, register=None):
+    with archive.open(fileobj=stream, mode="w:gz") as bundle:
+        for path in sorted(root.walk("*")):
+            if not path.is_file() or not (name == "manifest.json" or name.startswith(("assets/", "jobs/", "static/"))):
+                continue
+    try:
+        storage.upload(name, encode(entry), overwrite=False)
+    except AlreadyExists:
+        if existing != entry:
+            for revision in (existing, entry):
+                try:
+                    storage.upload(history, encode(revision), overwrite=False)
+                except AlreadyExists:
+                    pass
+    logger.info("Recorded %s", label)
+"#;
+    for source in [
+        source.to_owned(),
+        source
+            .replace("                try:\n", "                history = location(revision)\n                try:\n")
+            .replace("                    pass\n", "                    pass\n            storage.upload(name, encode(entry), overwrite=True)\n"),
+    ] {
+        assert_matches_cpython(&source, "iterator_handler_recovery.py", &LEVELS);
+        assert_matches_cpython(
+            &source.replace("def sample", "async def sample"),
+            "coroutine_iterator_handler_recovery.py",
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn erased_conditional_join_inside_async_manager_loop_keeps_marker() {
     for iterator in ["for", "async for"] {
         for binding in ["", " as (channel, identity)"] {
