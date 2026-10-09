@@ -15,6 +15,21 @@ use serc::{
 };
 
 #[test]
+fn attribute_key_recovery_loop_keeps_continuation_cold() {
+    for (scope, suspend) in [("def", ""), ("async def", "await ")] {
+        let source = format!(
+            "{scope} sample(owner, names, pending):\n    known = {{}}\n    try:\n        response = {suspend}owner.fetch(names)\n    except FetchError as error:\n        for name in names:\n            try:\n                response = {suspend}owner.fetch([name])\n            except FetchError as failure:\n                continue\n            known.update({{item.name: item for item in response.items}})\n    else:\n        known = {{item.name: item for item in response.items}}\n    for name in pending:\n        if owner.find(name) is None:\n            owner.warn(name)\n            continue\n"
+        );
+        for source in [
+            source.clone(),
+            source.replace("    known = {}\n", "    known = {}\n    for entry in pending:\n        try:\n            owner.inspect(entry)\n        except FetchError as error:\n            continue\n        if owner.reject(entry):\n            continue\n"),
+        ] {
+            assert_matches_cpython(&source, "attribute_key_recovery.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn conditional_retry_else_keeps_cleanup_cold() {
     let source = "async def sample(owner, merged, token):\n    try:\n        owner.verify()\n    except (FirstError, SecondError) as error:\n        if merged and not (isinstance(error, RemoteError) and error.code == 'unavailable'):\n            try:\n                owner.verify()\n            except (FirstError, SecondError) as retry_error:\n                saved_error = retry_error\n            else:\n                saved_error = None\n        else:\n            saved_error = error\n    else:\n        saved_error = None\n    finally:\n        owner.contracts.reset(token)\n    return Result(error=saved_error)\n";
     for source in [
