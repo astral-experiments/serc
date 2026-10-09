@@ -44019,6 +44019,30 @@ fn suite_contains_nested_handler_cold_join(body: &[Stmt]) -> bool {
                 self.found = true;
                 return;
             }
+            if matches!(statement, Stmt::For(iterator)
+            if !iterator.is_async
+                && iterator.orelse.is_empty()
+                && matches!(iterator.target.as_ref(), Expr::Name(_))
+                && !expression_contains_inline_branch(&iterator.iter)
+                && !expression_suspends_current_scope(&iterator.iter)
+                && matches!(iterator.body.split_last(), Some((Stmt::Try(recovery), leading))
+                    if (leading.is_empty() || suite_has_nonsuspending_linear_fallthrough(leading))
+                        && !recovery.is_star
+                        && recovery.orelse.is_empty()
+                        && recovery.finalbody.is_empty()
+                        && suite_has_nonsuspending_linear_fallthrough(&recovery.body)
+                        && !recovery.handlers.is_empty()
+                        && recovery.handlers.iter().all(|handler| {
+                            handler.as_except_handler().is_some_and(|handler| {
+                                handler.type_.is_some()
+                                    && handler.name.is_none()
+                                    && matches!(handler.body.as_slice(), [Stmt::Pass(_)])
+                            })
+                        })))
+            {
+                self.found = true;
+                return;
+            }
             if !self.found {
                 walk_stmt(self, statement);
             }
