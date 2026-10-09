@@ -43210,6 +43210,25 @@ fn suite_contains_orphan_cold_cleanup(body: &[Stmt]) -> bool {
                         self.visit_expr(test);
                     }
                     if truth != Some(false) {
+                        // A managed break leaves this runtime arm's normal join
+                        // empty when the async iterator's cold blocks move.
+                        if condition_has_linear_runtime_leaves(&statement.test)
+                            && test.is_none_or(condition_has_linear_runtime_leaves)
+                            && let [Stmt::For(iterator)] = body
+                            && iterator.is_async
+                            && iterator.orelse.is_empty()
+                            && matches!(iterator.target.as_ref(), Expr::Name(_))
+                            && !expression_contains_inline_branch(&iterator.iter)
+                            && matches!(iterator.body.as_slice(), [Stmt::With(manager)]
+                                if !manager.is_async
+                                    && matches!(manager.items.as_slice(), [item]
+                                        if item.optional_vars.is_none()
+                                            && matches!(item.context_expr, Expr::Name(_)))
+                                    && matches!(manager.body.last(), Some(Stmt::Break(_))))
+                        {
+                            self.found = true;
+                            return;
+                        }
                         self.visit_body(body);
                     }
                     if truth == Some(true) || test.is_none() {

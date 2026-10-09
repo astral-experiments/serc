@@ -15,6 +15,21 @@ use serc::{
 };
 
 #[test]
+fn managed_async_retry_break_keeps_continuation_cold() {
+    let source = "async def sample(owner, kind, item, created):\n    try:\n        changed = True\n    except Conflict:\n        if kind == 'primary':\n            async for attempt in owner.retry():\n                with attempt:\n                    if item is None or item.removed():\n                        break\n                    if item.kind == 'primary':\n                        break\n                    break\n        else:\n            owner.record({'kind': kind, **details(item)})\n    return owner.result(item, created)\n";
+    for source in [
+        source.to_owned(),
+        source
+            .replace("        changed = True", "        await owner.save(item)\n        changed = True")
+            .replace("                with attempt:\n", "                with attempt:\n                    item = await owner.get()\n")
+            .replace("                    if item.kind == 'primary':\n                        break", "                    if item.kind == 'primary':\n                        current = item\n                        break")
+            .replace("                    break\n        else:", "                    item.kind = 'primary'\n                    await owner.save(item)\n                    current = item\n                    break\n        else:"),
+    ] {
+        assert_matches_cpython(&source, "managed_async_retry_break.py", &LEVELS);
+    }
+}
+
+#[test]
 fn guarded_continue_recovery_keeps_continuation_cold() {
     for (scope, suspend) in [("def", ""), ("async def", "await ")] {
         let source = format!(
