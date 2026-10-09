@@ -32421,8 +32421,9 @@ impl<'source> Compiler<'source> {
                             && matches!(self.unit.scope, Scope::Function { .. })
                             && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
                             && clause.test.is_none()
-                            && matches!(clause.body.as_slice(), [Stmt::Return(returned)]
-                                if returned.value.as_deref().is_none_or(|value| {
+                            && matches!(clause.body.split_last(), Some((Stmt::Return(returned), prefix))
+                                if (prefix.is_empty() || suite_has_nonsuspending_linear_fallthrough(prefix))
+                                    && returned.value.as_deref().is_none_or(|value| {
                                     !expression_contains_inline_branch(value)
                                         && !expression_suspends_current_scope(value)
                                 }))))

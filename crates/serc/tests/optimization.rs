@@ -15,6 +15,35 @@ use serc::{
 };
 
 #[test]
+fn returning_else_prefix_keeps_live_cleanup_entry() {
+    let source = r#"async def sample(client, path):
+    for attempt in range(client.attempts):
+        try:
+            if response.status in retryable_statuses:
+                retry_after = response.headers.get("retry")
+            else:
+                complete = True
+                return result(attempt, size, response.headers.get("tag"), digest)
+        except (TransportError, ValidationError) as error:
+            last_error = error
+        finally:
+            if not complete:
+                path.unlink(missing_ok=True)
+"#;
+    for scope in ["def", "async def"] {
+        for prefix in [
+            "complete = True",
+            "record(path)\n                complete = True",
+        ] {
+            let source = source
+                .replace("async def", scope)
+                .replace("complete = True", prefix);
+            assert_matches_cpython(&source, "returning_else_prefix.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn erased_manager_prefix_keeps_empty_finalizer_exit() {
     for prefix in [
         "",
