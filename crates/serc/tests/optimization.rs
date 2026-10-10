@@ -215,6 +215,47 @@ fn guarded_recovery_work_reaches_stored_result_cleanup() {
 }
 
 #[test]
+fn coroutine_guarded_store_recovery_keeps_cleanup_reachable() {
+    let source = "async def sample(owner, item, result, cleanup):\n    try:\n        owner.results[item.key] = result\n    except CancelledError:\n        owner.results[item.key] = Result(status='cancelled')\n    except ActivityError as error:\n        if isinstance(error.cause, CancelledError) and item.key not in owner.cancelled:\n            raise CancelledError() from error\n    except Exception:\n        if item.key in owner.cancelled:\n            owner.results[item.key] = Result(status='cancelled')\n        else:\n            owner.results[item.key] = result\n    finally:\n        if cleanup is not None and owner.needs_cleanup(item, cleanup):\n            owner.results[item.key] = cleanup\n";
+    for source in [
+        source.to_owned(),
+        source
+            .replacen("    try:\n", "    try:\n        if item.key in owner.cancelled:\n            return\n        result = await owner.run(item)\n", 1)
+            .replace("            raise CancelledError() from error\n", "            raise CancelledError() from error\n        result = await owner.recover(error)\n")
+            .replace("    finally:\n", "    finally:\n        owner.accepting = False\n        cleanup = owner.results.get(item.key)\n")
+            .replace("            owner.results[item.key] = cleanup\n", "            await owner.drain()\n            cleanup = await owner.cleanup(item, cleanup)\n            owner.results[item.key] = cleanup\n"),
+    ] {
+        assert_matches_cpython(&source, "coroutine_guarded_store_recovery.py", &LEVELS);
+    }
+}
+
+#[test]
+fn coroutine_companion_handler_reaches_shared_cleanup() {
+    let source = r#"async def sample(resource, item):
+    try:
+        resource.results.update(build_result(item, token, status))
+    except ValueError as error:
+        report(item["name"], type(error).__name__)
+    except (Error, CancelledError) as error:
+        if isinstance(error, CancelledError):
+            raise
+    finally:
+        resource.flush()
+"#;
+    for source in [
+        source.to_owned(),
+        source
+            .replace("resource, item", "resource, item, items")
+            .replace(
+                "resource.flush()",
+                "resource.saved = encode([part for part in items if part.ready and part.kind == 'result'])",
+            ),
+    ] {
+        assert_matches_cpython(&source, "coroutine_companion_cleanup.py", &LEVELS);
+    }
+}
+
+#[test]
 fn comprehension_subscript_store_preserves_guarded_cleanup_entry() {
     let source = "async def sample(owner, report):\n    try:\n        report[\"state\"] = [{\"kind\": \"control\" if key is None else \"data\", \"code\": stream.code if stream.ready else None} for key, stream in owner.streams]\n    except BaseException as error:\n        if owner.cancelled(error):\n            raise\n    finally:\n        report[\"final\"] = [{\"kind\": \"control\" if key is None else \"data\", \"code\": stream.code if stream.ready else None} for key, stream in owner.streams]\n";
     for source in [
