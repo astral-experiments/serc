@@ -12775,6 +12775,34 @@ fn nonlinear_match_cases_keep_their_shared_exits() {
 }
 
 #[test]
+fn async_match_exhaustion_keeps_case_success_interrupt_check() {
+    for pattern in [
+        "First()",
+        "First() as selected",
+        "(First() | Second()) as selected",
+        "_",
+    ] {
+        for body in ["yield item", "await consume(item)"] {
+            let source = format!(
+                "async def sample(value, items):
+    match value:
+        case {pattern}:
+            async for item in items:
+                {body}
+    finish()
+"
+            );
+            assert_matches_cpython_versions(
+                &source,
+                "async_match_exhaustion.py",
+                &LEVELS,
+                &[PythonVersion::Py313],
+            );
+        }
+    }
+}
+
+#[test]
 fn completed_managers_preserve_coroutine_match_returns() {
     for manager in [
         "with manager as stream:\n                saved = stream.read()",
