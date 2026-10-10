@@ -699,20 +699,34 @@ impl<'source> Compiler<'source> {
             self.unit.flags & CO_FUTURE_ANNOTATIONS != 0 && module_annotations;
         if module_annotations && deferred_annotations {
             let annotation_name = self.required_name_id("__conditional_annotations__");
-            self.symbols.locals.push(annotation_name);
+            if !self.symbols.locals.contains(&annotation_name) {
+                self.symbols.locals.push(annotation_name);
+            }
             self.symbols.cell_names.insert(annotation_name);
         }
-        let cell_only_comprehension_names = self
+        let elided_comprehension_cells = self
             .context
             .scopes
-            .elided_comprehension_cells(ScopeId::MODULE)
+            .elided_comprehension_cells(ScopeId::MODULE);
+        let synthetic_annotation_cell = self
+            .context
+            .scopes
+            .names
+            .get("__conditional_annotations__")
+            .filter(|name| !elided_comprehension_cells.contains(name));
+        let cell_only_comprehension_names = elided_comprehension_cells
             .iter()
             .copied()
             .filter(|name| !self.symbols.locals.contains(name))
             .collect::<Vec<_>>();
         self.symbols.locals.extend(cell_only_comprehension_names);
-        self.symbols.locals[self.symbols.fast_local_count..]
-            .sort_by_key(|&name| self.context.scopes.names.resolve(name));
+        // Ordinary cells precede synthetic annotation cells, even after their assertions vanish.
+        self.symbols.locals[self.symbols.fast_local_count..].sort_by_key(|&name| {
+            (
+                Some(name) == synthetic_annotation_cell,
+                self.context.scopes.names.resolve(name),
+            )
+        });
         self.assembler.set_location(SourceLocation::NONE);
         let comprehension_cells = self
             .symbols
