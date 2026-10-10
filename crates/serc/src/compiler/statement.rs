@@ -34520,6 +34520,46 @@ impl<'source> Compiler<'source> {
                     && condition_has_linear_runtime_leaves(&loop_.test)
                     && !expression_suspends_current_scope(&loop_.test)
                     && suite_has_direct_nonterminal_break_guard(&loop_.body));
+        let group_iterator_cleanup_break = self.context.python_version
+            == crate::PythonVersion::Py314
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+            && statement.is_star
+            && statement.orelse.is_empty()
+            && self.control.loops.contexts.is_empty()
+            && self.control.exceptions.active_exception_handlers.is_empty()
+            && self.control.exceptions.active_exception_group_handlers == 0
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && self.control.finally.is_inactive_for_return_unwind()
+            && self.control.withs.active_with_region_exclusions.len() == 1
+            && matches!(self.control.withs.active_with_exits.as_slice(), [manager]
+                if manager.is_async && manager.loop_depth == 0
+                    && manager.exception_region_depth == 0 && manager.normal_finally_depth == 0)
+            && matches!(statement.handlers.as_slice(), [handler]
+            if handler.as_except_handler().is_some_and(|handler| {
+                matches!(handler.type_.as_deref(), Some(Expr::Name(_)))
+                    && handler.name.is_some()
+                    && suite_has_nonterminal_recovery_work(&handler.body, true)
+            }))
+            && matches!(statement.body.last(), Some(Stmt::For(iterator))
+                if !iterator.is_async
+                    && matches!(iterator.target.as_ref(), Expr::Name(_))
+                    && !expression_contains_inline_branch(&iterator.iter)
+                    && !expression_suspends_current_scope(&iterator.iter)
+                    && matches!(iterator.body.last(), Some(Stmt::Break(_)))
+                    && !suite_contains_return(&iterator.body)
+                    && suite_has_linear_raise_exit(&iterator.orelse))
+            && !suite_any_statement(&statement.finalbody, |part| {
+                matches!(part, Stmt::Return(_) | Stmt::Break(_) | Stmt::Continue(_))
+            })
+            && matches!(statement.finalbody.first(), Some(Stmt::If(cleanup))
+                if condition_has_only_runtime_tests(&cleanup.test)
+                    && !expression_contains_inline_branch(&cleanup.test)
+                    && !expression_suspends_current_scope(&cleanup.test));
         let loop_break_reaches_finally = !statement.handlers.is_empty()
             && !normal_finally_is_borrow_reachable
             && !statement.is_star
@@ -34570,7 +34610,8 @@ impl<'source> Compiler<'source> {
                                 suite_contains_loop_break_with_manager(std::slice::from_ref(tail))
                             })
                             && suite_contains_borrow_reachable_conditional_loop_break(
-                                &loop_statement.body))));
+                                &loop_statement.body))))
+            || group_iterator_cleanup_break;
         // A trailing nested try has its own emptied normal exit even when the
         // enclosing finally has no handlers. Straight-line recovery shares that empty exit.
         let nested_handler_exit = statement.handlers.is_empty()
