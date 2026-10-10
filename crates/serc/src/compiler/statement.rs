@@ -36055,10 +36055,26 @@ impl<'source> Compiler<'source> {
             }
         }
         if !statement.handlers.is_empty()
-            && matches!(statement.finalbody.first(), Some(Stmt::Try(_)))
+            && (matches!(statement.finalbody.first(), Some(Stmt::Try(_)))
+                || (self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+                    && statement.finalbody.iter().enumerate().any(|(index, part)| {
+                        matches!(part, Stmt::FunctionDef(_))
+                            && (index == 0
+                                || suite_has_nonsuspending_linear_fallthrough(
+                                    &statement.finalbody[..index],
+                                ))
+                            && (index + 1 == statement.finalbody.len()
+                                || suite_has_linear_borrow_fallthrough(
+                                    &statement.finalbody[index + 1..],
+                                ))
+                    })
+                    && statement.handlers.iter().any(|handler| {
+                        handler
+                            .as_except_handler()
+                            .is_some_and(|handler| suite_terminates(&handler.body))
+                    })))
         {
-            // Keep handler exits targeting the nested finally body instead of the removed
-            // normal-exit NOP that precedes it.
+            // Keep handler exits targeting cleanup instead of its removed normal-exit NOP.
             // The certified break enters the nonempty cleanup through the
             // preceding handler join; this protection boundary aliases it.
             if normal_finally_is_borrow_reachable || loop_break_reaches_finally {
@@ -36980,17 +36996,24 @@ impl<'source> Compiler<'source> {
                 self.assembler
                     .record_retained_pop_block_origin(protected_end);
             }
-            // A sole linear handler supplies the same original POP_BLOCK when the
+            // A sole normal handler supplies the same original POP_BLOCK when the
             // protected body already exits before constant folding. Preserve that
             // ownerless marker independently of the nested try's setup line.
             if !statement.is_star
                 && statement.orelse.is_empty()
                 && suite_terminates_before_constant_folding(&statement.body)
-                && matches!(statement.handlers.as_slice(), [handler]
-                if handler.as_except_handler().is_some_and(|handler| {
-                    handler.type_.is_some()
-                        && suite_has_linear_borrow_fallthrough(&handler.body)
-                }))
+                && {
+                    let mut handlers = statement
+                        .handlers
+                        .iter()
+                        .filter_map(ruff_python_ast::ExceptHandler::as_except_handler)
+                        .filter(|handler| !suite_terminates_before_constant_folding(&handler.body));
+                    handlers.next().is_some_and(|handler| {
+                        handler.type_.is_some()
+                            && (suite_has_linear_borrow_fallthrough(&handler.body)
+                                || matches!(handler.body.as_slice(), [Stmt::Pass(_)]))
+                    }) && handlers.next().is_none()
+                }
                 && matches!(statement.finalbody.first(), Some(Stmt::Try(_)))
             {
                 self.assembler.preserve_last_nop();
