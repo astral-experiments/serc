@@ -15,6 +15,21 @@ use serc::{
 };
 
 #[test]
+fn group_iterator_break_reaches_guarded_cleanup() {
+    let source = "async def sample(owner, source):\n    async with owner.manager():\n        try:\n            for item in source:\n                break\n            else:\n                raise Stop()\n        except* Error as group:\n            if owner.recover:\n                await owner.note(group)\n        finally:\n            if owner.active:\n                await owner.save()\n";
+    for source in [
+        source.to_owned(),
+        source.replace("for item in source:", "for item in range(owner.limit):"),
+        source.replace("            for item", "            owner.prepare()\n            for item")
+            .replace("                break", "                if owner.retry(item):\n                    continue\n                owner.process(item)\n                break"),
+        source.replace("async with owner.manager():", "async with owner.manager() as manager:")
+            .replace("                await owner.save()", "                await owner.save()\n            if owner.file is not None:\n                assert manager is not None\n                manager.release(owner.file)"),
+    ] {
+        assert_matches_cpython(&source, "group_iterator_cleanup.py", &LEVELS);
+    }
+}
+
+#[test]
 fn guarded_recovery_work_reaches_stored_result_cleanup() {
     let source = "def sample(owner, query, telemetry):\n    token = telemetry.set([])\n    try:\n        row = owner.grade(query)\n    except Error as error:\n        if owner.fatal(error):\n            raise\n        failure = {\"error\": type(error).__name__}\n        causes = [type(cause).__name__ for cause in owner.causes(error) if cause is not error]\n        if causes:\n            failure[\"causes\"] = causes\n        row = {\"status\": \"failed\", \"failure\": failure}\n    finally:\n        telemetry.reset(token)\n    return row\n";
     for source in [
