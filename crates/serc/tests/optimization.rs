@@ -3747,6 +3747,142 @@ fn managed_mixed_erased_iterator_guard_preserves_shared_backedge() {
 }
 
 #[test]
+fn boolean_returns_preserve_enclosing_named_handler_owners() {
+    let source = r"def sample(items, flag):
+    for value in items:
+        try:
+            return work(value)
+        except OSError as outer:
+            if flag:
+                try:
+                    value = retry(value)
+                except ValueError as middle:
+                    if flag:
+                        try:
+                            value = fallback(value)
+                        except RuntimeError:
+                            report(value)
+                            return False
+                        else:
+                            return value
+                    return False
+                else:
+                    return value
+            return False
+    return False
+";
+    for asynchronous in [false, true] {
+        for iterated in [false, true] {
+            for prefixed in [false, true] {
+                for returned in ["False", "True"] {
+                    let mut source = source.replace("return False", &format!("return {returned}"));
+                    if asynchronous {
+                        source = source.replace("def sample", "async def sample");
+                        for call in ["work(value)", "retry(value)", "fallback(value)"] {
+                            source = source.replace(call, &format!("await {call}"));
+                        }
+                    }
+                    if !prefixed {
+                        source = source.replace("                            report(value)\n", "");
+                    }
+                    if !iterated {
+                        let mut dedented = String::with_capacity(source.len());
+                        for line in source.lines() {
+                            if line == "    for value in items:" {
+                                continue;
+                            }
+                            let line = if line.starts_with("        ") {
+                                &line[4..]
+                            } else {
+                                line
+                            };
+                            writeln!(dedented, "{line}").unwrap();
+                        }
+                        source = dedented;
+                    }
+                    assert_matches_cpython(
+                        &source,
+                        &format!(
+                            "named_boolean_return_{asynchronous}_{iterated}_{prefixed}_{returned}.py"
+                        ),
+                        &LEVELS,
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn three_handler_returns_preserve_each_outer_cleanup_owner() {
+    let source = r"def sample(value):
+    try:
+        work(value)
+    except TypeError:
+        try:
+            retry(value)
+        except TypeError:
+            try:
+                fallback(value)
+            except Exception:
+                return recover(value)
+";
+    for asynchronous in [false, true] {
+        for named in [false, true] {
+            for returned in ["recover(value)", "value"] {
+                let mut source =
+                    source.replace("return recover(value)", &format!("return {returned}"));
+                if asynchronous {
+                    source = source.replace("def sample", "async def sample");
+                    for call in ["work(value)", "retry(value)", "fallback(value)"] {
+                        source = source.replace(call, &format!("await {call}"));
+                    }
+                }
+                if named {
+                    source = source.replace("except Exception:", "except Exception as error:");
+                }
+                assert_matches_cpython(&source, "three_handler_return.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn three_handler_returns_preserve_owners_before_iterator_cleanup() {
+    let source = r"def sample(values):
+    for value in values:
+        try:
+            work(value)
+        except TypeError:
+            try:
+                retry(value)
+            except TypeError:
+                try:
+                    fallback(value)
+                except Exception:
+                    return recover(value)
+";
+    for asynchronous in [false, true] {
+        for named in [false, true] {
+            for returned in ["recover(value)", "value"] {
+                let mut source =
+                    source.replace("return recover(value)", &format!("return {returned}"));
+                if asynchronous {
+                    source = source.replace("def sample", "async def sample");
+                    for call in ["work(value)", "retry(value)", "fallback(value)"] {
+                        source = source.replace(call, &format!("await {call}"));
+                    }
+                }
+                if named {
+                    source = source.replace("except Exception:", "except Exception as error:");
+                }
+                assert_matches_cpython(&source, "three_handler_iterator_return.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
 fn boolean_handler_returns_preserve_shared_finally_borrows() {
     let source = r"def sample(item):
     target = None
