@@ -9041,7 +9041,7 @@ impl<'source> Compiler<'source> {
                 // A return pops inner try blocks before discarding an iterator from an
                 // enclosing handler. Preserve each loop's exception depth during that unwind.
                 let tracks_handler_iterator_region_unwinds = !return_is_overridden
-                    && handler_count == 1
+                    && handler_count > 0
                     && self.control.withs.active_with_exits.is_empty()
                     && self
                         .control

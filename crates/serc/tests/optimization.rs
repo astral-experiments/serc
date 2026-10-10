@@ -4635,6 +4635,58 @@ fn following_name_return_with_copied_cleanup() {
 }
 
 #[test]
+fn nested_handler_iterator_returns_end_inner_try_ownership() {
+    let source = r"def sample(items, first, second, choose):
+    try:
+        return first()
+    except Error as error:
+        try:
+            return second()
+        except Error:
+            for item in items:
+                try:
+                    return choose(item)
+                except Error:
+                    continue
+            return None
+";
+    for source in [
+        source.to_owned(),
+        source.replace("except Error as error:", "except Error:"),
+        source.replacen("except Error:\n", "except Error as inner:\n", 1),
+        source.replace("return choose(item)", "return item"),
+        source.replace("return choose(item)", "return"),
+        source.replace("def sample", "async def sample"),
+        source.replacen("    try:\n", "    yield None\n    try:\n", 1),
+    ] {
+        assert_matches_cpython(&source, "nested_handler_iterator_return.py", &LEVELS);
+    }
+    for source in [
+        r"def sample(items, choose):
+    for item in items:
+        try:
+            return choose(item)
+        except Error:
+            continue
+    return None
+",
+        r"def sample(items, first, choose):
+    try:
+        return first()
+    except Error as error:
+        for item in items:
+            try:
+                return choose(item)
+            except Error:
+                continue
+        return None
+",
+    ] {
+        assert_matches_cpython(source, "handler_iterator_return_control.py", &LEVELS);
+    }
+}
+
+#[test]
 fn nested_handler_returns_preserve_outer_finalizer_owners() {
     let source = r"def nested_handlers(choice, item, owner, operation, cleanup, recover):
     value = None
