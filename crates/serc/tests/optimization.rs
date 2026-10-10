@@ -15,6 +15,24 @@ use serc::{
 };
 
 #[test]
+fn awaited_store_before_asserted_else_keeps_continuation_reachable() {
+    let source = "async def sample(owner, status, handled):\n    try:\n        response = await owner.update()\n    except Error as error:\n        response = None\n    else:\n        assert status is None\n    if handled:\n        owner.first()\n    else:\n        owner.second()\n";
+    for source in [
+        source.to_owned(),
+        source.replace(
+            "        response = None",
+            "        assert error.status == status\n        response = None",
+        ),
+        source.replace(
+            "owner.update()",
+            "owner.update(payload=owner.payload, source=owner.source)",
+        ),
+    ] {
+        assert_matches_cpython(&source, "awaited_store_asserted_else.py", &LEVELS);
+    }
+}
+
+#[test]
 fn managed_guarded_iterator_cleanup_keeps_normal_entry_reachable() {
     let source = "async def sample(owner, runs, capture, retry, error):\n    async with await owner.start() as environment:\n        async with owner.worker(environment, handlers=[owner.first, owner.failed if error is not None else owner.recover]), owner.worker(environment):\n            for index in range(runs):\n                try:\n                    owner.results.append(result)\n                except Failed as failure:\n                    if not retry or index + 1 >= runs:\n                        raise\n                finally:\n                    if capture:\n                        for event in events:\n                            if not event.has('task'):\n                                continue\n                            if event.kind != 'read':\n                                continue\n";
     for source in [
