@@ -9053,41 +9053,40 @@ impl<'source> Compiler<'source> {
                                             .active_exception_region_exclusions
                                             .len()
                             }));
-                // The outer async manager stays active after its retry iterator is
+                // The outer manager stays active after its retry iterator is
                 // discarded. The ordinary try inside that iterator must already end,
-                // after the named handler has restored its exception state.
-                let handler_try_below_async_manager = self.unit.flags
-                    & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                    == CO_COROUTINE
-                    && self.control.exceptions.active_try_marker_slots.len() == 1
-                    && self
-                        .control
-                        .exceptions
-                        .active_exception_region_exclusions
-                        .len()
-                        == 2
-                    && matches!(
-                        (
-                            self.control.exceptions.active_exception_handlers.as_slice(),
-                            self.control.loops.contexts.as_slice(),
-                            self.control.withs.active_with_exits.as_slice(),
-                        ),
-                        ([handler], [iterator], [manager])
-                            if handler.name.is_some()
-                                && handler.with_depth == 1
-                                && handler.loop_depth == 1
-                                && handler.try_body_depth == 1
-                                && handler.exception_region_depth == 1
-                                && iterator.iterator_cleanup == IteratorCleanup::Sync
-                                && !iterator.has_orelse
-                                && iterator.with_depth == 1
-                                && iterator.finally_end_depth == 0
-                                && iterator.exception_region_depth == 0
-                                && manager.is_async
-                                && manager.loop_depth == 0
-                                && manager.exception_region_depth == 0
-                                && manager.normal_finally_depth == 0
-                    );
+                // after the named handler has restored its exception state. Literal
+                // returns need the same boundaries without a preserved stack value.
+                let handler_try_below_manager =
+                    self.control.exceptions.active_try_marker_slots.len() == 1
+                        && self
+                            .control
+                            .exceptions
+                            .active_exception_region_exclusions
+                            .len()
+                            == 2
+                        && matches!(
+                            (
+                                self.control.exceptions.active_exception_handlers.as_slice(),
+                                self.control.loops.contexts.as_slice(),
+                                self.control.withs.active_with_exits.as_slice(),
+                            ),
+                            ([handler], [iterator], [manager])
+                                if handler.name.is_some()
+                                    && handler.with_depth == 1
+                                    && handler.loop_depth == 1
+                                    && handler.try_body_depth == 1
+                                    && handler.exception_region_depth == 1
+                                    && iterator.iterator_cleanup == IteratorCleanup::Sync
+                                    && !iterator.has_orelse
+                                    && iterator.with_depth == 1
+                                    && iterator.finally_end_depth == 0
+                                    && iterator.exception_region_depth == 0
+                                    && (manager.is_async || !preserve_tos)
+                                    && manager.loop_depth == 0
+                                    && manager.exception_region_depth == 0
+                                    && manager.normal_finally_depth == 0
+                        );
                 // A bare return still restores its handler before retiring the two ordinary
                 // tries that enclose it. Their collectors end independently at iterator
                 // disposal and at the final return, even without a preserved stack value.
@@ -9117,12 +9116,14 @@ impl<'source> Compiler<'source> {
                 // Preserve the existing older-iterator path, and also track an ordinary try
                 // when another try entered inside the handler must unwind before POP_EXCEPT.
                 let tracks_handler_enclosing_try_unwinds = !return_is_overridden
-                    && (preserve_tos || bare_handler_return_inside_two_tries)
+                    && (preserve_tos
+                        || bare_handler_return_inside_two_tries
+                        || handler_try_below_manager)
                     && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
                     && (handler_count == 1 || nested_handlers_inside_older_iterator)
                     && self.control.exceptions.active_exception_group_handlers == 0
                     && (self.control.withs.active_with_exits.is_empty()
-                        || handler_try_below_async_manager)
+                        || handler_try_below_manager)
                     && self
                         .control
                         .finally

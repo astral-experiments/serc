@@ -2473,6 +2473,40 @@ fn compound_finalizer_conditions_preserve_retired_handler_slots() {
 }
 
 #[test]
+fn literal_handler_returns_retire_inner_try_before_managed_iterator() {
+    let source = r"def sample(items, flag):
+    with manager():
+        for item in items:
+            try:
+                try:
+                    work(item)
+                except ValueError as error:
+                    if flag:
+                        return 7
+                    continue
+            except TypeError:
+                raise
+    raise RuntimeError
+";
+    for context in ["ordinary", "coroutine", "async_manager"] {
+        let mut source = source.to_owned();
+        if context != "ordinary" {
+            source = source.replace("def sample", "async def sample");
+        }
+        if context == "async_manager" {
+            source = source.replace("with manager():", "async with manager():");
+        }
+        for returned in ["return 7", "return None", "return"] {
+            assert_matches_cpython(
+                &source.replace("return 7", returned),
+                "managed_handler_return.py",
+                &LEVELS,
+            );
+        }
+    }
+}
+
+#[test]
 fn handler_return_keeps_outer_finalizer_owner_through_iterator_cleanup() {
     let source = r"async def sample(items, flag):
     try:
