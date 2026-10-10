@@ -4908,7 +4908,7 @@ impl OptimizationPipeline {
                     &self.exception_owner_provenance.block_boundaries,
                     &mut self.borrow_authored_finally_break_origins,
                 );
-            if !self.borrow_jump_entry_labels.is_empty() {
+            if !self.borrow_unreachable_blocks.is_empty() {
                 self.borrow_pre_copy_jump_entries =
                     Self::take_pre_copy_borrow_entries_with_threaded(
                         graph,
@@ -5038,7 +5038,7 @@ impl OptimizationPipeline {
                 &self.exception_owner_provenance.block_boundaries,
                 &mut self.borrow_authored_finally_break_origins,
             );
-        if !self.borrow_jump_entry_labels.is_empty() {
+        if !self.borrow_unreachable_blocks.is_empty() {
             // These are still the pre-copy blocks, including labels just assigned to
             // implicit entries. Every subsequently copied block receives fresh labels.
             self.borrow_pre_copy_jump_entries = Self::take_pre_copy_borrow_entries_with_threaded(
