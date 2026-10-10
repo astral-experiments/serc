@@ -4643,6 +4643,66 @@ fn handler_raising_while_else_preserves_break_cleanup() {
 }
 
 #[test]
+fn starred_mapping_capture_cleanups_apply_static_swaps() {
+    let source = r#"def probe(value):
+    match value:
+        case {"box": {"items": [*items]} as record}:
+            return items is not None and record is not None
+    return False
+"#;
+    for scalar in [false, true] {
+        for guarded in [false, true] {
+            let mut source = source.to_owned();
+            if scalar {
+                source = source.replace("\"items\":", "\"kind\": kind, \"items\":");
+            }
+            if guarded {
+                source = source.replace(
+                    " as record}:",
+                    " as record} if (\n            len(items) > 0\n        ):",
+                );
+            }
+            assert_matches_cpython(
+                &source,
+                &format!("starred_mapping_capture_{scalar}_{guarded}.py"),
+                &LEVELS,
+            );
+        }
+    }
+}
+
+#[test]
+fn multiline_mapping_capture_cleanups_apply_static_swaps() {
+    for guard in ["", " if record.get(\"extra\") is None"] {
+        let source = format!(
+            r#"def sample(data, mode):
+    match data:
+        case {{
+            "kind": "item",
+            "payload": {{"active": True, "items": [{{"kind": "text", "value": str(value)}}]}} as record,
+        }}{guard}:
+            return value == "absent" or (mode == "read" and value == "unknown")
+    return False
+"#
+        );
+        assert_matches_cpython(&source, "multiline_mapping_capture_cleanup.py", &LEVELS);
+    }
+}
+
+#[test]
+fn composed_mapping_capture_cleanups_apply_static_swaps() {
+    for pattern in [
+        "{\"number\": int(number), \"value\": str(value)} as record",
+        "{\"payload\": {\"number\": int(number), \"value\": str(value)} as record}",
+    ] {
+        let source = format!(
+            "def sample(data):\n    match data:\n        case {pattern}:\n            return accept(number, value, record)\n    return False\n"
+        );
+        assert_matches_cpython(&source, "mapping_capture_cleanup.py", &LEVELS);
+    }
+}
+
+#[test]
 fn unnamed_handler_match_cleanup_preserves_success_edges() {
     let source = r"async def handler_match(owner, kinds, operation, sink, choice):
     result = None
