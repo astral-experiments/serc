@@ -8557,6 +8557,7 @@ impl<'source> Compiler<'source> {
                     && !tracks_two_handlers_inside_ordinary_try
                     && self.plain_handler_chain_has_outer_try();
                 let mut protected_outer_pop_except_start = None;
+                let mut preserves_managed_handler_try_pops = false;
                 let mut next_loop =
                     loops_before_finally_end.unwrap_or(self.control.loops.contexts.len());
                 let mut with_unwind_before_exception_start = with_unwind_starts.len();
@@ -9589,6 +9590,43 @@ impl<'source> Compiler<'source> {
                             )?;
                             deferred_finally_end_marked = true;
                         }
+                        // An ordinary try between this handler and its finally still owns
+                        // POP_EXCEPT and any exception-name clearing. Keep that owner
+                        // until its finally starts, including after an inner manager exit.
+                        let enclosing_try_owns_pop_except = handler_count == 1
+                            && next_finally > 0
+                            && next_finally == return_finally_contexts.len()
+                            && next_with == with_depth
+                            && self
+                                .control
+                                .loops
+                                .contexts
+                                .iter()
+                                .all(|context| context.iterator_cleanup == IteratorCleanup::None)
+                            && self.control.exceptions.active_exception_group_handlers == 0
+                            && self.control.finally.active_finally_end_blocks == 0
+                            && self.control.finally.active_normal_finally_bodies == 0
+                            && return_finally_contexts[next_finally - 1].handler_depth == 0
+                            && return_finally_contexts[next_finally - 1].with_depth == with_depth
+                            && return_finally_contexts[next_finally - 1].exception_region_depth + 2
+                                == region_depth
+                            && self
+                                .control
+                                .exceptions
+                                .active_exception_region_exclusions
+                                .len()
+                                == region_depth + 1
+                            && self.control.withs.active_with_exits[with_depth..]
+                                .iter()
+                                .all(|manager| manager.exception_region_depth == region_depth + 1)
+                            && handler_region_unwind_starts
+                                .as_ref()
+                                .and_then(|starts| starts.get(region_depth - 1))
+                                .is_some_and(Option::is_none);
+                        preserves_managed_handler_try_pops |= enclosing_try_owns_pop_except
+                            && name.is_none()
+                            && return_finally_contexts.len() == 1
+                            && with_depth < self.control.withs.active_with_exits.len();
                         let preserve_named_handler_pop_slots = name.is_some()
                             && handler_count == 1
                             && next_finally > 0
@@ -9778,7 +9816,9 @@ impl<'source> Compiler<'source> {
                         if let Some(region_starts) = &mut handler_region_unwind_starts {
                             let start = self.assembler.label();
                             self.assembler.mark(start);
-                            if preserves_enclosing_try_return_owner {
+                            if preserves_enclosing_try_return_owner
+                                || preserves_managed_handler_try_pops
+                            {
                                 // This unwind label stays in the handler's original block.
                                 // It must not hide the later ordinary-try POP_BLOCK slots.
                                 self.assembler.record_exception_owner_continuation(start);
@@ -9830,39 +9870,6 @@ impl<'source> Compiler<'source> {
                                 || unwinds_plain_nested_handlers
                                 || (unwinds_named_outer_unnamed_handlers && handler_index == 2)
                                 || iterator_between_unnamed_handlers);
-                        // An ordinary try between this handler and its finally still owns
-                        // POP_EXCEPT and any exception-name clearing. Keep that owner
-                        // until its finally starts, including after an inner manager exit.
-                        let enclosing_try_owns_pop_except = handler_count == 1
-                            && next_finally > 0
-                            && next_finally == return_finally_contexts.len()
-                            && next_with == with_depth
-                            && self
-                                .control
-                                .loops
-                                .contexts
-                                .iter()
-                                .all(|context| context.iterator_cleanup == IteratorCleanup::None)
-                            && self.control.exceptions.active_exception_group_handlers == 0
-                            && self.control.finally.active_finally_end_blocks == 0
-                            && self.control.finally.active_normal_finally_bodies == 0
-                            && return_finally_contexts[next_finally - 1].handler_depth == 0
-                            && return_finally_contexts[next_finally - 1].with_depth == with_depth
-                            && return_finally_contexts[next_finally - 1].exception_region_depth + 2
-                                == region_depth
-                            && self
-                                .control
-                                .exceptions
-                                .active_exception_region_exclusions
-                                .len()
-                                == region_depth + 1
-                            && self.control.withs.active_with_exits[with_depth..]
-                                .iter()
-                                .all(|manager| manager.exception_region_depth == region_depth + 1)
-                            && handler_region_unwind_starts
-                                .as_ref()
-                                .and_then(|starts| starts.get(region_depth - 1))
-                                .is_some_and(Option::is_none);
                         let live_manager_handler_try_owner = preserves_manager_handler_try_owner
                             && next_finally == return_finally_contexts.len()
                             && next_with == with_depth
@@ -11130,6 +11137,7 @@ impl<'source> Compiler<'source> {
                     }
                     if preserves_enclosing_try_return_owner
                         || preserves_handler_iterator_try_pop_slots
+                        || preserves_managed_handler_try_pops
                     {
                         // After handler and iterator cleanup, ordinary tries unwind
                         // before this finally.
@@ -11143,6 +11151,10 @@ impl<'source> Compiler<'source> {
                         let ordinary_try_count = handler.exception_region_depth
                             - finally_context.exception_region_depth
                             - 1;
+                        if preserves_managed_handler_try_pops && ordinary_try_count == 1 {
+                            copied_return_none_pop_pair =
+                                Some((self.assembler.item_count(), false));
+                        }
                         for _ in 0..ordinary_try_count {
                             self.emit_with_exception_policy(
                                 NOP,

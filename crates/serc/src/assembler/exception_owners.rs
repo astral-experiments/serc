@@ -12783,8 +12783,28 @@ impl LayoutAssembler {
             } else {
                 0
             };
+            // A linear try-else exit transfers one removed POP to this exact
+            // successor. Its captured boundary certifies that separate NULL cell.
+            let linear_try_pop_slots = usize::from(
+                authored_return_slots == 0
+                    && literal_slots == 0
+                    && instruction.local_policy.hidden_exception_owner_slots() == 1
+                    && self
+                        .exception_owner_provenance
+                        .removed_pop_block_boundaries
+                        .iter()
+                        .filter(|label| positions.get(label) == Some(&(array_start + offset)))
+                        .map(|label| {
+                            self.exception_owner_provenance
+                                .removed_pop_block_widths
+                                .get(label)
+                                .copied()
+                                .unwrap_or(1)
+                        })
+                        .eq([1]),
+            );
             if usize::from(instruction.local_policy.hidden_exception_owner_slots())
-                != authored_return_slots + literal_slots
+                != authored_return_slots + literal_slots + linear_try_pop_slots
                 || usize::from(instruction.pre_fold_extra_instructions()) != literal_slots
                 || (instruction.exception_policy() != super::ExceptionPolicy::NoneUnchanged
                     && !origin
@@ -13752,6 +13772,149 @@ mod tests {
                 matches!(change, "original" | "copied"),
                 "{change}",
             );
+        }
+    }
+
+    #[test]
+    fn manager_return_prefix_requires_one_exact_linear_try_pop() {
+        use super::{CopiedManagerReturnCompaction, ExceptionOwnerProvenance, OwnerLabelPositions};
+        use crate::assembler::{
+            ExceptionPolicy, ExceptionRegion, ExceptionRegionPriority, Instruction, Item, Label,
+            LayoutAssembler, Operand, SourceLocation,
+        };
+        use crate::target::opcodes::{
+            CALL, LOAD_CONST, LOAD_FAST, NOP, NOT_TAKEN, POP_JUMP_IF_NONE, POP_TOP, SWAP,
+        };
+
+        for change in [
+            "unchanged",
+            "absent",
+            "moved",
+            "aliased",
+            "hidden",
+            "folded",
+            "wider pop",
+        ] {
+            let entry = Label::from_u32(0);
+            let end = Label::from_u32(1);
+            let target = Label::from_u32(2);
+            let alias = Label::from_u32(3);
+            let location = SourceLocation::new(4, 4, 8, 12);
+            let plain = |opcode, operand| Instruction::new(opcode, operand, location, None);
+            let mut prefix = plain(LOAD_FAST, Operand::Value(0));
+            prefix
+                .local_policy
+                .add_hidden_exception_owner_slots(if change == "hidden" { 2 } else { 1 });
+            if change == "folded" {
+                prefix.add_pre_fold_extra_instructions(1);
+            }
+            let cleanup = [
+                (SWAP, 3),
+                (SWAP, 2),
+                (LOAD_CONST, 0),
+                (LOAD_CONST, 0),
+                (LOAD_CONST, 0),
+                (CALL, 3),
+                (POP_TOP, 0),
+            ]
+            .map(|(opcode, argument)| plain(opcode, Operand::Value(argument)));
+            let mut pop = plain(NOP, Operand::Value(0));
+            pop.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
+            pop.fusion_policy.mark_converted_pop_block();
+            let load = plain(LOAD_FAST, Operand::Value(1));
+            let mut live_load = load;
+            live_load.local_policy.add_hidden_exception_owner_slots(1);
+            let mut condition = plain(POP_JUMP_IF_NONE, Operand::Forward(target));
+            condition.local_policy.add_hidden_exception_owner_slots(3);
+            let mut items = vec![
+                Item::Label(entry),
+                Item::Label(alias),
+                Item::Instruction(prefix),
+            ];
+            items.extend(cleanup.into_iter().map(Item::Instruction));
+            items.extend([
+                Item::Label(end),
+                Item::Instruction(live_load),
+                Item::Instruction(condition),
+                Item::Instruction(plain(NOT_TAKEN, Operand::Value(0))),
+                Item::Label(target),
+            ]);
+            let boundaries = match change {
+                "absent" => vec![],
+                "moved" => vec![end],
+                "aliased" => vec![entry, alias],
+                _ => vec![entry],
+            };
+            let assembler = LayoutAssembler {
+                python_version: crate::PythonVersion::Py314,
+                legacy_uniform_jump_seed: false,
+                items,
+                exception_regions: vec![ExceptionRegion {
+                    start: entry,
+                    end,
+                    target,
+                    depth: 0,
+                    preserve_lasti: false,
+                    is_scope_fallback: false,
+                    priority: ExceptionRegionPriority::OriginalRange(entry, end),
+                }],
+                exception_owner_provenance: Box::new(ExceptionOwnerProvenance {
+                    removed_pop_block_boundaries: boundaries.into_iter().collect(),
+                    removed_pop_block_widths: if change == "wider pop" {
+                        [(entry, 2)].into_iter().collect()
+                    } else {
+                        rustc_hash::FxHashMap::default()
+                    },
+                    copied_manager_return_compactions: vec![CopiedManagerReturnCompaction {
+                        ordinary_try_pops: 1,
+                        retained_outer_handler: None,
+                        cleanup: cleanup.to_vec(),
+                        earlier_cleanup: None,
+                        named_handler_cleanup: None,
+                        constant_return_prefix: None,
+                        to_bool: None,
+                        pop,
+                        load,
+                        condition,
+                    }],
+                    ..ExceptionOwnerProvenance::default()
+                })
+                .into(),
+                preserved_block_boundaries: rustc_hash::FxHashSet::default(),
+                removed_max_depth: None,
+                next_label: 4,
+                has_next_location: false,
+            };
+            let mut instructions = Vec::new();
+            let mut positions = OwnerLabelPositions::new(assembler.items.len());
+            for item in &assembler.items {
+                match item {
+                    Item::Label(label) => {
+                        positions.insert(*label, instructions.len());
+                    }
+                    Item::Instruction(instruction) => instructions.push(instruction),
+                }
+            }
+            let decision = assembler.copied_manager_return_compaction_owner(
+                10,
+                0,
+                ExceptionOwnerTail {
+                    early_removals: 5,
+                    ..ExceptionOwnerTail::default()
+                },
+                &instructions,
+                &positions,
+                &[target].into_iter().collect(),
+                false,
+            );
+            assert_eq!(decision.is_some(), change == "unchanged", "{change}");
+            if let Some(decision) = decision {
+                assert!(
+                    decision.is_definitive()
+                        && decision.overrides_existing()
+                        && !decision.has_owner()
+                );
+            }
         }
     }
 
