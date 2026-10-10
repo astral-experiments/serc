@@ -29378,6 +29378,44 @@ impl<'source> Compiler<'source> {
                 self.assembler
                     .mark_borrow_empty_block_if_unretained(normal_exit);
             }
+            if self.context.python_version == crate::PythonVersion::Py314
+                && matches!(self.unit.scope, Scope::Function { .. })
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                    == CO_COROUTINE
+                && self.control.finally.active_copied_finally_bodies == 1
+                && self.control.finally.active_normal_finally_bodies == 0
+                && self.control.finally.active_finally_end_blocks == 0
+                && self.control.finally.active_overriding_finally_returns == 0
+                && self.control.finally.copied_return_finally_preserved_values == 0
+                && self
+                    .control
+                    .finally
+                    .preserved_return_value_contexts
+                    .is_empty()
+                && self.control.finally.copied_finally_tail == Some(statement.range)
+                && self.control.loops.contexts.len() == 1
+                && self.control.finally.copied_return_finally_loop_depth
+                    == Some(self.control.loops.contexts.len())
+                && self.control.loops.contexts[0].iterator_cleanup != IteratorCleanup::Async
+                && self.control.withs.active_with_exits.is_empty()
+                && self.control.withs.active_with_region_exclusions.is_empty()
+                && self.control.exceptions.active_exception_handlers.is_empty()
+                && self.control.exceptions.active_exception_group_handlers == 0
+                && self.control.finally.active_return_finally_contexts.len() == 1
+                && self.control.finally.active_loop_finally_contexts.len() == 1
+                && self.control.finally.active_finally_try_bodies == 1
+                && body_noop_location.is_none()
+                && orelse_noop_location.is_none()
+                && !body_ends_in_nop
+                && !normal_exit_ends_in_nop
+                && suite_ends_in_empty_try_exit_block(normal_exit_suite, loop_tail.is_some())
+                && copied_guarded_recovery_has_empty_exit(statement)
+            {
+                // The copied recovery's original normal exit empties before the
+                // outer return cleanup. A retained NOP still makes it traversable.
+                self.assembler
+                    .mark_borrow_empty_block_if_unretained(normal_exit);
+            }
             if handlers_terminate
                 && statement.orelse.is_empty()
                 && statement.finalbody.is_empty()
@@ -46915,6 +46953,138 @@ fn suite_ends_in_empty_try_exit_block(body: &[Stmt], loop_tail: bool) -> bool {
             statement.orelse.is_empty() && condition_jump_target_count(&statement.test, false) > 1
         }
         _ => false,
+    }
+}
+
+fn copied_guarded_recovery_has_empty_exit(statement: &ruff_python_ast::StmtTry) -> bool {
+    if statement.is_star || !statement.orelse.is_empty() || !statement.finalbody.is_empty() {
+        return false;
+    }
+    let [handler] = statement.handlers.as_slice() else {
+        return false;
+    };
+    let Some(handler) = handler.as_except_handler() else {
+        return false;
+    };
+    if !handler.type_.as_ref().is_some_and(|kind| {
+        !expression_contains_inline_branch(kind)
+            && !expression_suspends_current_scope(kind)
+            && !expression_yields_in_current_scope(kind)
+    }) || !suite_has_nonsuspending_linear_fallthrough(&handler.body)
+    {
+        return false;
+    }
+    let [Stmt::If(guard)] = statement.body.as_slice() else {
+        return false;
+    };
+    if !guard.elif_else_clauses.is_empty()
+        || !condition_has_only_runtime_tests(&guard.test)
+        || expression_contains_inline_branch(&guard.test)
+        || expression_suspends_current_scope(&guard.test)
+        || expression_yields_in_current_scope(&guard.test)
+    {
+        return false;
+    }
+    let [Stmt::Expr(cleanup)] = guard.body.as_slice() else {
+        return false;
+    };
+    let call = match cleanup.value.as_ref() {
+        call @ Expr::Call(_) => call,
+        Expr::Await(awaited) if matches!(awaited.value.as_ref(), Expr::Call(_)) => &awaited.value,
+        _ => return false,
+    };
+    !expression_contains_inline_branch(call)
+        && !expression_suspends_current_scope(call)
+        && !expression_yields_in_current_scope(call)
+}
+
+#[cfg(test)]
+mod copied_guarded_recovery_exit_tests {
+    use ruff_python_ast::Stmt;
+    use ruff_python_parser::parse_module;
+
+    const SOURCE: &str = "try:\n    if resource is not None:\n        await resource.flush()\nexcept Error as error:\n    note(error)\n";
+
+    fn admitted(source: &str) -> bool {
+        let parsed = parse_module(source).unwrap();
+        let Stmt::Try(statement) = &parsed.suite()[0] else {
+            panic!("expected try");
+        };
+        super::copied_guarded_recovery_has_empty_exit(statement)
+    }
+
+    #[test]
+    fn retains_only_linear_guarded_recovery_exits() {
+        assert!(admitted(SOURCE));
+        for (old, new, expected) in [
+            ("resource is not None", "resource", true),
+            ("resource is not None", "ready(resource)", true),
+            ("await resource.flush()", "resource.flush()", true),
+            ("except Error as error:", "except Error:", true),
+            ("note(error)", "note(error)\n    report(error)", true),
+            ("note(error)", "note(lambda: (yield error))", true),
+            ("resource is not None", "True", false),
+            ("resource is not None", "resource and ready", false),
+            ("resource is not None", "await ready(resource)", false),
+            ("resource is not None", "(yield resource)", false),
+            ("resource.flush()", "resource.flush(await other())", false),
+            ("resource.flush()", "resource.flush((yield other))", false),
+            (
+                "resource.flush()",
+                "resource.flush(lambda x=(await other()): x)",
+                false,
+            ),
+            (
+                "resource.flush()",
+                "resource.flush(lambda x=(yield other): x)",
+                false,
+            ),
+            ("await resource.flush()", "return", false),
+            ("await resource.flush()", "pass", false),
+            (
+                "await resource.flush()",
+                "await resource.flush()\n        finish()",
+                false,
+            ),
+            ("except Error as error:", "except* Error as error:", false),
+            ("except Error as error:", "except:", false),
+            (
+                "except Error as error:",
+                "except (await kind()) as error:",
+                false,
+            ),
+            (
+                "except Error as error:",
+                "except (yield kind) as error:",
+                false,
+            ),
+            (
+                "except Error as error:",
+                "except kind(lambda x=(await other()): x) as error:",
+                false,
+            ),
+            (
+                "except Error as error:",
+                "except kind(lambda x=(yield other): x) as error:",
+                false,
+            ),
+            ("note(error)", "await note(error)", false),
+            ("note(error)", "note(await other())", false),
+            ("note(error)", "note(lambda x=(await other()): x)", false),
+            ("note(error)", "note(lambda x=(yield other): x)", false),
+            ("note(error)", "return", false),
+            ("note(error)", "pass", false),
+        ] {
+            let source = SOURCE.replace(old, new);
+            assert_eq!(admitted(&source), expected, "{source}");
+        }
+        for suffix in [
+            "except Other:\n    recover()\n",
+            "else:\n    completed()\n",
+            "finally:\n    completed()\n",
+        ] {
+            assert!(!admitted(&format!("{SOURCE}{suffix}")));
+        }
     }
 }
 

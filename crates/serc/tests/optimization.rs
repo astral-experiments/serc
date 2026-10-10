@@ -7365,6 +7365,46 @@ def run(flag, take, note):
 }
 
 #[test]
+fn copied_guarded_recovery_preserves_outer_cleanup_borrow_boundary() {
+    let source = r"async def sample(resource, values, operation, note):
+    try:
+        for value in values:
+            try:
+                await operation()
+                return
+            except ValueError as error:
+                note(error)
+            finally:
+                try:
+                    if resource is not None:
+                        await resource.flush()
+                except ValueError as error:
+                    note(error)
+    finally:
+        await resource.close()
+";
+    for named in [false, true] {
+        for iterator in [false, true] {
+            for awaited in [false, true] {
+                let mut source = source.to_owned();
+                if !named {
+                    source = source
+                        .replace("except ValueError as error:", "except ValueError:")
+                        .replace("note(error)", "note()");
+                }
+                if !iterator {
+                    source = source.replace("for value in values:", "while values:");
+                }
+                if !awaited {
+                    source = source.replace("await resource.flush()", "resource.flush()");
+                }
+                assert_matches_cpython(&source, "copied_guarded_recovery.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
 fn copied_nested_recovery_preserves_borrow_boundary() {
     let source = r"
 def run(flag, load, note):
