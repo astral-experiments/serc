@@ -4243,6 +4243,145 @@ fn conditional_manager_preserves_shared_subscript_return() {
 }
 
 #[test]
+fn retired_managed_handlers_keep_outer_try_ownership_for_finalizer_copies() {
+    let source = r#"async def sample(items, flag, resource, logger, parser):
+    try:
+        if flag:
+            try:
+                for item in items:
+                    try:
+                        if flag:
+                            return result("early")
+                        async with manage(item):
+                            async for entry in entries:
+                                try:
+                                    value = parser.read(entry)
+                                except (ValueError, TypeError):
+                                    reason = "left" if parser.check(parser.option("mode", default="")) else "right"
+                                    logger.record("failure", reason)
+                                    return result("failed")
+                                logger.record(entry, value)
+                                if flag:
+                                    return result("done")
+                        if flag:
+                            return result("finished")
+                        resource.count += 1
+                    finally:
+                        try:
+                            await resource.finish()
+                        except OSError:
+                            await resource.recover()
+                            raise
+                return result("empty")
+            except Exception:
+                logger.record("outer", flag)
+                return result("recovered")
+        return result("skipped")
+    except BaseException:
+        logger.record("final", flag)
+        return result("aborted")
+    finally:
+        logger.complete(resource)
+"#;
+    for asynchronous_manager in [false, true] {
+        for asynchronous_iterator in [false, true] {
+            for returned in ["value", "result(\"failed\")"] {
+                let mut source =
+                    source.replace("return result(\"failed\")", &format!("return {returned}"));
+                if !asynchronous_manager {
+                    source = source.replace("async with manage(item):", "with manage(item):");
+                }
+                if !asynchronous_iterator {
+                    source = source.replace("async for entry in entries:", "for entry in entries:");
+                }
+                assert_matches_cpython(
+                    &source,
+                    &format!(
+                        "retired_handler_{asynchronous_manager}_{asynchronous_iterator}_{returned}.py"
+                    ),
+                    &LEVELS,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn nested_tries_own_copied_finalizer_handler_cleanup() {
+    let source = r"async def sample(items, flag):
+    try:
+        if flag:
+            try:
+                for item in items:
+                    try:
+                        if flag:
+                            return result(False)
+                        await work(item)
+                        return result(True)
+                    finally:
+                        try:
+                            await finish(item)
+                        except ValueError:
+                            await recover(item)
+                            raise
+                return result(None)
+            except Exception:
+                report()
+                return result(False)
+        return result(None)
+    except BaseException:
+        report()
+        return result(False)
+    finally:
+        complete()
+";
+    for asynchronous in [false, true] {
+        for raising in [false, true] {
+            for (managed, iterated) in [(false, false), (true, false), (false, true), (true, true)]
+            {
+                let mut source = source.to_string();
+                if iterated {
+                    source = source.replace(
+                        "                        return result(True)\n",
+                        "                        async for value in values:\n                            return result(True)\n",
+                    );
+                }
+                if managed {
+                    let body = if iterated {
+                        "                        async for value in values:\n                            return result(True)\n"
+                    } else {
+                        "                        return result(True)\n"
+                    };
+                    let mut replacement =
+                        String::from("                        async with manager():\n");
+                    for line in body.lines() {
+                        writeln!(replacement, "    {line}").unwrap();
+                    }
+                    source = source.replace(body, &replacement);
+                }
+                if !asynchronous {
+                    source = source
+                        .replace("async def", "def")
+                        .replace("async with", "with")
+                        .replace("async for", "for")
+                        .replace("await ", "");
+                }
+                if !raising {
+                    source = source.replace("                            raise\n", "");
+                }
+                assert_matches_cpython(
+                    &source,
+                    &format!(
+                        "nested_try_finalizer_cleanup_{asynchronous}_{raising}_{managed}_{iterated}.py"
+                    ),
+                    &LEVELS,
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn named_handler_returns_preserve_outer_finalizer_owners() {
     let source = r"def named_nested(choice, item, owner, operation, cleanup, recover):
     value = None
