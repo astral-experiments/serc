@@ -3512,6 +3512,95 @@ fn coroutine_asserted_recovery_preserves_borrowed_continuation() {
 }
 
 #[test]
+fn located_pass_arm_keeps_guarded_cleanup_reachable() {
+    let source = "async def sample(owner, error_type, status, observation):\n    try:\n        if error_type is not None:\n            pass\n        elif status is not None and 200 <= status < 300:\n            try:\n                valid = True\n            except (ValueError, DecodeError):\n                error_type = 'shape'\n        else:\n            error_type = 'status'\n    except CancelledError as error:\n        error_type = 'cancelled'\n    except TimeoutError:\n        error_type = 'timeout'\n    except ClientError as error:\n        error_type = type(error).__name__\n    except Exception as error:\n        error_type = type(error).__name__\n    finally:\n        if owner.observe is not None:\n            await owner.observe(observation)\n";
+    for source in [
+        source.to_owned(),
+        source
+            .replacen("    try:\n", "    elapsed = 0\n    started = clock()\n    try:\n        exchange = await owner.exchange()\n        status, raw = exchange.status, exchange.raw\n        error_type = exchange.error\n", 1)
+            .replace("                valid = True", "                parsed = decode(raw)\n                if not isinstance(parsed, dict):\n                    raise ValueError('not an object')\n                valid = True")
+            .replace("    finally:\n", "    finally:\n        if elapsed == 0:\n            elapsed = (clock() - started) * 1000\n        observation = Observe(status, error=error_type)\n"),
+    ] {
+        assert_matches_cpython(&source, "located_pass_cleanup.py", &LEVELS);
+    }
+}
+
+#[test]
+fn async_manager_raising_arm_keeps_cleanup_reachable() {
+    let source = "async def sample(role, timeout, receipt, allocations, stopped, profile):\n    try:\n        if role == 'primary':\n            async with deadline(timeout):\n                if not all(checks.get(key) for key in ('ready', 'done')):\n                    raise RuntimeError('incomplete result')\n        else:\n            async with deadline(timeout):\n                checks['complete'] = True\n    except Exception as error:\n        if isinstance(error, RemoteError):\n            receipt['failure']['code'] = error.code\n    finally:\n        if allocations is None and stopped:\n            if profile is not None and profile.exists():\n                remove_tree(profile)\n";
+    for source in [
+        source.to_owned(),
+        source
+            .replace("stopped, profile):", "stopped, profile, checks):")
+            .replace("            async with deadline(timeout):\n                if", "            stage = 'start'\n            session = Session()\n            async with deadline(timeout):\n                await session.start()\n                checks['ready'] = await session.run()\n                checks['allowed'] = not (session.failed or session.cancelled)\n                if")
+            .replace("                checks['complete'] = True", "                await finish()\n                if not checks['ready']:\n                    raise RuntimeError('not ready')\n                checks['complete'] = True")
+            .replace("    finally:\n", "    finally:\n        try:\n            await finish()\n        except Exception as error:\n            receipt['failure'] = type(error).__name__\n"),
+    ] {
+        assert_matches_cpython(&source, "async_manager_raising_arm.py", &LEVELS);
+    }
+}
+
+#[test]
+fn conditional_value_cleanup_keeps_live_elif_entry() {
+    let source = "def sample(owner, now, current, allowed):\n    if allowed and current >= owner.next_poll and owner.ready() and not owner.stopped():\n        try:\n            if owner.healthy:\n                if not (owner.error == 'retry' and current < owner.retry_after):\n                    owner.error = None\n            elif owner.selected:\n                owner.error = 'unavailable'\n        except Exception as error:\n            owner.healthy = False\n        finally:\n            owner.next_poll = (clock() if now is None else now) + owner.interval\n    owner.finish()\n    return True\n";
+    for source in [
+        source.to_owned(),
+        source
+            .replace("            if owner.healthy:\n", "            if not owner.selected:\n                if owner.enabled:\n                    owner.verify(current)\n                owner.poll(current)\n                owner.healthy = True\n            else:\n                assert owner.source is not None\n                if owner.enabled:\n                    owner.verify(current)\n                owner.healthy = owner.source.tick(current)\n                if owner.healthy:\n                    with owner.transaction():\n                        owner.update_health()\n            if owner.healthy:\n                owner.last_poll = current\n")
+            .replace("        except Exception as error:\n", "        except Exception as error:\n            owner.error = type(error).__name__\n"),
+    ] {
+        assert_matches_cpython(&source, "conditional_value_cleanup.py", &LEVELS);
+    }
+    assert_matches_cpython_versions(
+        &source.replace(
+            "not (owner.error == 'retry' and current < owner.retry_after)",
+            "False and owner.healthy",
+        ),
+        "folded_conditional_value_cleanup.py",
+        &LEVELS,
+        &[PythonVersion::Py314],
+    );
+}
+
+#[test]
+fn terminal_returning_alternative_keeps_guarded_cleanup_entry() {
+    let source = r#"async def sample(client, path):
+    for attempt in range(client.attempts):
+        complete = False
+        response = None
+        try:
+            response = await client.open()
+            if response.redirected:
+                raise RequestError("redirect")
+            if response.status in retryable:
+                if attempt == client.attempts:
+                    raise RequestError("exhausted")
+                retry_after = response.headers.get("retry")
+            else:
+                if response.status != 200:
+                    raise ValidationError()
+                with path.open("wb") as output:
+                    async for chunk in response.chunks():
+                        if len(chunk) > limit:
+                            raise ValidationError()
+                        output.write(chunk)
+                digest = await checksum(path)
+                complete = True
+                return result(attempt, digest)
+        except (RequestError, ValidationError) as error:
+            last_error = error
+        finally:
+            if not complete:
+                path.unlink(missing_ok=True)
+            if response is not None:
+                await response.close()
+"#;
+    assert_matches_cpython(source, "terminal_return_alternative.py", &LEVELS);
+    let ordinary = source.replace("async ", "").replace("await ", "");
+    assert_matches_cpython(&ordinary, "ordinary_return_alternative.py", &LEVELS);
+}
+
+#[test]
 fn finalizer_loop_empty_try_keeps_exception_owner() {
     for manager in ["", "with acquire():", "with acquire(), acquire():"] {
         for prefix in ["def", "async def"] {

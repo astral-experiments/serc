@@ -33223,10 +33223,12 @@ impl<'source> Compiler<'source> {
                             && compare.ops[..] == [CmpOp::IsNot]
                             && matches!(compare.comparators(), [Expr::NoneLiteral(_)]))
                     && suite_has_linear_borrow_fallthrough(&cleanup.body));
-        // A synchronous manager in a coroutine emits a located normal __exit__
-        // call after its terminal await. That original array can jump from a live
-        // conditional arm into normal cleanup; the suppression copy stays separate.
+        // A completed manager exit can jump from a live conditional arm into
+        // normal cleanup; exceptional and suppression copies stay separate.
         let coroutine_manager_arm_reaches_finally = |body: &[Stmt]| {
+            let Some((Stmt::With(manager), prefix)) = body.split_last() else {
+                return false;
+            };
             matches!(self.unit.scope, Scope::Function { .. })
                 && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                     == CO_COROUTINE
@@ -33240,27 +33242,51 @@ impl<'source> Compiler<'source> {
                 && !self.control.in_exception_handler()
                 && self.control.finally.active_copied_finally_bodies == 0
                 && self.control.finally.active_finally_try_bodies == 0
-                && matches!(body, [Stmt::With(manager)]
-                if !manager.is_async
-                    && manager.items.len() == 1
-                    && manager.items[0].optional_vars.is_none()
-                    && !expression_contains_inline_branch(&manager.items[0].context_expr)
-                    && !expression_suspends_current_scope(&manager.items[0].context_expr)
-                    && manager.body.split_last().is_some_and(|(last, leading)| {
-                        matches!(last, Stmt::Expr(expression)
+                && manager.items.len() == 1
+                && manager.items[0].optional_vars.is_none()
+                && !expression_contains_inline_branch(&manager.items[0].context_expr)
+                && !expression_suspends_current_scope(&manager.items[0].context_expr)
+                && if manager.is_async {
+                    self.context.python_version == crate::PythonVersion::Py314
+                        && (prefix.is_empty() || suite_has_linear_borrow_fallthrough(prefix))
+                        && matches!(manager.body.split_last(), Some((Stmt::If(guard), leading))
+                        if guard.elif_else_clauses.is_empty()
+                            && condition_has_completed_call_leaves(&guard.test, self.context.python_version)
+                            && !expression_suspends_current_scope(&guard.test)
+                            && original_condition_has_unique_jump_target(&guard.test, false)
+                            && suite_has_linear_raise_exit(&guard.body)
+                            && leading.iter().all(|part| {
+                                suite_has_linear_borrow_fallthrough(std::slice::from_ref(part))
+                                    || matches!(part, Stmt::Assign(assignment)
+                                        if condition_has_linear_runtime_leaves(&assignment.value)
+                                            && !expression_suspends_current_scope(&assignment.value)
+                                            && assignment.targets.iter().all(|target| {
+                                                !expression_contains_inline_branch(target)
+                                                    && !expression_suspends_current_scope(target)
+                                            }))
+                            }))
+                } else {
+                    prefix.is_empty()
+                        && manager.body.split_last().is_some_and(|(last, leading)| {
+                            matches!(last, Stmt::Expr(expression)
                             if matches!(expression.value.as_ref(), Expr::Await(await_)
                                 if !expression_contains_inline_branch(&await_.value)))
-                            && leading.iter().all(|statement| {
-                                suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement))
-                                    || matches!(statement, Stmt::If(guard)
+                                && leading.iter().all(|statement| {
+                                    suite_has_linear_borrow_fallthrough(std::slice::from_ref(
+                                        statement,
+                                    )) || matches!(statement, Stmt::If(guard)
                                         if condition_has_only_runtime_tests(&guard.test)
                                             && condition_has_linear_runtime_leaves(&guard.test)
                                             && !expression_suspends_current_scope(&guard.test)
                                             && guard.elif_else_clauses.is_empty()
                                             && suite_has_linear_borrow_fallthrough(&guard.body))
-                            })
-                    }))
+                                })
+                        })
+                }
         };
+        let async_manager_arm_reaches_finally = matches!(statement.body.last(), Some(Stmt::If(branch))
+            if matches!(branch.body.last(), Some(Stmt::With(manager)) if manager.is_async)
+                && coroutine_manager_arm_reaches_finally(&branch.body));
         // A trailing runtime guard leaves the earlier case's success jump in an
         // unlocated join. That original jump still reaches conditional cleanup after
         // handlers move cold, even without a linear prefix or a cleanup-entry CALL.
@@ -33350,6 +33376,25 @@ impl<'source> Compiler<'source> {
                 && matches!(branch.elif_else_clauses.as_slice(), [clause]
                     if clause.test.is_none()
                         && suite_has_linear_borrow_fallthrough(&clause.body)));
+        let conditional_value_cleanup = matches!(statement.finalbody.as_slice(), [Stmt::Assign(assignment)]
+        if assignment.targets.iter().all(|target| {
+            !expression_contains_inline_branch(target)
+                && !expression_suspends_current_scope(target)
+        }) && {
+            let value = match assignment.value.as_ref() {
+                Expr::BinOp(binary)
+                    if !expression_contains_inline_branch(&binary.right)
+                        && !expression_suspends_current_scope(&binary.right) => binary.left.as_ref(),
+                value => value,
+            };
+            matches!(value, Expr::If(value)
+                if condition_has_linear_runtime_leaves(&value.test)
+                    && !expression_suspends_current_scope(&value.test)
+                    && !expression_contains_inline_branch(&value.body)
+                    && !expression_suspends_current_scope(&value.body)
+                    && !expression_contains_inline_branch(&value.orelse)
+                    && !expression_suspends_current_scope(&value.orelse))
+        });
         // An elif keeps the first arm's jump even without a final else. Its
         // populated recovery entry remains reachable after handlers move cold.
         let elif_recovery_entry = self.context.python_version == crate::PythonVersion::Py314
@@ -33360,14 +33405,23 @@ impl<'source> Compiler<'source> {
             && !self.has_active_control_flow_region()
             && !self.control.in_exception_handler()
             && self.control.finally.is_inactive_for_return_unwind()
-            && self.suite_has_nonempty_borrow_entry(&statement.finalbody)
-            && matches!(statement.finalbody.as_slice(), [Stmt::Try(cleanup)]
+            && (conditional_value_cleanup
+                || (self.suite_has_nonempty_borrow_entry(&statement.finalbody)
+                    && matches!(statement.finalbody.as_slice(), [Stmt::Try(cleanup)]
                 if !cleanup.is_star
                     && cleanup.orelse.is_empty()
                     && cleanup.finalbody.is_empty()
-                    && suite_has_nonsuspending_linear_fallthrough(&cleanup.body))
+                    && suite_has_nonsuspending_linear_fallthrough(&cleanup.body))))
             && matches!(statement.body.last(), Some(Stmt::If(branch))
-            if suite_has_nonsuspending_linear_fallthrough(&branch.body)
+            if (suite_has_nonsuspending_linear_fallthrough(&branch.body)
+                || (conditional_value_cleanup
+                    && matches!(branch.body.split_last(), Some((Stmt::If(guard), prefix))
+                        if (prefix.is_empty() || suite_has_nonsuspending_linear_fallthrough(prefix))
+                            && guard.elif_else_clauses.is_empty()
+                            && condition_has_linear_runtime_leaves(&guard.test)
+                            && !expression_suspends_current_scope(&guard.test)
+                            && original_condition_has_unique_jump_target(&guard.test, false)
+                            && suite_has_nonsuspending_linear_fallthrough(&guard.body))))
                 && branch.elif_else_clauses.iter().all(|clause| {
                     suite_has_nonsuspending_linear_fallthrough(&clause.body)
                 }));
@@ -33596,6 +33650,35 @@ impl<'source> Compiler<'source> {
                                     && matches!(handler.body.last(), Some(Stmt::Raise(raised))
                                         if raised.exc.is_none() && raised.cause.is_none())
                             }))));
+        // A terminal returning alternative uses copied cleanup, not the normal entry.
+        let returning_alternative = self.context.python_version == crate::PythonVersion::Py314
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+            && matches!(statement.body.last(), Some(Stmt::If(conditional))
+            if conditional.elif_else_clauses.last().is_some_and(|clause| {
+                clause.test.is_none()
+                    && matches!(clause.body.last(), Some(Stmt::Return(returned))
+                        if returned.value.as_deref().is_none_or(|value| {
+                            !expression_contains_inline_branch(value)
+                                && !expression_suspends_current_scope(value)
+                        }))
+            }));
+        let guarded_return_alternative_entry = returning_alternative
+            && matches!(statement.body.last(), Some(Stmt::If(conditional))
+            if conditional.body.split_last().is_some_and(|(last, leading)| {
+                suite_has_linear_borrow_fallthrough(std::slice::from_ref(last))
+                    && leading.iter().all(|part| {
+                        self.context.is_elided_statement(part)
+                            || suite_has_nonsuspending_linear_fallthrough(std::slice::from_ref(part))
+                            || matches!(part, Stmt::If(guard)
+                                if guard.elif_else_clauses.is_empty()
+                                    && condition_has_only_runtime_tests(&guard.test)
+                                    && !expression_contains_inline_branch(&guard.test)
+                                    && !expression_suspends_current_scope(&guard.test)
+                                    && original_condition_has_unique_jump_target(&guard.test, false)
+                                    && suite_has_linear_raise_exit(&guard.body))
+                    })
+            }));
         // A completed recovery arm threads past the final else's located normal exit.
         let recovered_arm_has_live_else_exit = self.context.python_version
             == crate::PythonVersion::Py314
@@ -33626,6 +33709,23 @@ impl<'source> Compiler<'source> {
                                             && (prefix.is_empty() || suite_has_nonsuspending_linear_fallthrough(prefix)))
                             })
                         })));
+        // A separately located pass retains the first arm's jump into cleanup.
+        let pass_arm_reaches_finally = self.context.python_version == crate::PythonVersion::Py314
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && self.control.finally.active_copied_finally_bodies == 0
+            && matches!(statement.body.last(), Some(Stmt::If(branch))
+                if self.context.fold_constant(&branch.test).is_none()
+                    && matches!(branch.body.as_slice(), [Stmt::Pass(pass)]
+                    if self.source_location(pass.range).line
+                        != self.source_location(branch.range).line));
         // A live linear arm before the final else keeps a reachable jump directly
         // into normal cleanup after handlers move cold. Folded assertions can leave
         // that jump behind an empty block, so a merely nonterminal arm is insufficient.
@@ -33640,6 +33740,16 @@ impl<'source> Compiler<'source> {
             && self.control.finally.active_finally_end_blocks == 0
             && !suite_contains_loop_break(&statement.body)
             && (self.suite_has_nonempty_borrow_entry(&statement.finalbody)
+                || elif_recovery_entry
+                || (async_manager_arm_reaches_finally
+                    && suite_has_nonsuspending_conditional_work(&statement.finalbody))
+                || (pass_arm_reaches_finally
+                    && !suite_any_statement(&statement.finalbody, |part| {
+                        matches!(part, Stmt::Return(_) | Stmt::Break(_) | Stmt::Continue(_))
+                    })
+                    && matches!(statement.finalbody.first(), Some(Stmt::If(cleanup))
+                        if condition_has_linear_runtime_leaves(&cleanup.test)
+                            && !expression_suspends_current_scope(&cleanup.test)))
                 || (coroutine_reraise_cleanup && conditional_reraise_entry)
                 || coroutine_guarded_recovery_entry
                 || statement.finalbody.iter().all(|statement| match statement {
@@ -33659,7 +33769,8 @@ impl<'source> Compiler<'source> {
                     }
                     _ => false,
                 })
-                || matches!(statement.finalbody.as_slice(), [Stmt::If(cleanup)]
+                || ((statement.finalbody.len() == 1 || returning_alternative)
+                && statement.finalbody.iter().all(|part| matches!(part, Stmt::If(cleanup)
                 if condition_has_only_runtime_tests(&cleanup.test)
                     && (!expression_contains_inline_branch(&cleanup.test)
                         || (matches!(self.unit.scope, Scope::Function { .. })
@@ -33678,7 +33789,7 @@ impl<'source> Compiler<'source> {
                             condition_has_only_runtime_tests(test)
                                 && !expression_contains_inline_branch(test)
                         }) && suite_has_linear_borrow_fallthrough(&clause.body)
-                    })))
+                    })))))
             && matches!(statement.body.last(), Some(Stmt::If(conditional))
             if condition_has_only_runtime_tests(&conditional.test)
                 && !expression_contains_inline_branch(&conditional.test)
@@ -33688,25 +33799,27 @@ impl<'source> Compiler<'source> {
                     }))
                 && (conditional_reraise_entry
                     || recovered_arm_has_live_else_exit
+                    || guarded_return_alternative_entry
+                    || async_manager_arm_reaches_finally
                     || !suite_contains_abrupt_control_flow(&conditional.body))
                 && conditional.elif_else_clauses.iter().all(|clause| {
                     clause.test.as_ref().is_none_or(|test| {
                         condition_has_only_runtime_tests(test)
-                            && !expression_contains_inline_branch(test)
+                            && (!expression_contains_inline_branch(test)
+                                || (pass_arm_reaches_finally
+                                    && condition_has_runtime_iterator_leaves(test)
+                                    && !expression_suspends_current_scope(test)))
                     }) && (!suite_contains_abrupt_control_flow(&clause.body)
-                        || (self.context.python_version == crate::PythonVersion::Py314
-                            && matches!(self.unit.scope, Scope::Function { .. })
-                            && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
-                            && clause.test.is_none()
-                            && matches!(clause.body.split_last(), Some((Stmt::Return(returned), prefix))
-                                if (prefix.is_empty() || suite_has_nonsuspending_linear_fallthrough(prefix))
-                                    && returned.value.as_deref().is_none_or(|value| {
-                                    !expression_contains_inline_branch(value)
-                                        && !expression_suspends_current_scope(value)
-                                }))))
+                        || ((async_manager_arm_reaches_finally || pass_arm_reaches_finally)
+                            && !suite_contains_return(&clause.body)
+                            && !suite_contains_loop_break(&clause.body)
+                            && !suite_contains_loop_continue(&clause.body))
+                        || (clause.test.is_none() && returning_alternative))
                 })
                 && (conditional_reraise_entry
                     || recovered_arm_has_live_else_exit
+                    || guarded_return_alternative_entry
+                    || pass_arm_reaches_finally
                     || suite_has_linear_borrow_fallthrough(&conditional.body)
                     || suite_has_populated_conditional_alternative(
                         &conditional.body,
