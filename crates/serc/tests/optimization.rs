@@ -3541,6 +3541,84 @@ fn managed_asserted_try_else_retains_borrowed_continuation() {
 }
 
 #[test]
+fn guarded_finalizer_retains_normal_condition_join() {
+    for nested_condition in [false, true] {
+        for second_handler in [false, true] {
+            for protected in [
+                "work(items)\n",
+                "for item in items:\n    work(item)\n",
+                "if failed(items):\n    raise Error()\nwork(items)\n",
+            ] {
+                let mut source = String::from("def sample(items, flag):\n    try:\n");
+                let indentation = if nested_condition {
+                    source.push_str("        if flag:\n            record(items)\n        else:\n");
+                    "            "
+                } else {
+                    "        "
+                };
+                source.push_str(indentation);
+                source.push_str("if items:\n");
+                source.push_str(indentation);
+                source.push_str("    try:\n");
+                for line in protected.lines() {
+                    source.push_str(indentation);
+                    source.push_str("        ");
+                    source.push_str(line);
+                    source.push('\n');
+                }
+                source.push_str(indentation);
+                source.push_str("    finally:\n");
+                source.push_str(indentation);
+                source.push_str("        cleanup(items)\n");
+                source.push_str("    except Error as error:\n        recover(error)\n");
+                if second_handler {
+                    source.push_str("    except Exception as error:\n        recover(error)\n");
+                }
+                source.push_str("    finally:\n        finish()\n");
+                assert_matches_cpython(&source, "guarded_finalizer_join.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn awaited_guard_preserves_nested_finally_false_exit() {
+    for arguments in [
+        "item",
+        "\n            item,\n            offset=1,\n            active=True,\n        ",
+    ] {
+        for prefix in ["", "ready or "] {
+            for comparison in ["is None", "is not None"] {
+                for guarded_body in [false, true] {
+                    for guarded_cleanup in [false, true] {
+                        let mut body = "await resource.set(context.value, item)\n".to_owned();
+                        if guarded_body {
+                            body = format!(
+                                "if context.value is not None:\n    {}",
+                                body.replace('\n', "\n    ")
+                            );
+                        }
+                        let mut cleanup = "await resource.finished(item, context)\n".to_owned();
+                        if guarded_cleanup {
+                            cleanup = format!(
+                                "if resource.finished is not None and item.kind != 0:\n    {}",
+                                cleanup.replace('\n', "\n    ")
+                            );
+                        }
+                        let source = format!(
+                            "async def sample(resource, item, context):\n    try:\n        ready = True\n    finally:\n        if {prefix}await resource.lookup({arguments}) {comparison}:\n            try:\n                {}\n            finally:\n                {}\n    resource.record(item)\n",
+                            body.replace('\n', "\n                "),
+                            cleanup.replace('\n', "\n                "),
+                        );
+                        assert_matches_cpython(&source, "awaited_guarded_finally.py", &LEVELS);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn runtime_while_false_edge_reaches_guarded_finally() {
     for (prefix, read) in [("def", "read()"), ("async def", "await read()")] {
         for condition in ["not stop.is_set()", "ready or stop.is_set()"] {

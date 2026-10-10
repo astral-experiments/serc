@@ -1165,6 +1165,164 @@ fn plain_linear_scopes_do_not_allocate_owner_provenance() {
 }
 
 #[test]
+fn nested_guarded_finalizer_requires_original_outer_diamond() {
+    for version in [crate::PythonVersion::Py314, crate::PythonVersion::Py315] {
+        for mutation in [
+            "intact",
+            "missing outer",
+            "duplicate outer",
+            "outer owner",
+            "outer location",
+            "bypass owner",
+            "bypass extra",
+            "bypass hidden",
+            "bypass location",
+            "same target",
+            "guard owner",
+            "guard depth",
+            "extra entrant",
+            "missing entry source",
+            "missing entry block",
+            "authored alias",
+            "cold opcode",
+        ] {
+            let mut assembler = Assembler::with_python_version(version);
+            let entry = assembler.label();
+            let outer_join = assembler.label();
+            let guard_join = assembler.label();
+            let cleanup_join = assembler.label();
+            let outer = SourceLocation::new(3, 3, 11, 15);
+            let body = SourceLocation::new(4, 4, 12, 25);
+            let inner = SourceLocation::new(6, 6, 15, 20);
+            assembler.set_location(if mutation == "outer location" {
+                inner
+            } else {
+                outer
+            });
+            if mutation != "missing outer" {
+                assembler.emit_forward_with_depth(
+                    POP_JUMP_IF_FALSE,
+                    entry,
+                    0,
+                    if mutation == "outer owner" {
+                        ExceptionPolicy::EXCLUDE_ALWAYS
+                    } else {
+                        ExceptionPolicy::default()
+                    },
+                );
+            }
+            if mutation == "duplicate outer" {
+                assembler.emit_forward_with_depth(
+                    POP_JUMP_IF_FALSE,
+                    entry,
+                    0,
+                    ExceptionPolicy::default(),
+                );
+            }
+            assembler.set_location(if mutation == "bypass location" {
+                SourceLocation::NONE
+            } else {
+                body
+            });
+            let bypass = assembler.emit_forward_with_depth(
+                JUMP_FORWARD,
+                if mutation == "same target" {
+                    guard_join
+                } else {
+                    outer_join
+                },
+                0,
+                if mutation == "bypass owner" {
+                    ExceptionPolicy::EXCLUDE_ALWAYS
+                } else {
+                    ExceptionPolicy::default()
+                },
+            );
+            if mutation == "bypass extra" {
+                assembler
+                    .emitted_jump_mut(bypass, "mutating bypass slots")
+                    .add_pre_fold_extra_instructions(1);
+            }
+            if mutation == "bypass hidden" {
+                assembler
+                    .emitted_jump_mut(bypass, "mutating bypass ownership")
+                    .local_policy
+                    .add_hidden_exception_owner_slots(1);
+            }
+            assembler.mark(entry);
+            assembler.record_exception_owner_block_boundary(entry);
+            assembler.set_location(inner);
+            assembler.emit_forward_with_depth(
+                POP_JUMP_IF_FALSE,
+                guard_join,
+                u32::from(mutation == "guard depth"),
+                if mutation == "guard owner" {
+                    ExceptionPolicy::EXCLUDE_ALWAYS
+                } else {
+                    ExceptionPolicy::default()
+                },
+            );
+            assembler.set_location(SourceLocation::new(11, 11, 20, 34));
+            assembler.emit_forward_with_depth(
+                JUMP_FORWARD,
+                cleanup_join,
+                0,
+                ExceptionPolicy::default(),
+            );
+            if mutation == "extra entrant" {
+                assembler.emit_forward_with_depth(
+                    JUMP_FORWARD,
+                    outer_join,
+                    0,
+                    ExceptionPolicy::default(),
+                );
+            }
+            assembler.set_location(SourceLocation::NONE);
+            assembler.emit_with_depth(
+                if mutation == "cold opcode" {
+                    POP_TOP
+                } else {
+                    COPY
+                },
+                3,
+                4,
+                ExceptionPolicy::default(),
+            );
+            assembler.emit_with_depth(POP_EXCEPT, 0, 3, ExceptionPolicy::default());
+            assembler.emit_with_depth(RERAISE, 1, 0, ExceptionPolicy::default());
+            for label in [cleanup_join, guard_join, outer_join] {
+                assembler.mark(label);
+                assembler.record_exception_owner_block_boundary(label);
+            }
+            match mutation {
+                "missing entry source" => {
+                    assembler
+                        .exception_owner_provenance
+                        .source_boundaries
+                        .remove(&entry);
+                }
+                "missing entry block" => {
+                    assembler
+                        .exception_owner_provenance
+                        .block_boundaries
+                        .remove(&entry);
+                }
+                "authored alias" => {
+                    assembler.original_nop_targets.insert(outer_join);
+                }
+                _ => {}
+            }
+            assert!(!assembler.original_guarded_finally_exit_has_false_donor(inner, true));
+            assert_eq!(
+                assembler.original_nested_guarded_finally_exit_has_false_donor(inner, outer, body),
+                mutation == "intact",
+                "{version:?}: {mutation}"
+            );
+        }
+    }
+}
+
+#[test]
 fn copied_finally_break_join_keeps_generic_cleanup_strict() {
     for version in [
         crate::PythonVersion::Py313,
@@ -1360,15 +1518,31 @@ fn copied_finally_break_join_keeps_generic_cleanup_strict() {
             "single guard",
             "empty cleanup",
             "empty cleanup preserved",
+            "empty cleanup preserved none",
+            "empty cleanup preserved not-none",
+            "empty cleanup unrecorded none",
+            "empty cleanup unrecorded not-none",
             "single preserved cleanup",
             "single preserved guard",
+            "empty cleanup multiline none",
+            "empty cleanup multiline not-none",
+            "empty cleanup multiline missing nop",
+            "empty cleanup multiline wrong depth",
+            "empty cleanup multiline wrong span",
+            "empty cleanup multiline owned nop",
         ] {
             let mut assembler = Assembler::with_python_version(version);
             let start = assembler.label();
             let join = assembler.label();
             let normal_exit = assembler.label();
             let end = assembler.label();
-            let condition = SourceLocation::new(3, 3, 4, 18);
+            let multiline = mutation.contains("multiline");
+            let condition = if multiline {
+                SourceLocation::new(3, 8, 4, 20)
+            } else {
+                SourceLocation::new(3, 3, 4, 18)
+            };
+            let none_location = SourceLocation::new(8, 8, 16, 20);
             let location = SourceLocation::new(8, 8, 8, 20);
             if mutation == "outside unwind" {
                 assembler.set_location(condition);
@@ -1381,14 +1555,52 @@ fn copied_finally_break_join_keeps_generic_cleanup_strict() {
             }
             assembler.mark(start);
             assembler.record_exception_owner_block_boundary(start);
+            if multiline && !mutation.ends_with("missing nop") {
+                assembler.set_location(if mutation.ends_with("wrong span") {
+                    SourceLocation::new(8, 8, 15, 20)
+                } else {
+                    none_location
+                });
+                assembler.emit_with_depth(
+                    NOP,
+                    0,
+                    if mutation.ends_with("wrong depth") {
+                        2
+                    } else {
+                        1
+                    },
+                    if mutation.ends_with("owned nop") {
+                        ExceptionPolicy::EXCLUDE_ALWAYS
+                    } else {
+                        ExceptionPolicy::default()
+                    },
+                );
+            }
             assembler.set_location(condition);
             let first = assembler.linear_items().len();
+            let none_guard =
+                mutation.starts_with("empty cleanup ") && mutation != "empty cleanup preserved";
             let first_jump = assembler.emit_forward_with_depth(
-                POP_JUMP_IF_FALSE,
+                if !none_guard {
+                    POP_JUMP_IF_FALSE
+                } else if mutation.ends_with("not-none") {
+                    POP_JUMP_IF_NOT_NONE
+                } else {
+                    POP_JUMP_IF_NONE
+                },
                 join,
                 0,
                 ExceptionPolicy::default(),
             );
+            if none_guard {
+                assembler
+                    .emitted_jump_mut(first_jump, "test awaited None guard")
+                    .local_policy
+                    .add_hidden_exception_owner_slots(if multiline { 2 } else { 3 });
+                if !multiline && !mutation.contains("unrecorded") {
+                    assembler.record_source_none_condition();
+                }
+            }
             if mutation == "single preserved guard" {
                 assembler
                     .emitted_jump_mut(first_jump, "test preserved guard")
@@ -1434,7 +1646,8 @@ fn copied_finally_break_join_keeps_generic_cleanup_strict() {
             if matches!(
                 mutation,
                 "empty cleanup preserved" | "single preserved cleanup"
-            ) {
+            ) || mutation.starts_with("empty cleanup preserved ")
+            {
                 assembler
                     .emitted_jump_mut(normal_jump, "test preserved cleanup")
                     .no_location_policy
@@ -1556,10 +1769,25 @@ fn copied_finally_break_join_keeps_generic_cleanup_strict() {
                 assembler.original_guarded_finally_exit_has_false_donor(condition, true),
                 matches!(
                     mutation,
-                    "single guard" | "empty cleanup" | "empty cleanup preserved"
+                    "single guard"
+                        | "empty cleanup"
+                        | "empty cleanup preserved"
+                        | "empty cleanup preserved none"
+                        | "empty cleanup preserved not-none"
                 ),
                 "{version:?}: {mutation}"
             );
+            if multiline {
+                assert_eq!(
+                    assembler
+                        .original_guarded_finally_exit_has_none_donor(condition, none_location),
+                    matches!(
+                        mutation,
+                        "empty cleanup multiline none" | "empty cleanup multiline not-none"
+                    ),
+                    "{version:?}: {mutation}"
+                );
+            }
             let shared = assembler.at_original_shared_copied_finally_break_join();
             let expected = version >= crate::PythonVersion::Py314
                 && matches!(mutation, "intact" | "outside unwind" | "single guard");

@@ -2585,8 +2585,118 @@ impl Assembler {
             self.linear_items(),
             Some(location),
             allow_recorded_none_guard,
+            None,
         )
         .is_some()
+    }
+
+    /// Certifies a source None guard, including its retained multiline literal NOP.
+    pub(crate) fn original_guarded_finally_exit_has_none_donor(
+        &self,
+        location: SourceLocation,
+        none_location: SourceLocation,
+    ) -> bool {
+        self.original_guarded_finally_exit_origin(
+            self.linear_items(),
+            Some(location),
+            true,
+            Some(none_location),
+        )
+        .is_some()
+    }
+
+    /// Certifies an outer true-arm bypass before the nested guard/cleanup aliases.
+    pub(crate) fn original_nested_guarded_finally_exit_has_false_donor(
+        &self,
+        location: SourceLocation,
+        outer_condition: SourceLocation,
+        outer_body: SourceLocation,
+    ) -> bool {
+        let items = self.linear_items();
+        let labels = trailing_labels(items).collect::<Vec<_>>();
+        let mut incoming = items.iter().enumerate().filter_map(|(index, item)| match item {
+            Item::Instruction(instruction)
+                if matches!(instruction.operand(), Operand::Forward(label) | Operand::Backward(label)
+                    if labels.contains(&label)) => Some((index, *instruction)),
+            _ => None,
+        });
+        let (Some((bypass_index, bypass)), Some((_, guard)), Some((_, cleanup))) =
+            (incoming.next(), incoming.next(), incoming.next())
+        else {
+            return false;
+        };
+        let (Some(target), Some(depth)) = (bypass.forward_target(), guard.depth_after()) else {
+            return false;
+        };
+        if incoming.next().is_some()
+            || bypass
+                != Instruction::new(
+                    JUMP_FORWARD,
+                    Operand::Forward(target),
+                    bypass.location,
+                    Some(depth),
+                )
+            || (bypass.location.line, bypass.location.column) < (outer_body.line, outer_body.column)
+            || (bypass.location.end_line, bypass.location.end_column)
+                > (outer_body.end_line, outer_body.end_column)
+            || bypass.operand() == guard.operand()
+            || bypass.operand() == cleanup.operand()
+            || !self
+                .exception_owner_provenance
+                .source_boundaries
+                .contains(&target)
+            || !self
+                .exception_owner_provenance
+                .block_boundaries
+                .contains(&target)
+        {
+            return false;
+        }
+        let suffix = &items[bypass_index + 1..];
+        let entries = suffix
+            .iter()
+            .take_while(|item| matches!(item, Item::Label(_)))
+            .filter_map(|item| match item {
+                Item::Label(label) => Some(*label),
+                Item::Instruction(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let mut outer_inputs = items.iter().enumerate().filter_map(|(index, item)| match item {
+            Item::Instruction(instruction)
+                if matches!(instruction.operand(), Operand::Forward(label) | Operand::Backward(label)
+                    if entries.contains(&label)) => Some((index, *instruction)),
+            _ => None,
+        });
+        let Some((outer_index, outer)) = outer_inputs.next() else {
+            return false;
+        };
+        let Some(entry) = outer.forward_target() else {
+            return false;
+        };
+        if outer_inputs.next().is_some()
+            || outer_index >= bypass_index
+            || outer
+                != Instruction::new(
+                    POP_JUMP_IF_FALSE,
+                    Operand::Forward(entry),
+                    outer_condition,
+                    Some(depth),
+                )
+            || !self
+                .exception_owner_provenance
+                .source_boundaries
+                .contains(&entry)
+            || !self
+                .exception_owner_provenance
+                .block_boundaries
+                .contains(&entry)
+        {
+            return false;
+        }
+        // Only the proved outer arm is omitted. The original nested suffix still
+        // has to satisfy every location, ownership and two-predecessor invariant.
+        self.original_guarded_finally_exit_origin(suffix, Some(location), true, None)
+            .is_some()
     }
 
     /// Returns the guard entry and separate normal-finally edge at a cleanup join.
@@ -2596,6 +2706,7 @@ impl Assembler {
         items: &[Item],
         guard_location: Option<SourceLocation>,
         allow_recorded_none_guard: bool,
+        retained_none_location: Option<SourceLocation>,
     ) -> Option<(Label, usize)> {
         let labels = trailing_labels(items).collect::<Vec<_>>();
         if self.join_labels_have_authored_location(&labels)
@@ -2635,7 +2746,7 @@ impl Assembler {
                     if labels.contains(&label)) => Some((index, *instruction)),
             _ => None,
         });
-        let (_, first) = incoming.next()?;
+        let (first_index, first) = incoming.next()?;
         let (cleanup_index, cleanup) = if guard_location.is_some() {
             let cleanup = incoming.next()?;
             if incoming.next().is_some() {
@@ -2698,9 +2809,40 @@ impl Assembler {
             && cleanup.operand() != Operand::Forward(target)
             && cleanup.local_policy.hidden_exception_owner_slots() == 0
             && original_input(&cleanup)
-            && std::iter::once(first)
-                .chain(incoming.map(|(_, guard)| guard))
-                .all(|guard| {
+            && std::iter::once((first_index, first))
+                .chain(incoming)
+                .all(|(index, guard)| {
+                    let hidden = guard.local_policy.hidden_exception_owner_slots();
+                    // A multiline None literal retains one of the three removed
+                    // comparison slots as an exact, adjacent source NOP.
+                    let original_none_guard = allow_recorded_none_guard
+                        && matches!(guard.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+                        && match hidden {
+                            3 => {
+                                self.exception_owner_provenance
+                                    .source_none_conditions
+                                    .iter()
+                                    .filter(|origin| origin.instruction == guard)
+                                    .count()
+                                    == 1
+                            }
+                            2 => retained_none_location.is_some_and(|location| {
+                                location.line > guard.location.line
+                                    && location.line == location.end_line
+                                    && location.end_line == guard.location.end_line
+                                    && location.end_column == guard.location.end_column
+                                    && index.checked_sub(1).and_then(|index| items.get(index))
+                                        == Some(&Item::Instruction(Instruction::new(
+                                            NOP,
+                                            Operand::Value(0),
+                                            location,
+                                            guard
+                                                .depth_after()
+                                                .and_then(|depth| depth.checked_add(1)),
+                                        )))
+                            }),
+                            _ => false,
+                        };
                     is_conditional_jump(guard.opcode)
                         && guard.operand() == Operand::Forward(target)
                         && guard.location.line >= 0
@@ -2709,20 +2851,7 @@ impl Assembler {
                         && guard.depth_after() == cleanup.depth_after()
                         && !guard.no_location_policy.preserves_location()
                         && original_input(&guard)
-                        && (guard.local_policy.hidden_exception_owner_slots() == 0
-                // Specializing a same-line None comparison removes LOAD_CONST,
-                // IS_OP, and TO_BOOL. Accept those slots only on the exact recorded
-                // source condition; copied or otherwise reserved guards still reject.
-                || (allow_recorded_none_guard
-                    && guard.opcode == POP_JUMP_IF_NONE
-                    && guard.local_policy.hidden_exception_owner_slots() == 3
-                    && self
-                        .exception_owner_provenance
-                        .source_none_conditions
-                        .iter()
-                        .filter(|origin| origin.instruction == guard)
-                        .count()
-                        == 1))
+                        && (hidden == 0 || original_none_guard)
                 });
         valid.then_some((target, cleanup_index))
     }
@@ -3413,7 +3542,7 @@ impl Assembler {
         self.python_version >= crate::PythonVersion::Py314
             && (self.original_shared_conditional_join(true, true)
                 || self
-                    .original_guarded_finally_exit_origin(self.linear_items(), None, true)
+                    .original_guarded_finally_exit_origin(self.linear_items(), None, true, None)
                     .is_some())
     }
 
@@ -11051,7 +11180,7 @@ impl Assembler {
         };
         let multiple_conditions = matching.next().is_some();
         let normal_finally_exit = self
-            .original_guarded_finally_exit_origin(head, None, true)
+            .original_guarded_finally_exit_origin(head, None, true, None)
             .filter(|(entry, index)| *entry == label && *index >= unwind_start)
             .map(|(_, index)| index);
         if (multiple_conditions && !original_shared_join)
