@@ -2566,7 +2566,8 @@ impl Assembler {
             }
         }
         // A finalizer can end in an original empty borrowing block. Its single
-        // unlocated jump threads past this join without supplying another line.
+        // unlocated jump threads past this join without supplying another line,
+        // including when that missing location is explicitly preserved.
         let empty_cleanup_marker = cleanup.location == SourceLocation::NONE
             && cleanup.jump_policy.borrow_empty_block()
             && cleanup.jump_policy.retained_nop() == ir::RetainedJumpNop::None
@@ -2575,7 +2576,6 @@ impl Assembler {
         let original_input = |instruction: &Instruction| {
             instruction.pre_fold_extra_instructions() == 0
                 && instruction.exception_policy() == ExceptionPolicy::default()
-                && !instruction.no_location_policy.preserves_location()
                 && !instruction.fusion_policy.is_authored_break()
                 && instruction.jump_policy.inline_small_exit()
                 && matches!(instruction.operand(), Operand::Forward(label)
@@ -2584,6 +2584,7 @@ impl Assembler {
         };
         let valid = cleanup.opcode == JUMP_FORWARD
             && (cleanup.location.line >= 0 || empty_cleanup_marker)
+            && (!cleanup.no_location_policy.preserves_location() || empty_cleanup_marker)
             && cleanup.operand() != Operand::Forward(target)
             && cleanup.local_policy.hidden_exception_owner_slots() == 0
             && original_input(&cleanup)
@@ -2596,6 +2597,7 @@ impl Assembler {
                         && guard_location.is_none_or(|location| guard.location == location)
                         && guard.depth_after().is_some()
                         && guard.depth_after() == cleanup.depth_after()
+                        && !guard.no_location_policy.preserves_location()
                         && original_input(&guard)
                         && (guard.local_policy.hidden_exception_owner_slots() == 0
                 // Specializing a same-line None comparison removes LOAD_CONST,

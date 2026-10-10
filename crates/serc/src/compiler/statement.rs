@@ -33133,6 +33133,44 @@ impl<'source> Compiler<'source> {
             && !suite_contains_abrupt_control_flow(&statement.finalbody);
         let runtime_coroutine_break_context = loop_break_context
             && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE;
+        // Runtime exhaustion reaches cleanup independently of the yielding handler.
+        let async_generator_while_cleanup = self.context.python_version
+            == crate::PythonVersion::Py314
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                == CO_ASYNC_GENERATOR
+            && loop_break_context
+            && !statement.is_star
+            && statement.orelse.is_empty()
+            && self.control.finally.active_finally_try_bodies == 0
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && self.suite_has_nonempty_borrow_entry(&statement.finalbody)
+            && matches!(statement.body.last(), Some(Stmt::While(loop_))
+                if loop_.orelse.is_empty()
+                    && condition_has_linear_runtime_leaves(&loop_.test)
+                    && original_condition_has_unique_jump_target(&loop_.test, false)
+                    && !expression_suspends_current_scope(&loop_.test)
+                    && suite_contains_loop_break(&loop_.body)
+                    && !suite_contains_return(&loop_.body))
+            && matches!(statement.handlers.as_slice(), [cancelled, recovery]
+            if cancelled.as_except_handler().is_some_and(|handler| {
+                handler.name.is_none()
+                    && handler.body.split_last().is_some_and(|(last, prefix)| {
+                        matches!(last, Stmt::Raise(raised) if raised.exc.is_none() && raised.cause.is_none())
+                            && (prefix.is_empty() || suite_has_nonsuspending_linear_fallthrough(prefix))
+                    })
+            }) && recovery.as_except_handler().is_some_and(|handler| {
+                handler.name.is_some()
+                    && handler.body.split_last().is_some_and(|(last, prefix)| {
+                        suite_has_nonterminal_recovery_work(prefix, true)
+                            && matches!(last, Stmt::Expr(expression)
+                                if matches!(expression.value.as_ref(), Expr::Yield(yielded)
+                                    if yielded.value.as_deref().is_some_and(|value| {
+                                        !expression_contains_inline_branch(value)
+                                            && !expression_suspends_current_scope(value)
+                                    })))
+                    })
+            }));
         let coroutine_nested_recovery_loop = self.context.python_version
             == crate::PythonVersion::Py314
             && runtime_coroutine_break_context
@@ -34475,6 +34513,7 @@ impl<'source> Compiler<'source> {
             || raising_alternative_reaches_finally
             || coroutine_manager_raise_else_reaches_finally
             || runtime_while_false_edge_reaches_finally
+            || async_generator_while_cleanup
             || coroutine_nested_recovery_loop
             || runtime_nonterminal_break_reaches_finally
             || conditional_break_reaches_finally
@@ -36096,6 +36135,47 @@ impl<'source> Compiler<'source> {
                         Stmt::If(statement) => nested_if_exit_location(statement, true),
                         _ => None,
                     });
+            // Both cleanup copies retain the guard's original false-edge donor.
+            let nested_coroutine_manager_guard = self.context.python_version
+                >= crate::PythonVersion::Py314
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                    == CO_COROUTINE
+                && capture_manager_pop
+                && preserve_exit_nop
+                && !shared_manager_exit
+                && !drop_expression_if_exit_nop
+                && !drop_shared_manager_exit_nop
+                && self.control.loops.contexts.is_empty()
+                && self.control.exceptions.active_exception_handlers.is_empty()
+                && self.control.exceptions.active_exception_group_handlers == 0
+                && self.control.finally.active_finally_try_bodies == 0
+                && self.control.finally.active_copied_finally_bodies == 0
+                && (self.control.finally.active_normal_finally_bodies > 0
+                    || self.control.finally.active_finally_end_blocks > 0)
+                && matches!(self.control.withs.active_with_exits.as_slice(), [manager]
+                    if !manager.is_async && manager.loop_depth == 0
+                        && manager.exception_region_depth == self.control.exceptions.active_exception_region_exclusions.len()
+                        && manager.normal_finally_depth == self.control.finally.active_normal_finally_bodies
+                        && manager.finally_end_depth == self.control.finally.active_finally_end_blocks)
+                && !statement.is_star
+                && statement.handlers.is_empty()
+                && statement.orelse.is_empty()
+                && matches!(conditional_exit, Some(NestedIfExitLocation::Unlocated))
+                && self.assembler.current_original_block_location().is_none()
+                && self
+                    .assembler
+                    .current_original_block_pre_fusion_instruction_count()
+                    == 0
+                && matches!(statement.finalbody.as_slice(), [Stmt::If(guard)]
+                    if guard.elif_else_clauses.is_empty()
+                        && condition_has_linear_runtime_leaves(&guard.test)
+                        && !expression_suspends_current_scope(&guard.test)
+                        && !suite_contains_abrupt_control_flow(&guard.body)
+                        && matches!(guard.body.as_slice(), [Stmt::Try(cleanup)]
+                            if !cleanup.is_star && cleanup.handlers.is_empty()
+                                && cleanup.orelse.is_empty() && !cleanup.finalbody.is_empty())
+                        && self.assembler.original_guarded_finally_exit_has_false_donor(
+                            self.source_location(condition_fallthrough_range(&guard.test)), true));
             // A nested normal finalizer in a generator can leave the same empty
             // guard/cleanup join inside its synchronous manager. Exceptional and
             // return copies keep their existing locations and ownership.
@@ -36142,7 +36222,7 @@ impl<'source> Compiler<'source> {
             // A nested finally jumps past this guard's empty normal continuation.
             // Its sole false edge supplies the NOP's line, while the surrounding
             // manager still owns that original jump before its own POP_BLOCK.
-            let located_nested_finally_guard = capture_manager_pop
+            let located_nested_finally_guard = (capture_manager_pop
                 && preserve_exit_nop
                 && !shared_manager_exit
                 && !drop_expression_if_exit_nop
@@ -36214,7 +36294,8 @@ impl<'source> Compiler<'source> {
                                 }
                                 _ => false,
                             }
-                    }));
+                    })))
+                || nested_coroutine_manager_guard;
             if located_nested_finally_guard && let Some(Stmt::If(tail)) = statement.finalbody.last()
             {
                 conditional_exit = Some(NestedIfExitLocation::Located(&tail.test));
@@ -36412,6 +36493,56 @@ impl<'source> Compiler<'source> {
                         == CO_ASYNC_GENERATOR
                     && matches!(statement.finalbody.last(), Some(Stmt::If(tail))
                         if tail.elif_else_clauses.is_empty());
+            // Either cleanup copy's normal exit still precedes the manager POP_BLOCK.
+            let nested_async_generator_manager_exit = self.context.python_version
+                >= crate::PythonVersion::Py314
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                    == CO_ASYNC_GENERATOR
+                && capture_manager_pop
+                && preserve_exit_nop
+                && drop_expression_if_exit_nop
+                && !shared_manager_exit
+                && !drop_shared_manager_exit_nop
+                && self.control.loops.contexts.is_empty()
+                && self.control.exceptions.active_exception_handlers.is_empty()
+                && self.control.exceptions.active_exception_group_handlers == 0
+                && self.control.finally.active_copied_finally_bodies == 0
+                && matches!(
+                    (
+                        self.control.finally.active_normal_finally_bodies,
+                        self.control.finally.active_finally_end_blocks
+                    ),
+                    (1, 0) | (0, 1)
+                )
+                && self.control.finally.active_finally_try_bodies == 1
+                && matches!(self.control.withs.active_with_exits.as_slice(), [manager]
+                    if !manager.is_async && manager.loop_depth == 0
+                        && manager.normal_finally_depth == self.control.finally.active_normal_finally_bodies
+                        && manager.finally_end_depth == self.control.finally.active_finally_end_blocks
+                        && manager.exception_region_depth == self.control.exceptions.active_exception_region_exclusions.len())
+                && !statement.is_star
+                && statement.handlers.is_empty()
+                && statement.orelse.is_empty()
+                && matches!(conditional_exit, Some(NestedIfExitLocation::Unlocated))
+                && self.assembler.current_original_block_location().is_none()
+                && self
+                    .assembler
+                    .current_original_block_pre_fusion_instruction_count()
+                    == 0
+                && matches!(statement.body.as_slice(), [Stmt::Expr(expression)]
+                    if matches!(expression.value.as_ref(), Expr::Await(awaited)
+                        if matches!(awaited.value.as_ref(), Expr::Call(_))
+                            && !expression_contains_inline_branch(&awaited.value)
+                            && !expression_suspends_current_scope(&awaited.value)))
+                && matches!(statement.finalbody.as_slice(), [Stmt::If(guard)]
+                    if guard.elif_else_clauses.is_empty()
+                        && condition_has_linear_runtime_leaves(&guard.test)
+                        && !expression_suspends_current_scope(&guard.test)
+                        && matches!(guard.body.as_slice(), [Stmt::Expr(expression)]
+                            if matches!(expression.value.as_ref(), Expr::Await(awaited)
+                                if matches!(awaited.value.as_ref(), Expr::Call(_))
+                                    && !expression_contains_inline_branch(&awaited.value)
+                                    && !expression_suspends_current_scope(&awaited.value))));
             // A nested call/raise conditional has the same empty normal-finally array.
             // Preserve its manager owner when the call arm threads through this jump
             // and when the located join becomes a NOP; all other exclusions stay intact.
@@ -37225,6 +37356,8 @@ impl<'source> Compiler<'source> {
                                     if !manager.is_async && manager.items.len() == 1));
                     if !original_sync_conditional_manager_jump
                         && !original_async_generator_conditional_manager_jump
+                        && !nested_async_generator_manager_exit
+                        && !nested_coroutine_manager_guard
                         && !original_nested_raising_manager_jump
                         && !suspended_chained_manager_exit
                         && !async_generator_guarded_manager_exit
