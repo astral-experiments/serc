@@ -32780,8 +32780,8 @@ impl<'source> Compiler<'source> {
                     })))
                 || guarded_first_arm_reaches_finally);
         // A synchronous manager's awaited store leaves a populated normal exit.
-        // Its arm jumps directly into the eager cleanup prefix even when another
-        // dispatch alternative raises. Exceptional manager and finally copies
+        // Its arm jumps directly into the eager cleanup prefix even when other
+        // dispatch arms return or raise. Copied returns and exceptional cleanup
         // retain their separate entries.
         let coroutine_manager_raise_else_reaches_finally = !statement.is_star
             && statement.orelse.is_empty()
@@ -32814,35 +32814,52 @@ impl<'source> Compiler<'source> {
                         && !suite_contains_return(&handler.body)
                 })
             })
-            && !suite_contains_return(&statement.body)
+            && !suite_any_statement(&statement.body, |part| {
+                matches!(part, Stmt::Return(returned)
+                if self.context.python_version != crate::PythonVersion::Py314
+                    || returned.value.as_deref().is_some_and(|value| {
+                        expression_contains_inline_branch(value)
+                            || expression_suspends_current_scope(value)
+                    }))
+            })
             && !suite_contains_loop_break(&statement.body)
             && !suite_contains_loop_continue(&statement.body)
             && matches!(statement.body.as_slice(), [Stmt::If(dispatch)]
-                if condition_has_only_runtime_tests(&dispatch.test)
-                    && !expression_contains_inline_branch(&dispatch.test)
-                    && dispatch.elif_else_clauses.last().is_some_and(|clause| {
-                        clause.test.is_none() && suite_has_linear_raise_exit(&clause.body)
+            if condition_has_only_runtime_tests(&dispatch.test)
+                && !expression_contains_inline_branch(&dispatch.test)
+                && dispatch.elif_else_clauses.last().is_some_and(|clause| {
+                    clause.test.is_none() && suite_has_linear_raise_exit(&clause.body)
+                })
+                && dispatch.elif_else_clauses.iter().all(|clause| {
+                    clause.test.as_ref().is_none_or(|test| {
+                        condition_has_only_runtime_tests(test)
+                            && !expression_contains_inline_branch(test)
                     })
-                    && dispatch.elif_else_clauses.iter().all(|clause| {
-                        clause.test.as_ref().is_none_or(|test| {
-                            condition_has_only_runtime_tests(test)
-                                && !expression_contains_inline_branch(test)
-                        })
-                    })
-                    && std::iter::once(dispatch.body.as_slice())
-                        .chain(dispatch.elif_else_clauses.iter()
-                            .filter(|clause| clause.test.is_some())
-                            .map(|clause| clause.body.as_slice()))
-                        .any(|body| matches!(body, [Stmt::With(manager)]
-                            if !manager.is_async
-                                && matches!(manager.items.as_slice(), [item]
-                                    if item.optional_vars.is_none()
-                                        && !expression_contains_inline_branch(&item.context_expr)
-                                        && !expression_suspends_current_scope(&item.context_expr))
-                                && matches!(manager.body.as_slice(), [Stmt::Assign(store)]
-                                    if matches!(store.targets.as_slice(), [Expr::Name(_)])
-                                        && matches!(store.value.as_ref(), Expr::Await(awaited)
-                                            if !expression_contains_inline_branch(&awaited.value))))));
+                })
+                && std::iter::once(dispatch.body.as_slice())
+                    .chain(dispatch.elif_else_clauses.iter()
+                        .filter(|clause| clause.test.is_some())
+                        .map(|clause| clause.body.as_slice()))
+                    .any(|body| {
+                        let Some((Stmt::With(manager), prefix)) = body.split_last() else {
+                            return false;
+                        };
+                        (prefix.is_empty()
+                            || (self.context.python_version == crate::PythonVersion::Py314
+                                && prefix.iter().all(|part| {
+                                    matches!(part, Stmt::Import(_) | Stmt::ImportFrom(_))
+                                        || suite_has_nonsuspending_linear_fallthrough(std::slice::from_ref(part))
+                                })))
+                            && !manager.is_async
+                            && matches!(manager.items.as_slice(), [item]
+                                if item.optional_vars.is_none()
+                                    && !expression_contains_inline_branch(&item.context_expr)
+                                    && !expression_suspends_current_scope(&item.context_expr))
+                            && matches!(manager.body.as_slice(), [Stmt::Assign(store)]
+                                if matches!(store.targets.as_slice(), [Expr::Name(_)])
+                                    && matches!(store.value.as_ref(), Expr::Await(awaited)
+                                        if !expression_contains_inline_branch(&awaited.value)))
+                    }));
         // Unconditional cleanup predecessors can empty their original handler or else
         // exit block. That block survives cold relocation and stops borrowed-load traversal.
         // A terminal recovery in a nonfinal handler arm also leaves its own empty
