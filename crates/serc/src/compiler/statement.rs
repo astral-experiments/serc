@@ -9948,6 +9948,7 @@ impl<'source> Compiler<'source> {
                             tracks_handler_outer_try_iterator_unwinds
                                 || (tracks_two_named_handlers_before_finally && handler_index == 0);
                         let protected_pop_except = (protects_outer_handler
+                            || live_manager_handler_try_owner
                             || (!return_is_overridden
                                 && !preserves_enclosing_try_return_owner
                                 && !enclosing_try_owns_pop_except
@@ -9961,7 +9962,7 @@ impl<'source> Compiler<'source> {
                         .then(|| {
                             let start = self.assembler.label();
                             self.assembler.mark(start);
-                            if preserve_handler_pop_slot {
+                            if preserve_handler_pop_slot || live_manager_handler_try_owner {
                                 // This protected range starts within the original cleanup block.
                                 self.assembler.record_exception_owner_continuation(start);
                             }

@@ -7243,6 +7243,33 @@ fn managed_handler_returns_preserve_primitive_finalizer_owners() {
 }
 
 #[test]
+fn managed_handler_returns_retain_outer_recovery_cleanup() {
+    for recovery in ["recover()", "raise"] {
+        let source = format!(
+            r"async def sample(manager, flag):
+    with manager:
+        try:
+            while True:
+                try:
+                    await action()
+                except Exception as error:
+                    if flag:
+                        record(error)
+                        return
+                    raise
+        except Other:
+            {recovery}
+        finally:
+            if not flag:
+                record()
+                await finish()
+"
+        );
+        assert_matches_cpython(&source, "managed_handler_recovery.py", &LEVELS);
+    }
+}
+
+#[test]
 fn enclosing_tries_own_handler_returns_before_finalizers() {
     let body = r"try:
     try:
