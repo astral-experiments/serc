@@ -15,6 +15,18 @@ use serc::{
 };
 
 #[test]
+fn conditional_manager_callback_store_keeps_cleanup_exit_owned() {
+    let source = "async def sample(owner, client, task, cancel, failed, detach):\n    try:\n        replacement = owner.create()\n    finally:\n        if cancel:\n            with owner.expect(Cancelled):\n                await owner.wait(task)\n        elif failed and not detach:\n            with owner.expect(Failed):\n                await owner.wait(task)\n        else:\n            await owner.wait(task)\n        client.close = lambda: None\n    assert owner.active.session is replacement\n";
+    for source in [
+        source.to_owned(),
+        source.replace("failed and not detach", "failed"),
+        source.replace("    finally:\n", "    finally:\n        owner.prepare()\n"),
+    ] {
+        assert_matches_cpython(&source, "conditional_manager_callback.py", &LEVELS);
+    }
+}
+
+#[test]
 fn awaited_store_before_asserted_else_keeps_continuation_reachable() {
     let source = "async def sample(owner, status, handled):\n    try:\n        response = await owner.update()\n    except Error as error:\n        response = None\n    else:\n        assert status is None\n    if handled:\n        owner.first()\n    else:\n        owner.second()\n";
     for source in [
