@@ -37318,6 +37318,42 @@ impl<'source> Compiler<'source> {
                 && !drop_expression_if_exit_nop
                 && !drop_shared_manager_exit_nop
                 && conditional_exit.is_none();
+            let erased_awaited_else_entry = if separate_manager_pop
+                && self.context.python_version >= crate::PythonVersion::Py314
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                    == CO_COROUTINE
+                && self.control.loops.contexts.is_empty()
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty()
+                && self.control.exceptions.active_exception_handlers.is_empty()
+                && self.control.finally.active_normal_finally_bodies == 0
+                && self.control.finally.active_copied_finally_bodies == 0
+                && self.control.finally.active_finally_end_blocks == 0
+                && statement.handlers.is_empty()
+                && statement.orelse.is_empty()
+                && statement
+                    .finalbody
+                    .iter()
+                    .all(|part| self.context.is_elided_statement(part))
+                && let Some(Stmt::If(branch)) = statement.body.last()
+                && condition_has_only_runtime_tests(&branch.test)
+                && matches!(branch.body.as_slice(), [Stmt::With(manager)]
+                    if manager.is_async && !suite_contains_abrupt_control_flow(&manager.body))
+                && let [otherwise] = branch.elif_else_clauses.as_slice()
+                && otherwise.test.is_none()
+                && let [Stmt::Expr(expression)] = otherwise.body.as_slice()
+                && let Expr::Await(awaited) = expression.value.as_ref()
+                && matches!(awaited.value.as_ref(), Expr::Call(_))
+                && !expression_contains_inline_branch(&awaited.value)
+                && !expression_suspends_current_scope(&awaited.value)
+            {
+                Some(self.assembler.label())
+            } else {
+                None
+            };
             // The original normal-finally jump precedes the manager POP_BLOCK.
             // Finalizer copies may instead leave the ownerless POP_BLOCK marker.
             let preserve_manager_jump = pass_finally_leaves_manager
@@ -37695,6 +37731,9 @@ impl<'source> Compiler<'source> {
                 self.assembler.mark(start);
                 start
             });
+            if let Some(entry) = erased_awaited_else_entry {
+                self.assembler.mark(entry);
+            }
             let normal_exit = if original_nested_pass_exit {
                 self.assembler.set_location(SourceLocation::NONE);
                 let exit = self.emit_jump_forward_instruction_preserving_nop(
@@ -38004,7 +38043,12 @@ impl<'source> Compiler<'source> {
                 // A small return copied onto the exit replaces the marker with its own code.
                 self.assembler.mark_borrow_empty_block(normal_exit);
             }
-            if drop_expression_if_exit_nop {
+            if let Some(entry) = erased_awaited_else_entry {
+                // Erasing the finalizer leaves the original POP_BLOCK/JUMP pair.
+                // Its incoming manager exits copy that boundary before line propagation.
+                self.assembler.record_normal_try_exit(entry, end, None);
+                self.assembler.preserve_folded_nested_if_exit(normal_exit);
+            } else if drop_expression_if_exit_nop {
                 // Keep the normal-finally exit through CPython's exit-copy pass, then remove it
                 // instead of retaining the redundant jump as a source-position NOP.
                 self.assembler.defer_jump_removal(normal_exit);

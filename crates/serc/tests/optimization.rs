@@ -98,6 +98,12 @@ fn erased_nested_coroutine_arms_preserve_saved_finalizer() {
 }
 
 #[test]
+fn erased_finalizer_after_awaited_alternative_keeps_exit_location() {
+    let source = "async def sample(mode, provider, path):\n    with acquire() as context:\n        try:\n            if mode:\n                async with provider.snapshot():\n                    await body()\n            else:\n                await provider.add(path)\n        finally:\n            assert not context.pending\n";
+    assert_matches_cpython(source, "erased_awaited_alternative.py", &LEVELS);
+}
+
+#[test]
 fn nested_suspended_manager_jump_keeps_owner() {
     let source = "async def sample(owner, done):\n    try:\n        yield owner.item()\n    except (Cancelled, GeneratorExit):\n        raise\n    except Error as error:\n        yield owner.event(error)\n    finally:\n        try:\n            with owner.shield():\n                try:\n                    await owner.terminate()\n                finally:\n                    if not done:\n                        await owner.finish()\n        finally:\n            owner.release()\n";
     for source in [
