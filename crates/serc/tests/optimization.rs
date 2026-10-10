@@ -10481,6 +10481,66 @@ fn elided_terminal_boolean_preserves_shared_return_order() {
 }
 
 #[test]
+fn terminal_conditional_name_assignments_preserve_join() {
+    for scope in ["nonlocal", "local", "global", "attribute"] {
+        for guard in ["compound", "simple", "none"] {
+            for following in [false, true] {
+                let mut source =
+                    String::from("def sample(holder):\n    state = None\n    def assign(value):\n");
+                match scope {
+                    "local" => source.push_str("        state = None\n"),
+                    "nonlocal" | "global" => {
+                        writeln!(source, "        {scope} state").unwrap();
+                    }
+                    _ => {}
+                }
+                let target = if scope == "attribute" {
+                    "holder.state"
+                } else {
+                    "state"
+                };
+                let indent = match guard {
+                    "compound" => {
+                        source.push_str("        if value is not None and value.ready:\n");
+                        "            "
+                    }
+                    "simple" => {
+                        source.push_str("        if value:\n");
+                        "            "
+                    }
+                    _ => "        ",
+                };
+                writeln!(
+                    source,
+                    "{indent}{target} = value if {target} is None else {target}.combine(value)"
+                )
+                .unwrap();
+                if following {
+                    writeln!(source, "        consume({target})").unwrap();
+                }
+                source.push_str("    return state\n");
+                assert_matches_cpython(
+                    &source,
+                    &format!("terminal_store_{scope}_{guard}_{following}.py"),
+                    &LEVELS,
+                );
+            }
+        }
+    }
+    for (index, source) in [
+        "def f(self, x, flag, other, left, right):\n    if flag:\n        value = 1 if x else 2\n    else:\n        use()\n",
+        "def f(self, x, flag, other, left, right):\n    if flag:\n        use()\n    elif other:\n        value = left if x else right\n    else:\n        done()\n",
+        "def target(enabled, choose, left, right):\n    if enabled:\n        result = left if choose else right\n    else:\n        fallback()\n",
+        "def target(outer, inner, choose, left, right):\n    if outer:\n        fallback()\n    else:\n        if inner:\n            result = left if choose else right\n        else:\n            finish()\n",
+    ]
+    .iter()
+    .enumerate()
+    {
+        assert_matches_cpython(source, &format!("terminal_store_sibling_{index}.py"), &LEVELS);
+    }
+}
+
+#[test]
 fn erased_try_arms_preserve_large_tuple_return_join() {
     for returned in [
         "value,",

@@ -5702,14 +5702,16 @@ impl<'source> Compiler<'source> {
             // before CPython removes the NOP and joins these blocks.
             return self.compile_suite_inner(body, false);
         }
-        // A final else's conditional name assignment joins at its STORE before the outer
-        // if's separate implicit return block. Keep that STORE-only block out of eager exit
-        // copying. A tested arm has an intervening jump and retains its existing lowering.
+        let has_siblings = has_siblings || self.control.statements.terminal_if_branch_has_siblings;
+        // A final else's conditional name assignment, or a tested arm without
+        // siblings, joins at its STORE before the separate implicit return block.
+        // Tested arms with siblings retain their existing exit-copy lowering.
         // Attribute assignments also keep their original join: their combined tail exceeds
         // the four-instruction exit-copy limit after the outer jump becomes a NOP.
         let assignment = body.last().and_then(|statement| match statement {
             Stmt::Assign(assignment)
-                if (is_final_else && matches!(assignment.targets.as_slice(), [Expr::Name(_)]))
+                if ((is_final_else || !has_siblings)
+                    && matches!(assignment.targets.as_slice(), [Expr::Name(_)]))
                     || matches!(assignment.targets.as_slice(), [Expr::Attribute(attribute)]
                         if matches!(attribute.value.as_ref(), Expr::Name(_))) =>
             {
@@ -5717,7 +5719,6 @@ impl<'source> Compiler<'source> {
             }
             _ => None,
         });
-        let has_siblings = has_siblings || self.control.statements.terminal_if_branch_has_siblings;
         self.with_control_override(
             |control| &mut control.statements.terminal_if_branch_has_siblings,
             has_siblings,
