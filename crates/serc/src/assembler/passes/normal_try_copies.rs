@@ -3732,6 +3732,98 @@ impl OptimizationPipeline {
             named_cleanup_joins.insert(block);
             joins.insert(block, target);
         }
+        // A conditional handler join can precede an empty normal-finally exit.
+        // Keep both original arrays: the first tuple copy grows past four slots.
+        let mut guarded_finally_joins = FxHashSet::default();
+        if self.python_version >= crate::PythonVersion::Py314 {
+            for &join in order {
+                let Some(&middle) = joins.get(&join) else {
+                    continue;
+                };
+                let (
+                    Some((Item::Instruction(first), first_head)),
+                    Some((Item::Instruction(second), second_head)),
+                ) = (
+                    graph[join].items().split_last(),
+                    graph[middle].items().split_last(),
+                )
+                else {
+                    continue;
+                };
+                let Some(label) = second.forward_target() else {
+                    continue;
+                };
+                let Some(target) = graph.label_block(label) else {
+                    continue;
+                };
+                let Some(tail @ OriginalTail::LocalTupleReturn { .. }) =
+                    original_return_tail(label)
+                else {
+                    continue;
+                };
+                let mut expected_first =
+                    Instruction::new(JUMP_FORWARD, first.operand(), first.location, Some(0));
+                expected_first.jump_policy.mark_original_empty_join();
+                expected_first
+                    .jump_policy
+                    .retain_redundant_nop_after_threading();
+                expected_first.no_location_policy.set_borrow_fallthrough(
+                    super::super::ir::BorrowFallthrough::RetainedNopReachable,
+                );
+                let mut expected_second = Instruction::new(
+                    JUMP_FORWARD,
+                    Operand::Forward(label),
+                    SourceLocation::NONE,
+                    Some(0),
+                );
+                expected_second.jump_policy.mark_borrow_empty_block();
+                if first.location.line < 0
+                    || *first != expected_first
+                    || *second != expected_second
+                    || first_head.is_empty()
+                    || second_head.is_empty()
+                    || !first_head.iter().chain(second_head).all(|item| matches!(item, Item::Label(_)))
+                    || positions[&join] >= positions[&middle]
+                    || positions[&middle] >= positions[&target]
+                    || !exits.values().any(|(_, target, pass)| *target == join && pass.is_none())
+                    || [join, middle, target].iter().any(|block| {
+                        let mut head = graph[*block].items().iter().take_while(|item| matches!(item, Item::Label(_)));
+                        !head.clone().any(|item| matches!(item, Item::Label(label)
+                            if self.exception_owner_provenance.source_boundaries.contains(label)
+                                && self.exception_owner_provenance.block_boundaries.contains(label)))
+                            || head.any(|item| matches!(item, Item::Label(label)
+                                if self.borrow_block_aliases.contains(label)
+                                    || self.folded_original_predecessor_targets.contains(label)
+                                    || self.folded_condition_exit_targets.contains(label)
+                                    || self.original_nop_targets.contains(label)
+                                    || self.exception_owner_provenance.omitted_nop_counts.contains_key(label)
+                                    || self.exception_owner_provenance.omitted_nop_locations.contains_key(label)
+                                    || self.exception_owner_provenance.setups.iter().any(|(entry, _)| entry == label)
+                                    || self.exception_regions.iter().any(|region| region.target == *label)))
+                    })
+                    || self.exception_regions.iter().any(|region| {
+                        !region.is_scope_fallback && match (
+                            graph.label_block(region.start), graph.label_block(region.end),
+                        ) {
+                            (Some(start), Some(end)) => [join, middle, target].iter().any(|block|
+                                (positions[&start]..positions[&end]).contains(&positions[block])),
+                            _ => true,
+                        }
+                    })
+                    || graph[target].items().iter().filter_map(|item| match item {
+                        Item::Instruction(instruction) => Some(instruction),
+                        Item::Label(_) => None,
+                    }).zip([1, 2, 1, 0]).any(|(instruction, depth)| {
+                        *instruction != Instruction::new(instruction.opcode, instruction.operand(), instruction.location, Some(depth))
+                    })
+                {
+                    continue;
+                }
+                guarded_finally_joins.insert(join);
+                joins.insert(middle, target);
+                returns.insert(target, tail);
+            }
+        }
         let successor = |block| {
             exits
                 .get(&block)
@@ -3840,7 +3932,9 @@ impl OptimizationPipeline {
                 if pass.is_some() || original_jump_targets.contains(&exit) {
                     continue;
                 }
-                if guarded_handler_joins.contains_key(&join) {
+                if guarded_handler_joins.contains_key(&join)
+                    || guarded_finally_joins.contains(&join)
+                {
                     private_joins.push(join);
                     continue;
                 }
@@ -4300,7 +4394,8 @@ impl OptimizationPipeline {
                 .instructions_mut(block)
                 .next_back()
                 .expect("certified original empty join");
-            if guarded_handler_joins.contains_key(&block)
+            if (guarded_handler_joins.contains_key(&block)
+                || guarded_finally_joins.contains(&block))
                 && jump.jump_policy.is_original_empty_join()
             {
                 jump.jump_policy.consume_original_join_copy_prediction();
@@ -5846,6 +5941,150 @@ mod tests {
                     before,
                     "{case}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn guarded_finally_tuple_schedule_requires_intact_private_arrays() {
+        use crate::target::opcodes::{
+            BUILD_TUPLE, DELETE_FAST, LOAD_FAST, POP_JUMP_IF_TRUE, STORE_FAST,
+        };
+
+        for case in [
+            "accepted",
+            "legacy",
+            "extra slot",
+            "foreign alias",
+            "concrete owner",
+            "changed depth",
+            "changed policy",
+            "addressable cleanup",
+            "adjacent cleanup",
+            "wide tuple",
+            "name return",
+            "missing boundary",
+        ] {
+            let [entry, normal, cleanup, join, middle, tail, handler, alias] =
+                [0, 1, 2, 3, 4, 5, 6, 7].map(Label::from_u32);
+            let location = SourceLocation::new(10, 10, 4, 9);
+            let record = |opcode, operand, depth| {
+                Item::Instruction(Instruction::new(opcode, operand, location, Some(depth)))
+            };
+            let mut first =
+                Instruction::new(JUMP_FORWARD, Operand::Forward(middle), location, Some(0));
+            first.jump_policy.mark_original_empty_join();
+            first.jump_policy.retain_redundant_nop_after_threading();
+            first.no_location_policy.set_borrow_fallthrough(
+                crate::assembler::ir::BorrowFallthrough::RetainedNopReachable,
+            );
+            let mut second = Instruction::new(
+                JUMP_FORWARD,
+                Operand::Forward(tail),
+                SourceLocation::NONE,
+                Some(u32::from(case == "changed depth")),
+            );
+            if case != "changed policy" {
+                second.jump_policy.mark_borrow_empty_block();
+            }
+            let mut items = vec![
+                Item::Label(entry),
+                record(LOAD_FAST, Operand::Value(0), 1),
+                record(
+                    POP_JUMP_IF_TRUE,
+                    Operand::Forward(if case == "addressable cleanup" {
+                        cleanup
+                    } else {
+                        join
+                    }),
+                    0,
+                ),
+                Item::Label(normal),
+                record(JUMP_FORWARD, Operand::Forward(join), 0),
+                Item::Label(cleanup),
+                record(POP_EXCEPT, Operand::Value(0), 0),
+                record(LOAD_CONST, Operand::Value(0), 1),
+                record(STORE_FAST, Operand::Value(3), 0),
+                record(DELETE_FAST, Operand::Value(3), 0),
+                record(JUMP_FORWARD, Operand::Forward(join), 0),
+            ];
+            if case != "adjacent cleanup" {
+                items.extend([
+                    Item::Label(handler),
+                    record(LOAD_CONST, Operand::Value(0), 1),
+                    record(RETURN_VALUE, Operand::Value(0), 0),
+                ]);
+            }
+            items.extend([
+                Item::Label(join),
+                Item::Instruction(first),
+                Item::Label(middle),
+            ]);
+            if case == "foreign alias" {
+                items.push(Item::Label(alias));
+            }
+            if case == "extra slot" {
+                items.push(record(NOP, Operand::Value(0), 0));
+            }
+            items.extend([
+                Item::Instruction(second),
+                Item::Label(tail),
+                record(LOAD_FAST, Operand::Value(1), 1),
+            ]);
+            if case != "name return" {
+                items.push(record(LOAD_FAST, Operand::Value(2), 2));
+                if case == "wide tuple" {
+                    items.push(record(LOAD_FAST, Operand::Value(3), 3));
+                }
+                items.push(record(
+                    BUILD_TUPLE,
+                    Operand::Value(if case == "wide tuple" { 3 } else { 2 }),
+                    1,
+                ));
+            }
+            items.push(record(RETURN_VALUE, Operand::Value(0), 0));
+            let mut assembler = Assembler {
+                code: UnoptimizedCode::Linear(items),
+                python_version: if case == "legacy" {
+                    crate::PythonVersion::Py313
+                } else {
+                    crate::PythonVersion::Py315
+                },
+                next_label: 8,
+                ..Assembler::default()
+            };
+            assembler.record_normal_try_exit(normal, join, None);
+            for label in [join, middle, tail] {
+                if case != "missing boundary" || label != middle {
+                    assembler.record_exception_owner_block_boundary(label);
+                }
+            }
+            let mut pipeline = assembler.into_optimization_pipeline();
+            if case == "foreign alias" {
+                pipeline.borrow_block_aliases.insert(alias);
+            }
+            if case == "concrete owner" {
+                pipeline
+                    .exception_regions
+                    .push(region(middle, tail, handler, false));
+            }
+            let before = pipeline.graph.copy_items();
+            pipeline.prepare_normal_try_copy_plan();
+            let steps = &pipeline.exception_owner_provenance.normal_try_copy_steps;
+            if case == "accepted" {
+                assert_eq!(
+                    *steps,
+                    [
+                        (normal, join, 1),
+                        (cleanup, join, 1),
+                        (join, middle, 1),
+                        (middle, tail, 4),
+                        (join, tail, 4),
+                    ]
+                );
+            } else {
+                assert!(steps.is_empty(), "{case}");
+                assert_eq!(pipeline.graph.copy_items(), before, "{case}");
             }
         }
     }

@@ -4771,6 +4771,43 @@ fn negated_finally_guard_preserves_copied_continue_owner() {
 }
 
 #[test]
+fn conditional_finalizer_preserves_tuple_return_copy_order() {
+    let source = r"async def sample(work, flag, left, right):
+    try:
+        await work()
+    except Exception:
+        raise
+    finally:
+        try:
+            await work()
+        finally:
+            if not flag:
+                try:
+                    await work()
+                except Exception as error:
+                    work(error)
+    return left, right
+";
+    for (index, source) in [
+        source.to_owned(),
+        source.replace("    except Exception:\n        raise\n", ""),
+        source
+            .replace("except Exception as error:", "except Exception:")
+            .replace("work(error)", "work()"),
+        source.replace("return left, right", "return left"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            &source,
+            &format!("conditional_finalizer_tuple_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn guarded_finalizer_handlers_share_tuple_return_copies() {
     let source = r"def sample(first, second, condition, callback):
     try:
