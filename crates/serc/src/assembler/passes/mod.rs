@@ -630,11 +630,26 @@ impl OptimizationPipeline {
                 &self.borrow_jump_entry_labels,
             );
         }
-        if !self.borrow_jump_entry_labels.is_empty() {
-            self.borrow_threaded_jump_targets = Self::mark_initial_borrow_jump_entries(
+        if !self.borrow_unreachable_blocks.is_empty() {
+            let routes = Self::mark_initial_borrow_jump_entries(
                 &mut self.graph,
                 &self.exception_owner_provenance.block_boundaries,
             );
+            if self.borrow_jump_entry_labels.is_empty() {
+                // A direct break can bypass an earlier empty array, but must not
+                // reopen that array through an originally threaded cleanup route.
+                self.graph.for_each_instruction_mut(|instruction| {
+                    if !instruction.fusion_policy.is_authored_break()
+                        || instruction
+                            .initial_borrow_jump_target()
+                            .is_some_and(|target| routes.contains_key(&target))
+                    {
+                        instruction.clear_initial_borrow_jump_target();
+                    }
+                });
+            } else {
+                self.borrow_threaded_jump_targets = routes;
+            }
             original_owners.retain_pipeline(&self);
         }
         self.record_original_jump_heads();
@@ -737,7 +752,7 @@ impl OptimizationPipeline {
         self.borrow_authored_finally_break_origins =
             crate::assembler::ir::AuthoredFinallyBreakOrigins::default();
         // Also clear scratch origins on assertion-only and duplicate-pass early-return paths.
-        if !self.borrow_jump_entry_labels.is_empty() {
+        if !self.borrow_unreachable_blocks.is_empty() {
             Self::clear_initial_borrow_jump_entries(&mut self.graph);
         }
         #[cfg(test)]

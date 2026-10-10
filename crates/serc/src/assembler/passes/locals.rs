@@ -1186,12 +1186,24 @@ fn conditional_enters_original_block(
 ) -> bool {
     if instruction.opcode != POP_JUMP_IF_FALSE
         || instruction.operand() != Operand::Forward(target)
-        || !original_boundaries.contains(&target)
         || instruction.jump_policy.borrow_empty_block()
         || instruction.jump_policy.is_normalized_conditional_backedge()
         || !instruction.jump_policy.allows_borrow_threading_target()
         || instruction.no_location_policy.borrow_fallthrough() != BorrowFallthrough::Reachable
     {
+        return false;
+    }
+    original_entry_has_live_prefix(target, items, original_boundaries, unreachable)
+}
+
+/// An explicit entry bypasses only erased arrays before its original target.
+fn original_entry_has_live_prefix(
+    target: Label,
+    items: &[Item],
+    original_boundaries: &FxHashSet<Label>,
+    unreachable: &FxHashSet<Label>,
+) -> bool {
+    if !original_boundaries.contains(&target) {
         return false;
     }
     let mut at_target = false;
@@ -4247,11 +4259,25 @@ impl OptimizationPipeline {
                     // entry without turning a removed jump's NOP into a new CFG edge.
                     let mut has_original_prefix = false;
                     let mut nearest_label = None;
+                    let explicit_break_entry = last.fusion_policy.is_authored_break()
+                        // Empty loop anchors and finalizers retain their own entry policy.
+                        && items[blocks[target].clone()].iter()
+                            .take_while(|item| matches!(item, Item::Label(_)))
+                            .all(|item| matches!(item, Item::Label(label)
+                                if !borrow_loop_exit_labels.contains_key(label)
+                                    && !borrow_finally_entries.contains_key(label)))
+                        && original_entry_has_live_prefix(
+                            label,
+                            &items[blocks[target].clone()],
+                            original_block_boundaries,
+                            borrow_unreachable_labels,
+                        );
                     let inspect_jump_source = is_unconditional_jump(last.opcode)
                         && last.no_location_policy.borrow_fallthrough()
                             == BorrowFallthrough::Reachable
                         && !last.jump_policy.borrow_empty_block()
-                        && jump_entry_blocks.get(target).copied().unwrap_or(false)
+                        && (jump_entry_blocks.get(target).copied().unwrap_or(false)
+                            || explicit_break_entry)
                         && (!pre_copy_jump_entries.is_empty()
                             || (last.fusion_policy.is_authored_break()
                                 && !authored_finally_break_entries.is_empty()))
@@ -4299,7 +4325,8 @@ impl OptimizationPipeline {
                         })
                         && nearest_label.and_then(|source| pre_copy_jump_entries.get(&source))
                             == Some(&label)
-                        && jump_entry_blocks.get(target).copied().unwrap_or(false);
+                        && (jump_entry_blocks.get(target).copied().unwrap_or(false)
+                            || explicit_break_entry);
                     // An original reachable break may thread past an empty loop exit
                     // into its captured nonempty finally array. Its separate origin
                     // cannot reopen generic empty blocks or transfer to copied labels.
@@ -5777,6 +5804,108 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn captured_break_entries_bypass_only_earlier_empty_arrays() {
+        use crate::assembler::block_graph::BlockGraph;
+
+        let source = Label::from_u32(0);
+        let empty = Label::from_u32(1);
+        let target = Label::from_u32(2);
+        let other = Label::from_u32(3);
+        for change in [
+            "original",
+            "ordinary jump",
+            "copied source",
+            "retargeted",
+            "empty target",
+            "later array",
+            "missing origin",
+            "loop barrier",
+        ] {
+            let mut edge = Instruction::new(
+                JUMP_FORWARD,
+                Operand::Forward(target),
+                SourceLocation::NONE,
+                None,
+            );
+            if change != "ordinary jump" {
+                edge.fusion_policy.mark_authored_break();
+            }
+            let mut items = vec![
+                Item::Label(source),
+                instruction(LOAD_CONST, Operand::Value(0)),
+                instruction(POP_TOP, Operand::Value(0)),
+                Item::Instruction(edge),
+                instruction(LOAD_CONST, Operand::Value(0)),
+                instruction(RETURN_VALUE, Operand::Value(0)),
+                Item::Label(empty),
+                Item::Label(target),
+                instruction(LOAD_FAST, Operand::Value(0)),
+                instruction(RETURN_VALUE, Operand::Value(0)),
+            ];
+            let mut boundaries = FxHashSet::from_iter([source, empty, target]);
+            let mut graph = BlockGraph::from_items(items.clone(), &FxHashSet::default());
+            super::OptimizationPipeline::mark_initial_borrow_jump_entries(&mut graph, &boundaries);
+            let mut entries = super::OptimizationPipeline::take_pre_copy_borrow_jump_entries(
+                &mut graph,
+                &boundaries,
+            );
+            let mut blocked = FxHashSet::from_iter([empty]);
+            let mut loop_exits = FxHashMap::default();
+            match change {
+                "copied source" => items[0] = Item::Label(other),
+                "retargeted" => {
+                    entries.insert(source, other);
+                }
+                "empty target" => {
+                    blocked.insert(target);
+                }
+                "later array" => {
+                    items.insert(8, Item::Label(other));
+                    boundaries.insert(other);
+                }
+                "missing origin" => entries.clear(),
+                "loop barrier" => {
+                    loop_exits.insert(
+                        empty,
+                        crate::assembler::BorrowLoopExitPolicy {
+                            allow_surviving_break: false,
+                            preserve_small_exit: false,
+                            cleanup_call: None,
+                        },
+                    );
+                }
+                _ => {}
+            }
+            super::OptimizationPipeline::optimize_load_fast(
+                &mut items,
+                &[],
+                super::BorrowEntryLabels {
+                    unreachable: &blocked,
+                    loop_exits: &loop_exits,
+                    finally_entries: &FxHashMap::default(),
+                    finally_jump_sources: &FxHashMap::default(),
+                    jump_entries: &FxHashSet::default(),
+                    original_boundaries: &boundaries,
+                    pre_copy_jump_entries: &entries,
+                    authored_finally_break_entries: &FxHashMap::default(),
+                },
+                &FxHashSet::default(),
+                &FxHashSet::default(),
+                false,
+            );
+            assert_eq!(
+                borrow_opcodes(&items),
+                [if change == "original" {
+                    LOAD_FAST_BORROW
+                } else {
+                    LOAD_FAST
+                }],
+                "{change}"
+            );
         }
     }
 

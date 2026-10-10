@@ -15,6 +15,17 @@ use serc::{
 };
 
 #[test]
+fn managed_loop_break_bypasses_erased_recovery_exit() {
+    let source = "def sample(owner, active, cleanup):\n    count = 0\n    while active:\n        claimed = False\n        try:\n            with owner.pop() as item:\n                claimed = item is not None\n                if item is None:\n                    break\n                count += 1\n            if cleanup and item is not None:\n                try:\n                    if item.exists():\n                        owner.remove(item)\n                except Error as error:\n                    owner.warning(error)\n        except Error as error:\n            if claimed:\n                owner.failed()\n            owner.warning(error)\n            if not claimed:\n                if not owner.retryable(error):\n                    owner.close()\n                    raise\n    owner.close()\n    owner.report(count)\n";
+    for source in [
+        source.to_owned(),
+        source.replace("while active:", "while active and count < limit:"),
+    ] {
+        assert_matches_cpython(&source, "managed_loop_break.py", &LEVELS);
+    }
+}
+
+#[test]
 fn conditional_iterator_arm_keeps_nested_condition_borrowed() {
     let source = "def sample():\n    with resource.temporary_directory() as folder:\n        try:\n            for mode in [2, 3] if alternate else [3]:\n                for query in [[\"LOOKUP\", \"alpha\"], [\"HELP\"], [b\"bad\\x00tail\"], [b\"x\" * 1000]]:\n                    if query[0] == \"LOOKUP\":\n                        check(mode, describe(actual), describe(expected))\n                    elif b\"\\x00\" in query[0] if isinstance(query[0], bytes) else False:\n                        if query[0].startswith(b\"help\"):\n                            output[\"differences\"].append({\"actual\": actual, \"expected\": expected})\n        finally:\n            if client:\n                client.close()\n";
     let with_else = source.replacen(
