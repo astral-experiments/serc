@@ -7954,14 +7954,22 @@ impl<'source> Compiler<'source> {
                     && self.control.finally.active_finally_end_blocks == 1
                     && self.control.exceptions.active_exception_handlers.len() == 1
                     && self.control.exceptions.active_exception_handlers[0].finally_end_depth == 1
-                    && self.control.exceptions.active_exception_handlers[0].exception_region_depth
-                        == 1
                     && self
                         .control
-                        .exceptions
-                        .active_exception_region_exclusions
-                        .len()
-                        == 2
+                        .finally
+                        .finally_end_region_indices
+                        .last()
+                        .is_some_and(|&owner| {
+                            self.control.exceptions.active_exception_handlers[0]
+                                .exception_region_depth
+                                == owner + 1
+                                && self
+                                    .control
+                                    .exceptions
+                                    .active_exception_region_exclusions
+                                    .len()
+                                    == owner + 2
+                        })
                     && self
                         .control
                         .finally
@@ -7972,8 +7980,18 @@ impl<'source> Compiler<'source> {
                         .finally
                         .preserved_return_value_contexts
                         .is_empty()
-                    && self.control.withs.active_with_exits.is_empty()
-                    && self.control.loops.contexts.is_empty();
+                    && self
+                        .control
+                        .withs
+                        .active_with_exits
+                        .iter()
+                        .all(|context| context.finally_end_depth == 0)
+                    && self
+                        .control
+                        .loops
+                        .contexts
+                        .iter()
+                        .all(|context| context.finally_end_depth == 0);
                 // Iterators entered by an exceptional finally sit above its saved
                 // exception state. Unwind that inner suffix before FINALLY_END, then
                 // leave older iterators for the later return cleanup.
@@ -10143,10 +10161,13 @@ impl<'source> Compiler<'source> {
                         }
                         if handler_before_finally_end {
                             let start = self.emit_finally_end_unwind(0, preserve_tos, None)?;
-                            if let Some(region_starts) = &mut handler_region_unwind_starts {
+                            if let Some(region_starts) = &mut handler_region_unwind_starts
+                                && let Some(&owner) =
+                                    self.control.finally.finally_end_region_indices.last()
+                            {
                                 // POP_TOP still belongs to the finally cleanup. Its
                                 // POP_BLOCK retires that owner before POP_EXCEPT.
-                                region_starts[0] = start;
+                                region_starts[owner] = start;
                             }
                         }
                         if let Some(start) = deferred_finally_end_start
@@ -10371,8 +10392,70 @@ impl<'source> Compiler<'source> {
                     } else {
                         inner_async_manager_start
                     };
+                    let lexical_manager_unwind = !return_is_overridden
+                        && handler_count == 0
+                        && finally_context.handler_depth == 0
+                        && next_with > finally_context.with_depth
+                        && finally_context.loop_depth < next_loop
+                        && self.control.finally.active_finally_end_blocks == 0
+                        && self.control.finally.active_normal_finally_bodies == 0
+                        && self.control.finally.active_copied_finally_bodies == 0
+                        && self.control.finally.copied_return_finally_preserved_values == 0
+                        && self
+                            .control
+                            .finally
+                            .preserved_return_value_contexts
+                            .is_empty()
+                        && self.control.withs.active_with_exits
+                            [finally_context.with_depth..next_with]
+                            .iter()
+                            .all(|manager| manager.normal_finally_depth == 0)
+                        && self.control.withs.active_with_exits
+                            [finally_context.with_depth..next_with]
+                            .iter()
+                            .any(|manager| {
+                                self.control
+                                    .loops
+                                    .contexts
+                                    .iter()
+                                    .take(manager.loop_depth)
+                                    .skip(finally_context.loop_depth)
+                                    .any(|context| {
+                                        context.iterator_cleanup != IteratorCleanup::None
+                                    })
+                            })
+                        && self.control.loops.contexts[finally_context.loop_depth..next_loop]
+                            .iter()
+                            .all(|context| context.finally_end_depth == 0);
                     let mut starts = Vec::new();
-                    let remaining_with = if let Some(from_depth) = early_manager_start {
+                    let remaining_with = if lexical_manager_unwind {
+                        // Each manager must consume its exit callable before the
+                        // surrounding iterators can be removed from the stack.
+                        for with_index in (finally_context.with_depth..next_with).rev() {
+                            let loop_depth =
+                                self.control.withs.active_with_exits[with_index].loop_depth;
+                            self.emit_return_loop_iterator_cleanup(
+                                loop_depth,
+                                next_loop,
+                                preserve_tos,
+                                handler_region_unwind_starts.as_deref_mut(),
+                            )?;
+                            next_loop = loop_depth;
+                            let manager_starts = self.emit_with_unwind(
+                                with_index,
+                                with_index + 1,
+                                preserve_tos,
+                                super::legacy_native_labels::WithAwait::Return(statement.range),
+                            )?;
+                            if let Some(region_starts) = &mut handler_region_unwind_starts {
+                                for unwind in &manager_starts {
+                                    unwind.record_exception_starts(region_starts);
+                                }
+                            }
+                            starts.extend(manager_starts);
+                        }
+                        finally_context.with_depth
+                    } else if let Some(from_depth) = early_manager_start {
                         starts = self.emit_with_unwind(
                             from_depth,
                             next_with,
@@ -10422,7 +10505,11 @@ impl<'source> Compiler<'source> {
                     // These iterators were created in the same manager that is
                     // still pending here, before any inner ordinary try began. A bare
                     // return has the same unwind boundary as an explicit `return None`.
-                    let retained_manager_surrounds_iterators = (nested_call_finally_return
+                    let retained_manager_surrounds_iterators = ((preserve_tos
+                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                            == CO_COROUTINE
+                        && return_finally_contexts.len() == 1)
+                        || nested_call_finally_return
                         || statement.value.is_none()
                         || inner_async_manager_start.is_some())
                         && remaining_with > finally_context.with_depth
