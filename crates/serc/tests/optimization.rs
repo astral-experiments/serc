@@ -1141,6 +1141,50 @@ fn async_iterator_recovery_keeps_cleanup_cold() {
 }
 
 #[test]
+fn guarded_manager_cleanup_retains_raise_recovery() {
+    for work in ["resource.run()", "result = resource.run()"] {
+        for exit in ["raise", "return"] {
+            for cleanup in ["resource.state = None", "release(resource)"] {
+                let source = format!(
+                    "def sample(resource, ready):\n    try:\n        {work}\n    except Exception as error:\n        if ready:\n            {exit}\n        record(resource)\n    finally:\n        with resource.lock:\n            if resource.state == resource.expected:\n                {cleanup}\n"
+                );
+                assert_matches_cpython(&source, "guarded_manager_cleanup.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn guarded_recovery_reaches_managed_finally_from_live_body() {
+    for depth in 1..=3 {
+        for comma in [false, true] {
+            for local in [false, true] {
+                let mut suite = "try:\n    current.wait()\nexcept Error as error:\n    if current.poll() is None:\n        try:\n            current.wait(delay=5)\n        except LookupError:\n            current.wait()\nfinally:\n    with resource.lock:\n        resource.release()\n".to_owned();
+                let mut managers: Vec<_> = (0..depth)
+                    .map(|index| format!("resource.open() as bound{index}"))
+                    .collect();
+                if comma {
+                    managers = vec![managers.join(", ")];
+                }
+                for manager in managers.iter().rev() {
+                    suite = format!("with {manager}:\n    {}", suite.replace('\n', "\n    "));
+                }
+                let parameters = if local {
+                    "resource, current"
+                } else {
+                    "resource"
+                };
+                let source = format!(
+                    "def sample({parameters}):\n    {}\n    return outcome\n",
+                    suite.replace('\n', "\n    ")
+                );
+                assert_matches_cpython(&source, "guarded_managed_finally.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
 fn managed_guarded_recovery_preserves_finalizer_borrowing() {
     for named in [false, true] {
         for raising in 0..3 {

@@ -28070,6 +28070,22 @@ impl<'source> Compiler<'source> {
                 && self
                     .assembler
                     .current_original_block_has_nonempty_borrow_source();
+            let guarded_manager_finally = self.context.python_version
+                == crate::PythonVersion::Py314
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                && self.control.loops.contexts.is_empty()
+                && self.control.in_synchronous_with()
+                && self.control.finally.active_finally_try_bodies == 1
+                && self.control.finally.active_normal_finally_bodies == 0
+                && self.control.finally.active_copied_finally_bodies == 0
+                && handlers_have_live_guarded_recovery_cleanup(statement, false)
+                && matches!(statement.finalbody.as_slice(), [Stmt::With(manager)]
+                    if !manager.is_async
+                        && matches!(manager.items.as_slice(), [item]
+                            if item.optional_vars.is_none()
+                                && !expression_contains_inline_branch(&item.context_expr)
+                                && !expression_suspends_current_scope(&item.context_expr))
+                        && suite_has_nonsuspending_linear_fallthrough(&manager.body));
             let stored_call_finally_source =
                 self.context.python_version == crate::PythonVersion::Py314
                     && matches!(self.unit.scope, Scope::Function { .. })
@@ -28105,9 +28121,10 @@ impl<'source> Compiler<'source> {
                 && !handler_contains_terminal_nested_try
                 && !suite_ends_in_empty_try_exit_block(normal_exit_suite, loop_tail.is_some())
                 && (named_recovery_finally_source
-                    || (matches!(statement.finalbody.first(), Some(Stmt::Expr(expression))
+                    || ((matches!(statement.finalbody.first(), Some(Stmt::Expr(expression))
                     if matches!(expression.value.as_ref(), Expr::Call(_))
                         && !expression_contains_inline_branch(&expression.value))
+                        || guarded_manager_finally)
                         && ((self.suite_has_nonempty_borrow_entry(&statement.finalbody)
                             && self
                                 .assembler
@@ -34757,6 +34774,21 @@ impl<'source> Compiler<'source> {
                 && !suite_contains_yield(body)
                 && self.suite_has_nonempty_borrow_entry(body)
         };
+        let guarded_sync_manager = |body: &[Stmt]| {
+            matches!(body, [Stmt::With(manager)]
+                if !manager.is_async
+                    && matches!(manager.items.as_slice(), [item]
+                        if item.optional_vars.is_none()
+                            && !expression_contains_inline_branch(&item.context_expr)
+                            && !expression_suspends_current_scope(&item.context_expr))
+                    && matches!(manager.body.as_slice(), [Stmt::If(guard)]
+                        if guard.elif_else_clauses.is_empty()
+                            && condition_has_only_runtime_tests(&guard.test)
+                            && !expression_contains_inline_branch(&guard.test)
+                            && original_condition_has_unique_jump_target(&guard.test, false)
+                            && suite_has_linear_borrow_fallthrough(&guard.body))
+                    && !suite_contains_yield(&manager.body))
+        };
         // This copied outer finalizer still has a live inner recovery exit.
         // The manager evaluates its context before the guarded cleanup body;
         // its captured entry belongs to this copy, not the exceptional finalizer.
@@ -34790,19 +34822,7 @@ impl<'source> Compiler<'source> {
                     && suite_has_linear_reraise_guards(&handler.body)
             }))
             && self.suite_has_nonempty_borrow_entry(&statement.finalbody)
-            && matches!(statement.finalbody.as_slice(), [Stmt::With(manager)]
-                if !manager.is_async
-                    && matches!(manager.items.as_slice(), [item]
-                        if item.optional_vars.is_none()
-                            && !expression_contains_inline_branch(&item.context_expr)
-                            && !expression_suspends_current_scope(&item.context_expr))
-                    && matches!(manager.body.as_slice(), [Stmt::If(guard)]
-                        if guard.elif_else_clauses.is_empty()
-                            && condition_has_only_runtime_tests(&guard.test)
-                            && !expression_contains_inline_branch(&guard.test)
-                            && original_condition_has_unique_jump_target(&guard.test, false)
-                            && suite_has_linear_borrow_fallthrough(&guard.body))
-                    && !suite_contains_yield(&manager.body));
+            && guarded_sync_manager(&statement.finalbody);
         // The false edge of a terminal handler break retains its populated name
         // cleanup. That original jump still reaches a nonempty guarded recovery.
         let named_iterator_break_reaches_finally =
@@ -35727,9 +35747,17 @@ impl<'source> Compiler<'source> {
                         }) || (coroutine_while_nested_cleanup
                             && suite_has_linear_reraise_guards(&handler.body)))
                 })}))
-            // Raising recovery keeps the multiline cleanup setup populated.
-            // A returning handler can copy that setup onto a separate exit.
-            && (coroutine_guarded_store_recovery || (nested_cleanup_has_located_setup
+            && (coroutine_guarded_store_recovery || (synchronous_recovery
+                && self.suite_has_nonempty_borrow_entry(&statement.finalbody)
+                && statement.handlers.iter().all(|handler| {
+                    handler.as_except_handler().is_some_and(|handler| {
+                        !suite_contains_return(&handler.body)
+                    })
+                })
+                && guarded_sync_manager(&statement.finalbody))
+                // Raising recovery keeps the multiline cleanup setup populated.
+                // A returning handler can copy that setup onto a separate exit.
+                || (nested_cleanup_has_located_setup
                     && statement.handlers.iter().all(|handler| {
                         handler.as_except_handler().is_some_and(|handler| {
                             !suite_contains_return(&handler.body)
@@ -35761,6 +35789,13 @@ impl<'source> Compiler<'source> {
                                             && !expression_suspends_current_scope(&work.value))
                                 }))
                 }));
+        // A populated recovery exit reaches ordinary cleanup without crossing
+        // the enclosing synchronous manager's cleanup entry.
+        let guarded_managed_cleanup = !statement.is_star
+            && statement.orelse.is_empty()
+            && suite_has_nonsuspending_linear_fallthrough(&statement.body)
+            && handlers_have_live_guarded_recovery_cleanup(statement, false)
+            && linear_sync_manager(&statement.finalbody);
         // Completed awaits retain the normal entry before guarded cleanup. Raising
         // recovery does not copy this entry across the enclosing manager's exit.
         let managed_coroutine_recovery_reaches_finally = self.context.python_version
@@ -35805,7 +35840,7 @@ impl<'source> Compiler<'source> {
             && matches!(self.unit.scope, Scope::Function { .. })
             && synchronous_recovery
             && self.control.in_synchronous_with()
-            && self.control.withs.active_with_exits.len() == 1
+            && (self.control.withs.active_with_exits.len() == 1 || guarded_managed_cleanup)
             && !self.control.in_synchronous_with_nested_exception_region()
             && !self.control.in_exception_handler()
             && self.control.exceptions.active_exception_group_handlers == 0
@@ -35815,7 +35850,8 @@ impl<'source> Compiler<'source> {
             && self.control.finally.active_finally_end_blocks == 0
             && self.control.finally.active_copied_finally_bodies == 0
             && ((self.control.loops.contexts.is_empty()
-                && managed_recovery_has_populated_finally_route(statement))
+                && (managed_recovery_has_populated_finally_route(statement)
+                    || guarded_managed_cleanup))
                 || ((self.control.loops.contexts.is_empty()
                     || matches!(self.control.loops.contexts.as_slice(), [context]
                         if matches!(context.iterator_cleanup, IteratorCleanup::None | IteratorCleanup::Sync)
