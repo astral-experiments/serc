@@ -15,6 +15,24 @@ use serc::{
 };
 
 #[test]
+fn conditional_stored_reraise_copies_local_join() {
+    let source = "async def sample(owner, target, cleanup, started, observed):\n    try:\n        try:\n            outcome, reason = 'accepted', 'acknowledged'\n        except AlreadyStarted:\n            return\n        except RemoteError as error:\n            raise Unavailable() from None\n        except TimeoutError as error:\n            raise Unavailable() from None\n    except BaseException as error:\n        if isinstance(error, Cancelled):\n            reason = 'during_dispatch' if started else 'before_dispatch'\n        elif isinstance(error, Disabled):\n            reason = 'disabled'\n        elif started:\n            if isinstance(observed, RemoteError) and observed.status in {Invalid, Unauthorized, Denied, Failed}:\n                reason = 'rejected'\n            else:\n                reason = 'transport' if isinstance(observed, (RemoteError, TimeoutError)) else 'other'\n        raise\n    finally:\n        if not cleanup:\n            owner.record(target, outcome, reason, observed)\n";
+    for source in [
+        source.to_owned(),
+        source.replacen("async def", "def", 1),
+        source
+            .replacen("async def", "def", 1)
+            .replacen("    try:", "    yield None\n    try:", 1),
+        source.replace(
+            "            reason = 'during_dispatch'",
+            "            outcome = 'cancelled'\n            reason = 'during_dispatch'",
+        ),
+    ] {
+        assert_matches_cpython(&source, "conditional_stored_reraise.py", &LEVELS);
+    }
+}
+
+#[test]
 fn nested_async_recovery_keeps_awaited_cleanup_entry_owned() {
     let source = "async def sample(owner, observation):\n    client = owner.client()\n    try:\n        try:\n            await owner.index(\n                validate=owner.validate if owner.allowed else None,\n                ready=observation.ready if observation is not None else None,\n            )\n        except BaseException as error:\n            try:\n                async with owner.timeout():\n                    await owner.delete()\n            except BaseException as cleanup_error:\n                if not isinstance(error, Exception) or isinstance(cleanup_error, (Denied, Conflict)):\n                    raise error from None\n                raise\n            if not isinstance(error, Exception):\n                raise error from None\n            if observation is not None:\n                observation.obsolete = True\n    finally:\n        await client.close()\n";
     for source in [
