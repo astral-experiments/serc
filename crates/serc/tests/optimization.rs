@@ -15,6 +15,29 @@ use serc::{
 };
 
 #[test]
+fn conditional_iterator_arm_keeps_nested_condition_borrowed() {
+    let source = "def sample():\n    with resource.temporary_directory() as folder:\n        try:\n            for mode in [2, 3] if alternate else [3]:\n                for query in [[\"LOOKUP\", \"alpha\"], [\"HELP\"], [b\"bad\\x00tail\"], [b\"x\" * 1000]]:\n                    if query[0] == \"LOOKUP\":\n                        check(mode, describe(actual), describe(expected))\n                    elif b\"\\x00\" in query[0] if isinstance(query[0], bytes) else False:\n                        if query[0].startswith(b\"help\"):\n                            output[\"differences\"].append({\"actual\": actual, \"expected\": expected})\n        finally:\n            if client:\n                client.close()\n";
+    let with_else = source.replacen(
+        "                    if query[0]",
+        "                    actual = left.request(query)\n                    expected = right.request(query)\n                    if query[0]",
+        1,
+    ).replace(
+        "        finally:",
+        "                        else:\n                            check(actual, expected)\n                    else:\n                        check(actual, expected)\n        finally:",
+    );
+    for source in [
+        source.to_owned(),
+        source.replace("[2, 3] if alternate else [3]", "modes"),
+        source.replace("else False", "else selected"),
+        source.replace("isinstance(query[0], bytes)", "active"),
+        with_else.clone(),
+        with_else.replace("else False", "else selected"),
+    ] {
+        assert_matches_cpython(&source, "managed_conditional_iterator.py", &LEVELS);
+    }
+}
+
+#[test]
 fn coroutine_guarded_recovery_reaches_nested_cleanup() {
     let source = "async def sample(client, owner, capacity, count, registered, done, cancelled):\n    try:\n        owner.ready()\n    except (Error, Cancelled) as error:\n        if registered:\n            try:\n                await client.update()\n            except ClientError:\n                owner.warning()\n        if isinstance(error, Cancelled):\n            raise\n    finally:\n        try:\n            if not done and not cancelled:\n                await owner.cancel()\n        finally:\n            capacity.release(count)\n";
     for source in [

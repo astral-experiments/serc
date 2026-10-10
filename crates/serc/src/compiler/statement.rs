@@ -20646,7 +20646,8 @@ impl<'source> Compiler<'source> {
                         nested.test.range()
                     });
                 let nested_tail = self.compile_with_strict_owned_loads(
-                    matches!(test, Expr::If(_)),
+                    matches!(test, Expr::If(conditional)
+                        if early_condition_truthiness(&conditional.test).is_some()),
                     |compiler| {
                         compiler.with_control_override(
                             |control| &mut control.loops.loop_tail_final_elif_nested_condition,
@@ -20998,21 +20999,24 @@ impl<'source> Compiler<'source> {
             // A non-final branch still targets the following `elif`; its nested Boolean joins
             // therefore remain forward instead of splitting directly around the loop edge.
             // The final `else` has no following branch and can split against that backedge.
-            // A runtime conditional with straight, nonsuspending leaves retains its
-            // populated body join; its first arm jumps there and its second falls through.
+            // A runtime arm retains its populated body join even when a folded-false
+            // fallback jumps directly to the next clause.
             let nested_tail = self.compile_with_strict_owned_loads(
                 test.is_some_and(|test| {
-                    matches!(test, Expr::If(conditional)
-                    if self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) != 0
-                        || ![
-                        conditional.test.as_ref(),
-                        conditional.body.as_ref(),
-                        conditional.orelse.as_ref(),
-                    ].into_iter().all(|part| {
+                    let Expr::If(conditional) = test else {
+                        return false;
+                    };
+                    let runtime_leaf = |part: &Expr| {
                         condition_has_only_runtime_tests(part)
                             && !expression_contains_inline_branch(part)
                             && !expression_suspends_current_scope(part)
-                    }))
+                    };
+                    self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) != 0
+                        || !runtime_leaf(&conditional.test)
+                        || !runtime_leaf(&conditional.body)
+                        || !(runtime_leaf(&conditional.orelse)
+                            || matches!(conditional.orelse.as_ref(), Expr::BooleanLiteral(value)
+                                if !value.value))
                 }),
                 |compiler| {
                     compiler.compile_loop_tail_suite_inner(
