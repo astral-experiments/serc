@@ -28497,6 +28497,22 @@ impl<'source> Compiler<'source> {
                         && handler.name.is_some()
                         && guarded_recovery_has_populated_handler_suffix(&handler.body)
                 }));
+            let unowned_guarded_recovery = self.context.python_version
+                == crate::PythonVersion::Py314
+                && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+                && self.control.loops.contexts.is_empty()
+                && self.control.withs.active_with_exits.is_empty()
+                && self.control.withs.active_with_region_exclusions.is_empty()
+                && self.control.exceptions.active_exception_group_handlers == 0
+                && !statement.handlers.is_empty()
+                && statement.handlers.iter().all(|handler| {
+                    handler.as_except_handler().is_some_and(|handler| {
+                        handler.type_.as_deref().is_some_and(|kind| {
+                            !expression_contains_inline_branch(kind)
+                                && !expression_suspends_current_scope(kind)
+                        })
+                    })
+                });
             let live_guarded_recovery_cleanup = handler_contains_nested_handler_cold_join
                 && !handler_contains_terminal_nested_try
                 && !handler_has_orphan_cold_cleanup
@@ -28505,7 +28521,32 @@ impl<'source> Compiler<'source> {
                 && statement.finalbody.is_empty()
                 && matches!(self.unit.scope, Scope::Function { .. })
                 && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
-                && suite_has_linear_borrow_fallthrough(&statement.body)
+                && (suite_has_linear_borrow_fallthrough(&statement.body)
+                    || (unowned_guarded_recovery
+                        && (statement.body.iter().all(|part| {
+                            matches!(part, Stmt::Import(_) | Stmt::ImportFrom(_))
+                                || suite_has_nonsuspending_linear_fallthrough(std::slice::from_ref(
+                                    part,
+                                ))
+                        }) || statement.body.split_last().is_some_and(|(last, prefix)| {
+                            (suite_has_nonsuspending_conditional_work(prefix)
+                                || (self.unit.flags & CO_COROUTINE != 0
+                                    && prefix.iter().all(|part| {
+                                        suite_has_linear_borrow_fallthrough(std::slice::from_ref(
+                                            part,
+                                        )) || statement_is_runtime_none_return_guard(part)
+                                    })))
+                                && suite_has_nonsuspending_linear_fallthrough(std::slice::from_ref(
+                                    last,
+                                ))
+                        }) || matches!(statement.body.as_slice(), [Stmt::Assign(assignment)]
+                        if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                            && matches!(assignment.value.as_ref(), Expr::If(value)
+                                if condition_has_linear_runtime_leaves(&value.test)
+                                    && [&value.test, &value.body, &value.orelse].into_iter().all(|part| {
+                                        !expression_contains_inline_branch(part)
+                                            && !expression_suspends_current_scope(part)
+                                    }))))))
                 && self.control.exceptions.active_exception_handlers.is_empty()
                 && self
                     .control
@@ -28515,7 +28556,7 @@ impl<'source> Compiler<'source> {
                 && self.control.finally.active_finally_try_bodies == 0
                 && self.control.finally.active_copied_finally_bodies == 0
                 && self.control.finally.active_finally_end_blocks == 0
-                && handlers_have_live_guarded_recovery_cleanup(statement);
+                && handlers_have_live_guarded_recovery_cleanup(statement, unowned_guarded_recovery);
             let populated_async_recovery_else = handler_contains_nested_handler_cold_join
                 && !handler_contains_terminal_nested_try
                 && !handler_has_orphan_cold_cleanup
@@ -45531,14 +45572,57 @@ fn guarded_recovery_has_populated_handler_suffix(body: &[Stmt]) -> bool {
 }
 
 // A final no-else runtime guard keeps the named handler cleanup live through its
-// false edge, including inside a loop or context manager. Normally completing
-// nested recoveries cannot orphan that entry.
-fn handlers_have_live_guarded_recovery_cleanup(statement: &ruff_python_ast::StmtTry) -> bool {
-    fn completed_work(statement: &Stmt) -> bool {
+// false edge, including inside a loop or context manager. The unowned
+// route also retains this entry through completed work and unnamed recovery.
+fn handlers_have_live_guarded_recovery_cleanup(
+    statement: &ruff_python_ast::StmtTry,
+    unowned_recovery: bool,
+) -> bool {
+    fn completed_value(expression: &Expr) -> bool {
+        if crate::stack_growth_required() {
+            return crate::grow_stack(|| completed_value(expression));
+        }
+        match expression {
+            Expr::BoolOp(boolean) => boolean.values.iter().all(completed_value),
+            Expr::If(value) => {
+                condition_has_linear_runtime_leaves(&value.test)
+                    && !expression_suspends_current_scope(&value.test)
+                    && completed_value(&value.body)
+                    && completed_value(&value.orelse)
+            }
+            Expr::Call(call) => {
+                !expression_contains_inline_branch(&call.func)
+                    && !expression_suspends_current_scope(&call.func)
+                    && call.arguments.args.iter().all(|argument| {
+                        !matches!(argument, Expr::Starred(_)) && completed_value(argument)
+                    })
+                    && call
+                        .arguments
+                        .keywords
+                        .iter()
+                        .all(|keyword| keyword.arg.is_some() && completed_value(&keyword.value))
+            }
+            _ => {
+                !expression_contains_inline_branch(expression)
+                    && !expression_suspends_current_scope(expression)
+                    && !expression_yields_in_current_scope(expression)
+            }
+        }
+    }
+
+    fn completed_work(statement: &Stmt, unowned_recovery: bool) -> bool {
         suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement))
+            || (unowned_recovery
+                && (matches!(statement, Stmt::Import(_) | Stmt::ImportFrom(_))
+                    || suite_has_linear_reraise_guards(std::slice::from_ref(statement))
+                    || statement_is_runtime_none_return_guard(statement)
+                    || matches!(statement, Stmt::Expr(work)
+                        if matches!(work.value.as_ref(), Expr::Call(_))
+                            && completed_value(&work.value))))
             || matches!(statement, Stmt::Assign(assignment)
                 if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
-                    && (matches!(assignment.value.as_ref(), Expr::If(value)
+                    && ((unowned_recovery && completed_value(&assignment.value))
+                        || matches!(assignment.value.as_ref(), Expr::If(value)
                         if is_specialized_none_condition(&value.test)
                             && !expression_contains_inline_branch(&value.test)
                             && !expression_contains_inline_branch(&value.body)
@@ -45549,29 +45633,55 @@ fn handlers_have_live_guarded_recovery_cleanup(statement: &ruff_python_ast::Stmt
                             && !expression_yields_in_current_scope(&assignment.value))))
     }
 
-    fn normal_recovery_suite(body: &[Stmt]) -> bool {
+    fn normal_recovery_suite(body: &[Stmt], unowned_recovery: bool) -> bool {
         !body.is_empty()
             && body.iter().all(|statement| {
-                if completed_work(statement) {
+                if completed_work(statement, unowned_recovery) {
                     return true;
                 }
                 match statement {
                     Stmt::If(guard) => {
-                        guard.elif_else_clauses.is_empty()
-                            && condition_has_linear_runtime_leaves(&guard.test)
-                            && !expression_contains_inline_branch(&guard.test)
-                            && normal_recovery_suite(&guard.body)
+                        condition_has_linear_runtime_leaves(&guard.test)
+                            && (unowned_recovery || !expression_contains_inline_branch(&guard.test))
+                            && if guard.elif_else_clauses.is_empty() {
+                                normal_recovery_suite(&guard.body, unowned_recovery)
+                            } else {
+                                unowned_recovery
+                                    && !expression_suspends_current_scope(&guard.test)
+                                    && suite_has_nonsuspending_linear_fallthrough(&guard.body)
+                                    && guard.elif_else_clauses.split_last().is_some_and(
+                                        |(otherwise, clauses)| {
+                                            otherwise.test.is_none()
+                                            && normal_recovery_suite(
+                                                &otherwise.body,
+                                                unowned_recovery,
+                                            )
+                                            && clauses.iter().all(|clause| {
+                                                clause.test.as_ref().is_some_and(|test| {
+                                                    condition_has_linear_runtime_leaves(test)
+                                                        && !expression_suspends_current_scope(test)
+                                                }) && suite_has_nonsuspending_linear_fallthrough(
+                                                    &clause.body,
+                                                )
+                                            })
+                                        },
+                                    )
+                            }
                     }
                     Stmt::Try(recovery) => {
                         !recovery.is_star
                             && recovery.orelse.is_empty()
                             && recovery.finalbody.is_empty()
                             && !recovery.body.is_empty()
-                            && recovery.body.iter().all(completed_work)
+                            && recovery
+                                .body
+                                .iter()
+                                .all(|part| completed_work(part, unowned_recovery))
                             && !recovery.handlers.is_empty()
                             && recovery.handlers.iter().all(|handler| {
                                 handler.as_except_handler().is_some_and(|handler| {
-                                    handler.type_.is_some() && normal_recovery_suite(&handler.body)
+                                    handler.type_.is_some()
+                                        && normal_recovery_suite(&handler.body, unowned_recovery)
                                 })
                             })
                     }
@@ -45585,20 +45695,36 @@ fn handlers_have_live_guarded_recovery_cleanup(statement: &ruff_python_ast::Stmt
         let Some(handler) = handler.as_except_handler() else {
             return false;
         };
-        if handler.type_.is_none() || handler.name.is_none() {
+        if handler.type_.is_none() || (handler.name.is_none() && !unowned_recovery) {
             return false;
         }
-        if suite_has_linear_borrow_fallthrough(&handler.body) {
+        if suite_has_linear_borrow_fallthrough(&handler.body)
+            || (unowned_recovery
+                && handler
+                    .body
+                    .iter()
+                    .all(|part| completed_work(part, unowned_recovery)))
+        {
             continue;
         }
-        let Some(Stmt::If(guard)) = handler.body.last() else {
-            return false;
+        let guarded_recovery = |part: &Stmt| {
+            matches!(part, Stmt::If(guard)
+            if guard.elif_else_clauses.is_empty()
+                && condition_has_linear_runtime_leaves(&guard.test)
+                && (matches!(guard.body.last(), Some(Stmt::Try(_)))
+                    || (unowned_recovery
+                        && matches!(guard.body.last(), Some(Stmt::If(dispatch))
+                            if dispatch.elif_else_clauses.last().is_some_and(|otherwise| {
+                                otherwise.test.is_none()
+                                    && matches!(otherwise.body.last(), Some(Stmt::Try(_)))
+                            })))))
         };
-        if !guard.elif_else_clauses.is_empty()
-            || !condition_has_linear_runtime_leaves(&guard.test)
-            || !matches!(guard.body.last(), Some(Stmt::Try(_)))
-            || !normal_recovery_suite(&handler.body)
-        {
+        let has_guard = if unowned_recovery {
+            handler.body.iter().any(guarded_recovery)
+        } else {
+            handler.body.last().is_some_and(guarded_recovery)
+        };
+        if !has_guard || !normal_recovery_suite(&handler.body, unowned_recovery) {
             return false;
         }
         has_guarded_recovery = true;
@@ -45649,6 +45775,16 @@ fn async_recovery_has_populated_handler_suffix(body: &[Stmt]) -> bool {
                 && handler.name.is_some()
                 && suite_has_linear_borrow_fallthrough(&handler.body)
         }))
+}
+
+// A no-else None-return guard leaves a completed false edge in its original array.
+fn statement_is_runtime_none_return_guard(statement: &Stmt) -> bool {
+    matches!(statement, Stmt::If(guard)
+        if guard.elif_else_clauses.is_empty()
+            && condition_has_linear_runtime_leaves(&guard.test)
+            && !expression_suspends_current_scope(&guard.test)
+            && matches!(guard.body.as_slice(), [Stmt::Return(returned)]
+                if returned.value.as_deref().is_none_or(|value| matches!(value, Expr::NoneLiteral(_)))))
 }
 
 // A bare-return guard leaves a normal recovery exit. The return's
@@ -50748,7 +50884,7 @@ mod tests {
                 panic!("expected recovery");
             };
             assert_eq!(
-                super::handlers_have_live_guarded_recovery_cleanup(recovery),
+                super::handlers_have_live_guarded_recovery_cleanup(recovery, false),
                 expected,
                 "{source}"
             );
