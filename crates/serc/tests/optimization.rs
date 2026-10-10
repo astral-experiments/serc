@@ -15,6 +15,25 @@ use serc::{
 };
 
 #[test]
+fn awaited_else_break_keeps_normal_cleanup_reachable() {
+    let source = "async def sample(owner, prepare, requested, observations, recovered, resolver, binding, context, streaming, emission):\n    while True:\n        try:\n            result, fallback, data, entries, tree, download, entities = owner.compile(\n                names=resolver.names if resolver is not None else None,\n                prefix=resolver.prefix if resolver is not None else None,\n                resolve=owner.resolve if binding is not None else None,\n                context=(context, recovered) if prepare is not None else context,\n                diagnostics=observations if not streaming else None,\n                counts=observations if not streaming else None,\n                output=emission,\n            )\n        except (ValueError, TypeError):\n            if recovered or prepare is None or not await prepare(tuple(requested)):\n                for observation in observations:\n                    owner.record(observation)\n        else:\n            if recovered or prepare is None or not await prepare(tuple(requested)):\n                break\n        if emission is not None:\n            emission.summary = None\n";
+    for source in [
+        source.to_owned(),
+        source
+            .replace(
+                "        else:\n",
+                "        else:\n            if prepare is not None:\n                requested.update(owner.references(entries))\n",
+            )
+            .replace(
+                "                    owner.record(observation)\n",
+                "                    owner.record(observation)\n                raise\n",
+            ),
+    ] {
+        assert_matches_cpython(&source, "awaited_else_break.py", &LEVELS);
+    }
+}
+
+#[test]
 fn guarded_break_preserves_normal_cleanup_ownership() {
     let source = "def sample(owner, values):\n    try:\n        while owner.ready():\n            try:\n                value = owner.next()\n                if (value or {}).get('ready', 0) > 0:\n                    owner.record(value)\n                    break\n            except Error as error:\n                owner.problem(error)\n            finally:\n                if not owner.done():\n                    owner.cancel()\n            owner.pause()\n        else:\n            raise Error()\n        owner.finish()\n    finally:\n        owner.close()\n";
     for source in [

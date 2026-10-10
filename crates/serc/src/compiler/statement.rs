@@ -27996,6 +27996,29 @@ impl<'source> Compiler<'source> {
                     && self.control.finally.active_copied_finally_bodies == 0
                     && self.control.finally.active_finally_end_blocks == 0
                     && ordinary_try_has_asserted_recovery(statement);
+                // The awaited guard's sole false edge keeps this normal-exit NOP
+                // live even when an independent cold recovery contains a loop.
+                let coroutine_awaited_else_break = borrow_exit_has_source_successor
+                    && self.context.python_version == crate::PythonVersion::Py314
+                    && !statement.is_star
+                    && statement.finalbody.is_empty()
+                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                        == CO_COROUTINE
+                    && matches!(self.control.loops.contexts.as_slice(), [context]
+                        if context.iterator_cleanup == IteratorCleanup::None)
+                    && self.control.withs.active_with_exits.is_empty()
+                    && !self.control.in_exception_handler()
+                    && self.control.finally.active_finally_try_bodies == 0
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_copied_finally_bodies == 0
+                    && self.control.finally.active_finally_end_blocks == 0
+                    && !normal_exit_starts_in_empty_block
+                    && matches!(statement.orelse.split_last(), Some((Stmt::If(guard), prefix))
+                        if suite_has_nonsuspending_conditional_work(prefix)
+                            && guard.elif_else_clauses.is_empty()
+                            && matches!(guard.body.as_slice(), [Stmt::Break(_)])
+                            && expression_suspends_current_scope(&guard.test)
+                            && original_condition_has_unique_jump_target(&guard.test, false));
                 // Recovery handlers keep this located normal exit connected to the following
                 // suite. Cold cleanup or an unlocated join can leave an empty block in between.
                 if (pass_only_handlers
@@ -28008,7 +28031,8 @@ impl<'source> Compiler<'source> {
                         && statement.handlers.iter().all(|handler| {
                             handler.as_except_handler().is_some_and(|handler| {
                                 !suite_terminates(&handler.body)
-                                    && !suite_contains_loop(&handler.body)
+                                    && (!suite_contains_loop(&handler.body)
+                                        || coroutine_awaited_else_break)
                                     && !handler
                                         .body
                                         .last()
