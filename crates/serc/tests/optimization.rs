@@ -2507,6 +2507,132 @@ fn literal_handler_returns_retire_inner_try_before_managed_iterator() {
 }
 
 #[test]
+fn coroutine_iterator_handler_returns_preserve_outer_try_owner() {
+    let source = r"async def sample(items, work, finish):
+    try:
+        for item in items:
+            try:
+                try:
+                    await work()
+                except ValueError:
+                    return item
+            finally:
+                await finish()
+    except Exception:
+        raise
+";
+    for named in [false, true] {
+        for iterator in [false, true] {
+            for returned in ["item", "None"] {
+                for awaited in [false, true] {
+                    let mut source = source.replace("return item", &format!("return {returned}"));
+                    if named {
+                        source =
+                            source.replace("except ValueError:", "except ValueError as error:");
+                    }
+                    if !iterator {
+                        source = source.replace("for item in items:", "while items:");
+                    }
+                    if !awaited {
+                        source = source.replace("await finish()", "finish()");
+                    }
+                    assert_matches_cpython(&source, "iterator_handler_return_owner.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn awaited_finalizers_preserve_normal_iterator_return_locations() {
+    let source = r"async def sample(items, work, finish):
+    try:
+        for item in items:
+            try:
+                try:
+                    await work()
+                except ValueError:
+                    if item:
+                        raise
+                    continue
+                except TypeError:
+                    return item
+                return item
+            finally:
+                await finish()
+    except Exception:
+        raise
+    return None
+";
+    for named in [false, true] {
+        for returned in ["item", "work(item)", "None", "7", "True", "(1, 2)"] {
+            for (index, cleanup) in ["finish()", "await finish()", "await finish.close(item)"]
+                .into_iter()
+                .enumerate()
+            {
+                let mut source = source
+                    .replace("return item", &format!("return {returned}"))
+                    .replace("await finish()", cleanup);
+                if named {
+                    source = source.replace("except TypeError:", "except TypeError as error:");
+                }
+                assert_matches_cpython(
+                    &source,
+                    &format!("awaited_iterator_return_location_{named}_{returned}_{index}.py"),
+                    &LEVELS,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn literal_finalizer_returns_preserve_completed_cleanup_locations() {
+    let source = r"def sample(items, work, finish):
+    try:
+        for item in items:
+            try:
+                work(item)
+                return None
+            finally:
+                finish()
+    except ValueError:
+        raise
+    return None
+";
+    for generator in [false, true] {
+        for returned in ["None", "7", "True", "(1, 2)"] {
+            let mut source = source.replace("return None", &format!("return {returned}"));
+            if generator {
+                source = source.replacen("    try:\n", "    yield None\n    try:\n", 1);
+            }
+            assert_matches_cpython(
+                &source,
+                &format!("literal_finalizer_return_{generator}_{returned}.py"),
+                &LEVELS,
+            );
+            if !generator {
+                assert_matches_cpython(
+                    &source.replace("def sample", "async def sample"),
+                    &format!("coroutine_literal_finalizer_return_{returned}.py"),
+                    &LEVELS,
+                );
+            }
+        }
+    }
+    let asynchronous = source
+        .replace("def sample", "async def sample")
+        .replacen("    try:\n", "    yield None\n    try:\n", 1)
+        .replace("return None", "return")
+        .replace("finish()", "await finish()");
+    assert_matches_cpython(
+        &asynchronous,
+        "async_generator_literal_finalizer_return.py",
+        &LEVELS,
+    );
+}
+
+#[test]
 fn handler_return_keeps_outer_finalizer_owner_through_iterator_cleanup() {
     let source = r"async def sample(items, flag):
     try:

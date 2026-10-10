@@ -6654,21 +6654,22 @@ impl Assembler {
         let Some(items) = self.linear_items().get(start..) else {
             return;
         };
-        let [Item::Instruction(call), Item::Instruction(pop), tail @ ..] = items else {
+        let [Item::Instruction(donor), Item::Instruction(pop), tail @ ..] = items else {
             return;
         };
-        if call.opcode != crate::target::opcodes::CALL
-            || call.value_argument().is_none()
-            || call.location.line < 0
+        if !matches!(
+            (donor.opcode, donor.value_argument()),
+            (crate::target::opcodes::CALL, Some(_)) | (crate::target::opcodes::END_SEND, Some(0))
+        ) || donor.location.line < 0
             || pop.opcode != POP_TOP
             || pop.value_argument() != Some(0)
-            || pop.location != call.location
+            || pop.location != donor.location
             || iterators == 0
             || !tail.iter().any(|item| matches!(item, Item::Label(_)))
         {
             return;
         }
-        self.record_copied_finally_iterator_return_tail(start, 2, iterators, call.location);
+        self.record_copied_finally_iterator_return_tail(start, 2, iterators, donor.location);
     }
 
     /// Captures a guard's unique false join before artificial iterator disposal.
