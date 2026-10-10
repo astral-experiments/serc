@@ -27133,7 +27133,7 @@ impl<'source> Compiler<'source> {
                             && matches!(handler.type_.as_deref(), Some(Expr::Name(_)))
                             && matches!(handler.body.as_slice(), [Stmt::If(_)])
                             && !suite_contains_conditional_nested_recovery(&handler.body)
-                            && suite_has_nonterminal_recovery_work(&handler.body)
+                            && suite_has_nonterminal_recovery_work(&handler.body, false)
                     })
                 })
                 && matches!(statement.finalbody.as_slice(), [Stmt::Try(cleanup)]
@@ -32451,9 +32451,7 @@ impl<'source> Compiler<'source> {
                         && !expression_contains_inline_branch(&assertion.test)
                         && !expression_suspends_current_scope(&assertion.test))
         };
-        // The completed await retains the first arm's jump into the separate-line
-        // recovery entry. Non-copying handler exits do not retire that normal jump.
-        let coroutine_await_recovery_reaches_finally = self.context.python_version
+        let coroutine_recovery_entry_context = self.context.python_version
             == crate::PythonVersion::Py314
             && matches!(self.unit.scope, Scope::Function { .. })
             && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
@@ -32468,7 +32466,10 @@ impl<'source> Compiler<'source> {
                 .active_exception_region_exclusions
                 .is_empty()
             && !self.control.in_exception_handler()
-            && self.control.finally.is_inactive_for_return_unwind()
+            && self.control.finally.is_inactive_for_return_unwind();
+        // The completed await retains the first arm's jump into the separate-line
+        // recovery entry. Non-copying handler exits do not retire that normal jump.
+        let coroutine_await_recovery_reaches_finally = coroutine_recovery_entry_context
             && matches!(statement.handlers.as_slice(), [handler]
             if handler.as_except_handler().is_some_and(|handler| {
                 matches!(handler.type_.as_deref(), Some(Expr::Name(_)))
@@ -32519,6 +32520,49 @@ impl<'source> Compiler<'source> {
                                                 && clause.body.iter().all(completed_await_recovery_work)))
                         })
                 }));
+        // A guarded reraise retains POP_EXCEPT before a nested cleanup's located
+        // setup. Completed recovery awaits do not empty that normal entry.
+        let coroutine_guarded_nested_cleanup_entry = coroutine_recovery_entry_context
+            && !suite_contains_abrupt_control_flow(&statement.body)
+            && matches!(statement.body.last(), Some(Stmt::Expr(work))
+                if matches!(work.value.as_ref(), Expr::Call(_))
+                    && !expression_contains_inline_branch(&work.value)
+                    && !expression_suspends_current_scope(&work.value))
+            && matches!(statement.handlers.as_slice(), [handler]
+            if handler.as_except_handler().is_some_and(|handler| {
+                handler.name.is_some()
+                    && handler.type_.as_deref().is_some_and(|type_| {
+                        !expression_contains_inline_branch(type_)
+                            && !expression_suspends_current_scope(type_)
+                    })
+                    && handler.body.split_last().is_some_and(|(last, prefix)| {
+                        suite_has_nonterminal_recovery_work(prefix, true)
+                            && matches!(last, Stmt::If(guard)
+                                if condition_has_linear_runtime_leaves(&guard.test)
+                                    && !expression_suspends_current_scope(&guard.test)
+                                    && guard.elif_else_clauses.is_empty()
+                                    && matches!(guard.body.as_slice(), [Stmt::Raise(raise)]
+                                        if raise.exc.is_none() && raise.cause.is_none()))
+                    })
+            }))
+            && self.suite_has_nonempty_borrow_entry(&statement.finalbody)
+            && matches!(statement.finalbody.as_slice(), [Stmt::Try(cleanup)]
+                if !cleanup.is_star
+                    && cleanup.handlers.is_empty()
+                    && cleanup.orelse.is_empty()
+                    && matches!(cleanup.body.as_slice(), [Stmt::If(guard)]
+                        if condition_has_linear_runtime_leaves(&guard.test)
+                            && !expression_suspends_current_scope(&guard.test)
+                            && guard.elif_else_clauses.is_empty()
+                            && matches!(guard.body.as_slice(), [Stmt::Expr(work)]
+                                if matches!(work.value.as_ref(), Expr::Await(awaited)
+                                    if matches!(awaited.value.as_ref(), Expr::Call(_))
+                                        && !expression_contains_inline_branch(&awaited.value)
+                                        && !expression_suspends_current_scope(&awaited.value))))
+                    && matches!(cleanup.finalbody.as_slice(), [Stmt::Expr(work)]
+                        if matches!(work.value.as_ref(), Expr::Call(_))
+                            && !expression_contains_inline_branch(&work.value)
+                            && !expression_suspends_current_scope(&work.value)));
         // Awaited recovery retains its success jump in normal and return-copied cleanup.
         let coroutine_reraise_cleanup =
             self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
@@ -34367,6 +34411,7 @@ impl<'source> Compiler<'source> {
             || conditional_body_reaches_finally
             || coroutine_conditional_store_reaches_finally
             || coroutine_await_recovery_reaches_finally
+            || coroutine_guarded_nested_cleanup_entry
             || raising_alternative_reaches_finally
             || coroutine_manager_raise_else_reaches_finally
             || runtime_while_false_edge_reaches_finally
@@ -46247,27 +46292,50 @@ mod protected_iterator_erased_else_tests {
 }
 
 /// Certifies conditional work with nonterminating, linear nested recoveries.
-fn suite_has_nonterminal_recovery_work(body: &[Stmt]) -> bool {
+fn suite_has_nonterminal_recovery_work(body: &[Stmt], allow_await: bool) -> bool {
     if crate::stack_growth_required() {
-        return crate::grow_stack(|| suite_has_nonterminal_recovery_work(body));
+        return crate::grow_stack(|| suite_has_nonterminal_recovery_work(body, allow_await));
     }
+    let completed_await = |part: &Stmt| {
+        let value = match part {
+            Stmt::Expr(expression) => expression.value.as_ref(),
+            Stmt::Assign(assignment)
+                if matches!(assignment.targets.as_slice(), [Expr::Name(_)]) =>
+            {
+                assignment.value.as_ref()
+            }
+            _ => return false,
+        };
+        allow_await
+            && matches!(value, Expr::Await(awaited)
+            if matches!(awaited.value.as_ref(), Expr::Call(_))
+                && !expression_contains_inline_branch(&awaited.value)
+                && !expression_suspends_current_scope(&awaited.value))
+    };
     body.iter().all(|part| match part {
         Stmt::If(branch) => {
             condition_has_linear_runtime_leaves(&branch.test)
                 && !expression_suspends_current_scope(&branch.test)
-                && suite_has_nonterminal_recovery_work(&branch.body)
+                && suite_has_nonterminal_recovery_work(&branch.body, allow_await)
                 && branch.elif_else_clauses.iter().all(|clause| {
                     clause.test.as_ref().is_none_or(|test| {
                         condition_has_linear_runtime_leaves(test)
                             && !expression_suspends_current_scope(test)
-                    }) && suite_has_nonterminal_recovery_work(&clause.body)
+                    }) && suite_has_nonterminal_recovery_work(&clause.body, allow_await)
                 })
         }
         Stmt::Try(recovery) => {
             !recovery.is_star
                 && recovery.orelse.is_empty()
                 && recovery.finalbody.is_empty()
-                && suite_has_nonsuspending_linear_fallthrough(&recovery.body)
+                && (suite_has_nonsuspending_linear_fallthrough(&recovery.body)
+                    || (allow_await
+                        && recovery.body.iter().all(|part| {
+                            completed_await(part)
+                                || suite_has_nonsuspending_linear_fallthrough(std::slice::from_ref(
+                                    part,
+                                ))
+                        })))
                 && matches!(recovery.handlers.as_slice(), [handler]
                 if handler.as_except_handler().is_some_and(|handler| {
                     matches!(handler.type_.as_deref(), Some(Expr::Name(_)))
@@ -46275,7 +46343,10 @@ fn suite_has_nonterminal_recovery_work(body: &[Stmt]) -> bool {
                             || handler.body.iter().all(|part| matches!(part, Stmt::Pass(_))))
                 }))
         }
-        _ => suite_has_nonsuspending_conditional_work(std::slice::from_ref(part)),
+        _ => {
+            suite_has_nonsuspending_conditional_work(std::slice::from_ref(part))
+                || completed_await(part)
+        }
     })
 }
 
