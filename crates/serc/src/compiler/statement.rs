@@ -726,6 +726,8 @@ pub(super) struct StatementContext {
     followed_by_name_assignment_or_deletion: bool,
     // Whether an elided conditional join reaches a call, linear store, or name delete.
     elided_join_has_live_successor: bool,
+    // Await starts this branch-free operand before entering any nested send loops.
+    elided_join_has_await_successor: bool,
     // A synchronous manager starts live work before entering its own protected body.
     elided_join_has_manager_successor: bool,
     // Two tuple elements, BUILD_TUPLE, POP_BLOCK, and RETURN exceed the four-record
@@ -3055,8 +3057,19 @@ impl<'source> Compiler<'source> {
                                 & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                                 == CO_COROUTINE
                             && self.control.loops.contexts.is_empty()
-                            && self.control.withs.active_with_exits.is_empty()
-                            && self.control.withs.active_with_region_exclusions.is_empty()
+                            && self.control.withs.active_with_exits.len()
+                                == self.control.withs.active_with_region_exclusions.len()
+                            && self.control.withs.active_with_exits.iter().all(|context| {
+                                context.exception_region_depth + 1
+                                    == self
+                                        .control
+                                        .exceptions
+                                        .active_exception_region_exclusions
+                                        .len()
+                                    && context.finally_end_depth == 0
+                                    && context.normal_finally_depth == 0
+                                    && context.loop_depth == 0
+                            })
                             && self
                                 .control
                                 .exceptions
@@ -3430,6 +3443,11 @@ impl<'source> Compiler<'source> {
                             && self.control.statements.context.same_region_continuation
                                 == Some(statement.range())
                             && self.control.statements.context.elided_join_has_live_successor),
+                    elided_join_has_await_successor: matches!(elided_join_successor,
+                        Some(Stmt::Expr(expression))
+                            if matches!(expression.value.as_ref(), Expr::Await(awaited)
+                                if matches!(awaited.value.as_ref(), Expr::Call(_) | Expr::Name(_))
+                                    && !expression_contains_inline_branch(&awaited.value))),
                     elided_join_has_large_tuple_return: matches!(elided_join_successor,
                         Some(Stmt::Return(returned))
                             if matches!(returned.value.as_deref(), Some(value @ Expr::Tuple(tuple))
@@ -15780,6 +15798,7 @@ impl<'source> Compiler<'source> {
                                 .statements
                                 .context
                                 .elided_join_has_live_successor
+                                || self.control.statements.context.elided_join_has_await_successor
                                 // A following runtime test also begins with a located
                                 // instruction before any cleanup in its branches.
                                 || self.control.statements.context.elided_join_has_conditional_successor)
@@ -15796,11 +15815,12 @@ impl<'source> Compiler<'source> {
                                 // Live work fixes the join's line before the finalizer
                                 // starts, even when its later cleanup introduces branches.
                                 || (async_managers_predate_finally
-                                    && self
+                                    && (self
                                         .control
                                         .statements
                                         .context
-                                        .elided_join_has_live_successor)
+                                        .elided_join_has_live_successor
+                                        || self.control.statements.context.elided_join_has_await_successor))
                         });
                     // An enclosing finalizer runs after the loop leaves this region.
                     // Live work precedes both cleanup and the backedge, so the manager
@@ -15833,7 +15853,7 @@ impl<'source> Compiler<'source> {
                                             .active_exception_region_exclusions
                                             .len()
                             });
-                    // Live work keeps this join inside the async manager. The sole
+                    // Live work keeps this join inside the manager. The sole
                     // enclosing finalizer starts before that manager and runs only
                     // after its exit, so it adds no predecessor to the empty arm.
                     let managed_finally_coroutine_join = matches!(
@@ -15844,11 +15864,16 @@ impl<'source> Compiler<'source> {
                         == CO_COROUTINE
                         && self.control.generators.generator_region_start.is_some()
                         && self.control.loops.contexts.is_empty()
-                        && self
+                        && (self
                             .control
                             .statements
                             .context
                             .elided_join_has_live_successor
+                            || self
+                                .control
+                                .statements
+                                .context
+                                .elided_join_has_await_successor)
                         && self.control.finally.active_finally_try_bodies == 1
                         && self
                             .control
@@ -15868,7 +15893,13 @@ impl<'source> Compiler<'source> {
                             .active_with_exits
                             .last()
                             .is_some_and(|manager| {
-                                manager.is_async && manager.exception_region_depth == 1
+                                manager.exception_region_depth == 1
+                                    && (manager.is_async
+                                        || self
+                                            .control
+                                            .statements
+                                            .context
+                                            .elided_join_has_await_successor)
                             });
                     let optimized_empty_both = self.context.python_version
                         >= crate::PythonVersion::Py314
