@@ -30037,6 +30037,30 @@ impl<'source> Compiler<'source> {
             if handler_ends_with_runtime_while_break_cleanup {
                 self.assembler.defer_original_while_break_cleanup_edges();
             }
+            let handler_has_folded_while_break_cleanup = self.context.python_version
+                >= crate::PythonVersion::Py314
+                && matches!(self.unit.scope, Scope::Function { .. })
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                && !statement.is_star
+                && statement.handlers.len() == 1
+                && statement.finalbody.is_empty()
+                && handler.name.is_none()
+                && matches!(handler.type_.as_deref(), Some(Expr::Name(_)))
+                && !terminal
+                && loop_tail.is_none()
+                && self.control.loops.contexts.is_empty()
+                && self.control.withs.active_with_exits.is_empty()
+                && self.control.exceptions.active_exception_handlers.is_empty()
+                && self.control.exceptions.active_exception_group_handlers == 0
+                && self.control.exceptions.active_try_marker_slots.is_empty()
+                && self.control.finally.active_finally_try_bodies == 0
+                && self.control.finally.active_normal_finally_bodies == 0
+                && self.control.finally.active_finally_end_blocks == 0
+                && self.control.finally.active_copied_finally_bodies == 0
+                && handler_ends_in_folded_while_break(&handler.body)
+                && self
+                    .assembler
+                    .defer_original_folded_while_break_cleanup((base_depth + 1).cast_unsigned());
             // Earlier raising arms can leave a complete conditional in the final else.
             // Its original jump and fallthrough both enter the name-cleanup array.
             let handler_has_nested_else_loop_cleanup = handler.name.is_some()
@@ -30191,6 +30215,7 @@ impl<'source> Compiler<'source> {
                 || handler_ends_with_named_conditional_cleanup
                 || handler_ends_with_loop_tail_join
                 || handler_ends_with_runtime_while_break_cleanup
+                || handler_has_folded_while_break_cleanup
                 // A named handler's five-record cleanup can be copied onto original
                 // break edges even when a loop's exhaustion arm also falls through.
                 || (handler.name.is_some()
@@ -45931,6 +45956,41 @@ fn handler_ends_in_runtime_while_break(body: &[Stmt]) -> bool {
         && condition_jump_target_count(&tail.test, false) == 1
         && suite_contains_loop_break(&tail.body)
         && !suite_contains_loop_break_with_finally(&tail.body)
+}
+
+fn handler_ends_in_folded_while_break(body: &[Stmt]) -> bool {
+    let Some((Stmt::While(tail), prefix)) = body.split_last() else {
+        return false;
+    };
+    let Some((Stmt::If(guard), work)) = tail.body.split_last() else {
+        return false;
+    };
+    let runtime_test = |expression: &Expr| {
+        condition_has_only_runtime_tests(expression)
+            && !expression_contains_inline_branch(expression)
+            && !expression_suspends_current_scope(expression)
+    };
+    matches!(tail.test.as_ref(), Expr::BooleanLiteral(value) if value.value)
+        && tail.orelse.is_empty()
+        && (prefix.is_empty() || suite_has_nonsuspending_linear_fallthrough(prefix))
+        && runtime_test(&guard.test)
+        && guard.elif_else_clauses.is_empty()
+        && matches!(guard.body.as_slice(), [Stmt::Break(_)])
+        && work.iter().all(|part| {
+            suite_has_nonsuspending_linear_fallthrough(std::slice::from_ref(part))
+                || matches!(part, Stmt::If(guard)
+                if runtime_test(&guard.test)
+                    && guard.elif_else_clauses.is_empty()
+                    && matches!(guard.body.as_slice(), [Stmt::Raise(raised)]
+                        if raised.exc.as_deref().is_some_and(|expression| {
+                            !expression_contains_inline_branch(expression)
+                                && !expression_suspends_current_scope(expression)
+                        })
+                            && raised.cause.as_deref().is_none_or(|expression| {
+                                !expression_contains_inline_branch(expression)
+                                    && !expression_suspends_current_scope(expression)
+                            })))
+        })
 }
 
 fn handler_ends_in_raising_while_break(body: &[Stmt]) -> bool {

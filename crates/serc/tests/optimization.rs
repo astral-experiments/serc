@@ -1284,6 +1284,46 @@ fn erased_coroutine_join_preserves_predating_async_managers() {
 }
 
 #[test]
+fn folded_while_breaks_copy_unnamed_handler_cleanup() {
+    let source = r"def sample(values, limit):
+    try:
+        rows = fetch(values)
+    except ValueError:
+        while True:
+            rows = fetch(values)
+            if len(rows) > limit:
+                raise RuntimeError('too many rows') from None
+            consume(rows)
+            if len(rows) < limit:
+                break
+    return rows
+";
+    for (name, source) in [
+        ("plain", source.to_owned()),
+        (
+            "try_else",
+            source.replace(
+                "    return rows",
+                "    else:\n        consume(rows)\n    return rows",
+            ),
+        ),
+        (
+            "prefix",
+            source.replace(
+                "        while True:",
+                "        total = len(values)\n        while True:",
+            ),
+        ),
+        (
+            "followup",
+            source.replace("    return rows", "    finish(rows)\n    return rows"),
+        ),
+    ] {
+        assert_matches_cpython(&source, &format!("folded_handler_break_{name}.py"), &LEVELS);
+    }
+}
+
+#[test]
 fn named_handler_none_while_break_copies_cleanup() {
     for prefix in ["", "async "] {
         for condition in ["value", "value is None", "value is not None"] {
