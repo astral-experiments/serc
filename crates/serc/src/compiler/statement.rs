@@ -15391,7 +15391,18 @@ impl<'source> Compiler<'source> {
                             if statement.elif_else_clauses.is_empty()
                                 && matches!(statement.body.last(), Some(Stmt::Break(_)))
                     );
-                    let unlocated_while_exit = matches!(body.last(), Some(Stmt::While(statement))
+                    // Optimized-away assertions do not replace the while's false-edge donor.
+                    let while_exit_tail =
+                        if self.context.python_version >= crate::PythonVersion::Py314 {
+                            body.iter().rfind(|tail| {
+                                !matches!(tail, Stmt::Global(global)
+                                if global.names.is_empty()
+                                    && self.context.is_elided_statement(tail))
+                            })
+                        } else {
+                            body.last()
+                        };
+                    let unlocated_while_exit = matches!(while_exit_tail, Some(Stmt::While(statement))
                         if statement.orelse.is_empty()
                             && !matches!(statement.test.as_ref(), Expr::Compare(_))
                             && condition_jump_target_count(&statement.test, false) > 1);
@@ -15432,7 +15443,7 @@ impl<'source> Compiler<'source> {
                             .set_location(self.source_location(condition_fallthrough_range(test)));
                     } else if matches!(nested_if_exit, Some(NestedIfExitLocation::Unlocated)) {
                         self.assembler.set_location(SourceLocation::NONE);
-                    } else if let Some(Stmt::While(while_statement)) = body.last()
+                    } else if let Some(Stmt::While(while_statement)) = while_exit_tail
                         && while_statement.orelse.is_empty()
                     {
                         // A sole false edge supplies the loop's empty exit block location.
@@ -16921,11 +16932,24 @@ impl<'source> Compiler<'source> {
                                 && suite_has_nonsuspending_conditional_work(std::slice::from_ref(
                                     part,
                                 )))
-                            // Argument branches finish at CALL and STORE before the
+                            // Completed value branches rejoin at STORE before the
                             // separate terminal conditional starts its own join.
                             || matches!(part, Stmt::Assign(assignment)
                                 if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
-                                    && call_has_completed_boolean_argument(&assignment.value))
+                                    && (call_has_completed_boolean_argument(&assignment.value)
+                                        || (matches!(assignment.value.as_ref(), Expr::If(_))
+                                            && !expression_suspends_current_scope(&assignment.value)
+                                            && !expression_yields_in_current_scope(&assignment.value))))
+                            // A completed manager rejoins before this conditional's
+                            // test, without adding an edge into its erased arms.
+                            || matches!(part, Stmt::With(manager)
+                                if !manager.is_async
+                                    && manager.items.iter().all(|item| {
+                                        !expression_suspends_current_scope(&item.context_expr)
+                                            && item.optional_vars.as_deref().is_none_or(|target| matches!(target, Expr::Name(_)))
+                                    })
+                                    && suite_has_linear_borrow_fallthrough(&manager.body)
+                                    && !suite_contains_yield(&manager.body))
                     })
                     .then_some(tail.range)
             })
@@ -17574,6 +17598,22 @@ impl<'source> Compiler<'source> {
                     && !context.has_orelse
                     && context.continue_label == restart
             });
+        let final_managed_iterator_arm = mode == LoopTailMode::default()
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.control.in_synchronous_with()
+            && self.control.in_loop_tail_without_nested_cleanup()
+            && self.control.exceptions.active_exception_group_handlers == 0
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && self.control.loops.contexts.last().is_some_and(|context| {
+                context.iterator_cleanup == IteratorCleanup::Sync
+                    && !context.has_orelse
+                    && context.continue_label == restart
+            });
         let erased_final_else = |statement: &ruff_python_ast::StmtIf| {
             !mode.non_final_branch
                 && final_coroutine_iterator_arm
@@ -17637,6 +17677,11 @@ impl<'source> Compiler<'source> {
                         && body[end + 1..].iter().all(|suffix| self.context.is_elided_statement(suffix)))
                     || ((mode.non_final_branch
                         || final_coroutine_iterator_arm
+                        // An erased suffix leaves both conditional exits at the
+                        // iterator's original, predating manager owner.
+                        || (final_managed_iterator_arm
+                            && original_condition_has_unique_jump_target(&statement.test, true)
+                            && original_condition_has_unique_jump_target(&statement.test, false))
                         || (final_async_iterator_arm
                             && original_condition_has_unique_jump_target(&statement.test, true)
                             && original_condition_has_unique_jump_target(&statement.test, false)))
@@ -20271,8 +20316,7 @@ impl<'source> Compiler<'source> {
                             if condition_has_linear_runtime_leaves(&value.test)
                                 && !expression_suspends_current_scope(&value.test)
                                 && [&value.body, &value.orelse].into_iter().all(|value|
-                                    !expression_contains_inline_branch(value)
-                                        && !expression_suspends_current_scope(value))))
+                                    expression_has_completed_conditional_value(value))))
         };
         // Exhausting the inner iterator restores the enclosing finally owner.
         // Its completed stores cannot enter the outer condition's erased edge.

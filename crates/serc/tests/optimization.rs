@@ -4837,6 +4837,155 @@ fn erased_iterator_else_preserves_linear_generator_creation() {
 }
 
 #[test]
+fn completed_manager_prefix_keeps_erased_conditional_tail() {
+    let source = "async def sample(mode, expected, task):\n    try:\n        if mode == 'cancel':\n            with raises(CancelledError):\n                await task\n        else:\n            with raises(RuntimeError if expected else Failure) as error:\n                await task\n            if expected:\n                assert error.value is expected\n            else:\n                assert error.value.code == 'unavailable'\n    finally:\n        await gather(task, return_exceptions=True)\n";
+    for source in [
+        source.to_owned(),
+        source.replace("RuntimeError if expected else Failure", "Failure"),
+        source.replace("await task\n", "await wait(task)\n"),
+        source.replace(
+            "with raises(RuntimeError if expected else Failure) as error:\n                await task",
+            "expected = (primary_error if mode in ('primary', 'both') else backup_error) if mode else None",
+        ),
+    ] {
+        assert_matches_cpython(&source, "completed_manager_tail.py", &LEVELS);
+    }
+}
+
+#[test]
+fn erased_assertions_preserve_nonfinal_while_branch_locations() {
+    let source = r"PREFIXdef sample(values, state):
+    count = len(values)
+    if state == 0:
+        consume(values)
+    elif state == 1:
+        while count:
+            consume(count)
+            count -= 1
+        assert ready(values)
+    else:
+        consume(state)
+    finish(values)
+";
+    for prefix in ["", "async "] {
+        for (name, source) in [
+            ("plain", source.to_owned()),
+            (
+                "call_condition",
+                source.replace("while count:", "while ready(count):"),
+            ),
+            (
+                "compound_condition",
+                source.replace("while count:", "while count and state:"),
+            ),
+            (
+                "break",
+                source.replace("            count -= 1", "            break"),
+            ),
+            (
+                "while_else",
+                source.replace(
+                    "        assert ready(values)",
+                    "        else:\n            consume(values)\n        assert ready(values)",
+                ),
+            ),
+            (
+                "live_suffix",
+                source.replace("assert ready(values)", "consume(values)"),
+            ),
+        ] {
+            assert_matches_cpython(
+                &source.replace("PREFIX", prefix),
+                &format!("nonfinal_while_assert_{name}.py"),
+                &LEVELS,
+            );
+        }
+    }
+}
+
+#[test]
+fn nested_conditional_stores_preserve_saved_iterator_owners() {
+    for (index, expression) in [
+        "(3 if flag else 5) if item == 1 else 7",
+        "3 if item == 1 else (5 if flag else 7)",
+        "(3 if flag else 5) if item == 1 else (7 if flag else 9)",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for manager in ["manager()", "manager() as owner"] {
+            for prefix in ["", "async "] {
+                let source = format!(
+                    "{prefix}def sample(values, flag, manager):
+    with {manager}:
+        for item in values:
+            if item > 0:
+                value = {expression}
+                seen = observe(value)
+                assert seen
+            else:
+                assert item == 0
+"
+                );
+                assert_matches_cpython(
+                    &source,
+                    &format!("nested_iterator_store_{index}_{manager}_{prefix}.py"),
+                    &LEVELS,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn managed_iterator_assertions_preserve_conditional_backedges() {
+    let indent = |source: &str| {
+        let mut result = String::new();
+        for line in source.lines() {
+            result.push_str("    ");
+            result.push_str(line);
+            result.push('\n');
+        }
+        result
+    };
+    for managed in [false, true] {
+        for in_loop in [false, true] {
+            for nested in [false, true] {
+                for following in [false, true] {
+                    for ordinary_assert in [false, true] {
+                        let mut core = String::from("value = transform(item)\n");
+                        if nested {
+                            core.push_str("if value is None:\n    value = replace(item)\n");
+                        }
+                        core.push_str(if ordinary_assert {
+                            "assert valid(value)\n"
+                        } else {
+                            "assert value is not None, \"missing value\"\n"
+                        });
+                        if following {
+                            core.push_str("observe(value)\n");
+                        }
+                        core = format!("if flag:\n{}", indent(&core));
+                        core = if in_loop {
+                            format!("for item in items:\n{}", indent(&core))
+                        } else {
+                            format!("item = items\n{core}")
+                        };
+                        core.push_str("return finish(items)\n");
+                        if managed {
+                            core = format!("with manager():\n{}", indent(&core));
+                        }
+                        let source =
+                            format!("def sample(manager, items, flag):\n{}", indent(&core));
+                        assert_matches_cpython(&source, "managed_iterator_assertion.py", &LEVELS);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn erased_elif_arms_preserve_saved_iterator_owners() {
     let indent = |body: &str| {
         let mut result = String::new();
