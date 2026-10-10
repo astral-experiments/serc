@@ -2430,6 +2430,57 @@ impl Assembler {
         true
     }
 
+    /// Keeps a folded true loop's sole break until its handler cleanup is copied.
+    pub(crate) fn defer_original_folded_while_break_cleanup(&mut self, depth: u32) -> bool {
+        if self.python_version < crate::PythonVersion::Py314 {
+            return false;
+        }
+        let items = self.linear_items();
+        let labels = trailing_labels(items).collect::<Vec<_>>();
+        let [end] = labels.as_slice() else {
+            return false;
+        };
+        let prefix = &items[..items.len() - labels.len()];
+        let Some(Item::Instruction(jump)) = prefix.last() else {
+            return false;
+        };
+        let mut expected = Instruction::new(
+            JUMP_FORWARD,
+            Operand::Forward(*end),
+            jump.location,
+            Some(depth),
+        );
+        expected.fusion_policy.mark_authored_break();
+        expected.jump_policy.prevent_threading_target();
+        expected.jump_policy.retain_nop_for_direct_target();
+        expected.add_pre_fold_extra_instructions(1);
+        if jump.location.line < 0
+            || *jump != expected
+            || !self.folded_loop_exit_anchors.contains(end)
+            || !self.folded_away_condition_targets.contains(end)
+            || !self.exception_owner_provenance.source_boundaries.contains(end)
+            || !self.exception_owner_provenance.block_boundaries.contains(end)
+            || self.join_labels_have_authored_location(&labels)
+            || prefix.contains(&Item::Label(*end))
+            || self.folded_away_loop_else_targets.contains(end)
+            || self.preserved_block_boundaries.contains(end)
+            || self.exception_owner_provenance.omitted_nop_counts.contains_key(end)
+            || prefix[..prefix.len() - 1].iter().any(|item| {
+                matches!(item, Item::Instruction(instruction)
+                    if matches!(instruction.operand(), Operand::Forward(target) | Operand::Backward(target)
+                        if target == *end))
+            })
+        {
+            return false;
+        }
+        let index = prefix.len() - 1;
+        let Item::Instruction(jump) = &mut self.linear_items_mut()[index] else {
+            unreachable!("the original break was checked above");
+        };
+        jump.jump_policy.defer_removal();
+        true
+    }
+
     /// Keeps one original break until its bare-raise else's handler cleanup is copied.
     pub(crate) fn defer_original_raising_while_break_cleanup(&mut self) -> bool {
         if self.python_version < crate::PythonVersion::Py314 {

@@ -313,6 +313,180 @@ fn guarded_handler_iterator_join_requires_original_edges() {
 }
 
 #[test]
+fn folded_while_cleanup_requires_one_original_break() {
+    for version in [
+        crate::PythonVersion::Py313,
+        crate::PythonVersion::Py314,
+        crate::PythonVersion::Py315,
+    ] {
+        for mutation in [
+            "intact",
+            "missing anchor",
+            "missing fold",
+            "missing source",
+            "missing block",
+            "folded cleanup",
+            "loop else",
+            "preserved alias",
+            "authored alias",
+            "omitted alias",
+            "duplicate alias",
+            "earlier alias",
+            "missing label",
+            "extra break",
+            "false edge",
+            "backward ingress",
+            "wrong target",
+            "wrong opcode",
+            "unlocated",
+            "wrong depth",
+            "unknown depth",
+            "not authored",
+            "threadable",
+            "no retention",
+            "wrong slots",
+            "local policy",
+            "exception policy",
+            "inlining policy",
+        ] {
+            let mut assembler = Assembler::with_python_version(version);
+            let end = assembler.label();
+            let cleanup = assembler.label();
+            assembler.record_folded_loop_exit_anchor(end);
+            assembler.record_exception_owner_block_boundary(end);
+            let location = SourceLocation::new(4, 4, 12, 17);
+            let mut jump = Instruction::new(
+                JUMP_FORWARD,
+                Operand::Forward(end),
+                location,
+                match mutation {
+                    "wrong depth" => Some(2),
+                    "unknown depth" => None,
+                    _ => Some(1),
+                },
+            );
+            if mutation != "not authored" {
+                jump.fusion_policy.mark_authored_break();
+            }
+            if mutation != "threadable" {
+                jump.jump_policy.prevent_threading_target();
+            }
+            if mutation != "no retention" {
+                jump.jump_policy.retain_nop_for_direct_target();
+            }
+            jump.add_pre_fold_extra_instructions(if mutation == "wrong slots" { 2 } else { 1 });
+            match mutation {
+                "missing anchor" => {
+                    assembler.folded_loop_exit_anchors.remove(&end);
+                }
+                "missing fold" => {
+                    assembler.folded_away_condition_targets.remove(&end);
+                }
+                "missing source" => {
+                    assembler
+                        .exception_owner_provenance
+                        .source_boundaries
+                        .remove(&end);
+                }
+                "missing block" => {
+                    assembler
+                        .exception_owner_provenance
+                        .block_boundaries
+                        .remove(&end);
+                }
+                "folded cleanup" => {
+                    assembler.record_folded_loop_exit_anchor(cleanup);
+                }
+                "loop else" => {
+                    assembler.folded_away_loop_else_targets.insert(end);
+                }
+                "preserved alias" => {
+                    assembler.preserved_block_boundaries.insert(end);
+                }
+                "authored alias" => {
+                    assembler.original_nop_targets.insert(end);
+                }
+                "omitted alias" => {
+                    assembler
+                        .exception_owner_provenance
+                        .omitted_nop_counts
+                        .insert(end, 1);
+                }
+                "earlier alias" => {
+                    assembler.mark(end);
+                }
+                "extra break" => {
+                    assembler.push_linear_item(Item::Instruction(jump));
+                }
+                "false edge" | "backward ingress" => {
+                    assembler.push_linear_item(Item::Instruction(Instruction::new(
+                        if mutation == "false edge" {
+                            POP_JUMP_IF_FALSE
+                        } else {
+                            JUMP_BACKWARD
+                        },
+                        if mutation == "false edge" {
+                            Operand::Forward(end)
+                        } else {
+                            Operand::Backward(end)
+                        },
+                        location,
+                        Some(1),
+                    )));
+                }
+                "wrong target" => {
+                    jump.set_operand(Operand::Forward(cleanup));
+                }
+                "wrong opcode" => {
+                    jump.opcode = JUMP_BACKWARD;
+                }
+                "unlocated" => {
+                    jump.location = SourceLocation::NONE;
+                }
+                "local policy" => {
+                    jump.local_policy.add_hidden_exception_owner_slots(1);
+                }
+                "exception policy" => {
+                    jump.exclude_from_exception_table(ExceptionExclusion::Always);
+                }
+                "inlining policy" => {
+                    jump.allow_unconditional_block_inlining();
+                }
+                _ => {}
+            }
+            assembler.push_linear_item(Item::Instruction(jump));
+            if mutation != "missing label" {
+                assembler.mark(end);
+            }
+            if mutation == "duplicate alias" {
+                assembler.mark(end);
+            } else if mutation == "folded cleanup" {
+                assembler.mark(cleanup);
+            }
+            let before = assembler.linear_items().to_vec();
+            let accepted = version >= crate::PythonVersion::Py314 && mutation == "intact";
+            assert_eq!(
+                assembler.defer_original_folded_while_break_cleanup(1),
+                accepted,
+                "{version:?}: {mutation}"
+            );
+            let mut expected = before;
+            if accepted {
+                let Item::Instruction(jump) = &mut expected[0] else {
+                    unreachable!()
+                };
+                jump.jump_policy.defer_removal();
+            }
+            assert_eq!(
+                assembler.linear_items(),
+                expected,
+                "{version:?}: {mutation}"
+            );
+        }
+    }
+}
+
+#[test]
 fn while_cleanup_none_condition_requires_original_record() {
     for version in [
         crate::PythonVersion::Py313,
