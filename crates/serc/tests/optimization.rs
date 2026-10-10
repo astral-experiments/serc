@@ -3178,6 +3178,33 @@ fn retained_managers_own_value_return_iterator_cleanup() {
 }
 
 #[test]
+fn coroutine_for_else_break_keeps_nonfinal_branch_order() {
+    let source = r"async def sample(values, flag):
+    OWNER manager():
+        ITERATOR item in values:
+            if flag:
+                if CONDITION:
+                    break
+            elif accepted(item):
+                break
+        else:
+            raise RuntimeError('exhausted')
+    await complete()
+";
+    for owner in ["with", "async with"] {
+        for iterator in ["for", "async for"] {
+            for condition in ["item.state in states", "flag", "accepted(item)"] {
+                let source = source
+                    .replace("OWNER", owner)
+                    .replace("ITERATOR", iterator)
+                    .replace("CONDITION", condition);
+                assert_matches_cpython(&source, "coroutine_for_else_break.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
 fn coroutine_nested_finalizers_keep_iterator_return_locations() {
     let source = r"async def sample(manager, action, cleanup, values, value, flag):
     try:
