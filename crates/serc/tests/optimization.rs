@@ -15,6 +15,31 @@ use serc::{
 };
 
 #[test]
+fn nested_coroutine_else_stores_reach_outer_continuation() {
+    let source = "async def sample(owner, flag):\n    try:\n        try:\n            result = await owner.run()\n        except First as error:\n            result = owner.recover(error)\n        except Second as error:\n            result, flag = owner.other(error)\n        else:\n            if flag:\n                result = owner.left()\n            else:\n                result = owner.right()\n    except BaseException as error:\n        raise\n    return owner.finish(result)\n";
+    for source in [
+        source.to_owned(),
+        source.replacen(
+            "        else:\n",
+            "        else:\n            owner.prepare(result)\n",
+            1,
+        ),
+        source
+            .replace(
+                "result = owner.recover(error)",
+                "result = {\"error\": {\"kind\": \"invalid\", **owner.recover(error)}}",
+            )
+            .replace(
+                "await owner.run()",
+                "await owner.run(retry=lambda delay: clock.now() + delay < deadline)",
+            ),
+        source.replace("if flag:", "if owner.ready:"),
+    ] {
+        assert_matches_cpython(&source, "nested_coroutine_else_store.py", &LEVELS);
+    }
+}
+
+#[test]
 fn group_iterator_break_reaches_guarded_cleanup() {
     let source = "async def sample(owner, source):\n    async with owner.manager():\n        try:\n            for item in source:\n                break\n            else:\n                raise Stop()\n        except* Error as group:\n            if owner.recover:\n                await owner.note(group)\n        finally:\n            if owner.active:\n                await owner.save()\n";
     for source in [
