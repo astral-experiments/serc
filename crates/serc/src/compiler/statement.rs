@@ -34635,7 +34635,7 @@ impl<'source> Compiler<'source> {
                     && !expression_suspends_current_scope(&cleanup.test)
                     && cleanup.orelse.is_empty()
                     && suite_has_linear_borrow_fallthrough(&cleanup.body));
-        let managed_while_recovery_exit = statement.handlers.is_empty()
+        let managed_recovery_exit = statement.handlers.is_empty()
             && !normal_finally_is_borrow_reachable
             && statement.orelse.is_empty()
             && self.unit.flags & (CO_COROUTINE | CO_GENERATOR | CO_ASYNC_GENERATOR) == CO_COROUTINE
@@ -34647,12 +34647,26 @@ impl<'source> Compiler<'source> {
             && self.control.finally.active_copied_finally_bodies == 0
             && (managed_while_reraise_leaves_empty_borrow_exit(&statement.body)
                 || (matches!(statement.finalbody.first(), Some(Stmt::While(_)))
-                    && managed_iterator_continue_leaves_empty_borrow_exit(&statement.body)));
+                    && managed_iterator_continue_leaves_empty_borrow_exit(&statement.body))
+                || (self.context.python_version == crate::PythonVersion::Py314
+                    && matches!(self.unit.scope, Scope::Function { .. })
+                    && self.control.withs.active_with_exits.is_empty()
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .is_empty()
+                    && matches!(statement.finalbody.as_slice(), [Stmt::Expr(expression)]
+                        if matches!(expression.value.as_ref(), Expr::Await(awaited)
+                            if matches!(awaited.value.as_ref(), Expr::Call(_))
+                                && !expression_contains_inline_branch(&awaited.value)
+                                && !expression_suspends_current_scope(&awaited.value)))
+                    && nested_async_cleanup_leaves_empty_borrow_entry(&statement.body)));
         if (!statement.handlers.is_empty() && !normal_finally_is_borrow_reachable)
             || nested_handler_exit
             || nested_named_recovery_exit
             || conditional_while_finally_exit
-            || managed_while_recovery_exit
+            || managed_recovery_exit
         {
             // An abrupt or bare handler leaves an empty CPython CFG block before the normal
             // finally body. Breaks and trailing structured try-body exits can leave the same
@@ -42546,6 +42560,66 @@ fn managed_while_reraise_leaves_empty_borrow_exit(body: &[Stmt]) -> bool {
             && matches!(handler.body.last(), Some(Stmt::Raise(raise))
                 if raise.exc.is_none() && raise.cause.is_none())
     })
+}
+
+// Nested named recovery moves behind the hot path, leaving an empty original
+// join between a completed await and the enclosing awaited cleanup.
+fn nested_async_cleanup_leaves_empty_borrow_entry(body: &[Stmt]) -> bool {
+    let [Stmt::Try(recovery)] = body else {
+        return false;
+    };
+    let [handler] = recovery.handlers.as_slice() else {
+        return false;
+    };
+    let Some(handler) = handler.as_except_handler() else {
+        return false;
+    };
+    let Some((Stmt::Try(cleanup), tail)) = handler.body.split_first() else {
+        return false;
+    };
+    let Some((Stmt::If(store), guards)) = tail.split_last() else {
+        return false;
+    };
+    let awaited_call = |body: &[Stmt]| {
+        matches!(body, [Stmt::Expr(expression)]
+            if matches!(expression.value.as_ref(), Expr::Await(awaited)
+                if matches!(awaited.value.as_ref(), Expr::Call(_))
+                    && !expression_suspends_current_scope(&awaited.value)))
+    };
+    !recovery.is_star
+        && recovery.orelse.is_empty()
+        && recovery.finalbody.is_empty()
+        && awaited_call(&recovery.body)
+        && handler.type_.is_some()
+        && handler.name.is_some()
+        && (guards.is_empty() || suite_has_linear_reraise_guards(guards))
+        && condition_has_linear_runtime_leaves(&store.test)
+        && !expression_suspends_current_scope(&store.test)
+        && store.elif_else_clauses.is_empty()
+        && matches!(store.body.as_slice(), [Stmt::Assign(assignment)]
+            if matches!(assignment.targets.as_slice(), [Expr::Attribute(attribute)]
+                if matches!(attribute.value.as_ref(), Expr::Name(_)))
+                && matches!(assignment.value.as_ref(), Expr::BooleanLiteral(_)))
+        && !cleanup.is_star
+        && cleanup.orelse.is_empty()
+        && cleanup.finalbody.is_empty()
+        && matches!(cleanup.body.as_slice(), [Stmt::With(manager)]
+            if manager.is_async
+                && matches!(manager.items.as_slice(), [item]
+                    if item.optional_vars.is_none()
+                        && !expression_contains_inline_branch(&item.context_expr)
+                        && !expression_suspends_current_scope(&item.context_expr))
+                && awaited_call(&manager.body))
+        && matches!(cleanup.handlers.as_slice(), [handler]
+        if handler.as_except_handler().is_some_and(|handler| {
+            handler.type_.is_some()
+                && handler.name.is_some()
+                && handler.body.split_last().is_some_and(|(last, prefix)| {
+                    matches!(last, Stmt::Raise(raise)
+                        if raise.exc.is_none() && raise.cause.is_none())
+                        && (prefix.is_empty() || suite_has_linear_reraise_guards(prefix))
+                })
+        }))
 }
 
 // Moving an iterator's continue handler leaves its abandoned cleanup between the

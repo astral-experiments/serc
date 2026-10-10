@@ -15,6 +15,25 @@ use serc::{
 };
 
 #[test]
+fn nested_async_recovery_keeps_awaited_cleanup_entry_owned() {
+    let source = "async def sample(owner, observation):\n    client = owner.client()\n    try:\n        try:\n            await owner.index(\n                validate=owner.validate if owner.allowed else None,\n                ready=observation.ready if observation is not None else None,\n            )\n        except BaseException as error:\n            try:\n                async with owner.timeout():\n                    await owner.delete()\n            except BaseException as cleanup_error:\n                if not isinstance(error, Exception) or isinstance(cleanup_error, (Denied, Conflict)):\n                    raise error from None\n                raise\n            if not isinstance(error, Exception):\n                raise error from None\n            if observation is not None:\n                observation.obsolete = True\n    finally:\n        await client.close()\n";
+    for source in [
+        source.to_owned(),
+        source.replace("observation.obsolete = True", "observation.obsolete = False"),
+        source.replace(
+            "                if not isinstance(error, Exception) or isinstance(cleanup_error, (Denied, Conflict)):\n                    raise error from None\n",
+            "",
+        ),
+        source.replace(
+            "            if not isinstance(error, Exception):\n                raise error from None\n",
+            "",
+        ),
+    ] {
+        assert_matches_cpython(&source, "nested_async_cleanup_entry.py", &LEVELS);
+    }
+}
+
+#[test]
 fn coroutine_manager_store_reaches_cleanup_past_returns() {
     let source = "async def sample(owner, kind, choice, payload, tags):\n    status = None\n    try:\n        if kind in owner.local:\n            with owner.track():\n                result = await owner.fetch(payload)\n        elif kind in owner.remote():\n            if choice and choice.ready():\n                return owner.saved\n        else:\n            raise Failed(kind)\n    except FetchError as error:\n        raise cause from error\n    except Error as error:\n        status = owner.status(error)\n        raise\n    finally:\n        flavor = 'cleanup'\n        if status is not None:\n            tags.append(status)\n        owner.record(flavor)\n";
     for source in [
