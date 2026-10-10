@@ -313,6 +313,90 @@ fn guarded_handler_iterator_join_requires_original_edges() {
 }
 
 #[test]
+fn while_cleanup_none_condition_requires_original_record() {
+    for version in [
+        crate::PythonVersion::Py313,
+        crate::PythonVersion::Py314,
+        crate::PythonVersion::Py315,
+    ] {
+        for mutation in [
+            "intact",
+            "inverse",
+            "missing",
+            "duplicate",
+            "changed",
+            "wrong slots",
+            "wrong opcode",
+            "break slots",
+        ] {
+            let mut assembler = Assembler::with_python_version(version);
+            let start = assembler.label();
+            let exhausted = assembler.label();
+            let end = assembler.label();
+            assembler.mark(start);
+            assembler
+                .exception_owner_provenance
+                .source_boundaries
+                .insert(start);
+            assembler.record_exception_owner_block_boundary(start);
+            assembler
+                .exception_owner_provenance
+                .source_boundaries
+                .insert(exhausted);
+            assembler.set_location(SourceLocation::new(2, 2, 4, 26));
+            let opcode = match mutation {
+                "inverse" => POP_JUMP_IF_NOT_NONE,
+                "wrong opcode" => POP_JUMP_IF_FALSE,
+                _ => POP_JUMP_IF_NONE,
+            };
+            assembler.emit_forward_with_depth(opcode, exhausted, 1, ExceptionPolicy::default());
+            assembler.add_last_hidden_exception_owner_slots(if mutation == "wrong slots" {
+                2
+            } else {
+                3
+            });
+            if mutation != "missing" {
+                assembler.record_source_none_condition();
+            }
+            if mutation == "duplicate" {
+                assembler.record_source_none_condition();
+            }
+            if mutation == "changed" {
+                let Item::Instruction(condition) = assembler.linear_items_mut().last_mut().unwrap()
+                else {
+                    unreachable!()
+                };
+                condition.location = SourceLocation::new(3, 3, 4, 26);
+            }
+            assembler.set_location(SourceLocation::new(4, 4, 8, 13));
+            let jump =
+                assembler.emit_forward_with_depth(JUMP_FORWARD, end, 1, ExceptionPolicy::default());
+            assembler.mark_jump_as_authored_break(jump);
+            assembler.prevent_jump_threading_target(jump);
+            assembler.preserve_direct_inlined_jump_nop(jump);
+            assembler.add_last_original_block_slots(1);
+            if mutation == "break slots" {
+                assembler.add_last_hidden_exception_owner_slots(3);
+            }
+            assembler.emit_with_depth(NOP, 0, 1, ExceptionPolicy::default());
+            assembler.mark(exhausted);
+            assembler.mark(end);
+            let accepted =
+                version >= crate::PythonVersion::Py314 && matches!(mutation, "intact" | "inverse");
+            let before = assembler.linear_items().to_vec();
+            assert_eq!(
+                assembler.defer_original_while_break_cleanup_edges(),
+                accepted,
+                "{version:?}: {mutation}"
+            );
+            if !accepted {
+                assert_eq!(assembler.linear_items(), before, "{version:?}: {mutation}");
+            }
+        }
+    }
+}
+
+#[test]
 fn copied_finally_iterator_return_requires_a_completed_donor() {
     for version in [
         crate::PythonVersion::Py312,

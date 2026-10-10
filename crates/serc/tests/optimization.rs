@@ -972,6 +972,66 @@ fn erased_coroutine_join_preserves_predating_async_managers() {
 }
 
 #[test]
+fn named_handler_none_while_break_copies_cleanup() {
+    for prefix in ["", "async "] {
+        for condition in ["value", "value is None", "value is not None"] {
+            for work in ["", "                consume(value)\n"] {
+                let operation = if prefix.is_empty() {
+                    "action(value)"
+                } else {
+                    "await action(value)"
+                };
+                let source = format!(
+                    "{prefix}def sample(value):
+    try:
+        {operation}
+    except ValueError as error:
+        while {condition}:
+            if check(value):
+{work}                break
+            value = advance(value)
+    return finish(value)
+"
+                );
+                assert_matches_cpython(&source, "named_handler_none_while.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn retry_breaks_copy_named_handler_interrupt_checks() {
+    let source = r"def probe(values, token, item):
+    records = []
+    saved = None
+    def transform(item):
+        try:
+            output = normalize(item)
+        except RuntimeError as error:
+            record(error)
+            raise
+        publish(output)
+        return output
+    try:
+        for item in values:
+            token = reserve(item)
+            records.append((item, token, None))
+            schedule(item, token)
+    except RuntimeError as error:
+        saved = error
+        while True:
+            try:
+                release()
+            except RuntimeError:
+                continue
+            break
+    if saved is not None:
+        raise saved
+";
+    assert_matches_cpython(source, "named_handler_retry_break.py", &LEVELS);
+}
+
+#[test]
 fn erased_loop_exit_precedes_manager_cleanup() {
     for manager in ["acquire()", "outer(), middle(), inner(), acquire()"] {
         for setup in ["", "            work()\n"] {
