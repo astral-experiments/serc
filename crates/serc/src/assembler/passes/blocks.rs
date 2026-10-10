@@ -7678,7 +7678,7 @@ impl OptimizationPipeline {
             // this seam. Admit its local pair through the same predicate used by the fuser;
             // the following operation does not determine whether CPython combines the loads.
             // Keep all existing copying paths unchanged, and decline any exception-bearing
-            // unit or copy with another label or branch that could observe the entry offset.
+            // unit or copy with an interior label or branch that could observe the entry offset.
             let inline_unprotected_local_pair = inline_small_exit
                 && self.exception_regions.is_empty()
                 && copied_exception_regions.is_empty()
@@ -7690,7 +7690,18 @@ impl OptimizationPipeline {
                     .block_boundaries
                     .contains(&copied_label)
                 && copied.split_first().is_some_and(|(entry, tail)| {
+                    // Nested expression joins can alias this same copied entry.
+                    // Only fresh leading aliases may disappear with it.
+                    let aliases = tail
+                        .iter()
+                        .take_while(|item| matches!(item, Item::Label(_)))
+                        .count();
+                    let (aliases, tail) = tail.split_at(aliases);
                     matches!(entry, Item::Label(label) if *label == copied_label)
+                        && aliases.iter().all(|item| matches!(item, Item::Label(label)
+                            if copied_labels.values().any(|replacement| replacement == label)
+                                && !self.preserved_block_boundaries.contains(label)
+                                && !self.exception_owner_provenance.block_boundaries.contains(label)))
                         && tail.iter().all(|item| {
                             matches!(item, Item::Instruction(instruction)
                                 if instruction.value_argument().is_some())
