@@ -8348,6 +8348,25 @@ fn copied_guarded_recovery_preserves_outer_cleanup_borrow_boundary() {
 }
 
 #[test]
+fn handler_return_copies_terminal_manager_cleanup() {
+    for (prefix, work, cleanup) in [
+        ("", "resource.record(item)", "resource.finished()"),
+        ("", "yield item", "resource.finished()"),
+        ("async ", "await resource.record(item)", "await task"),
+        ("async ", "yield item", "await task"),
+    ] {
+        for condition in ["task.done()", "True"] {
+            for handler in ["Empty", "Empty as error"] {
+                let source = format!(
+                    "{prefix}def sample(resource, queue, task, pending):\n    try:\n        while True:\n            try:\n                item = queue.get_nowait()\n            except {handler}:\n                if {condition}:\n                    return\n                item = pending.result()\n            {work}\n    finally:\n        with resource.open():\n            {cleanup}\n"
+                );
+                assert_matches_cpython(&source, "handler_return_manager.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
 fn copied_nested_recovery_preserves_borrow_boundary() {
     let source = r"
 def run(flag, load, note):
