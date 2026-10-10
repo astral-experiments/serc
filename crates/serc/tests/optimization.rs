@@ -3023,6 +3023,92 @@ fn final_recovery_dispatch_arm_keeps_continuation_reachable() {
 }
 
 #[test]
+fn coroutine_recovery_else_preserves_conditional_await_borrowing() {
+    let source = r#"
+async def probe(items, worker, flag, delay):
+    results = []
+    for item in items:
+        try:
+            values = []
+            if flag:
+                values = await worker.fetch(item)
+                if not values:
+                    raise ValueError(item)
+            values = values + [item]
+            if not values or any(not value for value in values):
+                raise ValueError(item)
+            results.append(values)
+        except Exception as error:
+            worker.report(error)
+            previous = worker.lookup(item)
+            if previous is None:
+                raise
+            values = previous.get("values")
+            if not isinstance(values, list) or not values or any(not value for value in values):
+                raise ValueError(item) from error
+            results.append(previous)
+            worker.recover(values)
+        else:
+            worker.complete(values)
+        finally:
+            if flag and delay:
+                await worker.wait(delay)
+    return results
+"#;
+    assert_matches_cpython(source, "coroutine_recovery_else.py", &LEVELS);
+}
+
+#[test]
+fn coroutine_recovery_guarded_await_call_variants() {
+    for recovery in ["flag", "flag or any(not value for value in items)"] {
+        for cleanup in [
+            "flag",
+            "flag and delay",
+            "flag or delay",
+            "flag and delay is not None",
+        ] {
+            let source = format!(
+                r"
+async def probe(items, item, worker, flag, delay):
+    try:
+        worker.fetch(item)
+    except Exception as error:
+        if {recovery}:
+            raise
+        worker.recover(error)
+    else:
+        worker.complete(item)
+    finally:
+        if {cleanup}:
+            await worker.wait(delay)
+"
+            );
+            assert_matches_cpython(&source, "coroutine_recovery_await_guards.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
+fn nested_coroutine_recovery_retains_guarded_await_boundary() {
+    let source = r"
+async def probe(items, item, worker, flag, delay):
+    try:
+        try:
+            worker.fetch(item)
+        except Exception as error:
+            if flag or any(not value for value in items):
+                raise
+            worker.recover(error)
+        finally:
+            if flag or delay:
+                await worker.wait(delay)
+    finally:
+        worker.close(item)
+";
+    assert_matches_cpython(source, "nested_coroutine_recovery_await.py", &LEVELS);
+}
+
+#[test]
 fn guarded_recovery_preserves_named_cleanup_entry() {
     for prefix in [
         "        if ready:\n            resource.prepare()\n",
