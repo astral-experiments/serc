@@ -4518,6 +4518,72 @@ fn nested_tries_own_copied_finalizer_handler_cleanup() {
 }
 
 #[test]
+fn enclosing_tries_own_handler_returns_before_finalizers() {
+    let body = r"try:
+    try:
+        await work()
+    except Error as error:
+        return value
+except Other:
+    recover()
+finally:
+    await finish()
+";
+    let indent = |source: &str| {
+        let mut indented = String::new();
+        for line in source.lines() {
+            writeln!(indented, "    {line}").unwrap();
+        }
+        indented
+    };
+    let with_manager = format!("async with manager():\n{}", indent(body));
+    let bodies = [
+        body.to_owned(),
+        with_manager.clone(),
+        with_manager.replace("async with", "with"),
+        format!("with manager():\n{}", indent(&with_manager)),
+        body.replace(
+            "        return value",
+            "        async with manager():\n            return value",
+        ),
+        format!("try:\n{}finally:\n    finish()\n", indent(&with_manager)),
+        format!("while value:\n{}", indent(body)),
+        format!("while value:\n{}", indent(&with_manager)),
+        body.replace(
+            "        return value",
+            "        try:\n            return value\n        except Third:\n            recover()",
+        ),
+    ];
+    for (index, body) in bodies.iter().enumerate() {
+        for named in [false, true] {
+            for returned in ["value", "None"] {
+                for kind in ["coroutine", "function", "generator"] {
+                    let mut source = format!(
+                        "async def sample(manager, work, finish, value):\n{}",
+                        indent(body)
+                    );
+                    if !named {
+                        source = source.replace("except Error as error:", "except Error:");
+                    }
+                    if kind != "coroutine" {
+                        source = source.replace("async ", "").replace("await ", "");
+                    }
+                    if kind == "generator" {
+                        source = source.replacen(":\n", ":\n    yield value\n", 1);
+                    }
+                    source = source.replace("return value", &format!("return {returned}"));
+                    assert_matches_cpython(
+                        &source,
+                        &format!("handler_try_owner_{index}_{named}_{returned}_{kind}.py"),
+                        &LEVELS,
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn named_handler_returns_preserve_outer_finalizer_owners() {
     let source = r"def named_nested(choice, item, owner, operation, cleanup, recover):
     value = None

@@ -9836,21 +9836,24 @@ impl<'source> Compiler<'source> {
                                 || (unwinds_named_outer_unnamed_handlers && handler_index == 2)
                                 || iterator_between_unnamed_handlers);
                         // An ordinary try between this handler and its finally still owns
-                        // POP_EXCEPT and any exception-name clearing. The manager unwind
-                        // tracks that collector until the finally starts; a synthetic
-                        // finally owner would replace it early.
+                        // POP_EXCEPT and any exception-name clearing. Keep that owner
+                        // until its finally starts, including after an inner manager exit.
                         let enclosing_try_owns_pop_except = handler_count == 1
-                            && next_finally == 1
-                            && return_finally_contexts.len() == 1
-                            && with_depth > 0
+                            && next_finally > 0
+                            && next_finally == return_finally_contexts.len()
                             && next_with == with_depth
-                            && with_depth == self.control.withs.active_with_exits.len()
-                            && self.control.loops.contexts.is_empty()
+                            && self
+                                .control
+                                .loops
+                                .contexts
+                                .iter()
+                                .all(|context| context.iterator_cleanup == IteratorCleanup::None)
+                            && self.control.exceptions.active_exception_group_handlers == 0
                             && self.control.finally.active_finally_end_blocks == 0
                             && self.control.finally.active_normal_finally_bodies == 0
-                            && return_finally_contexts[0].handler_depth == 0
-                            && return_finally_contexts[0].with_depth == with_depth
-                            && return_finally_contexts[0].exception_region_depth + 2
+                            && return_finally_contexts[next_finally - 1].handler_depth == 0
+                            && return_finally_contexts[next_finally - 1].with_depth == with_depth
+                            && return_finally_contexts[next_finally - 1].exception_region_depth + 2
                                 == region_depth
                             && self
                                 .control
@@ -9858,6 +9861,9 @@ impl<'source> Compiler<'source> {
                                 .active_exception_region_exclusions
                                 .len()
                                 == region_depth + 1
+                            && self.control.withs.active_with_exits[with_depth..]
+                                .iter()
+                                .all(|manager| manager.exception_region_depth == region_depth + 1)
                             && handler_region_unwind_starts
                                 .as_ref()
                                 .and_then(|starts| starts.get(region_depth - 1))
