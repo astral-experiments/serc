@@ -8473,7 +8473,8 @@ impl<'source> Compiler<'source> {
                             + 2;
                 // Two contiguous handlers retire their own collectors before the ordinary
                 // try surrounding them. Each name is cleared after its own handler exits,
-                // while the enclosing handler or try still owns the cleanup.
+                // while the enclosing handler or try still owns the cleanup. A while
+                // entered before both handlers contributes no iterator cleanup.
                 let tracks_two_handlers_inside_ordinary_try = !return_is_overridden
                     && handler_count == 2
                     && self.control.exceptions.active_try_marker_slots.len() == 1
@@ -8485,7 +8486,13 @@ impl<'source> Compiler<'source> {
                         == 3
                     && self.control.exceptions.active_exception_group_handlers == 0
                     && self.control.withs.active_with_exits.is_empty()
-                    && self.control.loops.contexts.is_empty()
+                    && (self.control.loops.contexts.is_empty()
+                        || (self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+                            && matches!(self.control.loops.contexts.as_slice(), [context]
+                                if context.iterator_cleanup == IteratorCleanup::None
+                                    && context.exception_region_depth == 1
+                                    && context.with_depth == 0
+                                    && context.finally_end_depth == 0)))
                     && self.control.finally.is_inactive_for_return_unwind()
                     && self
                         .control
@@ -8502,7 +8509,7 @@ impl<'source> Compiler<'source> {
                         .iter()
                         .all(|handler| {
                             handler.with_depth == 0
-                                && handler.loop_depth == 0
+                                && handler.loop_depth == self.control.loops.contexts.len()
                                 && handler.finally_end_depth == 0
                         })
                     && self
@@ -8949,9 +8956,9 @@ impl<'source> Compiler<'source> {
                                 && !suite_contains_abrupt_control_flow(outer.body)
                                 && !suite_contains_yield(outer.body)
                     );
-                // The handler exits before the inner finalizer, but the ordinary
-                // try between these finalizers remains active until the outer copy.
-                let tracks_handler_between_plain_finalizers = !return_is_overridden
+                // The ordinary try can surround both finalizers or sit between them.
+                // Retire it at its own boundary after the handler has exited.
+                let tracks_plain_handler_finally_unwinds = !return_is_overridden
                     && self.control.withs.active_with_exits.is_empty()
                     && self.control.loops.contexts.is_empty()
                     && self.control.exceptions.active_exception_group_handlers == 0
@@ -8984,8 +8991,10 @@ impl<'source> Compiler<'source> {
                                 && inner.loop_depth == 0
                                 && handler.loop_depth == 0
                                 && handler.finally_end_depth == 0
-                                && outer.exception_region_depth == 0
-                                && outer.try_body_depth == 0
+                                && matches!(
+                                    (outer.exception_region_depth, outer.try_body_depth),
+                                    (0, 0) | (1, 1)
+                                )
                                 && inner.exception_region_depth == 2
                                 && inner.try_body_depth == 1
                                 && handler.exception_region_depth == 3
@@ -9004,7 +9013,7 @@ impl<'source> Compiler<'source> {
                         || tracks_outer_try_handler_finally_unwinds
                         || tracks_two_named_handlers_before_finally
                         || tracks_try_between_finally_unwinds
-                        || tracks_handler_between_plain_finalizers
+                        || tracks_plain_handler_finally_unwinds
                         || unwinds_handler_and_with
                         || self
                             .control
@@ -12555,7 +12564,8 @@ impl<'source> Compiler<'source> {
                                 .is_some_and(Option::is_none);
                         let retained_try_owns_copy = retained_iterator_try_owns_copy
                             || ((tracks_try_between_finally_unwinds
-                                || tracks_handler_between_plain_finalizers)
+                                || (tracks_plain_handler_finally_unwinds
+                                    && outer_context.exception_region_depth == 0))
                                 && context_index == 1)
                             || ((handler_count == 0
                                 || retained_nested_try_owns_copy
@@ -12793,24 +12803,34 @@ impl<'source> Compiler<'source> {
                             // regions entered inside each iterator's saved depth; the call
                             // and handler retain their existing owners and source donors.
                             copied_finally_iterator_region_unwind = preserve_tos
-                                && self.unit.flags
-                                    & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                                    == 0
+                                && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
                                 && matches!(finally_context.body, [Stmt::Try(cleanup)]
-                                    if !cleanup.is_star
-                                        && cleanup.orelse.is_empty()
-                                        && cleanup.finalbody.is_empty()
-                                        && matches!(cleanup.body.as_slice(), [Stmt::Expr(expression)]
-                                            if matches!(expression.value.as_ref(), Expr::Call(_))
-                                                && !expression_contains_inline_branch(&expression.value)
-                                                && !expression_suspends_current_scope(&expression.value))
-                                        && matches!(cleanup.handlers.as_slice(), [handler]
-                                            if handler.as_except_handler().is_some_and(|handler|
-                                                handler.name.is_none()
-                                                    && handler.type_.as_deref().is_some_and(|test|
-                                                        !expression_contains_inline_branch(test)
-                                                            && !expression_suspends_current_scope(test))
-                                                    && matches!(handler.body.as_slice(), [Stmt::Pass(_)]))));
+                                if !cleanup.is_star
+                                    && cleanup.orelse.is_empty()
+                                    && cleanup.finalbody.is_empty()
+                                    && matches!(cleanup.body.as_slice(), [Stmt::Expr(expression)]
+                                        if match expression.value.as_ref() {
+                                            Expr::Call(_) => !expression_contains_inline_branch(&expression.value)
+                                                && !expression_suspends_current_scope(&expression.value),
+                                            Expr::Await(awaited) => self.unit.flags & CO_COROUTINE != 0
+                                                && matches!(awaited.value.as_ref(), Expr::Call(_))
+                                                && !expression_contains_inline_branch(&awaited.value)
+                                                && !expression_suspends_current_scope(&awaited.value),
+                                            _ => false,
+                                        })
+                                    && matches!(cleanup.handlers.as_slice(), [handler]
+                                        if handler.as_except_handler().is_some_and(|handler|
+                                            handler.name.is_none()
+                                                && handler.type_.as_deref().is_some_and(|test|
+                                                    !expression_contains_inline_branch(test)
+                                                        && !expression_suspends_current_scope(test))
+                                                && match handler.body.as_slice() {
+                                                    [Stmt::Pass(_)] => true,
+                                                    [Stmt::Expr(expression)] => matches!(expression.value.as_ref(), Expr::Call(_))
+                                                        && !expression_contains_inline_branch(&expression.value)
+                                                        && !expression_suspends_current_scope(&expression.value),
+                                                    _ => false,
+                                                })));
                             if matches!(finally_context.body, [Stmt::Expr(expression)]
                                 if matches!(expression.value.as_ref(), Expr::Call(_) | Expr::Await(_)))
                             {
