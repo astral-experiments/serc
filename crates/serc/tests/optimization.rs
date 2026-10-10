@@ -10644,6 +10644,21 @@ fn populated_nested_elif_preserves_outer_join() {
 }
 
 #[test]
+fn discarded_generator_calls_rejoin_loop_backedges() {
+    for source in [
+        "def sample(items):\n    while items:\n        any(value for value in items)\n",
+        "def sample(items):\n    for item in items:\n        any(value for value in items)\n",
+        "def sample(items, action):\n    while items:\n        any(value for value in items)\n        action()\n",
+        "async def sample(items, work):\n    try:\n        while items:\n            try:\n                try:\n                    await work()\n                except ValueError:\n                    return item\n            finally:\n                any(value for value in items)\n    except Exception:\n        raise\n",
+    ] {
+        for callable in ["any", "all"] {
+            let source = source.replace("any(", &format!("{callable}("));
+            assert_matches_cpython(&source, "discarded_generator_call.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn generator_call_stores_preserve_populated_nested_join() {
     let source = r"def choose(result, items):
     if result is None:

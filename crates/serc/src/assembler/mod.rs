@@ -17410,13 +17410,33 @@ impl Assembler {
                     Item::Instruction(instruction) => Some((position, *instruction)),
                     Item::Label(_) => None,
                 });
-            let (Some((_, pop)), Some(return_load), Some(return_value)) =
+            let (Some((pop_position, pop)), Some(return_load), return_value) =
                 (target.next(), target.next(), target.next())
             else {
                 continue;
             };
             if pop.opcode == POP_TOP
+                && matches!(
+                    return_load.1.opcode,
+                    JUMP_BACKWARD | JUMP_FORWARD | RETURN_VALUE | RERAISE
+                )
+            {
+                if let Operand::Backward(label) = return_load.1.operand()
+                    && label_positions
+                        .get(&label)
+                        .is_none_or(|position| *position > index)
+                {
+                    continue;
+                }
+                // Copy the exit before the removed discard so the resulting NOP
+                // is unreachable, even when their exception owners differ.
+                let mut discarded = pop;
+                discarded.opcode = NOP;
+                discarded.set_operand(Operand::Value(0));
+                replacements.push((index, return_load, (pop_position, discarded)));
+            } else if pop.opcode == POP_TOP
                 && is_constant_load(return_load.1.opcode)
+                && let Some(return_value) = return_value
                 && return_value.1.opcode == RETURN_VALUE
             {
                 replacements.push((index, return_load, return_value));

@@ -3765,6 +3765,177 @@ fn removes_an_overwritten_local_store() {
 }
 
 #[test]
+fn constant_discard_copies_only_direct_exits() {
+    for version in [
+        crate::PythonVersion::Py313,
+        crate::PythonVersion::Py314,
+        crate::PythonVersion::Py315,
+    ] {
+        for (tail, argument) in [
+            (JUMP_FORWARD, 0),
+            (JUMP_BACKWARD, 0),
+            (RETURN_VALUE, 0),
+            (RERAISE, 0),
+            (RERAISE, 1),
+            (CALL, 0),
+        ] {
+            for discard in [POP_TOP, COPY] {
+                let mut assembler = Assembler::with_python_version(version);
+                let start = assembler.label();
+                let target = assembler.label();
+                let end = assembler.label();
+                assembler.mark(start);
+                assembler.emit_with_depth(LOAD_CONST, 0, 2, ExceptionPolicy::default());
+                assembler.emit_forward_with_depth(
+                    JUMP_FORWARD,
+                    target,
+                    2,
+                    ExceptionPolicy::default(),
+                );
+                assembler.mark(target);
+                assembler.emit_with_depth(discard, 0, 1, ExceptionPolicy::default());
+                let location = SourceLocation::new(7, 7, 4, 18);
+                assembler.set_location(location);
+                match tail {
+                    JUMP_FORWARD => {
+                        assembler.emit_forward_with_depth(tail, end, 1, ExceptionPolicy::default());
+                    }
+                    JUMP_BACKWARD => {
+                        assembler.emit_backward_with_depth_and_exception_policy(
+                            tail,
+                            start,
+                            1,
+                            ExceptionPolicy::default(),
+                        );
+                    }
+                    _ => {
+                        assembler.emit_with_depth(
+                            tail,
+                            argument,
+                            0,
+                            ExceptionPolicy::EXCLUDE_IF_EXTENDED,
+                        );
+                    }
+                }
+                assembler.mark(end);
+                let original = assembler.linear_items().to_vec();
+                assembler.optimize_constant_pops();
+                if version == crate::PythonVersion::Py313 || discard != POP_TOP || tail == CALL {
+                    assert_eq!(assembler.linear_items(), original);
+                } else {
+                    assert_eq!(assembler.linear_items()[1], original[5]);
+                    assert!(
+                        matches!(assembler.linear_items()[2], Item::Instruction(nop) if nop.opcode == NOP)
+                    );
+                    assert_eq!(&assembler.linear_items()[3..], &original[3..]);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn constant_discard_preserves_backward_direction() {
+    let mut assembler = Assembler::default();
+    let middle = assembler.label();
+    let target = assembler.label();
+    assembler.emit(LOAD_CONST, 0);
+    assembler.emit_forward_with_depth(JUMP_FORWARD, target, 1, ExceptionPolicy::default());
+    assembler.mark(middle);
+    assembler.emit(NOP, 0);
+    assembler.mark(target);
+    assembler.emit(POP_TOP, 0);
+    assembler.emit_backward(JUMP_BACKWARD, middle);
+    let original = assembler.linear_items().to_vec();
+    assembler.optimize_constant_pops();
+    assert_eq!(assembler.linear_items(), original);
+}
+
+#[test]
+fn constant_discard_transports_each_exit_owner() {
+    let mut assembler = Assembler::default();
+    let source = assembler.label();
+    let target = assembler.label();
+    let exit = assembler.label();
+    let end = assembler.label();
+    let handlers = [assembler.label(), assembler.label(), assembler.label()];
+    assembler.mark(source);
+    assembler.emit_with_depth(LOAD_CONST, 0, 3, ExceptionPolicy::default());
+    assembler.emit_forward_with_depth(JUMP_FORWARD, target, 3, ExceptionPolicy::default());
+    assembler.mark(target);
+    assembler.emit_with_depth(POP_TOP, 0, 2, ExceptionPolicy::EXCLUDE_IF_EXTENDED);
+    assembler.mark(exit);
+    assembler.set_location(SourceLocation::new(7, 7, 4, 18));
+    assembler.emit_with_depth(RERAISE, 1, 1, ExceptionPolicy::NonePresent);
+    assembler.mark(end);
+    for handler in handlers {
+        assembler.mark(handler);
+        assembler.emit(RERAISE, 0);
+    }
+    for (index, (start, end)) in [(source, target), (target, exit), (exit, end)]
+        .into_iter()
+        .enumerate()
+    {
+        assembler.exception_regions.push(super::ExceptionRegion {
+            priority: super::ExceptionRegionPriority::OriginalRange(start, end),
+            is_scope_fallback: index == 2,
+            start,
+            end,
+            target: handlers[index],
+            depth: u32::try_from(index).unwrap(),
+            preserve_lasti: index != 0,
+        });
+    }
+    let original = assembler.linear_items().to_vec();
+    let owners = assembler.exception_regions.clone();
+    assembler.optimize_constant_pops();
+    let items = assembler.linear_items();
+    let position = |label| {
+        items
+            .iter()
+            .position(|item| *item == Item::Label(label))
+            .unwrap()
+    };
+    assert_eq!(&items[position(target)..], &original[3..]);
+    let copies = items[..position(target)]
+        .iter()
+        .enumerate()
+        .filter_map(|(position, item)| match item {
+            Item::Instruction(instruction) => Some((position, *instruction)),
+            Item::Label(_) => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(copies.len(), 2);
+    assert_eq!(Item::Instruction(copies[0].1), original[6]);
+    let Item::Instruction(mut discarded) = original[4] else {
+        unreachable!();
+    };
+    discarded.opcode = NOP;
+    discarded.set_operand(Operand::Value(0));
+    assert_eq!(copies[1].1, discarded);
+    for ((copy, _), expected) in copies.iter().zip([owners[2], owners[1]]) {
+        let coverage = assembler
+            .exception_regions
+            .iter()
+            .filter(|region| (position(region.start)..position(region.end)).contains(copy))
+            .collect::<Vec<_>>();
+        assert_eq!(coverage.len(), 1);
+        let actual = coverage[0];
+        assert_eq!(actual.target, expected.target);
+        assert!(matches!(
+            (actual.priority, expected.priority),
+            (
+                super::ExceptionRegionPriority::OriginalRange(actual_start, actual_end),
+                super::ExceptionRegionPriority::OriginalRange(expected_start, expected_end),
+            ) if actual_start == expected_start && actual_end == expected_end
+        ));
+        assert_eq!(actual.depth, expected.depth);
+        assert_eq!(actual.preserve_lasti, expected.preserve_lasti);
+        assert_eq!(actual.is_scope_fallback, expected.is_scope_fallback);
+    }
+}
+
+#[test]
 fn constant_pop_candidates_are_recorded_during_emission() {
     let mut separated = Assembler::default();
     separated.emit(LOAD_CONST, 0);
