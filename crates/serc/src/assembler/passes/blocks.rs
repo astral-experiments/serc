@@ -5245,24 +5245,15 @@ impl OptimizationPipeline {
                 let [Item::Label(end), Item::Instruction(ret)] = return_items else {
                     return None;
                 };
-                let mut owners = region_memberships
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, membership)| {
-                        membership.contains(&positions[source.index()])
-                            || membership.contains(&positions[target.index()])
-                    });
-                let (region_index, membership) = owners.next()?;
-                let region = self.exception_regions[region_index];
-                (owners.next().is_none()
-                    && !region.is_scope_fallback
-                    && region.depth == 0
-                    && !region.preserve_lasti
-                    && membership.contains(&positions[source.index()])
-                    && membership.contains(&positions[target.index()])
-                    && region.end == *end
-                    && !membership.contains(&positions[return_block.index()])
-                    && !exception_boundary_blocks[source.index()]
+                let region_index = original_protected_return_owner(
+                    &self.exception_regions,
+                    &region_memberships,
+                    positions[source.index()],
+                    positions[target.index()],
+                    positions[return_block.index()],
+                    *end,
+                )?;
+                (!exception_boundary_blocks[source.index()]
                     && !exception_boundary_blocks[target.index()]
                     && predecessors[target.index()] == 2
                     && predecessors[return_block.index()] == 1
@@ -10656,6 +10647,85 @@ mod located_normal_try_join_tests {
 #[cfg(test)]
 mod tuple_return_copy_tests {
     use super::*;
+
+    #[test]
+    fn protected_return_owner_requires_matching_ambient_memberships() {
+        use crate::assembler::ExceptionRegionPriority;
+
+        let owner = ExceptionRegion {
+            start: Label::from_u32(0),
+            end: Label::from_u32(3),
+            target: Label::from_u32(4),
+            depth: 0,
+            preserve_lasti: false,
+            is_scope_fallback: false,
+            priority: ExceptionRegionPriority::OriginalRange(
+                Label::from_u32(0),
+                Label::from_u32(3),
+            ),
+        };
+        let fallback = ExceptionRegion {
+            end: Label::from_u32(5),
+            preserve_lasti: true,
+            is_scope_fallback: true,
+            priority: ExceptionRegionPriority::OriginalRange(
+                Label::from_u32(0),
+                Label::from_u32(5),
+            ),
+            ..owner
+        };
+        for mutation in [
+            "none",
+            "no fallback",
+            "source only",
+            "target only",
+            "return only",
+            "no return",
+            "no source",
+            "owner misses target",
+            "owner includes return",
+            "owner end",
+            "owner depth",
+            "owner lasti",
+            "second owner",
+            "no owner",
+        ] {
+            let mut regions = vec![owner, fallback];
+            let mut memberships = vec![0..3, 0..5];
+            match mutation {
+                "source only" => memberships[1] = 1..2,
+                "target only" => memberships[1] = 2..3,
+                "return only" => memberships[1] = 3..4,
+                "no return" => memberships[1] = 0..3,
+                "no source" => memberships[1] = 2..5,
+                "owner misses target" => memberships[0] = 0..2,
+                "owner includes return" => memberships[0] = 0..4,
+                "owner end" => regions[0].end = Label::from_u32(2),
+                "owner depth" => regions[0].depth = 1,
+                "owner lasti" => regions[0].preserve_lasti = true,
+                "second owner" => regions[1].is_scope_fallback = false,
+                "no owner" => regions[0].is_scope_fallback = true,
+                "no fallback" => {
+                    regions.pop();
+                    memberships.pop();
+                }
+                "none" => {}
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                original_protected_return_owner(
+                    &regions,
+                    &memberships,
+                    1,
+                    2,
+                    3,
+                    Label::from_u32(3),
+                ),
+                matches!(mutation, "none" | "no fallback").then_some(0),
+                "{mutation}",
+            );
+        }
+    }
 
     fn fixture(arity: u32, mutation: &str) -> OptimizationPipeline {
         let location = SourceLocation::new(3, 3, 4, 60);
