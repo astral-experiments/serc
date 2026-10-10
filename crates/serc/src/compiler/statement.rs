@@ -34316,6 +34316,10 @@ impl<'source> Compiler<'source> {
                 || matches!(statement.body.as_slice(), [Stmt::Expr(work)]
                     if suite_has_linear_borrow_fallthrough(&statement.body)
                         && !expression_suspends_current_scope(&work.value))
+                || matches!(statement.body.as_slice(), [Stmt::Assign(work)]
+                    if matches!(work.targets.as_slice(), [Expr::Name(_)])
+                        && !expression_contains_inline_branch(&work.value)
+                        && !expression_suspends_current_scope(&work.value))
                 || (coroutine_while_nested_cleanup
                     && statement.body.split_last().is_some_and(|(last, prefix)| {
                         !suite_contains_loop_break(prefix)
@@ -34338,17 +34342,24 @@ impl<'source> Compiler<'source> {
                 })) && guarded.as_except_handler().is_some_and(|handler| {
                     handler.type_.is_some()
                         && handler.name.is_some()
-                        && (matches!(handler.body.as_slice(), [Stmt::If(guard)]
-                            if condition_has_linear_runtime_leaves(&guard.test)
-                                && !expression_suspends_current_scope(&guard.test)
-                                && guard.elif_else_clauses.is_empty()
-                                && (matches!(guard.body.as_slice(), [Stmt::Raise(raise)]
-                                    if raise.exc.as_deref().is_none_or(|value| matches!(value, Expr::Name(_)))
-                                        && raise.cause.as_deref().is_none_or(|value| matches!(value, Expr::Name(_))))
-                                    || matches!(guard.body.as_slice(), [Stmt::Return(return_)]
-                                        if return_.value.as_deref().is_none_or(|value| matches!(value, Expr::Name(_))))))
-                            || (coroutine_while_nested_cleanup
-                                && suite_has_linear_reraise_guards(&handler.body)))
+                        && (handler.body.iter().enumerate().any(|(index, part)| {
+                            let completed_work = |body: &[Stmt]| {
+                                suite_has_completed_recovery_work(body, self.context.python_version)
+                            };
+                            (index == 0 || completed_work(&handler.body[..index]))
+                                && (index + 1 == handler.body.len()
+                                    || completed_work(&handler.body[index + 1..]))
+                                && matches!(part, Stmt::If(guard)
+                                    if condition_has_linear_runtime_leaves(&guard.test)
+                                        && !expression_suspends_current_scope(&guard.test)
+                                        && guard.elif_else_clauses.is_empty()
+                                        && (matches!(guard.body.as_slice(), [Stmt::Raise(raise)]
+                                            if raise.exc.as_deref().is_none_or(|value| matches!(value, Expr::Name(_)))
+                                                && raise.cause.as_deref().is_none_or(|value| matches!(value, Expr::Name(_))))
+                                            || matches!(guard.body.as_slice(), [Stmt::Return(return_)]
+                                                if return_.value.as_deref().is_none_or(|value| matches!(value, Expr::Name(_))))))
+                        }) || (coroutine_while_nested_cleanup
+                            && suite_has_linear_reraise_guards(&handler.body)))
                 })})
             // Raising recovery keeps the multiline cleanup setup populated.
             // A returning handler can copy that setup onto a separate exit.
@@ -47636,6 +47647,23 @@ fn simple_cleanup_call(expression: &Expr) -> bool {
                 && (matches!(keyword.value, Expr::Name(_))
                     || fold_constant(&keyword.value).is_some())
         })
+}
+
+/// Completed conditional work and lazy generator calls retain a handler's normal exit.
+fn suite_has_completed_recovery_work(body: &[Stmt], python_version: crate::PythonVersion) -> bool {
+    body.iter().all(|part| {
+        suite_has_nonsuspending_linear_fallthrough(std::slice::from_ref(part))
+            || suite_has_nonsuspending_conditional_work(std::slice::from_ref(part))
+            || matches!(part, Stmt::Assign(assignment)
+                if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                    && matches!(assignment.value.as_ref(), Expr::Call(call)
+                        if matches!(call.func.as_ref(), Expr::Name(_))
+                            && call.arguments.keywords.is_empty()
+                            && optimized_generator_callable_for_target(call, python_version).is_none()
+                            && matches!(call.arguments.args.as_ref(), [generator @ Expr::Generator(_), fallback]
+                                if expression_has_linear_generator_creation(generator, python_version)
+                                    && fold_constant(fallback).is_some())))
+    })
 }
 
 // A simple branching value reconverges at its name store before the next guard.
