@@ -17514,6 +17514,66 @@ impl<'source> Compiler<'source> {
                     && !context.has_orelse
                     && context.continue_label == restart
             });
+        // Erased assertions leave the async iterator's conditional at its
+        // original backedge, including under one predating protected finally.
+        let erased_async_iterator_suffix = mode == LoopTailMode::default()
+            && split_short_circuit
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+            && !self.control.statements.in_match
+            && !self.control.in_exception_handler()
+            && self.control.exceptions.active_exception_group_handlers == 0
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.withs.active_with_region_exclusions.is_empty()
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && self.control.finally.active_overriding_finally_returns == 0
+            && self
+                .control
+                .finally
+                .active_pass_finally_locations
+                .is_empty()
+            && self
+                .control
+                .finally
+                .preserved_return_value_contexts
+                .is_empty()
+            && self.control.finally.copied_return_finally_preserved_values == 0
+            && self
+                .control
+                .finally
+                .copied_return_finally_loop_depth
+                .is_none()
+            && !self.control.finally.copy_return_finally_condition_exit
+            && !self.control.finally.copies_terminating_finally_returns
+            && ((self.control.finally.is_inactive_for_return_unwind()
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty())
+                || (self.control.finally.active_finally_try_bodies == 1
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .len()
+                        == 1
+                    && self
+                        .control
+                        .finally
+                        .innermost_finally_exception_exclusion_depth
+                        == Some(1)
+                    && matches!(self.control.finally.protected_try_loop_depths.as_slice(),
+                        [(1, loop_depth)] if *loop_depth < self.control.loops.contexts.len())))
+            && self.control.in_loop_tail_without_nested_cleanup()
+            && self.control.loops.contexts.len() == 1
+            && self.control.loops.contexts.last().is_some_and(|context| {
+                context.iterator_cleanup == IteratorCleanup::Async
+                    && !context.has_orelse
+                    && context.continue_label == restart
+            });
         let erased_final_else = |statement: &ruff_python_ast::StmtIf| {
             !mode.non_final_branch
                 && final_coroutine_iterator_arm
@@ -17542,6 +17602,17 @@ impl<'source> Compiler<'source> {
                 && !expression_suspends_current_scope(&statement.test)
                 && (matches!(statement.body.split_last(), Some((Stmt::Continue(_), prefix))
                         if prefix.iter().all(|part| self.context.is_elided_statement(part)))
+                    || (erased_async_iterator_suffix
+                        && statement.elif_else_clauses.is_empty()
+                        && condition_has_linear_runtime_leaves(&statement.test)
+                        && original_condition_has_unique_jump_target(&statement.test, true)
+                        && original_condition_has_unique_jump_target(&statement.test, false)
+                        && !statement.body.is_empty()
+                        && statement.body.iter().all(|part| self.context.is_elided_statement(part))
+                        && body[end + 1..].iter().all(|part| {
+                            matches!(part, Stmt::Global(global) if global.names.is_empty())
+                                && self.context.is_elided_statement(part)
+                        }))
                     // A Pass before an erased suffix still reaches the original
                     // iterator directly, in either arm of an enclosing condition.
                     || (matches!(statement.body.as_slice(), [Stmt::Pass(_)])
@@ -20134,6 +20205,38 @@ impl<'source> Compiler<'source> {
                                 if clause.test.is_none()
                                     && completed_conditional_arm(&clause.body))))
         };
+        // Nested erased arms finish before the outer false edge reaches the
+        // saved iterator. Each runtime false leaf can use its existing backedge.
+        let completed_erased_coroutine_arm = eligible_else
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+            && !expression_suspends_current_scope(final_test)
+            && final_body.iter().any(|part| matches!(part, Stmt::If(_)))
+            && final_body.iter().all(|part| {
+                self.context.is_elided_statement(part)
+                    || matches!(part, Stmt::If(branch)
+                        if completed_conditional_work(part)
+                            && branch.body.iter().all(|part| self.context.is_elided_statement(part))
+                            && matches!(branch.elif_else_clauses.as_slice(), [otherwise]
+                                if otherwise.test.is_none()
+                                    && otherwise.body.iter().all(|part| self.context.is_elided_statement(part))))
+            });
+        // A nested erased diamond keeps the false condition's location on its
+        // original backedge, even when the enclosing coroutine arm is non-final.
+        let erased_nested_coroutine_donor = non_final_branch
+            && !try_body_normal_exit
+            && self.context.python_version >= crate::PythonVersion::Py314
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+            && elided_else
+            && statement.elif_else_clauses.len() == 1
+            && erased_final_body
+            && leading
+                .iter()
+                .all(|part| self.context.is_elided_statement(part))
+            && condition_has_only_runtime_tests(&statement.test)
+            && condition_has_linear_runtime_leaves(&statement.test)
+            && !expression_suspends_current_scope(&statement.test)
+            && original_condition_has_unique_jump_target(&statement.test, true)
+            && original_condition_has_unique_jump_target(&statement.test, false);
         let ordinary_function = matches!(self.unit.scope, Scope::Function { .. })
             && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0;
         let completed_dict_store = |part: &Stmt| {
@@ -20267,6 +20370,8 @@ impl<'source> Compiler<'source> {
         let iterator_inside_finally = (ordinary_function
             || ((completed_manager_work
                 || completed_direct_await
+                || completed_erased_coroutine_arm
+                || erased_nested_coroutine_donor
                 || (eligible_else && erased_final_body))
                 && matches!(self.unit.scope, Scope::Function { .. })
                 && self.unit.flags & CO_COROUTINE != 0
@@ -20294,6 +20399,7 @@ impl<'source> Compiler<'source> {
             })
             && (condition_has_linear_runtime_leaves(final_test) || completed_erased_set_test)
             && (condition_jump_target_count(final_test, false) == 1
+                || completed_erased_coroutine_arm
                 || (ordinary_function && condition_has_flat_iterator_and_leaves(final_test)))
             && (erased_final_body
                 || completed_manager_work
@@ -21718,6 +21824,37 @@ impl<'source> Compiler<'source> {
                     && self.control.withs.active_with_exits.len()
                         == self.control.withs.active_with_region_exclusions.len()
                     && self.control.in_loop_tail_without_nested_cleanup();
+                // The shared true entry copies this erased arm's backedge before
+                // the predating finalizer can supply a fallthrough location.
+                let finalized_erased_coroutine_branch = !non_final_branch
+                    && completed_erased_coroutine_arm
+                    && iterator_inside_finally
+                    && self.control.in_loop_tail_without_nested_cleanup()
+                    && self.control.exceptions.active_exception_group_handlers == 0
+                    && self.control.finally.active_return_finally_contexts.len() == 1
+                    && self.control.finally.active_loop_finally_contexts.len() == 1
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_copied_finally_bodies == 0
+                    && self.control.finally.active_finally_end_blocks == 0
+                    && self.control.finally.active_overriding_finally_returns == 0
+                    && self
+                        .control
+                        .finally
+                        .active_pass_finally_locations
+                        .is_empty()
+                    && self
+                        .control
+                        .finally
+                        .preserved_return_value_contexts
+                        .is_empty()
+                    && self.control.finally.copied_return_finally_preserved_values == 0
+                    && self
+                        .control
+                        .finally
+                        .copied_return_finally_loop_depth
+                        .is_none()
+                    && !self.control.finally.copy_return_finally_condition_exit
+                    && !self.control.finally.copies_terminating_finally_returns;
                 let copied_erased_branch_exit = self.context.python_version
                     >= crate::PythonVersion::Py314
                     && branch_index + 1 < branch_count
@@ -21727,10 +21864,12 @@ impl<'source> Compiler<'source> {
                     && ((self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                         && !self.has_active_control_flow_region()
                         && self.control.withs.active_with_exits.is_empty())
-                        || managed_coroutine_branch)
+                        || managed_coroutine_branch
+                        || finalized_erased_coroutine_branch)
                     && !self.control.statements.in_match
                     && !self.control.in_exception_handler()
-                    && self.control.finally.is_inactive_for_return_unwind()
+                    && (self.control.finally.is_inactive_for_return_unwind()
+                        || finalized_erased_coroutine_branch)
                     && self.control.loops.contexts.len() == 1
                     && self.control.loops.contexts.last().is_some_and(|context| {
                         context.iterator_cleanup == IteratorCleanup::Sync
@@ -21760,6 +21899,14 @@ impl<'source> Compiler<'source> {
                         })
                     });
                 let linear_exit_body = |body: &[Stmt]| {
+                    if erased_nested_coroutine_donor
+                        && iterator_inside_finally
+                        && body
+                            .iter()
+                            .all(|part| self.context.is_elided_statement(part))
+                    {
+                        return true;
+                    }
                     if non_final_branch
                         && !try_body_normal_exit
                         && body

@@ -15,6 +15,89 @@ use serc::{
 };
 
 #[test]
+fn erased_async_iterator_suffix_preserves_conditional_backedges() {
+    for async_iterator in [false, true] {
+        for work in [
+            "await touch(item)",
+            "value = await touch(item)",
+            "value = next(entry for entry in rows if entry.ready)",
+        ] {
+            for prefix in [false, true] {
+                let mut source = String::from("async def sample(items, rows, flag):\n");
+                if prefix {
+                    source
+                        .push_str("    if flag:\n        prepare()\n    else:\n        finish()\n");
+                }
+                source.push_str(if async_iterator {
+                    "    async for item in items:\n"
+                } else {
+                    "    for item in items:\n"
+                });
+                writeln!(source, "        {work}").unwrap();
+                source.push_str("        if flag:\n            assert item\n        assert rows\n");
+                assert_matches_cpython(&source, "erased_async_iterator_suffix.py", &LEVELS);
+            }
+        }
+    }
+    for source in [
+        "async def sample(items, rows, flag):\n    try:\n        async for item in items:\n            await touch(item)\n            if flag:\n                assert item\n            assert rows\n    finally:\n        await finish(rows)\n",
+        "async def sample(items, rows, flag):\n    async for item in items:\n        await touch(item)\n        if flag:\n            assert item\n        assert rows\n        assert flag\n",
+    ] {
+        assert_matches_cpython(source, "erased_async_iterator_suffix.py", &LEVELS);
+    }
+}
+
+#[test]
+fn erased_nested_coroutine_arms_preserve_saved_finalizer() {
+    for (case, (first, condition)) in [
+        ("item.kind == 1", "item.kind == 3"),
+        (
+            "item.kind == 1 or item.kind == 2",
+            "item.kind == 3 or item.kind == 4",
+        ),
+        ("item.kind == 1 and flag", "item.kind == 3 and flag"),
+        (
+            "not (item.kind == 1 and flag)",
+            "not (item.kind == 3 and flag)",
+        ),
+        (
+            "item.kind == 1 and item.ready()",
+            "item.kind == 3 or (item.kind == 4 and flag)",
+        ),
+        (
+            "item.kind == 1 and item.ready()",
+            "(item.kind == 3 and flag) or item.kind == 4",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for nested_first in [false, true] {
+            let mut source = String::from(
+                "async def sample(items, manager, flag):\n    try:\n        for item in items:\n            if ",
+            );
+            source.push_str(first);
+            source.push_str(":\n                assert item.ready\n");
+            if nested_first {
+                source.push_str(
+                    "                if item.side == 1:\n                    assert item.left\n                else:\n                    assert item.right\n",
+                );
+            }
+            source.push_str("            elif ");
+            source.push_str(condition);
+            source.push_str(
+                ":\n                assert item.ready\n                if item.side == 2:\n                    assert item.left\n                else:\n                    assert item.right\n            else:\n                assert item.done\n    finally:\n        manager.finish()\n        await manager.wait()\n",
+            );
+            assert_matches_cpython(
+                &source,
+                &format!("erased_nested_coroutine_finalizer_{case}_{nested_first}.py"),
+                &LEVELS,
+            );
+        }
+    }
+}
+
+#[test]
 fn nested_suspended_manager_jump_keeps_owner() {
     let source = "async def sample(owner, done):\n    try:\n        yield owner.item()\n    except (Cancelled, GeneratorExit):\n        raise\n    except Error as error:\n        yield owner.event(error)\n    finally:\n        try:\n            with owner.shield():\n                try:\n                    await owner.terminate()\n                finally:\n                    if not done:\n                        await owner.finish()\n        finally:\n            owner.release()\n";
     for source in [
