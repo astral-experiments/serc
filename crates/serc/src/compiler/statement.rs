@@ -27235,6 +27235,59 @@ impl<'source> Compiler<'source> {
                     self.assembler
                         .original_guarded_finally_exit_has_false_donor(*location, true)
                 });
+            let guarded_normal_finally_exit_location = (self.context.python_version
+                >= crate::PythonVersion::Py314
+                && matches!(self.unit.scope, Scope::Function { .. })
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                && self.control.loops.contexts.is_empty()
+                && self.control.withs.active_with_exits.is_empty()
+                && self.control.withs.active_with_region_exclusions.is_empty()
+                && self.control.exceptions.active_exception_handlers.is_empty()
+                && self.control.exceptions.active_exception_group_handlers == 0
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .len()
+                    == 1
+                && self.control.finally.active_finally_try_bodies == 1
+                && self.control.finally.active_normal_finally_bodies == 0
+                && self.control.finally.active_finally_end_blocks == 0
+                && self.control.finally.active_copied_finally_bodies == 0)
+                .then(|| guarded_normal_finally_exit_test(statement))
+                .flatten()
+                .map(|test| self.source_location(condition_fallthrough_range(test)))
+                .filter(|location| {
+                    if self
+                        .assembler
+                        .original_guarded_finally_exit_has_false_donor(*location, true)
+                    {
+                        return true;
+                    }
+                    let Some(Stmt::If(outer)) = statement.body.last() else {
+                        return false;
+                    };
+                    let [otherwise] = outer.elif_else_clauses.as_slice() else {
+                        return false;
+                    };
+                    let (Some(first), Some(last), Some(Stmt::If(inner))) =
+                        (outer.body.first(), outer.body.last(), otherwise.body.last())
+                    else {
+                        return false;
+                    };
+                    otherwise.test.is_none()
+                        && original_condition_has_unique_jump_target(&outer.test, false)
+                        && original_condition_has_unique_jump_target(&outer.test, true)
+                        && self.source_location(condition_fallthrough_range(&inner.test))
+                            == *location
+                        && self
+                            .assembler
+                            .original_nested_guarded_finally_exit_has_false_donor(
+                                *location,
+                                self.source_location(condition_fallthrough_range(&outer.test)),
+                                self.source_location(TextRange::new(first.start(), last.end())),
+                            )
+                });
             let guarded_finally_exit_location = if !statement.is_star
                 && statement.orelse.is_empty()
                 && statement.finalbody.is_empty()
@@ -27267,7 +27320,7 @@ impl<'source> Compiler<'source> {
                     .original_guarded_finally_has_false_donor(try_end, location)
                     .then_some(location)
             } else {
-                guarded_compound_finally_exit_location
+                guarded_compound_finally_exit_location.or(guarded_normal_finally_exit_location)
             };
             let forwarded_conditional_exit = statement
                 .orelse
@@ -37423,6 +37476,53 @@ impl<'source> Compiler<'source> {
                         Stmt::If(statement) => nested_if_exit_location(statement, true),
                         _ => None,
                     });
+            // An awaited guard can be the sole donor after nested cleanup jumps
+            // past this empty normal exit. Require both original incoming edges.
+            if self.context.python_version >= crate::PythonVersion::Py314
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                    == CO_COROUTINE
+                && self.control.loops.contexts.is_empty()
+                && self.control.withs.active_with_exits.is_empty()
+                && self.control.withs.active_with_region_exclusions.is_empty()
+                && self.control.exceptions.active_exception_handlers.is_empty()
+                && self.control.exceptions.active_exception_group_handlers == 0
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty()
+                && self.control.finally.active_finally_try_bodies == 0
+                && self.control.finally.active_normal_finally_bodies == 0
+                && self.control.finally.active_copied_finally_bodies == 0
+                && self.control.finally.active_finally_end_blocks == 0
+                && self.assembler.current_original_block_location().is_none()
+                && self
+                    .assembler
+                    .current_original_block_pre_fusion_instruction_count()
+                    == 0
+                && !statement.is_star
+                && statement.handlers.is_empty()
+                && statement.orelse.is_empty()
+                && matches!(conditional_exit, Some(NestedIfExitLocation::Unlocated))
+                && let [Stmt::If(branch)] = statement.finalbody.as_slice()
+                && branch.elif_else_clauses.is_empty()
+                && condition_has_only_runtime_tests(&branch.test)
+                && expression_suspends_current_scope(&branch.test)
+                && original_condition_has_unique_jump_target(&branch.test, false)
+                && matches!(branch.body.as_slice(), [Stmt::Try(cleanup)]
+                    if !cleanup.is_star && cleanup.handlers.is_empty()
+                        && cleanup.orelse.is_empty() && !cleanup.finalbody.is_empty())
+                && let Some(Expr::Compare(test)) = unique_condition_jump_target(&branch.test, false)
+                && test.ops.len() == 1
+                && matches!(test.ops[0], CmpOp::Is | CmpOp::IsNot)
+                && matches!(test.comparators()[0], Expr::NoneLiteral(_))
+                && self.assembler.original_guarded_finally_exit_has_none_donor(
+                    self.source_location(test.range()),
+                    self.source_location(test.comparators()[0].range()),
+                )
+            {
+                conditional_exit = Some(NestedIfExitLocation::Located(&branch.test));
+            }
             // Both cleanup copies retain the guard's original false-edge donor.
             let nested_coroutine_manager_guard = self.context.python_version
                 >= crate::PythonVersion::Py314
@@ -42973,6 +43073,62 @@ fn direct_try_body_exit_location(body: &[Stmt]) -> Option<DirectTryBodyExitLocat
             })
         })
         .flatten()
+}
+
+/// Finds a sole false-edge donor beside a structured protected body's finalizer exit.
+fn guarded_normal_finally_exit_test(statement: &ruff_python_ast::StmtTry) -> Option<&Expr> {
+    if statement.is_star
+        || !statement.orelse.is_empty()
+        || statement.handlers.is_empty()
+        || !statement.handlers.iter().all(|handler| {
+            handler.as_except_handler().is_some_and(|handler| {
+                handler.type_.as_deref().is_some_and(|expression| {
+                    !expression_contains_inline_branch(expression)
+                        && !expression_suspends_current_scope(expression)
+                })
+            })
+        })
+        || !suite_has_nonsuspending_linear_fallthrough(&statement.finalbody)
+    {
+        return None;
+    }
+    let mut body = statement.body.as_slice();
+    loop {
+        let Stmt::If(guard) = body.last()? else {
+            return None;
+        };
+        if !condition_has_linear_runtime_leaves(&guard.test)
+            || expression_suspends_current_scope(&guard.test)
+        {
+            return None;
+        }
+        if let [otherwise] = guard.elif_else_clauses.as_slice()
+            && otherwise.test.is_none()
+            && !suite_terminates_before_constant_folding(&guard.body)
+        {
+            body = &otherwise.body;
+            continue;
+        }
+        let (Stmt::Try(cleanup), _) = guard.body.split_last()? else {
+            return None;
+        };
+        return (guard.elif_else_clauses.is_empty()
+            && original_condition_has_unique_jump_target(&guard.test, false)
+            && !cleanup.is_star
+            && cleanup.handlers.is_empty()
+            && cleanup.orelse.is_empty()
+            && !suite_terminates(&cleanup.body)
+            && !suite_has_nonsuspending_linear_fallthrough(&cleanup.body)
+            && !suite_any_statement(&cleanup.body, |statement| {
+                matches!(
+                    statement,
+                    Stmt::Return(_) | Stmt::Break(_) | Stmt::Continue(_)
+                )
+            })
+            && !suite_contains_yield(&cleanup.body)
+            && suite_has_nonsuspending_linear_fallthrough(&cleanup.finalbody))
+        .then_some(guard.test.as_ref());
+    }
 }
 
 /// Selects a terminal `None` guard with a separate nested-finalizer normal exit.
