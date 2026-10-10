@@ -10495,6 +10495,7 @@ impl LayoutAssembler {
                                                         .removed_pop_block_widths.get(&origin.end)
                                                         .copied().unwrap_or(1) == 1
                                             }).count() == 1;
+                                    // Earlier compactions also contribute to this array's removal count.
                                     let handler_truth_prefix = (missing == 0
                                         && end - start == 1
                                         && indexed_instructions[start].opcode
@@ -10505,7 +10506,7 @@ impl LayoutAssembler {
                                             == 2)
                                         || (missing == 2
                                             && end - start == 4
-                                            && end_removed == 1
+                                            && end_removed >= 1
                                             && indexed_instructions[start].opcode
                                                 == crate::target::opcodes::POP_EXCEPT
                                             && indexed_instructions[start]
@@ -10563,7 +10564,7 @@ impl LayoutAssembler {
                                             // at POP_EXCEPT. Do not revive that broader epoch.
                                             || (missing == 2
                                                 && end - start == 4
-                                                && end_removed == 1
+                                                && end_removed >= 1
                                                 && self.exception_owner_provenance
                                                     .copied_handler_cleanups.iter()
                                                     .filter(|origin| {

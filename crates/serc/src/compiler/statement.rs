@@ -2772,6 +2772,13 @@ impl<'source> Compiler<'source> {
                                         && handler.trailing_statement == Some(statement.range)
                                 },
                             )))
+                    // A handler's None return cannot absorb the preceding Pass location.
+                    || (matches!(body.get(index + 1), Some(Stmt::Return(returned))
+                        if returned.value.as_deref().is_none_or(|value| matches!(value, Expr::NoneLiteral(_))))
+                        && self.control.exceptions.active_exception_handlers.last().is_some_and(
+                            |handler| handler.name.is_some()
+                                && handler.with_depth == self.control.withs.active_with_exits.len(),
+                        ))
                     || ((!is_final || inherited_statement_has_following)
                         && self.control.withs.active_with_exits.is_empty()))
                 && (self.control.withs.active_with_region_exclusions.is_empty()
@@ -10015,8 +10022,7 @@ impl<'source> Compiler<'source> {
                                     && (return_finally_contexts[next_finally - 1].loop_depth == loop_depth
                                         // A while between this handler and its sole finally
                                         // emits no unwind records before the captured POP.
-                                        || (name.is_none()
-                                            && next_finally == 1
+                                        || (next_finally == 1
                                             && return_finally_contexts.len() == 1
                                             && return_finally_contexts[0].loop_depth < loop_depth
                                             && self.control.loops.contexts
