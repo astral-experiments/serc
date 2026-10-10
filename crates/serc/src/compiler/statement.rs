@@ -34682,7 +34682,6 @@ impl<'source> Compiler<'source> {
             && matches!(self.unit.scope, Scope::Function { .. })
             && statement.orelse.is_empty()
             && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
-            && self.control.loops.contexts.is_empty()
             && self.control.withs.active_with_exits.is_empty()
             && self
                 .control
@@ -34694,7 +34693,16 @@ impl<'source> Compiler<'source> {
             && self.control.finally.active_normal_finally_bodies == 0
             && self.control.finally.active_finally_end_blocks == 0
             && self.control.finally.active_copied_finally_bodies == 0
-            && nested_named_recovery_leaves_empty_borrow_entry(statement);
+            && ((self.control.loops.contexts.is_empty()
+                && nested_named_recovery_leaves_empty_borrow_entry(statement))
+                || (self.context.python_version == crate::PythonVersion::Py314
+                    && matches!(self.control.loops.contexts.as_slice(), [context]
+                        if context.iterator_cleanup == IteratorCleanup::Sync
+                            && !context.has_orelse
+                            && context.with_depth == 0
+                            && context.finally_end_depth == 0
+                            && context.exception_region_depth == 0)
+                    && nested_raising_repair_leaves_empty_borrow_entry(statement)));
         // A conditional try-body ends at a separate POP_BLOCK array. A leading
         // while finalizer starts another array, so removing POP_BLOCK leaves an
         // empty original entry between the guard and the cleanup loop.
@@ -42986,6 +42994,53 @@ fn nested_named_recovery_leaves_empty_borrow_entry(statement: &ruff_python_ast::
             && !suite_contains_yield(&retry.body)
             && suite_has_linear_borrow_fallthrough(&retry.finalbody)
     })
+}
+
+/// Nested raising repair leaves the successful normal jump empty before cleanup.
+fn nested_raising_repair_leaves_empty_borrow_entry(statement: &ruff_python_ast::StmtTry) -> bool {
+    let Some((Stmt::Try(recovery), prefix)) = statement.body.split_last() else {
+        return false;
+    };
+    !statement.is_star
+        && suite_has_nonsuspending_linear_fallthrough(&statement.finalbody)
+        && prefix.iter().all(|part| {
+            suite_has_nonsuspending_linear_fallthrough(std::slice::from_ref(part))
+                || matches!(part, Stmt::If(guard)
+                    if guard.elif_else_clauses.is_empty()
+                        && condition_has_only_runtime_tests(&guard.test)
+                        && condition_has_linear_runtime_leaves(&guard.test)
+                        && !expression_suspends_current_scope(&guard.test)
+                        && suite_has_linear_raise_exit(&guard.body))
+        })
+        && !recovery.is_star
+        && recovery.orelse.is_empty()
+        && recovery.finalbody.is_empty()
+        && suite_has_nonsuspending_linear_fallthrough(&recovery.body)
+        && matches!(recovery.handlers.as_slice(), [handler]
+        if handler.as_except_handler().is_some_and(|handler| {
+            handler.type_.is_some()
+                && handler.name.is_some()
+                && matches!(handler.body.as_slice(), [Stmt::Try(repair), guards @ ..]
+                    if !repair.is_star
+                        && repair.orelse.is_empty()
+                        && repair.finalbody.is_empty()
+                        && suite_has_nonsuspending_linear_fallthrough(&repair.body)
+                        && !repair.handlers.is_empty()
+                        && repair.handlers.iter().all(|handler| {
+                            handler.as_except_handler().is_some_and(|handler| {
+                                handler.type_.is_some()
+                                    && handler.name.is_some()
+                                    && suite_has_linear_raise_exit(&handler.body)
+                            })
+                        })
+                        && !guards.is_empty()
+                        && guards.iter().all(|part| matches!(part, Stmt::If(guard)
+                            if guard.elif_else_clauses.is_empty()
+                                && condition_has_only_runtime_tests(&guard.test)
+                                && !expression_contains_inline_branch(&guard.test)
+                                && !expression_suspends_current_scope(&guard.test)
+                                && suite_has_nonsuspending_linear_fallthrough(&guard.body))))
+        }))
 }
 
 /// A guarded reraise leaves the successful managed recovery at the original join.

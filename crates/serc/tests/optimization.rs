@@ -30,6 +30,20 @@ fn group_iterator_break_reaches_guarded_cleanup() {
 }
 
 #[test]
+fn nested_raising_repair_keeps_iterator_cleanup_owned() {
+    let source = "def sample(owner):\n    for item in owner.items:\n        try:\n            try:\n                result = owner.prepare(item)\n            except Error as error:\n                try:\n                    result, output = owner.repair(error)\n                except Error as other:\n                    raise Unsupported(other) from None\n                if output:\n                    owner.note(output)\n        finally:\n            owner.restore()\n        owner.finish(result)\n";
+    for source in [
+        source.to_owned(),
+        source.replacen("        try:\n", "        try:\n            owner.start()\n            if owner.invalid or owner.closed:\n                raise ValueError()\n", 1),
+        source.replace("except Error as other:", "except (Error, ValueError) as other:")
+            .replace("                if output:", "                if owner.errors:\n                    owner.report(error)\n                if output:"),
+        source.replace("            owner.restore()", "            owner.restore()\n            owner.enabled = item"),
+    ] {
+        assert_matches_cpython(&source, "nested_repair_cleanup.py", &LEVELS);
+    }
+}
+
+#[test]
 fn guarded_recovery_work_reaches_stored_result_cleanup() {
     let source = "def sample(owner, query, telemetry):\n    token = telemetry.set([])\n    try:\n        row = owner.grade(query)\n    except Error as error:\n        if owner.fatal(error):\n            raise\n        failure = {\"error\": type(error).__name__}\n        causes = [type(cause).__name__ for cause in owner.causes(error) if cause is not error]\n        if causes:\n            failure[\"causes\"] = causes\n        row = {\"status\": \"failed\", \"failure\": failure}\n    finally:\n        telemetry.reset(token)\n    return row\n";
     for source in [
