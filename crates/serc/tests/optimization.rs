@@ -751,6 +751,94 @@ fn stored_call_before_recovery_keeps_iterator_cleanup_reachable() {
 }
 
 #[test]
+fn runtime_while_recovery_keeps_finalizer_borrow_entry() {
+    for named in [false, true] {
+        for nested in [false, true] {
+            for none_test in [false, true] {
+                let work = if nested {
+                    "            for item in items:\n                result = advance(item)\n"
+                } else {
+                    "            result = advance(items)\n"
+                };
+                let handler = if named {
+                    "ValueError as error"
+                } else {
+                    "ValueError"
+                };
+                let recovered = if named { "error" } else { "items" };
+                let condition = if none_test {
+                    "result is not None"
+                } else {
+                    "ready(result)"
+                };
+                let source = format!(
+                    "def sample(items, flag):
+    engine = setup(items)
+    result = None
+    try:
+        while flag:
+{work}            if {condition}:
+                break
+    except {handler}:
+        result = {recovered}
+        for item in items:
+            cancel(item)
+    finally:
+        engine.close()
+    return result
+"
+                );
+                assert_matches_cpython(&source, "runtime_while_recovery.py", &LEVELS);
+                if named && !nested && none_test {
+                    for (before, after) in [
+                        ("    finally:\n        engine.close()\n", ""),
+                        (
+                            "                break\n",
+                            "                finish(result)\n",
+                        ),
+                        (
+                            "        for item in items:\n            cancel(item)\n",
+                            "        cancel(items)\n",
+                        ),
+                        ("        while flag:\n", "        for flag in items:\n"),
+                    ] {
+                        assert_matches_cpython(
+                            &source.replace(before, after),
+                            "runtime_while_recovery_control.py",
+                            &LEVELS,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn guarded_recovery_preserves_loop_cleanup_entry() {
+    for leading in ["", "        if ready:\n            resource.prepare()\n"] {
+        for guard in [false, true] {
+            for recovery in ["pass", "report(private)"] {
+                for cleanup in [
+                    "            handle.close()\n",
+                    "            if handle is not None:\n                handle.close()\n",
+                ] {
+                    let mut source = format!(
+                        "def sample(resource, private, public, ready):\n    try:\n{leading}        while not resource.stopped():\n            if ready:\n                resource.poll()\n            resource.wait()\n    except Error as error:\n"
+                    );
+                    if guard {
+                        source.push_str("        if private is not None:\n");
+                    }
+                    let indent = if guard { "            " } else { "        " };
+                    write!(source, "{indent}try:\n{indent}    write(private, resource)\n{indent}except OSError:\n{indent}    {recovery}\n    finally:\n        for handle in (private, public):\n{cleanup}").unwrap();
+                    assert_matches_cpython(&source, "guarded_loop_cleanup.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn runtime_while_break_reaches_finalizer_iteration() {
     for manager in ["", "with acquire():", "with acquire(), acquire():"] {
         for nested in [false, true] {
