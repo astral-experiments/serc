@@ -3819,6 +3819,222 @@ fn erased_coroutine_final_elif_preserves_shared_backedge() {
 }
 
 #[test]
+fn erased_iterator_else_preserves_saved_cleanup_owners() {
+    for body in [
+        "assert result",
+        "count = action(result)\n                assert count",
+    ] {
+        let sources = [
+            format!(
+                "def sample(items, state):
+    try:
+        action(state)
+    except Exception:
+        for item in items:
+            result = action(item)
+            if item == state:
+                {body}
+            else:
+                assert result is None
+"
+            ),
+            format!(
+                "def sample(items, state):
+    try:
+        with manager():
+            for item in items:
+                result = action(item)
+                if item == state:
+                    {body}
+                else:
+                    assert result is None
+    finally:
+        finish(state)
+"
+            )
+            .replace(
+                "\n                assert count",
+                "\n                    assert count",
+            ),
+            format!(
+                "async def sample(items, state):
+    try:
+        async with manager():
+            for item in items:
+                result = await action(item)
+                if item == state:
+                    {body}
+                else:
+                    assert result is None
+    finally:
+        await finish(state)
+"
+            )
+            .replace(
+                "\n                assert count",
+                "\n                    assert count",
+            ),
+        ];
+        for source in sources {
+            assert_matches_cpython(&source, "erased_iterator_saved_owners.py", &LEVELS);
+        }
+    }
+    for body in ["break", "continue", "return value"] {
+        let source = format!(
+            "def sample(value, state, items):
+    try:
+        for item in items:
+            if value:
+                {body}
+            else:
+                assert state
+    finally:
+        finish(state)
+"
+        );
+        assert_matches_cpython(&source, "erased_iterator_branch_exit.py", &LEVELS);
+    }
+    for source in [
+        r"def sample(value, state, items):
+    for item in items:
+        with manager():
+            if value:
+                assert state
+            else:
+                assert value is None
+",
+        r"def sample(value, state, items):
+    for item in items:
+        try:
+            action(item)
+        except Exception:
+            if value:
+                assert state
+            else:
+                assert value is None
+",
+    ] {
+        assert_matches_cpython(source, "erased_iterator_nested_owner.py", &LEVELS);
+    }
+}
+
+#[test]
+fn erased_iterator_else_preserves_linear_generator_creation() {
+    for expression in [
+        "(part for part in item)",
+        "consume(part for part in item)",
+        "sum(part for part in item)",
+        "action(sum(part for part in item))",
+        "sum((lambda: part) for part in item)",
+        "sum((part or state) for part in item)",
+        "sum((part if value else state) for part in item)",
+        "sum(part for part in item if part and state)",
+        "sum(part for group in item for part in (group if value else items))",
+        "sum(part + value for part in item)",
+        "sum(part for part in prepare(item))",
+    ] {
+        for prefix in ["", "async "] {
+            let source = format!(
+                "{prefix}def sample(value, state, items):
+    try:
+        with manager():
+            for item in items:
+                if value:
+                    result = {expression}
+                    assert result
+                else:
+                    assert state
+    finally:
+        finish(state)
+"
+            );
+            assert_matches_cpython(&source, "linear_generator_iterator_else.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
+fn erased_elif_arms_preserve_saved_iterator_owners() {
+    let indent = |body: &str| {
+        let mut result = String::new();
+        for line in body.lines() {
+            result.push_str("    ");
+            result.push_str(line);
+            result.push('\n');
+        }
+        result
+    };
+    for first in [
+        "assert flag\nresult = action(item)\nassert result\n",
+        "assert flag\naction(item)\nassert item\n",
+        "assert flag\n",
+    ] {
+        for condition in ["not value", "value"] {
+            for finalized in [false, true] {
+                let branch = format!(
+                    "if flag:\n{}elif {condition}:\n    assert item\nelse:\n    assert value\n",
+                    indent(first),
+                );
+                let body = format!(
+                    "for item in items:\n    value = read(item)\n{}finish(items)\n",
+                    indent(&branch),
+                );
+                let body = format!("with resource() as handle:\n{}", indent(&body));
+                let body = if finalized {
+                    format!("try:\n{}finally:\n    close(items)\n", indent(&body))
+                } else {
+                    body
+                };
+                let source = format!("def sample(items, flag):\n{}", indent(&body));
+                assert_matches_cpython(&source, "erased_elif_saved_iterator_owners.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn completed_await_iterator_arms_preserve_saved_cleanup_owners() {
+    for managers in 0..=2 {
+        for guarded in [false, true] {
+            for awaited_finalizer in [false, true] {
+                let mut body = String::from("await action(item)\n");
+                let indent = |body: &str| {
+                    let mut indented = String::new();
+                    for line in body.lines() {
+                        indented.push_str("    ");
+                        indented.push_str(line);
+                        indented.push('\n');
+                    }
+                    indented
+                };
+                if guarded {
+                    body = format!("with guard():\n{}", indent(&body));
+                }
+                body = format!("if item:\n{}else:\n    assert flag\n", indent(&body));
+                body = format!("for item in values:\n{}", indent(&body));
+                let finalizer = if awaited_finalizer {
+                    "await finish()"
+                } else {
+                    "finish()"
+                };
+                body = format!("try:\n{}finally:\n    {finalizer}\n", indent(&body));
+                for _ in 0..managers {
+                    body = format!("async with gate():\n{}", indent(&body));
+                }
+                let source = format!("async def scenario(values, flag):\n{}", indent(&body));
+                assert_matches_cpython(
+                    &source,
+                    &format!(
+                        "completed_iterator_await_{managers}_{guarded}_{awaited_finalizer}.py"
+                    ),
+                    &LEVELS,
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn managed_mixed_erased_iterator_guard_preserves_shared_backedge() {
     let source = r"def sample(items, manager, check):
     with manager():
