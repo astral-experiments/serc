@@ -11408,6 +11408,28 @@ fn optimized_legacy_await_return_preserves_symbol_error_precedence() {
 }
 
 #[test]
+fn erased_module_comprehension_cells_precede_synthetic_annotations() {
+    for future in ["", "from __future__ import annotations\n"] {
+        for annotation in ["value: int\n", "if flag:\n    value: int\n"] {
+            for body in [
+                "assert [(lambda: item) for item in items]\n",
+                "assert [(lambda: z) for z in items]\nassert [(lambda: a) for a in items]\n",
+                "out = [(lambda: z) for z in items]\nassert [(lambda: a) for a in items]\n",
+                "assert [(lambda: z) for z in items]\nout = [(lambda: a) for a in items]\n",
+                "assert [(lambda: __conditional_annotations__) for __conditional_annotations__ in items]\n",
+                "assert [(lambda: z) for z in items]\nassert [(lambda: __conditional_annotations__) for __conditional_annotations__ in items]\n",
+            ] {
+                assert_matches_cpython(
+                    &format!("{future}{annotation}{body}"),
+                    "erased_module_cells.py",
+                    &LEVELS,
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn debug_annotations_preserve_postponed_source_spelling() {
     let source =
         "value: __debug__ = 1\ndef function(arg: __debug__) -> tuple[__debug__]:\n    return arg\n";
