@@ -24994,13 +24994,20 @@ impl<'source> Compiler<'source> {
             })
             && matches!(statement.body.last(), Some(Stmt::Try(nested))
             if !nested.is_star
-                && nested.orelse.is_empty()
+                && (nested.orelse.is_empty()
+                    || (self.context.python_version == crate::PythonVersion::Py314
+                        && self.unit.flags & CO_COROUTINE != 0
+                        && matches!(nested.body.as_slice(), [Stmt::Assign(assignment)]
+                            if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                                && matches!(assignment.value.as_ref(), Expr::Await(awaited)
+                                    if matches!(awaited.value.as_ref(), Expr::Call(_))
+                                        && !expression_suspends_current_scope(&awaited.value)))))
                 && nested.finalbody.is_empty()
                 && !nested.handlers.is_empty()
                 && nested.handlers.iter().all(|handler| {
                     handler.as_except_handler().is_some_and(|handler| handler.type_.is_some())
                 })
-                && matches!(nested.body.last(), Some(Stmt::If(branch))
+                && matches!((if nested.orelse.is_empty() { &nested.body } else { &nested.orelse }).last(), Some(Stmt::If(branch))
                     if condition_has_only_runtime_tests(&branch.test)
                         && !expression_contains_inline_branch(&branch.test)
                         && matches!(branch.elif_else_clauses.as_slice(), [otherwise]
