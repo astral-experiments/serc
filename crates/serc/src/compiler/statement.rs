@@ -36151,7 +36151,10 @@ impl<'source> Compiler<'source> {
                     && suite_has_linear_live_conditional_break(&loop_statement.body)
                     && suite_contains_borrow_reachable_conditional_loop_break(
                         &loop_statement.body))
-                || (coroutine_conditional_cleanup_entry
+                || (self.context.python_version == crate::PythonVersion::Py314
+                    && (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                        == 0
+                        || coroutine_conditional_cleanup_entry)
                     && loop_break_context
                     && conditional_break_cleanup_entry
                     && matches!(statement.body.last(), Some(Stmt::While(loop_statement))
