@@ -5337,6 +5337,138 @@ fn nested_handler_iterator_returns_end_inner_try_ownership() {
 }
 
 #[test]
+fn nested_handler_returns_keep_enclosing_try_owner_inside_while() {
+    let source = r"def sample(flag):
+    try:
+        while flag:
+            try:
+                work()
+            except ValueError:
+                try:
+                    recover()
+                except OSError:
+                    return False
+                continue
+            finish()
+        raise RuntimeError
+    except Exception:
+        cleanup()
+        raise
+";
+    for source in [
+        source.to_owned(),
+        source
+            .replace("def sample", "async def sample")
+            .replace("work()", "await work()")
+            .replace("recover()", "await recover()"),
+    ] {
+        for (index, source) in [
+            source.clone(),
+            source.replace("return False", "return flag"),
+            source.replace("return False", "return"),
+            source.replace("except OSError:", "except OSError as error:"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_matches_cpython(
+                &source,
+                &format!("nested_handler_while_{index}.py"),
+                &LEVELS,
+            );
+        }
+    }
+}
+
+#[test]
+fn enclosing_tries_own_copied_finalizers_after_handler_returns() {
+    let source = r"def sample(first, second):
+    try:
+        prepare()
+        try:
+            check(first)
+            try:
+                check(second)
+            except ValueError:
+                return True
+            else:
+                finish(second)
+                return False
+            finally:
+                finish(first)
+        finally:
+            release(second)
+            release(first)
+    except OSError:
+        return False
+";
+    for asynchronous in [false, true] {
+        for named in [false, true] {
+            for returned in ["True", "first"] {
+                let mut source = source.replace("return True", &format!("return {returned}"));
+                if asynchronous {
+                    source = source.replace("def sample", "async def sample");
+                }
+                if named {
+                    source = source.replace("except ValueError:", "except ValueError as error:");
+                }
+                assert_matches_cpython(
+                    &source,
+                    &format!("enclosing_try_finalizers_{asynchronous}_{named}_{returned}.py"),
+                    &LEVELS,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn completed_recovery_finalizers_retire_iterator_return_owners() {
+    let source = r"async def sample(items, flag):
+    for item in items:
+        try:
+            token = await acquire(item)
+            try:
+                try:
+                    value = await work(token)
+                except LookupError:
+                    raise
+                except ValueError as error:
+                    value = error.value
+                    if flag and retry(value):
+                        raise RuntimeError() from error
+                if flag and value:
+                    raise RuntimeError()
+                return result(value if flag else None, token=token)
+            finally:
+                try:
+                    await finish(token)
+                except Exception:
+                    recover(token)
+        except Exception as error:
+            if flag or not retry(error):
+                raise
+            await delay()
+    raise AssertionError()
+";
+    for (index, source) in [
+        source.to_owned(),
+        source.replace("async def", "def").replace("await ", ""),
+        source.replace("recover(token)", "pass"),
+        source.replace("await finish(token)", "finish(token)"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            &source,
+            &format!("completed_recovery_iterator_return_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn nested_handler_returns_preserve_outer_finalizer_owners() {
     let source = r"def nested_handlers(choice, item, owner, operation, cleanup, recover):
     value = None
