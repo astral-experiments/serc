@@ -1155,7 +1155,10 @@ impl Compiler<'_> {
                         // The final async-for exhaustion falls directly into the following
                         // match continuation before cold blocks move. Its surviving bridge
                         // represents that fallthrough, not an interruptible case-success jump.
+                        // On 3.13, pattern-failure cleanup still requires the original jump.
                         let final_async_exhaustion = match_has_following
+                            && (self.context.python_version != PythonVersion::Py313
+                                || context.fail_pop.is_empty())
                             && index + 1 == matched_cases
                             && !has_default
                             && self
