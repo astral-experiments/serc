@@ -25041,6 +25041,23 @@ impl<'source> Compiler<'source> {
                 self.context.python_version == crate::PythonVersion::Py314
                     && coroutine_try_else_has_populated_call_entry(statement)
             };
+        let managed_await_store_entry = borrow_exit_has_source_successor
+            && self.context.python_version == crate::PythonVersion::Py314
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+            && matches!(self.control.loops.contexts.as_slice(), [context]
+                if context.iterator_cleanup == IteratorCleanup::Sync)
+            && self
+                .control
+                .withs
+                .active_with_exits
+                .last()
+                .is_some_and(|manager| manager.is_async)
+            && self.control.exceptions.active_exception_handlers.is_empty()
+            && self.control.finally.active_finally_try_bodies == 0
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && managed_nested_recovery_has_awaited_store_entry(statement);
         // A populated call arm can bypass the nested pass recovery's empty join.
         // Keep that source barrier, but let its surviving jump enter the outer
         // continuation while the other branch still stops at the empty array.
@@ -25139,6 +25156,7 @@ impl<'source> Compiler<'source> {
                 && suite_ends_in_empty_try_exit_block(normal_exit_suite, loop_tail.is_some())
                 && !nested_conditional_store_entry
                 && !nested_else_call_entry
+                && !managed_await_store_entry
                 && !nested_pass_call_entry
                 && !nested_conditional_pass_entry
                 && !nested_for_break_entry)
@@ -44286,6 +44304,63 @@ fn nested_try_else_has_populated_call_entry(statement: &ruff_python_ast::StmtTry
                 if tail.elif_else_clauses.is_empty()
                     && condition_has_linear_runtime_leaves(&tail.test)
                     && suite_has_linear_borrow_fallthrough(&tail.body)))
+}
+
+// The first awaited store arm retains a populated jump past both recovery exits.
+fn managed_nested_recovery_has_awaited_store_entry(statement: &ruff_python_ast::StmtTry) -> bool {
+    if statement.is_star || !statement.orelse.is_empty() || !statement.finalbody.is_empty() {
+        return false;
+    }
+    if !matches!(statement.handlers.as_slice(), [handler]
+    if handler.as_except_handler().is_some_and(|handler| {
+        handler.type_.is_some()
+            && handler.name.is_some()
+            && handler.body.split_last().is_some_and(|(last, prefix)| {
+                matches!(last, Stmt::Continue(_))
+                    && prefix.iter().all(|part| matches!(part, Stmt::Expr(expression)
+                        if matches!(expression.value.as_ref(), Expr::Call(_))
+                            && !expression_suspends_current_scope(&expression.value)))
+            })
+    })) {
+        return false;
+    }
+    let Some(Stmt::Try(recovery)) = statement.body.last() else {
+        return false;
+    };
+    if recovery.is_star
+        || !recovery.orelse.is_empty()
+        || !recovery.finalbody.is_empty()
+        || recovery.handlers.is_empty()
+        || !recovery.handlers.iter().all(|handler| {
+            handler.as_except_handler().is_some_and(|handler| {
+                handler.type_.is_some()
+                    && suite_has_nonsuspending_conditional_work(&handler.body)
+                    && matches!(handler.body.last(), Some(Stmt::Assign(assignment))
+                        if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                            && matches!(assignment.value.as_ref(), Expr::Call(_)))
+            })
+        })
+    {
+        return false;
+    }
+    let [Stmt::If(branch)] = recovery.body.as_slice() else {
+        return false;
+    };
+    let [otherwise] = branch.elif_else_clauses.as_slice() else {
+        return false;
+    };
+    condition_has_linear_runtime_leaves(&branch.test)
+        && !expression_suspends_current_scope(&branch.test)
+        && otherwise.test.is_none()
+        && [branch.body.as_slice(), otherwise.body.as_slice()]
+            .into_iter()
+            .all(|arm| matches!(arm, [Stmt::Assign(assignment)]
+                if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                    && matches!(assignment.value.as_ref(), Expr::Await(awaited)
+                        if matches!(awaited.value.as_ref(), Expr::Call(_))
+                            && ((!expression_contains_inline_branch(&awaited.value)
+                                && !expression_suspends_current_scope(&awaited.value))
+                                || cleanup_conditional_argument_has_eager_call_prefix(&awaited.value)))))
 }
 
 // Call arms can thread a coroutine's nested else exits without traversing the

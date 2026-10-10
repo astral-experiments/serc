@@ -15,6 +15,17 @@ use serc::{
 };
 
 #[test]
+fn managed_nested_await_store_keeps_continuation_reachable() {
+    let source = "async def sample(owner, groups, mode, flag, pending):\n    with owner.reporter() as reporter:\n        async with await owner.connect() as client:\n            for group in groups:\n                try:\n                    try:\n                        if mode == 'first':\n                            handle = await client.start(owner.first, group, key=key, reuse=owner.allow if flag else owner.reject)\n                        else:\n                            handle = await client.start(owner.second, group, key=key, reuse=owner.allow if flag else owner.reject)\n                    except AlreadyStarted:\n                        handle = client.lookup(key)\n                except Exception as error:\n                    continue\n                if len(pending) >= limit:\n                    await owner.collect(reporter, pending)\n";
+    for source in [
+        source.to_owned(),
+        source.replace("owner.allow if flag else owner.reject", "owner.allow"),
+    ] {
+        assert_matches_cpython(&source, "managed_nested_await_store.py", &LEVELS);
+    }
+}
+
+#[test]
 fn prefixed_copied_recovery_keeps_normal_continuation_owned() {
     let source = "async def sample(owner, value, flag, needed):\n    try:\n        try:\n            owner.report(value)\n        except Exception as error:\n            if flag:\n                return None\n            result = None\n        return owner.result, value\n    except CancelledError:\n        raise\n    except Exception as error:\n        return None\n    finally:\n        if owner.helper is not None:\n            owner.helper.close()\n        if needed and owner is not None:\n            try:\n                await owner.close(value)\n                owner.finished()\n            except Exception as error:\n                owner.problem(error)\n                raise\n";
     for source in [
