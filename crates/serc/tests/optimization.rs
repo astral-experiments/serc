@@ -9484,6 +9484,30 @@ fn discarded_star_imports_match_cpython() {
 }
 
 #[test]
+fn unprotected_conditional_returns_fuse_local_pairs_after_handlers() {
+    for handler in [
+        "except Exception:\n        recover()",
+        "except Exception as error:\n        recover(error)",
+    ] {
+        for condition in ["current is not None", "current"] {
+            for tail in [">= threshold", "+ threshold"] {
+                let source = format!(
+                    "def sample(current, threshold):\n    try:\n        prepare()\n    {handler}\n    return (current if {condition} else clock()) {tail}\n"
+                );
+                assert_matches_cpython(&source, "unprotected_conditional_return.py", &LEVELS);
+            }
+        }
+    }
+    for source in [
+        "def sample(current, threshold):\n    try:\n        return current >= threshold\n    except Exception:\n        return False\n",
+        "def sample(current, threshold):\n    try:\n        selected = current if current is not None else clock()\n    except Exception:\n        return False\n    return selected >= threshold\n",
+        "def sample(current, threshold):\n    with manager():\n        return (current if current is not None else clock()) >= threshold\n",
+    ] {
+        assert_matches_cpython(source, "protected_local_pair_boundary.py", &LEVELS);
+    }
+}
+
+#[test]
 fn named_handler_loop_cleanup_after_elided_assertions_matches_cpython() {
     for (index, suffix) in [
         "assert error\n",

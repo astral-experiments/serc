@@ -7677,10 +7677,15 @@ impl OptimizationPipeline {
             // A newly copied, unprotected straight-line exit has no native block boundary at
             // this seam. Admit its local pair through the same predicate used by the fuser;
             // the following operation does not determine whether CPython combines the loads.
-            // Keep all existing copying paths unchanged, and decline any exception-bearing
-            // unit or copy with an interior label or branch that could observe the entry offset.
+            // Keep all existing copying paths unchanged, and decline protected participating
+            // blocks or copies with an interior label or branch that could observe the entry offset.
             let inline_unprotected_local_pair = inline_small_exit
-                && self.exception_regions.is_empty()
+                && !exception_boundary_blocks[source.index()]
+                && !exception_boundary_blocks[target.index()]
+                && region_memberships.iter().all(|membership| {
+                    !membership.contains(&positions[source.index()])
+                        && !membership.contains(&positions[target.index()])
+                })
                 && copied_exception_regions.is_empty()
                 && copied_region_exclusions.iter().all(Vec::is_empty)
                 && self.borrow_finally_jump_sources.is_empty()
