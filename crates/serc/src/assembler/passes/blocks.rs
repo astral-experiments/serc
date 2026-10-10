@@ -519,6 +519,34 @@ fn block_is_bare_raise(items: &[Item], original_nop_targets: &FxHashSet<Label>) 
     }) && instructions.next().is_none()
 }
 
+/// Certifies a two-slot exit exposed by copying a bare raise after a local store.
+fn copied_raise_completes_local_store(source: &[Item], copied: &[Item]) -> bool {
+    let Some((Item::Instruction(store), source_labels)) = source.split_last() else {
+        return false;
+    };
+    let Some((Item::Instruction(raise), copied_labels)) = copied.split_last() else {
+        return false;
+    };
+    source_labels
+        .iter()
+        .chain(copied_labels)
+        .all(|item| matches!(item, Item::Label(_)))
+        && store.opcode == STORE_FAST
+        && raise.opcode == RAISE_VARARGS
+        && raise.value_argument() == Some(0)
+        // Only the active exception remains on the stack. Enclosing managers
+        // and iterators need their own copy-order proof.
+        && store.depth_after() == Some(1)
+        && raise.depth_after() == Some(1)
+        && [store, raise].iter().all(|instruction| {
+            instruction.value_argument().is_some()
+                && instruction.location.line >= 0
+                && instruction.pre_fold_extra_instructions() == 0
+                && instruction.local_policy.hidden_exception_owner_slots() == 0
+                && instruction.exception_policy() == ExceptionPolicy::default()
+        })
+}
+
 /// Certifies a local raise without copied return/finally unwind records.
 ///
 /// One original converted `POP_BLOCK` may precede the two-record raise. Authored
@@ -7593,6 +7621,23 @@ impl OptimizationPipeline {
                     owner_retargets.push((original, *instruction));
                 }
             }
+            // A copied bare raise completes this store's original exit array.
+            // Expose it before revisiting earlier conditional-expression arms.
+            let inline_stored_reraise = inline_small_exit
+                && target_pre_fusion_size == 1
+                && !planned_copy
+                && copied_exception_regions.is_empty()
+                && copied_region_exclusions.iter().all(Vec::is_empty)
+                && region_memberships.iter().all(|membership| {
+                    membership.contains(&source_position)
+                        == membership.contains(&target_position)
+                })
+                && [source, target].iter().all(|block| {
+                    !graph[*block].items().iter().any(|item| {
+                        matches!(item, Item::Label(label) if self.original_nop_targets.contains(label))
+                    })
+                })
+                && copied_raise_completes_local_store(graph[source].items(), &copied);
             // CPython appends a small, unprotected exit to its predecessor before inserting
             // superinstructions. A tuple/call or attribute store followed by a direct name
             // return can expose two local loads. Keeping the copied entry label would split them
@@ -7846,6 +7891,7 @@ impl OptimizationPipeline {
             } else if inline_no_location_block
                 || inline_unprotected_return
                 || inline_unprotected_raise
+                || inline_stored_reraise
                 || inline_protected_return
                 || (inline_small_exit && target_terminal_opcode == Some(RERAISE))
                 || planned_copy
@@ -11336,6 +11382,62 @@ mod represented_setup_nop_tests {
                 &ExceptionOwnerProvenance::default(),
             );
             assert_eq!(analysis.requires_copy, copy_source.is_some());
+        }
+    }
+
+    #[test]
+    fn stored_reraise_copy_requires_exact_original_slots() {
+        use crate::target::opcodes::{STORE_DEREF, STORE_GLOBAL};
+
+        let label = Label::from_u32(0);
+        let location = SourceLocation::new(2, 2, 0, 5);
+        for variation in [
+            "plain",
+            "cell store",
+            "global store",
+            "value raise",
+            "folded slot",
+            "hidden owner",
+            "unlocated",
+            "exception policy",
+            "extra prefix",
+            "outer stack",
+            "unknown depth",
+        ] {
+            let mut store = Instruction::new(STORE_FAST, Operand::Value(0), location, Some(1));
+            let mut raise = Instruction::new(RAISE_VARARGS, Operand::Value(0), location, Some(1));
+            let mut source = vec![Item::Label(label)];
+            match variation {
+                "plain" => {}
+                "cell store" => store.opcode = STORE_DEREF,
+                "global store" => store.opcode = STORE_GLOBAL,
+                "value raise" => raise.set_operand(Operand::Value(1)),
+                "folded slot" => store.add_pre_fold_extra_instructions(1),
+                "hidden owner" => store.local_policy.add_hidden_exception_owner_slots(1),
+                "unlocated" => store.location = SourceLocation::NONE,
+                "exception policy" => store.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS),
+                "extra prefix" => {
+                    source.push(Item::Instruction(Instruction::new(
+                        NOP,
+                        Operand::Value(0),
+                        location,
+                        None,
+                    )));
+                }
+                "outer stack" | "unknown depth" => {
+                    let depth = (variation == "outer stack").then_some(2);
+                    store = Instruction::new(STORE_FAST, Operand::Value(0), location, depth);
+                    raise = Instruction::new(RAISE_VARARGS, Operand::Value(0), location, depth);
+                }
+                _ => unreachable!(),
+            }
+            source.push(Item::Instruction(store));
+            let copied = [Item::Label(Label::from_u32(1)), Item::Instruction(raise)];
+            assert_eq!(
+                copied_raise_completes_local_store(&source, &copied),
+                variation == "plain",
+                "{variation}"
+            );
         }
     }
 
