@@ -716,6 +716,139 @@ fn async_iterator_recovery_keeps_cleanup_cold() {
 }
 
 #[test]
+fn managed_guarded_recovery_preserves_finalizer_borrowing() {
+    for named in [false, true] {
+        for raising in 0..3 {
+            for cleanup in 0..3 {
+                let mut source = String::from(
+                    "def probe(items, manager, first, second, worker, guard):\n    with manager():\n        try:\n            worker.run(items)\n        except LookupError",
+                );
+                if named {
+                    source.push_str(" as error");
+                }
+                let value = if named { "error" } else { "items" };
+                source.push_str(":\n            if guard(");
+                source.push_str(value);
+                source.push_str("):\n                raise");
+                if raising != 0 {
+                    let cause = if raising == 1 { "None" } else { value };
+                    source.push_str(" Failure(");
+                    source.push_str(value);
+                    source.push_str(") from ");
+                    source.push_str(cause);
+                }
+                source.push_str("\n        finally:\n");
+                if cleanup == 2 {
+                    source.push_str("            first.value = None\n");
+                } else {
+                    source.push_str("            first.close()\n");
+                    if cleanup != 0 {
+                        source.push_str("            second.finish()\n");
+                    }
+                }
+                source.push_str("    observe(items)\n");
+                assert_matches_cpython(&source, "managed_guarded_recovery.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn managed_loop_recovery_preserves_finalizer_borrowing() {
+    let source = |loop_header: &str, prefix: &str, named: bool, recovery: bool| {
+        let mut source = String::from(
+            "def probe(items, manager, cleanup, worker, guard, running, advance, clock, started):\n    with manager():\n        ",
+        );
+        source.push_str(loop_header);
+        source.push_str("\n            try:\n");
+        for line in prefix.lines() {
+            source.push_str("                ");
+            source.push_str(line);
+            source.push('\n');
+        }
+        source.push_str("                worker.run(items)\n            except LookupError");
+        if named {
+            source.push_str(" as error");
+        }
+        source.push_str(":\n");
+        if recovery {
+            source.push_str("                items = []\n                worker.note(items)\n");
+        }
+        source.push_str("                if guard(");
+        source.push_str(if named { "error" } else { "items" });
+        source.push_str("):\n                    raise\n            finally:\n                cleanup.observe(clock.now() - started)\n            items = advance(items)\n    observe(items)\n");
+        source
+    };
+    for loop_header in ["while running():", "for item in items:"] {
+        for named in [false, true] {
+            for recovery in [false, true] {
+                assert_matches_cpython(
+                    &source(loop_header, "", named, recovery),
+                    "managed_loop_recovery.py",
+                    &LEVELS,
+                );
+            }
+        }
+        for prefix in [
+            "worker.prepare(items)\nworker.refresh(items)\n",
+            "worker.value = items\n",
+            "first, second = items\n",
+            "prepared = [item.value for item in items]\n",
+            "prepared = {item.key: item.value for item in items}\n",
+            "prepared = {item.value for item in items}\n",
+            "prepared = collect(item.value for item in items)\n",
+            "worker.note(items if running() else None)\n",
+            "for item in items:\n    worker.note(item)\n",
+            "for item in items:\n    if guard(item):\n        worker.value = item\n",
+            "prepared = {item.key: item for item in items}\nworker.note(item for item in prepared)\nfor item in items:\n    if guard(item) and running():\n        prepared[item.key] = item\nworker.note(items if running() else None)\n",
+        ] {
+            assert_matches_cpython(
+                &source(loop_header, prefix, false, true),
+                "managed_loop_completed_recovery.py",
+                &LEVELS,
+            );
+        }
+    }
+}
+
+#[test]
+fn managed_recovery_preserves_finalizer_store_borrowing() {
+    for early_return in [false, true] {
+        for named in [false, true] {
+            for rebound in [false, true] {
+                for success in [false, true] {
+                    let mut source =
+                        String::from("def sample(owner, work):\n    with owner.lock:\n");
+                    if early_return {
+                        source.push_str(
+                            "        if owner.closed or work.done():\n            return\n",
+                        );
+                    }
+                    source.push_str("        owner.active = 1\n        try:\n            value = produce(work)\n        except Error");
+                    if named {
+                        source.push_str(" as error");
+                    }
+                    source.push_str(":\n            if not owner.ready():\n                owner.failed = True\n                report(work)\n                raise Stop()\n");
+                    if rebound {
+                        source.push_str("            if invalid(work):\n                code = first() if conflict(work) else second()\n                error = wrap(code)\n");
+                    }
+                    source.push_str(if named || rebound {
+                        "            finish(work, error)\n"
+                    } else {
+                        "            finish(work, None)\n"
+                    });
+                    if success {
+                        source.push_str("        else:\n            work.update({\"mode\": \"fast\" if owner.fast else \"slow\"})\n            finish(work, value)\n");
+                    }
+                    source.push_str("        finally:\n            owner.active = 0\n");
+                    assert_matches_cpython(&source, "managed_recovery_store.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn managed_coroutine_recovery_keeps_guarded_cleanup_reachable() {
     let source = "async def sample(owner, item, outcome, persisted):\n    with owner.context():\n        try:\n            outcome = await owner.route()\n        except Exception as error:\n            if item is None or item.status != Status.PENDING:\n                raise\n        finally:\n            if outcome is not None:\n                if not persisted:\n                    await owner.persist()\n";
     for source in [

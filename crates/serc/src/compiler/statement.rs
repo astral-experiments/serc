@@ -35071,6 +35071,30 @@ impl<'source> Compiler<'source> {
             && matches!(statement.finalbody.first(), Some(Stmt::If(cleanup))
                 if condition_has_linear_runtime_leaves(&cleanup.test)
                     && !expression_suspends_current_scope(&cleanup.test));
+        let managed_recovery_reaches_finally = self.context.python_version
+            == crate::PythonVersion::Py314
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && synchronous_recovery
+            && self.control.in_synchronous_with()
+            && self.control.withs.active_with_exits.len() == 1
+            && !self.control.in_synchronous_with_nested_exception_region()
+            && !self.control.in_exception_handler()
+            && self.control.exceptions.active_exception_group_handlers == 0
+            && self.control.exceptions.active_try_marker_slots.is_empty()
+            && self.control.finally.active_finally_try_bodies == 0
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && ((self.control.loops.contexts.is_empty()
+                && managed_recovery_has_populated_finally_route(statement))
+                || ((self.control.loops.contexts.is_empty()
+                    || matches!(self.control.loops.contexts.as_slice(), [context]
+                        if matches!(context.iterator_cleanup, IteratorCleanup::None | IteratorCleanup::Sync)
+                            && !context.has_orelse
+                            && context.with_depth == 1
+                            && context.finally_end_depth == 0
+                            && context.exception_region_depth == 0))
+                    && managed_guarded_raise_has_finally_route(statement)));
         let normal_finally_is_borrow_reachable = (simple_fallthrough_handlers_reach_finally
             || compound_fallthrough_handlers_reach_finally
             || runtime_while_handlers_reach_finally)
@@ -35092,6 +35116,7 @@ impl<'source> Compiler<'source> {
             || dispatcher_break_reaches_finally
             || inner_try_break_loop_range.is_some()
             || conditional_handler_reaches_finally
+            || managed_recovery_reaches_finally
             || managed_coroutine_recovery_reaches_finally
             || guarded_named_handler_reaches_finally
             || named_iterator_break_reaches_finally
@@ -48830,6 +48855,140 @@ fn suite_has_linear_reraise_guards(body: &[Stmt]) -> bool {
         }
     }
     has_guard
+}
+
+/// A runtime raise guard retains its false path through managed handler cleanup.
+fn managed_guarded_raise_has_finally_route(statement: &ruff_python_ast::StmtTry) -> bool {
+    fn completed_work(body: &[Stmt]) -> bool {
+        if crate::stack_growth_required() {
+            return crate::grow_stack(|| completed_work(body));
+        }
+        body.iter().all(|part| match part {
+            Stmt::Expr(expression) => !expression_suspends_current_scope(&expression.value),
+            Stmt::Assign(assignment) => {
+                !expression_suspends_current_scope(&assignment.value)
+                    && assignment.targets.iter().all(|target| {
+                        !expression_contains_inline_branch(target)
+                            && !expression_suspends_current_scope(target)
+                    })
+            }
+            Stmt::For(iterator) => {
+                !iterator.is_async
+                    && iterator.orelse.is_empty()
+                    && (matches!(iterator.target.as_ref(), Expr::Name(_))
+                        || matches!(iterator.target.as_ref(), Expr::Tuple(tuple)
+                            if !tuple.elts.is_empty()
+                                && tuple.elts.iter().all(|item| matches!(item, Expr::Name(_)))))
+                    && !expression_contains_inline_branch(&iterator.iter)
+                    && !expression_suspends_current_scope(&iterator.iter)
+                    && completed_work(&iterator.body)
+            }
+            Stmt::If(branch) => {
+                condition_has_linear_runtime_leaves(&branch.test)
+                    && !expression_suspends_current_scope(&branch.test)
+                    && branch.elif_else_clauses.is_empty()
+                    && completed_work(&branch.body)
+            }
+            Stmt::Pass(_) => true,
+            _ => false,
+        })
+    }
+
+    !statement.is_star
+        && statement.orelse.is_empty()
+        && statement.body.split_last().is_some_and(|(last, prefix)| {
+            completed_work(prefix)
+                && is_call_expression_suite(std::slice::from_ref(last))
+                && suite_has_nonsuspending_linear_fallthrough(std::slice::from_ref(last))
+        })
+        && ((!statement.finalbody.is_empty()
+            && statement
+                .finalbody
+                .iter()
+                .all(|part| is_call_expression_suite(std::slice::from_ref(part)))
+            && suite_has_nonsuspending_linear_fallthrough(&statement.finalbody))
+            || matches!(statement.finalbody.as_slice(), [Stmt::Assign(cleanup)]
+                if fold_constant(&cleanup.value).is_some()
+                    && matches!(cleanup.targets.as_slice(), [Expr::Attribute(attribute)]
+                        if matches!(attribute.value.as_ref(), Expr::Name(_)))))
+        && matches!(statement.handlers.as_slice(), [handler]
+        if handler.as_except_handler().is_some_and(|handler| {
+            matches!(handler.type_.as_deref(), Some(Expr::Name(_)))
+                && handler.body.split_last().is_some_and(|(last, prefix)| {
+                    (prefix.is_empty() || suite_has_nonsuspending_linear_fallthrough(prefix))
+                        && matches!(last, Stmt::If(guard)
+                            if condition_has_linear_runtime_leaves(&guard.test)
+                                && !expression_suspends_current_scope(&guard.test)
+                                && guard.elif_else_clauses.is_empty()
+                                && matches!(guard.body.as_slice(), [Stmt::Raise(raise)]
+                                    if raise.exc.as_deref().is_none_or(|value| {
+                                        !expression_contains_inline_branch(value)
+                                            && !expression_suspends_current_scope(value)
+                                    }) && raise.cause.as_deref().is_none_or(|value| {
+                                        !expression_contains_inline_branch(value)
+                                            && !expression_suspends_current_scope(value)
+                                    })))
+                })
+        }))
+}
+
+/// Recognizes populated work and guarded recovery before a managed finalizer store.
+fn managed_recovery_has_populated_finally_route(statement: &ruff_python_ast::StmtTry) -> bool {
+    fn work(statement: &Stmt) -> bool {
+        match statement {
+            Stmt::Expr(expression) => !expression_suspends_current_scope(&expression.value),
+            Stmt::Assign(assignment) => {
+                !expression_suspends_current_scope(&assignment.value)
+                    && assignment.targets.iter().all(|target| {
+                        !expression_contains_inline_branch(target)
+                            && !expression_suspends_current_scope(target)
+                    })
+            }
+            Stmt::Pass(_) => true,
+            _ => false,
+        }
+    }
+
+    fn populated(body: &[Stmt]) -> bool {
+        body.iter().all(work)
+            && body.last().is_some_and(|last| {
+                suite_has_nonsuspending_linear_fallthrough(std::slice::from_ref(last))
+            })
+    }
+
+    !statement.is_star
+        && populated(&statement.body)
+        && (statement.orelse.is_empty() || populated(&statement.orelse))
+        && matches!(statement.finalbody.as_slice(), [Stmt::Assign(cleanup)]
+            if fold_constant(&cleanup.value).is_some()
+                && matches!(cleanup.targets.as_slice(), [Expr::Attribute(attribute)]
+                    if matches!(attribute.value.as_ref(), Expr::Name(_))))
+        && matches!(statement.handlers.as_slice(), [handler]
+        if handler.as_except_handler().is_some_and(|handler| {
+            let mut has_raise = false;
+            matches!(handler.type_.as_deref(), Some(Expr::Name(_)))
+                && handler.body.last().is_some_and(|last| {
+                    suite_has_nonsuspending_linear_fallthrough(std::slice::from_ref(last))
+                })
+                && handler.body.iter().all(|part| {
+                    if work(part) {
+                        return true;
+                    }
+                    let Stmt::If(guard) = part else {
+                        return false;
+                    };
+                    condition_has_linear_runtime_leaves(&guard.test)
+                        && !expression_suspends_current_scope(&guard.test)
+                        && guard.elif_else_clauses.is_empty()
+                        && if suite_has_linear_raise_exit(&guard.body) {
+                            has_raise = true;
+                            true
+                        } else {
+                            populated(&guard.body)
+                        }
+                })
+                && has_raise
+        }))
 }
 
 // A unique direct dispatcher break has a nonempty original route into cleanup.
