@@ -34299,9 +34299,9 @@ impl<'source> Compiler<'source> {
         // handlers move. Short-circuit cleanup tests retain nonempty runtime entries.
         let synchronous_recovery =
             self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0;
-        // A local completion flag and a plain optional callback do not suspend
-        // before the normal cleanup entry reached by a named recovery guard chain.
-        let coroutine_guarded_callback_cleanup = self.unit.flags & CO_COROUTINE != 0
+        // Nonsuspending guard tests retain the populated recovery entry, even
+        // when the guarded cleanup call itself awaits after argument evaluation.
+        let coroutine_guarded_call_cleanup = self.unit.flags & CO_COROUTINE != 0
             && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
             && self.control.withs.active_with_exits.is_empty()
             && self.control.finally.active_copied_finally_bodies == 0
@@ -34309,12 +34309,15 @@ impl<'source> Compiler<'source> {
             && !statement.handlers.is_empty()
             && statement.handlers.iter().all(|handler| {
                 handler.as_except_handler().is_some_and(|handler| {
-                    handler.name.is_some() && suite_has_linear_reraise_guards(&handler.body)
+                    handler.name.is_some()
+                        && suite_has_reraise_guards(&handler.body, |test| {
+                            condition_has_completed_call_leaves(test, self.context.python_version)
+                        })
                 })
             })
             && matches!(statement.finalbody.as_slice(), [Stmt::If(cleanup)]
             if cleanup.elif_else_clauses.is_empty()
-                && matches!(cleanup.test.as_ref(), Expr::BoolOp(boolean)
+                && ((matches!(cleanup.test.as_ref(), Expr::BoolOp(boolean)
                     if boolean.op == BoolOp::And
                         && matches!(boolean.values.as_slice(), [Expr::Name(_), Expr::Compare(compare)]
                             if matches!(compare.first_operand(), Expr::Name(_))
@@ -34327,7 +34330,14 @@ impl<'source> Compiler<'source> {
                             && call.arguments.args.iter().all(|argument| {
                                 matches!(argument, Expr::Name(_) | Expr::NumberLiteral(_)
                                     | Expr::StringLiteral(_) | Expr::BooleanLiteral(_) | Expr::NoneLiteral(_))
-                            }))));
+                            }))))
+                    || (self.control.finally.active_finally_try_bodies == 0
+                        && self.control.exceptions.active_exception_region_exclusions.is_empty()
+                        && condition_has_linear_runtime_leaves(&cleanup.test)
+                        && !expression_suspends_current_scope(&cleanup.test)
+                        && matches!(cleanup.body.as_slice(), [Stmt::Expr(expression)]
+                            if matches!(expression.value.as_ref(), Expr::Await(awaited)
+                                if simple_cleanup_call(&awaited.value))))));
         // These two None tests cannot suspend. Their true edge reaches the
         // separately located try marker before the protected close call awaits.
         let coroutine_guarded_try_cleanup = self.unit.flags & CO_COROUTINE != 0
@@ -34688,11 +34698,11 @@ impl<'source> Compiler<'source> {
             && (statement.orelse.is_empty()
                 || linear_else_returning_recovery
                 || (suite_has_linear_borrow_fallthrough(&statement.orelse)
-                    && statement.handlers.iter().all(|handler| {
+                    && (coroutine_guarded_call_cleanup || statement.handlers.iter().all(|handler| {
                         handler.as_except_handler().is_some_and(|handler| {
                             suite_has_linear_reraise_guards(&handler.body)
                         })
-                    })))
+                    }))))
             && (self.control.withs.active_with_region_exclusions.is_empty()
                 || (synchronous_recovery
                     && self.control.finally.active_copied_finally_bodies == 0
@@ -34775,7 +34785,7 @@ impl<'source> Compiler<'source> {
                 || matches!(conditional_handler_cleanup, [Stmt::If(cleanup)]
                 if condition_has_only_runtime_tests(&cleanup.test)
                     && (!expression_contains_inline_branch(&cleanup.test)
-                        || ((synchronous_recovery || coroutine_guarded_callback_cleanup || coroutine_guarded_try_cleanup)
+                        || ((synchronous_recovery || coroutine_guarded_call_cleanup || coroutine_guarded_try_cleanup)
                             && condition_has_linear_runtime_leaves(&cleanup.test)))
                     && (coroutine_guarded_try_cleanup
                         || suite_has_linear_borrow_fallthrough(&cleanup.body)
@@ -34897,6 +34907,7 @@ impl<'source> Compiler<'source> {
                                 && (trailing.is_empty()
                                     || suite_has_linear_borrow_fallthrough(trailing))
                         }) || suite_has_linear_reraise_guards(&handler.body)
+                            || coroutine_guarded_call_cleanup
                             || ((plain_handler_shares_guarded_cleanup || linear_else_returning_recovery)
                                 && (suite_has_linear_borrow_fallthrough(&handler.body)
                                     || (!handler.body.is_empty()
@@ -49904,11 +49915,15 @@ fn loop_recovery_has_nonempty_finally_route(
 // Runtime re-raise guards keep their false successors connected to handler cleanup.
 // Linear work may separate guards; copied returns and folded tests need other proofs.
 fn suite_has_linear_reraise_guards(body: &[Stmt]) -> bool {
+    suite_has_reraise_guards(body, condition_has_linear_runtime_leaves)
+}
+
+fn suite_has_reraise_guards(body: &[Stmt], condition: impl Fn(&Expr) -> bool) -> bool {
     let mut has_guard = false;
     for (index, statement) in body.iter().enumerate() {
         match statement {
             Stmt::If(guard)
-                if condition_has_linear_runtime_leaves(&guard.test)
+                if condition(&guard.test)
                     && guard.elif_else_clauses.is_empty()
                     && suite_has_linear_raise_exit(&guard.body) =>
             {
