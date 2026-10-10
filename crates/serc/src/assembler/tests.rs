@@ -313,6 +313,58 @@ fn guarded_handler_iterator_join_requires_original_edges() {
 }
 
 #[test]
+fn copied_finally_iterator_return_requires_a_completed_donor() {
+    for version in [
+        crate::PythonVersion::Py312,
+        crate::PythonVersion::Py313,
+        crate::PythonVersion::Py314,
+        crate::PythonVersion::Py315,
+    ] {
+        for (opcode, argument, accepted) in [
+            (CALL, 2, true),
+            (END_SEND, 0, true),
+            (END_SEND, 1, false),
+            (LOAD_CONST, 0, false),
+        ] {
+            let mut assembler = Assembler::with_python_version(version);
+            let donor = SourceLocation::new(3, 3, 4, 20);
+            assembler.set_location(donor);
+            assembler.emit(opcode, argument);
+            assembler.emit(POP_TOP, 0);
+            let cleanup_end = assembler.item_count();
+            let boundary = assembler.label();
+            assembler.mark(boundary);
+            assembler.set_location(SourceLocation::NONE);
+            assembler.emit(
+                SWAP,
+                if version == crate::PythonVersion::Py315 {
+                    3
+                } else {
+                    2
+                },
+            );
+            assembler.emit(POP_TOP, 0);
+            if version == crate::PythonVersion::Py315 {
+                assembler.emit(POP_TOP, 0);
+            }
+            assembler.emit(RETURN_VALUE, 0);
+            assembler.record_copied_finally_iterator_return(cleanup_end, 1);
+            let origins = &assembler
+                .exception_owner_provenance
+                .copied_finally_iterator_returns;
+            assert_eq!(
+                origins.len(),
+                usize::from(accepted),
+                "{version:?} {opcode:?} {argument}"
+            );
+            if accepted {
+                assert_eq!(origins[0], (donor, assembler.linear_items().to_vec()));
+            }
+        }
+    }
+}
+
+#[test]
 fn copied_finally_continue_head_requires_one_original_condition() {
     for mutation in ["false", "true", "opcode", "location", "target", "duplicate"] {
         let mut assembler = Assembler::with_python_version(crate::PythonVersion::Py314);

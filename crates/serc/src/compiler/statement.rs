@@ -8784,11 +8784,9 @@ impl<'source> Compiler<'source> {
                         ),
                         ([handler, nested @ ..], [finally])
                             if ((handler.name.is_none() && self.control.loops.contexts.is_empty())
-                                // Clearing a handler's name does not exit its enclosing
-                                // ordinary try, even when an inner handler or a saved return
-                                // value precedes the copied finalizer.
-                                || (handler.name.is_some()
-                                    && (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                                // Restoring a handler does not exit the enclosing try or
+                                // discard an older iterator before the copied finalizer.
+                                || ((self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                                             == CO_COROUTINE
                                         || (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                                                 == 0
@@ -8799,7 +8797,7 @@ impl<'source> Compiler<'source> {
                                     && handler.loop_depth == finally.loop_depth
                                     && finally.loop_depth == self.control.loops.contexts.len()
                                     && self.control.loops.contexts.iter().all(|context| {
-                                        context.iterator_cleanup == IteratorCleanup::None
+                                        matches!(context.iterator_cleanup, IteratorCleanup::None | IteratorCleanup::Sync)
                                             && context.with_depth == 0
                                             && context.finally_end_depth == 0
                                             && context.exception_region_depth == finally.exception_region_depth
@@ -9413,6 +9411,7 @@ impl<'source> Compiler<'source> {
                 let mut next_finally = return_finally_contexts.len();
                 let mut copied_handler_assignment_span = None;
                 let mut copied_finally_iterator_location = None;
+                let mut copied_finally_return_location = None;
                 let mut copied_finally_iterator_join_location = None;
                 let mut copied_finally_iterator_region_unwind = false;
                 let mut copied_finally_handler_join = None;
@@ -12611,7 +12610,17 @@ impl<'source> Compiler<'source> {
                             }
                         }
                     }
-                    if preserve_tos
+                    if tracks_outer_try_handler_finally_unwinds
+                        && self.context.python_version >= crate::PythonVersion::Py314
+                        && self.control.loops.contexts[..finally_context.loop_depth]
+                            .iter()
+                            .any(|context| context.iterator_cleanup == IteratorCleanup::Sync)
+                        && let [Stmt::Expr(expression)] = finally_context.body
+                        && matches!(expression.value.as_ref(), Expr::Call(_) | Expr::Await(_))
+                    {
+                        copied_finally_return_location = self.assembler.last_instruction_location();
+                    }
+                    if (preserve_tos || self.context.python_version >= crate::PythonVersion::Py314)
                         && handler_count == 0
                         && return_finally_contexts.len() == 1
                         && self.control.withs.active_with_exits.is_empty()
@@ -12637,9 +12646,10 @@ impl<'source> Compiler<'source> {
                             // handler before the older iterator is discarded. Retire only
                             // regions entered inside each iterator's saved depth; the call
                             // and handler retain their existing owners and source donors.
-                            copied_finally_iterator_region_unwind = self.unit.flags
-                                & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                                == 0
+                            copied_finally_iterator_region_unwind = preserve_tos
+                                && self.unit.flags
+                                    & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                                    == 0
                                 && matches!(finally_context.body, [Stmt::Try(cleanup)]
                                     if !cleanup.is_star
                                         && cleanup.orelse.is_empty()
@@ -12656,11 +12666,17 @@ impl<'source> Compiler<'source> {
                                                             && !expression_suspends_current_scope(test))
                                                     && matches!(handler.body.as_slice(), [Stmt::Pass(_)]))));
                             if matches!(finally_context.body, [Stmt::Expr(expression)]
-                                if matches!(expression.value.as_ref(), Expr::Call(_)))
+                                if matches!(expression.value.as_ref(), Expr::Call(_) | Expr::Await(_)))
                             {
-                                copied_finally_iterator_location =
-                                    Some((self.assembler.item_count(), iterators));
-                            } else if matches!(finally_context.body.last(), Some(Stmt::If(tail))
+                                if preserve_tos {
+                                    copied_finally_iterator_location =
+                                        Some((self.assembler.item_count(), iterators));
+                                } else {
+                                    copied_finally_return_location =
+                                        self.assembler.last_instruction_location();
+                                }
+                            } else if preserve_tos
+                                && matches!(finally_context.body.last(), Some(Stmt::If(tail))
                                 if tail.elif_else_clauses.is_empty()
                                     && condition_has_only_runtime_tests(&tail.test)
                                     && !expression_suspends_current_scope(&tail.test))
@@ -13078,6 +13094,11 @@ impl<'source> Compiler<'source> {
                         )?;
                         self.assembler.mark_last_as_converted_pop_block();
                     }
+                }
+                // Ending the enclosing try does not erase the completed finalizer's
+                // location from the resumed return after iterator disposal.
+                if let Some(location) = copied_finally_return_location {
+                    self.assembler.set_location(location);
                 }
                 if !preserve_tos && !return_is_overridden {
                     if let Some(value) = &statement.value {
