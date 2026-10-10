@@ -392,7 +392,8 @@ fn capture_cleanup_rotation(items: &[Item]) -> Option<CaptureCleanupRotation<'_>
     // An OR arm carries its capture to the forward join. Only the smaller swaps
     // have enough pop operands; the largest swap remains ahead of the rotated pops.
     let pops_end = depth.checked_add(swap_count)?;
-    let pop_only_join = starred
+    let pop_only_join = (starred
+        || (prefix.opcode == UNPACK_SEQUENCE && prefix.value_argument() == Some(1)))
         && items.get(depth..pops_end).is_some_and(|consumers| {
             consumers.iter().all(|item| {
                 matches!(item, Item::Instruction(instruction)

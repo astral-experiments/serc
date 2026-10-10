@@ -3843,6 +3843,58 @@ fn sequence_capture_cleanup_items(depth: usize, count: usize) -> Vec<Item> {
 }
 
 #[test]
+fn unpacked_or_capture_cleanup_preserves_the_join_and_remaining_swap() {
+    let jump = Item::Instruction(Instruction::new(
+        JUMP_FORWARD,
+        Operand::Forward(super::Label::from_u32(0)),
+        SourceLocation::new(5, 5, 0, 1),
+        Some(1),
+    ));
+    let mut items = vec![pass_instruction(UNPACK_SEQUENCE, 1, 5)];
+    for distance in (2..=5).rev() {
+        items.push(pass_instruction(SWAP, distance, 5));
+    }
+    for _ in 0..4 {
+        items.push(pass_instruction(POP_TOP, 0, 5));
+    }
+    items.push(jump);
+    items.push(Item::Label(super::Label::from_u32(0)));
+    items.push(pass_instruction(RETURN_VALUE, 0, 6));
+    let rotation = super::capture_cleanup_rotation(&items).unwrap();
+    assert_eq!(rotation.swap_count, 4);
+    assert_eq!(rotation.removed_slots, 3);
+    assert_eq!(rotation.consumers.len(), 4);
+    let mut pipeline = optimization_pipeline(items.clone());
+    let (blocks, cleanup, _) = pipeline.optimize_swap_runs();
+    assert!(pipeline.apply_static_swaps((blocks, cleanup)).is_empty());
+    let actual = pipeline.graph.iter_items().copied().collect::<Vec<_>>();
+    assert_eq!(&actual[..2], &items[..2]);
+    for item in &actual[2..5] {
+        assert!(matches!(item, Item::Instruction(instruction) if instruction.opcode == NOP));
+    }
+    assert_eq!(&actual[5..], &items[5..]);
+    for mutation in 0..9 {
+        let mut changed = items.clone();
+        match mutation {
+            0 => changed[0] = pass_instruction(UNPACK_SEQUENCE, 0, 5),
+            1 => changed[0] = pass_instruction(UNPACK_SEQUENCE, 2, 5),
+            2 => changed[2] = pass_instruction(SWAP, 2, 5),
+            3 => changed[3] = pass_instruction(SWAP, 3, 6),
+            4 => changed[6] = pass_instruction(POP_TOP, 0, 6),
+            5 => changed[6] = pass_instruction(POP_TOP, 1, 5),
+            6 => changed.insert(4, Item::Label(super::Label::from_u32(1))),
+            7 => changed[9] = pass_instruction(NOP, 0, 5),
+            8 => changed.truncate(9),
+            _ => unreachable!(),
+        }
+        assert!(
+            super::capture_cleanup_rotation(&changed).is_none(),
+            "{mutation}"
+        );
+    }
+}
+
+#[test]
 fn sequence_capture_cleanup_preserves_pop_records_and_remaining_stack() {
     for (depth, count) in [(5, 3), (5, 4), (6, 3), (6, 4)] {
         let items = sequence_capture_cleanup_items(depth, count);

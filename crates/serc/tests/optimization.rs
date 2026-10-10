@@ -4715,6 +4715,28 @@ fn unnamed_handler_match_cleanup_preserves_success_edges() {
 }
 
 #[test]
+fn unpacked_or_captures_apply_static_cleanup_swaps() {
+    let nested = r#"{"kind": "outer", "value": {"kind": "leaf", "text": str(content)}}"#;
+    let flat = r#"{"kind": "leaf", "text": str(content)}"#;
+    for (name, pattern) in [
+        ("nested_first", format!("{nested} | {flat}")),
+        ("flat_first", format!("{flat} | {nested}")),
+        (
+            "multiline",
+            format!(
+                "{nested} | {{\n            \"kind\": \"leaf\",\n            \"text\": str(content),\n        }}"
+            ),
+        ),
+        ("single_alternative", nested.to_owned()),
+    ] {
+        let source = format!(
+            "def sample(value):\n    match value:\n        case {pattern}:\n            return content\n        case _:\n            return None\n"
+        );
+        assert_matches_cpython(&source, &format!("unpacked_or_capture_{name}.py"), &LEVELS);
+    }
+}
+
+#[test]
 fn sequence_capture_wildcard_cleanup_matrix() {
     let source = r#"
 def run(value):
