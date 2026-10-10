@@ -2368,8 +2368,19 @@ impl Assembler {
             if !labels.contains(&target) {
                 continue;
             }
+            let recorded_none_condition = self.python_version >= crate::PythonVersion::Py314
+                && matches!(instruction.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+                && instruction.local_policy.hidden_exception_owner_slots() == 3
+                && self
+                    .exception_owner_provenance
+                    .source_none_conditions
+                    .iter()
+                    .filter(|origin| origin.instruction == *instruction)
+                    .count()
+                    == 1;
             if instruction.location.line < 0
-                || instruction.local_policy.hidden_exception_owner_slots() != 0
+                || (instruction.local_policy.hidden_exception_owner_slots() != 0
+                    && !recorded_none_condition)
                 || instruction.no_location_policy.preserves_location()
             {
                 return false;

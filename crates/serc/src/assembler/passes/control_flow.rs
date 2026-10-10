@@ -4740,6 +4740,122 @@ impl OptimizationPipeline {
         jumps
     }
 
+    /// Keeps an original break until its named-handler cleanup inherits the interrupt check.
+    fn original_named_cleanup_breaks(&self) -> FxHashSet<ItemPosition> {
+        let mut breaks = FxHashSet::default();
+        if self.python_version < crate::PythonVersion::Py314 {
+            return breaks;
+        }
+        for &(entry, original) in &self
+            .exception_owner_provenance
+            .original_named_handler_cleanup_joins
+        {
+            let Some(block) = self.graph.label_block(entry) else {
+                continue;
+            };
+            let items = self.graph[block].items();
+            let head = items
+                .iter()
+                .take_while(|item| matches!(item, Item::Label(_)))
+                .count();
+            let aliases = &items[..head];
+            let Some(depth) = original[0].depth_after() else {
+                continue;
+            };
+            let Some(incoming_depth) = depth.checked_add(1) else {
+                continue;
+            };
+            if original[4].initial_borrow_jump_target().is_some()
+                || original[4].only_allows_unconditional_inlining()
+            {
+                continue;
+            }
+            let mut expected_cleanup = original;
+            // The compiler restricts copying just after recording the named cleanup.
+            expected_cleanup[4].allow_unconditional_block_inlining();
+            if !aliases.contains(&Item::Label(entry))
+                || items[head..]
+                    .iter()
+                    .copied()
+                    .ne(expected_cleanup.map(Item::Instruction))
+                || original[1].depth_after() != Some(incoming_depth)
+                || original[2..]
+                    .iter()
+                    .any(|instruction| instruction.depth_after() != Some(depth))
+                || !original[4].no_location_policy.allows_block_inlining()
+                || original[4]
+                    .forward_target()
+                    .is_none_or(|target| aliases.contains(&Item::Label(target)))
+                || aliases.iter().any(|item| match item {
+                    Item::Label(label) => {
+                        self.borrow_block_aliases.contains(label)
+                            || self.original_nop_targets.contains(label)
+                            || self
+                                .exception_owner_provenance
+                                .omitted_nop_counts
+                                .contains_key(label)
+                            || self
+                                .exception_owner_provenance
+                                .omitted_nop_locations
+                                .contains_key(label)
+                            || self
+                                .exception_regions
+                                .iter()
+                                .any(|region| region.target == *label)
+                    }
+                    Item::Instruction(_) => true,
+                })
+            {
+                continue;
+            }
+            let mut incoming = Vec::new();
+            let mut intact = true;
+            'incoming: for (source, contents) in self.graph.iter() {
+                for (offset, item) in contents.items().iter().enumerate() {
+                    let Item::Instruction(jump) = item else {
+                        continue;
+                    };
+                    let (Operand::Forward(target) | Operand::Backward(target)) = jump.operand()
+                    else {
+                        continue;
+                    };
+                    if !aliases.contains(&Item::Label(target)) {
+                        continue;
+                    }
+                    let mut expected = Instruction::new(
+                        JUMP_FORWARD,
+                        Operand::Forward(target),
+                        jump.location,
+                        Some(incoming_depth),
+                    );
+                    expected.fusion_policy.mark_authored_break();
+                    expected.jump_policy.prevent_threading_target();
+                    expected.jump_policy.retain_nop_for_direct_target();
+                    expected.add_pre_fold_extra_instructions(1);
+                    if jump.location.line < 0
+                        || *jump != expected
+                        || !self
+                            .exception_owner_provenance
+                            .source_boundaries
+                            .contains(&target)
+                        || !self
+                            .exception_owner_provenance
+                            .block_boundaries
+                            .contains(&target)
+                    {
+                        intact = false;
+                        break 'incoming;
+                    }
+                    incoming.push(ItemPosition::new(source, offset));
+                }
+            }
+            if intact && incoming.len() == 1 {
+                breaks.extend(incoming);
+            }
+        }
+        breaks
+    }
+
     pub(in crate::assembler) fn remove_redundant_forward_jumps(
         &mut self,
         finalize_borrow_empty_blocks: bool,
@@ -4795,6 +4911,11 @@ impl OptimizationPipeline {
             FxHashSet::default()
         } else {
             self.original_match_cleanup_jumps()
+        };
+        let named_cleanup_breaks = if finalize_borrow_empty_blocks {
+            FxHashSet::default()
+        } else {
+            self.original_named_cleanup_breaks()
         };
         // A removed original POP_BLOCK can leave its entry and end labels in
         // separate empty graph blocks. Bind them to the next physical record;
@@ -4999,8 +5120,10 @@ impl OptimizationPipeline {
                         continue;
                     }
                     // CPython copies the unlocated cleanup before deleting this adjacent
-                    // case jump. Preserve its interrupt check for the copied final jump.
-                    if match_cleanup_jumps.contains(&position) {
+                    // jump. Preserve its interrupt check for the copied final jump.
+                    if match_cleanup_jumps.contains(&position)
+                        || named_cleanup_breaks.contains(&position)
+                    {
                         previous = Some(position);
                         continue;
                     }
@@ -6579,6 +6702,256 @@ impl OptimizationPipeline {
 mod tests {
     use super::*;
     use crate::assembler::{Assembler, ExceptionRegion, ExceptionRegionPriority};
+
+    #[test]
+    fn named_cleanup_break_requires_original_records() {
+        fn instruction(item: &mut Item) -> &mut Instruction {
+            match item {
+                Item::Instruction(instruction) => instruction,
+                Item::Label(_) => panic!("expected instruction"),
+            }
+        }
+        let [start, join, entry, end, handler, extra] = [0, 1, 2, 3, 4, 5].map(Label::from_u32);
+        let location = SourceLocation::new(10, 10, 4, 9);
+        for mutation in [
+            "intact",
+            "modern",
+            "same entry",
+            "borrow tag",
+            "borrow target",
+            "source inline tag",
+            "borrow receipt",
+            "missing inline tag",
+            "unconditional receipt",
+            "legacy",
+            "missing receipt",
+            "changed receipt",
+            "changed cleanup",
+            "self cleanup",
+            "unknown cleanup depth",
+            "cleanup depth",
+            "source boundary",
+            "block boundary",
+            "borrow alias",
+            "handler alias",
+            "nop alias",
+            "non-break",
+            "source depth",
+            "source location",
+            "source policy",
+            "source owner",
+            "source slots",
+            "missing source slot",
+            "extra predecessor",
+        ] {
+            let target = if mutation == "same entry" {
+                entry
+            } else {
+                join
+            };
+            let mut jump =
+                Instruction::new(JUMP_FORWARD, Operand::Forward(target), location, Some(1));
+            jump.fusion_policy.mark_authored_break();
+            jump.jump_policy.prevent_threading_target();
+            jump.jump_policy.retain_nop_for_direct_target();
+            if mutation != "missing source slot" {
+                jump.add_pre_fold_extra_instructions(1);
+            }
+            let plain = |opcode, operand, depth| {
+                Instruction::new(opcode, operand, SourceLocation::NONE, Some(depth))
+            };
+            let mut exit = plain(JUMP_FORWARD, Operand::Forward(end), 0);
+            exit.jump_policy.prevent_threading_target();
+            exit.no_location_policy.allow_block_inlining();
+            let mut assembler = Assembler::from_linear_items(vec![
+                Item::Label(start),
+                Item::Instruction(jump),
+                Item::Label(join),
+                Item::Label(entry),
+                Item::Instruction(plain(POP_EXCEPT, Operand::Value(0), 0)),
+                Item::Instruction(plain(LOAD_CONST, Operand::Value(0), 1)),
+                Item::Instruction(plain(STORE_FAST, Operand::Value(2), 0)),
+                Item::Instruction(plain(DELETE_FAST, Operand::Value(2), 0)),
+                Item::Instruction(exit),
+            ]);
+            assembler.next_label = 6;
+            assembler.python_version = crate::PythonVersion::Py314;
+            assembler
+                .exception_owner_provenance
+                .source_boundaries
+                .extend([join, entry]);
+            assembler
+                .exception_owner_provenance
+                .block_boundaries
+                .extend([join, entry]);
+            assembler.record_original_named_handler_cleanup_join(entry, end);
+            assert_eq!(
+                assembler
+                    .exception_owner_provenance
+                    .original_named_handler_cleanup_joins
+                    .len(),
+                1
+            );
+            match mutation {
+                "modern" => assembler.python_version = crate::PythonVersion::Py315,
+                "legacy" => assembler.python_version = crate::PythonVersion::Py313,
+                "missing receipt" => assembler
+                    .exception_owner_provenance
+                    .original_named_handler_cleanup_joins
+                    .clear(),
+                "changed receipt" => {
+                    assembler
+                        .exception_owner_provenance
+                        .original_named_handler_cleanup_joins[0]
+                        .1[0]
+                        .location = location;
+                }
+                "changed cleanup" => {
+                    instruction(&mut assembler.linear_items_mut()[6])
+                        .set_operand(Operand::Value(3));
+                }
+                "self cleanup" => {
+                    exit.set_operand(Operand::Forward(entry));
+                    assembler.linear_items_mut()[8] = Item::Instruction(exit);
+                    assembler
+                        .exception_owner_provenance
+                        .original_named_handler_cleanup_joins[0]
+                        .1[4] = exit;
+                }
+                "borrow target" => {
+                    exit.set_operand(Operand::Forward(handler));
+                    exit.mark_initial_borrow_jump_target(handler);
+                    assembler.linear_items_mut()[8] = Item::Instruction(exit);
+                }
+                "source inline tag" => {
+                    instruction(&mut assembler.linear_items_mut()[1])
+                        .allow_unconditional_block_inlining();
+                }
+                "borrow receipt" => {
+                    exit.mark_initial_borrow_jump_target(end);
+                    assembler.linear_items_mut()[8] = Item::Instruction(exit);
+                    assembler
+                        .exception_owner_provenance
+                        .original_named_handler_cleanup_joins[0]
+                        .1[4] = exit;
+                }
+                "unconditional receipt" => assembler
+                    .exception_owner_provenance
+                    .original_named_handler_cleanup_joins[0]
+                    .1[4]
+                    .allow_unconditional_block_inlining(),
+                "unknown cleanup depth" | "cleanup depth" => {
+                    let pop = Instruction::new(
+                        POP_EXCEPT,
+                        Operand::Value(0),
+                        SourceLocation::NONE,
+                        if mutation == "cleanup depth" {
+                            Some(1)
+                        } else {
+                            None
+                        },
+                    );
+                    assembler.linear_items_mut()[4] = Item::Instruction(pop);
+                    assembler
+                        .exception_owner_provenance
+                        .original_named_handler_cleanup_joins[0]
+                        .1[0] = pop;
+                }
+                "source boundary" => {
+                    assembler
+                        .exception_owner_provenance
+                        .source_boundaries
+                        .remove(&target);
+                }
+                "borrow alias" => {
+                    assembler.borrow_block_aliases.insert(entry);
+                }
+                "nop alias" => {
+                    assembler.original_nop_targets.insert(entry);
+                }
+                "handler alias" => assembler.exception_regions.push(ExceptionRegion {
+                    start,
+                    end,
+                    target: entry,
+                    depth: 0,
+                    preserve_lasti: true,
+                    is_scope_fallback: false,
+                    priority: ExceptionRegionPriority::OriginalRange(start, end),
+                }),
+                "non-break" => {
+                    assembler.linear_items_mut()[1] = Item::Instruction(Instruction::new(
+                        JUMP_FORWARD,
+                        Operand::Forward(target),
+                        location,
+                        Some(1),
+                    ));
+                }
+                "source depth" => {
+                    let mut changed =
+                        Instruction::new(JUMP_FORWARD, Operand::Forward(target), location, Some(2));
+                    changed.fusion_policy = jump.fusion_policy;
+                    changed.jump_policy = jump.jump_policy;
+                    changed.add_pre_fold_extra_instructions(1);
+                    assembler.linear_items_mut()[1] = Item::Instruction(changed);
+                }
+                "source location" => {
+                    instruction(&mut assembler.linear_items_mut()[1]).location =
+                        SourceLocation::NONE;
+                }
+                "source policy" => instruction(&mut assembler.linear_items_mut()[1])
+                    .jump_policy
+                    .mark_interruptible_after_threading(),
+                "source owner" => instruction(&mut assembler.linear_items_mut()[1])
+                    .set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS),
+                "source slots" => instruction(&mut assembler.linear_items_mut()[1])
+                    .add_pre_fold_extra_instructions(1),
+                _ => {}
+            }
+            if mutation != "missing inline tag" {
+                assembler.allow_last_unconditional_block_inlining();
+            }
+            assembler.push_linear_item(Item::Label(end));
+            assembler.push_linear_item(Item::Instruction(plain(
+                RETURN_VALUE,
+                Operand::Value(0),
+                0,
+            )));
+            assembler.push_linear_item(Item::Label(handler));
+            assembler.push_linear_item(Item::Instruction(plain(RERAISE, Operand::Value(0), 0)));
+            if mutation == "extra predecessor" {
+                assembler.push_linear_item(Item::Label(extra));
+                assembler.push_linear_item(Item::Instruction(jump));
+            }
+            let mut pipeline = assembler.into_optimization_pipeline();
+            if mutation == "borrow tag" {
+                OptimizationPipeline::mark_initial_borrow_jump_entries(
+                    &mut pipeline.graph,
+                    &pipeline.exception_owner_provenance.block_boundaries,
+                );
+                let block = pipeline.graph.label_block(entry).unwrap();
+                assert_eq!(
+                    pipeline.graph[block]
+                        .last_instruction()
+                        .unwrap()
+                        .initial_borrow_jump_target(),
+                    Some(end)
+                );
+            }
+            if mutation == "block boundary" {
+                pipeline
+                    .exception_owner_provenance
+                    .block_boundaries
+                    .remove(&target);
+            }
+            let expected = usize::from(matches!(mutation, "intact" | "modern" | "same entry"));
+            let positions = pipeline.original_named_cleanup_breaks();
+            assert_eq!(positions.len(), expected, "{mutation}");
+            if let Some(&position) = positions.iter().next() {
+                pipeline.remove_redundant_forward_jumps(false);
+                assert_eq!(pipeline.graph.item(position), &Item::Instruction(jump));
+            }
+        }
+    }
 
     #[test]
     fn unnamed_match_cleanup_requires_original_records() {
