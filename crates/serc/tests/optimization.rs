@@ -15,6 +15,25 @@ use serc::{
 };
 
 #[test]
+fn copied_chained_raise_keeps_normal_continuation_owned() {
+    let source = "async def sample(owner, values, problem, flag):\n    for value in values:\n        try:\n            result = await owner.read(value)\n        except Error as error:\n            if 0 < value < 10:\n                raise problem from error\n        else:\n            result = owner.convert(value if flag else None)\n        owner.record(result)\n";
+    for source in [
+        source.to_owned(),
+        source.replace(
+            "        except Error as error:\n",
+            "        except Error as error:\n            problem = owner.error()\n",
+        ),
+        source.replace("0 < value < 10", "value < 10"),
+        source.replace(
+            "raise problem from error",
+            "raise owner.error(problem) from error",
+        ),
+    ] {
+        assert_matches_cpython(&source, "copied_chained_raise.py", &LEVELS);
+    }
+}
+
+#[test]
 fn awaited_else_break_keeps_normal_cleanup_reachable() {
     let source = "async def sample(owner, prepare, requested, observations, recovered, resolver, binding, context, streaming, emission):\n    while True:\n        try:\n            result, fallback, data, entries, tree, download, entities = owner.compile(\n                names=resolver.names if resolver is not None else None,\n                prefix=resolver.prefix if resolver is not None else None,\n                resolve=owner.resolve if binding is not None else None,\n                context=(context, recovered) if prepare is not None else context,\n                diagnostics=observations if not streaming else None,\n                counts=observations if not streaming else None,\n                output=emission,\n            )\n        except (ValueError, TypeError):\n            if recovered or prepare is None or not await prepare(tuple(requested)):\n                for observation in observations:\n                    owner.record(observation)\n        else:\n            if recovered or prepare is None or not await prepare(tuple(requested)):\n                break\n        if emission is not None:\n            emission.summary = None\n";
     for source in [

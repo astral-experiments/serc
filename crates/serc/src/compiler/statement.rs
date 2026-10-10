@@ -27885,12 +27885,48 @@ impl<'source> Compiler<'source> {
                     .is_some_and(|context| {
                         copied_finally_has_terminal_named_recovery(context.body)
                     });
+            // Copying a short raise onto the chained comparison's success jump
+            // leaves its original array empty when the handler moves cold.
+            let copied_chained_raise_orphan = self.context.python_version
+                == crate::PythonVersion::Py314
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                    == CO_COROUTINE
+                && !statement.is_star
+                && statement.finalbody.is_empty()
+                && borrow_exit_has_source_successor
+                && self.control.withs.active_with_exits.is_empty()
+                && !self.control.in_exception_handler()
+                && self.control.finally.active_finally_try_bodies == 0
+                && self.control.finally.active_normal_finally_bodies == 0
+                && self.control.finally.active_copied_finally_bodies == 0
+                && self.control.finally.active_finally_end_blocks == 0
+                && matches!(self.control.loops.contexts.as_slice(), [context]
+                    if context.iterator_cleanup == IteratorCleanup::Sync)
+                && matches!(statement.orelse.last(), Some(Stmt::Assign(assignment))
+                    if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                        && matches!(assignment.value.as_ref(), Expr::Call(_))
+                        && !expression_suspends_current_scope(&assignment.value))
+                && matches!(statement.handlers.as_slice(), [handler]
+                if handler.as_except_handler().is_some_and(|handler| {
+                    handler.type_.is_some()
+                        && handler.name.is_some()
+                        && matches!(handler.body.split_last(), Some((Stmt::If(guard), prefix))
+                            if suite_has_nonsuspending_conditional_work(prefix)
+                                && guard.elif_else_clauses.is_empty()
+                                && !expression_suspends_current_scope(&guard.test)
+                                && matches!(guard.test.as_ref(), Expr::Compare(comparison)
+                                    if comparison.ops.len() == 2)
+                                && matches!(guard.body.as_slice(), [Stmt::Raise(raised)]
+                                    if raised.exc.as_deref().is_some_and(|value| matches!(value, Expr::Name(_)))
+                                        && raised.cause.as_deref().is_some_and(|value| matches!(value, Expr::Name(_)))))
+                }));
             if !compound_match_pop_block
                 && ((terminal_handler_exit
                     && !(self.control.statements.context.followed_by_name_return
                         && self.control.withs.active_with_exits.is_empty()
                         && !following_name_return_has_noncopyable_cleanup))
                     || handler_has_orphan_cold_cleanup
+                    || copied_chained_raise_orphan
                     || handler_has_copied_pass_recovery
                     || handler_has_runtime_while_break_cleanup
                     || recovery_value_match_loop
