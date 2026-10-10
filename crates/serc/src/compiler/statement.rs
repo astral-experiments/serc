@@ -461,6 +461,7 @@ pub(super) struct ExceptionState {
     // A nested try under a normal body with an else suite exits there instead of directly
     // crossing the enclosing handler boundary.
     direct_try_body_has_else: bool,
+    direct_try_body_else_falls_through: bool,
     // A direct final assignment branch whose copied normal exit crosses to a following statement
     // outside the try.
     direct_try_assignment_branch_exit: Option<TextRange>,
@@ -1138,6 +1139,10 @@ impl<'source> Compiler<'source> {
             Vec::new()
         };
         let direct_try_body_has_else = !statement.orelse.is_empty();
+        let previous_direct_try_body_else_falls_through = std::mem::replace(
+            &mut self.control.exceptions.direct_try_body_else_falls_through,
+            direct_try_body_has_else && !suite_terminates(&statement.orelse),
+        );
         let direct_try_body_has_single_raise_handler = matches!(
             statement.handlers.as_slice(),
             [handler]
@@ -1244,6 +1249,8 @@ impl<'source> Compiler<'source> {
             .exceptions
             .direct_try_body_has_literal_return_successor =
             previous_direct_try_body_literal_return_successor;
+        self.control.exceptions.direct_try_body_else_falls_through =
+            previous_direct_try_body_else_falls_through;
         result
     }
 
@@ -6920,9 +6927,10 @@ impl<'source> Compiler<'source> {
                         && context.exception_region_depth > 0
                         && context.finally_end_depth == 0
                         && !context.break_target_keeps_exception_owner
-                        // A direct iterator break enters this try's else suite. Its
-                        // authored jump retains the still-active try owner.
-                        && !(context.iterator_cleanup != IteratorCleanup::None
+                        // A break into a fallthrough else retains the active try owner.
+                        // An exit copied from a returning else crosses that boundary.
+                        && !((context.iterator_cleanup != IteratorCleanup::None
+                            || self.control.exceptions.direct_try_body_else_falls_through)
                             && self.control.exceptions.direct_try_body_has_else
                             && self.control.withs.active_with_exits.is_empty()
                             && self.control.finally.active_loop_finally_contexts.is_empty()
@@ -23207,14 +23215,15 @@ impl<'source> Compiler<'source> {
                 self.assembler.prevent_borrow_loop_exit_reachability(end);
                 // A surviving authored break still reaches the loop's nonempty exit,
                 // even when a different break loses its edge before borrowed-load traversal.
-                // A following statement remains inside the current protected body. A direct
-                // finally cleanup also retains entry through an authored break that survives.
+                // A following statement, try-else suite, or direct finally cleanup retains
+                // entry through an authored break that survives.
                 if (self
                     .control
                     .exceptions
                     .active_exception_region_exclusions
                     .is_empty()
                     || ((self.control.statements.context.has_following
+                        || self.control.exceptions.direct_try_body_has_else
                         || finally_break_reaches_cleanup)
                         && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
                         && self.control.loops.contexts.is_empty()
