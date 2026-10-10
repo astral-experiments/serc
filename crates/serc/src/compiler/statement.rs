@@ -3433,7 +3433,11 @@ impl<'source> Compiler<'source> {
                                         && suite_has_nonsuspending_conditional_work(std::slice::from_ref(next))
                                         && !suite_contains_yield(std::slice::from_ref(next))))
                         || matches!(elided_join_successor,
-                            Some(Stmt::AugAssign(assignment)) if matches!(assignment.target.as_ref(), Expr::Name(_)))
+                            Some(next @ Stmt::AugAssign(assignment))
+                                if matches!(assignment.target.as_ref(), Expr::Name(_))
+                                    || (suite_has_linear_borrow_fallthrough(std::slice::from_ref(next))
+                                        && suite_has_nonsuspending_conditional_work(std::slice::from_ref(next))
+                                        && !suite_contains_yield(std::slice::from_ref(next))))
                         || matches!(elided_join_successor,
                             Some(Stmt::Delete(deletion)) if matches!(deletion.targets.as_slice(), [Expr::Name(_)]))
                         // A final nested condition reaches the enclosing condition's
@@ -15670,10 +15674,16 @@ impl<'source> Compiler<'source> {
                                     context.with_depth < self.control.withs.active_with_exits.len()
                                 })));
                     let linear_finalizer_entry = |part: &Stmt| {
-                        let Stmt::Expr(expression) = part else {
-                            return false;
+                        let value = match part {
+                            Stmt::Expr(expression) => expression.value.as_ref(),
+                            Stmt::Assign(assignment)
+                                if matches!(assignment.targets.as_slice(), [Expr::Name(_)]) =>
+                            {
+                                assignment.value.as_ref()
+                            }
+                            _ => return false,
                         };
-                        let call = match expression.value.as_ref() {
+                        let call = match value {
                             Expr::Await(await_expression)
                                 if self.unit.flags
                                     & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
@@ -15694,19 +15704,29 @@ impl<'source> Compiler<'source> {
                             && !expression_contains_inline_branch(call)
                             && !expression_suspends_current_scope(call)
                     };
+                    let guarded_finalizer_entry = |part: &Stmt| {
+                        linear_finalizer_entry(part)
+                            || matches!(part, Stmt::If(guard)
+                                if guard.elif_else_clauses.is_empty()
+                                    && condition_has_only_runtime_tests(&guard.test)
+                                    && !expression_contains_inline_branch(&guard.test)
+                                    && !expression_suspends_current_scope(&guard.test)
+                                    && !guard.body.is_empty()
+                                    && guard.body.iter().all(linear_finalizer_entry))
+                    };
+                    // Runtime guards and iterator headers start after the protected join.
                     let finalizer_has_located_entry = |body: &[Stmt]| {
-                        (!body.is_empty() && body.iter().all(linear_finalizer_entry))
-                            // A runtime guard keeps the entry located; following expressions
-                            // add no predecessor to the protected conditional join.
-                            || body.split_first().is_some_and(|(first, tail)| {
-                                matches!(first, Stmt::If(guard)
-                                    if guard.elif_else_clauses.is_empty()
-                                        && condition_has_only_runtime_tests(&guard.test)
-                                        && !expression_contains_inline_branch(&guard.test)
-                                        && !expression_suspends_current_scope(&guard.test)
-                                        && !guard.body.is_empty()
-                                        && guard.body.iter().all(linear_finalizer_entry))
-                                    && tail.iter().all(linear_finalizer_entry)
+                        !body.is_empty()
+                            && body.iter().all(|part| {
+                                guarded_finalizer_entry(part)
+                                    || matches!(part, Stmt::For(iterator)
+                                        if !iterator.is_async
+                                            && iterator.orelse.is_empty()
+                                            && matches!(iterator.target.as_ref(), Expr::Name(_))
+                                            && !expression_contains_inline_branch(&iterator.iter)
+                                            && !expression_suspends_current_scope(&iterator.iter)
+                                            && !iterator.body.is_empty()
+                                            && iterator.body.iter().all(guarded_finalizer_entry))
                             })
                     };
                     let finalizers = &self.control.finally.active_return_finally_contexts;
@@ -15777,9 +15797,9 @@ impl<'source> Compiler<'source> {
                             && self.control.withs.active_with_region_exclusions.is_empty())
                             // Managers entered before this try add no predecessor to
                             // its conditional join or its normal finalizer entry.
-                            || (self.unit.flags
-                                & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                                == 0
+                            || (matches!(self.unit.flags
+                                & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR),
+                                0 | CO_COROUTINE)
                                 && self.control.withs.active_with_exits.len()
                                     == self.control.withs.active_with_region_exclusions.len()
                                 && self.control.withs.active_with_exits.iter().all(|manager| {
@@ -15821,12 +15841,15 @@ impl<'source> Compiler<'source> {
                                 || self.control.statements.context.elided_join_has_await_successor
                                 // A following runtime test also begins with a located
                                 // instruction before any cleanup in its branches.
-                                || self.control.statements.context.elided_join_has_conditional_successor)
-                                && self
+                                || self.control.statements.context.elided_join_has_conditional_successor
+                                || self.control.statements.context.followed_by_literal_return)
+                                && (self
                                     .control
                                     .exceptions
                                     .direct_try_body_statements
-                                    .contains(&statement.range)))
+                                    .contains(&statement.range)
+                                    || self.control.statements.context.same_region_continuation
+                                        == Some(statement.range))))
                         && matches!(statement.elif_else_clauses.get(branch_index..), Some([clause])
                             if clause.test.is_none())
                         && (finalizers.len() == 1 || nested_finally_contexts)
@@ -15873,7 +15896,7 @@ impl<'source> Compiler<'source> {
                                             .active_exception_region_exclusions
                                             .len()
                             });
-                    // Live work keeps this join inside the manager. The sole
+                    // Live work or a manager exit keeps this join inside the manager. The
                     // enclosing finalizer starts before that manager and runs only
                     // after its exit, so it adds no predecessor to the empty arm.
                     let managed_finally_coroutine_join = matches!(
@@ -15893,7 +15916,15 @@ impl<'source> Compiler<'source> {
                                 .control
                                 .statements
                                 .context
-                                .elided_join_has_await_successor)
+                                .elided_join_has_await_successor
+                            || self
+                                .control
+                                .statements
+                                .context
+                                .elided_join_has_conditional_successor
+                            || self.control.withs.active_with_exits.last().is_some_and(
+                                |manager| manager.terminal_statement_range == Some(statement.range),
+                            ))
                         && self.control.finally.active_finally_try_bodies == 1
                         && self
                             .control
@@ -15912,15 +15943,7 @@ impl<'source> Compiler<'source> {
                             .withs
                             .active_with_exits
                             .last()
-                            .is_some_and(|manager| {
-                                manager.exception_region_depth == 1
-                                    && (manager.is_async
-                                        || self
-                                            .control
-                                            .statements
-                                            .context
-                                            .elided_join_has_await_successor)
-                            });
+                            .is_some_and(|manager| manager.exception_region_depth == 1);
                     let optimized_empty_both = self.context.python_version
                         >= crate::PythonVersion::Py314
                         && branch_index + 2 == branch_count
@@ -16854,11 +16877,14 @@ impl<'source> Compiler<'source> {
             _ => None,
         })
         .flatten();
+        let branch_tail = body
+            .iter()
+            .rfind(|part| !self.context.is_elided_statement(part));
         let same_region_continuation = if self.control.statements.context.same_region_continuation
             == Some(statement.range)
             || self.control.loops.split_loop_tail_prefix_end == Some(statement.range)
         {
-            body.last().map(Ranged::range)
+            branch_tail.map(Ranged::range)
         } else {
             None
         };
@@ -16914,7 +16940,23 @@ impl<'source> Compiler<'source> {
         } else {
             prefix_end
         };
-        self.with_control_override(
+        // Conditional tails reach the same manager exit; erased assertions add no array.
+        let manager_tail = self
+            .control
+            .withs
+            .active_with_exits
+            .last_mut()
+            .and_then(|manager| {
+                (manager.terminal_statement_range == Some(statement.range)
+                    && matches!(branch_tail, Some(Stmt::If(_))))
+                .then(|| {
+                    std::mem::replace(
+                        &mut manager.terminal_statement_range,
+                        branch_tail.map(Ranged::range),
+                    )
+                })
+            });
+        let result = self.with_control_override(
             |control| &mut control.loops.split_loop_tail_prefix_end,
             prefix_end,
             |compiler| {
@@ -16947,7 +16989,16 @@ impl<'source> Compiler<'source> {
                     },
                 )
             },
-        )
+        );
+        if let Some(previous) = manager_tail {
+            self.control
+                .withs
+                .active_with_exits
+                .last_mut()
+                .expect("conditional tail retains its enclosing manager")
+                .terminal_statement_range = previous;
+        }
+        result
     }
 
     /// Finds the sole false-edge donor after a raising arm and an erased nested else.

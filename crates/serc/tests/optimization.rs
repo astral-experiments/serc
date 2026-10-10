@@ -816,6 +816,82 @@ fn nested_reraise_cleanup_keeps_awaited_store_reachable() {
 }
 
 #[test]
+fn nested_manager_constants_keep_exception_ownership() {
+    let body = "with manager:\n    if condition:\n        work()\n        'comment'\n";
+    for prefix in ["", "def sample():\n", "async def sample():\n"] {
+        let mut source = String::from(prefix);
+        let indent = if prefix.is_empty() { "" } else { "    " };
+        for line in body.lines() {
+            writeln!(source, "{indent}{line}").unwrap();
+        }
+        assert_matches_cpython(&source, "nested_manager_constant.py", &LEVELS);
+    }
+}
+
+#[test]
+fn erased_nested_cleanup_continuations_keep_markers() {
+    for source in [
+        "async def sample(followup, mode, resources):\n    async with session():\n        try:\n            if followup:\n                if mode == 'quiet':\n                    assert ready()\n                else:\n                    assert expected()\n                return\n        finally:\n            for identifier in resources:\n                if state.get('status') not in {'failed', 'cancelled', 'completed'}:\n                    await client.cancel(identifier)\n",
+        "async def sample(state, status, clients):\n    try:\n        if state != 'none':\n            if status is None:\n                assert missing()\n            else:\n                assert valid()\n            assert stable()\n        if status is not None:\n            assert cleaned()\n        elif state != 'none':\n            assert expected()\n    finally:\n        for client in clients:\n            await client.close()\n",
+        "async def sample(mode, denied, trusted, cause, clients):\n    try:\n        with first(), second(), third():\n            if mode == 'hit':\n                assert ready()\n            elif denied:\n                assert expected()\n            else:\n                if trusted and cause is not None:\n                    assert valid()\n                else:\n                    assert absent()\n                assert stable()\n    finally:\n        for client in clients:\n            await client.close()\n",
+        "async def sample(mode, trusted, clients):\n    try:\n        with first(), second(), third():\n            if mode:\n                assert ready()\n            else:\n                if trusted:\n                    assert valid()\n                else:\n                    assert absent()\n                detail = encode(errors)\n    finally:\n        for client in clients:\n            await client.close()\n",
+    ] {
+        assert_matches_cpython(source, "nested_cleanup_continuation.py", &LEVELS);
+    }
+}
+
+#[test]
+fn erased_nested_cleanup_joins_keep_markers() {
+    for source in [
+        "async def sample(followup, mode, resources):\n    async with session():\n        try:\n            if followup:\n                if mode == 'quiet':\n                    assert output.items == ['result']\n                else:\n                    assert output.text or output.questions\n        finally:\n            for identifier in resources:\n                state = await client.fetch(identifier)\n",
+        "async def sample(mode, denied, clients):\n    try:\n        with first(), second(), third():\n            if mode == 'hit':\n                assert len(calls) == 2\n            elif denied:\n                assert len(calls) == 1\n            else:\n                assert all(call.content for call in calls)\n    finally:\n        for client in clients:\n            await client.close()\n",
+        "async def sample(state, status, clients):\n    try:\n        if state != 'none':\n            if status is None:\n                assert missing()\n            else:\n                assert valid()\n        if status is not None:\n            assert cleaned()\n        elif state != 'none':\n            assert expected()\n    finally:\n        for client in clients:\n            await client.close()\n",
+    ] {
+        assert_matches_cpython(source, "nested_cleanup_join.py", &LEVELS);
+    }
+}
+
+#[test]
+fn erased_conditional_before_cleanup_iterator_keeps_join_marker() {
+    for scope in ["def", "async def"] {
+        for cleanup in [
+            "task.cancel()",
+            "if not task.done():\n                task.cancel()",
+        ] {
+            let source = format!(
+                "{scope} sample(kind, captured, failure, tasks):\n    try:\n        if kind == 'cancelled':\n            assert isinstance(captured, (CancelledError, TransportError))\n        else:\n            assert captured.__cause__ is failure\n    finally:\n        for task in tasks:\n            {cleanup}\n"
+            );
+            assert_matches_cpython(&source, "erased_cleanup_iterator.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
+fn erased_coroutine_joins_before_live_successors_keep_markers() {
+    for source in [
+        "async def sample(grant, clock):\n    for index in range(6):\n        if grant.lane is Lane.MAIN:\n            assert await store.finish(grant, outcome='complete')\n        else:\n            assert await store.finish(grant, retry_after=1)\n        clock[0] += 1\n",
+        "async def sample(grant, moving, clock):\n    for turn in range(8):\n        if grant.identifier == moving.identifier and grant.lane is Lane.WAIT:\n            assert await store.finish(grant, handoff=next_stage)\n        elif grant.identifier == moving.identifier and turn == 5:\n            assert await store.finish(grant, retry_after=1)\n        else:\n            assert await store.finish(grant, outcome='complete')\n        clock[0] += 1\n",
+        "async def sample(mode, task, blocker):\n    try:\n        if mode == 'readonly':\n            assert all(item.valid for item in warning.calls)\n        else:\n            assert warning.kind == 'timeout'\n    finally:\n        if task is not None:\n            await gather(task, return_exceptions=True)\n        if blocker is not None:\n            await blocker.close()\n",
+        "async def sample(mode, stream):\n    with travel(now, tick=False):\n        try:\n            if mode.startswith('invalid'):\n                assert str(operation.error) == 'invalid'\n            else:\n                assert operation.error is original_error\n        finally:\n            await stream.close(identifier, replacement)\n",
+        "async def sample(owner, actor, client):\n    try:\n        async with intercept() as mocked:\n            if owner is not None:\n                assert request['account'] == expected_account\n            else:\n                assert 'owner' not in request\n            if actor is not None:\n                assert 'project' not in request\n            else:\n                assert 'actor' not in request\n    finally:\n        await client.close()\n",
+    ] {
+        assert_matches_cpython(source, "erased_coroutine_successor.py", &LEVELS);
+    }
+}
+
+#[test]
+fn erased_terminal_async_manager_join_keeps_marker() {
+    for binding in ["", " as data"] {
+        for condition in ["mode", "not mode", "mode is None"] {
+            let source = format!(
+                "async def sample(mode, writer):\n    async with runtime() as server:\n        async with connect(server) as control:\n            try:\n                async with channel(){binding}:\n                    if {condition}:\n                        assert ready()\n                    else:\n                        assert expected()\n                while True:\n                    if cancelled:\n                        break\n            finally:\n                await close(writer)\n"
+            );
+            assert_matches_cpython(&source, "erased_terminal_async_join.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn erased_finalizer_keeps_managed_return_copy() {
     let source = "async def sample(owner):\n    try:\n        with prepare_scope(owner, search=False):\n            return await prepare(owner, Context())\n    finally:\n        assert enabled()\n";
     assert_matches_cpython(source, "erased_managed_return.py", &LEVELS);
