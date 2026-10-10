@@ -25843,7 +25843,7 @@ impl<'source> Compiler<'source> {
             && self.control.finally.active_copied_finally_bodies == 0
             && self.control.finally.active_finally_end_blocks == 0
             && if self.unit.flags & CO_COROUTINE == 0 {
-                nested_try_else_has_populated_call_entry(statement)
+                nested_try_else_has_populated_call_entry(statement, self.context.python_version)
             } else {
                 self.context.python_version == crate::PythonVersion::Py314
                     && coroutine_try_else_has_populated_call_entry(statement)
@@ -45785,7 +45785,82 @@ fn nested_try_has_populated_for_break_entry(statement: &ruff_python_ast::StmtTry
 
 // The first arm of a nested try-else conditional keeps its populated jump to
 // the outer continuation. Empty normal joins still block other fallthroughs.
-fn nested_try_else_has_populated_call_entry(statement: &ruff_python_ast::StmtTry) -> bool {
+fn nested_try_else_has_populated_call_entry(
+    statement: &ruff_python_ast::StmtTry,
+    python_version: crate::PythonVersion,
+) -> bool {
+    let lazy_call = |expression: &Expr| {
+        expression_has_linear_generator_creation(expression, python_version)
+            || matches!(expression, Expr::Call(call)
+                if call.arguments.keywords.is_empty()
+                    && !expression_contains_inline_branch(&call.func)
+                    && !expression_suspends_current_scope(&call.func)
+                    && matches!(call.arguments.args.as_ref(), [generator, default]
+                        if expression_has_linear_generator_creation(generator, python_version)
+                            && !expression_contains_inline_branch(default)
+                            && !expression_suspends_current_scope(default)))
+    };
+    let lazy_statement = |statement: &Stmt| match statement {
+        Stmt::Expr(expression) => lazy_call(&expression.value),
+        Stmt::Assign(assignment) => {
+            matches!(assignment.targets.as_slice(), [Expr::Name(_)]) && lazy_call(&assignment.value)
+        }
+        _ => false,
+    };
+    // Creating a lazy generator does not branch in the containing scope.
+    // Eager comprehensions and branching iterable/default arguments still do.
+    let linear = |body: &[Stmt]| {
+        suite_has_nonsuspending_linear_fallthrough(body)
+            || (body.iter().any(lazy_statement)
+                && body.iter().all(|part| {
+                    matches!(part, Stmt::Pass(_))
+                        || suite_has_nonsuspending_linear_fallthrough(std::slice::from_ref(part))
+                        || lazy_statement(part)
+                }))
+    };
+    let ordinary_recovery = |statement: &ruff_python_ast::StmtTry| {
+        !statement.is_star
+            && statement.finalbody.is_empty()
+            && !statement.handlers.is_empty()
+            && statement.handlers.iter().all(|handler| {
+                handler.as_except_handler().is_some_and(|handler| {
+                    handler.type_.as_deref().is_some_and(|type_| {
+                        !expression_contains_inline_branch(type_)
+                            && !expression_suspends_current_scope(type_)
+                    }) && linear(&handler.body)
+                })
+            })
+    };
+    let populated_conditional = |body: &[Stmt]| {
+        matches!(body, [Stmt::If(branch)]
+        if condition_has_only_runtime_tests(&branch.test)
+            && condition_has_linear_runtime_leaves(&branch.test)
+            && !expression_suspends_current_scope(&branch.test)
+            && linear(&branch.body)
+            && matches!(branch.elif_else_clauses.as_slice(), [otherwise]
+                if otherwise.test.is_none()
+                    && (linear(&otherwise.body)
+                        || otherwise.body.split_last().is_some_and(|(last, prefix)| {
+                            linear(prefix)
+                                && matches!(last, Stmt::If(tail)
+                                    if tail.elif_else_clauses.is_empty()
+                                        && condition_has_linear_runtime_leaves(&tail.test)
+                                        && !expression_suspends_current_scope(&tail.test)
+                                        && linear(&tail.body))
+                        }))))
+    };
+    // A full conditional in the nested body or else suite has a populated
+    // first-arm jump. Its empty normal exit remains a fallthrough barrier.
+    if python_version == crate::PythonVersion::Py314
+        && ordinary_recovery(statement)
+        && linear(&statement.body)
+        && matches!(statement.orelse.as_slice(), [Stmt::Try(nested)]
+        if ordinary_recovery(nested)
+            && ((nested.orelse.is_empty() && populated_conditional(&nested.body))
+                || (linear(&nested.body) && populated_conditional(&nested.orelse))))
+    {
+        return true;
+    }
     let linear_recovery = |statement: &ruff_python_ast::StmtTry| {
         !statement.is_star
             && statement.finalbody.is_empty()

@@ -978,6 +978,50 @@ fn awaited_branch_keeps_nested_cleanup_reachable() {
 }
 
 #[test]
+fn nested_else_conditional_retains_borrowed_continuation() {
+    for handler in ["Error", "Error as error"] {
+        for arm in ["result = build(value)", "consume(value)"] {
+            for condition in ["other.ready", "other.ready and ready"] {
+                let source = format!(
+                    "def sample(acquire, resource, ready):\n    try:\n        value = acquire()\n    except {handler}:\n        result = resource.default\n    else:\n        try:\n            other = transform(value)\n        except {handler}:\n            result = recover(value)\n        else:\n            if {condition}:\n                {arm}\n            else:\n                result = resource.empty\n    try:\n        consume(result)\n    except Error:\n        pass\n"
+                );
+                assert_matches_cpython(&source, "nested_else_conditional.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn nested_recovery_condition_retains_borrowed_continuation() {
+    for named in [false, true] {
+        for guarded in [false, true] {
+            for lazy in [false, true] {
+                let handler = if named { "Error as caught" } else { "Error" };
+                let value = if lazy {
+                    "next((entry for entry in items if entry.ready), None)"
+                } else {
+                    "convert(value)"
+                };
+                let recovery = if lazy {
+                    "recover(build(entry) for entry in items)"
+                } else {
+                    "recover(value)"
+                };
+                let tail = if guarded {
+                    "                if flag:\n                    observe(value)\n"
+                } else {
+                    "                observe(value)\n"
+                };
+                let source = format!(
+                    "def sample(value, flag):\n    try:\n        value = load(value)\n    except {handler}:\n        warn(value)\n    else:\n        try:\n            if value is None:\n                value = create()\n            else:\n                value = {value}\n{tail}        except {handler}:\n            {recovery}\n    observe(value)\n    return value\n"
+                );
+                assert_matches_cpython(&source, "nested_recovery.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
 fn nested_recovery_else_keeps_loop_cleanup_reachable() {
     let source = "async def sample(owner, entry, queue):\n    while True:\n        try:\n            if entry.observed == entry.subscribed:\n                continue\n            if entry.observed:\n                try:\n                    result = await owner.request('resume', entry.identifier, empty=True)\n                except Exception:\n                    raise\n                else:\n                    owner.publish()\n                finally:\n                    entry.resumed.set()\n            else:\n                entry.subscribed = False\n        except Exception:\n            owner.logger.error('unable to update', details=owner.details(entry))\n        finally:\n            queue.task_done()\n";
     for source in [
