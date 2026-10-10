@@ -910,6 +910,109 @@ fn tuple_unpack_prefix_keeps_retained_setup_marker_owner() {
 }
 
 #[test]
+fn erased_coroutine_join_preserves_linear_await_successors() {
+    for awaited in ["action(state)", "state", "state.finish(value)"] {
+        for managers in [1, 2] {
+            for prefix in ["fetch(items)", "next(part for part in items if part.ready)"] {
+                let mut source = String::from("async def sample(value, state, items):\n");
+                let mut indent = String::from("    ");
+                for _ in 0..managers {
+                    writeln!(source, "{indent}async with manager(state):").unwrap();
+                    indent.push_str("    ");
+                }
+                write!(
+                    source,
+                    "{indent}try:
+{indent}    result = {prefix}
+{indent}    if value == state:
+{indent}        assert result
+{indent}    else:
+{indent}        assert result is None
+{indent}    await {awaited}
+{indent}finally:
+{indent}    await finish(state)
+"
+                )
+                .unwrap();
+                assert_matches_cpython(&source, "erased_join_await.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn managed_erased_coroutine_join_preserves_linear_await_successors() {
+    for outer in ["with", "async with"] {
+        for inner in ["with", "async with"] {
+            for awaited in [
+                "action(state)",
+                "state",
+                "state.finish(value)",
+                "action(await prepare(state))",
+                "state.finish(await prepare(value))",
+                "manager(state).finish(await prepare(value))",
+            ] {
+                let source = format!(
+                    "async def sample(value, state):
+    {outer} manager(value):
+        try:
+            {inner} guard(state):
+                with capture_error() as error:
+                    await prepare(value)
+                if value:
+                    assert ready(state)
+                else:
+                    assert accepted(error)
+                assert retained(state)
+                await {awaited}
+        finally:
+            finish(state)
+"
+                );
+                assert_matches_cpython(&source, "managed_erased_join_await.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn erased_async_iterator_tails_preserve_predating_manager_exits() {
+    let source = r"async def probe(value):
+    OWNER outer():
+        try:
+            with guard():
+                async for value in left():
+                    BODY
+            assert accepted()
+            async for value in right():
+                BODY
+            assert settled()
+        finally:
+            CLEANUP
+";
+    for owner in ["with", "async with"] {
+        for body in ["pass", "consume(value)"] {
+            for cleanup in ["finish()", "await finish()"] {
+                let source = source
+                    .replace("OWNER", owner)
+                    .replace("BODY", body)
+                    .replace("CLEANUP", cleanup);
+                for (name, source) in [
+                    ("erased_tail", source.clone()),
+                    ("live_tail", source.replace("assert settled()", "advance()")),
+                ] {
+                    assert_matches_cpython(
+                        &source,
+                        &format!("managed_async_iterator_{name}.py"),
+                        &LEVELS,
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn erased_coroutine_join_preserves_predating_async_managers() {
     let source = r"async def sample(value, state, items):
     async with manager(value):
