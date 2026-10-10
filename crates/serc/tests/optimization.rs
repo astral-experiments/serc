@@ -5136,6 +5136,25 @@ fn unnamed_handler_match_cleanup_preserves_success_edges() {
 }
 
 #[test]
+fn protected_conditional_tuples_fuse_locals_with_scope_fallbacks() {
+    for (prefix, suspend) in [("", ""), ("async ", ""), ("", "    yield value\n")] {
+        for handler in ["RuntimeError", "RuntimeError as error"] {
+            let source = format!(
+                "{prefix}def sample(flag, value, path, state):
+{suspend}    try:
+        if flag:
+            return value, path if value is not None else None, state
+        return None
+    except {handler}:
+        return None
+"
+            );
+            assert_matches_cpython(&source, "protected_conditional_tuple.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn unpacked_or_captures_apply_static_cleanup_swaps() {
     let nested = r#"{"kind": "outer", "value": {"kind": "leaf", "text": str(content)}}"#;
     let flat = r#"{"kind": "leaf", "text": str(content)}"#;
