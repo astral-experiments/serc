@@ -9,7 +9,7 @@ pub(crate) fn assert_matches(source: &str, filename: &str) {
 mod native {
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
-    use std::process::Command;
+    use std::process::{Command, Output};
     use std::sync::OnceLock;
 
     use serc::{CPYTHON_TARGET, compile};
@@ -47,6 +47,11 @@ mod native {
             .arg("--identity")
             .output()
             .map_err(|error| format!("failed to run CPython reference identity: {error}"))?;
+        validate_identity(&output)?;
+        Ok(executable)
+    }
+
+    fn validate_identity(output: &Output) -> Result<(), String> {
         if !output.status.success() {
             return Err(format!("CPython reference identity failed: {output:?}"));
         }
@@ -55,7 +60,7 @@ mod native {
         if actual != expected_identity() {
             return Err(format!("unexpected CPython reference identity: {actual}"));
         }
-        Ok(executable)
+        Ok(())
     }
 
     pub(super) fn assert_matches(source: &str, filename: &str) {
@@ -97,16 +102,15 @@ mod native {
 
     #[test]
     fn wrong_reference_identity_is_an_error() {
-        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::process::ExitStatusExt as _;
+        use std::process::ExitStatus;
 
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("reference");
-        let write_identity = |identity: &serde_json::Value| {
-            fs_err::write(&path, format!("#!/bin/sh\nprintf '%s\\n' '{identity}'\n")).unwrap();
-            fs_err::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let output = |identity: &serde_json::Value| Output {
+            status: ExitStatus::from_raw(0),
+            stdout: serde_json::to_vec(identity).unwrap(),
+            stderr: Vec::new(),
         };
-        write_identity(&expected_identity());
-        assert_eq!(discover(Some(path.as_os_str())).unwrap(), path);
+        assert!(validate_identity(&output(&expected_identity())).is_ok());
         for (field, value) in [
             ("protocol", serde_json::json!("other")),
             ("protocol", serde_json::json!("minimal-v1")),
@@ -115,11 +119,30 @@ mod native {
             ("release_level", serde_json::json!("candidate")),
             ("release_serial", serde_json::json!(1)),
             ("magic", serde_json::json!("00000000")),
+            ("extra", serde_json::json!(true)),
         ] {
             let mut identity = expected_identity();
             identity[field] = value;
-            write_identity(&identity);
-            assert!(discover(Some(path.as_os_str())).is_err(), "{field}");
+            assert!(
+                validate_identity(&output(&identity))
+                    .unwrap_err()
+                    .starts_with("unexpected CPython reference identity:"),
+                "{field}",
+            );
         }
+        let mut invalid = output(&expected_identity());
+        invalid.stdout = b"not JSON".to_vec();
+        assert!(
+            validate_identity(&invalid)
+                .unwrap_err()
+                .starts_with("invalid CPython reference identity:")
+        );
+        let mut failed = output(&expected_identity());
+        failed.status = ExitStatus::from_raw(1 << 8);
+        assert!(
+            validate_identity(&failed)
+                .unwrap_err()
+                .starts_with("CPython reference identity failed:")
+        );
     }
 }
