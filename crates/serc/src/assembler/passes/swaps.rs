@@ -13,6 +13,130 @@ pub(in crate::assembler) struct SwapBlock {
     positions: Vec<ItemPosition>,
     rewritten_nops: FxHashSet<ItemPosition>,
     original_donors: FxHashMap<ItemPosition, Instruction>,
+    composed_capture_swaps: FxHashSet<ItemPosition>,
+}
+
+/// Certifies complete capture rotations separated by mapping cleanup pops.
+fn composed_capture_cleanup(items: &[Item]) -> Option<Vec<usize>> {
+    let [Item::Instruction(prefix), Item::Instruction(first), ..] = items else {
+        return None;
+    };
+    let mut depth = first.value_argument()?;
+    if !matches!(
+        (prefix.opcode, prefix.value_argument()),
+        (UNPACK_SEQUENCE, Some(1)) | (UNPACK_EX, Some(0))
+    ) || first.opcode != SWAP
+        || depth < 4
+        || prefix.depth_after() != Some(depth)
+        || prefix.location.line < 0
+    {
+        return None;
+    }
+    let mut index = 1;
+    let mut swaps = Vec::new();
+    let mut rotations = 0;
+    let mut consumer_line = None;
+    loop {
+        let Item::Instruction(first_swap) = items.get(index)? else {
+            return None;
+        };
+        for distance in (2..=depth).rev() {
+            let Item::Instruction(swap) = items.get(index)? else {
+                return None;
+            };
+            if swap.opcode != SWAP
+                || swap.value_argument() != Some(distance)
+                || swap.location != first_swap.location
+                || swap.depth_after() != Some(depth)
+            {
+                return None;
+            }
+            swaps.push(index);
+            index += 1;
+        }
+        rotations += 1;
+        let mut pops = 0;
+        let mut pop_line = None;
+        while let Some(Item::Instruction(pop)) = items.get(index)
+            && pop.opcode == POP_TOP
+        {
+            let line = *pop_line.get_or_insert(pop.location.line);
+            if pop.value_argument() != Some(0) || pop.location.line != line {
+                return None;
+            }
+            depth = depth.checked_sub(1)?;
+            if pop.depth_after() != Some(depth) {
+                return None;
+            }
+            pops += 1;
+            index += 1;
+        }
+        consumer_line = pop_line.or(consumer_line);
+        if !matches!(items.get(index), Some(Item::Instruction(next)) if next.opcode == SWAP) {
+            break;
+        }
+        if pops < 2 || depth < 2 {
+            return None;
+        }
+    }
+    if rotations < 2 || depth < 2 {
+        return None;
+    }
+    let mut stores = FxHashSet::default();
+    for remaining in (0..depth).rev() {
+        let Item::Instruction(store) = items.get(index)? else {
+            return None;
+        };
+        if store.opcode != STORE_FAST
+            || store.local_policy.may_store_null()
+            || store.depth_after() != Some(remaining)
+            || Some(store.location.line) != consumer_line
+            || !stores.insert(store.value_argument()?)
+        {
+            return None;
+        }
+        index += 1;
+    }
+    if !matches!(items.get(index), Some(Item::Instruction(next))
+        if next.location.line >= 0 && Some(next.location.line) != consumer_line)
+    {
+        return None;
+    }
+    for item in &items[..index] {
+        let Item::Instruction(instruction) = item else {
+            return None;
+        };
+        if instruction.location.line < 0
+            || instruction.no_location_policy != super::super::ir::NoLocationPolicy::default()
+            || instruction.fusion_policy != super::super::ir::FusionPolicy::default()
+            || instruction.jump_policy != super::super::ir::JumpPolicy::default()
+            || instruction.local_policy != super::super::ir::LocalPolicy::default()
+            || instruction.exception_policy() != super::super::ExceptionPolicy::NoneUnchanged
+            || instruction.pre_fold_extra_instructions() != 0
+        {
+            return None;
+        }
+    }
+    Some(swaps)
+}
+
+fn transport_capture_pop_donors(
+    donors: &mut FxHashMap<ItemPosition, Instruction>,
+    certified: bool,
+    (first, first_instruction): (ItemPosition, Instruction),
+    (last, last_instruction): (ItemPosition, Instruction),
+) {
+    if certified
+        && first != last
+        && first_instruction.opcode == POP_TOP
+        && last_instruction.opcode == POP_TOP
+        && first_instruction.location.line == last_instruction.location.line
+        && donors.get(&first) == Some(&first_instruction)
+        && donors.get(&last) == Some(&last_instruction)
+    {
+        donors.insert(first, last_instruction);
+        donors.insert(last, first_instruction);
+    }
 }
 
 /// Retires a rewritten swap's line only when a surviving record in the same array has it.
@@ -271,6 +395,7 @@ impl OptimizationPipeline {
         // Admit cleanups from their complete original partition before any swap run is
         // rewritten. A newly simplified suffix cannot certify an emitted owner slot.
         let mut capture_cleanup_swaps = FxHashSet::default();
+        let mut composed_capture_swaps = FxHashSet::default();
         let mut capture_cleanup_donors = FxHashMap::default();
         for block in &blocks {
             for rotation in block.windows(6) {
@@ -295,6 +420,16 @@ impl OptimizationPipeline {
                 .map(|position| *graph.item(*position))
                 .collect::<Vec<_>>();
             for index in 0..items.len() {
+                // No owner-slot prediction changes are needed in an unprotected array.
+                if self.exception_regions.is_empty()
+                    && let Some(swaps) = composed_capture_cleanup(&items[index..])
+                {
+                    for offset in swaps {
+                        let position = block[index + offset];
+                        capture_cleanup_swaps.insert(position);
+                        composed_capture_swaps.insert(position);
+                    }
+                }
                 if let Some(rotation) = capture_cleanup_rotation(&items[index..]) {
                     if let Some((offset, donor)) = rotation.projected_pop_donor {
                         // Static swaps rotate this original POP into the following donor slot.
@@ -439,6 +574,11 @@ impl OptimizationPipeline {
                     .map(|donor| (*position, *donor))
             }));
             rewritten_blocks.push(SwapBlock {
+                composed_capture_swaps: block
+                    .iter()
+                    .copied()
+                    .filter(|position| composed_capture_swaps.contains(position))
+                    .collect(),
                 positions: block,
                 rewritten_nops: rewritten,
                 original_donors,
@@ -537,7 +677,8 @@ impl OptimizationPipeline {
         for SwapBlock {
             positions,
             rewritten_nops: mut rewritten,
-            original_donors,
+            mut original_donors,
+            composed_capture_swaps,
         } in blocks
         {
             let mut index = positions.len();
@@ -669,6 +810,12 @@ impl OptimizationPipeline {
                 if self.python_version >= crate::PythonVersion::Py314 {
                     rewritten.insert(positions[index]);
                 }
+                transport_capture_pop_donors(
+                    &mut original_donors,
+                    composed_capture_swaps.contains(&positions[index]),
+                    (positions[first], first_instruction),
+                    (positions[last], last_instruction),
+                );
                 *graph
                     .instruction_mut(positions[first])
                     .expect("swappable item is an instruction") = last_instruction;
@@ -889,6 +1036,174 @@ mod tests {
     use crate::assembler::{Assembler, Label};
     use crate::target::opcodes::JUMP_FORWARD;
 
+    fn composed_capture_items() -> Vec<Item> {
+        [
+            (UNPACK_SEQUENCE, 1, 5),
+            (SWAP, 5, 5),
+            (SWAP, 4, 5),
+            (SWAP, 3, 5),
+            (SWAP, 2, 5),
+            (POP_TOP, 0, 4),
+            (POP_TOP, 0, 3),
+            (SWAP, 3, 3),
+            (SWAP, 2, 3),
+            (STORE_FAST, 0, 2),
+            (STORE_FAST, 1, 1),
+            (STORE_FAST, 2, 0),
+            (NOP, 0, 0),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (opcode, argument, depth))| {
+            let line = if index == 12 { 4 } else { 3 };
+            Item::Instruction(Instruction::new(
+                opcode,
+                Operand::Value(argument),
+                SourceLocation::new(line, line, 0, 1),
+                Some(depth),
+            ))
+        })
+        .collect()
+    }
+
+    #[test]
+    fn composed_capture_cleanup_requires_complete_original_arrays() {
+        assert_eq!(
+            composed_capture_cleanup(&composed_capture_items()),
+            Some(vec![1, 2, 3, 4, 7, 8])
+        );
+        for mutation in 0..9 {
+            let mut items = composed_capture_items();
+            match mutation {
+                0 => items.insert(6, Item::Label(Label::from_u32(0))),
+                1 => items.truncate(11),
+                2 => items[10] = items[9],
+                3 => items[2] = items[3],
+                4 => items[7] = items[1],
+                5 => items[12] = items[5],
+                6 => items[0] = items[5],
+                7 => items[5] = items[9],
+                8 => items[6] = items[12],
+                _ => unreachable!(),
+            }
+            assert!(composed_capture_cleanup(&items).is_none(), "{mutation}");
+        }
+        for index in 0..12 {
+            for policy in 0..8 {
+                let mut items = composed_capture_items();
+                let Item::Instruction(instruction) = &mut items[index] else {
+                    unreachable!()
+                };
+                match policy {
+                    0 => instruction.location = SourceLocation::NONE,
+                    1 => instruction.no_location_policy.preserve_location(),
+                    2 => instruction.fusion_policy.prevent_with_previous(),
+                    3 => instruction.jump_policy.retain_nop(),
+                    4 => instruction.local_policy.add_hidden_exception_owner_slots(1),
+                    5 => instruction
+                        .set_exception_policy(super::super::super::ExceptionPolicy::EXCLUDE_ALWAYS),
+                    6 => instruction.add_pre_fold_extra_instructions(1),
+                    7 => {
+                        *instruction = Instruction::new(
+                            instruction.opcode,
+                            instruction.operand(),
+                            instruction.location,
+                            None,
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(
+                    composed_capture_cleanup(&items).is_none(),
+                    "{index}/{policy}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn composed_capture_cleanup_requires_single_result_unpack() {
+        for (opcode, argument, accepted) in [
+            (UNPACK_SEQUENCE, 1, true),
+            (UNPACK_EX, 0, true),
+            (UNPACK_EX, 1, false),
+            (UNPACK_EX, 256, false),
+            (UNPACK_EX, 257, false),
+            (UNPACK_SEQUENCE, 0, false),
+            (POP_TOP, 0, false),
+        ] {
+            let mut items = composed_capture_items();
+            let Item::Instruction(prefix) = &mut items[0] else {
+                unreachable!()
+            };
+            *prefix = Instruction::new(
+                opcode,
+                Operand::Value(argument),
+                prefix.location,
+                prefix.depth_after(),
+            );
+            assert_eq!(
+                composed_capture_cleanup(&items).is_some(),
+                accepted,
+                "{opcode:?}/{argument}"
+            );
+        }
+    }
+
+    #[test]
+    fn composed_capture_cleanup_keeps_lines_within_each_pop_group() {
+        let items = [
+            (UNPACK_SEQUENCE, 1, 8),
+            (SWAP, 8, 8),
+            (SWAP, 7, 8),
+            (SWAP, 6, 8),
+            (SWAP, 5, 8),
+            (SWAP, 4, 8),
+            (SWAP, 3, 8),
+            (SWAP, 2, 8),
+            (POP_TOP, 0, 7),
+            (POP_TOP, 0, 6),
+            (POP_TOP, 0, 5),
+            (POP_TOP, 0, 4),
+            (SWAP, 4, 4),
+            (SWAP, 3, 4),
+            (SWAP, 2, 4),
+            (POP_TOP, 0, 3),
+            (POP_TOP, 0, 2),
+            (STORE_FAST, 0, 1),
+            (STORE_FAST, 1, 0),
+            (NOP, 0, 0),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (opcode, argument, depth))| {
+            let line = match index {
+                0..15 => 5,
+                15..19 => 3,
+                _ => 6,
+            };
+            Item::Instruction(Instruction::new(
+                opcode,
+                Operand::Value(argument),
+                SourceLocation::new(line, line, 0, 1),
+                Some(depth),
+            ))
+        })
+        .collect::<Vec<_>>();
+        assert_eq!(
+            composed_capture_cleanup(&items),
+            Some(vec![1, 2, 3, 4, 5, 6, 7, 12, 13, 14])
+        );
+        for (index, line) in [(9, 3), (16, 5), (18, 5), (19, 3)] {
+            let mut changed = items.clone();
+            let Item::Instruction(instruction) = &mut changed[index] else {
+                unreachable!()
+            };
+            instruction.location = SourceLocation::new(line, line, 0, 1);
+            assert!(composed_capture_cleanup(&changed).is_none(), "{index}");
+        }
+    }
+
     pub(super) fn redundant_swap_discoveries(
         graph: &BlockGraph,
     ) -> (Vec<ItemPosition>, Vec<(ItemPosition, ItemPosition)>) {
@@ -1065,6 +1380,67 @@ mod tests {
             &original_donors,
         );
         assert_eq!(*graph.instruction_mut(positions[1]).unwrap(), nop);
+    }
+
+    #[test]
+    fn capture_pop_donors_follow_only_certified_exact_exchanges() {
+        for mutation in 0..9 {
+            let first = Instruction::new(
+                POP_TOP,
+                Operand::Value(0),
+                SourceLocation::new(5, 5, 0, 1),
+                Some(3),
+            );
+            let mut last = Instruction::new(
+                POP_TOP,
+                Operand::Value(0),
+                SourceLocation::new(5, 5, 2, 3),
+                Some(2),
+            );
+            let graph = BlockGraph::from_items(
+                vec![Item::Instruction(first), Item::Instruction(last)],
+                &FxHashSet::default(),
+            );
+            let positions = graph.item_positions();
+            let mut donors = FxHashMap::from_iter([(positions[0], first), (positions[1], last)]);
+            let mut certified = true;
+            let mut last_position = positions[1];
+            match mutation {
+                0 => {}
+                1 => certified = false,
+                2 => {
+                    donors.remove(&positions[0]);
+                }
+                3 => {
+                    donors.remove(&positions[1]);
+                }
+                4 => donors.get_mut(&positions[0]).unwrap().location.column += 1,
+                5 => donors.get_mut(&positions[1]).unwrap().location.column += 1,
+                6 => last_position = positions[0],
+                7 => {
+                    last.opcode = STORE_FAST;
+                    donors.insert(positions[1], last);
+                }
+                8 => {
+                    last.location.line = 6;
+                    donors.insert(positions[1], last);
+                }
+                _ => unreachable!(),
+            }
+            let before = donors.clone();
+            transport_capture_pop_donors(
+                &mut donors,
+                certified,
+                (positions[0], first),
+                (last_position, last),
+            );
+            if mutation == 0 {
+                assert_eq!(donors[&positions[0]], last);
+                assert_eq!(donors[&positions[1]], first);
+            } else {
+                assert_eq!(donors, before, "{mutation}");
+            }
+        }
     }
 
     #[test]
