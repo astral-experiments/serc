@@ -15,6 +15,30 @@ use serc::{
 };
 
 #[test]
+fn coroutine_retry_false_exit_reaches_conditional_cleanup() {
+    let source = "async def sample(owner, adapter, payload, accepted, logging):\n    try:\n        while adapter is None or adapter.open:\n            async with owner.authorize():\n                while adapter.open:\n                    if owner.ready(payload):\n                        break\n    except Error as error:\n        if accepted:\n            await owner.close()\n        else:\n            await owner.deny()\n    except Other:\n        if adapter is None or adapter.open:\n            raise\n    finally:\n        if logging():\n            owner.log(payload)\n";
+    for source in [
+        source.to_owned(),
+        source.replace(
+            "while adapter is None or adapter.open:",
+            "while adapter.open:",
+        ),
+        source.replace("    try:\n", "    try:\n        owner.prepare()\n"),
+        source
+            .replace(
+                "    except Error as error:\n",
+                "    except Error as error:\n        if logging():\n            owner.log(error)\n",
+            )
+            .replace(
+                "    finally:\n",
+                "    finally:\n        if adapter is not None:\n            await owner.disconnect(adapter)\n",
+            ),
+    ] {
+        assert_matches_cpython(&source, "coroutine_retry_cleanup.py", &LEVELS);
+    }
+}
+
+#[test]
 fn conditional_manager_callback_store_keeps_cleanup_exit_owned() {
     let source = "async def sample(owner, client, task, cancel, failed, detach):\n    try:\n        replacement = owner.create()\n    finally:\n        if cancel:\n            with owner.expect(Cancelled):\n                await owner.wait(task)\n        elif failed and not detach:\n            with owner.expect(Failed):\n                await owner.wait(task)\n        else:\n            await owner.wait(task)\n        client.close = lambda: None\n    assert owner.active.session is replacement\n";
     for source in [
