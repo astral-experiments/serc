@@ -34168,6 +34168,48 @@ impl<'source> Compiler<'source> {
                         .is_some_and(|handler| !suite_contains_loop_break(&handler.body))
                 }))
             && loop_recovery_has_nonempty_finally_route(statement, self.context.python_version);
+        let managed_iterator_cleanup_entry = self.context.python_version
+            == crate::PythonVersion::Py314
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+            && !statement.is_star
+            && statement.orelse.is_empty()
+            && matches!(self.control.loops.contexts.as_slice(), [context]
+                if context.iterator_cleanup == IteratorCleanup::Sync
+                    && !context.has_orelse
+                    && context.with_depth == self.control.withs.active_with_exits.len())
+            && !self.control.withs.active_with_exits.is_empty()
+            && self
+                .control
+                .withs
+                .active_with_exits
+                .iter()
+                .all(|manager| manager.is_async)
+            && !self.control.in_exception_handler()
+            && self.control.exceptions.active_exception_group_handlers == 0
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && self.control.finally.active_finally_try_bodies == 0
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && !suite_contains_abrupt_control_flow(&statement.body)
+            && matches!(statement.body.last(), Some(Stmt::Expr(expression))
+                if matches!(expression.value.as_ref(), Expr::Call(_))
+                    && !expression_contains_inline_branch(&expression.value)
+                    && !expression_suspends_current_scope(&expression.value))
+            && matches!(statement.handlers.as_slice(), [handler]
+            if handler.as_except_handler().is_some_and(|handler| {
+                handler.type_.is_some()
+                    && handler.name.is_some()
+                    && suite_has_linear_reraise_guards(&handler.body)
+                    && suite_has_nonsuspending_raise_work(&handler.body)
+                    && !suite_any_statement(&handler.body, |part| matches!(part, Stmt::Raise(raised)
+                        if raised.exc.is_some() || raised.cause.is_some()))
+            }))
+            && guarded_iterator_cleanup_has_local_continues(self, &statement.finalbody);
         // A guarded named handler has a populated exit into normal cleanup,
         // even when the protected body or an earlier handler is only `pass`.
         let guarded_named_handler_reaches_finally = !statement.is_star
@@ -34307,7 +34349,8 @@ impl<'source> Compiler<'source> {
             || for_exhaustion_reaches_finally
             || generator_else_break_loop_range.is_some()
             || runtime_while_else_break_reaches_finally
-            || loop_guarded_recovery_reaches_finally;
+            || loop_guarded_recovery_reaches_finally
+            || managed_iterator_cleanup_entry;
         // A runtime loop's surviving break enters the iterator cleanup without
         // crossing the enclosing synchronous managers' exits.
         let runtime_while_iterator_cleanup_break = self.context.python_version
@@ -47378,6 +47421,42 @@ fn recovery_comprehension_call_has_nonempty_exit(expression: &Expr) -> bool {
             matches!(argument, Expr::Name(_)) || fold_constant(argument).is_some()
         }
     }) && comprehensions == 1
+}
+
+/// Recognizes a populated cleanup guard whose continues stay inside its own iterator.
+fn guarded_iterator_cleanup_has_local_continues(compiler: &Compiler<'_>, body: &[Stmt]) -> bool {
+    let runtime_test = |test: &Expr| {
+        condition_has_linear_runtime_leaves(test) && !expression_suspends_current_scope(test)
+    };
+    let [Stmt::If(guard)] = body else {
+        return false;
+    };
+    let Some((Stmt::For(iterator), prefix)) = guard.body.split_last() else {
+        return false;
+    };
+    runtime_test(&guard.test)
+        && guard.elif_else_clauses.is_empty()
+        && prefix.iter().all(|part| {
+            compiler.context.is_elided_statement(part)
+                || (suite_has_linear_borrow_fallthrough(std::slice::from_ref(part))
+                    && !suite_contains_yield(std::slice::from_ref(part)))
+        })
+        && !iterator.is_async
+        && iterator.orelse.is_empty()
+        && matches!(iterator.target.as_ref(), Expr::Name(_))
+        && !expression_contains_inline_branch(&iterator.iter)
+        && !expression_suspends_current_scope(&iterator.iter)
+        && suite_contains_loop_continue(&iterator.body)
+        && iterator.body.iter().all(|part| {
+            compiler.context.is_elided_statement(part)
+                || suite_has_nonsuspending_linear_fallthrough(std::slice::from_ref(part))
+                || matches!(part, Stmt::Assert(assertion)
+                    if assertion.msg.is_none() && runtime_test(&assertion.test))
+                || matches!(part, Stmt::If(guard)
+                    if runtime_test(&guard.test)
+                        && guard.elif_else_clauses.is_empty()
+                        && matches!(guard.body.as_slice(), [Stmt::Continue(_)]))
+        })
 }
 
 /// Recognize loop recovery with populated normal and guarded handler exits.

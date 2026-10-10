@@ -15,6 +15,24 @@ use serc::{
 };
 
 #[test]
+fn managed_guarded_iterator_cleanup_keeps_normal_entry_reachable() {
+    let source = "async def sample(owner, runs, capture, retry, error):\n    async with await owner.start() as environment:\n        async with owner.worker(environment, handlers=[owner.first, owner.failed if error is not None else owner.recover]), owner.worker(environment):\n            for index in range(runs):\n                try:\n                    owner.results.append(result)\n                except Failed as failure:\n                    if not retry or index + 1 >= runs:\n                        raise\n                finally:\n                    if capture:\n                        for event in events:\n                            if not event.has('task'):\n                                continue\n                            if event.kind != 'read':\n                                continue\n";
+    for source in [
+        source.to_owned(),
+        source.replace(
+            "                        for event in events:",
+            "                        history = await owner.history()\n                        owner.record(history)\n                        for event in events:",
+        ),
+        source.replace(
+            "                            if event.kind != 'read':\n                                continue",
+            "                            if event.kind != 'read':\n                                continue\n                            assert len(event.values) == 1\n                            owner.record(event)",
+        ),
+    ] {
+        assert_matches_cpython(&source, "managed_guarded_iterator_cleanup.py", &LEVELS);
+    }
+}
+
+#[test]
 fn managed_nested_await_store_keeps_continuation_reachable() {
     let source = "async def sample(owner, groups, mode, flag, pending):\n    with owner.reporter() as reporter:\n        async with await owner.connect() as client:\n            for group in groups:\n                try:\n                    try:\n                        if mode == 'first':\n                            handle = await client.start(owner.first, group, key=key, reuse=owner.allow if flag else owner.reject)\n                        else:\n                            handle = await client.start(owner.second, group, key=key, reuse=owner.allow if flag else owner.reject)\n                    except AlreadyStarted:\n                        handle = client.lookup(key)\n                except Exception as error:\n                    continue\n                if len(pending) >= limit:\n                    await owner.collect(reporter, pending)\n";
     for source in [
