@@ -25637,10 +25637,16 @@ impl<'source> Compiler<'source> {
                         suite_ends_in_nested_handler_cold_join(&handler.body)
                     })
                 }));
+        let return_copies_terminal_with = self
+            .control
+            .finally
+            .active_return_finally_contexts
+            .iter()
+            .any(|context| matches!(context.body.last(), Some(Stmt::With(_))));
         let handler_has_orphan_cold_cleanup = statement.handlers.iter().any(|handler| {
-            handler
-                .as_except_handler()
-                .is_some_and(|handler| suite_contains_orphan_cold_cleanup(&handler.body))
+            handler.as_except_handler().is_some_and(|handler| {
+                suite_contains_orphan_cold_cleanup(&handler.body, return_copies_terminal_with)
+            })
         });
         // Copying a nested pass-only recovery empties the enclosing unnamed
         // handler's original cleanup. Cold ordering leaves that orphan after the
@@ -28366,7 +28372,7 @@ impl<'source> Compiler<'source> {
                                                         && recovery.orelse.is_empty()
                                                         && recovery.finalbody.is_empty()
                                                         && !recovery.handlers.is_empty()))
-                                        && suite_contains_orphan_cold_cleanup(&conditional.body))
+                                        && suite_contains_orphan_cold_cleanup(&conditional.body, false))
                             })
                     })
                 })
@@ -45731,10 +45737,11 @@ fn handler_has_raised_try_before_linear_suffix(body: &[Stmt]) -> bool {
 
 // Unreachable cleanup blocks can remain empty when cold handler blocks move. A final with
 // and the specialized tuple loop leave such blocks in the normal try exit's physical path.
-fn suite_contains_orphan_cold_cleanup(body: &[Stmt]) -> bool {
+fn suite_contains_orphan_cold_cleanup(body: &[Stmt], return_copies_terminal_with: bool) -> bool {
     #[derive(Default)]
     struct Detector {
         found: bool,
+        return_copies_terminal_with: bool,
     }
 
     impl<'ast> Visitor<'ast> for Detector {
@@ -45761,6 +45768,12 @@ fn suite_contains_orphan_cold_cleanup(body: &[Stmt]) -> bool {
 
         fn visit_stmt(&mut self, statement: &'ast Stmt) {
             if self.found || matches!(statement, Stmt::TypeAlias(_)) {
+                return;
+            }
+            // Copying the enclosing terminal manager leaves the same empty exit
+            // as a manager authored directly in this handler.
+            if self.return_copies_terminal_with && matches!(statement, Stmt::Return(_)) {
+                self.found = true;
                 return;
             }
             // Definition bodies and annotations run in separate scopes. Their decorators and
@@ -46113,7 +46126,10 @@ fn suite_contains_orphan_cold_cleanup(body: &[Stmt]) -> bool {
     }) {
         return true;
     }
-    let mut detector = Detector::default();
+    let mut detector = Detector {
+        return_copies_terminal_with,
+        ..Detector::default()
+    };
     detector.visit_body(body);
     detector.found
 }
@@ -52038,6 +52054,31 @@ mod tests {
     };
     use ruff_python_ast::Stmt;
     use ruff_python_parser::parse_module;
+
+    #[test]
+    fn copied_terminal_manager_requires_a_live_current_scope_return() {
+        for (source, live_return) in [
+            ("if ready:\n    return\n", true),
+            ("if True:\n    return\n", true),
+            ("if False:\n    return\n", false),
+            ("while False:\n    return\n", false),
+            ("def inner():\n    return\n", false),
+            (
+                "class Inner:\n    def method(self):\n        return\n",
+                false,
+            ),
+            ("if ready:\n    raise Error\n", false),
+        ] {
+            let parsed = parse_module(source).unwrap();
+            for copied_manager in [false, true] {
+                assert_eq!(
+                    super::suite_contains_orphan_cold_cleanup(parsed.suite(), copied_manager),
+                    copied_manager && live_return,
+                    "{source}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn guarded_recovery_store_requires_completed_runtime_arms() {
