@@ -15,6 +15,25 @@ use serc::{
 };
 
 #[test]
+fn coroutine_asserted_success_keeps_call_cleanup_reachable() {
+    let source = "async def sample(owner, outcome, tags, metrics):\n    try:\n        async with owner.timeout():\n            runtime = owner.create()\n    except Timeout as error:\n        owner.warning()\n    except Error as error:\n        owner.emit(\n            first=runtime.backing if runtime is not None else None,\n            second=str(runtime.model) if runtime is not None else owner.model,\n            third=runtime.virtual() if runtime is not None else owner.virtual,\n            error=type(error).__name__,\n        )\n    else:\n        assert runtime is not None\n        owner.update({\n            'first': str(runtime.model),\n            'second': runtime.virtual(),\n            'elapsed': owner.elapsed(),\n            **metrics,\n        })\n    finally:\n        owner.record(owner.elapsed(), tags=[f'state:{outcome}', *tags])\n";
+    for (index, source) in [
+        source.to_owned(),
+        source.replace("runtime = owner.create()", "runtime = await owner.create()"),
+        source.replace("    try:\n", "    runtime = None\n    try:\n"),
+        source.replace(
+            "tags=[f'state:{outcome}', *tags])\n",
+            "tags=[f'state:{outcome}', *tags])\n        try:\n            owner.clear()\n        except Error:\n            owner.failed()\n        owner.destroy()\n",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(&source, &format!("coroutine_asserted_success_{index}.py"), &LEVELS);
+    }
+}
+
+#[test]
 fn coroutine_retry_false_exit_reaches_conditional_cleanup() {
     let source = "async def sample(owner, adapter, payload, accepted, logging):\n    try:\n        while adapter is None or adapter.open:\n            async with owner.authorize():\n                while adapter.open:\n                    if owner.ready(payload):\n                        break\n    except Error as error:\n        if accepted:\n            await owner.close()\n        else:\n            await owner.deny()\n    except Other:\n        if adapter is None or adapter.open:\n            raise\n    finally:\n        if logging():\n            owner.log(payload)\n";
     for source in [

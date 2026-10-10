@@ -31977,17 +31977,27 @@ impl<'source> Compiler<'source> {
                     && self.control.exceptions.active_exception_region_exclusions.is_empty()
                     && !self.control.in_exception_handler()
                     && self.control.finally.is_inactive_for_return_unwind()
-                    && matches!(statement.orelse.as_slice(), [Stmt::Assert(assertion)]
-                        if assertion.msg.is_none()
-                            && condition_has_only_runtime_tests(&assertion.test)
-                            && !expression_contains_inline_branch(&assertion.test)
-                            && !expression_suspends_current_scope(&assertion.test))
-                    && matches!(statement.finalbody.split_last(), Some((Stmt::Expr(cleanup), prefix))
+                    && statement.orelse.split_first().is_some_and(|(first, suffix)| {
+                        (matches!(first, Stmt::Assert(assertion)
+                            if assertion.msg.is_none()
+                                && condition_has_only_runtime_tests(&assertion.test)
+                                && !expression_contains_inline_branch(&assertion.test)
+                                && !expression_suspends_current_scope(&assertion.test))
+                            || (!suffix.is_empty() && self.context.is_elided_statement(first)))
+                            && (suffix.is_empty() || suite_has_nonsuspending_linear_fallthrough(suffix))
+                    })
+                    && (matches!(statement.finalbody.split_last(), Some((Stmt::Expr(cleanup), prefix))
                         if (prefix.is_empty() || suite_has_nonsuspending_linear_fallthrough(prefix))
                             && matches!(cleanup.value.as_ref(), Expr::Await(awaited)
                             if matches!(awaited.value.as_ref(), Expr::Call(_))
                                 && !expression_contains_inline_branch(&awaited.value)
-                                && !expression_suspends_current_scope(&awaited.value)))));
+                                && !expression_suspends_current_scope(&awaited.value)))
+                        || (statement.orelse.len() > 1
+                            && !suite_contains_abrupt_control_flow(&statement.finalbody)
+                            && matches!(statement.finalbody.first(), Some(Stmt::Expr(cleanup))
+                                if matches!(cleanup.value.as_ref(), Expr::Call(_))
+                                    && !expression_contains_inline_branch(&cleanup.value)
+                                    && !expression_suspends_current_scope(&cleanup.value))))));
         let nested_cleanup_has_located_setup = matches!(statement.finalbody.as_slice(), [Stmt::Try(cleanup)]
         if !cleanup.is_star
             && cleanup.body.first().is_some_and(|first| {
