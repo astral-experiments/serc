@@ -20231,6 +20231,116 @@ impl<'source> Compiler<'source> {
                             !expression_contains_chained_comparison(test)
                         })
                     })));
+        // An erased else reaches the saved iterator directly when every active
+        // owner predates it. Only the new conditional and backedge lose ownership;
+        // evaluating the test and completing the true arm stay protected.
+        let completed_await_call = |body: &[Stmt]| {
+            matches!(body, [Stmt::Expr(expression)]
+                if matches!(expression.value.as_ref(), Expr::Await(awaited)
+                    if matches!(awaited.value.as_ref(), Expr::Call(_))
+                        && !expression_suspends_current_scope(&awaited.value)
+                        && !expression_contains_inline_branch(&awaited.value)))
+        };
+        let completed_await_iterator_arm = self.context.python_version
+            >= crate::PythonVersion::Py314
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+            && self.control.finally.active_finally_try_bodies > 0
+            && !self.control.in_exception_handler()
+            && (completed_await_call(&statement.body)
+                || (!self.control.withs.active_with_exits.is_empty()
+                    && matches!(statement.body.as_slice(), [Stmt::With(manager)]
+                        if !manager.is_async
+                            && matches!(manager.items.as_slice(), [item]
+                                if item.optional_vars.is_none()
+                                    && !expression_suspends_current_scope(&item.context_expr)
+                                    && !expression_contains_inline_branch(&item.context_expr))
+                            && completed_await_call(&manager.body))));
+        // Erased elif arms reach the same saved iterator as the removed else.
+        // Each runtime test retains its own conditional edge into that backedge.
+        let erased_ordinary_elif_arms = statement.elif_else_clauses.len() > 1
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && statement.elif_else_clauses.iter().all(|clause| {
+                clause.test.as_ref().is_none_or(|test| {
+                    condition_has_only_runtime_tests(test)
+                        && condition_has_linear_runtime_leaves(test)
+                        && !expression_suspends_current_scope(test)
+                        && original_condition_has_unique_jump_target(test, true)
+                        && original_condition_has_unique_jump_target(test, false)
+                }) && !clause.body.is_empty()
+                    && clause
+                        .body
+                        .iter()
+                        .all(|part| self.context.is_elided_statement(part))
+            });
+        let saved_owner_iterator_else = eligible_else
+            && mode == LoopTailMode::default()
+            && (statement.elif_else_clauses.len() == 1 || erased_ordinary_elif_arms)
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+            && self.control.in_loop_tail_without_nested_cleanup()
+            && self.control.loops.contexts.last().is_some_and(|context| {
+                context.iterator_cleanup == IteratorCleanup::Sync
+                    && context.continue_label == restart
+            })
+            && condition_has_only_runtime_tests(&statement.test)
+            && condition_has_linear_runtime_leaves(&statement.test)
+            && !expression_suspends_current_scope(&statement.test)
+            && original_condition_has_unique_jump_target(&statement.test, true)
+            && original_condition_has_unique_jump_target(&statement.test, false)
+            && !statement.body.is_empty()
+            && (completed_await_iterator_arm
+                || statement.body.iter().all(|part| {
+                    self.context.is_elided_statement(part)
+                        || suite_has_nonsuspending_linear_fallthrough(std::slice::from_ref(part))
+                        || matches!(part, Stmt::Assign(assignment)
+                        if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                            && expression_has_linear_generator_creation(
+                                &assignment.value,
+                                self.context.python_version,
+                            ))
+                }))
+            && self.control.withs.active_with_exits.len()
+                == self.control.withs.active_with_region_exclusions.len()
+            && self
+                .control
+                .withs
+                .active_with_exits
+                .iter()
+                .all(|owner| owner.loop_depth < self.control.loops.contexts.len())
+            && self
+                .control
+                .exceptions
+                .active_exception_handlers
+                .iter()
+                .all(|owner| owner.loop_depth < self.control.loops.contexts.len())
+            && self.control.exceptions.active_exception_group_handlers == 0
+            && self.control.finally.protected_try_loop_depths.len()
+                == self.control.finally.active_finally_try_bodies
+            && self
+                .control
+                .finally
+                .protected_try_loop_depths
+                .iter()
+                .enumerate()
+                .all(|(index, (depth, loop_depth))| {
+                    *depth == index + 1 && *loop_depth < self.control.loops.contexts.len()
+                })
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && self.control.finally.active_overriding_finally_returns == 0
+            && self
+                .control
+                .finally
+                .active_pass_finally_locations
+                .is_empty()
+            && self
+                .control
+                .finally
+                .preserved_return_value_contexts
+                .is_empty()
+            && self.control.finally.copied_return_finally_preserved_values == 0;
+        let optimized_empty_else = optimized_empty_else || saved_owner_iterator_else;
         if statement.elif_else_clauses.is_empty()
             || original_optimized_empty_else
             || (optimized_empty_else && statement.elif_else_clauses.len() == 1)
