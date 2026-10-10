@@ -43897,13 +43897,14 @@ fn copied_finally_has_guarded_raise_cleanup(body: &[Stmt]) -> bool {
 
 /// Certifies the unreachable name cleanup copied by a guarded handler return.
 fn copied_finally_has_terminal_named_recovery(body: &[Stmt]) -> bool {
-    let [Stmt::If(guard)] = body else {
+    let Some((Stmt::If(guard), prefix)) = body.split_last() else {
         return false;
     };
     let Some((Stmt::Try(recovery), leading)) = guard.body.split_last() else {
         return false;
     };
-    guard.elif_else_clauses.is_empty()
+    suite_has_nonsuspending_conditional_work(prefix)
+        && guard.elif_else_clauses.is_empty()
         && condition_has_linear_runtime_leaves(&guard.test)
         && !expression_suspends_current_scope(&guard.test)
         && (leading.is_empty() || suite_has_linear_borrow_fallthrough(leading))

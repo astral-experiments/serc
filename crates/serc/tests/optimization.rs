@@ -15,6 +15,21 @@ use serc::{
 };
 
 #[test]
+fn prefixed_copied_recovery_keeps_normal_continuation_owned() {
+    let source = "async def sample(owner, value, flag, needed):\n    try:\n        try:\n            owner.report(value)\n        except Exception as error:\n            if flag:\n                return None\n            result = None\n        return owner.result, value\n    except CancelledError:\n        raise\n    except Exception as error:\n        return None\n    finally:\n        if owner.helper is not None:\n            owner.helper.close()\n        if needed and owner is not None:\n            try:\n                await owner.close(value)\n                owner.finished()\n            except Exception as error:\n                owner.problem(error)\n                raise\n";
+    for source in [
+        source.to_owned(),
+        source.replace("await owner.close(value)", "owner.close(value)"),
+        source.replace(
+            "        if owner.helper is not None:\n            owner.helper.close()",
+            "        owner.before()",
+        ),
+    ] {
+        assert_matches_cpython(&source, "prefixed_copied_recovery.py", &LEVELS);
+    }
+}
+
+#[test]
 fn coroutine_nested_else_call_keeps_continuation_reachable() {
     let source = "async def sample(owner):\n    try:\n        owner.prepare()\n    except Error:\n        owner.fail()\n    else:\n        try:\n            result = await owner.work()\n        except Error:\n            owner.fail()\n        else:\n            if owner.invalid(result):\n                owner.fail()\n            else:\n                try:\n                    owner.parse(result)\n                except Error:\n                    owner.fail()\n                else:\n                    owner.store(result)\n    owner.done()\n";
     for source in [
