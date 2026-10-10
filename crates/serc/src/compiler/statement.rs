@@ -4721,29 +4721,24 @@ impl<'source> Compiler<'source> {
             && !self.control.statements.in_match
             && self.has_nested_erased_branch_scope_exit(statement);
         if self.context.python_version <= crate::PythonVersion::Py313
-            && (nested_312_scope_exit || if_suites(statement)
-                .any(|body| {
+            && (nested_312_scope_exit
+                || if_suites(statement).any(|body| {
                     matches!(body.last(), Some(Stmt::While(_)))
                         || (self.context.python_version == crate::PythonVersion::Py312
-                            && (matches!(body.last(), Some(Stmt::Try(_) | Stmt::If(_) | Stmt::Match(_) | Stmt::For(_)))
-                                || (plain_312_scope_exit
-                                    && matches!(body.iter().rev().find(|statement| {
+                            && (matches!(
+                                body.last(),
+                                Some(Stmt::Try(_) | Stmt::If(_) | Stmt::Match(_) | Stmt::For(_))
+                            ) || (plain_312_scope_exit
+                                && matches!(
+                                    body.iter().rev().find(|statement| {
                                         !self.context.is_elided_statement(statement)
-                                    }), Some(Stmt::If(_) | Stmt::While(_))))
+                                    }),
+                                    Some(Stmt::If(_) | Stmt::While(_))
+                                ))
                                 || matches!(body.last(), Some(Stmt::Expr(expression))
                                     if matches!(expression.value.as_ref(), Expr::Await(_)))
                                 || suite_has_cold_only_terminal_if_continuation(body)
-                                || body.iter().any(|statement| match statement {
-                                    Stmt::Assign(assignment) => {
-                                        super::expression::expression_defers_async_comprehension_restore(
-                                            &assignment.value,
-                                        )
-                                    }
-                                    Stmt::Assert(assertion) => {
-                                        assertion_defers_async_comprehension_restore(&assertion.test)
-                                    }
-                                    _ => false,
-                                })))
+                                || suite_defers_async_comprehension_restore(body)))
                 }))
         {
             // Keep each compound arm's original jump to the shared footer. 3.12
@@ -4767,14 +4762,15 @@ impl<'source> Compiler<'source> {
                         && loop_statement.orelse.is_empty()
                         && !suite_contains_loop_break(&loop_statement.body));
             self.compile_if(statement)?;
-            if nested_312_scope_exit || (plain_312_scope_exit
-                && (self.has_erased_binary_if_scope_exit(statement)
-                    || Self::has_nested_raising_if_scope_exit(statement)
-                    || (!self.control.statements.in_match
-                        && (nonbreaking_while_arm
-                            || (matches!(statement.test.as_ref(), Expr::Name(name) if name.id != "__debug__")
-                                && statement.elif_else_clauses.is_empty()
-                                && matches!(statement.body.as_slice(), [Stmt::If(inner)]
+            if nested_312_scope_exit
+                || (plain_312_scope_exit
+                    && (self.has_erased_binary_if_scope_exit(statement)
+                        || Self::has_nested_raising_if_scope_exit(statement)
+                        || (!self.control.statements.in_match
+                            && (nonbreaking_while_arm
+                                || (matches!(statement.test.as_ref(), Expr::Name(name) if name.id != "__debug__")
+                                    && statement.elif_else_clauses.is_empty()
+                                    && matches!(statement.body.as_slice(), [Stmt::If(inner)]
                                     if matches!(inner.test.as_ref(), Expr::Name(name) if name.id != "__debug__")
                                         && inner.elif_else_clauses.is_empty()
                                         && matches!(inner.body.as_slice(), [Stmt::Return(return_statement)]
@@ -47179,6 +47175,21 @@ fn suite_unary_not_fallthrough_range(body: &[Stmt]) -> Option<TextRange> {
         }
         _ => None,
     }
+}
+
+/// Manager bodies share their enclosing branch's cold restoration and return footer.
+fn suite_defers_async_comprehension_restore(body: &[Stmt]) -> bool {
+    if crate::stack_growth_required() {
+        return crate::grow_stack(|| suite_defers_async_comprehension_restore(body));
+    }
+    body.iter().any(|statement| match statement {
+        Stmt::Assign(assignment) => {
+            super::expression::expression_defers_async_comprehension_restore(&assignment.value)
+        }
+        Stmt::Assert(assertion) => assertion_defers_async_comprehension_restore(&assertion.test),
+        Stmt::With(manager) => suite_defers_async_comprehension_restore(&manager.body),
+        _ => false,
+    })
 }
 
 // Short-circuit, negated, and comparison assertions can still defer the comprehension's

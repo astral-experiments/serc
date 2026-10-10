@@ -13004,6 +13004,40 @@ fn short_circuit_prefix_preserves_nested_return_donors() {
 }
 
 #[test]
+fn manager_comprehensions_preserve_shared_conditional_returns() {
+    let source = r"async def sample(flag, items):
+    if flag:
+        async with manager():
+            assert [item async for item in items] == []
+        assert flag
+";
+    for asynchronous in [false, true] {
+        for nested in [false, true] {
+            for assigned in [false, true] {
+                let mut source = source.to_string();
+                if nested {
+                    source = source.replace(
+                        "            assert [",
+                        "            async with other():\n                assert [",
+                    );
+                }
+                if !asynchronous {
+                    source = source.replace("async with", "with");
+                }
+                if assigned {
+                    source = source.replace("        assert flag\n", "        result = flag\n");
+                }
+                assert_matches_cpython(
+                    &source,
+                    &format!("manager_comprehension_exit_{asynchronous}_{nested}_{assigned}.py"),
+                    &LEVELS,
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn suspended_comprehension_siblings_preserve_return_locations() {
     let source = r"async def collect(flag, items):
     if flag:
