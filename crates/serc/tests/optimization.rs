@@ -3319,6 +3319,47 @@ async def probe(items, item, worker, flag, delay):
 }
 
 #[test]
+fn guarded_first_arms_preserve_recovery_finalizer_borrowing() {
+    let source = r"def sample(mode, value, state):
+    try:
+        prepare()
+        if mode:
+            current = action() if state else value
+            report(value if state else current)
+            if not current:
+                raise RuntimeError()
+        else:
+            if value:
+                raise ValueError()
+            current = action()
+    except ValueError:
+        recover()
+        raise
+    except Exception as error:
+        recover(error)
+        raise
+    finally:
+        try:
+            finish(value, state)
+        except (ValueError, RuntimeError) as error:
+            if state is not None:
+                report(error)
+            raise
+";
+    for prefix in [
+        "prepare()",
+        "for item in values:\n            prepare(item)",
+    ] {
+        let source = source.replace("prepare()", prefix);
+        assert_matches_cpython(&source, "guarded_recovery.py", &LEVELS);
+        let source = format!(
+            "{source}        if state is not None:\n            for item in state.items:\n                try:\n                    action(item)\n                except ValueError:\n                    raise\n"
+        );
+        assert_matches_cpython(&source, "guarded_recovery_suffix.py", &LEVELS);
+    }
+}
+
+#[test]
 fn guarded_recovery_preserves_named_cleanup_entry() {
     for prefix in [
         "        if ready:\n            resource.prepare()\n",
