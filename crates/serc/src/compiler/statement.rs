@@ -34708,6 +34708,45 @@ impl<'source> Compiler<'source> {
                 .exceptions
                 .active_exception_region_exclusions
                 .is_empty();
+        // A guarded nonterminating recovery keeps the runtime loop's located exit
+        // connected to the cleanup iterator's populated preheader.
+        let nested_fallthrough_handler_reaches_finally = normal_recovery_entry_context
+            && synchronous_recovery
+            && self.control.finally.active_normal_finally_bodies == 0
+            && !statement.is_star
+            && statement.orelse.is_empty()
+            && !statement.handlers.is_empty()
+            && statement.handlers.iter().all(|handler| {
+                handler.as_except_handler().is_some_and(|handler| {
+                    handler.name.is_some()
+                        && matches!(handler.type_.as_deref(), Some(Expr::Name(_)))
+                        && matches!(handler.body.as_slice(), [Stmt::If(_)])
+                        && !suite_contains_conditional_nested_recovery(&handler.body)
+                        && suite_has_nonterminal_recovery_work(&handler.body, false)
+                })
+            })
+            && statement.handlers.iter().any(|handler| {
+                handler.as_except_handler().is_some_and(|handler| {
+                    suite_any_statement(&handler.body, |part| matches!(part, Stmt::Try(_)))
+                })
+            })
+            && matches!(statement.body.last(), Some(Stmt::While(body))
+            if body.orelse.is_empty()
+                && condition_has_only_runtime_tests(&body.test)
+                && condition_has_linear_runtime_leaves(&body.test)
+                && original_condition_has_unique_jump_target(&body.test, false)
+                && !expression_suspends_current_scope(&body.test)
+                && !suite_contains_loop_break(&body.body)
+                && body.body.last().is_some_and(|last| {
+                    suite_has_nonsuspending_linear_fallthrough(std::slice::from_ref(last))
+                }))
+            && matches!(statement.finalbody.as_slice(), [Stmt::For(cleanup)]
+                        if !cleanup.is_async
+                            && cleanup.orelse.is_empty()
+                            && matches!(cleanup.target.as_ref(), Expr::Name(_))
+                            && !expression_contains_inline_branch(&cleanup.iter)
+                            && !expression_suspends_current_scope(&cleanup.iter)
+                            && suite_has_nonsuspending_conditional_work(&cleanup.body));
         // A runtime condition store starts with its own populated test array.
         // Its short-circuit join does not empty the preceding recovery entry.
         let runtime_condition_cleanup_entry = normal_recovery_entry_context
@@ -35582,6 +35621,7 @@ impl<'source> Compiler<'source> {
             || dispatcher_break_reaches_finally
             || inner_try_break_loop_range.is_some()
             || conditional_handler_reaches_finally
+            || nested_fallthrough_handler_reaches_finally
             || managed_recovery_reaches_finally
             || managed_coroutine_recovery_reaches_finally
             || guarded_named_handler_reaches_finally
@@ -35595,6 +35635,50 @@ impl<'source> Compiler<'source> {
             || runtime_while_else_break_reaches_finally
             || loop_guarded_recovery_reaches_finally
             || managed_iterator_cleanup_entry;
+        // A runtime loop's terminal break can enter populated normal cleanup
+        // alongside an iterator recovery. Preserve the existing removed-edge veto.
+        let runtime_while_recovery_break = self.context.python_version
+            == crate::PythonVersion::Py314
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.control.loops.contexts.is_empty()
+            && !self.has_active_control_flow_region()
+            && !self.control.in_exception_handler()
+            && self.control.exceptions.active_exception_group_handlers == 0
+            && self.control.finally.active_finally_try_bodies == 0
+            && matches!(statement.handlers.as_slice(), [handler]
+            if handler.as_except_handler().is_some_and(|handler| {
+                handler.type_.as_ref().is_some_and(|kind| {
+                    !expression_contains_inline_branch(kind)
+                        && !expression_suspends_current_scope(kind)
+                }) && handler.body.split_last().is_some_and(|(last, prefix)| {
+                    (prefix.is_empty() || suite_has_linear_borrow_fallthrough(prefix))
+                        && matches!(last, Stmt::For(recovery)
+                            if !recovery.is_async
+                                && recovery.orelse.is_empty()
+                                && matches!(recovery.target.as_ref(), Expr::Name(_))
+                                && !expression_contains_inline_branch(&recovery.iter)
+                                && suite_has_linear_borrow_fallthrough(&recovery.body))
+                })
+            }))
+            && statement.body.split_last().is_some_and(|(last, prefix)| {
+                (prefix.is_empty() || suite_has_linear_borrow_fallthrough(prefix))
+                    && matches!(last, Stmt::While(loop_)
+                    if loop_.orelse.is_empty()
+                        && condition_has_only_runtime_tests(&loop_.test)
+                        && !expression_contains_inline_branch(&loop_.test)
+                        && original_condition_has_unique_jump_target(&loop_.test, false)
+                        && loop_.body.split_last().is_some_and(|(last, prefix)| {
+                            !suite_contains_loop_break(prefix)
+                                && !suite_contains_loop_continue(prefix)
+                                && !suite_contains_return(prefix)
+                                && matches!(last, Stmt::If(guard)
+                                    if guard.elif_else_clauses.is_empty()
+                                        && condition_has_only_runtime_tests(&guard.test)
+                                        && !expression_contains_inline_branch(&guard.test)
+                                        && matches!(guard.body.as_slice(), [Stmt::Break(_)]))
+                        }))
+            });
         // A runtime loop's surviving break enters the iterator cleanup without
         // crossing the enclosing synchronous managers' exits.
         let runtime_while_iterator_cleanup_break = self.context.python_version
@@ -35719,7 +35803,8 @@ impl<'source> Compiler<'source> {
                 || coroutine_conditional_cleanup_entry
                 || runtime_while_iterator_cleanup_break
                 || runtime_guarded_cleanup_break)
-            && (runtime_while_iterator_cleanup_break
+            && (runtime_while_recovery_break
+                || runtime_while_iterator_cleanup_break
                 || runtime_guarded_cleanup_break
                 || (self.context.python_version == crate::PythonVersion::Py314
                     && runtime_coroutine_break_context
