@@ -246,6 +246,25 @@ impl ConstantTable for InterningConstantTable<'_, '_> {
         Ok(index)
     }
 
+    fn fold_binary_sequence(
+        &mut self,
+        left: Constant,
+        argument: u32,
+        right: Constant,
+    ) -> Result<Option<u32>, CompileError> {
+        let index = self.output.fold_binary_sequence(left, argument, right)?;
+        if let Some(index) = index {
+            if argument == crate::target::operands::BinaryOperation::MULTIPLY.argument()
+                && matches!(self.output.get(index), Constant::Bytes(value) if value.is_empty())
+            {
+                self.context.record_empty_bytes_origin(true);
+            }
+            self.context
+                .record_constant_string_origins(self.output.get(index), false);
+        }
+        Ok(index)
+    }
+
     fn len(&self) -> usize {
         self.output.len()
     }

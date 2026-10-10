@@ -8,7 +8,7 @@ use super::super::{
 use crate::code_object::Constant;
 use crate::target::Opcode;
 use crate::target::opcodes::{
-    BUILD_LIST, BUILD_SET, BUILD_TUPLE, CALL_INTRINSIC_1, CONTAINS_OP, GET_ITER,
+    BINARY_OP, BUILD_LIST, BUILD_SET, BUILD_TUPLE, CALL_INTRINSIC_1, CONTAINS_OP, GET_ITER,
     GET_YIELD_FROM_ITER, LIST_APPEND, LOAD_COMMON_CONSTANT, LOAD_CONST, LOAD_SMALL_INT, NOP,
     SET_ADD, UNARY_NEGATIVE,
 };
@@ -446,6 +446,48 @@ impl OptimizationPipeline {
                         unary.set_operand(Operand::Value(argument));
                         loads.pop();
                         loads.push((position, opcode, argument));
+                        source_loads = loads.len();
+                    }
+                    BINARY_OP if loads.len() >= 2 && loads.len() - 2 < source_loads => {
+                        let first = loads.len() - 2;
+                        let value = |(_, opcode, argument): &(ItemPosition, Opcode, u32)| {
+                            if *opcode == LOAD_CONST {
+                                constants.get(*argument).clone()
+                            } else {
+                                Constant::Int(u64::from(*argument))
+                            }
+                        };
+                        let left = value(&loads[first]);
+                        let right = value(&loads[first + 1]);
+                        let Some(index) = constants.fold_binary_sequence(left, argument, right)?
+                        else {
+                            loads.clear();
+                            source_loads = 0;
+                            continue;
+                        };
+                        for (operand_position, opcode, argument) in loads.drain(first..) {
+                            if opcode == LOAD_CONST {
+                                folded_operand_admissions.insert(operand_position, argument);
+                            }
+                            let load = self.graph.instruction_mut(operand_position).unwrap();
+                            load.opcode = NOP;
+                            load.set_operand(Operand::Value(0));
+                            load.location = SourceLocation::NONE;
+                            load.no_location_policy.preserve_location();
+                        }
+                        if let Some((marker_position, marker_location)) = copied_jump_marker {
+                            let marker = self.graph.instruction_mut(marker_position).unwrap();
+                            marker.location = if marker_location.line == instruction.location.line {
+                                SourceLocation::NONE
+                            } else {
+                                marker_location
+                            };
+                            marker.no_location_policy.preserve_location();
+                        }
+                        let binary = self.graph.instruction_mut(position).unwrap();
+                        binary.opcode = LOAD_CONST;
+                        binary.set_operand(Operand::Value(index));
+                        loads.push((position, LOAD_CONST, index));
                         source_loads = loads.len();
                     }
                     BUILD_TUPLE

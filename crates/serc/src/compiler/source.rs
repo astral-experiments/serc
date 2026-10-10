@@ -898,6 +898,9 @@ fn can_fold_bytes(expression: &Expr) -> bool {
         Expr::BinOp(binary) if matches!(binary.op, Operator::Add | Operator::Mult) => {
             can_fold_bytes(&binary.left) || can_fold_bytes(&binary.right)
         }
+        Expr::If(conditional) => {
+            can_fold_bytes(&conditional.body) || can_fold_bytes(&conditional.orelse)
+        }
         Expr::Tuple(tuple) => tuple.elts.iter().any(can_fold_bytes),
         Expr::Subscript(subscript) => can_fold_bytes(&subscript.value),
         _ => false,
@@ -1138,10 +1141,13 @@ impl<'ast> SourceAnalysis<'ast> {
                     && self.python_version >= crate::PythonVersion::Py314
                     && can_fold_bytes(expression) =>
             {
-                self.requires_empty_bytes_cache_trace = matches!(
-                    fold_constant_for_version(expression, self.python_version),
-                    Some(Constant::Bytes(value)) if value.is_empty()
-                );
+                self.requires_empty_bytes_cache_trace =
+                    match fold_constant_for_version(expression, self.python_version) {
+                        Some(Constant::Bytes(value)) => value.is_empty(),
+                        Some(_) => false,
+                        // Exit copying may expose an operand that is not constant yet.
+                        None => true,
+                    };
             }
             Expr::Attribute(attribute) => {
                 self.record_raw_name(attribute.attr.as_str());
@@ -3227,6 +3233,9 @@ mod tests {
             ("((0,) + (b'a',))[1] * 0", true, true),
             ("((b'a',) * 2)[1] * 0", true, true),
             ("b'' * -1", true, true),
+            ("(b'a' if flag else b'b') * False", true, true),
+            ("(b'a' if flag else value) * 0", true, true),
+            ("b'a' * count", true, true),
             ("b'a' * 2", true, false),
             ("(b'a',) * 0", true, false),
             ("(1, b'a')[0] * 0", true, false),
