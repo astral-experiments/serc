@@ -58,6 +58,19 @@ fn guarded_recovery_work_reaches_stored_result_cleanup() {
 }
 
 #[test]
+fn comprehension_subscript_store_preserves_guarded_cleanup_entry() {
+    let source = "async def sample(owner, report):\n    try:\n        report[\"state\"] = [{\"kind\": \"control\" if key is None else \"data\", \"code\": stream.code if stream.ready else None} for key, stream in owner.streams]\n    except BaseException as error:\n        if owner.cancelled(error):\n            raise\n    finally:\n        report[\"final\"] = [{\"kind\": \"control\" if key is None else \"data\", \"code\": stream.code if stream.ready else None} for key, stream in owner.streams]\n";
+    for source in [
+        source.to_owned(),
+        source.replacen("    try:\n", "    try:\n        async with owner.manager():\n            await owner.prepare()\n", 1),
+        source.replace("        if owner.cancelled(error):", "        report[\"failed\"] = True\n        if owner.retry:\n            try:\n                value = await owner.recover()\n                report[\"recovered\"] = value\n                ready = value.active and value.done\n                if ready:\n                    owner.note(value)\n            except BaseException as recovery_error:\n                report[\"recovery_error\"] = recovery_error\n                if owner.cancelled(recovery_error):\n                    raise\n        if owner.cancelled(error):"),
+        source.replace("    finally:\n", "    finally:\n        if owner.active:\n            owner.cancel()\n        await owner.finish()\n"),
+    ] {
+        assert_matches_cpython(&source, "comprehension_store_cleanup.py", &LEVELS);
+    }
+}
+
+#[test]
 fn managed_loop_break_bypasses_erased_recovery_exit() {
     let source = "def sample(owner, active, cleanup):\n    count = 0\n    while active:\n        claimed = False\n        try:\n            with owner.pop() as item:\n                claimed = item is not None\n                if item is None:\n                    break\n                count += 1\n            if cleanup and item is not None:\n                try:\n                    if item.exists():\n                        owner.remove(item)\n                except Error as error:\n                    owner.warning(error)\n        except Error as error:\n            if claimed:\n                owner.failed()\n            owner.warning(error)\n            if not claimed:\n                if not owner.retryable(error):\n                    owner.close()\n                    raise\n    owner.close()\n    owner.report(count)\n";
     for source in [
