@@ -15,6 +15,49 @@ use serc::{
 };
 
 #[test]
+fn nested_suspended_manager_jump_keeps_owner() {
+    let source = "async def sample(owner, done):\n    try:\n        yield owner.item()\n    except (Cancelled, GeneratorExit):\n        raise\n    except Error as error:\n        yield owner.event(error)\n    finally:\n        try:\n            with owner.shield():\n                try:\n                    await owner.terminate()\n                finally:\n                    if not done:\n                        await owner.finish()\n        finally:\n            owner.release()\n";
+    for source in [
+        source.to_owned(),
+        source.replacen("    try:\n", "    try:\n        async with owner.open() as values:\n            async for value in values:\n                yield owner.event(value)\n", 1),
+        source.replace("if not done:", "if owner.pending:"),
+        source.replacen(
+            "        raise\n",
+            "        with owner.shield():\n            await owner.note()\n        raise\n",
+            1,
+        ),
+    ] {
+        assert_matches_cpython(&source, "suspended_manager_jump.py", &LEVELS);
+    }
+}
+
+#[test]
+fn nested_suspended_guard_preserves_false_edge_location() {
+    let source = "async def sample(owner):\n    try:\n        await owner.run()\n    finally:\n        with owner.shield():\n            try:\n                if owner.active == owner.ident:\n                    await owner.stream.close()\n            finally:\n                if owner.active == owner.ident:\n                    try:\n                        owner.result = owner.client.result\n                    finally:\n                        try:\n                            await owner.finish()\n                        finally:\n                            owner.release()\n";
+    for source in [
+        source.to_owned(),
+        source.replace("owner.active == owner.ident", "owner.active"),
+        source.replace("owner.result = owner.client.result", "await owner.cancel()\n                        owner.status = owner.client.status\n                        owner.result = owner.client.result"),
+    ] {
+        assert_matches_cpython(&source, "suspended_cleanup_guard.py", &LEVELS);
+    }
+}
+
+#[test]
+fn async_generator_while_exit_reaches_managed_cleanup() {
+    let source = "async def sample(owner, active):\n    try:\n        while active:\n            if owner.failed:\n                break\n    except Cancelled:\n        raise\n    except Error as error:\n        yield owner.event(error)\n    finally:\n        with owner.shield():\n            await owner.finish()\n";
+    for source in [
+        source.to_owned(),
+        source.replace("        while active:\n", "        while active:\n            item = await owner.next()\n            yield item\n"),
+        source.replace("    finally:\n", "    finally:\n        for worker in owner.workers:\n            if not worker.done():\n                worker.cancel()\n"),
+        source.replace("        yield owner.event(error)", "        owner.warning(error)\n        await owner.record(error)\n        yield owner.event(error)")
+            .replace("            await owner.finish()", "            with owner.suppress():\n                await owner.wait()\n            await owner.finish()"),
+    ] {
+        assert_matches_cpython(&source, "async_generator_while_cleanup.py", &LEVELS);
+    }
+}
+
+#[test]
 fn nested_coroutine_else_stores_reach_outer_continuation() {
     let source = "async def sample(owner, flag):\n    try:\n        try:\n            result = await owner.run()\n        except First as error:\n            result = owner.recover(error)\n        except Second as error:\n            result, flag = owner.other(error)\n        else:\n            if flag:\n                result = owner.left()\n            else:\n                result = owner.right()\n    except BaseException as error:\n        raise\n    return owner.finish(result)\n";
     for source in [

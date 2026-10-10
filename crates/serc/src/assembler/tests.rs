@@ -1049,6 +1049,9 @@ fn copied_finally_break_join_keeps_generic_cleanup_strict() {
             "outside unwind",
             "single guard",
             "empty cleanup",
+            "empty cleanup preserved",
+            "single preserved cleanup",
+            "single preserved guard",
         ] {
             let mut assembler = Assembler::with_python_version(version);
             let start = assembler.label();
@@ -1070,13 +1073,19 @@ fn copied_finally_break_join_keeps_generic_cleanup_strict() {
             assembler.record_exception_owner_block_boundary(start);
             assembler.set_location(condition);
             let first = assembler.linear_items().len();
-            assembler.emit_forward_with_depth(
+            let first_jump = assembler.emit_forward_with_depth(
                 POP_JUMP_IF_FALSE,
                 join,
                 0,
                 ExceptionPolicy::default(),
             );
-            if !matches!(mutation, "single guard" | "empty cleanup") {
+            if mutation == "single preserved guard" {
+                assembler
+                    .emitted_jump_mut(first_jump, "test preserved guard")
+                    .no_location_policy
+                    .preserve_location();
+            }
+            if !mutation.starts_with("single ") && !mutation.starts_with("empty cleanup") {
                 let second = assembler.emit_forward_with_depth(
                     POP_JUMP_IF_NONE,
                     join,
@@ -1100,7 +1109,7 @@ fn copied_finally_break_join_keeps_generic_cleanup_strict() {
                 );
             }
             assembler.set_location(location);
-            if mutation == "empty cleanup" {
+            if mutation.starts_with("empty cleanup") {
                 let entry = assembler.label();
                 assembler.mark(entry);
                 assembler.set_location(SourceLocation::NONE);
@@ -1112,7 +1121,16 @@ fn copied_finally_break_join_keeps_generic_cleanup_strict() {
                 0,
                 ExceptionPolicy::default(),
             );
-            if mutation == "empty cleanup" {
+            if matches!(
+                mutation,
+                "empty cleanup preserved" | "single preserved cleanup"
+            ) {
+                assembler
+                    .emitted_jump_mut(normal_jump, "test preserved cleanup")
+                    .no_location_policy
+                    .preserve_location();
+            }
+            if mutation.starts_with("empty cleanup") {
                 assembler.mark_borrow_empty_block(normal_jump);
                 let handler = assembler.label();
                 assembler.mark(handler);
@@ -1226,7 +1244,10 @@ fn copied_finally_break_join_keeps_generic_cleanup_strict() {
             );
             assert_eq!(
                 assembler.original_guarded_finally_exit_has_false_donor(condition, true),
-                matches!(mutation, "single guard" | "empty cleanup"),
+                matches!(
+                    mutation,
+                    "single guard" | "empty cleanup" | "empty cleanup preserved"
+                ),
                 "{version:?}: {mutation}"
             );
             let shared = assembler.at_original_shared_copied_finally_break_join();
