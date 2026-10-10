@@ -15383,6 +15383,87 @@ fn completed_prefix_preserves_finally_manager_exit() {
 }
 
 #[test]
+fn structured_cleanup_after_nested_definition_preserves_handler_entry() {
+    for (header, suspension) in [("def", ""), ("async def", "await ")] {
+        for tail in [
+            "job = complete(cleanup())\ntry:\n    finish(job)\nexcept Error:\n    report(resource)\n",
+            "job = complete(cleanup())\nwhile ready:\n    finish(job)\n",
+            "job = complete(cleanup())\nif ready:\n    finish(job)\n",
+            "with resource.lock:\n    complete(cleanup())\n",
+            "finish(cleanup() if ready else other)\n",
+        ] {
+            let mut source = format!(
+                "{header} sample(resource, ready, other):\n    try:\n        resource.run()\n    except Error as error:\n        raise\n    finally:\n        {header} cleanup():\n            {suspension}resource.close()\n"
+            );
+            for line in tail.lines() {
+                writeln!(source, "        {line}").unwrap();
+            }
+            assert_matches_cpython(&source, "structured_definition_cleanup.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
+fn generator_nested_cleanup_preserves_handler_boundary() {
+    for (header, suspension) in [("def", ""), ("async def", "await ")] {
+        for prefix in [
+            "",
+            "        fields = {**resource.fields, 'phase': 'cleanup'}\n        consume(fields)\n",
+        ] {
+            let source = format!(
+                "{header} sample(resource):\n    try:\n        yield resource\n    except Exception as error:\n        resource.poison()\n        if resource.failed:\n            consume(error)\n        raise\n    finally:\n{prefix}        state = None\n        {header} cleanup():\n            nonlocal state\n            state = resource.state\n            if not resource.closed:\n                {suspension}resource.close()\n        {suspension}complete(cleanup())\n        consume(state)\n"
+            );
+            assert_matches_cpython(&source, "generator_nested_cleanup.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
+fn nested_function_finally_retains_terminating_handler_boundary() {
+    for (header, suspension) in [("def", ""), ("async def", "await ")] {
+        for work in [
+            "pass\n",
+            "resource.wait()\n",
+            "for job in jobs:\n            job.finish()\n",
+        ] {
+            for cleanup_prefix in ["", "        resource.unregister()\n"] {
+                for handler in ["Exception", "Exception as error"] {
+                    for raising in ["", "    except LookupError:\n        raise\n"] {
+                        let source = format!(
+                            "{header} sample(resource, jobs):\n    try:\n        {work}{raising}    except {handler}:\n        pass\n    finally:\n{cleanup_prefix}        {header} cleanup():\n            if not resource.closed:\n                {suspension}resource.close()\n        {suspension}complete(cleanup())\n    return resource\n"
+                        );
+                        assert_matches_cpython(&source, "nested_function_finally.py", &LEVELS);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn sole_handler_retains_nested_finally_entry_marker() {
+    for (header, suspension) in [("def", ""), ("async def", "await ")] {
+        for recovery in ["pass", "recover(resource)"] {
+            for named in ["Exception", "Exception as error"] {
+                for raising_first in [false, true] {
+                    let normal = format!("    except {named}:\n        {recovery}\n");
+                    let raising = "    except LookupError:\n        raise\n";
+                    let handlers = if raising_first {
+                        format!("{raising}{normal}")
+                    } else {
+                        format!("{normal}{raising}")
+                    };
+                    let source = format!(
+                        "{header} sample(work, resource, tasks):\n    try:\n        return {suspension}work(resource)\n{handlers}    finally:\n        try:\n            {suspension}resource.close()\n        finally:\n            tasks.discard(work)\n"
+                    );
+                    assert_matches_cpython(&source, "sole_handler_finally_entry.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn nested_definition_before_finally_preserves_manager_exit() {
     for definition in [
         "async def child():\n            yield flag",
