@@ -28114,7 +28114,6 @@ impl<'source> Compiler<'source> {
                                 .current_original_block_ends_with_discarded_call())
                             || stored_call_finally_source)));
             let retained_finally_normal_source = !statement.is_star
-                && statement.orelse.is_empty()
                 && !statement.finalbody.is_empty()
                 && self
                     .assembler
@@ -35678,10 +35677,15 @@ impl<'source> Compiler<'source> {
                 || matches!(statement.body.as_slice(), [Stmt::Expr(work)]
                     if suite_has_linear_borrow_fallthrough(&statement.body)
                         && !expression_suspends_current_scope(&work.value))
-                || matches!(statement.body.as_slice(), [Stmt::Assign(work)]
-                    if matches!(work.targets.as_slice(), [Expr::Name(_)])
-                        && !expression_contains_inline_branch(&work.value)
-                        && !expression_suspends_current_scope(&work.value))
+                || statement.body.split_last().is_some_and(|(last, prefix)| {
+                    (prefix.is_empty() || suite_has_nonsuspending_linear_fallthrough(prefix))
+                        && matches!(last, Stmt::Assign(work)
+                            if matches!(work.targets.as_slice(), [Expr::Name(_)])
+                                && !expression_suspends_current_scope(&work.value)
+                                && (!expression_contains_inline_branch(&work.value)
+                                    || condition_has_linear_runtime_leaves(&work.value)
+                                    || recovery_assignment_has_nonempty_join(work)))
+                })
                 || (coroutine_while_nested_cleanup
                     && statement.body.split_last().is_some_and(|(last, prefix)| {
                         !suite_contains_loop_break(prefix)
@@ -35739,7 +35743,24 @@ impl<'source> Compiler<'source> {
                         && !expression_suspends_current_scope(&cleanup.value))
                 || matches!(statement.finalbody.as_slice(), [Stmt::Assign(cleanup)]
                     if cleanup.targets.iter().all(|target| !expression_suspends_current_scope(target))
-                        && !expression_suspends_current_scope(&cleanup.value)))));
+                        && !expression_suspends_current_scope(&cleanup.value))))
+                // Calls retain a populated entry before their argument branches.
+                || statement.finalbody.split_last().is_some_and(|(last, prefix)| {
+                    (prefix.is_empty()
+                        || (self.unit.flags & CO_COROUTINE == 0
+                            && self.suite_has_nonempty_borrow_entry(prefix)
+                            && matches!(prefix, [Stmt::With(manager)]
+                                if !manager.is_async && !suite_contains_abrupt_control_flow(&manager.body))))
+                        && matches!(last, Stmt::If(cleanup)
+                            if condition_has_linear_runtime_leaves(&cleanup.test)
+                                && !expression_suspends_current_scope(&cleanup.test)
+                                && cleanup.elif_else_clauses.is_empty()
+                                && cleanup.body.iter().all(|part| {
+                                    matches!(part, Stmt::Expr(work)
+                                        if matches!(work.value.as_ref(), Expr::Call(_))
+                                            && !expression_suspends_current_scope(&work.value))
+                                }))
+                }));
         // Completed awaits retain the normal entry before guarded cleanup. Raising
         // recovery does not copy this entry across the enclosing manager's exit.
         let managed_coroutine_recovery_reaches_finally = self.context.python_version

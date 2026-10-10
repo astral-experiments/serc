@@ -7207,6 +7207,64 @@ finally:
 }
 
 #[test]
+fn guarded_recovery_work_reaches_managed_cleanup() {
+    for (header, manager) in [
+        ("def", ""),
+        ("async def", ""),
+        (
+            "def",
+            "        with lock():\n            resource.release()\n",
+        ),
+    ] {
+        for value in [
+            "len(values)",
+            "len(values) == 1 and values[0] is True",
+            "first if ready else second",
+        ] {
+            for prefix in [
+                "",
+                "        token = resource.send()\n        values = token.get()\n",
+            ] {
+                for (before_guard, after_guard) in [
+                    ("", ""),
+                    (
+                        "        failed = expired(error)\n",
+                        "        healthy = False\n        saved_error = error\n",
+                    ),
+                ] {
+                    for terminal in ["raise", "return resource"] {
+                        let source = format!(
+                            "{header} sample(resource, values, ready, failed, retire, saved_error, first, second):\n    try:\n{prefix}        healthy = {value}\n    except Exception as error:\n{before_guard}        if not failed and not recoverable(error):\n            {terminal}\n{after_guard}    finally:\n{manager}        if retire:\n            report(resource, kind=type(saved_error).__name__ if saved_error is not None else None)\n            retire_resource(resource)\n"
+                        );
+                        assert_matches_cpython(&source, "guarded_recovery_cleanup.py", &LEVELS);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn recovery_else_finalizers_preserve_borrow_boundaries_across_local_slots() {
+    let recovery = "        try:\n            owner.report(item, details, force=True)\n        except Exception:\n            pass\n";
+    for padding in [9, 10, 64] {
+        let mut source = "def sample(owner, item, state, values):\n".to_owned();
+        for index in 0..padding {
+            writeln!(source, "    local_{index} = prepare(values)").unwrap();
+        }
+        source.push_str("    worker = prepare(item)\n    details = {}\n    try:\n        result = worker.run(item)\n        if state:\n            action(result)\n        else:\n            action(item)\n    except Exception as error:\n        details['error'] = error.payload if accepted(error) else {'kind': type(error).__name__, 'message': str(error)}\n        record(details)\n        try:\n            owner.report(item, details, force=True)\n        except Exception:\n            pass\n    else:\n        owner.finish(result, details)\n    finally:\n        worker.stop()\n");
+        for source in [
+            source.clone(),
+            source.replace("worker.stop()", "finish(worker)"),
+            source.replace(recovery, ""),
+            source.replace("    else:\n        owner.finish(result, details)\n", ""),
+        ] {
+            assert_matches_cpython(&source, "recovery_else_slots.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn guarded_recovery_preserves_populated_normal_cleanup_entries() {
     fn indent(source: &str) -> String {
         source.lines().fold(String::new(), |mut output, line| {
