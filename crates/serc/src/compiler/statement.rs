@@ -34303,6 +34303,43 @@ impl<'source> Compiler<'source> {
                         if raised.exc.is_some() || raised.cause.is_some()))
             }))
             && guarded_iterator_cleanup_has_local_continues(self, &statement.finalbody);
+        let comprehension_store_recovery = self.context.python_version
+            == crate::PythonVersion::Py314
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+            && statement.body.last().is_some_and(completed_comprehension_subscript_store)
+            && statement.handlers.iter().all(|handler| {
+                handler.as_except_handler().is_some_and(|handler| {
+                    handler.type_.is_some()
+                        && !suite_any_statement(&handler.body, |part| {
+                            matches!(part, Stmt::Return(_) | Stmt::Break(_) | Stmt::Continue(_)
+                                | Stmt::For(_) | Stmt::While(_) | Stmt::With(_))
+                                || matches!(part, Stmt::Try(recovery)
+                                    if recovery.is_star || !recovery.orelse.is_empty()
+                                        || !recovery.finalbody.is_empty() || recovery.handlers.is_empty()
+                                        || recovery.handlers.iter().any(|handler| {
+                                            handler.as_except_handler().is_none_or(|handler| handler.type_.is_none())
+                                        }))
+                                || matches!(part, Stmt::Raise(raised)
+                                    if raised.exc.is_some() || raised.cause.is_some())
+                        })
+                })
+            })
+            && statement.handlers.iter().any(|handler| {
+                handler.as_except_handler().is_some_and(|handler| {
+                    handler.name.is_some()
+                        && handler.body.iter().any(|part| matches!(part, Stmt::If(guard)
+                            if guard.elif_else_clauses.is_empty()
+                                && condition_has_linear_runtime_leaves(&guard.test)
+                                && !expression_suspends_current_scope(&guard.test)
+                                && suite_has_linear_raise_exit(&guard.body)))
+                })
+            })
+            && !suite_contains_abrupt_control_flow(&statement.finalbody)
+            && (self.suite_has_nonempty_borrow_entry(&statement.finalbody)
+                || statement.finalbody.first().is_some_and(completed_comprehension_subscript_store)
+                || matches!(statement.finalbody.first(), Some(Stmt::If(cleanup))
+                    if condition_has_linear_runtime_leaves(&cleanup.test)
+                        && !expression_suspends_current_scope(&cleanup.test)));
         // A guarded named handler has a populated exit into normal cleanup,
         // even when the protected body or an earlier handler is only `pass`.
         let guarded_named_handler_reaches_finally = !statement.is_star
@@ -34319,7 +34356,8 @@ impl<'source> Compiler<'source> {
             && self.control.finally.active_normal_finally_bodies == 0
             && self.control.finally.active_finally_end_blocks == 0
             && self.control.finally.active_copied_finally_bodies == 0
-            && (matches!(statement.body.as_slice(), [Stmt::Pass(_)])
+            && (comprehension_store_recovery
+                || matches!(statement.body.as_slice(), [Stmt::Pass(_)])
                 || matches!(statement.body.as_slice(), [Stmt::Expr(work)]
                     if suite_has_linear_borrow_fallthrough(&statement.body)
                         && !expression_suspends_current_scope(&work.value))
@@ -34341,7 +34379,7 @@ impl<'source> Compiler<'source> {
                                     && !expression_contains_inline_branch(&work.value)
                                     && !expression_suspends_current_scope(&work.value))
                     })))
-            && statement.handlers.split_last().is_some_and(|(guarded, preceding)| {
+            && (comprehension_store_recovery || statement.handlers.split_last().is_some_and(|(guarded, preceding)| {
                 preceding.len() <= 1 && preceding.iter().all(|plain| plain.as_except_handler().is_some_and(|handler| {
                     handler.type_.is_some()
                         && handler.name.is_none()
@@ -34367,10 +34405,10 @@ impl<'source> Compiler<'source> {
                                                 if return_.value.as_deref().is_none_or(|value| matches!(value, Expr::Name(_))))))
                         }) || (coroutine_while_nested_cleanup
                             && suite_has_linear_reraise_guards(&handler.body)))
-                })})
+                })}))
             // Raising recovery keeps the multiline cleanup setup populated.
             // A returning handler can copy that setup onto a separate exit.
-            && ((nested_cleanup_has_located_setup
+            && (comprehension_store_recovery || (nested_cleanup_has_located_setup
                     && statement.handlers.iter().all(|handler| {
                         handler.as_except_handler().is_some_and(|handler| {
                             !suite_contains_return(&handler.body)
@@ -42417,6 +42455,38 @@ pub(super) fn suite_has_linear_borrow_fallthrough(body: &[Stmt]) -> bool {
         has_runtime_work |= has_work;
     }
     has_runtime_work
+}
+
+/// A subscript store follows the tuple-binding comprehension's restored-local exit.
+fn completed_comprehension_subscript_store(statement: &Stmt) -> bool {
+    let Stmt::Assign(assignment) = statement else {
+        return false;
+    };
+    let Expr::ListComp(comprehension) = assignment.value.as_ref() else {
+        return false;
+    };
+    matches!(assignment.targets.as_slice(), [Expr::Subscript(target)]
+        if matches!(target.value.as_ref(), Expr::Name(_))
+            && fold_constant(&target.slice).is_some())
+        && !expression_suspends_current_scope(&assignment.value)
+        && !expression_yields_in_current_scope(&assignment.value)
+        && matches!(comprehension.generators.as_slice(), [iterator]
+            if !iterator.is_async
+                && iterator.ifs.is_empty()
+                && !expression_contains_inline_branch(&iterator.iter)
+                && matches!(&iterator.target, Expr::Tuple(tuple)
+                    if tuple.elts.len() > 1
+                        && tuple.elts.iter().all(|item| matches!(item, Expr::Name(_)))))
+        && matches!(comprehension.elt.as_ref(), Expr::Dict(dict)
+        if !dict.items.is_empty()
+            && dict.items.iter().all(|item| {
+                item.key.as_ref().is_some_and(|key| fold_constant(key).is_some())
+                    && (!expression_contains_inline_branch(&item.value)
+                        || matches!(&item.value, Expr::If(value)
+                            if condition_has_linear_runtime_leaves(&value.test)
+                                && !expression_contains_inline_branch(&value.body)
+                                && !expression_contains_inline_branch(&value.orelse)))
+            }))
 }
 
 /// Recognizes a populated try exit after linear work or a completed comprehension store.
