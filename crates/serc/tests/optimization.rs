@@ -6511,6 +6511,18 @@ fn erased_conditional_preserves_join_before_async_manager_exit() {
 }
 
 #[test]
+fn conditional_attribute_copies_fuse_aliased_local_entries() {
+    for operator in ["and", "or"] {
+        for condition in ["flag", "isinstance(value, str)"] {
+            let source = format!(
+                "def sample(receiver, explicit, value, flag):\n    receiver.value = explicit {operator} (value if {condition} else None)\n"
+            );
+            assert_matches_cpython(&source, "conditional_attribute_entry.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn conditional_call_preserves_erased_else_try_exit() {
     for (index, (call, otherwise)) in [
         ("consume(item if enabled else values)", "assert item"),
