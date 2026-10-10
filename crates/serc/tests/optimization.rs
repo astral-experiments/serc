@@ -382,6 +382,213 @@ fn coroutine_retry_false_exit_reaches_conditional_cleanup() {
 }
 
 #[test]
+fn outer_awaited_finalizers_preserve_continuation_borrowing() {
+    let base = |prefix: bool, chain: bool, binding: bool| {
+        let mut source = String::from(
+            "async def probe(worker, cleanup, guard, task, flag, other):\n    await worker.prepare()\n    try:\n        await worker.run()\n    finally:\n",
+        );
+        if prefix {
+            source.push_str("        worker.release()\n");
+        }
+        source.push_str("        if flag:\n            with guard()");
+        source.push_str(if binding { " as result:\n" } else { ":\n" });
+        source.push_str("                await task\n");
+        if chain {
+            source.push_str(
+                "        elif other:\n            with guard():\n                await task\n",
+            );
+        }
+        source.push_str(
+            "        else:\n            await task\n        await cleanup.close()\n    worker.finish()\n",
+        );
+        source
+    };
+    for prefix in [false, true] {
+        for chain in [false, true] {
+            for binding in [false, true] {
+                assert_matches_cpython(
+                    &base(prefix, chain, binding),
+                    &format!("outer_awaited_cleanup_{prefix}_{chain}_{binding}.py"),
+                    &LEVELS,
+                );
+            }
+        }
+    }
+    let source = base(true, true, false);
+    for (index, (before, after)) in [
+        ("    worker.finish()\n", "    assert worker.ready()\n"),
+        ("    worker.finish()\n", "    assert worker\n"),
+        (
+            "    worker.finish()\n",
+            "    assert worker.ready()\n    assert cleanup.ready()\n",
+        ),
+        ("    worker.finish()\n", "    pass\n"),
+        ("        if flag:\n", "        if True:\n"),
+        (
+            "        elif other:\n            with guard():\n                await task\n",
+            "        elif other:\n            with guard() as result:\n                await task\n            assert result.ready\n",
+        ),
+        (
+            "        elif other:\n            with guard():\n                await task\n",
+            "        elif other:\n            with guard() as result:\n                await task\n            if flag:\n                assert result.ready\n",
+        ),
+        (
+            "        elif other:\n            with guard():\n                await task\n",
+            "        elif other:\n            with guard():\n                await task\n        elif cleanup:\n            with guard() as result:\n                await task\n            if flag:\n                assert result.ready\n",
+        ),
+        (
+            "        if flag:\n            with guard():\n                await task\n",
+            "        if flag:\n            with guard():\n                await task\n            assert task.ready\n",
+        ),
+        (
+            "        else:\n            await task\n",
+            "        else:\n            assert (await task).ready\n",
+        ),
+        (
+            "        else:\n            await task\n",
+            "        else:\n            assert (await task).ready == 1\n",
+        ),
+        (
+            "        else:\n            await task\n",
+            "        else:\n            assert (await worker.consume(task)).ready == flag\n",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            &source.replace(before, after),
+            &format!("outer_awaited_cleanup_boundary_{index}.py"),
+            &LEVELS,
+        );
+    }
+    for (index, assertion) in [
+        "assert task.ready",
+        "assert (await worker.consume(await task)).ready == flag",
+        "assert (await (task if flag else other)).ready == flag",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let source = source.replace(
+            "        else:\n            await task\n",
+            &format!("        else:\n            {assertion}\n"),
+        );
+        assert_matches_cpython(
+            &source,
+            &format!("outer_awaited_erased_assertion_{index}.py"),
+            &[OptimizationLevel::One, OptimizationLevel::Two],
+        );
+    }
+}
+
+#[test]
+fn asserted_awaited_finalizers_preserve_continuation_borrowing() {
+    for protected in ["pass", "await task"] {
+        for managed in ["pass", "await task"] {
+            for prefix in ["", "        resource.release()\n"] {
+                let source = format!(
+                    "async def probe(flag, task, resource):\n    try:\n        {protected}\n    finally:\n{prefix}        if flag:\n            with guard():\n                {managed}\n        else:\n            await task\n        assert await resource.finish()\n    assert resource.ready()\n"
+                );
+                assert_matches_cpython(&source, "asserted_awaited_finalizer.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn conditional_awaited_finalizers_preserve_outer_cleanup_borrowing() {
+    for managed in [false, true] {
+        for body_guard in [false, true] {
+            let mut source = String::from(
+                "async def probe(value, manager, guard, worker, cleanup, task, flag):\n    await worker.prepare(value)\n    try:\n",
+            );
+            let pad = if managed {
+                source.push_str("        async with manager():\n");
+                "            "
+            } else {
+                "        "
+            };
+            let mut push = |line: &str| {
+                source.push_str(pad);
+                source.push_str(line);
+                source.push('\n');
+            };
+            push("try:");
+            push("    await worker.run(value)");
+            if body_guard {
+                push("    with guard():");
+                push("        await worker.fetch(value)");
+            } else {
+                push("    await worker.fetch(value)");
+            }
+            for line in [
+                "    assert worker.ready(value)",
+                "finally:",
+                "    if flag:",
+                "        task.cancel()",
+                "        with guard():",
+                "            await task",
+                "    else:",
+                "        worker.stop()",
+                "        await task",
+                "    await cleanup.close()",
+            ] {
+                push(line);
+            }
+            source.push_str("    finally:\n        await worker.finish()\n");
+            assert_matches_cpython(
+                &source,
+                &format!("conditional_awaited_cleanup_{managed}_{body_guard}.py"),
+                &LEVELS,
+            );
+            if !managed && !body_guard {
+                for (index, (old, new)) in [
+                    ("    await worker.prepare(value)\n", ""),
+                    ("                task.cancel()\n", ""),
+                    ("                worker.stop()\n", ""),
+                    (
+                        "            await cleanup.close()\n",
+                        "            await cleanup\n",
+                    ),
+                    (
+                        "                    await task\n",
+                        "                    await task.finish()\n",
+                    ),
+                    (
+                        "        await worker.finish()\n",
+                        "        worker.finish()\n",
+                    ),
+                    (
+                        "            await worker.run(value)\n            await worker.fetch(value)\n            assert worker.ready(value)\n",
+                        "            pass\n",
+                    ),
+                    (
+                        "            await worker.run(value)\n            await worker.fetch(value)\n            assert worker.ready(value)\n",
+                        "            worker.run(value)\n",
+                    ),
+                    ("            if flag:\n", "            if True:\n"),
+                    (
+                        "                task.cancel()\n                with guard():\n                    await task\n            else:\n                worker.stop()\n                await task\n",
+                        "                task.cancel()\n                await task\n            else:\n                worker.stop()\n                with guard():\n                    await task\n",
+                    ),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let source = source.replace(old, new);
+                    assert_matches_cpython(
+                        &source,
+                        &format!("conditional_awaited_cleanup_boundary_{index}.py"),
+                        &LEVELS,
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn conditional_manager_callback_store_keeps_cleanup_exit_owned() {
     let source = "async def sample(owner, client, task, cancel, failed, detach):\n    try:\n        replacement = owner.create()\n    finally:\n        if cancel:\n            with owner.expect(Cancelled):\n                await owner.wait(task)\n        elif failed and not detach:\n            with owner.expect(Failed):\n                await owner.wait(task)\n        else:\n            await owner.wait(task)\n        client.close = lambda: None\n    assert owner.active.session is replacement\n";
     for source in [

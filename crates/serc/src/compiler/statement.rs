@@ -37977,7 +37977,58 @@ impl<'source> Compiler<'source> {
             {
                 self.assembler.record_folded_condition_borrow_entry(end);
             }
-            let outer_conditional_callback_exit = self.context.python_version
+            // Completing the first arm's manager leaves an empty original exit before
+            // the enclosing cleanup, even when this finalizer ends with an await.
+            let conditional_awaited_finally_exit = self.context.python_version
+                == crate::PythonVersion::Py314
+                && matches!(self.unit.scope, Scope::Function { .. })
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                    == CO_COROUTINE
+                && !statement.is_star
+                && statement.handlers.is_empty()
+                && statement.orelse.is_empty()
+                && self.control.loops.contexts.is_empty()
+                && self.control.exceptions.active_exception_handlers.is_empty()
+                && self.control.exceptions.active_exception_group_handlers == 0
+                && self.control.finally.active_finally_try_bodies == 1
+                && self
+                    .control
+                    .finally
+                    .innermost_finally_exception_exclusion_depth
+                    == Some(1)
+                && self.control.finally.protected_try_loop_depths.as_slice() == [(1, 0)]
+                && self.control.finally.active_normal_finally_bodies == 0
+                && self.control.finally.active_copied_finally_bodies == 0
+                && self.control.finally.active_finally_end_blocks == 0
+                && self.control.finally.active_overriding_finally_returns == 0
+                && self.control.withs.active_with_exits.len() <= 1
+                && self.control.withs.active_with_region_exclusions.len()
+                    == self.control.withs.active_with_exits.len()
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .len()
+                    == 1
+                && matches!(self.control.finally.active_return_finally_contexts.as_slice(), [owner]
+                if owner.enclosing_finally_try_depth == 0
+                    && owner.loop_depth == 0
+                    && owner.with_depth == 0
+                    && owner.handler_depth == 0
+                    && owner.finally_end_depth == 0
+                    && owner.exception_region_depth == 0
+                    && owner.source_range.contains_range(statement.range)
+                    && self.control.withs.active_with_exits.iter().all(|manager| {
+                        manager.is_async
+                            && manager.exception_region_depth == 1
+                            && manager.finally_end_depth == 0
+                            && manager.normal_finally_depth == 0
+                            && manager.loop_depth == 0
+                            && owner.source_range.contains_range(manager.source_range)
+                            && manager.terminal_statement_range == Some(statement.range)
+                    }))
+                && finally_conditional_await_leaves_empty_borrow_exit(&statement.finalbody);
+            let outer_conditional_await_exit = self.context.python_version
                 == crate::PythonVersion::Py314
                 && !preserve_exit_nop
                 && conditional_exit.is_none()
@@ -38004,7 +38055,7 @@ impl<'source> Compiler<'source> {
                     .finally
                     .innermost_finally_exception_exclusion_depth
                     .is_none()
-                && outer_finally_callback_store_leaves_empty_borrow_exit(&statement.finalbody);
+                && outer_finally_await_chain_leaves_empty_borrow_exit(self, &statement.finalbody);
             // An erased finalizer after structured cleanup leaves a separate empty array.
             let erased_cleanup_finally_exit = self.context.python_version
                 == crate::PythonVersion::Py314
@@ -38068,7 +38119,8 @@ impl<'source> Compiler<'source> {
                 };
             // A folded true terminal conditional also retains its original empty exit,
             // even when its selected body has a nested handler or manager bypass.
-            if outer_conditional_callback_exit
+            if conditional_awaited_finally_exit
+                || outer_conditional_await_exit
                 || erased_cleanup_finally_exit
                 || (suite_ends_in_empty_try_exit_block(&statement.finalbody, false)
                     && matches!(statement.finalbody.last(), Some(Stmt::If(tail))
@@ -38168,7 +38220,15 @@ impl<'source> Compiler<'source> {
                 // Branch and manager joins, including empty joins retained when a finally
                 // loop's cold copy moves, interrupt CPython's borrowed-load traversal.
                 // A small return copied onto the exit replaces the marker with its own code.
-                self.assembler.mark_borrow_empty_block(normal_exit);
+                if outer_conditional_await_exit
+                    && matches!(statement.finalbody.last(), Some(Stmt::Assert(_)))
+                {
+                    // Keep the assertion's located success NOP while stopping borrowing.
+                    self.assembler
+                        .mark_borrow_fallthrough_barrier(normal_exit.instruction());
+                } else {
+                    self.assembler.mark_borrow_empty_block(normal_exit);
+                }
             }
             if let Some(entry) = erased_awaited_else_entry {
                 // Erasing the finalizer leaves the original POP_BLOCK/JUMP pair.
@@ -46558,46 +46618,129 @@ fn suite_contains_nested_handler_cold_join(body: &[Stmt]) -> bool {
     detector.found
 }
 
-// Completed manager arms leave an empty exit after the common callback store.
-fn outer_finally_callback_store_leaves_empty_borrow_exit(body: &[Stmt]) -> bool {
-    let linear = |expression: &Expr| {
-        !expression_contains_inline_branch(expression)
-            && !expression_suspends_current_scope(expression)
-    };
+// The false arm bypasses the completed manager before both arms await the suffix.
+fn finally_conditional_await_leaves_empty_borrow_exit(body: &[Stmt]) -> bool {
     let simple_await = |part: &Stmt| {
         matches!(part, Stmt::Expr(expression)
             if matches!(expression.value.as_ref(), Expr::Await(awaited)
                 if matches!(awaited.value.as_ref(), Expr::Call(_) | Expr::Name(_))
-                    && linear(&awaited.value)))
+                    && !expression_contains_inline_branch(&awaited.value)
+                    && !expression_suspends_current_scope(&awaited.value)))
     };
-    let Some((Stmt::Assign(store), leading)) = body.split_last() else {
+    let call_prefix = |parts: &[Stmt]| {
+        parts.iter().all(|part| {
+            matches!(part, Stmt::Expr(expression)
+                if matches!(expression.value.as_ref(), Expr::Call(_))
+                    && !expression_contains_inline_branch(&expression.value)
+                    && !expression_suspends_current_scope(&expression.value))
+        })
+    };
+    let [Stmt::If(branch), suffix] = body else {
         return false;
     };
-    if !matches!(store.targets.as_slice(), [Expr::Attribute(target)] if linear(&target.value))
-        || !matches!(store.value.as_ref(), Expr::Lambda(callback)
-            if callback.parameters.as_ref().is_none_or(|parameters| parameters.is_empty())
-                && matches!(callback.body.as_ref(), Expr::NoneLiteral(_)))
-    {
+    let [otherwise] = branch.elif_else_clauses.as_slice() else {
         return false;
-    }
+    };
+    let Some((Stmt::With(manager), prefix)) = branch.body.split_last() else {
+        return false;
+    };
+    let Some((alternative, alternative_prefix)) = otherwise.body.split_last() else {
+        return false;
+    };
+    condition_has_linear_runtime_leaves(&branch.test)
+        && !expression_suspends_current_scope(&branch.test)
+        && condition_jump_target_count(&branch.test, true) == 1
+        && condition_jump_target_count(&branch.test, false) == 1
+        && otherwise.test.is_none()
+        && call_prefix(prefix)
+        && !manager.is_async
+        && manager.items.len() == 1
+        && manager.items[0].optional_vars.is_none()
+        && !expression_contains_inline_branch(&manager.items[0].context_expr)
+        && !expression_suspends_current_scope(&manager.items[0].context_expr)
+        && matches!(manager.body.as_slice(), [part] if simple_await(part))
+        && call_prefix(alternative_prefix)
+        && simple_await(alternative)
+        && simple_await(suffix)
+}
+
+// Completed manager arms leave an original exit after the common cleanup suffix.
+fn outer_finally_await_chain_leaves_empty_borrow_exit(
+    compiler: &Compiler<'_>,
+    body: &[Stmt],
+) -> bool {
+    let linear = |expression: &Expr| {
+        !expression_contains_inline_branch(expression)
+            && !expression_suspends_current_scope(expression)
+    };
+    let simple_await = |expression: &Expr| {
+        matches!(expression, Expr::Await(awaited)
+            if matches!(awaited.value.as_ref(), Expr::Call(_) | Expr::Name(_))
+                && linear(&awaited.value))
+    };
+    let awaited_attribute = |expression: &Expr| matches!(expression, Expr::Attribute(attribute) if simple_await(&attribute.value));
+    let asserted_await = |expression: &Expr| {
+        awaited_attribute(expression)
+            || matches!(expression, Expr::Compare(comparison)
+                if comparison.ops.as_ref() == [CmpOp::Eq]
+                    && matches!(comparison.operands.as_ref(), [left, right]
+                        if awaited_attribute(left)
+                            && (matches!(right, Expr::Name(_)) || is_literal_constant(right))))
+    };
+    let Some((suffix, leading)) = body.split_last() else {
+        return false;
+    };
+    let stored_callback = matches!(suffix, Stmt::Assign(assignment)
+        if matches!(assignment.targets.as_slice(), [Expr::Attribute(target)] if linear(&target.value))
+            && matches!(assignment.value.as_ref(), Expr::Lambda(callback)
+                if callback.parameters.as_ref().is_none_or(|parameters| parameters.is_empty())
+                    && matches!(callback.body.as_ref(), Expr::NoneLiteral(_))));
+    let condition = |test: &Expr| {
+        condition_has_linear_runtime_leaves(test)
+            && !expression_suspends_current_scope(test)
+            && condition_jump_target_count(test, true) == 1
+            && (stored_callback || condition_jump_target_count(test, false) == 1)
+    };
+    let elided_assertion = |statement: &Stmt| {
+        matches!(statement, Stmt::Global(global) if global.names.is_empty())
+            && compiler.context.is_elided_statement(statement)
+    };
+    let assertion = |statement: &Stmt| {
+        elided_assertion(statement)
+            || matches!(statement, Stmt::Assert(assertion)
+                if assertion.msg.is_none() && condition(&assertion.test))
+    };
+    let asserted_suffix = matches!(suffix, Stmt::Assert(assertion)
+        if assertion.msg.is_none() && simple_await(&assertion.test));
+    let manager_arm = |parts: &[Stmt]| {
+        let Some((Stmt::With(manager), tail)) = parts.split_first() else {
+            return false;
+        };
+        !manager.is_async
+            && manager.items.len() == 1
+            && manager.items[0]
+                .optional_vars
+                .as_ref()
+                .is_none_or(|target| matches!(target.as_ref(), Expr::Name(_)))
+            && linear(&manager.items[0].context_expr)
+            && (matches!(manager.body.as_slice(), [Stmt::Expr(part)] if simple_await(&part.value))
+                || (asserted_suffix && matches!(manager.body.as_slice(), [Stmt::Pass(_)])))
+            && match tail {
+                [] => true,
+                [part] if assertion(part) => true,
+                [Stmt::If(branch)] => {
+                    condition(&branch.test)
+                        && branch.elif_else_clauses.is_empty()
+                        && matches!(branch.body.as_slice(), [part] if assertion(part))
+                }
+                _ => false,
+            }
+    };
     let Some((Stmt::If(branch), prefix)) = leading.split_last() else {
         return false;
     };
     let Some((otherwise, tested)) = branch.elif_else_clauses.split_last() else {
         return false;
-    };
-    let condition = |test: &Expr| {
-        condition_has_linear_runtime_leaves(test)
-            && !expression_suspends_current_scope(test)
-            && condition_jump_target_count(test, true) == 1
-    };
-    let manager_arm = |parts: &[Stmt]| {
-        matches!(parts, [Stmt::With(manager)]
-            if !manager.is_async
-                && matches!(manager.items.as_slice(), [item]
-                    if item.optional_vars.as_ref().is_none_or(|target| matches!(target.as_ref(), Expr::Name(_)))
-                        && linear(&item.context_expr))
-                && matches!(manager.body.as_slice(), [part] if simple_await(part)))
     };
     prefix.iter().all(|part| {
         matches!(part, Stmt::Expr(expression)
@@ -46608,7 +46751,15 @@ fn outer_finally_callback_store_leaves_empty_borrow_exit(body: &[Stmt]) -> bool 
             .iter()
             .all(|arm| arm.test.as_ref().is_some_and(&condition) && manager_arm(&arm.body))
         && otherwise.test.is_none()
-        && matches!(otherwise.body.as_slice(), [part] if simple_await(part))
+        && match otherwise.body.as_slice() {
+            [part] if elided_assertion(part) => true,
+            [Stmt::Expr(expression)] => simple_await(&expression.value),
+            [Stmt::Assert(assertion)] => assertion.msg.is_none() && asserted_await(&assertion.test),
+            _ => false,
+        }
+        && (stored_callback
+            || asserted_suffix
+            || matches!(suffix, Stmt::Expr(expression) if simple_await(&expression.value)))
 }
 
 // A conditional cleanup can reach its call suffix through an independent bypass,
