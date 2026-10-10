@@ -34518,7 +34518,10 @@ impl<'source> Compiler<'source> {
         // A plain companion containing work or only pass statements does not remove
         // that route. Named companions retain their own normal name-clearing cleanup.
         // Copied loop and nested cleanup exits keep their separate rules.
-        let plain_handler_shares_guarded_cleanup = synchronous_recovery
+        let plain_handler_shares_guarded_cleanup = matches!(
+            self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR),
+            0 | CO_COROUTINE
+        )
             && matches!(self.unit.scope, Scope::Function { .. })
             && statement.orelse.is_empty()
             && self.control.loops.contexts.is_empty()
@@ -34827,6 +34830,16 @@ impl<'source> Compiler<'source> {
                             !expression_contains_inline_branch(value)
                         })))))
                 || runtime_condition_cleanup_entry
+                // Loading the callable keeps this entry populated before argument
+                // comprehensions or other runtime branches begin.
+                || (plain_handler_shares_guarded_cleanup
+                    && matches!(statement.finalbody.first(), Some(Stmt::Assign(assignment))
+                        if assignment.targets.len() == 1
+                            && !expression_suspends_current_scope(&assignment.value)
+                            && matches!(assignment.value.as_ref(), Expr::Call(call)
+                                if matches!(call.func.as_ref(), Expr::Name(_))
+                                    || matches!(call.func.as_ref(), Expr::Attribute(attribute)
+                                        if matches!(attribute.value.as_ref(), Expr::Name(_))))))
                 || suite_has_linear_borrow_fallthrough(&statement.finalbody)
                 || nested_recovery_finally_entry
                 || copied_guarded_manager_cleanup
@@ -35417,10 +35430,20 @@ impl<'source> Compiler<'source> {
                         if raised.exc.is_some() || raised.cause.is_some()))
             }))
             && guarded_iterator_cleanup_has_local_continues(self, &statement.finalbody);
-        let comprehension_store_recovery = self.context.python_version
+        // A named raise guard retains its recovery entry after a completed store.
+        // Plain companion handlers do not remove that route into normal cleanup.
+        let comprehension_subscript_store = statement
+            .body
+            .last()
+            .is_some_and(completed_comprehension_subscript_store);
+        let coroutine_guarded_store_recovery = self.context.python_version
             == crate::PythonVersion::Py314
             && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
-            && statement.body.last().is_some_and(completed_comprehension_subscript_store)
+            && statement.body.last().is_some_and(|tail| {
+                comprehension_subscript_store
+                    || (matches!(tail, Stmt::Assign(_))
+                        && suite_has_nonsuspending_linear_fallthrough(std::slice::from_ref(tail)))
+            })
             && statement.handlers.iter().all(|handler| {
                 handler.as_except_handler().is_some_and(|handler| {
                     handler.type_.is_some()
@@ -35428,13 +35451,17 @@ impl<'source> Compiler<'source> {
                             matches!(part, Stmt::Return(_) | Stmt::Break(_) | Stmt::Continue(_)
                                 | Stmt::For(_) | Stmt::While(_) | Stmt::With(_))
                                 || matches!(part, Stmt::Try(recovery)
-                                    if recovery.is_star || !recovery.orelse.is_empty()
-                                        || !recovery.finalbody.is_empty() || recovery.handlers.is_empty()
+                                    if !comprehension_subscript_store
+                                        || recovery.is_star
+                                        || !recovery.orelse.is_empty()
+                                        || !recovery.finalbody.is_empty()
+                                        || recovery.handlers.is_empty()
                                         || recovery.handlers.iter().any(|handler| {
                                             handler.as_except_handler().is_none_or(|handler| handler.type_.is_none())
                                         }))
-                                || matches!(part, Stmt::Raise(raised)
-                                    if raised.exc.is_some() || raised.cause.is_some())
+                                || (comprehension_subscript_store
+                                    && matches!(part, Stmt::Raise(raised)
+                                        if raised.exc.is_some() || raised.cause.is_some()))
                         })
                 })
             })
@@ -35450,7 +35477,8 @@ impl<'source> Compiler<'source> {
             })
             && !suite_contains_abrupt_control_flow(&statement.finalbody)
             && (self.suite_has_nonempty_borrow_entry(&statement.finalbody)
-                || statement.finalbody.first().is_some_and(completed_comprehension_subscript_store)
+                || (comprehension_subscript_store
+                    && statement.finalbody.first().is_some_and(completed_comprehension_subscript_store))
                 || matches!(statement.finalbody.first(), Some(Stmt::If(cleanup))
                     if condition_has_linear_runtime_leaves(&cleanup.test)
                         && !expression_suspends_current_scope(&cleanup.test)));
@@ -35470,7 +35498,7 @@ impl<'source> Compiler<'source> {
             && self.control.finally.active_normal_finally_bodies == 0
             && self.control.finally.active_finally_end_blocks == 0
             && self.control.finally.active_copied_finally_bodies == 0
-            && (comprehension_store_recovery
+            && (coroutine_guarded_store_recovery
                 || matches!(statement.body.as_slice(), [Stmt::Pass(_)])
                 || matches!(statement.body.as_slice(), [Stmt::Expr(work)]
                     if suite_has_linear_borrow_fallthrough(&statement.body)
@@ -35493,7 +35521,7 @@ impl<'source> Compiler<'source> {
                                     && !expression_contains_inline_branch(&work.value)
                                     && !expression_suspends_current_scope(&work.value))
                     })))
-            && (comprehension_store_recovery || statement.handlers.split_last().is_some_and(|(guarded, preceding)| {
+            && (coroutine_guarded_store_recovery || statement.handlers.split_last().is_some_and(|(guarded, preceding)| {
                 preceding.len() <= 1 && preceding.iter().all(|plain| plain.as_except_handler().is_some_and(|handler| {
                     handler.type_.is_some()
                         && handler.name.is_none()
@@ -35522,7 +35550,7 @@ impl<'source> Compiler<'source> {
                 })}))
             // Raising recovery keeps the multiline cleanup setup populated.
             // A returning handler can copy that setup onto a separate exit.
-            && (comprehension_store_recovery || (nested_cleanup_has_located_setup
+            && (coroutine_guarded_store_recovery || (nested_cleanup_has_located_setup
                     && statement.handlers.iter().all(|handler| {
                         handler.as_except_handler().is_some_and(|handler| {
                             !suite_contains_return(&handler.body)
