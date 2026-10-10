@@ -25022,7 +25022,7 @@ impl<'source> Compiler<'source> {
                                     }))));
         let nested_else_call_entry = borrow_exit_has_source_successor
             && matches!(self.unit.scope, Scope::Function { .. })
-            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
             && self.control.loops.contexts.is_empty()
             && self.control.withs.active_with_exits.is_empty()
             && self.control.exceptions.active_exception_handlers.is_empty()
@@ -25035,7 +25035,12 @@ impl<'source> Compiler<'source> {
             && self.control.finally.active_normal_finally_bodies == 0
             && self.control.finally.active_copied_finally_bodies == 0
             && self.control.finally.active_finally_end_blocks == 0
-            && nested_try_else_has_populated_call_entry(statement);
+            && if self.unit.flags & CO_COROUTINE == 0 {
+                nested_try_else_has_populated_call_entry(statement)
+            } else {
+                self.context.python_version == crate::PythonVersion::Py314
+                    && coroutine_try_else_has_populated_call_entry(statement)
+            };
         // A populated call arm can bypass the nested pass recovery's empty join.
         // Keep that source barrier, but let its surviving jump enter the outer
         // continuation while the other branch still stops at the empty array.
@@ -44280,6 +44285,88 @@ fn nested_try_else_has_populated_call_entry(statement: &ruff_python_ast::StmtTry
                 if tail.elif_else_clauses.is_empty()
                     && condition_has_linear_runtime_leaves(&tail.test)
                     && suite_has_linear_borrow_fallthrough(&tail.body)))
+}
+
+// Call arms can thread a coroutine's nested else exits without traversing the
+// empty normal arrays left by its terminal recovery.
+fn coroutine_try_else_has_populated_call_entry(statement: &ruff_python_ast::StmtTry) -> bool {
+    let completed = |body: &[Stmt]| {
+        body.iter().all(|part| match part {
+            Stmt::Import(_) | Stmt::ImportFrom(_) | Stmt::Pass(_) => true,
+            Stmt::Assign(assignment)
+                if assignment.targets.iter().all(|target| {
+                    !expression_contains_inline_branch(target)
+                        && !expression_suspends_current_scope(target)
+                }) && expression_has_completed_conditional_value(&assignment.value) =>
+            {
+                true
+            }
+            _ => {
+                suite_has_linear_borrow_fallthrough(std::slice::from_ref(part))
+                    && !suite_contains_yield(std::slice::from_ref(part))
+            }
+        })
+    };
+    let ordinary_recovery = |recovery: &ruff_python_ast::StmtTry| {
+        !recovery.is_star
+            && recovery.finalbody.is_empty()
+            && !recovery.handlers.is_empty()
+            && recovery.handlers.iter().all(|handler| {
+                handler.as_except_handler().is_some_and(|handler| {
+                    handler.type_.as_deref().is_some_and(|type_| {
+                        !expression_contains_inline_branch(type_)
+                            && !expression_suspends_current_scope(type_)
+                    }) && suite_has_nonsuspending_linear_fallthrough(&handler.body)
+                })
+            })
+    };
+    let call_arm = |body: &[Stmt]| {
+        matches!(body, [Stmt::Expr(expression)]
+            if matches!(expression.value.as_ref(), Expr::Call(_))
+                && !expression_contains_inline_branch(&expression.value)
+                && !expression_suspends_current_scope(&expression.value))
+    };
+    let runtime_test = |test: &Expr| {
+        condition_has_linear_runtime_leaves(test) && !expression_suspends_current_scope(test)
+    };
+    let mut recovery = statement;
+    loop {
+        if !ordinary_recovery(recovery) || !completed(&recovery.body) {
+            return false;
+        }
+        let Some((last, prefix)) = recovery.orelse.split_last() else {
+            return false;
+        };
+        if !completed(prefix) {
+            return false;
+        }
+        match last {
+            Stmt::Try(nested) => recovery = nested,
+            Stmt::If(branch) => {
+                let Some((otherwise, elifs)) = branch.elif_else_clauses.split_last() else {
+                    return false;
+                };
+                return runtime_test(&branch.test)
+                    && call_arm(&branch.body)
+                    && elifs.iter().all(|clause| {
+                        clause.test.as_ref().is_some_and(runtime_test) && call_arm(&clause.body)
+                    })
+                    && otherwise.test.is_none()
+                    && matches!(otherwise.body.as_slice(), [Stmt::Try(tail)]
+                    if ordinary_recovery(tail)
+                        && suite_has_nonsuspending_linear_fallthrough(&tail.body)
+                        && tail.orelse.split_last().is_some_and(|(last, prefix)| {
+                            suite_has_nonsuspending_linear_fallthrough(std::slice::from_ref(last))
+                                && prefix.iter().all(|part| {
+                                    suite_has_nonsuspending_linear_fallthrough(std::slice::from_ref(part))
+                                        || matches!(part, Stmt::Expr(expression)
+                                            if cleanup_conditional_argument_has_eager_call_prefix(&expression.value))
+                                })
+                        }));
+            }
+            _ => return false,
+        }
+    }
 }
 
 // A nonempty call arm survives the terminal pass recovery and can jump around

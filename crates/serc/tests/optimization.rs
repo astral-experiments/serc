@@ -15,6 +15,25 @@ use serc::{
 };
 
 #[test]
+fn coroutine_nested_else_call_keeps_continuation_reachable() {
+    let source = "async def sample(owner):\n    try:\n        owner.prepare()\n    except Error:\n        owner.fail()\n    else:\n        try:\n            result = await owner.work()\n        except Error:\n            owner.fail()\n        else:\n            if owner.invalid(result):\n                owner.fail()\n            else:\n                try:\n                    owner.parse(result)\n                except Error:\n                    owner.fail()\n                else:\n                    owner.store(result)\n    owner.done()\n";
+    for source in [
+        source.to_owned(),
+        source.replace("except Error:", "except Error as error:"),
+        source.replace(
+            "            else:\n                try:",
+            "            elif owner.incomplete(result):\n                owner.fail()\n            else:\n                try:",
+        ),
+        source.replace(
+            "                    owner.store(result)",
+            "                    owner.update(result, status='partial' if result else 'complete')\n                    owner.output['result'] = result",
+        ),
+    ] {
+        assert_matches_cpython(&source, "coroutine_nested_else_call.py", &LEVELS);
+    }
+}
+
+#[test]
 fn copied_chained_raise_keeps_normal_continuation_owned() {
     let source = "async def sample(owner, values, problem, flag):\n    for value in values:\n        try:\n            result = await owner.read(value)\n        except Error as error:\n            if 0 < value < 10:\n                raise problem from error\n        else:\n            result = owner.convert(value if flag else None)\n        owner.record(result)\n";
     for source in [
