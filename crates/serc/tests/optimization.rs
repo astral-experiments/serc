@@ -2651,6 +2651,127 @@ fn guarded_runtime_break_retains_its_line_before_cleanup() {
 }
 
 #[test]
+fn ordinary_guarded_recovery_preserves_continuation_borrowing() {
+    let source = "def probe(value, receiver, worker, flag):\n    try:\n        result = worker.decode(value)\n    except Failure:\n        if flag:\n            try:\n                result = worker.decode(worker.unpack(value))\n            except Failure:\n                receiver.problem(value)\n    if worker.accepts(result):\n        receiver.store(result.get(\"first\"))\n    receiver.store(value)\n    receiver.finish()\n";
+    for conditional in [false, true] {
+        for outer_name in [false, true] {
+            for inner_name in [false, true] {
+                let mut source = source.to_owned();
+                if conditional {
+                    source = source.replacen(
+                        "result = worker.decode(value)",
+                        "result = worker.decode(value) if flag else value",
+                        1,
+                    );
+                }
+                if outer_name {
+                    source = source.replacen(
+                        "\n    except Failure:\n",
+                        "\n    except Failure as outer_error:\n",
+                        1,
+                    );
+                }
+                if inner_name {
+                    source = source.replacen(
+                        "\n            except Failure:\n",
+                        "\n            except Failure as inner_error:\n",
+                        1,
+                    );
+                }
+                assert_matches_cpython(&source, "ordinary_guarded_recovery.py", &LEVELS);
+            }
+        }
+    }
+    for recovery in ["pass", "raise", "return value"] {
+        let source = source.replace("receiver.problem(value)", recovery);
+        assert_matches_cpython(&source, "abrupt_guarded_recovery.py", &LEVELS);
+    }
+    let source = source.replace(
+        "        if flag:\n            try:\n                result = worker.decode(worker.unpack(value))\n            except Failure:\n                receiver.problem(value)\n",
+        "        receiver.problem(value)\n",
+    );
+    assert_matches_cpython(&source, "linear_recovery.py", &LEVELS);
+}
+
+#[test]
+fn guarded_recovery_suffix_keeps_normal_continuation_live() {
+    for preceding in [
+        "",
+        "    except AdmissionError:\n        result = recover(request)\n    except OtherError as other:\n        record(other)\n",
+        "    except AdmissionError:\n        from helpers import READY, recover\n    except OtherError as other:\n        record(other)\n",
+        "    except AdmissionError:\n        if started:\n            raise\n        from helpers import READY, recover\n        result = recover(request)\n    except OtherError as other:\n        record(other)\n",
+    ] {
+        for status in ["'pending'", "'pending' if started else 'blocked'"] {
+            for suffix in [
+                "",
+                "        if uncertain:\n            stopped = error\n",
+                "        if uncertain:\n            stopped = error\n        if not started and recovered is None:\n            if ready():\n                result = recover(request)\n",
+                "        if uncertain:\n            stopped = error\n        if not started and recovered is None:\n            import helpers as imported\n",
+                "        if uncertain:\n            stopped = error\n        if not started and recovered is None:\n            from helpers import READY, recover\n",
+                "        if uncertain:\n            stopped = error\n        result = recovered or Result(state='pending' if uncertain else 'blocked', details={'ready': True} if uncertain else {}, error=f'Failed: {type(error).__name__}')\n",
+                "        if uncertain:\n            stopped = error\n        result = Result(state='pending' if uncertain else 'blocked', details={'ready': True} if uncertain else {})\n",
+            ] {
+                for setup in ["", "        from helpers import work\n"] {
+                    let source = format!(
+                        "def sample(request, state, started, uncertain, stopped):\n    try:\n{setup}        result = work(request, state)\n{preceding}    except Error as error:\n        if isinstance(error, ProcessError):\n            try:\n                recovered = recover(state, request)\n            except Error as nested:\n                record(nested, status={status})\n{suffix}    if result.ready and stopped is not None:\n        finish(state, request, stopped)\n"
+                    );
+                    assert_matches_cpython(&source, "guarded_recovery_continuation.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn guarded_recovery_type_expressions_retain_borrowed_continuation() {
+    for kind in [
+        "Error",
+        "errors.Error",
+        "(Error, errors.Error)",
+        "(Error, choose_error())",
+    ] {
+        for prefix in [
+            "",
+            "            if ready:\n                resource.close()\n",
+            "            if ready:\n                resource.close()\n            else:\n                resource.retry()\n",
+        ] {
+            for continuation in [
+                "        consume(resource)\n",
+                "        for item in (resource.first, resource.second):\n            consume(item)\n",
+            ] {
+                let source = format!(
+                    "def sample(resource, ready):\n    if ready:\n        try:\n{prefix}            resource.wait()\n        except {kind}:\n            if resource.ready():\n                try:\n                    resource.wait()\n                except RuntimeError:\n                    resource.retry()\n{continuation}"
+                );
+                assert_matches_cpython(&source, "guarded_type_expression_recovery.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn guarded_nested_recovery_keeps_coroutine_continuation_reachable() {
+    let source = "async def sample(owner, ready):\n    try:\n        origin = 'query'\n    except Exception:\n        if ready and owner is not None:\n            try:\n                origin = 'result'\n            except Exception:\n                log('result unavailable', extra={'identifier': owner.identifier})\n    return Result(identifier=owner.identifier, available=owner.state is not None, origin=origin)\n";
+    for source in [
+        source.to_owned(),
+        source
+            .replace("        origin = 'query'", "        value = await owner.query()\n        if value.owner != owner.identifier or not owner.accepts(value):\n            return None\n        origin = 'query'")
+            .replace("                origin = 'result'", "                value = await owner.result()\n                if value.owner != owner.identifier or not owner.accepts(value):\n                    return None\n                origin = 'result'"),
+    ] {
+        assert_matches_cpython(&source, "guarded_nested_recovery.py", &LEVELS);
+    }
+}
+
+#[test]
+fn final_recovery_dispatch_arm_keeps_continuation_reachable() {
+    for scope in ["def", "async def"] {
+        let source = format!(
+            "{scope} sample(owner, mode, allowed, force, required, registry, witness):\n    try:\n        entries = owner.entries()\n    except OSError:\n        reset = True\n    except ValueError as error:\n        if not allowed:\n            if mode == 'first':\n                required = True\n            elif mode == 'second':\n                needed = True\n            elif mode == 'third':\n                witness = owner.seed()\n            elif mode == 'fourth':\n                witness = owner.seed()\n            else:\n                try:\n                    witness = owner.seed()\n                except ValueError:\n                    owner.record(witness)\n    try:\n        repaired = owner.repair()\n    except (OSError, ValueError):\n        for path in ('first', 'second'):\n            try:\n                owner.clear(path)\n            except OSError:\n                continue\n    if not (force or required or (registry is None and not allowed) or (registry is not None and registry.bad)):\n        try:\n            release = owner.release(blocked=frozenset() if registry is None else registry.blocked)\n        except Incomplete:\n            force = True\n        except ValueError:\n            for path in ('first', 'second'):\n                try:\n                    owner.clear(path)\n                except OSError:\n                    continue\n"
+        );
+        assert_matches_cpython(&source, "final_recovery_dispatch.py", &LEVELS);
+    }
+}
+
+#[test]
 fn guarded_recovery_preserves_named_cleanup_entry() {
     for prefix in [
         "        if ready:\n            resource.prepare()\n",
