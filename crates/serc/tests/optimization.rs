@@ -4794,6 +4794,63 @@ fn erased_final_else_suffix_preserves_coroutine_loop_exits() {
 }
 
 #[test]
+fn surviving_break_reaches_try_else_continuation() {
+    for coroutine in [false, true] {
+        for conditional in [false, true] {
+            for otherwise in [
+                "resource.closed()",
+                "result = item",
+                "return item",
+                "if resource.current is not item or item.status is not None:\n    return",
+            ] {
+                let mut work = if coroutine {
+                    "await resource.consume(item)".to_owned()
+                } else {
+                    "resource.consume(item)".to_owned()
+                };
+                if conditional {
+                    work = format!("if isinstance(item, dict):\n    {work}");
+                }
+                let prefix = if coroutine { "async " } else { "" };
+                let source = format!(
+                    "{prefix}def sample(resource, ready, item):\n    try:\n        while True:\n            if not ready:\n                break\n            {}\n    except CancelledError:\n        raise\n    except Error as error:\n        resource.failed()\n    else:\n        {}\n",
+                    work.replace('\n', "\n            "),
+                    otherwise.replace('\n', "\n        "),
+                );
+                assert_matches_cpython(&source, "surviving_break_try_else.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn while_break_keeps_fallthrough_else_exception_owner() {
+    for coroutine in ["", "async "] {
+        for condition in ["True", "ready"] {
+            for prefix in ["", "ready = resource.ready()\n            "] {
+                for otherwise in [
+                    "resource.closed()",
+                    "result = ready",
+                    "pass",
+                    "if ready:\n            return ready",
+                ] {
+                    let source = format!(
+                        "{coroutine}def sample(resource, items, ready):\n    try:\n        while {condition}:\n            {prefix}if not ready:\n                break\n    except CancelledError:\n        raise\n    except Error as error:\n        resource.failed(error)\n    else:\n        {otherwise}\n"
+                    );
+                    assert_matches_cpython(&source, "while_break_try_else.py", &LEVELS);
+                }
+            }
+        }
+    }
+    for otherwise in ["return", "return None", "raise Error"] {
+        let source = format!(
+            "def sample(resource, items, ready):\n    try:\n        while True:\n            if not ready:\n                break\n    except CancelledError:\n        raise\n    except Error as error:\n        pass\n    else:\n        {otherwise}\n"
+        );
+        assert_matches_cpython(&source, "while_break_returning_else.py", &LEVELS);
+    }
+}
+
+#[test]
 fn while_else_nonfinal_condition_preserves_forward_exit() {
     for coroutine in [false, true] {
         for loop_else in [false, true] {
