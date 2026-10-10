@@ -419,7 +419,7 @@ fn capture_cleanup_rotation(items: &[Item]) -> Option<CaptureCleanupRotation<'_>
         let Item::Instruction(instruction) = item else {
             return None;
         };
-        if instruction.location.line != first_consumer.location.line {
+        if instruction.location.line < 0 {
             return None;
         }
         match (instruction.opcode, instruction.operand()) {
@@ -459,9 +459,9 @@ fn capture_cleanup_rotation(items: &[Item]) -> Option<CaptureCleanupRotation<'_>
     };
     let same_line_capture_guard = matches!(
         stores.as_slice(),
-        [local]
+        [_]
             if following.opcode == LOAD_FAST
-                && following.operand() == Operand::Value(*local)
+                && following.value_argument().is_some()
     ) || matches!(
         stores.as_slice(),
         [penultimate, _]
@@ -487,6 +487,45 @@ fn capture_cleanup_rotation(items: &[Item]) -> Option<CaptureCleanupRotation<'_>
         {
             return None;
         }
+    }
+    if consumers.iter().any(|item| {
+        matches!(item, Item::Instruction(instruction)
+            if instruction.location.line != first_consumer.location.line)
+    }) {
+        let count = consumers
+            .iter()
+            .take_while(|item| {
+                matches!(item, Item::Instruction(instruction)
+                    if instruction.opcode == POP_TOP
+                        && instruction.location.line == first_consumer.location.line)
+            })
+            .count();
+        let Item::Instruction(store) = consumers.last()? else {
+            return None;
+        };
+        if prefix.opcode != UNPACK_SEQUENCE
+            || prefix.value_argument() != Some(1)
+            || stores.len() != 1
+            || count < 3
+            || count >= pop_count
+            || first_consumer.location.line != first_swap.location.line
+            || store.location.line >= first_consumer.location.line
+            || consumers[count..].iter().any(|item| {
+                matches!(item, Item::Instruction(instruction)
+                    if instruction.location.line != store.location.line)
+            })
+        {
+            return None;
+        }
+        // Only the same-line pop prefix rotates. Older-line cleanup retains its
+        // original records and the larger swaps that still reach beyond this prefix.
+        return Some(CaptureCleanupRotation {
+            swap_count,
+            removed_slots: count - 1,
+            consumer_rotation: 1,
+            consumers: &consumers[..count],
+            projected_pop_donor: None,
+        });
     }
     // The conditional starts a fresh native array. Its capture line needs one NOP
     // when it differs from the cleanup line; the other same-line NOPs disappear.

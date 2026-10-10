@@ -4104,6 +4104,135 @@ fn mapping_capture_rotations_preserve_arrays_and_predict_native_compaction() {
 }
 
 #[test]
+fn multiline_capture_cleanup_rotates_only_the_same_line_pop_prefix() {
+    let mut items = vec![pass_instruction(UNPACK_SEQUENCE, 1, 5)];
+    for depth in (2..=7).rev() {
+        items.push(pass_instruction(SWAP, depth, 5));
+    }
+    for index in 0..6 {
+        let line = if index < 4 { 5 } else { 3 };
+        items.push(Item::Instruction(Instruction::new(
+            POP_TOP,
+            Operand::Value(0),
+            SourceLocation::new(line, line, index, index + 1),
+            None,
+        )));
+    }
+    items.extend([
+        pass_instruction(STORE_FAST, 0, 3),
+        pass_instruction(LOAD_FAST, 1, 6),
+    ]);
+    let rotation = super::capture_cleanup_rotation(&items).unwrap();
+    assert_eq!(rotation.swap_count, 6);
+    assert_eq!(rotation.removed_slots, 3);
+    assert_eq!(rotation.consumers, &items[7..11]);
+    assert_eq!(
+        Assembler::from_linear_items(items.clone()).current_block_dynamic_exception_owner_slots(),
+        3,
+    );
+    let mut pipeline = optimization_pipeline(items.clone());
+    let (blocks, cleanup, _) = pipeline.optimize_swap_runs();
+    assert!(pipeline.apply_static_swaps((blocks, cleanup)).is_empty());
+    let actual = pipeline.graph.iter_items().copied().collect::<Vec<_>>();
+    assert_eq!(&actual[..4], &items[..4]);
+    for item in &actual[4..7] {
+        assert!(matches!(item, Item::Instruction(instruction) if instruction.opcode == NOP));
+    }
+    let mut pops = items[7..11].to_vec();
+    pops.rotate_right(1);
+    assert_eq!(&actual[7..11], pops);
+    assert_eq!(&actual[11..], &items[11..]);
+    for mutation in 0..13 {
+        let mut changed = items.clone();
+        match mutation {
+            0 => changed[0] = pass_instruction(UNPACK_SEQUENCE, 0, 5),
+            1 => changed[0] = pass_instruction(UNPACK_EX, 0, 5),
+            2 => changed[2] = pass_instruction(SWAP, 4, 5),
+            3 => changed[3] = pass_instruction(SWAP, 5, 6),
+            4 => changed[7] = pass_instruction(POP_TOP, 0, -1),
+            5 => changed[8] = pass_instruction(POP_TOP, 0, 3),
+            6 => changed[11] = pass_instruction(POP_TOP, 0, 4),
+            7 => changed[13] = pass_instruction(STORE_FAST, 0, 6),
+            8 => changed[12] = pass_instruction(STORE_FAST, 1, 3),
+            9 => changed[13] = pass_instruction(STORE_DEREF, 0, 3),
+            10 => changed[14] = pass_instruction(LOAD_FAST, 1, -1),
+            11 => changed.insert(6, Item::Label(super::Label::from_u32(0))),
+            12 => changed.truncate(14),
+            _ => unreachable!(),
+        }
+        assert!(
+            super::capture_cleanup_rotation(&changed).is_none(),
+            "{mutation}"
+        );
+    }
+    for index in 0..14 {
+        for policy in 0..3 {
+            let mut changed = items.clone();
+            let Item::Instruction(instruction) = &mut changed[index] else {
+                unreachable!()
+            };
+            match policy {
+                0 => instruction.no_location_policy.preserve_location(),
+                1 => instruction.fusion_policy.prevent_with_next(),
+                2 => instruction.jump_policy.retain_nop(),
+                _ => unreachable!(),
+            }
+            assert!(super::capture_cleanup_rotation(&changed).is_none());
+        }
+    }
+}
+
+#[test]
+fn capture_cleanup_guard_requires_one_complete_local_rotation() {
+    for guard_local in [0, 1, 16, 256] {
+        let items = [
+            pass_instruction(UNPACK_SEQUENCE, 1, 5),
+            pass_instruction(SWAP, 5, 5),
+            pass_instruction(SWAP, 4, 5),
+            pass_instruction(SWAP, 3, 5),
+            pass_instruction(SWAP, 2, 5),
+            pass_instruction(POP_TOP, 0, 5),
+            pass_instruction(POP_TOP, 0, 5),
+            pass_instruction(POP_TOP, 0, 5),
+            pass_instruction(POP_TOP, 0, 5),
+            pass_instruction(STORE_FAST, 0, 5),
+            pass_instruction(LOAD_FAST, guard_local, 5),
+        ];
+        assert!(super::capture_cleanup_rotation(&items).is_some());
+        assert_eq!(
+            Assembler::from_linear_items(items.to_vec())
+                .current_block_dynamic_exception_owner_slots(),
+            4,
+        );
+        for mutation in 0..10 {
+            let mut changed = items.to_vec();
+            match mutation {
+                0 => changed[1] = pass_instruction(SWAP, 6, 5),
+                1 => changed[2] = pass_instruction(SWAP, 3, 5),
+                2 => changed[3] = pass_instruction(SWAP, 3, 6),
+                3 => changed[6] = pass_instruction(POP_TOP, 0, 6),
+                4 => changed[9] = pass_instruction(STORE_FAST, 0, 6),
+                5 => changed[10] = pass_instruction(LOAD_CONST, guard_local, 5),
+                6 => changed[10] = pass_instruction(LOAD_FAST, guard_local, -1),
+                7 => changed.insert(5, Item::Label(super::Label::from_u32(0))),
+                8 => changed[8] = pass_instruction(STORE_FAST, 1, 5),
+                9 => {
+                    let Item::Instruction(load) = &mut changed[10] else {
+                        unreachable!()
+                    };
+                    load.set_operand(Operand::Forward(super::Label::from_u32(0)));
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                super::capture_cleanup_rotation(&changed).is_none(),
+                "{guard_local}/{mutation}"
+            );
+        }
+    }
+}
+
+#[test]
 fn mapping_capture_rotations_require_complete_unchanged_same_line_shapes() {
     for mutation in 0..9 {
         let mut items = mapping_capture_items(2, 1);
