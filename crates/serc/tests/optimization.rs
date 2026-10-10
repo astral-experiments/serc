@@ -3747,6 +3747,64 @@ fn managed_mixed_erased_iterator_guard_preserves_shared_backedge() {
 }
 
 #[test]
+fn iterator_handler_returns_preserve_conditional_finalizer_entry() {
+    let source = r"def sample(values, flag):
+    resource = None
+    try:
+        while True:
+            for value in values:
+                if resource is not None:
+                    break
+                try:
+                    resource = acquire(value)
+                    break
+                except OSError as error:
+                    if flag:
+                        report(error)
+                        return
+                    report(error)
+    finally:
+        if resource is not None:
+            release(resource)
+";
+    for asynchronous in [false, true] {
+        for explicit_none in [false, true] {
+            for (index, report) in [
+                "report(error)",
+                "logger.report(error)",
+                "logger.report('message')",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let mut source = source.replacen(
+                    "                        report(error)",
+                    &format!("                        {report}"),
+                    1,
+                );
+                if asynchronous {
+                    source = source.replace("def sample", "async def sample");
+                    for call in ["acquire(value)", "release(resource)"] {
+                        source = source.replace(call, &format!("await {call}"));
+                    }
+                }
+                if explicit_none {
+                    source = source.replace(
+                        "                        return\n",
+                        "                        return None\n",
+                    );
+                }
+                assert_matches_cpython(
+                    &source,
+                    &format!("iterator_handler_entry_{asynchronous}_{explicit_none}_{index}.py"),
+                    &LEVELS,
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn boolean_returns_preserve_enclosing_named_handler_owners() {
     let source = r"def sample(items, flag):
     for value in items:

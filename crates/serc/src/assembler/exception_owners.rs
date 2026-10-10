@@ -425,11 +425,38 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) original_uniform_folds: Vec<Instruction>,
     // Exact source comparison and original labels, before any jump copying or cleanup.
     pub(super) source_none_conditions: Vec<SourceNoneCondition>,
+    // Exact exit-copy retargets used only by named-handler live-iterator cleanup.
+    pub(super) handler_iterator_none_retargets: Vec<(Instruction, Instruction)>,
     // Exact terminal pairs produced by original conditional jump threading.
     pub(super) threaded_condition_origins: Vec<(Instruction, Instruction)>,
 }
 
 impl ExceptionOwnerProvenance {
+    fn is_handler_iterator_none_condition(&self, condition: &Instruction) -> bool {
+        let mut retargets = self
+            .handler_iterator_none_retargets
+            .iter()
+            .filter(|(_, after)| after == condition);
+        let original = if let Some((before, _)) = retargets.next() {
+            if retargets.next().is_some()
+                || self
+                    .source_none_conditions
+                    .iter()
+                    .any(|origin| origin.instruction == *condition)
+            {
+                return false;
+            }
+            before
+        } else {
+            condition
+        };
+        self.source_none_conditions
+            .iter()
+            .filter(|origin| origin.instruction == *original)
+            .count()
+            == 1
+    }
+
     /// Authenticates a concrete fragment without inferring its setup from range positions.
     pub(super) fn is_original_ordinary_try_region(&self, region: super::ExceptionRegion) -> bool {
         let mut origins =
@@ -667,6 +694,10 @@ impl ExceptionOwnerProvenance {
             visit(&mut record.2);
         }
         for record in &mut self.early_return_nop_pairs {
+            visit(&mut record.0);
+            visit(&mut record.1);
+        }
+        for record in &mut self.handler_iterator_none_retargets {
             visit(&mut record.0);
             visit(&mut record.1);
         }
@@ -1221,6 +1252,8 @@ pub(super) struct CopiedHandlerCleanup {
     pub(super) instructions: Vec<Instruction>,
     pub(super) missing_null_pops: usize,
     pub(super) removed_prefix_slots: u16,
+    // The compiler certified one synchronous iterator immediately after this handler.
+    pub(super) following_iterator: bool,
     // Exact inner-finally POP removed immediately before the captured local assignment.
     pub(super) assignment_pop: Option<(Label, Instruction)>,
     pub(super) continued_call: Option<([Instruction; 6], Instruction)>,
@@ -6953,6 +6986,7 @@ impl LayoutAssembler {
                                 original.missing_null_pops,
                                 original.continued_call,
                                 original.continued_attribute_none,
+                                *original,
                             ));
                         }
                     }
@@ -10390,6 +10424,7 @@ impl LayoutAssembler {
                                 missing,
                                 continued_call,
                                 continued_attribute_none,
+                                copied_handler_origin,
                             )) = copied_handler_prefix
                             && array == original_array_start
                             && end <= instruction_index
@@ -10662,6 +10697,108 @@ impl LayoutAssembler {
                                         ExceptionOwnerDecision::override_with_region(Some(region)),
                                     );
                                 }
+                            }
+                            // A certified iterator leaves a live disposal cell before the
+                            // finalizer's NULL POP. Equality selects that cell's owner.
+                            if removed == suffix
+                                && missing == 0
+                                && end - start == 4
+                                && instruction_index - end == 3
+                                && instruction.local_policy.hidden_exception_owner_slots() == 0
+                                && instruction.pre_fold_extra_instructions() == 0
+                                && continued_call.is_none()
+                                && continued_attribute_none.is_none()
+                                && copied_handler_origin.following_iterator
+                                && copied_handler_origin.missing_null_pops == 0
+                                && copied_handler_origin.removed_prefix_slots == 3
+                                && copied_handler_origin.instructions.len() == 4
+                                && copied_handler_origin.return_iterator.is_none()
+                                && copied_handler_origin.assignment_pop.is_none()
+                                && indexed_instructions[end].location
+                                    == copied_handler_origin.return_nop.location
+                                && self
+                                    .exception_owner_provenance
+                                    .copied_handler_cleanups
+                                    .iter()
+                                    .filter(|origin| {
+                                        origin.following_iterator
+                                            && label_positions.get(&origin.start) == Some(&start)
+                                            && label_positions.get(&origin.end) == Some(&end)
+                                    })
+                                    .count()
+                                    == 1
+                                && indexed_instructions[end].opcode == POP_TOP
+                                && indexed_instructions[end].value_argument() == Some(0)
+                                && indexed_instructions[end]
+                                    .local_policy
+                                    .hidden_exception_owner_slots()
+                                    == 0
+                                && indexed_instructions[end].pre_fold_extra_instructions() == 0
+                                && indexed_instructions[end].exception_policy().exclusion()
+                                    == super::ExceptionExclusion::None
+                                && matches!(
+                                    indexed_instructions[end + 1].opcode,
+                                    crate::target::opcodes::LOAD_FAST
+                                        | crate::target::opcodes::LOAD_FAST_BORROW
+                                )
+                                && indexed_instructions[end + 1]
+                                    .local_policy
+                                    .hidden_exception_owner_slots()
+                                    == 1
+                                && indexed_instructions[end + 1].pre_fold_extra_instructions() == 0
+                                && indexed_instructions[end + 1].exception_policy()
+                                    == super::ExceptionPolicy::NoneUnchanged
+                                && previous.is_some_and(|condition| {
+                                    matches!(
+                                        condition.opcode,
+                                        POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE
+                                    ) && condition.local_policy.hidden_exception_owner_slots() == 3
+                                        && condition.pre_fold_extra_instructions() == 0
+                                        && condition.exception_policy()
+                                            == super::ExceptionPolicy::NoneUnchanged
+                                        && condition.location == instruction.location
+                                        && indexed_instructions[end + 1].location.line
+                                            == condition.location.line
+                                        && indexed_instructions[end + 1].location.end_line
+                                            == condition.location.end_line
+                                        && indexed_instructions[end + 1].location.column
+                                            == condition.location.column
+                                        && indexed_instructions[end + 1].location.end_column
+                                            < condition.location.end_column
+                                        && self
+                                            .exception_owner_provenance
+                                            .is_handler_iterator_none_condition(condition)
+                                })
+                                && self
+                                    .exception_owner_provenance
+                                    .removed_pop_block_boundaries
+                                    .iter()
+                                    .filter(|label| label_positions.get(label) == Some(&(end + 1)))
+                                    .map(|label| {
+                                        self.exception_owner_provenance
+                                            .removed_pop_block_widths
+                                            .get(label)
+                                            .copied()
+                                            .unwrap_or(1)
+                                    })
+                                    .eq([1])
+                                && !jump_targets
+                                    .iter()
+                                    .chain(&self.exception_owner_provenance.source_boundaries)
+                                    .chain(&self.exception_owner_provenance.block_boundaries)
+                                    .any(|label| {
+                                        label_positions.get(label).is_some_and(|position| {
+                                            end < *position && *position <= instruction_index
+                                        })
+                                    })
+                                && let Some(region) =
+                                    self.uniform_exception_owner(end, end + 1, &label_positions)
+                                && !self.exception_regions[region].is_scope_fallback
+                            {
+                                owners.insert(
+                                    instruction_index,
+                                    ExceptionOwnerDecision::override_with_region(Some(region)),
+                                );
                             }
                         }
                         // Before the captured authored-return slot, an appended marker can
@@ -13534,6 +13671,89 @@ impl LayoutAssembler {
 #[cfg(test)]
 mod tests {
     use super::ExceptionOwnerTail;
+
+    #[test]
+    fn handler_iterator_none_condition_requires_exact_exit_copy() {
+        use super::{ExceptionOwnerProvenance, SourceNoneCondition};
+        use crate::assembler::{Instruction, Label, Operand, SourceLocation};
+        use crate::target::opcodes::POP_JUMP_IF_NONE;
+
+        for change in [
+            "original",
+            "copied",
+            "missing copy",
+            "missing source",
+            "duplicate source",
+            "duplicate copy",
+            "ambiguous copy",
+            "original and copy",
+            "changed target",
+            "changed location",
+            "changed depth",
+            "changed hidden slots",
+            "changed folding",
+            "changed source",
+        ] {
+            let before = Instruction::new(
+                POP_JUMP_IF_NONE,
+                Operand::Forward(Label::from_u32(1)),
+                SourceLocation::new(4, 4, 8, 20),
+                Some(0),
+            );
+            let mut after = before;
+            after.retarget(Operand::Forward(Label::from_u32(2)));
+            let origin = |instruction| SourceNoneCondition {
+                entry: Label::from_u32(0),
+                labels: vec![Label::from_u32(0)],
+                instruction,
+                entry_prefix: None,
+            };
+            let mut provenance = ExceptionOwnerProvenance {
+                source_none_conditions: vec![origin(before)],
+                handler_iterator_none_retargets: vec![(before, after)],
+                ..ExceptionOwnerProvenance::default()
+            };
+            let mut actual = after;
+            match change {
+                "original" => actual = before,
+                "copied" => {}
+                "missing copy" => provenance.handler_iterator_none_retargets.clear(),
+                "missing source" => provenance.source_none_conditions.clear(),
+                "duplicate source" => provenance.source_none_conditions.push(origin(before)),
+                "duplicate copy" => provenance
+                    .handler_iterator_none_retargets
+                    .push((before, after)),
+                "ambiguous copy" => {
+                    let mut other = before;
+                    other.retarget(Operand::Forward(Label::from_u32(3)));
+                    provenance
+                        .handler_iterator_none_retargets
+                        .push((other, after));
+                }
+                "original and copy" => provenance.source_none_conditions.push(origin(after)),
+                "changed target" => actual.retarget(Operand::Forward(Label::from_u32(3))),
+                "changed location" => actual.location.column += 1,
+                "changed depth" => {
+                    actual =
+                        Instruction::new(actual.opcode, actual.operand(), actual.location, Some(1));
+                }
+                "changed hidden slots" => actual.local_policy.add_hidden_exception_owner_slots(1),
+                "changed folding" => actual.add_pre_fold_extra_instructions(1),
+                "changed source" => {
+                    provenance.source_none_conditions[0]
+                        .instruction
+                        .location
+                        .column += 1;
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                provenance.is_handler_iterator_none_condition(&actual),
+                matches!(change, "original" | "copied"),
+                "{change}",
+            );
+        }
+    }
 
     #[test]
     fn single_dynamic_owner_admission_scan_matches_both_original_gates() {
