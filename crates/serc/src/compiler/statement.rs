@@ -8234,15 +8234,35 @@ impl<'source> Compiler<'source> {
                 } else {
                     0
                 };
-                // A plain chain of unnamed handlers exposes one outer cleanup at a time.
-                // Saved scope depths certify that no manager, loop, ordinary try, or finally
-                // must be interleaved between those handler cleanups.
+                let three_handler_value_chain = preserve_tos
+                    && handler_count == 3
+                    && self.control.exceptions.active_try_marker_slots.is_empty()
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .len()
+                        == 3;
+                let three_handler_older_iterator = three_handler_value_chain
+                    && matches!(self.control.loops.contexts.as_slice(), [iterator]
+                        if iterator.iterator_cleanup == IteratorCleanup::Sync
+                            && iterator.with_depth == 0
+                            && iterator.finally_end_depth == 0
+                            && iterator.exception_region_depth == 0);
+                // A plain handler chain exposes one outer cleanup at a time. In the
+                // three-handler value case, only the innermost handler may clear a name.
+                // Saved scope depths exclude interleaved scopes; an older iterator stays
+                // below the handlers until all three cleanups have completed.
                 let unwinds_plain_nested_handlers = !return_is_overridden
                     && handler_count > 1
-                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    && (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                        || (three_handler_value_chain
+                            && self.unit.flags
+                                & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                                == CO_COROUTINE))
                     && self.control.exceptions.active_exception_group_handlers == 0
                     && self.control.withs.active_with_exits.is_empty()
-                    && self.control.loops.contexts.is_empty()
+                    && (self.control.loops.contexts.is_empty() || three_handler_older_iterator)
                     && self.control.finally.is_inactive_for_return_unwind()
                     && self
                         .control
@@ -8257,10 +8277,11 @@ impl<'source> Compiler<'source> {
                         .exceptions
                         .active_exception_handlers
                         .iter()
-                        .all(|handler| {
-                            handler.name.is_none()
+                        .enumerate()
+                        .all(|(index, handler)| {
+                            (handler.name.is_none() || (three_handler_value_chain && index == 2))
                                 && handler.with_depth == 0
-                                && handler.loop_depth == 0
+                                && handler.loop_depth == usize::from(three_handler_older_iterator)
                                 && handler.finally_end_depth == 0
                         })
                     && self
@@ -29216,15 +29237,32 @@ impl<'source> Compiler<'source> {
                 // An unnamed return nested directly inside two named handlers exposes
                 // the nearer handler's name cleanup. Saved depths exclude another scope
                 // between these collectors; only the innermost POP_EXCEPT needs ownership.
+                let boolean_handler_return = self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR)
+                    == 0
+                    && (self.control.loops.contexts.is_empty()
+                        || matches!(self.control.loops.contexts.as_slice(), [iterator]
+                            if iterator.iterator_cleanup == IteratorCleanup::Sync
+                                && iterator.with_depth == 0
+                                && iterator.finally_end_depth == 0
+                                && iterator.exception_region_depth == 0))
+                    && matches!(handler.body.split_last(), Some((Stmt::Return(statement), leading))
+                    if matches!(statement.value.as_deref(), Some(Expr::BooleanLiteral(_)))
+                        && leading.iter().all(|statement| {
+                            matches!(statement, Stmt::Expr(expression)
+                                if matches!(expression.value.as_ref(), Expr::Call(_))
+                                    && !expression_contains_inline_branch(&expression.value)
+                                    && !expression_suspends_current_scope(&expression.value))
+                        }));
                 let returns_through_two_named_handlers =
-                    self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
-                        && handler_name.is_none()
+                    ((self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                        && self.control.loops.contexts.is_empty()
                         && matches!(handler.body.as_slice(), [Stmt::Return(statement)]
-                            if matches!(statement.value.as_deref(), Some(Expr::Tuple(_))))
+                            if matches!(statement.value.as_deref(), Some(Expr::Tuple(_)))))
+                        || boolean_handler_return)
+                        && handler_name.is_none()
                         && self.control.exceptions.active_exception_group_handlers == 0
                         && self.control.exceptions.active_try_marker_slots.is_empty()
                         && self.control.withs.active_with_exits.is_empty()
-                        && self.control.loops.contexts.is_empty()
                         && self.control.finally.is_inactive_for_return_unwind()
                         && matches!(
                             self.control.exceptions.active_exception_handlers.as_slice(),
@@ -29237,8 +29275,8 @@ impl<'source> Compiler<'source> {
                                     && middle.exception_region_depth == 1
                                     && outer.with_depth == 0
                                     && middle.with_depth == 0
-                                    && outer.loop_depth == 0
-                                    && middle.loop_depth == 0
+                                    && outer.loop_depth == self.control.loops.contexts.len()
+                                    && middle.loop_depth == outer.loop_depth
                                     && outer.finally_end_depth == 0
                                     && middle.finally_end_depth == 0
                         );
