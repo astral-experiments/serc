@@ -4768,6 +4768,83 @@ finally:
 }
 
 #[test]
+fn guarded_recovery_preserves_populated_normal_cleanup_entries() {
+    fn indent(source: &str) -> String {
+        source.lines().fold(String::new(), |mut output, line| {
+            writeln!(output, "    {line}").unwrap();
+            output
+        })
+    }
+    for (work_name, work) in [
+        ("linear", "perform(value)\n"),
+        (
+            "guarded",
+            "if value is not None:\n    try:\n        perform(value)\n    finally:\n        finish(value)\n",
+        ),
+    ] {
+        for (entry_name, entry) in [("boolean", "not (flag and done)"), ("local", "flag")] {
+            let work = indent(work);
+            let cleanup = format!(
+                "done = False\ntry:\n{work}    done = True\nexcept RuntimeError as error:\n    report(error)\n    if flag:\n        raise\nfinally:\n    quiet = {entry}\n    try:\n        with manager() if quiet else alternate():\n            close(value)\n    finally:\n        if flag:\n            with manager() if quiet else alternate():\n                finish(value)\n"
+            );
+            for (name, prefix) in [
+                ("flat", None),
+                ("normal", Some("perform(value)")),
+                ("generator", Some("yield value")),
+            ] {
+                let body = if let Some(prefix) = prefix {
+                    let nested = indent(&cleanup);
+                    format!("try:\n    {prefix}\nfinally:\n{nested}")
+                } else {
+                    cleanup.clone()
+                };
+                let body = indent(&body);
+                let source = format!("def sample(value, flag):\n{body}");
+                assert_matches_cpython(
+                    &source,
+                    &format!("populated_recovery_cleanup_{work_name}_{entry_name}_{name}.py"),
+                    &LEVELS,
+                );
+            }
+            if entry_name == "boolean" {
+                let controls = if work_name == "linear" {
+                    vec![
+                        (
+                            "exceptional",
+                            format!(
+                                "try:\n    raise LookupError\nfinally:\n{}",
+                                indent(&cleanup)
+                            ),
+                        ),
+                        (
+                            "handler",
+                            format!(
+                                "try:\n    perform(value)\nexcept LookupError:\n{}",
+                                indent(&cleanup)
+                            ),
+                        ),
+                    ]
+                } else {
+                    let tail = cleanup.replace("    done = True\n", "");
+                    vec![(
+                        "structured_tail",
+                        format!("try:\n    yield value\nfinally:\n{}", indent(&tail)),
+                    )]
+                };
+                for (name, body) in controls {
+                    let source = format!("def sample(value, flag):\n{}", indent(&body));
+                    assert_matches_cpython(
+                        &source,
+                        &format!("populated_recovery_boundary_{name}.py"),
+                        &LEVELS,
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn named_handler_returns_preserve_outer_finalizer_owners() {
     let source = r"def named_nested(choice, item, owner, operation, cleanup, recover):
     value = None

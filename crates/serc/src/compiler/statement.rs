@@ -33874,6 +33874,60 @@ impl<'source> Compiler<'source> {
                 if matches!(cleanup.value.as_ref(), Expr::Call(_))
                     && !expression_contains_inline_branch(&cleanup.value)
                     && !expression_suspends_current_scope(&cleanup.value));
+        let normal_recovery_entry_context = self.context.python_version
+            == crate::PythonVersion::Py314
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && !suite_contains_yield(&statement.body)
+            && self.control.finally.active_normal_finally_bodies <= 1
+            && self.control.finally.active_finally_try_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self.control.finally.active_overriding_finally_returns == 0
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.withs.active_with_region_exclusions.is_empty()
+            && self.control.exceptions.active_exception_handlers.is_empty()
+            && self.control.exceptions.active_exception_group_handlers == 0
+            && self.control.exceptions.active_try_marker_slots.is_empty()
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty();
+        // A runtime condition store starts with its own populated test array.
+        // Its short-circuit join does not empty the preceding recovery entry.
+        let runtime_condition_cleanup_entry = normal_recovery_entry_context
+            && !suite_contains_abrupt_control_flow(&statement.finalbody)
+            && !suite_contains_yield(&statement.finalbody)
+            && matches!(statement.finalbody.first(), Some(Stmt::Assign(entry))
+                if matches!(entry.targets.as_slice(), [Expr::Name(_)])
+                    && condition_has_linear_runtime_leaves(&entry.value)
+                    && !expression_suspends_current_scope(&entry.value));
+        // Completed work leaves a populated normal exit inside one normal
+        // finalizer. The named handler's conditional reraise retains that entry.
+        let nested_populated_recovery_entry = normal_recovery_entry_context
+            && self.control.finally.active_normal_finally_bodies == 1
+            && statement.orelse.is_empty()
+            && !suite_contains_abrupt_control_flow(&statement.body)
+            && !suite_any_statement(&statement.body, |part| {
+                matches!(part, Stmt::For(_) | Stmt::While(_))
+            })
+            && statement.body.last().is_some_and(|tail| {
+                suite_has_nonsuspending_linear_fallthrough(std::slice::from_ref(tail))
+            })
+            && matches!(statement.handlers.as_slice(), [handler]
+            if handler.as_except_handler().is_some_and(|handler| {
+                handler.type_.is_some()
+                    && handler.name.is_some()
+                    && suite_has_linear_reraise_guards(&handler.body)
+            }))
+            && !suite_contains_abrupt_control_flow(&statement.finalbody)
+            && !suite_contains_yield(&statement.finalbody)
+            && (runtime_condition_cleanup_entry
+                || statement.finalbody.first().is_some_and(|entry| {
+                    suite_has_nonsuspending_linear_fallthrough(std::slice::from_ref(entry))
+                }));
         let conditional_handler_reaches_finally = !statement.is_star
             && (statement.orelse.is_empty()
                 || linear_else_returning_recovery
@@ -33901,7 +33955,8 @@ impl<'source> Compiler<'source> {
                                 if matches!(call.func.as_ref(), Expr::Attribute(attribute)
                                     if matches!(attribute.value.as_ref(), Expr::Name(_)))))))
             && (self.control.finally.active_normal_finally_bodies == 0
-                || nested_normal_handler_cleanup)
+                || nested_normal_handler_cleanup
+                || nested_populated_recovery_entry)
             && self.control.finally.active_finally_end_blocks == 0
             && !suite_contains_loop_break(&statement.body)
             && !matches!(
@@ -33919,6 +33974,7 @@ impl<'source> Compiler<'source> {
                         if return_.value.as_deref().is_none_or(|value| {
                             !expression_contains_inline_branch(value)
                         })))))
+                || runtime_condition_cleanup_entry
                 || suite_has_linear_borrow_fallthrough(&statement.finalbody)
                 || nested_recovery_finally_entry
                 || copied_guarded_manager_cleanup
