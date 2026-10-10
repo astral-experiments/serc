@@ -5924,6 +5924,68 @@ fn handler_raising_while_else_preserves_break_cleanup() {
 }
 
 #[test]
+fn nested_mapping_captures_preserve_multiline_cleanup_boundaries() {
+    let body = r#"match value:
+    case {
+        "state": "ready",
+        "box": {"kind": "single", "items": [{"value": item}]},
+    }GUARD:
+        return item
+"#;
+    let guard = " if guard.get(\"warnings\", []) == []";
+    for coroutine in [false, true] {
+        for (protected, guard) in [(false, ""), (false, guard), (true, guard)] {
+            let prefix = if coroutine { "async " } else { "" };
+            let mut source = format!("{prefix}def probe(value, guard):\n");
+            let indent = if protected { "        " } else { "    " };
+            if protected {
+                source.push_str("    try:\n");
+            }
+            for line in body.replace("GUARD", guard).lines() {
+                writeln!(source, "{indent}{line}").unwrap();
+            }
+            if protected {
+                source.push_str("    except RuntimeError as error:\n        report(error)\n");
+            }
+            source.push_str("    return None\n");
+            assert_matches_cpython(&source, "multiline_capture_boundary.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
+fn single_mapping_captures_preserve_other_local_guards() {
+    let body = r#"match value:
+    case {"box": {"items": [{"value": item}]}} if GUARD is not None:
+        return item
+"#;
+    for coroutine in [false, true] {
+        for protected in [false, true] {
+            for guard in ["item", "guard"] {
+                let prefix = if coroutine { "async " } else { "" };
+                let mut source = format!("{prefix}def probe(value, guard):\n");
+                let indent = if protected { "        " } else { "    " };
+                if protected {
+                    source.push_str("    try:\n");
+                }
+                for line in body.replace("GUARD", guard).lines() {
+                    writeln!(source, "{indent}{line}").unwrap();
+                }
+                if protected {
+                    source.push_str("    except RuntimeError as error:\n        report(error)\n");
+                }
+                source.push_str("    return None\n");
+                assert_matches_cpython(
+                    &source,
+                    &format!("mapping_local_guard_{coroutine}_{protected}_{guard}.py"),
+                    &LEVELS,
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn starred_mapping_capture_cleanups_apply_static_swaps() {
     let source = r#"def probe(value):
     match value:
