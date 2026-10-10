@@ -15,6 +15,20 @@ use serc::{
 };
 
 #[test]
+fn guarded_recovery_work_reaches_stored_result_cleanup() {
+    let source = "def sample(owner, query, telemetry):\n    token = telemetry.set([])\n    try:\n        row = owner.grade(query)\n    except Error as error:\n        if owner.fatal(error):\n            raise\n        failure = {\"error\": type(error).__name__}\n        causes = [type(cause).__name__ for cause in owner.causes(error) if cause is not error]\n        if causes:\n            failure[\"causes\"] = causes\n        row = {\"status\": \"failed\", \"failure\": failure}\n    finally:\n        telemetry.reset(token)\n    return row\n";
+    for source in [
+        source.to_owned(),
+        source.replace("[type(cause).__name__ for cause in owner.causes(error) if cause is not error]", "owner.causes(error)"),
+        source.replace("        failure = ", "        role = next((str(cause.tag) for cause in owner.causes(error) if cause.tag), 'unknown')\n        failure = "),
+        source.replace("        if owner.fatal(error):", "        if owner.ready(error):\n            owner.note(error)\n        if owner.fatal(error):"),
+        source.replace("def sample", "async def sample"),
+    ] {
+        assert_matches_cpython(&source, "guarded_store_cleanup.py", &LEVELS);
+    }
+}
+
+#[test]
 fn managed_loop_break_bypasses_erased_recovery_exit() {
     let source = "def sample(owner, active, cleanup):\n    count = 0\n    while active:\n        claimed = False\n        try:\n            with owner.pop() as item:\n                claimed = item is not None\n                if item is None:\n                    break\n                count += 1\n            if cleanup and item is not None:\n                try:\n                    if item.exists():\n                        owner.remove(item)\n                except Error as error:\n                    owner.warning(error)\n        except Error as error:\n            if claimed:\n                owner.failed()\n            owner.warning(error)\n            if not claimed:\n                if not owner.retryable(error):\n                    owner.close()\n                    raise\n    owner.close()\n    owner.report(count)\n";
     for source in [
