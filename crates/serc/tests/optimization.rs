@@ -15,6 +15,25 @@ use serc::{
 };
 
 #[test]
+fn coroutine_guarded_recovery_reaches_nested_cleanup() {
+    let source = "async def sample(client, owner, capacity, count, registered, done, cancelled):\n    try:\n        owner.ready()\n    except (Error, Cancelled) as error:\n        if registered:\n            try:\n                await client.update()\n            except ClientError:\n                owner.warning()\n        if isinstance(error, Cancelled):\n            raise\n    finally:\n        try:\n            if not done and not cancelled:\n                await owner.cancel()\n        finally:\n            capacity.release(count)\n";
+    for source in [
+        source.to_owned(),
+        source.replace("not done and not cancelled", "not done"),
+        source.replace(
+            "        if registered:",
+            "        if not done:\n            cancelled = await owner.cancel()\n        code = owner.describe(error)\n        owner.note(code)\n        if registered:",
+        ),
+        source.replace(
+            "        owner.ready()",
+            "        async with owner.timeout():\n            await owner.prepare()\n        owner.ready()",
+        ),
+    ] {
+        assert_matches_cpython(&source, "guarded_recovery_nested_cleanup.py", &LEVELS);
+    }
+}
+
+#[test]
 fn conditional_stored_reraise_copies_local_join() {
     let source = "async def sample(owner, target, cleanup, started, observed):\n    try:\n        try:\n            outcome, reason = 'accepted', 'acknowledged'\n        except AlreadyStarted:\n            return\n        except RemoteError as error:\n            raise Unavailable() from None\n        except TimeoutError as error:\n            raise Unavailable() from None\n    except BaseException as error:\n        if isinstance(error, Cancelled):\n            reason = 'during_dispatch' if started else 'before_dispatch'\n        elif isinstance(error, Disabled):\n            reason = 'disabled'\n        elif started:\n            if isinstance(observed, RemoteError) and observed.status in {Invalid, Unauthorized, Denied, Failed}:\n                reason = 'rejected'\n            else:\n                reason = 'transport' if isinstance(observed, (RemoteError, TimeoutError)) else 'other'\n        raise\n    finally:\n        if not cleanup:\n            owner.record(target, outcome, reason, observed)\n";
     for source in [
