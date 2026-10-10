@@ -2633,6 +2633,235 @@ fn literal_finalizer_returns_preserve_completed_cleanup_locations() {
 }
 
 #[test]
+fn inner_handler_returns_restore_exception_state_before_outer_managers() {
+    let source = r"def sample(manager, work, finish, value):
+    with manager():
+        try:
+            work()
+        finally:
+            try:
+                finish()
+            except ValueError:
+                return value
+";
+    for asynchronous in [false, true] {
+        for named in [false, true] {
+            for returned in ["value", "None"] {
+                let mut source = source.replace("return value", &format!("return {returned}"));
+                if asynchronous {
+                    source = source.replace("def sample", "async def sample");
+                }
+                if named {
+                    source = source.replace("except ValueError:", "except ValueError as error:");
+                }
+                for outer_try in [false, true] {
+                    let source = if outer_try {
+                        let (header, body) = source.split_once('\n').unwrap();
+                        format!(
+                            "{header}\n    try:\n{}    except RuntimeError:\n        raise\n",
+                            body.lines().fold(String::new(), |mut output, line| {
+                                writeln!(output, "    {line}").unwrap();
+                                output
+                            }),
+                        )
+                    } else {
+                        source.clone()
+                    };
+                    assert_matches_cpython(&source, "handler_finally_manager_order.py", &LEVELS);
+                    if asynchronous {
+                        assert_matches_cpython(
+                            &source.replace("with manager():", "async with manager():"),
+                            "handler_finally_async_manager_order.py",
+                            &LEVELS,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn inner_handler_returns_restore_exception_state_before_outer_iterators() {
+    fn indent(source: &str) -> String {
+        source.lines().fold(String::new(), |mut output, line| {
+            writeln!(output, "    {line}").unwrap();
+            output
+        })
+    }
+
+    let body = "try:\n    work()\nfinally:\n    try:\n        finish()\n    except ValueError:\n        return value\n";
+    for loops in [
+        &[][..],
+        &["for item in items:"][..],
+        &["while items:"][..],
+        &["for item in items:", "for other in items:"][..],
+    ] {
+        for named in [false, true] {
+            for returned in ["value", "None"] {
+                let mut body = body.replace("return value", &format!("return {returned}"));
+                if named {
+                    body = body.replace("except ValueError:", "except ValueError as error:");
+                }
+                for header in loops.iter().rev() {
+                    body = format!("{header}\n{}", indent(&body));
+                }
+                for (header, prefix) in
+                    [("def", ""), ("async def", ""), ("def", "    yield None\n")]
+                {
+                    let source = format!(
+                        "{header} sample(items, value, work, finish):\n{prefix}{}",
+                        indent(&body),
+                    );
+                    assert_matches_cpython(&source, "handler_finally_iterator_order.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn retained_managers_own_value_return_iterator_cleanup() {
+    let source = r"async def sample(items, manager, action, finish):
+    try:
+        async with manager():
+            for item in items:
+                try:
+                    value = await action(item)
+                    return value
+                except Error as error:
+                    recover(error)
+    finally:
+        await finish()
+";
+    for source in [
+        source.to_owned(),
+        source.replace("async with", "with"),
+        source.replace("return value", "return"),
+        r"async def sample(items, manager, action, finish):
+    try:
+        async with manager():
+            for item in items:
+                value = await action(item)
+                return value
+    finally:
+        await finish()
+"
+        .to_owned(),
+        r"async def sample(items, action, finish):
+    try:
+        for item in items:
+            try:
+                value = await action(item)
+                return value
+            except Error as error:
+                recover(error)
+    finally:
+        await finish()
+"
+        .to_owned(),
+    ] {
+        assert_matches_cpython(&source, "retained_manager_iterator_return.py", &LEVELS);
+    }
+}
+
+#[test]
+fn coroutine_nested_finalizers_keep_iterator_return_locations() {
+    let source = r"async def sample(manager, action, cleanup, values, value, flag):
+    try:
+        with manager:
+            for outer in values:
+                for middle in values:
+                    try:
+                        for item in values:
+                            if flag:
+                                value = None
+                                return item.attr
+                    except ValueError:
+                        value = None
+                        raise
+                    finally:
+                        value = [*value.attr, None] if value is not None else None
+                        cleanup(value)
+    except TypeError as error:
+        value = None
+        raise
+    finally:
+        cleanup()
+";
+    for source in [
+        source.to_owned(),
+        source.replace(
+            "                        value = [*value.attr, None] if value is not None else None\n",
+            "",
+        ),
+        source.replace(
+            "                        value = [*value.attr, None] if value is not None else None",
+            "                        if flag:\n                            raise ValueError",
+        ),
+    ] {
+        assert_matches_cpython(&source, "coroutine_nested_finalizer_owner.py", &LEVELS);
+    }
+}
+
+#[test]
+fn return_unwinds_interleaved_managers_and_iterators() {
+    let source = r"async def sample(items, manager, stream, flag, finish):
+    try:
+        for item in items:
+            async with manager():
+                async for value in stream():
+                    if flag:
+                        return
+    finally:
+        await finish()
+";
+    for (name, source) in [
+        ("async", source.to_owned()),
+        ("sync_manager", source.replace("async with", "with")),
+        ("sync_iterator", source.replace("async for", "for")),
+    ] {
+        for (result, statement) in [
+            ("bare", "return"),
+            ("none", "return None"),
+            ("value", "return value"),
+        ] {
+            assert_matches_cpython(
+                &source.replace("return\n", &format!("{statement}\n")),
+                &format!("interleaved_return_{name}_{result}.py"),
+                &LEVELS,
+            );
+        }
+    }
+    for (name, source) in [
+        (
+            "no_finally",
+            r"async def sample(items, manager, stream, flag):
+    for item in items:
+        async with manager():
+            async for value in stream():
+                if flag:
+                    return
+",
+        ),
+        (
+            "no_outer_iterator",
+            r"async def sample(manager, stream, flag, finish):
+    try:
+        async with manager():
+            async for value in stream():
+                if flag:
+                    return
+    finally:
+        await finish()
+",
+        ),
+    ] {
+        assert_matches_cpython(source, &format!("interleaved_return_{name}.py"), &LEVELS);
+    }
+}
+
+#[test]
 fn handler_return_keeps_outer_finalizer_owner_through_iterator_cleanup() {
     let source = r"async def sample(items, flag):
     try:
