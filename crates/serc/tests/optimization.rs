@@ -792,6 +792,23 @@ fn stored_call_before_recovery_keeps_iterator_cleanup_reachable() {
 }
 
 #[test]
+fn ordinary_loop_breaks_reach_structured_finalizers() {
+    for recovery in ["state = 0", "report(error)"] {
+        for cleanup in [
+            "try:\n    close(items, state)\nexcept ValueError:\n    report(items)\nfinish(items)",
+            "state = None\nif ready(items):\n    close(items)\nif items:\n    finish(items)",
+            "with manager(items):\n    close(items)\nif items:\n    finish(items)",
+        ] {
+            let source = format!(
+                "def sample(items, step, ready, close, finish, manager, report):\n    state = None\n    try:\n        while True:\n            item = step(items)\n            if ready(item):\n                break\n            if item is None:\n                break\n            report(item)\n    except ValueError as error:\n        {recovery}\n    finally:\n        {}\n",
+                cleanup.replace('\n', "\n        "),
+            );
+            assert_matches_cpython(&source, "ordinary_loop_cleanup.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn runtime_while_recovery_keeps_finalizer_borrow_entry() {
     for named in [false, true] {
         for nested in [false, true] {
