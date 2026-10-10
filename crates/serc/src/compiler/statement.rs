@@ -23040,10 +23040,27 @@ impl<'source> Compiler<'source> {
                     )
                 && matches!(self.control.finally.active_return_finally_contexts.last(), Some(context)
                     if context.loop_depth == 0
-                        && context.with_depth == self.control.withs.active_with_exits.len()
+                        && context.with_depth <= self.control.withs.active_with_exits.len()
                         && context.handler_depth == 0
                         && context.exception_region_depth + 1
                             == self.control.exceptions.active_exception_region_exclusions.len());
+            // Managers entered before the loop are retained by its break.
+            let break_stays_inside_manager = statement.orelse.is_empty()
+                && self.control.loops.contexts.is_empty()
+                && !self.control.withs.active_with_exits.is_empty()
+                && self.control.withs.active_with_region_exclusions.len()
+                    == self.control.withs.active_with_exits.len()
+                && self
+                    .control
+                    .withs
+                    .active_with_exits
+                    .iter()
+                    .all(|manager| !manager.is_async || self.unit.flags & CO_COROUTINE != 0)
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty();
             // Completed awaits and deferred generator creation can precede the
             // same erased tail without reconnecting its empty original exit.
             let completed_prefix_context = matches!(
@@ -23066,10 +23083,16 @@ impl<'source> Compiler<'source> {
                 && matches!(self.unit.scope, Scope::Function { .. })
                 && (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                     || completed_prefix_context
-                    || (break_stays_inside_finally
-                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                            == CO_COROUTINE
-                        && self.control.withs.active_with_exits.last().is_some_and(|manager| manager.is_async)))
+                    || (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                        == CO_COROUTINE
+                        && (break_stays_inside_manager
+                            || (break_stays_inside_finally
+                                && self
+                                    .control
+                                    .withs
+                                    .active_with_exits
+                                    .last()
+                                    .is_some_and(|manager| manager.is_async)))))
                 && (self.control.loops.contexts.is_empty()
                     || (statement.orelse.is_empty()
                         && matches!(self.control.loops.contexts.as_slice(), [outer]
@@ -23083,29 +23106,7 @@ impl<'source> Compiler<'source> {
                 && (!self.has_active_control_flow_region()
                     || break_stays_inside_finally
                     || completed_prefix_context
-                    // A manager entered before the loop is not unwound by its
-                    // break. Erased assertions still leave an empty tail array.
-                    || (statement.orelse.is_empty()
-                        && self.control.loops.contexts.is_empty()
-                        && (self.control.statements.context.has_following
-                            || self.control.withs.active_with_exits.last().is_some_and(|manager|
-                                matches!(manager.normal_exit,
-                                    WithBodyNormalExit::While(range) | WithBodyNormalExit::WhileBeforeElided(range)
-                                        if range == statement.range)))
-                        && !self.control.withs.active_with_exits.is_empty()
-                        && self.control.withs.active_with_region_exclusions.len()
-                            == self.control.withs.active_with_exits.len()
-                        && self
-                            .control
-                            .withs
-                            .active_with_exits
-                            .iter()
-                            .all(|manager| !manager.is_async)
-                        && self
-                            .control
-                            .exceptions
-                            .active_exception_region_exclusions
-                            .is_empty()))
+                    || break_stays_inside_manager)
                 && !self.control.in_exception_handler()
                 && (self.control.finally.is_inactive_for_return_unwind()
                     || break_stays_inside_finally)
@@ -23126,10 +23127,12 @@ impl<'source> Compiler<'source> {
                     };
                     (leading.is_empty()
                         || suite_has_linear_borrow_fallthrough(leading)
-                        || (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                        || leading.iter().all(linear_or_elided)
+                        || ((self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                            || completed_prefix_context)
                             && leading.iter().all(|part| {
                                 linear_or_elided(part)
-                                    || statement_has_completed_iterator_prefix(part)
+                                    || statement_has_completed_borrow_prefix(self, part)
                             }))
                         || (completed_prefix_context
                             && leading.iter().all(|part| {
@@ -34076,8 +34079,14 @@ impl<'source> Compiler<'source> {
                         early_condition_truthiness(&conditional.test).is_none()
                             && !expression_contains_inline_branch(&conditional.test)
                     }
-                    Stmt::Try(_) => {
-                        self.control.withs.active_with_exits.is_empty()
+                    Stmt::Try(_) | Stmt::With(_) => {
+                        (matches!(entry, Stmt::Try(_))
+                            || (self.context.python_version == crate::PythonVersion::Py314
+                                && matches!(self.unit.scope, Scope::Function { .. })
+                                && self.unit.flags
+                                    & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                                    == 0))
+                            && self.control.withs.active_with_exits.is_empty()
                             && self.control.finally.active_copied_finally_bodies == 0
                             && self.suite_has_nonempty_borrow_entry(&statement.finalbody)
                     }
@@ -43834,8 +43843,8 @@ fn suite_has_populated_try_exit(body: &[Stmt]) -> bool {
                                 && !expression_contains_inline_branch(&iterator.iter))))
 }
 
-/// Completed synchronous iterators cannot enter a later erased while-loop tail.
-fn statement_has_completed_iterator_prefix(statement: &Stmt) -> bool {
+/// Completed prefixes cannot enter a later erased while-loop tail.
+fn statement_has_completed_borrow_prefix(compiler: &Compiler<'_>, statement: &Stmt) -> bool {
     fn linear(expression: &Expr) -> bool {
         !expression_contains_inline_branch(expression)
             && !expression_suspends_current_scope(expression)
@@ -43876,7 +43885,7 @@ fn statement_has_completed_iterator_prefix(statement: &Stmt) -> bool {
         }
     }
     if crate::stack_growth_required() {
-        return crate::grow_stack(|| statement_has_completed_iterator_prefix(statement));
+        return crate::grow_stack(|| statement_has_completed_borrow_prefix(compiler, statement));
     }
     match statement {
         Stmt::For(iterator) => {
@@ -43888,10 +43897,20 @@ fn statement_has_completed_iterator_prefix(statement: &Stmt) -> bool {
                             && tuple.elts.iter().all(|item| matches!(item, Expr::Name(_)))))
                 && linear(&iterator.iter)
                 && iterator.body.iter().all(|part| {
-                    (suite_has_linear_borrow_fallthrough(std::slice::from_ref(part))
-                        && !suite_contains_yield(std::slice::from_ref(part)))
-                        || statement_has_completed_iterator_prefix(part)
+                    compiler.context.is_elided_statement(part)
+                        || (suite_has_linear_borrow_fallthrough(std::slice::from_ref(part))
+                            && !suite_contains_yield(std::slice::from_ref(part)))
+                        || statement_has_completed_borrow_prefix(compiler, part)
                 })
+        }
+        Stmt::If(branch) => {
+            branch.elif_else_clauses.is_empty()
+                && condition_has_linear_runtime_leaves(&branch.test)
+                && !expression_suspends_current_scope(&branch.test)
+                && branch
+                    .body
+                    .iter()
+                    .all(|part| compiler.context.is_elided_statement(part))
         }
         Stmt::Assign(assignment) => {
             matches!(assignment.targets.as_slice(), [Expr::Name(_)]) && value(&assignment.value)

@@ -1958,6 +1958,87 @@ fn erased_async_cleanup_after_comprehension_keeps_empty_exit() {
 }
 
 #[test]
+fn completed_coroutine_iterator_prefix_keeps_erased_exit() {
+    for target in ["move", "key, move"] {
+        for prefix in ["", "        await wait()\n"] {
+            for work in [
+                "owners[move.key] = move.target",
+                "await publish(move)",
+                "for pair in move.peers:\n                assert pair.kind == ('first' if ready else 'second')",
+            ] {
+                let source = format!(
+                    "async def sample(batch, owners, rerun):\n    while True:\n{prefix}        for {target} in batch.moves:\n            {work}\n        if batch.done:\n            break\n        assert valid()\n    while not rerun.done:\n        rerun = await plan(rerun.progress)\n"
+                );
+                assert_matches_cpython(&source, "completed_coroutine_iterator.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn erased_conditional_prefix_keeps_loop_exit() {
+    for scope in ["def", "async def"] {
+        for condition in ["not before.complete", "before.complete and ready"] {
+            let source = format!(
+                "{scope} sample(batch, before, rerun, ready):\n    while True:\n        if {condition}:\n            assert not batch.moves\n        if batch.done:\n            break\n        assert valid()\n    while not rerun.done:\n        rerun = plan(rerun.progress)\n"
+            );
+            assert_matches_cpython(&source, "erased_conditional_prefix.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
+fn erased_loop_before_managed_dispatch_keeps_empty_exit() {
+    for branches in [1, 3, 6] {
+        for setup in ["", "                work()\n"] {
+            let mut source = format!(
+                "def sample(context, path, mode):\n    with outer(workers=1) as executor, acquire(store.path, automatic=True) as connection:\n        with connection.transaction(), connection.cursor() as cursor:\n            while True:\n{setup}                if row is not None and row[0]:\n                    break\n                assert waiting()\n"
+            );
+            for index in 0..branches {
+                let keyword = if index == 0 { "if" } else { "elif" };
+                writeln!(source, "            {keyword} mode == 'case_{index}':\n                cursor.execute('update {index}', (group,))").unwrap();
+            }
+            source.push_str(
+                "            else:\n                cursor.execute('update last', (target.key,))\n",
+            );
+            assert_matches_cpython(&source, "managed_loop_dispatch.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
+fn erased_async_manager_loop_keeps_empty_exit() {
+    for source in [
+        "async def sample(server, health, receipt):\n    async with runtime() as context:\n        try:\n            async with connect(context) as control:\n                while True:\n                    if receipt['kind'] == 'done':\n                        break\n                    assert receipt['kind'] == 'progress'\n                await wait(lambda: not server.tasks)\n        finally:\n            if health is not None:\n                await gather(health, return_exceptions=True)\n",
+        "async def sample(page, offset):\n    with backing():\n        async with environment() as env:\n            async with lifespan(env), connection(env) as transport, stream(transport) as channel, session(channel) as client:\n                while True:\n                    if page['next'] is None:\n                        break\n                    assert page['next'] == offset\n                result = await client.fetch(offset)\n",
+        "async def sample(writer, receipt, message, received):\n    async with runtime() as server:\n        async with connect(server) as control:\n            try:\n                async with channel() as data:\n                    while True:\n                        if message == 'done':\n                            break\n                        received.extend(message)\n                while True:\n                    assert receipt['id'] == expected\n                    if receipt['kind'] == 'done':\n                        break\n                    assert receipt['kind'] == 'progress'\n                with expecting(TimeoutError):\n                    await control.receive()\n            finally:\n                await close(writer)\n",
+    ] {
+        assert_matches_cpython(source, "erased_async_manager_loop.py", &LEVELS);
+    }
+}
+
+#[test]
+fn compound_while_breaks_preserve_managed_cleanup_borrowing() {
+    let source = r#"class Sample:
+    def sample(self):
+        try:
+            while True:
+                value = self.reader.read(self.limit + 1)
+                if not value or len(value) > self.limit or not value.endswith(b"\n"):
+                    break
+                item = decode(value)
+                if "key" in item:
+                    self.output.put(item, timeout=1)
+        except (TypeError, ValueError, LookupError):
+            pass
+        finally:
+            with manager(LookupError):
+                self.output.put_nowait(None)
+"#;
+    assert_matches_cpython(source, "compound_while_cleanup.py", &LEVELS);
+}
+
+#[test]
 fn completed_while_prefixes_preserve_erased_exit_borrow_boundaries() {
     for coroutine in [false, true] {
         for generator in [false, true] {
