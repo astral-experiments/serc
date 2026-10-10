@@ -4211,6 +4211,132 @@ fn erased_coroutine_final_elif_preserves_shared_backedge() {
 }
 
 #[test]
+fn completed_managed_stores_preserve_iterator_backedges() {
+    let source = r"async def sample(items, outer, resource, work, convert, flag):
+    async with outer():
+        with resource():
+            for item in items:
+                ready = await work(item)
+                if flag is item:
+                    value = convert(next(entry for entry in ready if entry.active))
+                    assert value
+                else:
+                    assert item
+";
+    let generator = "convert(next(entry for entry in ready if entry.active))";
+    for (name, source) in [
+        ("generator_store", source.to_owned()),
+        ("generator_attribute", source.replace("value", "item.value")),
+        (
+            "generator_sync_manager",
+            source
+                .replace("    async with outer():\n", "")
+                .replace("\n    ", "\n"),
+        ),
+        (
+            "list_store",
+            source.replace(generator, "[entry.code for entry in ready if entry.active]"),
+        ),
+        (
+            "set_store",
+            source.replace(generator, "{entry.code for entry in ready if entry.active}"),
+        ),
+        (
+            "dict_store",
+            source.replace(
+                generator,
+                "{entry.code: entry.value for entry in ready if entry.active}",
+            ),
+        ),
+        (
+            "combined_work",
+            r"async def sample(items, outer, resource, work, convert, flag):
+    async with outer():
+        with resource():
+            for item in items:
+                ready = await work(item)
+                if flag is item:
+                    chosen = ready if item.active else items
+                    value = convert(next(entry for entry in chosen if entry.active))
+                    assert value
+                    if flag:
+                        value = item.value
+                        assert value
+                    else:
+                        assert item
+                    selected = [entry for entry in ready if entry.active]
+                    result = await work(selected)
+                    item.value = convert(next(entry for entry in ready if entry.active))
+                    item.ready = result
+                else:
+                    assert item
+"
+            .to_owned(),
+        ),
+    ] {
+        assert_matches_cpython(
+            &source,
+            &format!("completed_managed_store_{name}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
+fn nested_managed_arms_preserve_iterator_backedges() {
+    let source = r"async def sample(items, outer, resource, work, convert, flag, active):
+    async with outer():
+        with resource():
+            for item in items:
+                ready = await work(item)
+                if flag is item:
+                    value = convert(next(entry for entry in ready if entry.active))
+                    assert value
+                    if active:
+                        value = ready[0]
+                        assert value
+                    else:
+                        assert ready
+                    assert item
+                else:
+                    assert item
+";
+    for (name, source) in [
+        ("base", source.to_owned()),
+        (
+            "no_generator",
+            source.replace(
+                "value = convert(next(entry for entry in ready if entry.active))",
+                "value = ready[0]",
+            ),
+        ),
+        (
+            "no_inner_else",
+            source.replace(
+                "                    else:\n                        assert ready\n",
+                "",
+            ),
+        ),
+        (
+            "no_trailing_assert",
+            source.replace(
+                "                        assert ready\n                    assert item\n",
+                "                        assert ready\n",
+            ),
+        ),
+        (
+            "suspending_prefix",
+            source.replace(
+                "                    if active:\n",
+                "                    await work(ready)\n                    if active:\n",
+            ),
+        ),
+    ] {
+        assert_matches_cpython(&source, &format!("nested_managed_arm_{name}.py"), &LEVELS);
+    }
+}
+
+#[test]
 fn erased_iterator_else_preserves_saved_cleanup_owners() {
     for body in [
         "assert result",

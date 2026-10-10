@@ -17383,6 +17383,50 @@ impl<'source> Compiler<'source> {
         )
     }
 
+    /// Keeps completed nested arms at an iterator's original manager owners.
+    fn managed_completed_branch_tail(
+        &self,
+        statement: &ruff_python_ast::StmtIf,
+        restart: Label,
+        mode: LoopTailMode,
+    ) -> bool {
+        self.context.python_version >= crate::PythonVersion::Py314
+            && mode.non_final_branch
+            && !mode.try_body_normal_exit
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+            && self.control.in_synchronous_with()
+            && self.control.in_loop_tail_without_nested_cleanup()
+            && self.control.finally.is_inactive_for_return_unwind()
+            && !self.control.in_exception_handler()
+            && self.control.exceptions.active_exception_group_handlers == 0
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && self.control.loops.contexts.last().is_some_and(|context| {
+                context.iterator_cleanup == IteratorCleanup::Sync
+                    && context.continue_label == restart
+            })
+            && matches!(statement.test.as_ref(), Expr::Name(_))
+            && statement
+                .body
+                .iter()
+                .any(|part| !self.context.is_elided_statement(part))
+            && statement.body.iter().all(|part| {
+                self.context.is_elided_statement(part)
+                    || (suite_has_linear_borrow_fallthrough(std::slice::from_ref(part))
+                        && suite_has_nonsuspending_conditional_work(std::slice::from_ref(part))
+                        && !suite_contains_yield(std::slice::from_ref(part)))
+            })
+            && (statement.elif_else_clauses.is_empty()
+                || matches!(statement.elif_else_clauses.as_slice(), [clause]
+                    if clause.test.is_none()
+                        && !clause.body.is_empty()
+                        && clause.body.iter().all(|part| self.context.is_elided_statement(part))))
+    }
+
     fn compile_loop_tail_suite_inner(
         &mut self,
         body: &[Stmt],
@@ -17440,7 +17484,8 @@ impl<'source> Compiler<'source> {
                 .iter()
                 .any(|statement| self.context.is_elided_statement(statement))
             && matches!(&body[end], Stmt::If(statement)
-            if (statement.elif_else_clauses.is_empty() || erased_final_else(statement))
+            if (statement.elif_else_clauses.is_empty() || erased_final_else(statement)
+                    || self.managed_completed_branch_tail(statement, restart, mode))
                 && condition_has_only_runtime_tests(&statement.test)
                 && !expression_suspends_current_scope(&statement.test)
                 && (matches!(statement.body.split_last(), Some((Stmt::Continue(_), prefix))
@@ -17465,6 +17510,8 @@ impl<'source> Compiler<'source> {
                         && body[end + 1..].iter().all(|suffix| self.context.is_elided_statement(suffix)))
                     // Iterator arms keep both inner exits when their erased
                     // suffix sits under the surrounding loop owner.
+                    || (self.managed_completed_branch_tail(statement, restart, mode)
+                        && body[end + 1..].iter().all(|suffix| self.context.is_elided_statement(suffix)))
                     || ((mode.non_final_branch
                         || final_coroutine_iterator_arm
                         || (final_async_iterator_arm
@@ -19860,8 +19907,10 @@ impl<'source> Compiler<'source> {
         // A removed else in a non-final arm leaves an unlocated exit that native
         // copies onto each runtime edge. For-loop else and nonlinear condition joins
         // keep their existing lowering because they have separate continuations.
+        let managed_completed_branch = self.managed_completed_branch_tail(statement, restart, mode);
         let eligible_else = self.context.python_version >= crate::PythonVersion::Py314
             && (!non_final_branch
+                || managed_completed_branch
                 || (!self.has_active_control_flow_region()
                     && !self.control.in_exception_handler()
                     && self.control.withs.active_with_exits.is_empty()
@@ -20039,6 +20088,23 @@ impl<'source> Compiler<'source> {
             ordinary_function
                 && self.control.finally.active_finally_try_bodies == 1
                 && iterator_arm_has_completed_dict_store(part)
+        };
+        // These stores finish under the iterator's saved manager owners. Their
+        // completed work cannot enter the enclosing condition's erased else.
+        let completed_managed_store = |part: &Stmt| {
+            completed_work_at_restart
+                && matches!(self.unit.scope, Scope::Function { .. })
+                && self.unit.flags & CO_COROUTINE != 0
+                && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+                && self.control.in_synchronous_with()
+                && self.control.finally.is_inactive_for_return_unwind()
+                && self
+                    .control
+                    .loops
+                    .contexts
+                    .last()
+                    .is_some_and(|context| context.iterator_cleanup == IteratorCleanup::Sync)
+                && iterator_arm_has_completed_managed_store(part)
         };
         // Both value arms merge before the name store, independently
         // of the enclosing condition's erased false edge.
@@ -20220,6 +20286,7 @@ impl<'source> Compiler<'source> {
                         self.context.is_elided_statement(statement)
                             || suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement))
                             || completed_dict_store(statement)
+                            || completed_managed_store(statement)
                             || completed_inner_for(statement)
                             || completed_conditional_store(statement)
                             || completed_conditional_work(statement)
@@ -20323,6 +20390,7 @@ impl<'source> Compiler<'source> {
                 });
         let optimized_empty_else = eligible_else
             && (self.control.withs.active_with_region_exclusions.is_empty()
+                || managed_completed_branch
                 || protected_loop_else
                 || protected_while_loop_else
                 // Elided arms share the original loop backedge even inside a
@@ -46932,6 +47000,66 @@ fn iterator_arm_has_completed_dict_store(statement: &Stmt) -> bool {
         && !expression_contains_inline_branch(&comprehension.value)
 }
 
+/// Recognizes completed comprehension stores and nested lazy-generator calls.
+fn iterator_arm_has_completed_managed_store(statement: &Stmt) -> bool {
+    let Stmt::Assign(assignment) = statement else {
+        return false;
+    };
+    let [target] = assignment.targets.as_slice() else {
+        return false;
+    };
+    let linear = |value: &Expr| {
+        !expression_contains_inline_branch(value)
+            && !expression_suspends_current_scope(value)
+            && !expression_yields_in_current_scope(value)
+    };
+    let filter = |test: &Expr| {
+        condition_has_linear_runtime_leaves(test)
+            && original_condition_has_unique_jump_target(test, true)
+            && original_condition_has_unique_jump_target(test, false)
+            && !expression_suspends_current_scope(test)
+            && !expression_yields_in_current_scope(test)
+    };
+    if let Some((iterators, key, value)) = super::comprehension_parts(&assignment.value) {
+        let [iterator] = iterators else {
+            return false;
+        };
+        return matches!(target, Expr::Name(_))
+            && !iterator.is_async
+            && matches!(iterator.target, Expr::Name(_))
+            && iterator.ifs.len() <= 1
+            && iterator.ifs.iter().all(filter)
+            && linear(&iterator.iter)
+            && key.is_none_or(linear)
+            && (!matches!(assignment.value.as_ref(), Expr::DictComp(_)) || key.is_some())
+            && linear(value);
+    }
+    let Expr::Call(outer) = assignment.value.as_ref() else {
+        return false;
+    };
+    let [Expr::Call(inner)] = outer.arguments.args.as_ref() else {
+        return false;
+    };
+    let [Expr::Generator(generator)] = inner.arguments.args.as_ref() else {
+        return false;
+    };
+    let [iterator] = generator.generators.as_slice() else {
+        return false;
+    };
+    (matches!(target, Expr::Name(_))
+        || matches!(target, Expr::Attribute(attribute) if matches!(attribute.value.as_ref(), Expr::Name(_))))
+        && linear(&outer.func)
+        && outer.arguments.keywords.is_empty()
+        && matches!(inner.func.as_ref(), Expr::Name(name) if name.id.as_str() == "next")
+        && inner.arguments.keywords.is_empty()
+        && !iterator.is_async
+        && matches!(iterator.target, Expr::Name(_))
+        && iterator.ifs.len() <= 1
+        && iterator.ifs.iter().all(filter)
+        && linear(&iterator.iter)
+        && linear(&generator.elt)
+}
+
 /// Both eager set operands finish before the comparison's conditional jump.
 fn condition_has_completed_set_comparison(expression: &Expr) -> bool {
     let Expr::Compare(comparison) = expression else {
@@ -46960,6 +47088,121 @@ fn condition_has_completed_set_comparison(expression: &Expr) -> bool {
 mod protected_iterator_erased_else_tests {
     use ruff_python_ast::Stmt;
     use ruff_python_parser::parse_module;
+
+    #[test]
+    fn managed_stores_require_completed_synchronous_work() {
+        for (statement, expected) in [
+            ("value = [entry for entry in items]", true),
+            (
+                "value = [entry.code for entry in items if entry.active]",
+                true,
+            ),
+            (
+                "value = {entry.code for entry in items if entry.active}",
+                true,
+            ),
+            (
+                "value = {entry.code: entry.value for entry in items if entry.active}",
+                true,
+            ),
+            ("value = convert(next(entry for entry in items))", true),
+            (
+                "value = convert(next(entry for entry in items if entry.active))",
+                true,
+            ),
+            (
+                "item.value = convert(next(entry.code for entry in items if entry.active))",
+                true,
+            ),
+            (
+                "value = converter.convert(next(entry for entry in items))",
+                true,
+            ),
+            ("item.value = [entry for entry in items]", false),
+            ("left = right = [entry for entry in items]", false),
+            ("left, right = [entry for entry in items]", false),
+            (
+                "value = [entry for group in items for entry in group]",
+                false,
+            ),
+            (
+                "value = [entry for entry in items if entry.active if entry.ready]",
+                false,
+            ),
+            ("value = [entry async for entry in items]", false),
+            (
+                "value = [entry if flag else other for entry in items]",
+                false,
+            ),
+            ("value = [await convert(entry) for entry in items]", false),
+            ("value = [entry for entry in await work()]", false),
+            (
+                "value = {entry if flag else other: entry for entry in items}",
+                false,
+            ),
+            (
+                "value = convert(next(entry for entry in (items if flag else other)))",
+                false,
+            ),
+            (
+                "value = convert(next(entry async for entry in items))",
+                false,
+            ),
+            (
+                "value = convert(next(entry for entry in items if await work(entry)))",
+                false,
+            ),
+            (
+                "value = convert(next(await work(entry) for entry in items))",
+                false,
+            ),
+            (
+                "value = convert(next(entry for group in items for entry in group))",
+                false,
+            ),
+            (
+                "value = convert(next(entry for entry in items if entry.active if entry.ready))",
+                false,
+            ),
+            (
+                "value = convert(next((entry for entry in items), None))",
+                false,
+            ),
+            (
+                "value = convert(next(entry for entry in items), flag=True)",
+                false,
+            ),
+            ("value = convert(list(entry for entry in items))", false),
+            ("value = next(entry for entry in items)", false),
+            (
+                "item().value = convert(next(entry for entry in items))",
+                false,
+            ),
+            (
+                "items[index] = convert(next(entry for entry in items))",
+                false,
+            ),
+            (
+                "value = (await converter())(next(entry for entry in items))",
+                false,
+            ),
+            (
+                "value = (yield converter)(next(entry for entry in items))",
+                false,
+            ),
+        ] {
+            let source = format!("async def sample():\n    {statement}\n");
+            let parsed = parse_module(&source).unwrap();
+            let Stmt::FunctionDef(function) = &parsed.suite()[0] else {
+                unreachable!();
+            };
+            assert_eq!(
+                super::iterator_arm_has_completed_managed_store(&function.body[0]),
+                expected,
+                "{statement}",
+            );
+        }
+    }
 
     #[test]
     fn set_comparison_requires_two_completed_synchronous_iterators() {
