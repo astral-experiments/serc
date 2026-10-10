@@ -20731,10 +20731,40 @@ impl<'source> Compiler<'source> {
                         && !expression_suspends_current_scope(value)
                         && !expression_yields_in_current_scope(value)
                 }));
+            // A break leaves the iterator, not the managers that predate it. Its
+            // non-final condition keeps the same forward exit before threading.
+            let copied_coroutine_for_else_break = self.context.python_version
+                >= crate::PythonVersion::Py314
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                    == CO_COROUTINE
+                && matches!(self.unit.scope, Scope::Function { .. })
+                && matches!(statement.body.as_slice(), [Stmt::Break(_)])
+                && statement.elif_else_clauses.is_empty()
+                && condition_has_linear_runtime_leaves(&statement.test)
+                && original_condition_has_unique_jump_target(&statement.test, true)
+                && !expression_suspends_current_scope(&statement.test)
+                && !expression_yields_in_current_scope(&statement.test)
+                && !self.control.in_exception_handler()
+                && self.control.exceptions.active_exception_group_handlers == 0
+                && self.control.finally.is_inactive_for_return_unwind()
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty()
+                && self.control.withs.active_with_exits.len()
+                    == self.control.withs.active_with_region_exclusions.len()
+                && self
+                    .control
+                    .withs
+                    .active_with_exits
+                    .iter()
+                    .all(|owner| owner.loop_depth < self.control.loops.contexts.len());
             let copied_loop_else_branch_exit = non_final_branch
                 && self.control.loops.contexts.last().is_some_and(|context| {
                     context.has_orelse
-                        && context.iterator_cleanup != IteratorCleanup::Async
+                        && (context.iterator_cleanup != IteratorCleanup::Async
+                            || copied_coroutine_for_else_break)
                         && context.continue_label == restart
                         && context.with_depth == self.control.withs.active_with_exits.len()
                         && context.finally_end_depth
@@ -20771,7 +20801,8 @@ impl<'source> Compiler<'source> {
                             .body
                             .iter()
                             .all(|part| self.context.is_elided_statement(part)))
-                    || copied_coroutine_for_else_return);
+                    || copied_coroutine_for_else_return
+                    || copied_coroutine_for_else_break);
             let copied_loop_branch_exit = non_final_branch
                 && (self.control.in_loop_tail_without_nested_cleanup()
                     || copied_loop_else_branch_exit)
