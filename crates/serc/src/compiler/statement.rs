@@ -33111,6 +33111,17 @@ impl<'source> Compiler<'source> {
                             .body
                             .iter()
                             .all(|part| matches!(part, Stmt::Pass(_)))
+                        || (runtime_coroutine_break_context
+                            && (suite_has_nonsuspending_conditional_work(&handler.body)
+                                || handler.body.split_last().is_some_and(|(last, prefix)| {
+                                    suite_has_nonsuspending_conditional_work(prefix)
+                                        && (suite_has_populated_conditional_alternative(
+                                            std::slice::from_ref(last),
+                                            false,
+                                        ) || suite_has_linear_reraise_guards(
+                                            std::slice::from_ref(last),
+                                        ))
+                                })))
                 })
             })
             && matches!(statement.body.last(), Some(Stmt::While(loop_statement))
