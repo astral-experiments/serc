@@ -5025,6 +5025,47 @@ fn managed_handler_returns_preserve_conditional_finalizer_entry() {
 }
 
 #[test]
+fn managed_handler_returns_preserve_primitive_finalizer_owners() {
+    let source = r"async def sample(manager, flag):
+    with manager:
+        try:
+            while True:
+                try:
+                    await action()
+                except Exception as error:
+                    if flag:
+                        record()
+                        return
+                    raise
+        finally:
+            if not flag:
+                record()
+                await finish()
+";
+    for (index, prefix) in [
+        "record()",
+        "record(); record()",
+        "current = flag; record(current)",
+        "pass",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (return_index, returned) in ["", " None"].into_iter().enumerate() {
+            let source = source.replace(
+                "record()\n                        return",
+                &format!("{prefix}\n                        return{returned}"),
+            );
+            assert_matches_cpython(
+                &source,
+                &format!("managed_handler_finalizer_{index}_{return_index}.py"),
+                &LEVELS,
+            );
+        }
+    }
+}
+
+#[test]
 fn enclosing_tries_own_handler_returns_before_finalizers() {
     let body = r"try:
     try:
