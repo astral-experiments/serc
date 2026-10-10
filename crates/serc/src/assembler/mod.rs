@@ -505,6 +505,14 @@ pub(crate) trait ConstantTable {
     fn intern(&mut self, constant: Constant) -> Result<u32, CompileError>;
     fn fold_sequence(&mut self, values: Vec<Constant>, is_set: bool) -> Result<u32, CompileError>;
 
+    /// Fold sequence arithmetic exposed by an appended exit block.
+    fn fold_binary_sequence(
+        &mut self,
+        left: Constant,
+        argument: u32,
+        right: Constant,
+    ) -> Result<Option<u32>, CompileError>;
+
     /// Reallocate non-reflexive values for a copied exit, leaving other constants unchanged.
     /// The remap is shared across the copy to preserve aliases among its constants.
     fn reallocate_non_reflexive_constant(

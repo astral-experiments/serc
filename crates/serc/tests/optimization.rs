@@ -8576,6 +8576,65 @@ fn nested_authored_pass_preserves_returns_before_removed_assertions() {
 }
 
 #[test]
+fn copied_exits_fold_sequence_arithmetic() {
+    for (left, right) in [
+        ("'first'", "'second'"),
+        ("b'first'", "b'second'"),
+        ("(1, 2)", "(3, 4)"),
+        ("'\\ud800'", "'text'"),
+    ] {
+        for expression in [
+            format!("({left} if flag else {right}) + {left}"),
+            format!("({left} if flag else {right}) * 4"),
+            format!("4 * ({left} if flag else {right})"),
+            format!("({left} if flag else {right}) + {left} + {right}"),
+            format!("({left} if flag else {right}) * 4097"),
+            format!("({left} if flag else {right}) * False"),
+            format!("({left} if flag else {right}) * -1"),
+        ] {
+            let source = format!("def sample(flag):\n    return {expression}\n");
+            assert_matches_cpython(&source, "copied_sequence_arithmetic.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
+fn copied_sequence_folds_preserve_locations_and_constant_order() {
+    for (left, right) in [
+        ("'first'", "'second'"),
+        ("b'first'", "b'second'"),
+        ("(1, 2)", "(3, 4)"),
+    ] {
+        for expression in [
+            format!("(\n        ({left} if flag else {right})\n        + {left}\n    )"),
+            format!("(\n        ({left} if flag else {right}) *\n        4\n    )"),
+            format!("(({left} if flag else {right}) + {left},)"),
+        ] {
+            let source = format!(
+                "def sample(flag, early):\n    if early:\n        return {expression}\n    return {left}, {right}\n"
+            );
+            assert_matches_cpython(&source, "copied_sequence_locations.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
+fn copied_empty_bytes_folds_preserve_cache_admission() {
+    for prefix in ["", "empty = b''\n", "def earlier():\n    return None\n"] {
+        for expression in [
+            "(b'first' if flag else b'second') * False",
+            "(b'' if flag else b'first') * -1",
+            "(b'first' if flag else value) * 0",
+        ] {
+            let source = format!(
+                "{prefix}def sample(flag, value):\n    return {expression}\n\ndef later():\n    return b''\n"
+            );
+            assert_matches_cpython(&source, "copied_empty_bytes.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn protected_conditional_tuple_returns_revisit_completed_tail() {
     let source = r"
 async def run(record, select, ready):
