@@ -15,6 +15,27 @@ use serc::{
 };
 
 #[test]
+fn coroutine_manager_store_reaches_cleanup_past_returns() {
+    let source = "async def sample(owner, kind, choice, payload, tags):\n    status = None\n    try:\n        if kind in owner.local:\n            with owner.track():\n                result = await owner.fetch(payload)\n        elif kind in owner.remote():\n            if choice and choice.ready():\n                return owner.saved\n        else:\n            raise Failed(kind)\n    except FetchError as error:\n        raise cause from error\n    except Error as error:\n        status = owner.status(error)\n        raise\n    finally:\n        flavor = 'cleanup'\n        if status is not None:\n            tags.append(status)\n        owner.record(flavor)\n";
+    for source in [
+        source.to_owned(),
+        source.replace("return owner.saved", "return ([], owner.saved)"),
+        source.replace("return owner.saved", "return"),
+        source.replace("return owner.saved", "result = owner.saved"),
+        source.replace(
+            "            with owner.track():",
+            "            from math import pi\n            with owner.track():",
+        ),
+        source.replace(
+            "            with owner.track():",
+            "            location = None\n            owner.prepare()\n            with owner.track():",
+        ),
+    ] {
+        assert_matches_cpython(&source, "coroutine_manager_store_return.py", &LEVELS);
+    }
+}
+
+#[test]
 fn coroutine_asserted_success_keeps_call_cleanup_reachable() {
     let source = "async def sample(owner, outcome, tags, metrics):\n    try:\n        async with owner.timeout():\n            runtime = owner.create()\n    except Timeout as error:\n        owner.warning()\n    except Error as error:\n        owner.emit(\n            first=runtime.backing if runtime is not None else None,\n            second=str(runtime.model) if runtime is not None else owner.model,\n            third=runtime.virtual() if runtime is not None else owner.virtual,\n            error=type(error).__name__,\n        )\n    else:\n        assert runtime is not None\n        owner.update({\n            'first': str(runtime.model),\n            'second': runtime.virtual(),\n            'elapsed': owner.elapsed(),\n            **metrics,\n        })\n    finally:\n        owner.record(owner.elapsed(), tags=[f'state:{outcome}', *tags])\n";
     for (index, source) in [
