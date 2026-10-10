@@ -12323,11 +12323,76 @@ impl<'source> Compiler<'source> {
                             })
                             && !suite_contains_abrupt_control_flow(finally_context.body)
                             && !suite_contains_yield(finally_context.body);
+                        // Two ordinary tries can remain between these finalizers. The
+                        // innermost one owns cleanup emitted by the copied handler too.
+                        // An already-exited inner handler does not retire either try.
+                        let retained_nested_try_owns_copy = context_index == 1
+                            && return_finally_contexts.len() == 2
+                            && (handler_count == 0
+                                || (!return_is_overridden
+                                    && preserve_tos
+                                    && next_handler == 0
+                                    && self.unit.flags
+                                        & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                                        == CO_COROUTINE
+                                    && self.control.withs.active_with_exits.len() == 1
+                                    && self.control.loops.contexts.len() == 2
+                                    && self.control.exceptions.active_try_marker_slots.len() == 2
+                                    && self
+                                        .control
+                                        .exceptions
+                                        .active_exception_region_exclusions
+                                        .len()
+                                        == 5
+                                    && matches!(self.control.exceptions.active_exception_handlers.as_slice(),
+                                        [handler] if handler.name.is_none()
+                                            && handler.exception_region_depth == 4
+                                            && handler.try_body_depth == 2
+                                            && handler.loop_depth == 2
+                                            && handler.with_depth == 1
+                                            && handler.finally_end_depth == 0)))
+                            && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+                            && (self.control.withs.active_with_exits.is_empty()
+                                || (next_with == 0
+                                    && outer_context.with_depth == 0
+                                    && finally_context.with_depth == 0
+                                    && matches!(self.control.withs.active_with_exits.as_slice(), [manager]
+                                        if manager.exception_region_depth == 4
+                                            && manager.loop_depth == 1
+                                            && manager.finally_end_depth == 0
+                                            && manager.normal_finally_depth == 0)))
+                            && self.control.exceptions.active_exception_group_handlers == 0
+                            && self.control.finally.active_finally_end_blocks == 0
+                            && self.control.finally.active_normal_finally_bodies == 0
+                            && self.control.finally.active_copied_finally_bodies == 0
+                            && outer_context.exception_region_depth == 0
+                            && outer_context.try_body_depth == 0
+                            && outer_context.handler_depth == 0
+                            && outer_context.loop_depth == 0
+                            && finally_context.exception_region_depth == 3
+                            && finally_context.try_body_depth == 2
+                            && finally_context.handler_depth == 0
+                            && finally_context.loop_depth == 1
+                            && (matches!(self.control.loops.contexts.as_slice(), [context]
+                                if context.iterator_cleanup == IteratorCleanup::Sync)
+                                || matches!(self.control.loops.contexts.as_slice(), [outer, inner]
+                                    if outer.iterator_cleanup == IteratorCleanup::Sync
+                                        && matches!(inner.iterator_cleanup,
+                                            IteratorCleanup::Sync | IteratorCleanup::Async)
+                                        && inner.with_depth == self.control.withs.active_with_exits.len()
+                                        && inner.finally_end_depth == 0
+                                        && inner.exception_region_depth == 4
+                                        && next_loop == 2))
+                            && handler_region_unwind_starts
+                                .as_ref()
+                                .and_then(|starts| starts.get(2))
+                                .is_some_and(Option::is_none);
                         let retained_try_owns_copy = retained_iterator_try_owns_copy
                             || ((tracks_try_between_finally_unwinds
                                 || tracks_handler_between_plain_finalizers)
                                 && context_index == 1)
                             || ((handler_count == 0
+                                || retained_nested_try_owns_copy
                                 || (preserves_manager_handler_try_owner
                                     && next_handler == 0
                                     && context_index == 1))
@@ -12346,10 +12411,11 @@ impl<'source> Compiler<'source> {
                                                     && context.exception_region_depth
                                                         == finally_context.exception_region_depth
                                             })))
-                                && finally_context.exception_region_depth
-                                    == outer_context.exception_region_depth + 2
-                                && finally_context.try_body_depth
-                                    == outer_context.try_body_depth + 1
+                                && (retained_nested_try_owns_copy
+                                    || (finally_context.exception_region_depth
+                                        == outer_context.exception_region_depth + 2
+                                        && finally_context.try_body_depth
+                                            == outer_context.try_body_depth + 1))
                                 && handler_region_unwind_starts
                                     .as_ref()
                                     .and_then(|starts| {
