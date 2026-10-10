@@ -4702,6 +4702,113 @@ fn nested_tries_own_copied_finalizer_handler_cleanup() {
 }
 
 #[test]
+fn try_else_manager_returns_preserve_conditional_finalizer_entry() {
+    let source = r"async def sample(manager, work, pending):
+    try:
+        try:
+            with manager() as resource:
+                try:
+                    value = await work()
+                except Error:
+                    raise
+                else:
+                    return value
+        except Error:
+            return None
+    finally:
+        if pending is not None:
+            await pending
+";
+    for nested in [false, true] {
+        for assigned in [false, true] {
+            for coroutine in [false, true] {
+                for present in [false, true] {
+                    let mut source = source.to_owned();
+                    if nested {
+                        source = source.replace(
+                            "                    value = await work()",
+                            "                    async with manager():\n                        value = await work()",
+                        );
+                    }
+                    if assigned {
+                        source = source.replace(
+                            "                    return value",
+                            "                    resource.state = 1\n                    return value",
+                        );
+                    }
+                    if !coroutine {
+                        source = source.replace("async ", "").replace("await ", "");
+                    }
+                    if !present {
+                        source = source.replace("pending is not None", "pending is None");
+                    }
+                    assert_matches_cpython(
+                        &source,
+                        &format!(
+                            "try_else_manager_finalizer_{nested}_{assigned}_{coroutine}_{present}.py"
+                        ),
+                        &LEVELS,
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn managed_handler_returns_preserve_conditional_finalizer_entry() {
+    let source = r"async def sample(manager, work, cleanup, ready, value):
+    try:
+        try:
+            with manager():
+                await work()
+        except Error:
+            with manager():
+                if await ready():
+                    return value, {}, None
+            raise
+        return value
+    except Other as error:
+        raise Error() from error
+    finally:
+        if cleanup is not None:
+            await cleanup.close()
+";
+    for asynchronous in [false, true] {
+        for returned in ["value, {}, None", "value", "None", "False"] {
+            for present in [false, true] {
+                for kind in ["coroutine", "function", "generator"] {
+                    if asynchronous && kind != "coroutine" {
+                        continue;
+                    }
+                    let mut source =
+                        source.replace("return value, {}, None", &format!("return {returned}"));
+                    if asynchronous {
+                        source = source.replace("with manager():", "async with manager():");
+                    }
+                    if !present {
+                        source = source.replace("cleanup is not None", "cleanup is None");
+                    }
+                    if kind != "coroutine" {
+                        source = source.replace("async ", "").replace("await ", "");
+                    }
+                    if kind == "generator" {
+                        source = source.replacen(":\n", ":\n    yield value\n", 1);
+                    }
+                    assert_matches_cpython(
+                        &source,
+                        &format!(
+                            "managed_conditional_finalizer_{asynchronous}_{returned}_{present}_{kind}.py"
+                        ),
+                        &LEVELS,
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn enclosing_tries_own_handler_returns_before_finalizers() {
     let body = r"try:
     try:
