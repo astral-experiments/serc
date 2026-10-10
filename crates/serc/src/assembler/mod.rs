@@ -15545,6 +15545,27 @@ impl Assembler {
         self.record_copied_handler_cleanup_inner(start, end, return_item, named, None, false);
     }
 
+    /// Captures a named handler followed by one compiler-certified synchronous iterator.
+    pub(crate) fn record_handler_cleanup_before_iterator(
+        &mut self,
+        start: Label,
+        end: Label,
+        return_item: usize,
+    ) {
+        let index = self
+            .exception_owner_provenance
+            .copied_handler_cleanups
+            .len();
+        self.record_copied_handler_cleanup(start, end, return_item, true);
+        if let Some(origin) = self
+            .exception_owner_provenance
+            .copied_handler_cleanups
+            .get_mut(index)
+        {
+            origin.following_iterator = true;
+        }
+    }
+
     /// Captures an unnamed handler unwind and its immediately copied local assignment.
     pub(crate) fn record_copied_handler_assignment_cleanup(
         &mut self,
@@ -15740,6 +15761,7 @@ impl Assembler {
                 instructions,
                 missing_null_pops,
                 removed_prefix_slots,
+                following_iterator: false,
                 assignment_pop,
                 continued_call: None,
                 continued_attribute_none: None,

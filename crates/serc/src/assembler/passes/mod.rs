@@ -768,6 +768,29 @@ impl OptimizationPipeline {
         // Exit duplication changes this surviving conditional's target, not its
         // original array or the normal-finally comparison cells recorded within it.
         for (before, after) in &copied_exit_owner_retargets {
+            if self
+                .exception_owner_provenance
+                .copied_handler_cleanups
+                .iter()
+                .any(|origin| origin.following_iterator)
+                && self
+                    .exception_owner_provenance
+                    .source_none_conditions
+                    .iter()
+                    .filter(|origin| origin.instruction == *before)
+                    .count()
+                    == 1
+                && self
+                    .graph
+                    .iter_items()
+                    .filter(|item| matches!(item, Item::Instruction(record) if record == after))
+                    .count()
+                    == 1
+            {
+                self.exception_owner_provenance
+                    .handler_iterator_none_retargets
+                    .push((*before, *after));
+            }
             let primitive_origins = &mut self
                 .exception_owner_provenance
                 .original_primitive_condition_boundaries;

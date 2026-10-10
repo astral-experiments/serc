@@ -9962,13 +9962,43 @@ impl<'source> Compiler<'source> {
                                         copied_handler_return_item,
                                     );
                                 }
+                                let handler_before_finally_iterator = next_finally == 1
+                                    && return_finally_contexts.len() == 1
+                                    && return_finally_contexts[0].loop_depth == 0
+                                    && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+                                    && with_depth == 0
+                                    && try_body_depth == 0
+                                    && region_depth == 1
+                                    && self.control.withs.active_with_exits.is_empty()
+                                    && self.control.exceptions.active_try_marker_slots.is_empty()
+                                    && self
+                                        .control
+                                        .exceptions
+                                        .active_exception_region_exclusions
+                                        .len()
+                                        == 2
+                                    && self.control.finally.active_copied_finally_bodies == 0
+                                    && self.control.loops.contexts.len() == loop_depth
+                                    && (1..=2).contains(&loop_depth)
+                                    && self.control.loops.contexts.last().is_some_and(|context| {
+                                        context.iterator_cleanup == IteratorCleanup::Sync
+                                    })
+                                    && self.control.loops.contexts[..loop_depth - 1].iter().all(
+                                        |context| context.iterator_cleanup == IteratorCleanup::None,
+                                    )
+                                    && self.control.loops.contexts.iter().all(|context| {
+                                        !context.has_orelse
+                                            && context.with_depth == 0
+                                            && context.finally_end_depth == 0
+                                            && context.exception_region_depth == region_depth
+                                    });
                                 if !preserve_tos
                                     && handler_count == 1
                                     && (next_finally == 1
                                         || (tracks_try_between_finally_unwinds && next_finally == 2))
                                     && next_with == with_depth
                                     // Matching saved depths and the exact emitted prefix
-                                    // exclude iterator cleanup before this pending finally.
+                                    // exclude iterator cleanup before the captured handler POP.
                                     && next_loop == loop_depth
                                     && self.control.finally.active_finally_end_blocks == 0
                                     && self.control.finally.active_normal_finally_bodies == 0
@@ -9987,16 +10017,25 @@ impl<'source> Compiler<'source> {
                                                 .iter()
                                                 .all(|context| {
                                                     context.iterator_cleanup == IteratorCleanup::None
-                                                })))
+                                                }))
+                                        || handler_before_finally_iterator)
                                     && return_finally_contexts[next_finally - 1].exception_region_depth + 1
                                         == region_depth
                                 {
-                                    self.assembler.record_copied_handler_cleanup(
-                                        start,
-                                        end,
-                                        copied_handler_return_item,
-                                        name.is_some(),
-                                    );
+                                    if handler_before_finally_iterator && name.is_some() {
+                                        self.assembler.record_handler_cleanup_before_iterator(
+                                            start,
+                                            end,
+                                            copied_handler_return_item,
+                                        );
+                                    } else {
+                                        self.assembler.record_copied_handler_cleanup(
+                                            start,
+                                            end,
+                                            copied_handler_return_item,
+                                            name.is_some(),
+                                        );
+                                    }
                                 }
                                 if live_manager_handler_try_owner {
                                     // Keep the original return NOP and four name-cleanup
