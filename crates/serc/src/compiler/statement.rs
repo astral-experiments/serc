@@ -20375,6 +20375,87 @@ impl<'source> Compiler<'source> {
                             !expression_contains_chained_comparison(test)
                         })
                     })));
+        // A single pending return value remains below an iterator entered by its
+        // cleanup copy; that iterator's backedge cannot discard the saved value.
+        let preserved_finalizer_iterator_value = matches!(
+            self.control.finally.preserved_return_value_contexts.as_slice(),
+            [value]
+                if self.control.finally.copied_return_finally_preserved_values == 1
+                    && self.control.finally.active_copied_finally_bodies == 1
+                    && self.control.finally.copied_return_finally_loop_depth == Some(value.loops)
+                    && value.loops + 1 == self.control.loops.contexts.len()
+                    && value.finally_scopes
+                        == self.control.finally.active_loop_finally_contexts.len()
+                    && value.handlers == self.control.exceptions.active_exception_handlers.len()
+                    && value.managers == self.control.withs.active_with_exits.len()
+        );
+        // A return copy can outlive its managers' lexical exclusion collectors.
+        // Its newly entered iterator still runs after those managers were unwound.
+        let unwound_finalizer_iterator_manager = self.unit.flags & CO_COROUTINE != 0
+            && !self.control.withs.active_with_region_exclusions.is_empty()
+            && self.control.finally.active_copied_finally_bodies == 1
+            && self
+                .control
+                .finally
+                .copied_return_finally_loop_depth
+                .is_some_and(|depth| depth + 1 == self.control.loops.contexts.len());
+        // This iterator was entered inside one already-active finally copy. Its
+        // erased arms reach the saved backedge without unwinding that owner.
+        let erased_finalizer_iterator_else = eligible_else
+            && mode == LoopTailMode::default()
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+            && ((self
+                .control
+                .finally
+                .preserved_return_value_contexts
+                .is_empty()
+                && self.control.finally.copied_return_finally_preserved_values == 0)
+                || preserved_finalizer_iterator_value)
+            && statement.elif_else_clauses.len() == 1
+            && !statement.body.is_empty()
+            && statement
+                .body
+                .iter()
+                .all(|part| self.context.is_elided_statement(part))
+            && leading
+                .iter()
+                .all(|part| self.context.is_elided_statement(part))
+            && condition_has_only_runtime_tests(&statement.test)
+            && condition_has_linear_runtime_leaves(&statement.test)
+            && !expression_suspends_current_scope(&statement.test)
+            && self.control.withs.active_with_exits.is_empty()
+            && (self.control.withs.active_with_region_exclusions.is_empty()
+                || unwound_finalizer_iterator_manager)
+            && !self.control.in_exception_handler()
+            && self.control.exceptions.active_exception_group_handlers == 0
+            && self.control.finally.active_finally_try_bodies == 0
+            && self
+                .control
+                .finally
+                .active_pass_finally_locations
+                .is_empty()
+            && self.control.finally.active_overriding_finally_returns == 0
+            && matches!(
+                (
+                    self.control.finally.active_normal_finally_bodies,
+                    self.control.finally.active_copied_finally_bodies,
+                    self.control.finally.active_finally_end_blocks
+                ),
+                (1, 0, 0) | (0, 1, 0) | (0, 0, 1)
+            )
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .len()
+                == self.control.finally.active_finally_end_blocks
+            && self.control.in_loop_tail_without_nested_cleanup()
+            && self.control.loops.contexts.last().is_some_and(|context| {
+                context.iterator_cleanup == IteratorCleanup::Sync
+                    && context.continue_label == restart
+                    && self.assembler.instruction_count() == context.body_start
+            });
         // An erased else reaches the saved iterator directly when every active
         // owner predates it. Only the new conditional and backedge lose ownership;
         // evaluating the test and completing the true arm stay protected.
@@ -20484,7 +20565,8 @@ impl<'source> Compiler<'source> {
                 .preserved_return_value_contexts
                 .is_empty()
             && self.control.finally.copied_return_finally_preserved_values == 0;
-        let optimized_empty_else = optimized_empty_else || saved_owner_iterator_else;
+        let optimized_empty_else =
+            optimized_empty_else || erased_finalizer_iterator_else || saved_owner_iterator_else;
         if statement.elif_else_clauses.is_empty()
             || original_optimized_empty_else
             || (optimized_empty_else && statement.elif_else_clauses.len() == 1)

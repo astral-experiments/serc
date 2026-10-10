@@ -15585,6 +15585,138 @@ fn normal_finalizer_none_marker_reuses_original_local_load_owner() {
 }
 
 #[test]
+fn erased_finalizer_arms_preserve_iterator_backedges() {
+    let source = r#"async def sample(items, work, cleanup, flag):
+    try:
+        await work()
+    finally:
+        cleanup()
+        for item in items:
+            assert item.ready
+            if flag in {"first", "second"} and item.code == 7:
+                assert item.closed is None
+            else:
+                assert item.closed is not None
+        assert flag
+"#;
+    for (name, source) in [
+        ("compound", source.to_owned()),
+        (
+            "simple",
+            source.replace("flag in {\"first\", \"second\"} and item.code == 7", "flag"),
+        ),
+        (
+            "synchronous",
+            source.replace("async def", "def").replace("await ", ""),
+        ),
+        (
+            "return_copy",
+            source.replace(
+                "        await work()",
+                "        await work()\n        if flag:\n            return",
+            ),
+        ),
+    ] {
+        assert_matches_cpython(
+            &source,
+            &format!("erased_finalizer_iterator_{name}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
+fn erased_finalizer_iterator_preserves_pending_return_value() {
+    let source = r#"async def sample(items, work, cleanup, flag):
+    try:
+        await work()
+        if flag:
+            return flag
+    finally:
+        cleanup()
+        for item in items:
+            assert item.ready
+            if flag in {"first", "second"} and item.code == 7:
+                assert item.closed is None
+            else:
+                assert item.closed is not None
+        assert flag
+"#;
+    for (name, source) in [
+        ("name", source.to_owned()),
+        ("call", source.replace("return flag", "return work()")),
+        (
+            "await",
+            source.replace("return flag", "return await work()"),
+        ),
+        (
+            "synchronous",
+            source.replace("async def", "def").replace("await ", ""),
+        ),
+    ] {
+        assert_matches_cpython(
+            &source,
+            &format!("erased_finalizer_preserved_value_{name}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
+fn erased_finalizer_iterator_preserves_unwound_manager_return() {
+    let source = r#"async def sample(items, manager, work, cleanup, flag):
+    try:
+        async with manager():
+            await work()
+            if flag:
+                return
+    finally:
+        cleanup()
+        for key, item in items:
+            assert item.ready
+            if flag in {"first", "second"} and item.code == 7:
+                assert item.closed is None
+            else:
+                assert item.closed is not None
+        assert flag
+"#;
+    for (name, source) in [
+        ("bare", source.to_owned()),
+        ("name_target", source.replace("for key, item", "for item")),
+        ("sync_manager", source.replace("async with", "with")),
+        (
+            "value",
+            source.replace("                return\n", "                return flag\n"),
+        ),
+        (
+            "two",
+            source.replace("async with manager():", "async with manager(), manager():"),
+        ),
+        (
+            "three",
+            source.replace("async with manager():", "async with manager(), manager(), manager():"),
+        ),
+        (
+            "four",
+            source.replace("async with manager():", "async with manager(), manager(), manager(), manager():"),
+        ),
+        (
+            "nested",
+            source.replace(
+                "        async with manager():\n            await work()\n            if flag:\n                return\n",
+                "        async with manager():\n            async with manager():\n                await work()\n                if flag:\n                    return\n",
+            ),
+        ),
+    ] {
+        assert_matches_cpython(
+            &source,
+            &format!("erased_finalizer_unwound_manager_{name}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn erased_iterator_else_stays_inside_enclosing_finally() {
     let source = r"def f(items, expected, count):
     try:
