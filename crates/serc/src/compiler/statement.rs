@@ -37998,6 +37998,48 @@ impl<'source> Compiler<'source> {
                         && finally_guarded_loop_recovery_leaves_empty_borrow_exit(
                             &statement.finalbody,
                         ))))
+                || (!preserve_exit_nop
+                    && conditional_exit.is_none()
+                    && self.context.python_version == crate::PythonVersion::Py314
+                    && matches!(self.unit.scope, Scope::Function { .. })
+                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    && !statement.is_star
+                    && statement.handlers.is_empty()
+                    && statement.orelse.is_empty()
+                    && suite_has_nonsuspending_linear_fallthrough(&statement.body)
+                    && self.control.loops.contexts.is_empty()
+                    && self.control.generators.generator_region_start.is_none()
+                    && !self.control.in_exception_handler()
+                    && self.control.exceptions.active_exception_group_handlers == 0
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .is_empty()
+                    && self.control.finally.is_inactive_for_return_unwind()
+                    && self.control.withs.active_with_exits.len() <= 1
+                    && self.control.withs.active_with_exits.len()
+                        == self.control.withs.active_with_region_exclusions.len()
+                    && self.control.withs.active_with_exits.iter().all(|manager| {
+                        !manager.is_async
+                            && manager.exception_region_depth == 0
+                            && manager.finally_end_depth == 0
+                            && manager.normal_finally_depth == 0
+                            && manager.loop_depth == 0
+                    })
+                    && finally_elif_recovery_leaves_empty_borrow_exit(&statement.finalbody))
+                || (!preserve_exit_nop
+                    && conditional_exit.is_none()
+                    && self.context.python_version == crate::PythonVersion::Py314
+                    && matches!(self.unit.scope, Scope::Function { .. })
+                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    && !self.has_active_control_flow_region()
+                    && !self.control.in_exception_handler()
+                    && self.control.exceptions.active_exception_group_handlers == 0
+                    && self.control.loops.contexts.is_empty()
+                    && self.control.withs.active_with_exits.is_empty()
+                    && self.control.finally.is_inactive_for_return_unwind()
+                    && finally_named_elif_recovery_leaves_empty_borrow_exit(statement))
             {
                 // Branch and manager joins, including empty joins retained when a finally
                 // loop's cold copy moves, interrupt CPython's borrowed-load traversal.
@@ -46417,6 +46459,124 @@ fn finally_conditional_call_suffix_leaves_empty_borrow_exit(body: &[Stmt]) -> bo
         })
 }
 
+// The recovery's emptied exit precedes an elif array. After cold relocation,
+// that original boundary separates the normal cleanup suffix from its continuation.
+fn finally_elif_recovery_leaves_empty_borrow_exit(body: &[Stmt]) -> bool {
+    let [Stmt::If(condition), suffix] = body else {
+        return false;
+    };
+    let [alternative] = condition.elif_else_clauses.as_slice() else {
+        return false;
+    };
+    let Some(test) = &alternative.test else {
+        return false;
+    };
+    let [Stmt::Try(recovery)] = condition.body.as_slice() else {
+        return false;
+    };
+    let [handler] = recovery.handlers.as_slice() else {
+        return false;
+    };
+    let Some(handler) = handler.as_except_handler() else {
+        return false;
+    };
+    let runtime_test = |expression: &Expr| {
+        condition_has_only_runtime_tests(expression)
+            && !expression_contains_inline_branch(expression)
+            && !expression_suspends_current_scope(expression)
+            && !expression_yields_in_current_scope(expression)
+    };
+    let linear_call = |body: &[Stmt]| {
+        is_call_expression_suite(body) && suite_has_nonsuspending_linear_fallthrough(body)
+    };
+    !recovery.is_star
+        && recovery.orelse.is_empty()
+        && recovery.finalbody.is_empty()
+        && handler.name.is_none()
+        && matches!(handler.type_.as_deref(), Some(Expr::Name(_)))
+        && matches!(handler.body.as_slice(), [Stmt::Pass(_)])
+        && runtime_test(&condition.test)
+        && runtime_test(test)
+        && linear_call(&recovery.body)
+        && linear_call(&alternative.body)
+        && linear_call(std::slice::from_ref(suffix))
+}
+
+/// Certifies a named recovery's empty exit before a populated elif and call suffix.
+fn finally_named_elif_recovery_leaves_empty_borrow_exit(
+    statement: &ruff_python_ast::StmtTry,
+) -> bool {
+    let [Stmt::If(condition), suffix @ ..] = statement.finalbody.as_slice() else {
+        return false;
+    };
+    let [alternative] = condition.elif_else_clauses.as_slice() else {
+        return false;
+    };
+    let Some(test) = &alternative.test else {
+        return false;
+    };
+    let [Stmt::Try(recovery)] = condition.body.as_slice() else {
+        return false;
+    };
+    let [handler] = recovery.handlers.as_slice() else {
+        return false;
+    };
+    let named_linear_handler = |handler: &ruff_python_ast::ExceptHandler| {
+        handler.as_except_handler().is_some_and(|handler| {
+            handler.name.is_some()
+                && matches!(handler.type_.as_deref(), Some(Expr::Name(_)))
+                && suite_has_nonsuspending_linear_fallthrough(&handler.body)
+        })
+    };
+    let named_linear_recovery = |part: &Stmt| {
+        matches!(part, Stmt::Try(recovery)
+            if !recovery.is_star
+                && recovery.orelse.is_empty()
+                && recovery.finalbody.is_empty()
+                && suite_has_nonsuspending_linear_fallthrough(&recovery.body)
+                && matches!(recovery.handlers.as_slice(), [handler]
+                    if named_linear_handler(handler)))
+    };
+    let runtime_test = |expression: &Expr| {
+        condition_has_linear_runtime_leaves(expression)
+            && !expression_suspends_current_scope(expression)
+            && !expression_yields_in_current_scope(expression)
+    };
+    !statement.is_star
+        && statement.orelse.is_empty()
+        && statement.handlers.len() <= 1
+        && statement.handlers.iter().all(named_linear_handler)
+        && suite_has_normal_fallthrough(&statement.body)
+        && !recovery.is_star
+        && recovery.orelse.is_empty()
+        && recovery.finalbody.is_empty()
+        && named_linear_handler(handler)
+        && runtime_test(&condition.test)
+        && runtime_test(test)
+        && !recovery.body.is_empty()
+        && recovery.body.iter().all(|part| {
+            suite_has_nonsuspending_linear_fallthrough(std::slice::from_ref(part))
+                || matches!(part, Stmt::With(manager)
+                    if !manager.is_async
+                        && matches!(manager.items.as_slice(), [item]
+                            if item.optional_vars.is_none()
+                                && !expression_contains_inline_branch(&item.context_expr)
+                                && !expression_suspends_current_scope(&item.context_expr)
+                                && !expression_yields_in_current_scope(&item.context_expr))
+                        && suite_has_nonsuspending_linear_fallthrough(&manager.body))
+        })
+        && (suite_has_nonsuspending_linear_fallthrough(&alternative.body)
+            || matches!(alternative.body.as_slice(), [part] if named_linear_recovery(part)))
+        && suffix.last().is_some_and(|part| is_call_expression_suite(std::slice::from_ref(part)))
+        && suffix.iter().all(|part| {
+            named_linear_recovery(part)
+                || (is_call_expression_suite(std::slice::from_ref(part))
+                    && (suite_has_nonsuspending_linear_fallthrough(std::slice::from_ref(part))
+                        || matches!(part, Stmt::Expr(expression)
+                            if cleanup_conditional_argument_has_eager_call_prefix(&expression.value))))
+        })
+}
+
 // Guarded breaks and a split loop fallthrough bypass the copied recovery's normal exit.
 // Cold relocation leaves that empty array after the normal finalizer's live suffix.
 fn finally_guarded_loop_recovery_leaves_empty_borrow_exit(body: &[Stmt]) -> bool {
@@ -49030,7 +49190,7 @@ fn cleanup_conditional_argument_has_eager_call_prefix(expression: &Expr) -> bool
                 conditional_arguments += 1;
                 conditional_arguments == 1
                     && condition_has_only_runtime_tests(&conditional.test)
-                    && !expression_contains_inline_branch(&conditional.test)
+                    && condition_has_linear_runtime_leaves(&conditional.test)
                     && !expression_contains_inline_branch(&conditional.body)
                     && !expression_contains_inline_branch(&conditional.orelse)
             } else {
@@ -50776,6 +50936,51 @@ mod tests {
             let parsed = parse_module(&source).unwrap();
             assert_eq!(
                 super::finally_loop_leaves_empty_borrow_exit(&parsed.suite()[0]),
+                expected,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn finally_elif_borrow_exit_requires_linear_recovery() {
+        use super::finally_elif_recovery_leaves_empty_borrow_exit;
+
+        let source = "if first:\n    try:\n        work()\n    except Error:\n        pass\nelif second:\n    recover()\nfinish()\n";
+        for (from, to, expected) in [
+            ("first", "first", true),
+            ("first", "left == right", true),
+            ("first", "True", false),
+            ("first", "left and right", false),
+            ("first", "await ready()", false),
+            ("first", "(yield item)", false),
+            ("first", "(yield from items)", false),
+            ("second", "False", false),
+            ("second", "left or right", false),
+            ("second", "await ready()", false),
+            ("second", "(yield item)", false),
+            ("work()", "work(left if flag else right)", false),
+            ("work()", "await work()", false),
+            ("work()", "work((yield item))", false),
+            ("work()", "work((yield from items))", false),
+            ("recover()", "await recover()", false),
+            ("recover()", "recover((yield item))", false),
+            ("finish()", "await finish()", false),
+            ("finish()", "finish((yield item))", false),
+            ("except Error:", "except Error as error:", false),
+            ("except Error:", "except error_type():", false),
+            ("except Error:", "except* Error:", false),
+            ("        pass", "        recover()", false),
+            ("elif second:", "else:", false),
+            ("finish()\n", "", false),
+            ("finish()", "finish()\nfinish()", false),
+            ("finish()", "elif third:\n    recover()\nfinish()", false),
+            ("if first:", "prepare()\nif first:", false),
+        ] {
+            let source = source.replace(from, to);
+            let parsed = parse_module(&source).unwrap();
+            assert_eq!(
+                finally_elif_recovery_leaves_empty_borrow_exit(parsed.suite()),
                 expected,
                 "{source}"
             );

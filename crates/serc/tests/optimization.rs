@@ -5419,6 +5419,120 @@ fn negated_finally_guard_preserves_copied_continue_owner() {
 }
 
 #[test]
+fn conditional_finalizer_recovery_preserves_borrow_boundary() {
+    let source = r"def sample(resource, work, flag):
+    with resource() as state:
+        try:
+            result = work()
+        finally:
+            if flag == 1:
+                try:
+                    work()
+                except Exception:
+                    pass
+            elif flag == 2:
+                work()
+            work()
+        if state.failed:
+            raise ValueError
+        return result
+";
+    let unmanaged = r"def sample(state, work, flag):
+    try:
+        result = work()
+    finally:
+        if flag == 1:
+            try:
+                work()
+            except Exception:
+                pass
+        elif flag == 2:
+            work()
+        work()
+    if state.failed:
+        raise ValueError
+    return result
+";
+    for (name, source) in [
+        ("base", source.to_owned()),
+        ("no_manager", unmanaged.to_owned()),
+        (
+            "no_elif",
+            source.replace("            elif flag == 2:\n                work()\n", ""),
+        ),
+        (
+            "no_inner_handler",
+            source.replace(
+                "                try:\n                    work()\n                except Exception:\n                    pass\n",
+                "                work()\n",
+            ),
+        ),
+    ] {
+        assert_matches_cpython(&source, &format!("conditional_finalizer_{name}.py"), &LEVELS);
+    }
+}
+
+#[test]
+fn named_finalizer_elif_recovery_keeps_owned_continuation() {
+    for condition in ["flag", "flag and value"] {
+        for cleanup in [
+            "action(value)",
+            "with guard(value):\n                    action(value)",
+        ] {
+            for outer_handler in [
+                "",
+                "    except Exception as outer_error:\n        state['error'] = str(outer_error)\n",
+            ] {
+                let source = format!(
+                    "def sample(flag, value):
+    state = {{}}
+    try:
+        action(value)
+{outer_handler}    finally:
+        if {condition}:
+            try:
+                {cleanup}
+            except Exception as error:
+                state['error'] = str(error)
+        elif value:
+            state['phase'] = 'missing'
+        finish(value)
+        restore(value)
+    consume(state)
+    return state
+"
+                );
+                assert_matches_cpython(&source, "named_finalizer_elif.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
+fn named_elif_cleanup_retains_recovery_and_conditional_suffix() {
+    for managed in [false, true] {
+        for condition in ["ready", "result is not None and not result.failed"] {
+            for recovery_suffix in [
+                "",
+                "        try:\n            resource.close()\n        except Error as error:\n            report(error)\n",
+            ] {
+                for successor in ["", "    consume(resource, result)\n"] {
+                    let work = if managed {
+                        "        with resource.collect():\n            result = resource.run()\n"
+                    } else {
+                        "        result = resource.run()\n"
+                    };
+                    let source = format!(
+                        "def sample(resource, context, result, toolbox, ready):\n    try:\n{work}    finally:\n        if context is not None:\n            try:\n                context.clean(result)\n            except Error as error:\n                report(error)\n        elif toolbox is not None:\n            try:\n                toolbox.close()\n            except Error as error:\n                report(error)\n{recovery_suffix}        record(resource, outcome='ok' if {condition} else 'error')\n{successor}    return resource.finish(result)\n"
+                    );
+                    assert_matches_cpython(&source, "named_elif_cleanup_suffix.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn conditional_finalizer_preserves_tuple_return_copy_order() {
     let source = r"async def sample(work, flag, left, right):
     try:
