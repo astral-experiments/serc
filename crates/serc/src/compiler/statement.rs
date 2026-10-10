@@ -33972,6 +33972,66 @@ impl<'source> Compiler<'source> {
                             && suite_has_linear_borrow_fallthrough(&clause.body)
                     })))
                 || guarded_first_arm_reaches_finally);
+        // A first-arm raising guard retains its false-edge jump into normal cleanup.
+        // A separate-line recovery call supplies an entry even when cleanup can reraise.
+        let guarded_recovery_arm_reaches_finally = self.context.python_version
+            == crate::PythonVersion::Py314
+            && !statement.is_star
+            && statement.orelse.is_empty()
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.withs.active_with_region_exclusions.is_empty()
+            && self.control.exceptions.active_exception_region_exclusions.is_empty()
+            && !self.control.in_exception_handler()
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self.control.finally.active_finally_try_bodies == 0
+            && !statement.handlers.is_empty()
+            && std::iter::once(statement.body.as_slice())
+                .chain(std::iter::once(statement.finalbody.as_slice()))
+                .chain(statement.handlers.iter().filter_map(|handler| {
+                    handler.as_except_handler().map(|handler| handler.body.as_slice())
+                }))
+                .all(|body| !suite_any_statement(body, |part| {
+                    matches!(part, Stmt::Return(_) | Stmt::Break(_) | Stmt::Continue(_) | Stmt::While(_))
+                }))
+            && statement.handlers.iter().all(|handler| {
+                handler.as_except_handler().is_some_and(|handler| {
+                    matches!(handler.type_.as_deref(), Some(Expr::Name(_)))
+                        && matches!(handler.body.last(), Some(Stmt::Raise(raise))
+                            if raise.exc.is_none() && raise.cause.is_none())
+                })
+            })
+            && statement.body.split_last().is_some_and(|(last, prefix)| {
+                !suite_terminates(prefix)
+                    && matches!(last, Stmt::If(branch)
+                        if condition_has_only_runtime_tests(&branch.test)
+                            && !expression_contains_inline_branch(&branch.test)
+                            && matches!(branch.elif_else_clauses.as_slice(), [clause]
+                                if clause.test.is_none())
+                            && branch.body.split_last().is_some_and(|(last, leading)| {
+                                leading.iter().all(|part| matches!(part, Stmt::Expr(_) | Stmt::Assign(_)))
+                                    && matches!(last, Stmt::If(guard)
+                                        if condition_has_only_runtime_tests(&guard.test)
+                                            && !expression_contains_inline_branch(&guard.test)
+                                            && original_condition_has_unique_jump_target(&guard.test, false)
+                                            && guard.elif_else_clauses.is_empty()
+                                            && matches!(guard.body.as_slice(), [Stmt::Raise(_)])
+                                            && suite_has_linear_raise_exit(&guard.body))
+                            }))
+            })
+            && (suite_has_linear_borrow_fallthrough(&statement.finalbody)
+                || matches!(statement.finalbody.first(), Some(Stmt::Try(cleanup))
+                    if !cleanup.is_star
+                        && cleanup.orelse.is_empty()
+                        && cleanup.finalbody.is_empty()
+                        && matches!(cleanup.body.as_slice(), [Stmt::Expr(call)]
+                            if self.source_location(call.range).line != self.source_location(cleanup.range).line
+                                && matches!(call.value.as_ref(), Expr::Call(_))
+                                && !expression_contains_inline_branch(&call.value))));
         // A synchronous manager's awaited store leaves a populated normal exit.
         // Its arm jumps directly into the eager cleanup prefix even when other
         // dispatch arms return or raise. Copied returns and exceptional cleanup
@@ -35835,6 +35895,7 @@ impl<'source> Compiler<'source> {
             || coroutine_await_recovery_reaches_finally
             || coroutine_guarded_nested_cleanup_entry
             || raising_alternative_reaches_finally
+            || guarded_recovery_arm_reaches_finally
             || coroutine_manager_raise_else_reaches_finally
             || runtime_while_false_edge_reaches_finally
             || async_generator_while_cleanup
