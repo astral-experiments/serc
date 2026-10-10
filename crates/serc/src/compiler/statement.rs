@@ -28011,8 +28011,8 @@ impl<'source> Compiler<'source> {
                         .mark_retained_nop_borrow_fallthrough_if_unblocked(normal_exit);
                 }
                 // The one success edge of an asserted else retains this normal
-                // jump as a located NOP. Linear assertions in the named handler
-                // supply no intervening cleanup array or terminal exit.
+                // jump as a located NOP. Linear assertions and fallback stores
+                // in the named handler add no intervening cleanup or terminal exit.
                 let coroutine_asserted_else_exit = borrow_exit_has_source_successor
                     && !statement.is_star
                     && statement.finalbody.is_empty()
@@ -40981,10 +40981,16 @@ fn coroutine_try_has_asserted_recovery(statement: &ruff_python_ast::StmtTry) -> 
                         if matches!(awaited.value.as_ref(), Expr::Call(_))
                             && !expression_contains_inline_branch(&awaited.value)
                             && !expression_suspends_current_scope(&awaited.value))));
-    matches!(statement.body.as_slice(), [Stmt::Expr(expression)]
+    let awaited_assignment = matches!(statement.body.as_slice(), [Stmt::Assign(assignment)]
+        if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+            && matches!(assignment.value.as_ref(), Expr::Await(awaited)
+                if matches!(awaited.value.as_ref(), Expr::Call(_))
+                    && !expression_suspends_current_scope(&awaited.value)));
+    (matches!(statement.body.as_slice(), [Stmt::Expr(expression)]
         if matches!(expression.value.as_ref(), Expr::Await(awaited)
             if matches!(awaited.value.as_ref(), Expr::Call(_))
                 && !expression_suspends_current_scope(&awaited.value)))
+        || (awaited_assignment && !awaited_success))
         && (awaited_success
             || matches!(statement.orelse.as_slice(), [assertion] if linear_assertion(assertion)))
         && matches!(statement.handlers.as_slice(), [handler]
@@ -40996,7 +41002,13 @@ fn coroutine_try_has_asserted_recovery(statement: &ruff_python_ast::StmtTry) -> 
                 } else {
                     handler.name.is_some()
                         && !handler.body.is_empty()
-                        && handler.body.iter().all(linear_assertion)
+                        && handler.body.iter().all(|part| {
+                            linear_assertion(part)
+                                || (awaited_assignment
+                                    && matches!(part, Stmt::Assign(assignment)
+                                        if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                                            && matches!(assignment.value.as_ref(), Expr::NoneLiteral(_))))
+                        })
                 }
         }))
 }
