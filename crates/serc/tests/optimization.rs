@@ -90,6 +90,54 @@ fn erased_async_iterator_suffix_preserves_conditional_backedges() {
 }
 
 #[test]
+fn completed_recovery_prefix_preserves_monitoring_marker_owner() {
+    let source = r"from __future__ import annotations
+
+def sample() -> None:
+    with acquire() as context:
+        try:
+            actions.prepare(context, first | second)
+        except Fault:
+            actions.recover('retry')
+        owner = make_owner(
+            [
+                'a',
+                'b',
+                step(),
+                'c',
+                step(),
+                step(),
+                step(),
+                step(),
+                step(),
+            ],
+            left=left,
+            right=right,
+        )
+        def notify(value: int, unused: object) -> None:
+            if owner.poll() is None:
+                owner.send(value)
+
+        try:
+            result = owner.run()
+        finally:
+            if owner.poll() is None:
+                try:
+                    owner.wait(timeout=30)
+                except Fault:
+                    owner.wait()
+";
+    for removed in [0, 2, 6] {
+        for condition in ["is None", "is not None"] {
+            let source = source
+                .replacen("                step(),\n", "", removed)
+                .replace("is None", condition);
+            assert_matches_cpython(&source, "monitoring_marker_owner.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn erased_nested_coroutine_arms_preserve_saved_finalizer() {
     for (case, (first, condition)) in [
         ("item.kind == 1", "item.kind == 3"),
