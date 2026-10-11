@@ -1480,6 +1480,7 @@ impl<'source> Compiler<'source> {
                     }
             })
             .collect();
+        let interner = &self.context.scopes.names;
         let (output_locals, local_ids): (Vec<MetadataName>, Vec<MetadataId>) = self
             .symbols
             .locals
@@ -1492,7 +1493,10 @@ impl<'source> Compiler<'source> {
                     || self.unit.header_symbol_names_are_final)
                     && !(self.unit.annotation_thunk && spelling == ".format")
                 {
-                    return (MetadataName::new(spelling), MetadataId::from(*name_id));
+                    return (
+                        MetadataName::from(interner.clone_name(*name_id)),
+                        MetadataId::from(*name_id),
+                    );
                 }
                 // The annotation argument has a separate internal identity so user names
                 // and comprehension targets spelled `format` do not bind to its slot.
@@ -1504,14 +1508,22 @@ impl<'source> Compiler<'source> {
                 }
                 let name = self.mangled_name_cow(spelling);
                 let id = if name == spelling {
-                    MetadataId::from(*name_id)
+                    *name_id
                 } else {
-                    MetadataId::from(self.required_name_id(&name))
+                    self.required_name_id(&name)
                 };
-                (MetadataName::from(name), id)
+                (
+                    MetadataName::from(interner.clone_name(id)),
+                    MetadataId::from(id),
+                )
             })
             .unzip();
-        let interner = &self.context.scopes.names;
+        let output_names = self
+            .output
+            .name_ids
+            .iter()
+            .map(|id| MetadataName::from(interner.clone_name(NameId::from_u32(id.as_u32()))))
+            .collect::<Vec<_>>();
         let filename_id = to_u32(interner.len(), "marshal metadata name count")?;
         let metadata_ids = MarshalMetadataIds {
             domain_len: filename_id
@@ -1579,7 +1591,7 @@ impl<'source> Compiler<'source> {
                 (FxHashSet::default(), FxHashSet::default())
             };
         let metadata_tuple_properties =
-            crate::marshal::metadata_tuple_properties(&self.output.names, &output_locals);
+            crate::marshal::metadata_tuple_properties(&output_names, &output_locals);
         let constants = self.output.constants.into_values();
         // The root's non-string constant tuple is recorded as unique, so its hash
         // would never be used. All-string roots can still alias metadata tuples.
@@ -1594,7 +1606,7 @@ impl<'source> Compiler<'source> {
         };
         let marshal_occurrence_bound = crate::marshal::code_occurrence_bound(
             &constants,
-            self.output.names.len(),
+            output_names.len(),
             output_locals.len(),
         );
         let mut code = CodeObject {
@@ -1605,7 +1617,7 @@ impl<'source> Compiler<'source> {
             flags: self.unit.flags,
             bytecode,
             constants,
-            names: self.output.names,
+            names: output_names,
             locals: output_locals,
             local_kinds,
             filename: self.context.filename.clone(),
