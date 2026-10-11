@@ -133,7 +133,7 @@ struct Writer<'output, 'graph, 'code> {
     graph: &'graph mut ObjectGraph<'code>,
     output: &'output mut Vec<u8>,
     reference_count: usize,
-    occurrences: OccurrenceCursor<std::vec::IntoIter<Occurrence>>,
+    occurrences: OccurrenceCursor<Vec<Occurrence>>,
     frozen_set_order_index: usize,
 }
 
