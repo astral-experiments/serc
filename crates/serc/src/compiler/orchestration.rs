@@ -1038,12 +1038,19 @@ impl<'source> Compiler<'source> {
                 .rev()
                 .find(|statement| !is_elided_statement(statement))
             && early_condition_truthiness(&conditional.test).is_none()
-            && conditional.body.iter().all(is_elided_statement)
-            && matches!(conditional.elif_else_clauses.as_slice(), [clause]
-                if clause.test.is_none() && clause.body.iter().all(is_elided_statement))
+            && ((self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                == CO_COROUTINE
+                && conditional.elif_else_clauses.is_empty()
+                && matches!(conditional.body.iter().rfind(|part| !is_elided_statement(part)),
+                    Some(Stmt::Expr(expression))
+                        if matches!(expression.value.as_ref(), Expr::Call(_) | Expr::Await(_))))
+                || (conditional.body.iter().all(is_elided_statement)
+                    && matches!(conditional.elif_else_clauses.as_slice(), [clause]
+                        if clause.test.is_none() && clause.body.iter().all(is_elided_statement))))
         {
-            // General If lowering leaves its original end label here when both
-            // arms and the suffix are erased. Keep that shared footer until
+            // General If lowering leaves its original end label here, including
+            // discarded coroutine calls before an erased suffix. Stores retain
+            // their early line donor. Keep the call footer until
             // native repeated predecessor counts decide which returns survive.
             self.assembler.record_current_original_scope_exit();
         }
