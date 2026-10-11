@@ -245,9 +245,10 @@ impl<'source> Compiler<'source> {
         unit: CodeUnit,
         symbols: SymbolState,
     ) -> Box<Self> {
+        let allocation = Box::new_uninit();
         let assembler = Assembler::with_python_version(context.python_version);
         Box::write(
-            Box::new_uninit(),
+            allocation,
             Self {
                 context,
                 cached_source_lines: Cell::new([None; 2]),
