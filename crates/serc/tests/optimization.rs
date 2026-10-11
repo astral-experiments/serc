@@ -12397,6 +12397,22 @@ fn elided_protected_elif_preserves_loop_condition_owner() {
 }
 
 #[test]
+fn erased_coroutine_branch_tails_preserve_return_locations() {
+    for definition in ["def", "async def"] {
+        for prefix in ["", "    prepare()\n"] {
+            for work in ["consume()", "owner.consume()"] {
+                for assertion in ["assert items", "assert len(items) == 1"] {
+                    let source = format!(
+                        "{definition} sample(first, second, owner, items):\n{prefix}    if first:\n        {work}\n    else:\n        if second:\n            items.append('value')\n        else:\n            {work}\n        {assertion}\n"
+                    );
+                    assert_matches_cpython(&source, "erased_coroutine_branch.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn erased_manager_branches_preserve_return_locations() {
     for (body, otherwise) in [
         ("with manager():\n                consume()", "consume()"),

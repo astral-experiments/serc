@@ -5635,13 +5635,23 @@ impl<'source> Compiler<'source> {
         body: &'a [Stmt],
         allow_terminating_else: bool,
     ) -> Option<&'a Stmt> {
-        if self.context.python_version < crate::PythonVersion::Py314
+        // The coroutine scope handler adds no normal edge to a completed branch.
+        let coroutine_scope = self.context.python_version >= crate::PythonVersion::Py313
+            && self.unit.flags & CO_COROUTINE != 0
+            && self.supports_elided_terminal_if()
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty();
+        if (self.context.python_version < crate::PythonVersion::Py314 && !coroutine_scope)
             || !matches!(self.unit.scope, Scope::Function { .. })
-            || self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) != 0
+            || (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) != 0
+                && !coroutine_scope)
             || !self.control.loops.contexts.is_empty()
             || self.control.loops.suite_fallthrough_to_loop_backedge
             || !self.control.withs.active_with_exits.is_empty()
-            || self.has_active_control_flow_region()
+            || (self.has_active_control_flow_region() && !coroutine_scope)
             || self.control.in_exception_handler()
             || self.control.exceptions.active_exception_group_handlers != 0
             || !self.control.finally.is_inactive_for_return_unwind()
@@ -5668,16 +5678,22 @@ impl<'source> Compiler<'source> {
                 _ => false,
             }
         };
+        let linear = |body: &[Stmt]| {
+            if coroutine_scope {
+                suite_has_nonsuspending_linear_fallthrough(body)
+            } else {
+                suite_has_linear_borrow_fallthrough(body) && !suite_contains_yield(body)
+            }
+        };
         let branch_fallthrough = |body: &[Stmt]| {
-            (suite_has_linear_borrow_fallthrough(body) && !suite_contains_yield(body))
+            linear(body)
                 || matches!(body, [Stmt::With(manager)]
                     if !manager.is_async
                         && manager.items.len() == 1
                         && manager.items[0].optional_vars.is_none()
                         && !expression_contains_inline_branch(&manager.items[0].context_expr)
                         && !expression_suspends_current_scope(&manager.items[0].context_expr)
-                        && suite_has_linear_borrow_fallthrough(&manager.body)
-                        && !suite_contains_yield(&manager.body))
+                        && linear(&manager.body))
         };
         match &body[end] {
             Stmt::If(statement)
@@ -5696,7 +5712,8 @@ impl<'source> Compiler<'source> {
                 Some(&body[end])
             }
             Stmt::While(statement)
-                if statement.orelse.is_empty()
+                if !coroutine_scope
+                    && statement.orelse.is_empty()
                     && condition_has_linear_runtime_leaves(&statement.test)
                     && !expression_suspends_current_scope(&statement.test)
                     && original_condition_has_unique_jump_target(&statement.test, false)
