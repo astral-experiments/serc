@@ -44530,8 +44530,8 @@ fn suite_has_completed_manager_loop_work(body: &[Stmt]) -> bool {
     })
 }
 
-// Suspension adds resume and cleanup entries even to an otherwise linear suite.
-fn suite_has_nonsuspending_linear_fallthrough(body: &[Stmt]) -> bool {
+/// Visits nested statement bodies as well as declaration headers.
+fn suite_contains_suspending_expression(body: &[Stmt]) -> bool {
     struct SuspensionDetector(bool);
 
     impl<'ast> Visitor<'ast> for SuspensionDetector {
@@ -44544,14 +44544,16 @@ fn suite_has_nonsuspending_linear_fallthrough(body: &[Stmt]) -> bool {
         }
     }
 
-    if !suite_has_linear_borrow_fallthrough(body)
-        || suite_contains_yield_with_headers(body, true, true)
-    {
-        return false;
-    }
     let mut detector = SuspensionDetector(false);
     detector.visit_body(body);
-    !detector.0
+    detector.0
+}
+
+// Suspension adds resume and cleanup entries even to an otherwise linear suite.
+fn suite_has_nonsuspending_linear_fallthrough(body: &[Stmt]) -> bool {
+    suite_has_linear_borrow_fallthrough(body)
+        && !suite_contains_yield_with_headers(body, true, true)
+        && !suite_contains_suspending_expression(body)
 }
 
 /// Certifies a populated named-handler exit into guarded, named linear recovery.
@@ -49947,22 +49949,8 @@ fn handler_cleanup_has_runtime_elif_join(statement: &ruff_python_ast::StmtIf) ->
 
 // END_FOR/POP_ITER falls through into the same cleanup reached by the final elif's
 // false jump. Neither predecessor is an unconditional jump that can copy the
-// cleanup away. Breaks, loop else suites, and nested cleanup retain their old path.
+// cleanup away. Breaks, loop else suites, and nested cleanup are excluded.
 fn handler_cleanup_has_for_exhaustion_join(body: &[Stmt]) -> bool {
-    // Suspension introduces additional resume/cleanup blocks. Keep those outside
-    // this certificate, including yields in function defaults and annotations.
-    struct SuspensionDetector(bool);
-
-    impl<'ast> Visitor<'ast> for SuspensionDetector {
-        fn visit_expr(&mut self, expression: &'ast Expr) {
-            if crate::stack_growth_required() {
-                return crate::grow_stack(|| self.visit_expr(expression));
-            }
-
-            self.0 |= expression_suspends_current_scope(expression);
-        }
-    }
-
     let Some((Stmt::For(tail), prefix)) = body.split_last() else {
         return false;
     };
@@ -49978,11 +49966,8 @@ fn handler_cleanup_has_for_exhaustion_join(body: &[Stmt]) -> bool {
         return false;
     }
 
-    let mut detector = SuspensionDetector(false);
-    for statement in body {
-        detector.visit_stmt(statement);
-    }
-    !detector.0
+    // Suspension adds resume and cleanup blocks, including in declaration headers.
+    !suite_contains_suspending_expression(body)
 }
 
 // Earlier terminating arms bypass cleanup; a final else's partial runtime conditional
