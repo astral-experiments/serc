@@ -1691,9 +1691,7 @@ impl Assembler {
         if self.python_version >= crate::PythonVersion::Py314 {
             let instruction = *self.required_last_instruction_mut("recording an authored Pass");
             debug_assert_eq!(instruction.opcode, NOP);
-            self.exception_owner_provenance
-                .original_pass_nops
-                .push(instruction);
+            self.original_pass_nops.push(instruction);
         }
     }
 

@@ -1680,6 +1680,8 @@ pub(crate) struct Assembler {
     pub(super) original_sync_for_else_ends: FxHashMap<Label, u32>,
     /// Keeps this large state in place as the assembler changes optimization phases.
     pub(super) exception_owner_provenance: LazyExceptionOwnerProvenance,
+    /// Authored Pass records do not require the full owner state during emission.
+    pub(super) original_pass_nops: Vec<Instruction>,
     pub(super) preserved_block_boundaries: FxHashSet<Label>,
     pub(super) borrow_unreachable_blocks: FxHashSet<Label>,
     /// Cleanup targets whose original for-loop backedge array was omitted during lowering.
@@ -1947,6 +1949,7 @@ impl Default for Assembler {
             original_match_join: None,
             original_sync_for_else_ends: FxHashMap::default(),
             exception_owner_provenance: LazyExceptionOwnerProvenance::default(),
+            original_pass_nops: Vec::new(),
             preserved_block_boundaries: FxHashSet::default(),
             borrow_unreachable_blocks: FxHashSet::default(),
             borrow_omitted_for_backedges: FxHashSet::default(),
