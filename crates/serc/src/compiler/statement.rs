@@ -40818,6 +40818,10 @@ impl<'source> Compiler<'source> {
                     .roles(item.context_expr.range())
             }),
         )?;
+        if self.context.python_version == crate::PythonVersion::Py312 {
+            // Exit copies precede propagation of the suppression helper's locations.
+            self.assembler.set_location(SourceLocation::NONE);
+        }
         self.emit(TO_BOOL, 0, 0)?;
         self.emit_jump_forward(POP_JUMP_IF_TRUE, suppress, -1)?;
         let not_taken_start = self.assembler.label();
