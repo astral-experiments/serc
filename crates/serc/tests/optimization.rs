@@ -40,6 +40,23 @@ fn guarded_finally_arms_keep_their_manager_exit_location() {
 }
 
 #[test]
+fn completed_coroutine_prefixes_keep_comprehension_return_locations() {
+    for iterator in ["for", "async for"] {
+        for suffix in ["", "        finish(values)\n"] {
+            for prefix in [
+                "        prepare()\n",
+                "        with acquire() as owner:\n            prepare(owner)\n",
+            ] {
+                let source = format!(
+                    "async def sample(flag, items):\n    if flag:\n        values = [item {iterator} item in items]\n{suffix}    else:\n{prefix}        values = [item {iterator} item in items]\n    assert values\n"
+                );
+                assert_matches_cpython(&source, "completed_comprehension_return.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
 fn erased_async_iterator_suffix_preserves_conditional_backedges() {
     for async_iterator in [false, true] {
         for work in [

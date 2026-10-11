@@ -1844,17 +1844,18 @@ impl<'source> Compiler<'source> {
             && self.control.finally.is_inactive_for_return_unwind()
     }
 
-    /// Certifies ordinary coroutine work ending after its conditional prefixes.
+    /// Certifies coroutine work ending after completed conditional or cleanup prefixes.
     pub(super) fn coroutine_branch_has_linear_tail(&self, body: &[Stmt]) -> bool {
         let is_elided = |statement: &Stmt| self.context.is_elided_statement(statement);
         let linear = |statement: &Stmt| {
             let single = std::slice::from_ref(statement);
-            suite_has_nonsuspending_conditional_work(single)
-                && (suite_has_linear_borrow_fallthrough(single)
-                    || matches!(statement, Stmt::Assign(assignment)
-                        if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
-                            && matches!(assignment.value.as_ref(),
-                                Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_))))
+            (suite_has_nonsuspending_conditional_work(single)
+                && suite_has_linear_borrow_fallthrough(single))
+                // Comprehension suspension finishes before the result store.
+                || matches!(statement, Stmt::Assign(assignment)
+                    if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                        && matches!(assignment.value.as_ref(),
+                            Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_)))
         };
         let Some(end) = body.iter().rposition(|statement| !is_elided(statement)) else {
             return false;
@@ -1870,6 +1871,16 @@ impl<'source> Compiler<'source> {
                             && !expression_suspends_current_scope(&conditional.test)
                             && suite_has_linear_borrow_fallthrough(&conditional.body)
                             && suite_has_nonsuspending_conditional_work(&conditional.body))
+                    || matches!(statement, Stmt::With(manager)
+                        if !manager.is_async
+                            && manager.items.iter().all(|item| {
+                                !expression_suspends_current_scope(&item.context_expr)
+                                    && item.optional_vars.as_ref().is_none_or(|target| {
+                                        !expression_suspends_current_scope(target)
+                                    })
+                            })
+                            && suite_has_linear_borrow_fallthrough(&manager.body)
+                            && suite_has_nonsuspending_conditional_work(&manager.body))
             })
     }
 
@@ -1878,15 +1889,6 @@ impl<'source> Compiler<'source> {
         &self,
         conditional: &ruff_python_ast::StmtIf,
     ) -> bool {
-        let has_return_donor = |body: &[Stmt]| {
-            self.coroutine_branch_has_linear_tail(body)
-                // Suspension inside a comprehension finishes before its result store.
-                // That store remains the sole normal return donor for this arm.
-                || matches!(body, [Stmt::Assign(assignment)]
-                    if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
-                        && matches!(assignment.value.as_ref(),
-                            Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_)))
-        };
         std::iter::once(conditional.body.as_slice())
             .chain(
                 conditional
@@ -1895,7 +1897,7 @@ impl<'source> Compiler<'source> {
                     .map(|clause| clause.body.as_slice()),
             )
             .all(|branch| {
-                has_return_donor(branch)
+                self.coroutine_branch_has_linear_tail(branch)
                     || matches!(branch, [Stmt::With(manager)]
                         if !manager.is_async
                             && manager.items.iter().all(|item| {
@@ -1904,7 +1906,7 @@ impl<'source> Compiler<'source> {
                                         !expression_suspends_current_scope(target)
                                     })
                             })
-                            && has_return_donor(&manager.body))
+                            && self.coroutine_branch_has_linear_tail(&manager.body))
             })
     }
 
