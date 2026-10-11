@@ -12,8 +12,9 @@ use crate::target::opcodes::{
     CALL, CALL_FUNCTION_EX, CALL_INTRINSIC_1, CLEANUP_THROW, COMPARE_OP, CONTAINS_OP, COPY,
     COPY_FREE_VARS, END_SEND, IS_OP, JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD,
     LOAD_CLOSURE, LOAD_CONST, LOAD_FAST, LOAD_FAST_LOAD_FAST, LOAD_GLOBAL, MAKE_CELL, NOP, POP_TOP,
-    PUSH_NULL, RERAISE, RESUME, RETURN_CONST, RETURN_GENERATOR, RETURN_VALUE, SEND, STORE_FAST,
-    STORE_FAST_LOAD_FAST, STORE_FAST_STORE_FAST, TO_BOOL, UNARY_NOT, YIELD_VALUE,
+    PUSH_NULL, RERAISE, RESUME, RETURN_CONST, RETURN_GENERATOR, RETURN_VALUE, SEND, STORE_ATTR,
+    STORE_DEREF, STORE_FAST, STORE_FAST_LOAD_FAST, STORE_FAST_STORE_FAST, STORE_GLOBAL, STORE_NAME,
+    STORE_SLICE, STORE_SUBSCR, TO_BOOL, UNARY_NOT, YIELD_VALUE,
 };
 use crate::target::operands::ResumeLocation;
 use crate::target::{is_conditional_jump_for, is_unconditional_jump};
@@ -579,6 +580,20 @@ impl OptimizationPipeline {
                     && !block_has_fallthrough(self.graph[*targets.last().unwrap()].items());
                 if !small_exit && !unlocated_terminal {
                     continue;
+                }
+                if targets.iter().any(|target| {
+                    self.graph[*target].items().iter().any(|item| {
+                        matches!(item, Item::Label(label)
+                            if self.original_scope_exit_labels.contains(label))
+                    })
+                }) {
+                    // A copied footer retains its source identity for repeated
+                    // predecessor counts after the original exit is removed.
+                    for item in self.graph[block].items() {
+                        if let Item::Label(label) = item {
+                            self.original_scope_exit_labels.insert(*label);
+                        }
+                    }
                 }
                 legacy_nop(self.graph.instructions_mut(block).next_back().unwrap());
                 for target in targets {
@@ -2213,6 +2228,30 @@ impl OptimizationPipeline {
             predecessors.insert(copy, 1);
         }
         let order = self.graph.order().to_vec();
+        if self.python_version == PythonVersion::Py312 {
+            // Tests and ordinary stores retain their native locations. Donate
+            // those spans before propagation, even with inflated predecessor counts.
+            for pair in order.windows(2) {
+                let source = pair[0];
+                let target = pair[1];
+                if block_has_fallthrough(self.graph[source].items())
+                    && let Some(last) = self.graph[source].last_instruction().copied()
+                    && (is_conditional_jump_for(self.python_version, last.opcode)
+                        || (matches!(last.opcode,
+                            STORE_ATTR | STORE_DEREF | STORE_FAST | STORE_GLOBAL | STORE_NAME
+                                | STORE_SLICE | STORE_SUBSCR)
+                            && !last.local_policy.may_store_null()))
+                    && self.graph[target].last_instruction().is_some_and(|instruction| {
+                        crate::target::is_scope_exit_for(self.python_version, instruction.opcode)
+                    })
+                    && !self.graph[target].items().iter().any(|item| {
+                        matches!(item, Item::Instruction(instruction) if instruction.location.line >= 0)
+                    })
+                {
+                    self.graph.instructions_mut(target).next().unwrap().location = last.location;
+                }
+            }
+        }
         for (index, block) in order.iter().copied().enumerate() {
             let mut location = SourceLocation::NONE;
             let mut follows_generator_prefix = false;

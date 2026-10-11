@@ -4686,6 +4686,7 @@ impl<'source> Compiler<'source> {
             // Keep that footer until legacy CFG optimization duplicates exits;
             // eager per-arm returns lose the original end-label aliases.
             self.compile_if(statement)?;
+            self.assembler.record_current_original_scope_exit();
             self.assembler.set_location(SourceLocation::NONE);
             return self.emit_deferred_implicit_return();
         }
