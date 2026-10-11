@@ -4801,6 +4801,12 @@ impl<'source> Compiler<'source> {
                         && !suite_contains_loop_break(&loop_statement.body));
             self.compile_if(statement)?;
             if nested_312_scope_exit
+                || (coroutine_312_scope_exit
+                    && !self.control.statements.in_terminal_if_branch_suite
+                    && if_suites(statement).any(|body| {
+                        matches!(body.last(), Some(Stmt::Expr(expression))
+                            if matches!(expression.value.as_ref(), Expr::Await(_)))
+                    }))
                 || (plain_312_scope_exit
                     && (self.has_erased_binary_if_scope_exit(statement)
                         || Self::has_nested_raising_if_scope_exit(statement)

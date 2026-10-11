@@ -11944,6 +11944,41 @@ fn consecutive_elided_conditions_preserve_empty_branch_locations() {
 }
 
 #[test]
+fn erased_prefixes_preserve_original_coroutine_return_locations() {
+    for prefix in [
+        "    if not flag:\n        assert values\n",
+        "    if flag:\n        assert values\n    elif values:\n        assert flag\n",
+    ] {
+        for body in [
+            "work()",
+            "await work()",
+            "values.append(f'item:{flag}')",
+            "value = work()",
+            "value = await work()",
+        ] {
+            for suffix in ["", "    assert values\n"] {
+                let source = format!(
+                    "async def sample(flag, values):\n{prefix}    prepare()\n    if flag:\n        {body}\n{suffix}"
+                );
+                assert_matches_cpython(&source, "erased_coroutine_footer.py", &LEVELS);
+            }
+        }
+    }
+    for condition in ["flag", "flag == 'ready'"] {
+        for body in [
+            "        if flag:\n            assert values\n",
+            "        assert values\n        if flag:\n            assert values\n",
+            "        if flag:\n            result = work()\n",
+        ] {
+            let source = format!(
+                "async def sample(flag, values):\n    if {condition}:\n        assert values\n    if values:\n{body}"
+            );
+            assert_matches_cpython(&source, "erased_nested_coroutine_footer.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn protected_coroutine_branches_keep_returns_before_erased_assertions() {
     for (case, source) in [
         "async def f(a, b):\n    try:\n        if a:\n            assert a\n        assert b\n    except ValueError:\n        pass\n",
