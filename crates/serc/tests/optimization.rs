@@ -57,6 +57,23 @@ fn completed_coroutine_prefixes_keep_comprehension_return_locations() {
 }
 
 #[test]
+fn erased_assertions_preserve_reordered_assignment_return_locations() {
+    for assignment in [
+        "first, second = left(), right()",
+        "first, second, third = left(), middle(), right()",
+        "first, second = values",
+        "first = second = left()",
+    ] {
+        for closure in ["", "    def capture():\n        return first\n"] {
+            let source = format!(
+                "def sample(flag, values):\n{closure}    if flag:\n        {assignment}\n        assert first\n        assert second\n"
+            );
+            assert_matches_cpython(&source, "erased_assignment_return.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn erased_async_iterator_suffix_preserves_conditional_backedges() {
     for async_iterator in [false, true] {
         for work in [

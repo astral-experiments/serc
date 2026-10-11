@@ -5143,16 +5143,13 @@ impl<'source> Compiler<'source> {
         for (branch_index, (test, body)) in branches.into_iter().enumerate() {
             let terminal_312_assignment = self.context.python_version
                 == crate::PythonVersion::Py312
-                && (matches!(body.last(), Some(Stmt::Assign(_)))
-                    || matches!(
-                        body.iter().rev().find(|statement| {
-                            !(matches!(statement, Stmt::Global(global) if global.names.is_empty())
-                                && self.context.is_elided_statement(statement))
-                        }),
-                        Some(Stmt::Assign(assignment))
-                            if matches!(assignment.value.as_ref(),
-                                Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_))
-                    ));
+                && matches!(
+                    body.iter().rev().find(|statement| {
+                        !(matches!(statement, Stmt::Global(global) if global.names.is_empty())
+                            && self.context.is_elided_statement(statement))
+                    }),
+                    Some(Stmt::Assign(_))
+                );
             if let Some(test) = test {
                 let next = self.assembler.label();
                 if self.context.python_version == crate::PythonVersion::Py312
@@ -5296,7 +5293,7 @@ impl<'source> Compiler<'source> {
                 if !suite_terminates(body) && !emitted_fallthrough {
                     if terminal_312_assignment {
                         // Resolve the return after 3.12's static swaps, even when an
-                        // elided assertion follows the comprehension assignment.
+                        // elided assertion follows the assignment.
                         self.assembler.set_location(SourceLocation::NONE);
                     } else if let Some(location) = self.elided_branch_return_location(body) {
                         self.assembler.set_location(location);
@@ -5394,7 +5391,7 @@ impl<'source> Compiler<'source> {
                         self.assembler.set_location(SourceLocation::NONE);
                     } else if terminal_312_assignment {
                         // Resolve the return after 3.12's static swaps, even when an
-                        // elided assertion follows the comprehension assignment.
+                        // elided assertion follows the assignment.
                         self.assembler.set_location(SourceLocation::NONE);
                     } else if let Some(location) = self.elided_branch_return_location(body) {
                         self.assembler.set_location(location);
