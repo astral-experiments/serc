@@ -21,7 +21,7 @@ use super::expression::{jump_constant_truthiness, literal_truthiness};
 use super::scope::NameId;
 use super::symbol::{mangle_name, to_u32};
 use super::{Compiler, comprehension_parts};
-use crate::code_object::{CodeObject, Constant, MetadataId, MetadataName, NonReflexiveRemap};
+use crate::code_object::{CodeObject, Constant, MetadataId, NonReflexiveRemap};
 
 #[derive(Debug, Default)]
 pub(super) struct ConstantPool {
@@ -279,7 +279,6 @@ pub(super) struct OutputState {
     pub(super) folded_constant_dependencies: Vec<(Constant, Vec<Constant>)>,
     pub(super) has_untracked_discarded_collection: bool,
     pub(super) deferred_names: Vec<(OperandPatchId, String)>,
-    pub(super) names: Vec<MetadataName>,
     pub(super) name_ids: Vec<MetadataId>,
     name_indices: FxHashMap<MetadataId, u32>,
     pub(super) interned_constant_strings: FxHashSet<String>,
@@ -876,9 +875,9 @@ impl Compiler<'_> {
 }
 
 impl OutputState {
-    /// Admits an emitted name in first-use order, building an index only for larger tables.
+    /// Admits emitted name IDs in first-use order, building an index only for larger tables.
     #[inline]
-    fn name_index(&mut self, name_id: MetadataId, name: Cow<'_, str>) -> Result<u32, CompileError> {
+    fn name_index(&mut self, name_id: MetadataId) -> Result<u32, CompileError> {
         if self.name_indices.is_empty() {
             if let Some(index) = self
                 .name_ids
@@ -887,14 +886,13 @@ impl OutputState {
             {
                 return to_u32(index, "name count");
             }
-            let index = to_u32(self.names.len(), "name count")?;
+            let index = to_u32(self.name_ids.len(), "name count")?;
             if self.name_ids.len() == NAME_INDEX_THRESHOLD {
                 self.name_indices.reserve(NAME_INDEX_THRESHOLD + 1);
                 self.name_indices
                     .extend(self.name_ids.iter().copied().zip(0..));
                 self.name_indices.insert(name_id, index);
             }
-            self.names.push(MetadataName::from(name));
             self.name_ids.push(name_id);
             return Ok(index);
         }
@@ -902,8 +900,7 @@ impl OutputState {
         match self.name_indices.entry(name_id) {
             Entry::Occupied(entry) => Ok(*entry.get()),
             Entry::Vacant(entry) => {
-                let index = to_u32(self.names.len(), "name count")?;
-                self.names.push(MetadataName::from(name));
+                let index = to_u32(self.name_ids.len(), "name count")?;
                 self.name_ids.push(name_id);
                 entry.insert(index);
                 Ok(index)
@@ -1156,7 +1153,8 @@ impl Compiler<'_> {
             Cow::Borrowed(_) => name_id,
             Cow::Owned(name) => self.required_name_id(name),
         };
-        self.output.name_index(MetadataId::from(name_id), name)
+        debug_assert_eq!(self.resolve_name(name_id), name.as_ref());
+        self.output.name_index(MetadataId::from(name_id))
     }
 
     pub(super) fn emit_unsigned_constant(&mut self, value: u32) -> Result<(), CompileError> {
@@ -4535,8 +4533,6 @@ pub(super) fn big_integer_digits(token: &str) -> Vec<u16> {
 
 #[cfg(test)]
 mod tests {
-    use std::borrow::Cow;
-
     use ruff_python_ast::Operator;
 
     use super::{
@@ -4550,34 +4546,22 @@ mod tests {
     use crate::{CompileOptions, PythonVersion, compile_with_options};
 
     #[test]
-    fn emitted_names_preserve_order_and_first_spelling_across_index_creation() {
+    fn emitted_names_preserve_order_across_index_creation() {
         let mut state = OutputState::default();
         let ids: Vec<_> = (0..NAME_INDEX_THRESHOLD + 8)
             .map(|index| MetadataId::from_u32(u32::try_from(4_007 - index * 29).unwrap()))
             .collect();
         for (index, &id) in ids.iter().enumerate() {
-            let spelling = format!("name_{index}");
-            assert_eq!(
-                state.name_index(id, Cow::Owned(spelling)).unwrap(),
-                u32::try_from(index).unwrap()
-            );
+            assert_eq!(state.name_index(id).unwrap(), u32::try_from(index).unwrap());
             for previous in (0..=index).rev() {
                 assert_eq!(
-                    state
-                        .name_index(ids[previous], Cow::Borrowed("unchanged"))
-                        .unwrap(),
+                    state.name_index(ids[previous]).unwrap(),
                     u32::try_from(previous).unwrap()
                 );
             }
             assert_eq!(state.name_indices.is_empty(), index < NAME_INDEX_THRESHOLD);
         }
         assert_eq!(state.name_ids, ids);
-        assert_eq!(
-            state.names,
-            (0..ids.len())
-                .map(|index| format!("name_{index}"))
-                .collect::<Vec<_>>()
-        );
     }
 
     #[test]
@@ -4593,10 +4577,10 @@ mod tests {
         }
 
         let globals: Vec<_> = (0..NAME_INDEX_THRESHOLD + 6)
-            .map(|index| format!("global_{index}"))
+            .map(|index| format!("global_café_name_beyond_inline_{index}"))
             .collect();
         let source = format!(
-            "class Class:\n    def small(self):\n        return self.__private, self._Class__private, self.__other\n    def large(self):\n        return self.__private, {}, self._Class__private, self.__other, {}\n",
+            "class ClassWithLongName:\n    def small(self):\n        __long_local_variable = self.__private\n        return __long_local_variable, self._ClassWithLongName__private, self.__other\n    def large(self):\n        return self.__private, {}, self._ClassWithLongName__private, self.__other, {}\n",
             globals.join(", "),
             globals[0],
         );
@@ -4615,13 +4599,20 @@ mod tests {
                 },
             )
             .unwrap();
-            let class = child(&module.code, "Class");
+            let class = child(&module.code, "ClassWithLongName");
             let small = child(class, "small");
             let large = child(class, "large");
-            assert_eq!(small.names, ["_Class__private", "_Class__other"]);
-            let expected = std::iter::once("_Class__private")
+            assert_eq!(
+                small.names,
+                ["_ClassWithLongName__private", "_ClassWithLongName__other"]
+            );
+            assert_eq!(
+                small.locals,
+                ["self", "_ClassWithLongName__long_local_variable"]
+            );
+            let expected = std::iter::once("_ClassWithLongName__private")
                 .chain(globals.iter().map(String::as_str))
-                .chain(std::iter::once("_Class__other"))
+                .chain(std::iter::once("_ClassWithLongName__other"))
                 .collect::<Vec<_>>();
             assert_eq!(large.names, expected);
             let small_ids = &small.marshal_provenance.metadata_ids.names;

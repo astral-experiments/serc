@@ -740,6 +740,17 @@ impl NameInterner {
         }
     }
 
+    /// Retains a spelling without copying a heap-backed name's contents.
+    #[inline]
+    pub(super) fn clone_name(&self, id: NameId) -> Name {
+        let index = id.index();
+        if let Some(name) = self.seed_names.get(index) {
+            Name::new_static(name)
+        } else {
+            self.names[index - self.seed_names.len()].clone()
+        }
+    }
+
     pub(super) fn len(&self) -> usize {
         self.seed_names.len() + self.names.len()
     }
@@ -8894,6 +8905,7 @@ def function():
             let id = NameId::from_usize(index);
             assert_eq!(names.get(name), Some(id));
             assert_eq!(names.resolve(id), name);
+            assert_eq!(names.clone_name(id), name);
             assert_eq!(names.seed_names[index], name);
         }
         assert!(names.names.is_empty());
@@ -8902,6 +8914,19 @@ def function():
         assert_eq!(names.names[0], "__user_name__");
         assert_eq!(names.intern("super"), NameId::from_u32(25));
         assert_eq!(names.intern_owned("super".to_owned()), NameId::from_u32(25));
+    }
+
+    #[test]
+    fn cloned_names_retain_interned_heap_storage() {
+        for mut names in [NameInterner::seeded(), NameInterner::default()] {
+            let spelling = "identifier_that_does_not_fit_inline";
+            let id = names.intern(spelling);
+            let cloned = names.clone_name(id);
+            assert_eq!(cloned.as_str(), spelling);
+            assert_eq!(cloned.as_str().as_ptr(), names.resolve(id).as_ptr());
+            drop(names);
+            assert_eq!(cloned.as_str(), spelling);
+        }
     }
 
     #[test]
