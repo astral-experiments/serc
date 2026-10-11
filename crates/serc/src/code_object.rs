@@ -142,6 +142,12 @@ impl From<&str> for MetadataName {
     }
 }
 
+impl From<Name> for MetadataName {
+    fn from(value: Name) -> Self {
+        Self(value)
+    }
+}
+
 impl From<String> for MetadataName {
     fn from(value: String) -> Self {
         Self(Name::from(value))
