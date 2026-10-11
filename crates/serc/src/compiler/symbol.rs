@@ -1132,26 +1132,6 @@ impl Compiler<'_> {
                 }
             }
 
-            fn visit_annotation_subscript(&mut self, expression: &'ast Expr) {
-                match expression {
-                    Expr::Slice(slice) => {
-                        // Annotation-only targets evaluate bounds without constructing a slice.
-                        for bound in [&slice.lower, &slice.upper, &slice.step]
-                            .into_iter()
-                            .flatten()
-                        {
-                            self.visit_expr(bound);
-                        }
-                    }
-                    Expr::Tuple(tuple) => {
-                        for element in &tuple.elts {
-                            self.visit_annotation_subscript(element);
-                        }
-                    }
-                    _ => self.visit_expr(expression),
-                }
-            }
-
             fn record_interpolated_constant(&mut self, constant: Constant) {
                 if self.record_string_origins {
                     self.string_origin_constants.push((constant.clone(), false));
@@ -1316,7 +1296,7 @@ impl Compiler<'_> {
                                 Expr::Attribute(attribute) => self.visit_expr(&attribute.value),
                                 Expr::Subscript(subscript) => {
                                     self.visit_expr(&subscript.value);
-                                    self.visit_annotation_subscript(&subscript.slice);
+                                    super::walk_annotation_subscript(self, &subscript.slice);
                                 }
                                 _ => {}
                             }
