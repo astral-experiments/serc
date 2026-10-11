@@ -675,31 +675,34 @@ impl NameInterner {
     }
 
     pub(super) fn get(&self, name: &str) -> Option<NameId> {
-        // Before any dynamic name is interned, seed lookups need no cache allocation.
-        // Once populated, use the exact-spelling cache before checking the static seeds.
-        if self.reverse.is_empty()
-            && !self.seed_names.is_empty()
-            && let Some(id) = Self::seed_id(name)
-        {
-            return Some(id);
+        // Before the first dynamic insertion, only static seeds can match.
+        if self.reverse.is_empty() {
+            return self.get_uncached(name);
         }
         if let Some(key) = ShortNameKey::new(name) {
             if let Some(id) = self.short_names.get(key) {
                 return Some(id);
             }
-            let id = self.get_uncached(name)?;
-            self.short_names.insert(key, id);
-            return Some(id);
-        }
-        if let Some(key) = MediumNameKey::new(name) {
+        } else if let Some(key) = MediumNameKey::new(name) {
             if let Some(id) = self.short_names.get_medium(key) {
                 return Some(id);
             }
-            let id = self.get_uncached(name)?;
-            self.short_names.insert_medium(key, id);
-            return Some(id);
+        } else {
+            return self.get_uncached(name);
         }
-        self.get_uncached(name)
+        self.get_and_cache(name)
+    }
+
+    // Keep cache population out of the cache-hit path's stack frame.
+    #[inline(never)]
+    fn get_and_cache(&self, name: &str) -> Option<NameId> {
+        let id = self.get_uncached(name)?;
+        if let Some(key) = ShortNameKey::new(name) {
+            self.short_names.insert(key, id);
+        } else if let Some(key) = MediumNameKey::new(name) {
+            self.short_names.insert_medium(key, id);
+        }
+        Some(id)
     }
 
     fn get_uncached(&self, name: &str) -> Option<NameId> {
