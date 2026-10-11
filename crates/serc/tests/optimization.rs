@@ -11992,6 +11992,41 @@ fn empty_conditionals_preserve_legacy_terminal_return_locations() {
 }
 
 #[test]
+fn erased_elif_prefix_preserves_original_scope_footer() {
+    for definition in ["def", "async def"] {
+        for prefix in ["", "        if flag:\n            assert value\n"] {
+            for terminal in ["raise Failure", "return"] {
+                let source = format!(
+                    "{definition} sample(first, second, flag, value):\n    if first:\n        if flag:\n            {terminal}\n    elif second:\n{prefix}        if flag:\n            {terminal}\n"
+                );
+                for suffix in ["", "    else:\n        raise Failure\n"] {
+                    assert_matches_cpython(
+                        &format!("{source}{suffix}"),
+                        "erased_elif_footer.py",
+                        &LEVELS,
+                    );
+                }
+            }
+        }
+        for store in [
+            "value = 3",
+            "owner.value = 3",
+            "owner.value = {**owner.value, 'item': value}",
+            "owner['item'] = value",
+            "first, second = items",
+            "first, second = left(), right()",
+        ] {
+            for prefix in ["", "        if flag:\n            assert value\n"] {
+                let source = format!(
+                    "{definition} sample(first, second, flag, owner, value, items):\n    if first:\n        assert flag\n    elif second:\n        assert flag\n    else:\n{prefix}        {store}\n"
+                );
+                assert_matches_cpython(&source, "live_else_footer.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
 fn consecutive_elided_conditions_preserve_empty_branch_locations() {
     for (prefix, suffix) in [
         (
