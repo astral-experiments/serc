@@ -80,10 +80,7 @@ impl BasicBlock {
     }
 
     pub(super) fn last_instruction(&self) -> Option<&Instruction> {
-        self.items.iter().rev().find_map(|item| match item {
-            Item::Instruction(instruction) => Some(instruction),
-            Item::Label(_) => None,
-        })
+        self.items.iter().rev().find_map(Item::as_instruction)
     }
 
     /// Finds the fallthrough and explicit target from the same final instruction.
@@ -1056,10 +1053,7 @@ impl BlockGraph {
         self.blocks[block]
             .items
             .iter_mut()
-            .filter_map(|item| match item {
-                Item::Instruction(instruction) => Some(instruction),
-                Item::Label(_) => None,
-            })
+            .filter_map(Item::as_instruction_mut)
     }
 
     pub(super) fn for_each_adjacent_instruction_pair_mut(

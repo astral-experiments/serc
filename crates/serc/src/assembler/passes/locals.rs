@@ -1745,10 +1745,7 @@ pub(in crate::assembler) fn optimize_linear_assertion_load_fast(
         let last = items[start..end]
             .iter()
             .rev()
-            .find_map(|item| match item {
-                Item::Instruction(instruction) => Some(instruction),
-                Item::Label(_) => None,
-            })
+            .find_map(Item::as_instruction)
             .expect("a borrow block with candidates should contain an instruction");
         let consumes_stack = (last.value_argument().is_none() || ends_scope(last.opcode))
             && last.depth_after() == Some(0);
@@ -3348,10 +3345,7 @@ impl OptimizationPipeline {
                             &preserved,
                         );
                         let range = blocks.get(*label_blocks.get(label.index())?)?;
-                        let records = items[range.clone()].iter().filter_map(|item| match item {
-                            Item::Instruction(instruction) => Some(instruction),
-                            Item::Label(_) => None,
-                        });
+                        let records = items[range.clone()].iter().filter_map(Item::as_instruction);
                         let first = records.clone().next()?;
                         if first.opcode != NOP || !first.fusion_policy.is_converted_pop_block() {
                             return None;
@@ -4000,10 +3994,7 @@ impl OptimizationPipeline {
                                     })
                                     && items[blocks[block + 1].clone()]
                                         .iter()
-                                        .find_map(|item| match item {
-                                            Item::Instruction(instruction) => Some(instruction),
-                                            Item::Label(_) => None,
-                                        })
+                                        .find_map(Item::as_instruction)
                                         .is_some_and(|instruction| {
                                             (!matches!(instruction.opcode, NOP | NOT_TAKEN)
                                                 || (instruction.opcode == NOP
@@ -4102,12 +4093,9 @@ impl OptimizationPipeline {
                         && finally_block == target + 1
                         && finally_block < blocks.len()
                         && {
-                            let mut instructions = items[blocks[target].clone()].iter().filter_map(
-                                |item| match item {
-                                    Item::Instruction(instruction) => Some(instruction),
-                                    Item::Label(_) => None,
-                                },
-                            );
+                            let mut instructions = items[blocks[target].clone()]
+                                .iter()
+                                .filter_map(Item::as_instruction);
                             instructions.next().is_some_and(|nop| {
                                 nop.opcode == NOP
                                     && nop.location == last.location
@@ -4468,10 +4456,7 @@ impl OptimizationPipeline {
                 let last = items[range.clone()]
                     .iter()
                     .rev()
-                    .find_map(|item| match item {
-                        Item::Instruction(instruction) => Some(instruction),
-                        Item::Label(_) => None,
-                    })
+                    .find_map(Item::as_instruction)
                     .expect("a borrow block with candidates should contain an instruction");
                 let consumes_stack = (last.value_argument().is_none() || ends_scope(last.opcode))
                     && last.depth_after() == Some(0);

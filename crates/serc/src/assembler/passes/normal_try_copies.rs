@@ -876,10 +876,7 @@ impl OptimizationPipeline {
             let target_instructions = graph[target]
                 .items()
                 .iter()
-                .filter_map(|item| match item {
-                    Item::Instruction(instruction) => Some(instruction),
-                    Item::Label(_) => None,
-                })
+                .filter_map(Item::as_instruction)
                 .collect::<Vec<_>>();
             let Some((jump, prefix)) = target_instructions.split_last() else {
                 return false;
@@ -937,10 +934,7 @@ impl OptimizationPipeline {
                         || order.get(position + 1) != Some(&cleanup_block)
                         || order.get(position + 2) != Some(&target)
                         || !intact(cleanup_block, false, false)
-                        || !graph[cleanup_block].items().iter().filter_map(|item| match item {
-                            Item::Instruction(instruction) => Some(instruction),
-                            Item::Label(_) => None,
-                        }).eq([pop, cleanup_jump])
+                        || !graph[cleanup_block].items().iter().filter_map(Item::as_instruction).eq([pop, cleanup_jump])
                     {
                         return false;
                     }
@@ -1257,10 +1251,7 @@ impl OptimizationPipeline {
                 let instructions = graph[block]
                     .items()
                     .iter()
-                    .filter_map(|item| match item {
-                        Item::Instruction(instruction) => Some(instruction),
-                        Item::Label(_) => None,
-                    })
+                    .filter_map(Item::as_instruction)
                     .collect::<Vec<_>>();
                 let (jump, prefix) = instructions
                     .split_last()
@@ -1728,14 +1719,10 @@ impl OptimizationPipeline {
             };
             // A shared finalizer RERAISE has the same enclosing owner as the
             // original empty-body exit. Keep that owner available to exit copying.
-            let mut target_instructions =
-                graph[target_block]
-                    .items()
-                    .iter()
-                    .filter_map(|item| match item {
-                        Item::Instruction(instruction) => Some(instruction),
-                        Item::Label(_) => None,
-                    });
+            let mut target_instructions = graph[target_block]
+                .items()
+                .iter()
+                .filter_map(Item::as_instruction);
             let shared_reraise = self.python_version >= crate::PythonVersion::Py314
                 && target_instructions.next().is_some_and(|instruction| {
                     instruction.opcode == crate::target::opcodes::RERAISE
@@ -2303,10 +2290,7 @@ impl OptimizationPipeline {
                             }
                             let mut instructions =
                                 self.graph[source].items().iter().rev().filter_map(
-                                    |item| match item {
-                                        Item::Instruction(instruction) => Some(instruction),
-                                        Item::Label(_) => None,
-                                    },
+                                    Item::as_instruction,
                                 );
                             instructions.next() == Some(pop) && instructions.next() == Some(first)
                         })
@@ -2408,10 +2392,7 @@ impl OptimizationPipeline {
                             .items()
                             .iter()
                             .rev()
-                            .find_map(|item| match item {
-                                Item::Instruction(instruction) => Some(instruction),
-                                Item::Label(_) => None,
-                            })
+                            .find_map(Item::as_instruction)
                             .is_some_and(|instruction| {
                                 super::super::is_conditional_jump(instruction.opcode)
                                     && instruction.location == jump.location
@@ -3382,10 +3363,7 @@ impl OptimizationPipeline {
             let instructions = graph[block]
                 .items()
                 .iter()
-                .filter_map(|item| match item {
-                    Item::Instruction(instruction) => Some(instruction),
-                    Item::Label(_) => None,
-                })
+                .filter_map(Item::as_instruction)
                 .collect::<Vec<_>>();
             let [jump] = instructions.as_slice() else {
                 continue;
@@ -3487,10 +3465,7 @@ impl OptimizationPipeline {
             let instructions = graph[block]
                 .items()
                 .iter()
-                .filter_map(|item| match item {
-                    Item::Instruction(instruction) => Some(instruction),
-                    Item::Label(_) => None,
-                })
+                .filter_map(Item::as_instruction)
                 .collect::<Vec<_>>();
             let [jump] = instructions.as_slice() else {
                 continue;
@@ -3810,10 +3785,7 @@ impl OptimizationPipeline {
                             _ => true,
                         }
                     })
-                    || graph[target].items().iter().filter_map(|item| match item {
-                        Item::Instruction(instruction) => Some(instruction),
-                        Item::Label(_) => None,
-                    }).zip([1, 2, 1, 0]).any(|(instruction, depth)| {
+                    || graph[target].items().iter().filter_map(Item::as_instruction).zip([1, 2, 1, 0]).any(|(instruction, depth)| {
                         *instruction != Instruction::new(instruction.opcode, instruction.operand(), instruction.location, Some(depth))
                     })
                 {
@@ -4281,10 +4253,7 @@ impl OptimizationPipeline {
                     let mut instructions = graph[block]
                         .items()
                         .iter()
-                        .filter_map(|item| match item {
-                            Item::Instruction(instruction) => Some(instruction),
-                            Item::Label(_) => None,
-                        })
+                        .filter_map(Item::as_instruction)
                         .peekable();
                     while let Some(instruction) = instructions.next() {
                         if instructions.peek().is_none() {
@@ -4704,10 +4673,7 @@ mod tests {
             let pop = *pipeline.graph[block]
                 .items()
                 .iter()
-                .find_map(|item| match item {
-                    Item::Instruction(instruction) => Some(instruction),
-                    Item::Label(_) => None,
-                })
+                .find_map(Item::as_instruction)
                 .unwrap();
             assert!(pop.fusion_policy.is_converted_pop_block());
             assert_eq!(
@@ -5125,10 +5091,7 @@ mod tests {
             let instructions = pipeline.graph[block]
                 .items()
                 .iter()
-                .filter_map(|item| match item {
-                    Item::Instruction(instruction) => Some(instruction),
-                    Item::Label(_) => None,
-                })
+                .filter_map(Item::as_instruction)
                 .collect::<Vec<_>>();
             assert_eq!(
                 instructions.len(),

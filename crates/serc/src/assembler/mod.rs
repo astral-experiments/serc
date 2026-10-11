@@ -1641,10 +1641,7 @@ impl Assembler {
             .linear_items()
             .iter()
             .rev()
-            .find_map(|item| match item {
-                Item::Instruction(instruction) => Some(instruction),
-                Item::Label(_) => None,
-            })?;
+            .find_map(Item::as_instruction)?;
         if instruction.opcode != STORE_FAST || instruction.local_policy.may_store_null() {
             return None;
         }
@@ -3555,10 +3552,7 @@ impl Assembler {
                 .linear_items()
                 .iter()
                 .rev()
-                .find_map(|item| match item {
-                    Item::Instruction(instruction) => Some(instruction),
-                    Item::Label(_) => None,
-                })
+                .find_map(Item::as_instruction)
                 .is_some_and(|instruction| {
                     ends_scope(instruction.opcode) || is_unconditional_jump(instruction.opcode)
                 })
@@ -4767,10 +4761,7 @@ impl Assembler {
         self.linear_items()
             .iter()
             .rev()
-            .filter_map(|item| match item {
-                Item::Instruction(instruction) => Some(instruction),
-                Item::Label(_) => None,
-            })
+            .filter_map(Item::as_instruction)
             .take(self.instruction_count.saturating_sub(instruction_offset))
             .map(|instruction| {
                 1 + usize::from(instruction.pre_fold_extra_instructions())
@@ -4872,10 +4863,7 @@ impl Assembler {
     /// Returns whether a normalized Boolean value marker was already emitted in this code unit.
     pub(crate) fn contains_boolean_value_marker(&self) -> bool {
         let mut previous = None;
-        for instruction in self.linear_items().iter().filter_map(|item| match item {
-            Item::Instruction(instruction) => Some(instruction),
-            Item::Label(_) => None,
-        }) {
+        for instruction in self.linear_items().iter().filter_map(Item::as_instruction) {
             if previous == Some(NOT_TAKEN) && instruction.opcode == POP_TOP {
                 return true;
             }
@@ -4895,10 +4883,7 @@ impl Assembler {
         let items = self.linear_items();
         for instruction in items[scan.cursor_item..]
             .iter()
-            .filter_map(|item| match item {
-                Item::Instruction(instruction) => Some(instruction),
-                Item::Label(_) => None,
-            })
+            .filter_map(Item::as_instruction)
         {
             if matches!(
                 instruction.opcode,
@@ -4920,10 +4905,7 @@ impl Assembler {
         self.linear_items()
             .iter()
             .rev()
-            .filter_map(|item| match item {
-                Item::Instruction(instruction) => Some(instruction),
-                Item::Label(_) => None,
-            })
+            .filter_map(Item::as_instruction)
             .take(self.instruction_count.saturating_sub(instruction_offset))
             .any(|instruction| instruction.opcode == opcode)
     }
@@ -7506,10 +7488,7 @@ impl Assembler {
             .expect("normal POP_BLOCK boundary is emitted");
         let materialized = self.linear_items()[index + 1..]
             .iter()
-            .find_map(|item| match item {
-                Item::Instruction(instruction) => Some(instruction),
-                Item::Label(_) => None,
-            })
+            .find_map(Item::as_instruction)
             .is_some_and(|instruction| instruction.fusion_policy.is_converted_pop_block());
         if !materialized {
             // Reuse the logical POP boundary. Inserting a label before its last
@@ -7616,13 +7595,9 @@ impl Assembler {
 
     /// Places removed records on their first surviving successor after a source join.
     pub(crate) fn add_hidden_exception_owner_slots_at(&mut self, item_offset: usize, count: usize) {
-        if let Some(instruction) =
-            self.linear_items_mut()[item_offset..]
-                .iter_mut()
-                .find_map(|item| match item {
-                    Item::Instruction(instruction) => Some(instruction),
-                    Item::Label(_) => None,
-                })
+        if let Some(instruction) = self.linear_items_mut()[item_offset..]
+            .iter_mut()
+            .find_map(Item::as_instruction_mut)
         {
             instruction.local_policy.add_hidden_exception_owner_slots(
                 u16::try_from(
@@ -7709,10 +7684,7 @@ impl Assembler {
     pub(crate) fn add_constant_fold_slots_at(&mut self, item_offset: usize, count: usize) {
         let instruction = self.linear_items_mut()[item_offset..]
             .iter_mut()
-            .find_map(|item| match item {
-                Item::Instruction(instruction) => Some(instruction),
-                Item::Label(_) => None,
-            })
+            .find_map(Item::as_instruction_mut)
             .expect("folded operations require a surviving successor");
         instruction.local_policy.add_hidden_exception_owner_slots(
             u16::try_from(count.min(usize::from(LocalPolicy::MAX_HIDDEN_EXCEPTION_OWNER_SLOTS)))
@@ -8524,10 +8496,7 @@ impl Assembler {
             .linear_items()
             .iter()
             .rev()
-            .filter_map(|item| match item {
-                Item::Instruction(instruction) => Some(instruction),
-                Item::Label(_) => None,
-            });
+            .filter_map(Item::as_instruction);
         let (Some(jump), Some(pop), Some(call)) = (
             instructions.next(),
             instructions.next(),
@@ -8774,14 +8743,11 @@ impl Assembler {
             // pipeline determines exit copying without this modern policy.
             return;
         }
-        let mut instructions =
-            self.linear_items_mut()
-                .iter_mut()
-                .rev()
-                .filter_map(|item| match item {
-                    Item::Instruction(instruction) => Some(instruction),
-                    Item::Label(_) => None,
-                });
+        let mut instructions = self
+            .linear_items_mut()
+            .iter_mut()
+            .rev()
+            .filter_map(Item::as_instruction_mut);
         let marker = instructions
             .next()
             .expect("condition marker should be present");
@@ -9023,10 +8989,7 @@ impl Assembler {
         let has_fallthrough = items
             .iter()
             .rev()
-            .find_map(|item| match item {
-                Item::Instruction(instruction) => Some(instruction),
-                Item::Label(_) => None,
-            })
+            .find_map(Item::as_instruction)
             .is_some_and(|instruction| {
                 !ends_scope(instruction.opcode) && !is_unconditional_jump(instruction.opcode)
             });
@@ -15262,10 +15225,7 @@ impl Assembler {
         let original = items[start..].to_vec();
         let records = original
             .iter()
-            .filter_map(|item| match item {
-                Item::Instruction(instruction) => Some(instruction),
-                Item::Label(_) => None,
-            })
+            .filter_map(Item::as_instruction)
             .collect::<Vec<_>>();
         let [first, swap, second, pop_except] = records.as_slice() else {
             return;
@@ -15853,10 +15813,7 @@ impl Assembler {
         }
         let prefix = items[return_item..start_at]
             .iter()
-            .filter_map(|item| match item {
-                Item::Instruction(instruction) => Some(instruction),
-                Item::Label(_) => None,
-            })
+            .filter_map(Item::as_instruction)
             .collect::<Vec<_>>();
         let return_iterator = if inner_iterator {
             let [authored, iterator] = prefix.as_slice() else {
@@ -16131,10 +16088,7 @@ impl Assembler {
         }
         let Some(suffix) = items[target_index + 1..]
             .iter()
-            .find_map(|item| match item {
-                Item::Instruction(instruction) => Some(instruction),
-                Item::Label(_) => None,
-            })
+            .find_map(Item::as_instruction)
         else {
             return;
         };
@@ -16313,10 +16267,7 @@ impl Assembler {
             .linear_items()
             .iter()
             .rev()
-            .filter_map(|item| match item {
-                Item::Instruction(instruction) => Some(instruction),
-                Item::Label(_) => None,
-            });
+            .filter_map(Item::as_instruction);
         let (Some(pop), Some(authored)) = (instructions.next(), instructions.next()) else {
             return false;
         };

@@ -2166,10 +2166,7 @@ impl ExceptionOwnerProvenance {
                 }
                 let records = prefix
                     .iter()
-                    .filter_map(|item| match item {
-                        Item::Instruction(instruction) => Some(instruction),
-                        Item::Label(_) => None,
-                    })
+                    .filter_map(Item::as_instruction)
                     .collect::<Vec<_>>();
                 let [copy, to_bool, condition, marker] = records.as_slice() else {
                     return None;
@@ -4732,10 +4729,9 @@ impl LayoutAssembler {
             if let Some(location) = authored_break_location {
                 // CP propagates its sole jump predecessor's location before
                 // NOP removal. A distinct next line retains this original slot.
-                let next = current[marker_at + 1..].iter().find_map(|item| match item {
-                    Item::Instruction(instruction) => Some(instruction),
-                    Item::Label(_) => None,
-                });
+                let next = current[marker_at + 1..]
+                    .iter()
+                    .find_map(Item::as_instruction);
                 if marker.location != location
                     || next.is_none_or(|next| {
                         next.location.line < 0 || next.location.line == location.line
@@ -4832,14 +4828,7 @@ impl LayoutAssembler {
         &self,
         label_positions: &FxHashMap<Label, usize>,
     ) -> FxHashSet<usize> {
-        let instructions: Vec<_> = self
-            .items
-            .iter()
-            .filter_map(|item| match item {
-                Item::Instruction(instruction) => Some(instruction),
-                Item::Label(_) => None,
-            })
-            .collect();
+        let instructions: Vec<_> = self.items.iter().filter_map(Item::as_instruction).collect();
         let label_positions = OwnerLabelPositions::from_hashed(self.items.len(), label_positions);
         self.retained_setup_nops_with_instructions(&label_positions, &instructions)
     }
@@ -4985,10 +4974,7 @@ impl LayoutAssembler {
             if let Some(previous) = self.items[..begin]
                 .iter()
                 .rev()
-                .find_map(|item| match item {
-                    Item::Instruction(instruction) => Some(instruction),
-                    Item::Label(_) => None,
-                })
+                .find_map(Item::as_instruction)
                 && !is_scope_exit(previous.opcode)
                 && !crate::target::is_unconditional_jump(previous.opcode)
             {
@@ -11595,13 +11581,7 @@ impl LayoutAssembler {
                 continue;
             };
             let owner = self.exception_regions[region];
-            let store = current
-                .iter()
-                .find_map(|item| match item {
-                    Item::Instruction(instruction) => Some(instruction),
-                    Item::Label(_) => None,
-                })
-                .unwrap();
+            let store = current.iter().find_map(Item::as_instruction).unwrap();
             if owner.target != origin.target
                 || owner.is_scope_fallback
                 || !owner.preserve_lasti
@@ -14623,10 +14603,7 @@ mod tests {
         let instructions = assembler
             .items
             .iter()
-            .filter_map(|item| match item {
-                Item::Instruction(instruction) => Some(instruction),
-                Item::Label(_) => None,
-            })
+            .filter_map(Item::as_instruction)
             .collect::<Vec<_>>();
         assert_eq!(
             assembler.threaded_condition_positions(&instructions),
@@ -15322,10 +15299,7 @@ mod tests {
             let marker_index = assembler
                 .items
                 .iter()
-                .filter_map(|item| match item {
-                    Item::Instruction(instruction) => Some(instruction),
-                    Item::Label(_) => None,
-                })
+                .filter_map(Item::as_instruction)
                 .position(|instruction| instruction.opcode == NOT_TAKEN)
                 .unwrap();
             let owners = assembler.dynamic_exception_owners();
@@ -17874,10 +17848,7 @@ mod tests {
             let instructions = assembler
                 .linear_items()
                 .iter()
-                .filter_map(|item| match item {
-                    Item::Instruction(instruction) => Some(instruction),
-                    Item::Label(_) => None,
-                })
+                .filter_map(Item::as_instruction)
                 .collect::<Vec<_>>();
             assert_eq!(
                 instructions[0].opcode,
@@ -18192,10 +18163,7 @@ mod tests {
                 let instruction = assembler
                     .items
                     .iter_mut()
-                    .filter_map(|item| match item {
-                        Item::Instruction(instruction) => Some(instruction),
-                        Item::Label(_) => None,
-                    })
+                    .filter_map(Item::as_instruction_mut)
                     .nth(6)
                     .unwrap();
                 instruction.opcode = NOT_TAKEN;
@@ -18210,10 +18178,7 @@ mod tests {
                 let instruction = assembler
                     .items
                     .iter_mut()
-                    .filter_map(|item| match item {
-                        Item::Instruction(instruction) => Some(instruction),
-                        Item::Label(_) => None,
-                    })
+                    .filter_map(Item::as_instruction_mut)
                     .nth(3)
                     .unwrap();
                 instruction
