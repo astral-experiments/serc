@@ -317,6 +317,9 @@ impl MarshalNameLookup {
     }
 }
 
+const NAME_CACHE_BITS: u32 = 6;
+const NAME_CACHE_SIZE: usize = 1 << NAME_CACHE_BITS;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ShortNameKey {
     packed: u64,
@@ -350,7 +353,7 @@ impl ShortNameKey {
     fn slot(self) -> usize {
         let mixed = (self.packed ^ u64::from(self.length).wrapping_mul(0x517c_c1b7_2722_0a95))
             .wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        usize::try_from(mixed >> (64 - 7)).unwrap()
+        usize::try_from(mixed >> (64 - NAME_CACHE_BITS)).unwrap()
     }
 }
 
@@ -383,7 +386,8 @@ impl MediumNameKey {
         let mixed = self.first
             ^ self.last.rotate_left(37)
             ^ u64::from(self.length).wrapping_mul(0x517c_c1b7_2722_0a95);
-        usize::try_from(mixed.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - 7)).unwrap()
+        usize::try_from(mixed.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - NAME_CACHE_BITS))
+            .unwrap()
     }
 }
 
@@ -393,8 +397,8 @@ struct ShortNameCache(OnceCell<Box<NameCaches>>);
 
 #[derive(Debug)]
 struct NameCaches {
-    short: [Cell<ShortNameEntry>; 128],
-    medium: OnceCell<Box<[Cell<MediumNameEntry>; 128]>>,
+    short: [Cell<ShortNameEntry>; NAME_CACHE_SIZE],
+    medium: OnceCell<Box<[Cell<MediumNameEntry>; NAME_CACHE_SIZE]>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -421,7 +425,7 @@ impl Default for NameCaches {
                     id: None,
                     length: 0,
                 })
-            }; 128],
+            }; NAME_CACHE_SIZE],
             medium: OnceCell::new(),
         }
     }
@@ -468,7 +472,7 @@ impl ShortNameCache {
                         id: None,
                         length: 0,
                     })
-                }; 128],
+                }; NAME_CACHE_SIZE],
             )
         });
         entries[key.slot()].set(MediumNameEntry {
@@ -8972,7 +8976,7 @@ def function():
 
     #[test]
     fn short_name_cache_preserves_lengths_unicode_and_direct_map_collisions() {
-        use super::ShortNameKey;
+        use super::{NAME_CACHE_SIZE, ShortNameKey};
 
         let mut names = NameInterner::default();
         let spellings = [
@@ -9000,8 +9004,8 @@ def function():
             assert_eq!(names.resolve(id), *spelling);
         }
 
-        let mut slots = vec![None; 128];
-        let (first, second) = (0..=128)
+        let mut slots = vec![None; NAME_CACHE_SIZE];
+        let (first, second) = (0..=NAME_CACHE_SIZE)
             .find_map(|index| {
                 let spelling = format!("v{index}");
                 let slot = ShortNameKey::new(&spelling).unwrap().slot();
@@ -9009,7 +9013,7 @@ def function():
                     .replace(spelling.clone())
                     .map(|earlier| (earlier, spelling))
             })
-            .expect("129 spellings must share at least one of 128 slots");
+            .expect("more spellings than cache slots must collide");
         let first_id = names.intern(&first);
         let second_id = names.intern(&second);
         for _ in 0..4 {
