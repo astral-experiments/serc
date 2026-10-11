@@ -20,7 +20,7 @@ use crate::target::{is_conditional_jump, is_unconditional_jump};
 #[cfg(test)]
 mod copied_backedge_tests;
 
-/// Locates unique NOT_TAKEN markers using their complete original item prefixes.
+/// Locates unique `NOT_TAKEN` markers using their complete original item prefixes.
 fn original_not_taken_marker_positions(
     graph: &BlockGraph,
     prefixes: &[Vec<Item>],
