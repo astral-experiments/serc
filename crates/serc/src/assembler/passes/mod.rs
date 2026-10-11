@@ -238,6 +238,13 @@ impl Assembler {
         self.prune_unused_loop_finally_region_boundaries();
         self.resolve_folded_condition_borrow_entries();
         let mut exception_owner_provenance = self.exception_owner_provenance.into_box();
+        if exception_owner_provenance.original_pass_nops.is_empty() {
+            exception_owner_provenance.original_pass_nops = self.original_pass_nops;
+        } else {
+            exception_owner_provenance
+                .original_pass_nops
+                .extend(self.original_pass_nops);
+        }
         let (mut graph, initial_reachable) = match self.code {
             UnoptimizedCode::Linear(items) => (
                 BlockGraph::from_items(items, &rustc_hash::FxHashSet::default()),

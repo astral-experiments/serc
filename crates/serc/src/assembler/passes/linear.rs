@@ -497,12 +497,19 @@ impl Assembler {
             None,
             AssemblerStage::OptimizeLoadFast,
         )?;
+        let mut exception_owner_provenance = self.exception_owner_provenance;
+        // The certified linear path has no exception table to replay these records.
+        if !self.exception_regions.is_empty() && !self.original_pass_nops.is_empty() {
+            exception_owner_provenance
+                .original_pass_nops
+                .extend(self.original_pass_nops);
+        }
         Ok(LayoutAssembler {
             python_version: self.python_version,
             legacy_uniform_jump_seed: self.legacy_uniform_jump_seed,
             items,
             exception_regions: self.exception_regions,
-            exception_owner_provenance: self.exception_owner_provenance,
+            exception_owner_provenance,
             preserved_block_boundaries: self.preserved_block_boundaries,
             removed_max_depth,
             next_label: self.next_label,

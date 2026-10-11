@@ -1147,6 +1147,8 @@ fn raising_while_cleanup_requires_exact_original_edges() {
 #[test]
 fn plain_linear_scopes_do_not_allocate_owner_provenance() {
     let mut assembler = Assembler::with_python_version(crate::PythonVersion::Py314);
+    assembler.emit(NOP, 0);
+    assembler.record_original_pass_nop();
     assembler.emit(LOAD_CONST, 0);
     assembler.emit(RETURN_VALUE, 0);
     assert!(assembler.exception_owner_provenance.setups.is_empty());
@@ -1162,6 +1164,28 @@ fn plain_linear_scopes_do_not_allocate_owner_provenance() {
     provenance.block_boundaries.insert(entry);
     let provenance = provenance.as_mut_if_present().unwrap();
     assert!(provenance.block_boundaries.contains(&entry));
+}
+
+#[test]
+fn deferred_pass_origins_reach_control_flow_optimization() {
+    for version in [crate::PythonVersion::Py314, crate::PythonVersion::Py315] {
+        let mut assembler = Assembler::with_python_version(version);
+        assembler.emit(NOP, 0);
+        assembler.record_original_pass_nop();
+        let expected = assembler.original_pass_nops.clone();
+        assert_eq!(expected.len(), 1);
+        assert!(
+            assembler
+                .exception_owner_provenance
+                .as_mut_if_present()
+                .is_none()
+        );
+        let pipeline = assembler.into_optimization_pipeline();
+        assert_eq!(
+            pipeline.exception_owner_provenance.original_pass_nops,
+            expected
+        );
+    }
 }
 
 #[test]
