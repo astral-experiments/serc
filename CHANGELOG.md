@@ -1,5 +1,327 @@
 # Changelog
 
+## 0.1.3
+
+Released on 2026-10-11.
+
+Serc 0.1.3 expands CPython bytecode compatibility, especially for Python 3.14
+optimized control flow, exception cleanup, and source locations.
+
+### Bug fixes
+
+- Match CPython loop backedges when optimization erases final coroutine-loop
+  branches, including loops inside context managers (astral-sh/serc#1031;
+  https://github.com/astral-sh/serc/pull/1031) (astral-sh/serc#1038;
+  https://github.com/astral-sh/serc/pull/1038) (astral-sh/serc#1040;
+  https://github.com/astral-sh/serc/pull/1040) (astral-sh/serc#1041;
+  https://github.com/astral-sh/serc/pull/1041) (astral-sh/serc#1042;
+  https://github.com/astral-sh/serc/pull/1042)
+- Match CPython loop exits when optimization erases prefixes, nested-finalizer
+  branches, completed manager work, or coroutine `for`/`else` arms
+  (astral-sh/serc#1043; https://github.com/astral-sh/serc/pull/1043)
+  (astral-sh/serc#1044; https://github.com/astral-sh/serc/pull/1044)
+  (astral-sh/serc#1047; https://github.com/astral-sh/serc/pull/1047)
+  (astral-sh/serc#1054; https://github.com/astral-sh/serc/pull/1054)
+  (astral-sh/serc#1055; https://github.com/astral-sh/serc/pull/1055)
+- Preserve optimized branch exits after erased iterator work, completed managed
+  branches, and discarded constants (astral-sh/serc#1188;
+  https://github.com/astral-sh/serc/pull/1188) (astral-sh/serc#1198;
+  https://github.com/astral-sh/serc/pull/1198) (astral-sh/serc#1220;
+  https://github.com/astral-sh/serc/pull/1220)
+- Preserve loop and async-cleanup boundaries when optimization removes
+  assertions or loop tails (astral-sh/serc#1102;
+  https://github.com/astral-sh/serc/pull/1102) (astral-sh/serc#1104;
+  https://github.com/astral-sh/serc/pull/1104) (astral-sh/serc#1107;
+  https://github.com/astral-sh/serc/pull/1107) (astral-sh/serc#1114;
+  https://github.com/astral-sh/serc/pull/1114)
+- Preserve exits when optimization erases comprehension, context-manager,
+  structured-cleanup, or finalizer work (astral-sh/serc#1106;
+  https://github.com/astral-sh/serc/pull/1106) (astral-sh/serc#1108;
+  https://github.com/astral-sh/serc/pull/1108) (astral-sh/serc#1112;
+  https://github.com/astral-sh/serc/pull/1112) (astral-sh/serc#1118;
+  https://github.com/astral-sh/serc/pull/1118)
+- Preserve coroutine, loop, and finalizer exits when optimization erases
+  recovery paths, assertions, or awaited alternatives (astral-sh/serc#1162;
+  https://github.com/astral-sh/serc/pull/1162) (astral-sh/serc#1204;
+  https://github.com/astral-sh/serc/pull/1204) (astral-sh/serc#1205;
+  https://github.com/astral-sh/serc/pull/1205) (astral-sh/serc#1207;
+  https://github.com/astral-sh/serc/pull/1207)
+- Match CPython exception ownership when copied loop exits cross finalizers,
+  backedges, or guarded handlers (astral-sh/serc#1032;
+  https://github.com/astral-sh/serc/pull/1032) (astral-sh/serc#1048;
+  https://github.com/astral-sh/serc/pull/1048) (astral-sh/serc#1052;
+  https://github.com/astral-sh/serc/pull/1052)
+- Preserve control-flow and borrowing boundaries for nested `while`/`else` loops
+  and runtime loops in finalizers (astral-sh/serc#1064;
+  https://github.com/astral-sh/serc/pull/1064) (astral-sh/serc#1068;
+  https://github.com/astral-sh/serc/pull/1068) (astral-sh/serc#1069;
+  https://github.com/astral-sh/serc/pull/1069) (astral-sh/serc#1078;
+  https://github.com/astral-sh/serc/pull/1078)
+- Preserve loop and retry cleanup after recovery breaks, linear `else` suites,
+  and nested context managers (astral-sh/serc#1080;
+  https://github.com/astral-sh/serc/pull/1080) (astral-sh/serc#1085;
+  https://github.com/astral-sh/serc/pull/1085) (astral-sh/serc#1086;
+  https://github.com/astral-sh/serc/pull/1086)
+- Match CPython iterator-loop cleanup boundaries for chained comparisons, async
+  breaks, and abrupt async `else` suites (astral-sh/serc#1046;
+  https://github.com/astral-sh/serc/pull/1046) (astral-sh/serc#1049;
+  https://github.com/astral-sh/serc/pull/1049) (astral-sh/serc#1088;
+  https://github.com/astral-sh/serc/pull/1088) (astral-sh/serc#1089;
+  https://github.com/astral-sh/serc/pull/1089)
+- Preserve async-iterator exits into nested cleanup, outer-loop cleanup, and
+  assertion cleanup (astral-sh/serc#1093;
+  https://github.com/astral-sh/serc/pull/1093) (astral-sh/serc#1097;
+  https://github.com/astral-sh/serc/pull/1097) (astral-sh/serc#1120;
+  https://github.com/astral-sh/serc/pull/1120) (astral-sh/serc#1127;
+  https://github.com/astral-sh/serc/pull/1127)
+- Preserve iterator cleanup when runtime breaks, conditional loads, or guarded
+  cleanup are involved (astral-sh/serc#1144;
+  https://github.com/astral-sh/serc/pull/1144) (astral-sh/serc#1161;
+  https://github.com/astral-sh/serc/pull/1161) (astral-sh/serc#1164;
+  https://github.com/astral-sh/serc/pull/1164)
+- Preserve natural loop and iterator exits into structured, managed, nested, and
+  Boolean-guarded cleanup (astral-sh/serc#1094;
+  https://github.com/astral-sh/serc/pull/1094) (astral-sh/serc#1095;
+  https://github.com/astral-sh/serc/pull/1095) (astral-sh/serc#1096;
+  https://github.com/astral-sh/serc/pull/1096) (astral-sh/serc#1098;
+  https://github.com/astral-sh/serc/pull/1098)
+- Preserve coroutine-loop recovery entries and cold continuations around nested
+  cleanup and async `else` breaks (astral-sh/serc#1131;
+  https://github.com/astral-sh/serc/pull/1131) (astral-sh/serc#1135;
+  https://github.com/astral-sh/serc/pull/1135) (astral-sh/serc#1138;
+  https://github.com/astral-sh/serc/pull/1138) (astral-sh/serc#1139;
+  https://github.com/astral-sh/serc/pull/1139)
+- Preserve `break` paths into conditional, guarded, and awaited cleanup
+  (astral-sh/serc#1137; https://github.com/astral-sh/serc/pull/1137)
+  (astral-sh/serc#1140; https://github.com/astral-sh/serc/pull/1140)
+  (astral-sh/serc#1146; https://github.com/astral-sh/serc/pull/1146)
+  (astral-sh/serc#1147; https://github.com/astral-sh/serc/pull/1147)
+- Preserve loop and managed-recovery exits through handler cleanup, context
+  managers, and runtime finalizers (astral-sh/serc#1155;
+  https://github.com/astral-sh/serc/pull/1155) (astral-sh/serc#1187;
+  https://github.com/astral-sh/serc/pull/1187) (astral-sh/serc#1200;
+  https://github.com/astral-sh/serc/pull/1200) (astral-sh/serc#1214;
+  https://github.com/astral-sh/serc/pull/1214)
+- Match CPython ordering for folded breaks, coroutine loop-`else` breaks, direct
+  loop exits, and finalizer entry after loops (astral-sh/serc#1202;
+  https://github.com/astral-sh/serc/pull/1202) (astral-sh/serc#1203;
+  https://github.com/astral-sh/serc/pull/1203) (astral-sh/serc#1212;
+  https://github.com/astral-sh/serc/pull/1212) (astral-sh/serc#1217;
+  https://github.com/astral-sh/serc/pull/1217) (astral-sh/serc#1223;
+  https://github.com/astral-sh/serc/pull/1223)
+- Preserve exception ownership when guarded finalizers and conditional
+  context-manager cleanup are copied (astral-sh/serc#1035;
+  https://github.com/astral-sh/serc/pull/1035) (astral-sh/serc#1036;
+  https://github.com/astral-sh/serc/pull/1036) (astral-sh/serc#1050;
+  https://github.com/astral-sh/serc/pull/1050) (astral-sh/serc#1053;
+  https://github.com/astral-sh/serc/pull/1053)
+- Preserve finalizer ownership, condition slots, and empty exits around
+  terminating handlers and conditional branches (astral-sh/serc#1058;
+  https://github.com/astral-sh/serc/pull/1058) (astral-sh/serc#1062;
+  https://github.com/astral-sh/serc/pull/1062) (astral-sh/serc#1065;
+  https://github.com/astral-sh/serc/pull/1065) (astral-sh/serc#1066;
+  https://github.com/astral-sh/serc/pull/1066)
+- Match CPython exception tables after erased `try`/`else` assertions and
+  compacted `None` checks in nested context managers (astral-sh/serc#1072;
+  https://github.com/astral-sh/serc/pull/1072) (astral-sh/serc#1087;
+  https://github.com/astral-sh/serc/pull/1087)
+- Preserve recovery cleanup after conditional stores, `elif` branches, and
+  awaited branches in coroutines (astral-sh/serc#1057;
+  https://github.com/astral-sh/serc/pull/1057) (astral-sh/serc#1059;
+  https://github.com/astral-sh/serc/pull/1059) (astral-sh/serc#1063;
+  https://github.com/astral-sh/serc/pull/1063)
+- Preserve borrowed continuations after assertion recovery in functions,
+  coroutines, and context managers (astral-sh/serc#1067;
+  https://github.com/astral-sh/serc/pull/1067) (astral-sh/serc#1070;
+  https://github.com/astral-sh/serc/pull/1070) (astral-sh/serc#1073;
+  https://github.com/astral-sh/serc/pull/1073) (astral-sh/serc#1074;
+  https://github.com/astral-sh/serc/pull/1074)
+- Preserve normal cleanup after terminating, guarded, reraising, or named
+  exception recovery (astral-sh/serc#1071;
+  https://github.com/astral-sh/serc/pull/1071) (astral-sh/serc#1075;
+  https://github.com/astral-sh/serc/pull/1075) (astral-sh/serc#1076;
+  https://github.com/astral-sh/serc/pull/1076) (astral-sh/serc#1077;
+  https://github.com/astral-sh/serc/pull/1077)
+- Preserve normal-cleanup reachability after terminal protected bodies, nested
+  guards, and guarded recovery (astral-sh/serc#1081;
+  https://github.com/astral-sh/serc/pull/1081) (astral-sh/serc#1082;
+  https://github.com/astral-sh/serc/pull/1082) (astral-sh/serc#1083;
+  https://github.com/astral-sh/serc/pull/1083) (astral-sh/serc#1084;
+  https://github.com/astral-sh/serc/pull/1084)
+- Preserve nested cleanup entries after guarded raises and awaited reraises
+  (astral-sh/serc#1091; https://github.com/astral-sh/serc/pull/1091)
+  (astral-sh/serc#1092; https://github.com/astral-sh/serc/pull/1092)
+- Preserve cleanup after awaited `try`/`else` assertions, nested recovery
+  alternatives, and asserted coroutine exits (astral-sh/serc#1099;
+  https://github.com/astral-sh/serc/pull/1099) (astral-sh/serc#1100;
+  https://github.com/astral-sh/serc/pull/1100) (astral-sh/serc#1101;
+  https://github.com/astral-sh/serc/pull/1101)
+- Preserve cleanup reachability, boundaries, and ownership across abrupt
+  branches and nested loops (astral-sh/serc#1109;
+  https://github.com/astral-sh/serc/pull/1109) (astral-sh/serc#1110;
+  https://github.com/astral-sh/serc/pull/1110) (astral-sh/serc#1111;
+  https://github.com/astral-sh/serc/pull/1111) (astral-sh/serc#1113;
+  https://github.com/astral-sh/serc/pull/1113)
+- Preserve live cleanup continuations around iterator recovery, raising cleanup,
+  completed handler values, and nested recovery (astral-sh/serc#1117;
+  https://github.com/astral-sh/serc/pull/1117) (astral-sh/serc#1119;
+  https://github.com/astral-sh/serc/pull/1119) (astral-sh/serc#1121;
+  https://github.com/astral-sh/serc/pull/1121) (astral-sh/serc#1122;
+  https://github.com/astral-sh/serc/pull/1122) (astral-sh/serc#1123;
+  https://github.com/astral-sh/serc/pull/1123)
+- Preserve async-manager and coroutine cleanup entries through nested,
+  returning, and guarded recovery (astral-sh/serc#1116;
+  https://github.com/astral-sh/serc/pull/1116) (astral-sh/serc#1124;
+  https://github.com/astral-sh/serc/pull/1124) (astral-sh/serc#1125;
+  https://github.com/astral-sh/serc/pull/1125) (astral-sh/serc#1126;
+  https://github.com/astral-sh/serc/pull/1126)
+- Preserve cleanup joins after async-manager recovery and managed async retries
+  (astral-sh/serc#1130; https://github.com/astral-sh/serc/pull/1130)
+  (astral-sh/serc#1133; https://github.com/astral-sh/serc/pull/1133)
+  (astral-sh/serc#1136; https://github.com/astral-sh/serc/pull/1136)
+- Preserve coroutine cleanup around raising guards and calls followed by nested
+  `else` exits (astral-sh/serc#1141;
+  https://github.com/astral-sh/serc/pull/1141) (astral-sh/serc#1149;
+  https://github.com/astral-sh/serc/pull/1149)
+- Preserve context-manager cleanup around outer iterators, conditional call
+  arguments, and guarded async iterators (astral-sh/serc#1142;
+  https://github.com/astral-sh/serc/pull/1142) (astral-sh/serc#1143;
+  https://github.com/astral-sh/serc/pull/1143) (astral-sh/serc#1152;
+  https://github.com/astral-sh/serc/pull/1152)
+- Preserve manager cleanup after awaited or conditional stores and across
+  suspension (astral-sh/serc#1151; https://github.com/astral-sh/serc/pull/1151)
+  (astral-sh/serc#1154; https://github.com/astral-sh/serc/pull/1154)
+  (astral-sh/serc#1157; https://github.com/astral-sh/serc/pull/1157)
+  (astral-sh/serc#1168; https://github.com/astral-sh/serc/pull/1168)
+- Preserve normal cleanup entries and copied recovery exits around stored calls
+  and raises (astral-sh/serc#1145; https://github.com/astral-sh/serc/pull/1145)
+  (astral-sh/serc#1148; https://github.com/astral-sh/serc/pull/1148)
+  (astral-sh/serc#1150; https://github.com/astral-sh/serc/pull/1150)
+- Preserve conditional exits and cleanup around stored reraises, guarded
+  recovery, and nested repair paths (astral-sh/serc#1159;
+  https://github.com/astral-sh/serc/pull/1159) (astral-sh/serc#1163;
+  https://github.com/astral-sh/serc/pull/1163) (astral-sh/serc#1165;
+  https://github.com/astral-sh/serc/pull/1165)
+- Preserve coroutine success and recovery paths through awaited, nested, and
+  `else` cleanup (astral-sh/serc#1153;
+  https://github.com/astral-sh/serc/pull/1153) (astral-sh/serc#1156;
+  https://github.com/astral-sh/serc/pull/1156) (astral-sh/serc#1158;
+  https://github.com/astral-sh/serc/pull/1158) (astral-sh/serc#1160;
+  https://github.com/astral-sh/serc/pull/1160) (astral-sh/serc#1166;
+  https://github.com/astral-sh/serc/pull/1166)
+- Preserve cleanup ownership after tuple unpacking, deletion, and comprehension
+  work (astral-sh/serc#1115; https://github.com/astral-sh/serc/pull/1115)
+  (astral-sh/serc#1128; https://github.com/astral-sh/serc/pull/1128)
+  (astral-sh/serc#1132; https://github.com/astral-sh/serc/pull/1132)
+  (astral-sh/serc#1134; https://github.com/astral-sh/serc/pull/1134)
+  (astral-sh/serc#1167; https://github.com/astral-sh/serc/pull/1167)
+- Preserve guarded and nested recovery continuations through completed work and
+  finalizers (astral-sh/serc#1185; https://github.com/astral-sh/serc/pull/1185)
+  (astral-sh/serc#1206; https://github.com/astral-sh/serc/pull/1206)
+  (astral-sh/serc#1208; https://github.com/astral-sh/serc/pull/1208)
+  (astral-sh/serc#1210; https://github.com/astral-sh/serc/pull/1210)
+- Preserve copied and coroutine recovery entries into normal and nested
+  finalizers (astral-sh/serc#1211; https://github.com/astral-sh/serc/pull/1211)
+  (astral-sh/serc#1215; https://github.com/astral-sh/serc/pull/1215)
+  (astral-sh/serc#1216; https://github.com/astral-sh/serc/pull/1216)
+  (astral-sh/serc#1218; https://github.com/astral-sh/serc/pull/1218)
+- Preserve finalizer entries after completed work, context-manager cleanup, and
+  raising recovery (astral-sh/serc#1221;
+  https://github.com/astral-sh/serc/pull/1221) (astral-sh/serc#1222;
+  https://github.com/astral-sh/serc/pull/1222) (astral-sh/serc#1224;
+  https://github.com/astral-sh/serc/pull/1224)
+- Preserve cleanup joins and continuations across erased branches, awaited
+  finalizers, and guarded coroutine recovery (astral-sh/serc#1193;
+  https://github.com/astral-sh/serc/pull/1193) (astral-sh/serc#1196;
+  https://github.com/astral-sh/serc/pull/1196) (astral-sh/serc#1209;
+  https://github.com/astral-sh/serc/pull/1209) (astral-sh/serc#1213;
+  https://github.com/astral-sh/serc/pull/1213)
+- Preserve enclosing exception owners when returns copy nested finalizers
+  (astral-sh/serc#1029; https://github.com/astral-sh/serc/pull/1029)
+  (astral-sh/serc#1051; https://github.com/astral-sh/serc/pull/1051)
+  (astral-sh/serc#1177; https://github.com/astral-sh/serc/pull/1177)
+  (astral-sh/serc#1181; https://github.com/astral-sh/serc/pull/1181)
+  (astral-sh/serc#1191; https://github.com/astral-sh/serc/pull/1191)
+- Preserve cleanup ownership when handler returns unwind nested finalizers and
+  context managers (astral-sh/serc#1061;
+  https://github.com/astral-sh/serc/pull/1061) (astral-sh/serc#1178;
+  https://github.com/astral-sh/serc/pull/1178) (astral-sh/serc#1225;
+  https://github.com/astral-sh/serc/pull/1225) (astral-sh/serc#1226;
+  https://github.com/astral-sh/serc/pull/1226)
+- End inner `try` regions at the CPython-compatible point before iterator and
+  context-manager cleanup (astral-sh/serc#1060;
+  https://github.com/astral-sh/serc/pull/1060) (astral-sh/serc#1175;
+  https://github.com/astral-sh/serc/pull/1175) (astral-sh/serc#1180;
+  https://github.com/astral-sh/serc/pull/1180)
+- Preserve iterator ownership and cleanup ordering through returns and
+  named-handler cleanup (astral-sh/serc#1182;
+  https://github.com/astral-sh/serc/pull/1182) (astral-sh/serc#1183;
+  https://github.com/astral-sh/serc/pull/1183) (astral-sh/serc#1190;
+  https://github.com/astral-sh/serc/pull/1190)
+- Preserve shared subscript, conditional, and tuple return paths through cleanup
+  (astral-sh/serc#1033; https://github.com/astral-sh/serc/pull/1033)
+  (astral-sh/serc#1034; https://github.com/astral-sh/serc/pull/1034)
+  (astral-sh/serc#1039; https://github.com/astral-sh/serc/pull/1039)
+- Preserve return-copy paths after managed comprehensions and copied finalizers
+  (astral-sh/serc#1179; https://github.com/astral-sh/serc/pull/1179)
+  (astral-sh/serc#1186; https://github.com/astral-sh/serc/pull/1186)
+  (astral-sh/serc#1195; https://github.com/astral-sh/serc/pull/1195)
+  (astral-sh/serc#1197; https://github.com/astral-sh/serc/pull/1197)
+- Preserve local-load borrowing boundaries when returns cross handler,
+  finalizer, or branching call cleanup (astral-sh/serc#1030;
+  https://github.com/astral-sh/serc/pull/1030) (astral-sh/serc#1037;
+  https://github.com/astral-sh/serc/pull/1037) (astral-sh/serc#1045;
+  https://github.com/astral-sh/serc/pull/1045) (astral-sh/serc#1090;
+  https://github.com/astral-sh/serc/pull/1090)
+- Match CPython constant folding and local-load fusion after copied exits and
+  exception handlers (astral-sh/serc#1171;
+  https://github.com/astral-sh/serc/pull/1171) (astral-sh/serc#1174;
+  https://github.com/astral-sh/serc/pull/1174) (astral-sh/serc#1176;
+  https://github.com/astral-sh/serc/pull/1176) (astral-sh/serc#1184;
+  https://github.com/astral-sh/serc/pull/1184)
+- Match CPython cleanup rotations and boundaries for sequence and mapping
+  patterns (astral-sh/serc#1172; https://github.com/astral-sh/serc/pull/1172)
+  (astral-sh/serc#1173; https://github.com/astral-sh/serc/pull/1173)
+  (astral-sh/serc#1192; https://github.com/astral-sh/serc/pull/1192)
+- Preserve module cell ordering when optimization removes assertions
+  (astral-sh/serc#1169; https://github.com/astral-sh/serc/pull/1169)
+- Preserve interrupt and monitoring checks through async-match exhaustion and
+  handler cleanup (astral-sh/serc#1170;
+  https://github.com/astral-sh/serc/pull/1170) (astral-sh/serc#1194;
+  https://github.com/astral-sh/serc/pull/1194) (astral-sh/serc#1232;
+  https://github.com/astral-sh/serc/pull/1232)
+- Match CPython bytecode for terminal conditional name stores
+  (astral-sh/serc#1201; https://github.com/astral-sh/serc/pull/1201)
+- Preserve return source locations after removed assertions and completed
+  prefixes (astral-sh/serc#1103; https://github.com/astral-sh/serc/pull/1103)
+  (astral-sh/serc#1228; https://github.com/astral-sh/serc/pull/1228)
+  (astral-sh/serc#1229; https://github.com/astral-sh/serc/pull/1229)
+  (astral-sh/serc#1230; https://github.com/astral-sh/serc/pull/1230)
+- Preserve return source locations after managed branches, erased coroutine
+  assertions, and async cleanup (astral-sh/serc#1238;
+  https://github.com/astral-sh/serc/pull/1238) (astral-sh/serc#1239;
+  https://github.com/astral-sh/serc/pull/1239) (astral-sh/serc#1240;
+  https://github.com/astral-sh/serc/pull/1240)
+- Preserve authored break lines, unlocated manager joins, and line markers
+  through nested finalizers (astral-sh/serc#1079;
+  https://github.com/astral-sh/serc/pull/1079) (astral-sh/serc#1105;
+  https://github.com/astral-sh/serc/pull/1105) (astral-sh/serc#1129;
+  https://github.com/astral-sh/serc/pull/1129)
+- Preserve original guard, exit, scope-footer, and copied-match source locations
+  (astral-sh/serc#1219; https://github.com/astral-sh/serc/pull/1219)
+  (astral-sh/serc#1227; https://github.com/astral-sh/serc/pull/1227)
+  (astral-sh/serc#1233; https://github.com/astral-sh/serc/pull/1233)
+  (astral-sh/serc#1237; https://github.com/astral-sh/serc/pull/1237)
+- Avoid a debug-build assertion failure when legacy return blocks receive a late
+  leading source location (astral-sh/serc#1056;
+  https://github.com/astral-sh/serc/pull/1056)
+
+### Other changes
+
+- Focus the compatibility documentation on selecting and reproducing supported
+  reference builds (astral-sh/serc#1244;
+  https://github.com/astral-sh/serc/pull/1244)
+
 ## 0.1.2
 
 Released on 2026-10-05.
