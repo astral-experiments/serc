@@ -20,6 +20,37 @@ use crate::target::{is_conditional_jump, is_unconditional_jump};
 #[cfg(test)]
 mod copied_backedge_tests;
 
+/// Locates unique `NOT_TAKEN` markers using their complete original item prefixes.
+fn original_not_taken_marker_positions(
+    graph: &BlockGraph,
+    prefixes: &[Vec<Item>],
+) -> Vec<(usize, usize)> {
+    if prefixes.is_empty() {
+        return Vec::new();
+    }
+    let original_items = graph.copy_items();
+    prefixes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, prefix)| {
+            if !matches!(prefix.last(), Some(Item::Instruction(marker))
+                if marker.opcode == NOT_TAKEN)
+            {
+                return None;
+            }
+            let mut matches = original_items
+                .windows(prefix.len())
+                .enumerate()
+                .filter(|(_, items)| *items == prefix.as_slice());
+            let (start, _) = matches.next()?;
+            matches
+                .next()
+                .is_none()
+                .then_some((index, start + prefix.len() - 1))
+        })
+        .collect()
+}
+
 /// Finds a protected return owner while retaining equal ambient scope fallbacks.
 fn original_protected_return_owner(
     regions: &[ExceptionRegion],
@@ -4921,55 +4952,18 @@ impl OptimizationPipeline {
         // Bind each captured marker to its complete original prefix before the
         // copier labels implicit block entries. Transport only that new label;
         // final owner replay still requires every item to match literally.
-        let conjunction_markers = if self
-            .exception_owner_provenance
-            .copied_conjunction_break_prefixes
-            .is_empty()
-        {
-            Vec::new()
-        } else {
-            let original_items = graph.copy_items();
-            self.exception_owner_provenance
-                .copied_conjunction_break_prefixes
-                .iter()
-                .enumerate()
-                .filter_map(|(index, prefix)| {
-                    if !matches!(prefix.last(), Some(Item::Instruction(marker))
-                        if marker.opcode == NOT_TAKEN)
-                    {
-                        return None;
-                    }
-                    let mut matches = original_items
-                        .windows(prefix.len())
-                        .enumerate()
-                        .filter(|(_, items)| *items == prefix.as_slice());
-                    let (start, _) = matches.next()?;
-                    matches
-                        .next()
-                        .is_none()
-                        .then_some((index, start + prefix.len() - 1))
-                })
-                .collect::<Vec<_>>()
-        };
-        let shared_break_markers = if self
-            .exception_owner_provenance
-            .copied_shared_break_truth_prefixes
-            .is_empty()
-        {
-            Vec::new()
-        } else {
-            let original_items = graph.copy_items();
-            self.exception_owner_provenance.copied_shared_break_truth_prefixes.iter().enumerate()
-                .filter_map(|(index, prefix)| {
-                    if !matches!(prefix.last(), Some(Item::Instruction(marker)) if marker.opcode == NOT_TAKEN) {
-                        return None;
-                    }
-                    let mut matches = original_items.windows(prefix.len()).enumerate()
-                        .filter(|(_, items)| *items == prefix.as_slice());
-                    let (start, _) = matches.next()?;
-                    matches.next().is_none().then_some((index, start + prefix.len() - 1))
-                }).collect::<Vec<_>>()
-        };
+        let conjunction_markers = original_not_taken_marker_positions(
+            graph,
+            &self
+                .exception_owner_provenance
+                .copied_conjunction_break_prefixes,
+        );
+        let shared_break_markers = original_not_taken_marker_positions(
+            graph,
+            &self
+                .exception_owner_provenance
+                .copied_shared_break_truth_prefixes,
+        );
         let mut original_position = 0;
         for block in order.iter().copied() {
             let original_len = graph[block].items().len();
