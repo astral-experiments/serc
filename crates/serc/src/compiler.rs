@@ -1,6 +1,7 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
+use ruff_python_ast::visitor::Visitor;
 use ruff_python_ast::{Comprehension, Expr};
 use ruff_text_size::TextSize;
 use rustc_hash::FxHashMap;
@@ -149,5 +150,25 @@ fn comprehension_parts(expression: &Expr) -> Option<(&[Comprehension], Option<&E
             &comprehension.value,
         )),
         _ => None,
+    }
+}
+
+/// Annotation-only subscript targets evaluate slice bounds without constructing a slice.
+fn walk_annotation_subscript<'ast>(visitor: &mut impl Visitor<'ast>, expression: &'ast Expr) {
+    match expression {
+        Expr::Slice(slice) => {
+            for bound in [&slice.lower, &slice.upper, &slice.step]
+                .into_iter()
+                .flatten()
+            {
+                visitor.visit_expr(bound);
+            }
+        }
+        Expr::Tuple(tuple) => {
+            for element in &tuple.elts {
+                walk_annotation_subscript(visitor, element);
+            }
+        }
+        _ => visitor.visit_expr(expression),
     }
 }

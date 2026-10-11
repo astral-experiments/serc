@@ -3864,26 +3864,6 @@ fn first_constant(
             self.frames.push(frame);
         }
 
-        fn visit_annotation_subscript(&mut self, expression: &'ast Expr) {
-            match expression {
-                Expr::Slice(slice) => {
-                    // Annotation-only targets evaluate explicit bounds without building a slice.
-                    for bound in [&slice.lower, &slice.upper, &slice.step]
-                        .into_iter()
-                        .flatten()
-                    {
-                        self.visit_expr(bound);
-                    }
-                }
-                Expr::Tuple(tuple) => {
-                    for element in &tuple.elts {
-                        self.visit_annotation_subscript(element);
-                    }
-                }
-                _ => self.visit_expr(expression),
-            }
-        }
-
         /// Older code generation builds an entire constant display before visiting its items.
         fn legacy_collection_constant(
             &self,
@@ -4180,7 +4160,7 @@ fn first_constant(
                         match assignment.target.as_ref() {
                             Expr::Subscript(subscript) => {
                                 self.visit_expr(&subscript.value);
-                                self.visit_annotation_subscript(&subscript.slice);
+                                super::walk_annotation_subscript(self, &subscript.slice);
                             }
                             Expr::Attribute(attribute) => self.visit_expr(&attribute.value),
                             _ => {}
