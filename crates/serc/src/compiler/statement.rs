@@ -5465,7 +5465,7 @@ impl<'source> Compiler<'source> {
             return Some(self.source_location(condition_fallthrough_range(test)));
         }
         match self
-            .elided_linear_branch_tail(body, true)
+            .elided_branch_fallthrough_tail(body, true)
             .or_else(|| self.elided_fallthrough_if_tail(body))
             .or_else(|| self.elided_returning_while_tail(body))?
         {
@@ -5629,8 +5629,8 @@ impl<'source> Compiler<'source> {
         Some(&body[end])
     }
 
-    /// Finds a linear conditional or loop exit hidden by removed branch-tail assertions.
-    fn elided_linear_branch_tail<'a>(
+    /// Finds a conditional or loop exit hidden by removed branch-tail assertions.
+    fn elided_branch_fallthrough_tail<'a>(
         &self,
         body: &'a [Stmt],
         allow_terminating_else: bool,
@@ -5668,16 +5668,25 @@ impl<'source> Compiler<'source> {
                 _ => false,
             }
         };
+        let branch_fallthrough = |body: &[Stmt]| {
+            (suite_has_linear_borrow_fallthrough(body) && !suite_contains_yield(body))
+                || matches!(body, [Stmt::With(manager)]
+                    if !manager.is_async
+                        && manager.items.len() == 1
+                        && manager.items[0].optional_vars.is_none()
+                        && !expression_contains_inline_branch(&manager.items[0].context_expr)
+                        && !expression_suspends_current_scope(&manager.items[0].context_expr)
+                        && suite_has_linear_borrow_fallthrough(&manager.body)
+                        && !suite_contains_yield(&manager.body))
+        };
         match &body[end] {
             Stmt::If(statement)
                 if condition_has_linear_runtime_leaves(&statement.test)
                     && !expression_suspends_current_scope(&statement.test)
-                    && suite_has_linear_borrow_fallthrough(&statement.body)
-                    && !suite_contains_yield(&statement.body)
+                    && branch_fallthrough(&statement.body)
                     && matches!(statement.elif_else_clauses.as_slice(), [clause]
                         if clause.test.is_none()
-                            && ((suite_has_linear_borrow_fallthrough(&clause.body)
-                                && !suite_contains_yield(&clause.body))
+                            && (branch_fallthrough(&clause.body)
                                 || (allow_terminating_else
                                     && !self.control.statements.in_match
                                     && direct_exit(&clause.body)))) =>
@@ -16732,7 +16741,7 @@ impl<'source> Compiler<'source> {
                     } else if let Some(Stmt::If(nested)) = body
                         .last()
                         .filter(|statement| matches!(statement, Stmt::If(_)))
-                        .or_else(|| self.elided_linear_branch_tail(body, false))
+                        .or_else(|| self.elided_branch_fallthrough_tail(body, false))
                     {
                         // CPython emits this jump in the nested if's empty join block. When
                         // small-exit inlining replaces it with a NOP, no preceding instruction
