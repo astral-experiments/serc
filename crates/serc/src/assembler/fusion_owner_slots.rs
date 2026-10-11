@@ -57,10 +57,11 @@ fn key(condition: Instruction, marker: Instruction) -> Option<Key> {
     ))
 }
 
-/// Indexes normally consecutive compiler labels without hashing every owner lookup.
+/// Indexes positions and boundary membership for normally consecutive compiler labels.
 struct LabelPositions {
     dense: Vec<LabelPositionSlot>,
     sparse: FxHashMap<Label, (usize, usize)>,
+    sparse_boundaries: FxHashSet<Label>,
     dense_limit: usize,
     generation: u32,
 }
@@ -69,6 +70,7 @@ struct LabelPositions {
 struct LabelPositionSlot {
     position: (usize, usize),
     generation: u32,
+    boundary_generation: u32,
 }
 
 impl Default for LabelPositions {
@@ -76,6 +78,7 @@ impl Default for LabelPositions {
         Self {
             dense: Vec::new(),
             sparse: FxHashMap::default(),
+            sparse_boundaries: FxHashSet::default(),
             dense_limit: 0,
             generation: 1,
         }
@@ -91,6 +94,7 @@ impl LabelPositions {
 
     fn clear(&mut self) {
         self.sparse.clear();
+        self.sparse_boundaries.clear();
         self.generation = self.generation.wrapping_add(1);
         if self.generation == 0 {
             self.dense.fill(LabelPositionSlot::default());
@@ -109,11 +113,33 @@ impl LabelPositions {
         }
         let slot = &mut self.dense[index];
         let previous = (slot.generation == self.generation).then_some(slot.position);
-        *slot = LabelPositionSlot {
-            position,
-            generation: self.generation,
-        };
+        slot.position = position;
+        slot.generation = self.generation;
         previous
+    }
+
+    #[inline]
+    fn insert_boundary(&mut self, label: Label) {
+        let index = label.index();
+        if index >= self.dense_limit {
+            self.sparse_boundaries.insert(label);
+            return;
+        }
+        if index >= self.dense.len() {
+            self.dense.resize(index + 1, LabelPositionSlot::default());
+        }
+        self.dense[index].boundary_generation = self.generation;
+    }
+
+    #[inline]
+    fn is_boundary(&self, label: Label) -> bool {
+        let index = label.index();
+        if index >= self.dense_limit {
+            return self.sparse_boundaries.contains(&label);
+        }
+        self.dense
+            .get(index)
+            .is_some_and(|slot| slot.boundary_generation == self.generation)
     }
 
     #[inline]
@@ -131,7 +157,6 @@ impl LabelPositions {
 #[derive(Default)]
 struct ViewTables {
     labels: LabelPositions,
-    boundaries: FxHashSet<Label>,
     markers: FxHashMap<Key, SmallVec<[(usize, usize); 1]>>,
     label_item_indices: Vec<usize>,
 }
@@ -139,7 +164,6 @@ struct ViewTables {
 impl ViewTables {
     fn clear(&mut self) {
         self.labels.clear();
-        self.boundaries.clear();
         self.markers.clear();
         self.label_item_indices.clear();
     }
@@ -156,7 +180,6 @@ struct View<'a> {
     regions: &'a [ExceptionRegion],
     provenance: &'a ExceptionOwnerProvenance,
     labels: LabelPositions,
-    boundaries: FxHashSet<Label>,
     supplementary_references: OnceCell<FxHashSet<Label>>,
     markers: FxHashMap<Key, SmallVec<[(usize, usize); 1]>>,
     label_item_indices: Vec<usize>,
@@ -180,17 +203,16 @@ impl<'a> View<'a> {
     ) -> Option<Self> {
         let ViewTables {
             mut labels,
-            mut boundaries,
             mut markers,
             mut label_item_indices,
         } = tables;
         labels.prepare(items.len());
-        boundaries.clear();
         markers.clear();
         label_item_indices.clear();
         label_item_indices.reserve(items.len().div_ceil(4));
-        boundaries.extend(&provenance.block_boundaries);
-        boundaries.extend(preserved);
+        for &label in provenance.block_boundaries.iter().chain(preserved) {
+            labels.insert_boundary(label);
+        }
         let mut previous = None;
         let mut n = 0;
         for (i, item) in items.iter().enumerate() {
@@ -203,7 +225,7 @@ impl<'a> View<'a> {
                 }
                 Item::Instruction(ins) => {
                     if let Some(l) = ins.jump_target() {
-                        boundaries.insert(l);
+                        labels.insert_boundary(l);
                     }
                     if ins.opcode == NOT_TAKEN
                         && let Some(p) = previous
@@ -218,14 +240,13 @@ impl<'a> View<'a> {
             }
         }
         for region in regions {
-            boundaries.insert(region.target);
+            labels.insert_boundary(region.target);
         }
         Some(Self {
             items,
             regions,
             provenance,
             labels,
-            boundaries,
             supplementary_references: OnceCell::new(),
             markers,
             label_item_indices,
@@ -267,7 +288,7 @@ impl<'a> View<'a> {
     }
 
     fn is_reference(&self, label: Label) -> bool {
-        self.boundaries.contains(&label)
+        self.labels.is_boundary(label)
             || self
                 .supplementary_references
                 .get_or_init(|| self.collect_supplementary_references())
@@ -277,7 +298,6 @@ impl<'a> View<'a> {
     fn into_tables(self) -> ViewTables {
         ViewTables {
             labels: self.labels,
-            boundaries: self.boundaries,
             markers: self.markers,
             label_item_indices: self.label_item_indices,
         }
@@ -455,11 +475,11 @@ impl Certificate {
     fn same_boundaries(&self, view: &View<'_>) -> bool {
         self.boundaries
             .iter()
-            .all(|label| self.labels.contains(label) && view.boundaries.contains(label))
+            .all(|label| self.labels.contains(label) && view.labels.is_boundary(*label))
             && self
                 .labels
                 .iter()
-                .filter(|label| view.boundaries.contains(*label))
+                .filter(|label| view.labels.is_boundary(**label))
                 .count()
                 == self.boundaries.len()
     }
@@ -497,11 +517,11 @@ fn labels_in(items: &[Item]) -> FxHashSet<Label> {
 }
 
 /// Intersects an interval's labels with the view's boundaries without scanning the whole view.
-fn boundaries_in(items: &[Item], boundaries: &FxHashSet<Label>) -> FxHashSet<Label> {
+fn boundaries_in(items: &[Item], labels: &LabelPositions) -> FxHashSet<Label> {
     items
         .iter()
         .filter_map(|item| match item {
-            Item::Label(label) if boundaries.contains(label) => Some(*label),
+            Item::Label(label) if labels.is_boundary(*label) => Some(*label),
             Item::Label(_) | Item::Instruction(_) => None,
         })
         .collect()
@@ -638,7 +658,7 @@ impl FreshSingletonCertificate {
             return None;
         }
         let items = view.items[start..=marker].to_vec();
-        let boundaries = boundaries_in(&items, &view.boundaries);
+        let boundaries = boundaries_in(&items, &view.labels);
         let result = Self {
             interval: Certificate {
                 anchor,
@@ -769,7 +789,7 @@ impl FallbackCertificate {
             return None;
         }
         let items = after.items[after_start..=after_marker].to_vec();
-        let boundaries = boundaries_in(&items, &after.boundaries);
+        let boundaries = boundaries_in(&items, &after.labels);
         let result = Self {
             interval: Certificate {
                 anchor: Anchor::Label(anchor),
@@ -832,7 +852,7 @@ impl FallbackCertificate {
             before.uniform_fallback_interval(start, condition_index, false)?
         };
         let items = before.items[start..=marker_index].to_vec();
-        let boundaries = boundaries_in(&items, &before.boundaries);
+        let boundaries = boundaries_in(&items, &before.labels);
         let result = Self {
             interval: Certificate {
                 anchor,
@@ -993,7 +1013,7 @@ impl View<'_> {
             || !self.provenance.source_boundaries.contains(&anchor)
             || self.items[start + 1..=marker].iter().any(|item| {
                 matches!(item,
-                Item::Label(label) if self.boundaries.contains(label)
+                Item::Label(label) if self.labels.is_boundary(*label)
                     || self.provenance.source_boundaries.contains(label))
             })
             || !self.no_late_insertions_or_setups(start, marker)
@@ -1023,7 +1043,7 @@ impl View<'_> {
             || !self.provenance.source_boundaries.contains(&anchor)
             || self.items[start + 1..=marker].iter().any(|item| {
                 matches!(item,
-                Item::Label(label) if self.boundaries.contains(label)
+                Item::Label(label) if self.labels.is_boundary(*label)
                     || self.provenance.source_boundaries.contains(label))
             })
             || marker_instruction.pre_fold_extra_instructions() != 0
@@ -1153,7 +1173,7 @@ impl View<'_> {
         for (offset, item) in self.items[start..=condition].iter().enumerate() {
             let instruction = match item {
                 Item::Label(label) => {
-                    if offset != 0 && self.boundaries.contains(label) {
+                    if offset != 0 && self.labels.is_boundary(*label) {
                         return None;
                     }
                     continue;
@@ -1249,7 +1269,7 @@ impl View<'_> {
         for (offset, item) in self.items[start..=condition].iter().copied().enumerate() {
             let instruction = match item {
                 Item::Label(label) => {
-                    if offset != 0 && self.boundaries.contains(&label) {
+                    if offset != 0 && self.labels.is_boundary(label) {
                         return None;
                     }
                     continue;
@@ -1413,7 +1433,7 @@ impl ManagerSetupCertificate {
                     cells.push(Some(index));
                 }
                 Item::Label(label) => {
-                    if after.boundaries.contains(label) {
+                    if after.labels.is_boundary(*label) {
                         return None;
                     }
                     if let Some((_, location)) = after
@@ -1509,7 +1529,7 @@ impl ManagerSetupCertificate {
                 items: after.items[..=after_marker].to_vec(),
                 labels: labels_in(&after.items[..=after_marker]),
                 owner: None,
-                boundaries: boundaries_in(&after.items[..=after_marker], &after.boundaries),
+                boundaries: boundaries_in(&after.items[..=after_marker], &after.labels),
                 setups: after.provenance.setups.clone(),
             },
             source,
@@ -1617,7 +1637,7 @@ impl HandlerDispatchCertificate {
             items: origin.items.clone(),
             labels: labels_in(&origin.items),
             owner: Some((region.target, region.depth, region.preserve_lasti)),
-            boundaries: boundaries_in(&origin.items, &view.boundaries),
+            boundaries: boundaries_in(&origin.items, &view.labels),
             setups: view.provenance.setups.clone(),
         };
         let mut result = Self {
@@ -2031,7 +2051,7 @@ impl FusionOwnerCertificates {
         for (index, item) in items.iter().copied().enumerate() {
             match item {
                 Item::Label(label) => {
-                    if view.boundaries.contains(&label) {
+                    if view.labels.is_boundary(label) {
                         if has_instruction {
                             start = index;
                             has_instruction = false;
@@ -2271,7 +2291,7 @@ impl FusionOwnerCertificates {
         for (index, item) in before.iter().copied().enumerate() {
             match item {
                 Item::Label(l) => {
-                    if has_instruction && b.boundaries.contains(&l) {
+                    if has_instruction && b.labels.is_boundary(l) {
                         start = index;
                         has_instruction = false;
                     }
@@ -2328,8 +2348,7 @@ impl FusionOwnerCertificates {
                                         {
                                             cert.items = after[s..=m].to_vec();
                                             cert.labels = labels_in(&cert.items);
-                                            cert.boundaries =
-                                                boundaries_in(&cert.items, &a.boundaries);
+                                            cert.boundaries = boundaries_in(&cert.items, &a.labels);
                                             result.certificates.push(cert);
                                         }
                                     }
@@ -2767,13 +2786,15 @@ mod tests {
 
     #[test]
     fn interval_boundaries_match_whole_view_membership() {
-        let boundaries = [
+        let mut boundaries = LabelPositions::default();
+        boundaries.prepare(5);
+        for label in [
             Label::from_u32(1),
             Label::from_u32(3),
             Label::from_u32(u32::MAX - 1),
-        ]
-        .into_iter()
-        .collect();
+        ] {
+            boundaries.insert_boundary(label);
+        }
         let items = [
             Item::Label(Label::from_u32(4)),
             Item::Label(Label::from_u32(3)),
@@ -2791,7 +2812,7 @@ mod tests {
                 .collect()
         );
         assert!(boundaries_in(&items[..1], &boundaries).is_empty());
-        assert!(boundaries_in(&items, &FxHashSet::default()).is_empty());
+        assert!(boundaries_in(&items, &LabelPositions::default()).is_empty());
     }
 
     #[test]
@@ -2947,18 +2968,48 @@ mod tests {
         labels.prepare(3);
         assert_eq!(labels.insert(Label::from_u32(1), (1, 1)), None);
         assert_eq!(labels.insert(Label::from_u32(u32::MAX - 1), (9, 9)), None);
+        for label in [1, 2, u32::MAX - 1] {
+            labels.insert_boundary(Label::from_u32(label));
+        }
         // Simulate a record left from the generation to which a wrap returns.
         labels.dense[1].generation = 1;
+        labels.dense[1].boundary_generation = 1;
         labels.generation = u32::MAX;
         assert_eq!(labels.insert(Label::from_u32(2), (2, 2)), None);
+        labels.insert_boundary(Label::from_u32(2));
         labels.clear();
         assert_eq!(labels.generation, 1);
         assert_eq!(labels.get(Label::from_u32(1)), None);
         assert_eq!(labels.get(Label::from_u32(2)), None);
         assert_eq!(labels.get(Label::from_u32(u32::MAX - 1)), None);
+        for label in [1, 2, u32::MAX - 1] {
+            assert!(!labels.is_boundary(Label::from_u32(label)));
+        }
         assert_eq!(labels.insert(Label::from_u32(1), (3, 3)), None);
         assert_eq!(labels.get(Label::from_u32(1)), Some(&(3, 3)));
         assert_eq!(labels.insert(Label::from_u32(1), (4, 4)), Some((3, 3)));
+    }
+    #[test]
+    fn boundary_membership_is_independent_of_label_positions() {
+        let mut labels = LabelPositions::default();
+        for item_count in [3, 100, 3] {
+            labels.prepare(item_count);
+            for value in [0, 5, 90, u32::MAX - 1] {
+                let label = Label::from_u32(value);
+                assert!(!labels.is_boundary(label));
+                labels.insert_boundary(label);
+                assert!(labels.is_boundary(label));
+                assert_eq!(labels.get(label), None);
+                assert_eq!(labels.insert(label, (1, 2)), None);
+                assert!(labels.is_boundary(label));
+                labels.insert_boundary(label);
+                assert_eq!(labels.get(label), Some(&(1, 2)));
+                assert_eq!(labels.insert(label, (3, 4)), Some((1, 2)));
+                assert!(labels.is_boundary(label));
+            }
+            assert!(labels.dense.len() <= 91);
+            assert!(!labels.is_boundary(Label::from_u32(4)));
+        }
     }
     #[test]
     fn references_include_control_flow_and_supplementary_provenance() {
@@ -2977,6 +3028,16 @@ mod tests {
     }
     #[test]
     fn reused_view_tables_rebuild_all_boundary_memberships() {
+        let boundaries = |view: &View<'_>| {
+            view.labels
+                .dense
+                .iter()
+                .enumerate()
+                .filter(|(_, slot)| slot.boundary_generation == view.labels.generation)
+                .map(|(index, _)| Label::from_u32(u32::try_from(index).unwrap()))
+                .chain(view.labels.sparse_boundaries.iter().copied())
+                .collect::<FxHashSet<_>>()
+        };
         let sparse = Label::from_u32(u32::MAX - 1);
         let new_sparse = Label::from_u32(u32::MAX - 2);
         let make_regions = |target| {
@@ -3016,7 +3077,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            first.boundaries,
+            boundaries(&first),
             FxHashSet::from_iter([
                 Label::from_u32(1),
                 Label::from_u32(2),
@@ -3044,7 +3105,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            next.boundaries,
+            boundaries(&next),
             FxHashSet::from_iter([
                 Label::from_u32(11),
                 Label::from_u32(12),
@@ -3063,7 +3124,7 @@ mod tests {
         let empty_preserved = FxHashSet::default();
         let empty =
             View::with_tables(&[], &[], &empty_provenance, &empty_preserved, tables).unwrap();
-        assert!(empty.boundaries.is_empty());
+        assert!(boundaries(&empty).is_empty());
         assert!(!empty.is_reference(new_sparse));
 
         for duplicate in [Label::from_u32(1), sparse] {
@@ -4530,7 +4591,7 @@ mod tests {
                     &pipeline.preserved_block_boundaries,
                 )
                 .unwrap();
-                assert!(view.boundaries.contains(&Label::from_u32(0)));
+                assert!(view.labels.is_boundary(Label::from_u32(0)));
                 let (condition, marker) = *view.markers.values().next().unwrap().first().unwrap();
                 let Item::Instruction(condition_instruction) = items[condition] else {
                     unreachable!();
