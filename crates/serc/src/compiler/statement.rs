@@ -45226,8 +45226,8 @@ fn suite_has_linear_raise_exit(body: &[Stmt]) -> bool {
     })
 }
 
-// A complete finally if/else owns its join when each normal arm ends in located work.
-// A leading runtime raising guard adds an exceptional exit without changing that donor.
+// A complete finally if/else owns its join after located work or a runtime guard.
+// A leading raising guard adds an exceptional exit without changing that donor.
 fn suite_has_located_finally_arm(body: &[Stmt]) -> bool {
     suite_has_linear_borrow_fallthrough(body)
         || body.split_last().is_some_and(|(last, prefix)| {
@@ -45239,6 +45239,16 @@ fn suite_has_located_finally_arm(body: &[Stmt]) -> bool {
                 && condition_has_only_runtime_tests(&guard.test)
                 && suite_has_linear_raise_exit(&guard.body)
                 && suite_has_linear_borrow_fallthrough(rest))
+        || matches!(body, [Stmt::If(guard)]
+        if condition_has_only_runtime_tests(&guard.test)
+            && !expression_suspends_current_scope(&guard.test)
+            && suite_has_linear_borrow_fallthrough(&guard.body)
+            && guard.elif_else_clauses.iter().all(|clause| {
+                clause.test.as_ref().is_none_or(|test| {
+                    condition_has_only_runtime_tests(test)
+                        && !expression_suspends_current_scope(test)
+                }) && suite_has_linear_borrow_fallthrough(&clause.body)
+            }))
 }
 
 /// Searches statements in the current scope, excluding nested function and class bodies.
