@@ -9095,6 +9095,20 @@ impl LayoutAssembler {
                         && owner_history_exact
                         && tail.late_removals == 0
                         && let Some((start, end, start_tail, end_tail)) = ended_owned_prefix
+                            .or_else(|| {
+                                // A retained SETUP and its erased POP also bound an exact
+                                // prefix after an earlier NOP ended the broader owner epoch.
+                                let (start, start_tail, _) = protected_suffix?;
+                                let (end, end_tail, _) = ended_pop_slot?;
+                                (pop_slot_epoch_known
+                                    && original_array_start <= start
+                                    && start < end
+                                    && ended_owned_suffix == Some(end)
+                                    && tail.insertions == 0
+                                    && tail.post_compaction_fusions == 0
+                                    && start_tail.early_removals == end_tail.early_removals)
+                                    .then_some((start, end, start_tail, end_tail))
+                            })
                         && (tail.insertions == 0
                             || (start_tail.insertions == tail.insertions
                                 && (tail.post_compaction_fusions <= tail.insertions
