@@ -12397,6 +12397,21 @@ fn elided_protected_elif_preserves_loop_condition_owner() {
 }
 
 #[test]
+fn erased_manager_branches_preserve_return_locations() {
+    for (body, otherwise) in [
+        ("with manager():\n                consume()", "consume()"),
+        ("consume()", "with manager():\n                consume()"),
+    ] {
+        for suffix in ["assert flag", "assert [item for item in items]"] {
+            let source = format!(
+                "def sample(first, second, flag, items):\n    if first:\n        if second:\n            {body}\n        else:\n            {otherwise}\n        {suffix}\n"
+            );
+            assert_matches_cpython(&source, "erased_manager_branch.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn with_conditional_exit_before_removed_assertion() {
     for (index, body) in [
         "if flag:\n    return 1\nassert flag\n",
