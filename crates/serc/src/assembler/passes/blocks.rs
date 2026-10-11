@@ -6275,6 +6275,48 @@ impl OptimizationPipeline {
                     })
                     .unwrap_or(SourceLocation::NONE)
             };
+            // Earlier unconditional predecessors have copied the exit. A remaining
+            // guard supplies the original empty match join's retained jump span.
+            let source_location = if !planned_copy
+                && inline_unprotected_return
+                && remaining_predecessors[source.index()] == 1
+                && graph[source].items().iter().any(|item| {
+                    matches!(item, Item::Label(label)
+                        if self.exception_owner_provenance.original_match_join_boundaries.contains(label)
+                            && !self.borrow_block_aliases.contains(label))
+                })
+                && graph[source]
+                    .items()
+                    .iter()
+                    .filter(|item| matches!(item, Item::Instruction(_)))
+                    .count()
+                    == 1
+                && graph[source].last_instruction().is_some_and(|jump| {
+                    jump.jump_policy.is_original_match_success()
+                        && jump.jump_policy.is_original_empty_join()
+                        && !jump.no_location_policy.preserves_location()
+                        && jump.exception_policy() == ExceptionPolicy::default()
+                })
+            {
+                let mut incoming = jump_sources[source.index()].iter().filter_map(|predecessor| {
+                    (!drop_blocks[predecessor.index()]
+                        && !inline_copies.contains_key(predecessor)
+                        && block_jump_target(graph[*predecessor].items())
+                            .and_then(|label| graph.label_block(label)) == Some(source))
+                        .then(|| graph[*predecessor].last_instruction())
+                        .flatten()
+                });
+                match (incoming.next(), incoming.next()) {
+                    (Some(guard), None)
+                        if is_conditional_jump(guard.opcode) && guard.location.line >= 0 =>
+                    {
+                        guard.location
+                    }
+                    _ => source_location,
+                }
+            } else {
+                source_location
+            };
             let keyword_return_seam = original_keyword_return_seams.get(&source).filter(
                 |(original_target, source_items, target_items)| {
                     inline_small_exit
