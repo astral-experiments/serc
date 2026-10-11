@@ -15,6 +15,31 @@ use serc::{
 };
 
 #[test]
+fn guarded_finally_arms_keep_their_manager_exit_location() {
+    for body in ["work(item)", "yield item"] {
+        for condition in ["ready", "not ready", "ready is not None"] {
+            for guard_else in [
+                "",
+                "                else:\n                    alternate()\n",
+            ] {
+                let guard = format!(
+                    "                if {condition}:\n                    finish()\n{guard_else}"
+                );
+                for (first, otherwise) in [
+                    (guard.as_str(), "                release()\n"),
+                    ("                release()\n", guard.as_str()),
+                ] {
+                    let source = format!(
+                        "def sample(items, flag, ready):\n    with acquire() as owner:\n        try:\n            for item in items:\n                {body}\n        finally:\n            if flag:\n{first}            else:\n{otherwise}"
+                    );
+                    assert_matches_cpython(&source, "guarded_finally_arm.py", &LEVELS);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn erased_async_iterator_suffix_preserves_conditional_backedges() {
     for async_iterator in [false, true] {
         for work in [
