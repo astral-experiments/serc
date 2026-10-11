@@ -14480,6 +14480,20 @@ monitor.free_tool_id(5)
 }
 
 #[test]
+fn nested_match_guards_donate_copied_exit_locations() {
+    for definition in ["def", "async def"] {
+        for guard in ["value is not None", "flag", "flag and other"] {
+            for returned in ["None", "(flag, other)", "consume()"] {
+                let source = format!(
+                    "{definition} sample(subject, value, flag, other):\n    match subject:\n        case First():\n            match value:\n                case Second() | Third() if {guard}:\n                    return value\n        case Fourth():\n            return value\n    return {returned}\n"
+                );
+                assert_matches_cpython(&source, "nested_match_guard_location.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
 fn folded_match_guard_preserves_original_nop() {
     let source = r#"class Example:
     @property
