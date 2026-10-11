@@ -12397,6 +12397,18 @@ fn elided_protected_elif_preserves_loop_condition_owner() {
 }
 
 #[test]
+fn async_manager_suppression_preserves_copied_return_locations() {
+    for value in ["source", "await source"] {
+        for error in ["Error", "(FirstError, SecondError)"] {
+            let source = format!(
+                "async def sample(source, manager):\n    try:\n        return {value}\n    finally:\n        try:\n            await cleanup()\n        finally:\n            try:\n                async with manager():\n                    await consume()\n            except {error}:\n                recover()\n"
+            );
+            assert_matches_cpython(&source, "async_manager_return_locations.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn erased_coroutine_branch_tails_preserve_return_locations() {
     for definition in ["def", "async def"] {
         for prefix in ["", "    prepare()\n"] {
