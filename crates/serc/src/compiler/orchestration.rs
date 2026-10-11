@@ -83,91 +83,46 @@ fn partition_function_locals(
 
 /// Proves that the surviving constants cannot be changed by interning a metadata tuple.
 ///
-/// Ordinary ASCII identifier strings are already interned independently. For every other string
-/// in an all-string constant tuple, conservatively check for an equal name or local anywhere in
-/// this module, including recorded metadata from discarded code. Equality of the complete tuple
-/// is left to marshal when any string can match.
-fn metadata_alias_scan_unnecessary(code: &CodeObject) -> bool {
-    fn collect_candidates<'a>(values: &'a [Constant], candidates: &mut FxHashSet<&'a str>) {
+/// Every emitted name and local has an interner ID, including metadata from discarded code.
+/// An absent spelling cannot alias metadata; a present spelling conservatively leaves the
+/// complete tuple comparison to marshal, even when that name was never emitted.
+fn metadata_alias_scan_unnecessary(code: &CodeObject, names: &NameInterner) -> bool {
+    fn constants_cannot_alias(values: &[Constant], names: &NameInterner) -> bool {
         if values
             .iter()
             .all(|value| matches!(value, Constant::String(_)))
         {
-            for value in values {
+            return values.iter().all(|value| {
                 let Constant::String(value) = value else {
                     unreachable!("all-string tuple");
                 };
-                if value
+                // Ordinary ASCII identifier strings are already interned independently.
+                value
                     .bytes()
-                    .any(|byte| byte != b'_' && !byte.is_ascii_alphanumeric())
-                {
-                    candidates.insert(value);
-                }
-            }
-            return;
+                    .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+                    || names.get(value).is_none()
+            });
         }
-
-        for value in values {
-            collect_nested_candidates(value, candidates);
-        }
-    }
-
-    fn collect_nested_candidates<'a>(value: &'a Constant, candidates: &mut FxHashSet<&'a str>) {
-        match value {
-            Constant::Tuple(values) => collect_candidates(values, candidates),
-            Constant::FrozenSet(values) => {
-                for value in values {
-                    collect_nested_candidates(value, candidates);
-                }
-            }
-            Constant::Code(code) => collect_candidates(&code.constants, candidates),
-            Constant::Slice { lower, upper, step } => {
-                for value in [lower.as_ref(), upper.as_ref(), step.as_ref()] {
-                    collect_nested_candidates(value, candidates);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn metadata_matches(code: &CodeObject, candidates: &FxHashSet<&str>) -> bool {
-        if code
-            .names
+        values
             .iter()
-            .chain(&code.locals)
-            .map(MetadataName::as_str)
-            .chain(
-                code.marshal_provenance
-                    .interned_metadata_tuples
-                    .iter()
-                    .flatten()
-                    .map(String::as_str),
-            )
-            .any(|value| candidates.contains(value))
-        {
-            return true;
-        }
-        code.constants
-            .iter()
-            .any(|value| nested_metadata_matches(value, candidates))
+            .all(|value| constant_cannot_alias(value, names))
     }
 
-    fn nested_metadata_matches(value: &Constant, candidates: &FxHashSet<&str>) -> bool {
+    fn constant_cannot_alias(value: &Constant, names: &NameInterner) -> bool {
         match value {
-            Constant::Code(code) => metadata_matches(code, candidates),
-            Constant::Tuple(values) | Constant::FrozenSet(values) => values
+            Constant::Tuple(values) => constants_cannot_alias(values, names),
+            Constant::FrozenSet(values) => values
                 .iter()
-                .any(|value| nested_metadata_matches(value, candidates)),
+                .all(|value| constant_cannot_alias(value, names)),
+            Constant::Code(code) => constants_cannot_alias(&code.constants, names),
             Constant::Slice { lower, upper, step } => [lower, upper, step]
                 .into_iter()
-                .any(|value| nested_metadata_matches(value, candidates)),
-            _ => false,
+                .all(|value| constant_cannot_alias(value, names)),
+            _ => true,
         }
     }
 
-    let mut candidates = FxHashSet::default();
-    collect_candidates(&code.constants, &mut candidates);
-    candidates.is_empty() || !metadata_matches(code, &candidates)
+    constants_cannot_alias(&code.constants, names)
 }
 
 #[derive(Clone, Debug)]
@@ -1652,6 +1607,15 @@ impl<'source> Compiler<'source> {
             crate::marshal::bytes_hash(&code.line_table),
             crate::marshal::bytes_hash(&code.exception_table),
         ]);
+        debug_assert!(
+            code.names.iter().chain(&code.locals).all(|name| self
+                .context
+                .scopes
+                .names
+                .get(name.as_str())
+                .is_some()),
+            "emitted metadata names must be present in the module interner"
+        );
         code.validate()?;
         code.marshal_provenance.assembly_order = self.context.record_code_assembly(&code);
         if matches!(self.unit.scope, Scope::Module) {
@@ -1661,7 +1625,7 @@ impl<'source> Compiler<'source> {
             code.marshal_provenance.interned_metadata_tuples =
                 self.context.take_interned_metadata_tuples();
             code.marshal_provenance.metadata_alias_scan_unnecessary =
-                metadata_alias_scan_unnecessary(&code);
+                metadata_alias_scan_unnecessary(&code, &self.context.scopes.names);
             let context = Rc::get_mut(&mut self.context)
                 .expect("completed module exclusively owns its compilation context");
             code.marshal_provenance.metadata_name_lookup = Some(std::sync::Arc::new(
