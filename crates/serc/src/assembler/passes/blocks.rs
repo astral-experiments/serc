@@ -373,10 +373,7 @@ fn normalize_unmoved_interruptible_jumps(graph: &mut BlockGraph) {
 // Deferred source locations must resolve through their own writers, which do not all
 // honor PRESERVE.
 fn is_unlocated_value_cleanup_prefix(items: &[Item], python_version: crate::PythonVersion) -> bool {
-    let mut instructions = items.iter().filter_map(|item| match item {
-        Item::Instruction(instruction) => Some(instruction),
-        Item::Label(_) => None,
-    });
+    let mut instructions = items.iter().filter_map(Item::as_instruction);
     let Some(first) = instructions.next() else {
         return false;
     };
@@ -436,10 +433,10 @@ fn preserve_original_shared_jump_location(
     {
         return false;
     }
-    let mut instructions = graph[target].items().iter().filter_map(|item| match item {
-        Item::Instruction(instruction) => Some(instruction),
-        Item::Label(_) => None,
-    });
+    let mut instructions = graph[target]
+        .items()
+        .iter()
+        .filter_map(Item::as_instruction);
     let Some(jump) = instructions.next() else {
         return false;
     };
@@ -508,10 +505,7 @@ fn block_is_bare_raise(items: &[Item], original_nop_targets: &FxHashSet<Label>) 
                     && instruction.exception_policy() == ExceptionPolicy::default()
             });
     }
-    let mut instructions = items.iter().filter_map(|item| match item {
-        Item::Instruction(instruction) => Some(instruction),
-        Item::Label(_) => None,
-    });
+    let mut instructions = items.iter().filter_map(Item::as_instruction);
     instructions.next().is_some_and(|instruction| {
         instruction.opcode == RAISE_VARARGS
             && instruction.value_argument() == Some(0)
@@ -559,10 +553,7 @@ fn block_is_local_raise(items: &[Item], original_nop_targets: &FxHashSet<Label>)
     {
         return false;
     }
-    let mut instructions = items.iter().filter_map(|item| match item {
-        Item::Instruction(instruction) => Some(instruction),
-        Item::Label(_) => None,
-    });
+    let mut instructions = items.iter().filter_map(Item::as_instruction);
     let Some(mut first) = instructions.next() else {
         return false;
     };
@@ -598,10 +589,7 @@ fn named_cleanup_has_short_return(graph: &BlockGraph, target: BasicBlockId) -> b
     let cleanup = graph[target]
         .items()
         .iter()
-        .filter_map(|item| match item {
-            Item::Instruction(instruction) => Some(instruction),
-            Item::Label(_) => None,
-        })
+        .filter_map(Item::as_instruction)
         .collect::<Vec<_>>();
     let [pop, value, store, delete, jump] = cleanup.as_slice() else {
         return false;
@@ -628,10 +616,7 @@ fn named_cleanup_has_short_return(graph: &BlockGraph, target: BasicBlockId) -> b
     let mut returned = graph[successor]
         .items()
         .iter()
-        .filter_map(|item| match item {
-            Item::Instruction(instruction) => Some(instruction),
-            Item::Label(_) => None,
-        });
+        .filter_map(Item::as_instruction);
     let Some(mut value) = returned.next() else {
         return false;
     };
@@ -1570,10 +1555,7 @@ fn restore_retained_pop_block_locations(
         {
             continue;
         }
-        let Some(first) = graph[target].items().iter().find_map(|item| match item {
-            Item::Instruction(instruction) => Some(instruction),
-            Item::Label(_) => None,
-        }) else {
+        let Some(first) = graph[target].items().iter().find_map(Item::as_instruction) else {
             continue;
         };
         if first.opcode != NOP
@@ -1647,10 +1629,7 @@ fn block_is_original_setup_nop(
     block: BasicBlockId,
     provenance: &ExceptionOwnerProvenance,
 ) -> bool {
-    let mut instructions = graph[block].items().iter().filter_map(|item| match item {
-        Item::Instruction(instruction) => Some(instruction),
-        Item::Label(_) => None,
-    });
+    let mut instructions = graph[block].items().iter().filter_map(Item::as_instruction);
     let Some(nop) = instructions.next() else {
         return false;
     };
@@ -2277,10 +2256,7 @@ fn propagate_exit_block_locations_inner<const SKIP_LOCATED: bool>(
             && graph[target]
                 .items()
                 .iter()
-                .find_map(|item| match item {
-                    Item::Instruction(instruction) => Some(instruction),
-                    Item::Label(_) => None,
-                })
+                .find_map(Item::as_instruction)
                 .is_none_or(|first| first.location.line >= 0)
         {
             continue;
@@ -2433,10 +2409,7 @@ fn propagate_exit_block_locations_inner<const SKIP_LOCATED: bool>(
                         .items()
                         .iter()
                         .rev()
-                        .filter_map(|item| match item {
-                            Item::Instruction(instruction) => Some(instruction),
-                            Item::Label(_) => None,
-                        })
+                        .filter_map(Item::as_instruction)
                         .nth(1);
                     if let Some(previous) = previous
                         && matches!(previous.opcode, POP_TOP | STORE_ATTR | DELETE_FAST)
@@ -3049,10 +3022,10 @@ impl OptimizationPipeline {
                     return None;
                 }
                 let source = graph.label_block(source)?;
-                let marker = graph[source].items().iter().find_map(|item| match item {
-                    Item::Instruction(instruction) => Some(instruction),
-                    Item::Label(_) => None,
-                })?;
+                let marker = graph[source]
+                    .items()
+                    .iter()
+                    .find_map(Item::as_instruction)?;
                 // A removed marker can leave a label alias on unrelated live code.
                 (marker.opcode == NOP && marker.location == location)
                     .then(|| graph.label_block(target))
@@ -3732,10 +3705,7 @@ impl OptimizationPipeline {
                 let marker = self.graph[source]
                     .items()
                     .iter()
-                    .find_map(|item| match item {
-                        Item::Instruction(instruction) => Some(instruction),
-                        Item::Label(_) => None,
-                    })?;
+                    .find_map(Item::as_instruction)?;
                 // A removed source marker can leave its label aliased to later live code.
                 // Such an alias no longer certifies the original condition's reachability.
                 if marker.opcode != NOP || marker.location != location {
@@ -3755,10 +3725,7 @@ impl OptimizationPipeline {
                 // path before resolving lines. Carry the folded predecessor through
                 // that original bridge so the cleanup head remains shared.
                 let items = self.graph[block].items();
-                let mut instructions = items.iter().filter_map(|item| match item {
-                    Item::Instruction(instruction) => Some(instruction),
-                    Item::Label(_) => None,
-                });
+                let mut instructions = items.iter().filter_map(Item::as_instruction);
                 if let Some(jump) = instructions.next()
                     && instructions.next().is_none()
                     && jump.opcode == JUMP_FORWARD
@@ -4497,10 +4464,10 @@ impl OptimizationPipeline {
                     let Some(Item::Label(prefix_label)) = graph[prefix].items().first() else {
                         continue;
                     };
-                    let mut cleanup = graph[prefix].items().iter().filter_map(|item| match item {
-                        Item::Instruction(instruction) => Some(instruction),
-                        Item::Label(_) => None,
-                    });
+                    let mut cleanup = graph[prefix]
+                        .items()
+                        .iter()
+                        .filter_map(Item::as_instruction);
                     let (Some(pop), Some(value), Some(store), Some(delete)) = (
                         cleanup.next(),
                         cleanup.next(),
@@ -4886,10 +4853,10 @@ impl OptimizationPipeline {
                 let Item::Label(label) = graph[target].items().first()? else {
                     return None;
                 };
-                let mut instructions = graph[target].items().iter().filter_map(|item| match item {
-                    Item::Instruction(instruction) => Some(instruction),
-                    Item::Label(_) => None,
-                });
+                let mut instructions = graph[target]
+                    .items()
+                    .iter()
+                    .filter_map(Item::as_instruction);
                 let first = instructions.next()?;
                 (first.opcode == NOP
                     && first.fusion_policy.is_converted_pop_block()
@@ -6459,10 +6426,8 @@ impl OptimizationPipeline {
                             && instruction.jump_policy.is_original_match_success()
                             && instruction.exception_policy() == ExceptionPolicy::default())
                 })
-                && let Some(instruction) = copied.iter_mut().rev().find_map(|item| match item {
-                    Item::Instruction(instruction) => Some(instruction),
-                    Item::Label(_) => None,
-                })
+                && let Some(instruction) =
+                    copied.iter_mut().rev().find_map(Item::as_instruction_mut)
                 && is_unconditional_jump(instruction.opcode)
             {
                 // CPython preserves the removed JUMP's eval-breaker check when replacing it
@@ -6479,10 +6444,8 @@ impl OptimizationPipeline {
                 }
             }
             if inline_no_location_block
-                && let Some(instruction) = copied.iter_mut().rev().find_map(|item| match item {
-                    Item::Instruction(instruction) => Some(instruction),
-                    Item::Label(_) => None,
-                })
+                && let Some(instruction) =
+                    copied.iter_mut().rev().find_map(Item::as_instruction_mut)
                 && instruction
                     .no_location_policy
                     .first_copy_is_interruptible_backward()
@@ -7170,10 +7133,7 @@ impl OptimizationPipeline {
                 || inline_reraising_iterator_break
                 || inline_reraising_attribute_store)
                 && !planned_copy
-                && let Some(instruction) = copied.iter_mut().find_map(|item| match item {
-                    Item::Instruction(instruction) => Some(instruction),
-                    Item::Label(_) => None,
-                })
+                && let Some(instruction) = copied.iter_mut().find_map(Item::as_instruction_mut)
             {
                 // CPython retains the replaced jump and any jumps bypassed by our earlier
                 // threading as NOPs until after the repeated small-exit copy pass. A 3.15
@@ -7188,12 +7148,10 @@ impl OptimizationPipeline {
                         .saturating_add(jump_extra),
                 );
             }
-            if let Some(instruction) = copied.iter_mut().find_map(|item| match item {
-                Item::Instruction(instruction) => Some(instruction),
-                Item::Label(_) => None,
-            }) && instruction
-                .no_location_policy
-                .copy_inherits_shared_predecessor()
+            if let Some(instruction) = copied.iter_mut().find_map(Item::as_instruction_mut)
+                && instruction
+                    .no_location_policy
+                    .copy_inherits_shared_predecessor()
             {
                 // The original shared cleanup can stay unlocated while its copies inherit
                 // their own predecessor, as CPython resolves each copied exit separately.
@@ -7201,10 +7159,7 @@ impl OptimizationPipeline {
             }
             let inherit_copied_locations = copied
                 .iter()
-                .find_map(|item| match item {
-                    Item::Instruction(instruction) => Some(instruction),
-                    Item::Label(_) => None,
-                })
+                .find_map(Item::as_instruction)
                 .is_some_and(|instruction| {
                     let inherits_shared_predecessor = instruction
                         .no_location_policy
@@ -7519,14 +7474,8 @@ impl OptimizationPipeline {
                     .expect("an exit-copy source must end in a jump");
                 let mut source_instructions = graph[source].items()[..source_jump_position]
                     .iter()
-                    .filter_map(|item| match item {
-                        Item::Instruction(instruction) => Some(instruction),
-                        Item::Label(_) => None,
-                    });
-                let mut copied_instructions = copied.iter().filter_map(|item| match item {
-                    Item::Instruction(instruction) => Some(instruction),
-                    Item::Label(_) => None,
-                });
+                    .filter_map(Item::as_instruction);
+                let mut copied_instructions = copied.iter().filter_map(Item::as_instruction);
                 match (
                     source_instructions.next(),
                     source_instructions.next(),
@@ -8304,10 +8253,10 @@ impl OptimizationPipeline {
                 {
                     return None;
                 }
-                let first = graph[target].items().iter().find_map(|item| match item {
-                    Item::Instruction(instruction) => Some(instruction),
-                    Item::Label(_) => None,
-                })?;
+                let first = graph[target]
+                    .items()
+                    .iter()
+                    .find_map(Item::as_instruction)?;
                 (first.opcode == NOP
                     && first.fusion_policy.is_converted_pop_block()
                     && first.location.line < 0
@@ -8337,10 +8286,7 @@ impl OptimizationPipeline {
                 && graph[target]
                     .items()
                     .iter()
-                    .find_map(|item| match item {
-                        Item::Instruction(instruction) => Some(instruction),
-                        Item::Label(_) => None,
-                    })
+                    .find_map(Item::as_instruction)
                     .is_some_and(|first| {
                         first.location.line >= 0
                             && !planned_blocks.contains(&target)

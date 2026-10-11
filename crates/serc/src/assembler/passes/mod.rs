@@ -393,10 +393,10 @@ impl Assembler {
                     .clear_preserved_location();
                 continue;
             }
-            let mut instructions = graph[target].items().iter().filter_map(|item| match item {
-                Item::Instruction(instruction) => Some(instruction),
-                Item::Label(_) => None,
-            });
+            let mut instructions = graph[target]
+                .items()
+                .iter()
+                .filter_map(Item::as_instruction);
             let (Some(first), Some(second)) = (instructions.next(), instructions.next()) else {
                 continue;
             };

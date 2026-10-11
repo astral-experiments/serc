@@ -1306,10 +1306,7 @@ impl OptimizationPipeline {
             let Some(marker) = self.graph[source]
                 .items()
                 .iter()
-                .find_map(|item| match item {
-                    Item::Instruction(instruction) => Some(instruction),
-                    Item::Label(_) => None,
-                })
+                .find_map(Item::as_instruction)
             else {
                 continue;
             };
@@ -1333,10 +1330,7 @@ impl OptimizationPipeline {
             if self.graph[target]
                 .items()
                 .iter()
-                .find_map(|item| match item {
-                    Item::Instruction(instruction) => Some(instruction),
-                    Item::Label(_) => None,
-                })
+                .find_map(Item::as_instruction)
                 .is_some_and(|first| {
                     (first.opcode == NOP && first.fusion_policy.is_converted_pop_block())
                     // Ordinary try lowering keeps POP_BLOCK as a hidden copy
@@ -1825,10 +1819,7 @@ impl OptimizationPipeline {
                     || self.graph[end_block]
                         .items()
                         .iter()
-                        .find_map(|item| match item {
-                            Item::Instruction(instruction) => Some(instruction),
-                            Item::Label(_) => None,
-                        })
+                        .find_map(Item::as_instruction)
                         != body.get(1).copied()
                     || self
                         .exception_owner_provenance
@@ -2013,10 +2004,7 @@ impl OptimizationPipeline {
                     || !self.graph[target_block]
                         .items()
                         .iter()
-                        .find_map(|item| match item {
-                            Item::Instruction(instruction) => Some(instruction),
-                            Item::Label(_) => None,
-                        })
+                        .find_map(Item::as_instruction)
                         .is_some_and(|next| {
                             next.location.line >= 0
                                 && next.opcode != NOP
@@ -3262,10 +3250,7 @@ mod tests {
                 let instructions = pipeline.graph[first]
                     .items()
                     .iter()
-                    .filter_map(|item| match item {
-                        Item::Instruction(instruction) => Some(instruction),
-                        Item::Label(_) => None,
-                    })
+                    .filter_map(Item::as_instruction)
                     .collect::<Vec<_>>();
                 if source_boundary {
                     assert_eq!(instructions.len(), 1);
@@ -4632,10 +4617,7 @@ mod protected_repeated_backedge_tests {
                     pipeline.graph[block]
                         .items()
                         .iter()
-                        .find_map(|item| match item {
-                            Item::Instruction(instruction) => Some(instruction),
-                            Item::Label(_) => None,
-                        })
+                        .find_map(Item::as_instruction)
                 };
                 assert_eq!(first_instruction(actual), first_instruction(unrelated));
             }

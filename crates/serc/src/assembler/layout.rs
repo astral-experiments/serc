@@ -205,10 +205,7 @@ impl LayoutAssembler {
         let needs_late_owner_replay = self
             .items
             .iter()
-            .filter_map(|item| match item {
-                Item::Instruction(instruction) => Some(instruction),
-                Item::Label(_) => None,
-            })
+            .filter_map(Item::as_instruction)
             .enumerate()
             .any(|(index, instruction)| {
                 // The main walk only changes output for these explicit owner or exclusion

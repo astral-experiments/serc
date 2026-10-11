@@ -1586,10 +1586,7 @@ impl HandlerDispatchCertificate {
     ) -> Option<Self> {
         use crate::target::opcodes::CHECK_EXC_MATCH;
 
-        let mut instructions = origin.items.iter().rev().filter_map(|item| match item {
-            Item::Instruction(instruction) => Some(instruction),
-            Item::Label(_) => None,
-        });
+        let mut instructions = origin.items.iter().rev().filter_map(Item::as_instruction);
         let (marker, condition, check) = (
             instructions.next()?,
             instructions.next()?,

@@ -1917,10 +1917,7 @@ impl OptimizationPipeline {
                     nop_targets.entry(block).or_default().push(*label);
                 }
             }
-            let Some(instruction) = contents.items().iter().find_map(|item| match item {
-                Item::Instruction(instruction) => Some(instruction),
-                Item::Label(_) => None,
-            }) else {
+            let Some(instruction) = contents.items().iter().find_map(Item::as_instruction) else {
                 continue;
             };
             let Some(target) = instruction.forward_target() else {
@@ -3461,10 +3458,10 @@ impl OptimizationPipeline {
         for block in order.iter().copied() {
             let mut leaves = 0_usize;
             for source in incoming.get(&block).into_iter().flatten().copied() {
-                let mut instructions = graph[source].items().iter().filter_map(|item| match item {
-                    Item::Instruction(instruction) => Some(instruction),
-                    Item::Label(_) => None,
-                });
+                let mut instructions = graph[source]
+                    .items()
+                    .iter()
+                    .filter_map(Item::as_instruction);
                 let jump_only = instructions.next().is_some_and(|jump| {
                     jump.opcode == JUMP_FORWARD
                         && instructions.next().is_none()
@@ -3831,10 +3828,7 @@ impl OptimizationPipeline {
                     block
                         .items()
                         .iter()
-                        .find_map(|item| match item {
-                            Item::Instruction(instruction) => Some(instruction),
-                            Item::Label(_) => None,
-                        })
+                        .find_map(Item::as_instruction)
                         .is_some_and(Self::is_original_jump_head)
                 }))
         {
@@ -4074,10 +4068,7 @@ impl OptimizationPipeline {
                 let first = self.graph[target]
                     .items()
                     .iter()
-                    .find_map(|item| match item {
-                        Item::Instruction(instruction) => Some(instruction),
-                        Item::Label(_) => None,
-                    })?;
+                    .find_map(Item::as_instruction)?;
                 if !is_unconditional_jump(first.opcode) {
                     return None;
                 }
@@ -4377,10 +4368,7 @@ impl OptimizationPipeline {
                 let first = self.graph[block]
                     .items()
                     .iter()
-                    .find_map(|item| match item {
-                        Item::Instruction(instruction) => Some(instruction),
-                        Item::Label(_) => None,
-                    })?;
+                    .find_map(Item::as_instruction)?;
                 ((first.opcode == JUMP_FORWARD
                     || (first.opcode == JUMP_BACKWARD
                         && self.original_jump_head_targets.contains(label)

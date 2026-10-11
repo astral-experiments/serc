@@ -1592,6 +1592,22 @@ pub(super) enum Item {
     Label(Label),
 }
 
+impl Item {
+    pub(super) const fn as_instruction(&self) -> Option<&Instruction> {
+        match self {
+            Self::Instruction(instruction) => Some(instruction),
+            Self::Label(_) => None,
+        }
+    }
+
+    pub(super) const fn as_instruction_mut(&mut self) -> Option<&mut Instruction> {
+        match self {
+            Self::Instruction(instruction) => Some(instruction),
+            Self::Label(_) => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(super) enum UnoptimizedCode {
     /// Instructions are still being emitted and patched by the compiler.
