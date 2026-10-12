@@ -39,7 +39,7 @@ impl LayoutAssembler {
         let cache_widths = OpcodeCacheWidths::for_version(crate::PythonVersion::Py314);
 
         for (item_index, item) in self.items.iter().enumerate() {
-            let instruction = match *item {
+            let instruction = match item {
                 Item::Instruction(instruction) => instruction,
                 Item::Label(label) => {
                     labels[label.index()] = Some(position);
