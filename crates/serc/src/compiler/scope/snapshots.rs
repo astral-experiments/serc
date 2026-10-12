@@ -32,6 +32,7 @@ fn nested_scope_plan() {
     for (index, node) in arena.nodes.iter().enumerate() {
         writeln!(snapshot, "scope {index} children={:?}", node.children).unwrap();
         match &node.plan {
+            ScopePlan::Pending => unreachable!("scope plan is not built"),
             ScopePlan::Module => writeln!(snapshot, "  module").unwrap(),
             ScopePlan::Function(plan) => {
                 writeln!(
