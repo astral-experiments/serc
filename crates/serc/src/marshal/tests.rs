@@ -2831,6 +2831,44 @@ fn compiled_metadata_tuple_aliases_match_pinned_cpython() {
 }
 
 #[test]
+fn unused_interner_names_keep_the_metadata_alias_fallback() {
+    for (value, source) in [
+        ("café", "global café\nshared = ('café',)\n"),
+        (".format", "shared = ('.format',)\n"),
+    ] {
+        for python_version in [
+            crate::PythonVersion::Py312,
+            crate::PythonVersion::Py313,
+            crate::PythonVersion::Py314,
+            crate::PythonVersion::Py315,
+        ] {
+            let module = crate::compile_with_options(
+                source,
+                "unused_metadata_name.py",
+                &crate::CompileOptions {
+                    python_version,
+                    ..crate::CompileOptions::default()
+                },
+            )
+            .unwrap();
+            assert!(module.code.names.iter().all(|name| name != value));
+            assert!(
+                !module
+                    .code
+                    .marshal_provenance
+                    .metadata_alias_scan_unnecessary
+            );
+            let mut without_alias_scan = module.clone();
+            without_alias_scan
+                .code
+                .marshal_provenance
+                .metadata_alias_scan_unnecessary = true;
+            assert_eq!(module.marshal(), without_alias_scan.marshal());
+        }
+    }
+}
+
+#[test]
 fn skipping_unrelated_metadata_tuple_aliases_preserves_benchmark_streams() {
     let workloads = [
         &serc_fixtures::MARSHAL_MICRO_WORKLOADS[1],
