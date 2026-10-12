@@ -1960,6 +1960,8 @@ impl ScopeOrigin {
 
 #[derive(Debug)]
 enum ScopePlan {
+    // Filled after the scope's children have been analyzed.
+    Pending,
     Module,
     Function(FunctionPlan),
     Class(ClassPlan),
@@ -2286,22 +2288,22 @@ impl ScopeArena {
         self.nodes.raw.reserve(definitions.len());
         self.by_parent_and_origin.reserve(definitions.len());
         for (index, input) in definitions.iter().enumerate() {
-            let (origin, plan) = match input.definition {
-                ScopeDefinition::Function(definition, _, _) => (
-                    ScopeOrigin::function(definition),
-                    ScopePlan::Function(FunctionPlan::default()),
-                ),
-                ScopeDefinition::Class(definition, _) => (
-                    ScopeOrigin::class(definition),
-                    ScopePlan::Class(ClassPlan::default()),
-                ),
+            let origin = match input.definition {
+                ScopeDefinition::Function(definition, _, _) => ScopeOrigin::function(definition),
+                ScopeDefinition::Class(definition, _) => ScopeOrigin::class(definition),
             };
-            let id = self.add_scope(input.parent, origin, plan);
+            let id = self.add_scope(input.parent, origin);
             debug_assert_eq!(id.index(), index + 1);
         }
 
         for (index, input) in definitions.into_iter().enumerate().rev() {
             let id = ScopeId::from_usize(index + 1);
+            debug_assert!(
+                self.nodes[id]
+                    .children
+                    .iter()
+                    .all(|child| !matches!(self.nodes[*child].plan, ScopePlan::Pending))
+            );
             match input.definition {
                 ScopeDefinition::Function(definition, flat, private_name) => {
                     self.build_function(
@@ -2325,11 +2327,11 @@ impl ScopeArena {
         }
     }
 
-    fn add_scope(&mut self, parent: ScopeId, origin: ScopeOrigin, plan: ScopePlan) -> ScopeId {
+    fn add_scope(&mut self, parent: ScopeId, origin: ScopeOrigin) -> ScopeId {
         let id = self.nodes.next_index();
         self.nodes.push(ScopeNode {
             parent: Some(parent),
-            plan,
+            plan: ScopePlan::Pending,
             children: Vec::new(),
         });
         self.nodes[parent].children.push(id);
@@ -2518,6 +2520,7 @@ impl ScopeArena {
                 ScopePlan::Function(plan) => plan.required.contains(&dunder_class),
                 ScopePlan::Class(plan) => plan.required.contains(&dunder_class),
                 ScopePlan::Module => false,
+                ScopePlan::Pending => unreachable!("child scope plan is not built"),
             })
         });
         let mut plan = ClassPlan::build(
@@ -2630,6 +2633,7 @@ impl ScopeArena {
         while let Some(id) = parent {
             let node = &self.nodes[id];
             match &node.plan {
+                ScopePlan::Pending => unreachable!("scope plan is not built"),
                 ScopePlan::Module => return false,
                 ScopePlan::Function(plan) => {
                     if plan.globals.contains(&name) {
@@ -2656,6 +2660,7 @@ impl ScopeArena {
 
     fn function_or_enclosing_binds(&self, id: ScopeId, name: NameId) -> bool {
         match &self.nodes[id].plan {
+            ScopePlan::Pending => unreachable!("scope plan is not built"),
             ScopePlan::Module => return false,
             ScopePlan::Function(plan) => {
                 if plan.globals.contains(&name) {
@@ -2680,6 +2685,7 @@ impl ScopeArena {
 
     pub(super) fn function(&self, id: ScopeId) -> Option<&FunctionPlan> {
         match &self.nodes.get(id)?.plan {
+            ScopePlan::Pending => unreachable!("scope plan is not built"),
             ScopePlan::Function(plan) => Some(plan),
             ScopePlan::Module | ScopePlan::Class(_) => None,
         }
@@ -2687,6 +2693,7 @@ impl ScopeArena {
 
     fn class(&self, id: ScopeId) -> Option<&ClassPlan> {
         match &self.nodes.get(id)?.plan {
+            ScopePlan::Pending => unreachable!("scope plan is not built"),
             ScopePlan::Class(plan) => Some(plan),
             ScopePlan::Module | ScopePlan::Function(_) => None,
         }
@@ -9202,6 +9209,32 @@ def function():
                 (ScopeId::from_usize(4), "other", true),
             ]
         );
+
+        for version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            let arena = ScopeArena::analyze_with_python_version(parsed.suite(), version);
+            assert_eq!(arena.nodes.len(), definitions.len() + 1);
+            for (index, input) in definitions.iter().enumerate() {
+                let id = ScopeId::from_usize(index + 1);
+                assert_eq!(arena.nodes[id].parent, Some(input.parent));
+                match input.definition {
+                    ScopeDefinition::Function(..) => assert!(arena.function(id).is_some()),
+                    ScopeDefinition::Class(..) => assert!(arena.class(id).is_some()),
+                }
+            }
+            let value = arena.names.get("value").unwrap();
+            assert!(
+                arena
+                    .function(ScopeId::from_usize(1))
+                    .unwrap()
+                    .cellvars
+                    .contains(&value)
+            );
+        }
     }
 
     #[test]
