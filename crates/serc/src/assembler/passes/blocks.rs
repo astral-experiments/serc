@@ -4659,6 +4659,12 @@ impl OptimizationPipeline {
     /// Captures the original donor before static swaps reverse a certified store tail.
     pub(in crate::assembler) fn capture_reversed_store_exits(&self) -> ReversedStoreExits {
         let mut entries = FxHashMap::default();
+        if !self.graph.features().has_swap() {
+            return ReversedStoreExits {
+                original_labels: FxHashSet::default(),
+                entries,
+            };
+        }
         for pair in self.graph.order().windows(2) {
             let source = self.graph[pair[0]].items();
             let target = self.graph[pair[1]].items();
