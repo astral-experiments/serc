@@ -87,33 +87,32 @@ pub(super) struct Occurrence {
 const _: [(); 8] = [(); std::mem::size_of::<Occurrence>()];
 
 #[derive(Debug)]
-pub(super) struct OccurrenceCursor<T: Iterator<Item = Occurrence>> {
-    occurrences: std::iter::Peekable<T>,
-    count: usize,
+pub(super) struct OccurrenceCursor<T> {
+    occurrences: T,
+    index: usize,
 }
 
-impl<T: ExactSizeIterator<Item = Occurrence>> OccurrenceCursor<T> {
+impl<T: AsRef<[Occurrence]>> OccurrenceCursor<T> {
     #[inline]
     pub(super) fn consume(&mut self, expected: OccurrenceKind) -> ObjectId {
-        let Some(occurrence) = self.occurrences.peek().copied() else {
-            missing_occurrence(self.count, expected, self.count);
+        let occurrences = self.occurrences.as_ref();
+        let Some(occurrence) = occurrences.get(self.index) else {
+            missing_occurrence(self.index, expected, occurrences.len());
         };
         if occurrence.kind != expected {
-            let index = self.count - self.occurrences.len();
-            mismatched_occurrence(index, expected, occurrence.kind);
+            mismatched_occurrence(self.index, expected, occurrence.kind);
         }
-        let _ = self.occurrences.next();
+        self.index += 1;
         occurrence.object
     }
 
     pub(super) fn finish(self) {
-        let remaining = self.occurrences.len();
+        let count = self.occurrences.as_ref().len();
+        let remaining = count - self.index;
         assert_eq!(
-            remaining,
-            0,
+            remaining, 0,
             "marshal writer consumed {} of {} recorded occurrences",
-            self.count - remaining,
-            self.count
+            self.index, count
         );
     }
 }
@@ -1024,20 +1023,18 @@ impl<'a> ObjectGraph<'a> {
     }
 
     #[cfg(test)]
-    pub(super) fn occurrence_cursor(
-        &self,
-    ) -> OccurrenceCursor<std::iter::Copied<std::slice::Iter<'_, Occurrence>>> {
+    pub(super) fn occurrence_cursor(&self) -> OccurrenceCursor<&[Occurrence]> {
         OccurrenceCursor {
-            occurrences: self.occurrences.iter().copied().peekable(),
-            count: self.occurrences.len(),
+            occurrences: &self.occurrences,
+            index: 0,
         }
     }
 
     /// Separates the read-only occurrence stream before the writer mutates object references.
-    pub(super) fn take_occurrences(&mut self) -> OccurrenceCursor<std::vec::IntoIter<Occurrence>> {
+    pub(super) fn take_occurrences(&mut self) -> OccurrenceCursor<Vec<Occurrence>> {
         OccurrenceCursor {
-            count: self.occurrences.len(),
-            occurrences: std::mem::take(&mut self.occurrences).into_iter().peekable(),
+            occurrences: std::mem::take(&mut self.occurrences),
+            index: 0,
         }
     }
 
@@ -3273,10 +3270,16 @@ mod wire_reference_tests {
             kind: OccurrenceKind::Bytes,
         };
         let cursor = || OccurrenceCursor {
-            occurrences: vec![occurrence].into_iter().peekable(),
-            count: 1,
+            occurrences: vec![occurrence],
+            index: 0,
         };
         let mut complete = cursor();
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                complete.consume(OccurrenceKind::Code);
+            }))
+            .is_err()
+        );
         assert_eq!(complete.consume(OccurrenceKind::Bytes), occurrence.object);
         complete.finish();
         assert!(std::panic::catch_unwind(|| cursor().finish()).is_err());
