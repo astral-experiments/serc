@@ -1397,6 +1397,11 @@ impl Compiler<'_> {
     }
 
     /// Locate setup instructions that precede the elision of their opening statement.
+    #[expect(
+        clippy::inline_always,
+        reason = "avoid call overhead for the common cached source-location path"
+    )]
+    #[inline(always)]
     pub(super) fn physical_source_location(
         &self,
         range: ruff_text_size::TextRange,
