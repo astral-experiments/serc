@@ -1481,12 +1481,14 @@ impl Instruction {
     }
 
     pub(super) fn set_operand(&mut self, operand: Operand) {
-        if self.operand() != operand {
+        let previous_policy = self.fusion_policy;
+        let payload = self.fusion_policy.set_operand(operand);
+        if self.operand_payload != payload || self.fusion_policy != previous_policy {
             self.jump_policy.retire_original_uniform_fold();
             self.jump_policy.retire_original_match_success();
             self.metadata = self.metadata.with_initial_borrow_entry(false);
         }
-        self.operand_payload = self.fusion_policy.set_operand(operand);
+        self.operand_payload = payload;
     }
 
     /// Records an initial direct edge until its operand changes or the proof is consumed.
@@ -2077,6 +2079,39 @@ mod initial_borrow_metadata_tests {
         let maximum = Instruction::value_with_depth(LOAD_FAST, u32::MAX, SourceLocation::NONE, 0);
         assert_eq!(maximum.value_argument(), Some(u32::MAX));
         assert_eq!(maximum.jump_target(), None);
+    }
+
+    #[test]
+    fn operand_updates_preserve_policy_invalidation() {
+        for flags in 0..=u8::MAX {
+            for payload in [0, 1, u32::MAX - 1] {
+                let mut original =
+                    Instruction::value_with_depth(LOAD_FAST, payload, SourceLocation::NONE, 0);
+                original.fusion_policy = super::FusionPolicy(flags);
+                original.jump_policy.mark_original_uniform_fold();
+                original.jump_policy.mark_original_match_success();
+                original.metadata = original.metadata.with_initial_borrow_entry(true);
+                for operand in [
+                    Operand::Value(0),
+                    Operand::Value(1),
+                    Operand::Value(u32::MAX),
+                    Operand::Deferred(OperandPatchId::from_u32(payload)),
+                    Operand::Forward(Label::from_u32(payload)),
+                    Operand::Backward(Label::from_u32(payload)),
+                ] {
+                    let mut expected = original;
+                    if original.operand() != operand {
+                        expected.jump_policy.retire_original_uniform_fold();
+                        expected.jump_policy.retire_original_match_success();
+                        expected.metadata = expected.metadata.with_initial_borrow_entry(false);
+                    }
+                    expected.operand_payload = expected.fusion_policy.set_operand(operand);
+                    let mut actual = original;
+                    actual.set_operand(operand);
+                    assert_eq!(actual, expected);
+                }
+            }
+        }
     }
 
     #[test]
