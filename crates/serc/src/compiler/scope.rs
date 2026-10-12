@@ -1561,6 +1561,7 @@ impl FunctionPlan {
     }
 
     /// Copies only the state consumed by late closure resolution and lowering.
+    #[inline(never)]
     fn clone_for_lowering(&self) -> Self {
         Self {
             locals: self.locals.clone(),
