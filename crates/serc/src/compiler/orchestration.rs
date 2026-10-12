@@ -245,17 +245,21 @@ impl<'source> Compiler<'source> {
         unit: CodeUnit,
         symbols: SymbolState,
     ) -> Box<Self> {
+        let allocation = Box::new_uninit();
         let assembler = Assembler::with_python_version(context.python_version);
-        Box::new(Self {
-            context,
-            cached_source_lines: Cell::new([None; 2]),
-            unit,
-            output: OutputState::default(),
-            symbols,
-            control: ControlFlowState::default(),
-            assembler,
-            native_label_plan: None,
-        })
+        Box::write(
+            allocation,
+            Self {
+                context,
+                cached_source_lines: Cell::new([None; 2]),
+                unit,
+                output: OutputState::default(),
+                symbols,
+                control: ControlFlowState::default(),
+                assembler,
+                native_label_plan: None,
+            },
+        )
     }
 
     /// Inherit the enclosing scope's name mangling and imported-name context.
