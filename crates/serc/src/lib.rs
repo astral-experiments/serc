@@ -704,7 +704,7 @@ impl Drop for ParsedModule {
 // parsing limit is separate from the limit supplied for formatting. This raw scan
 // overapproximates a long decimal token even when Ruff stops on an earlier error.
 fn may_depend_on_decimal_parse(source: &str) -> bool {
-    if !source.contains("match") || !source.contains("case") {
+    if source.len() <= 640 || !source.contains("match") || !source.contains("case") {
         return false;
     }
     let mut digits = 0_usize;
@@ -1041,4 +1041,32 @@ pub fn compile_to_pyc(
         CompileError::Unsupported("Python source exceeds the 4 GiB `.pyc` limit".to_string())
     })?;
     Ok(compile(source, filename)?.to_timestamp_pyc(source_mtime, source_size))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::may_depend_on_decimal_parse;
+
+    #[test]
+    fn decimal_prescan_keeps_digit_and_keyword_boundaries() {
+        for prefix in ["match case ", "match ", "case ", ""] {
+            for digits in [0, 630, 631, 639, 640, 641, 4096] {
+                for digit in ["1", "1_"] {
+                    let source = format!("{prefix}{}", digit.repeat(digits));
+                    assert_eq!(
+                        may_depend_on_decimal_parse(&source),
+                        prefix == "match case " && digits > 640,
+                    );
+                }
+            }
+        }
+        let first = "1".repeat(320);
+        let second = "1".repeat(321);
+        assert!(!may_depend_on_decimal_parse(&format!(
+            "match case {first}x{second}"
+        )));
+        assert!(may_depend_on_decimal_parse(&format!(
+            "match case {first}_{second}"
+        )));
+    }
 }
