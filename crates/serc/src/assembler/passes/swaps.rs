@@ -448,7 +448,11 @@ impl OptimizationPipeline {
         let mut rewritten_blocks = Vec::with_capacity(blocks.len());
         for block in blocks {
             let mut rewritten = FxHashSet::default();
-            let instruction_positions = block
+            // Only SWAP-started runs are rewritten; retain the full partition for donor tracking.
+            let start = block.iter().position(|position| {
+                matches!(graph.item(*position), Item::Instruction(instruction) if instruction.opcode == SWAP)
+            }).expect("matching partition contains a swap");
+            let instruction_positions = block[start..]
                 .iter()
                 .copied()
                 .filter(|position| matches!(graph.item(*position), Item::Instruction(_)))
@@ -1035,6 +1039,54 @@ mod tests {
     use crate::assembler::exception_owners::TupleJoinLocationOrigin;
     use crate::assembler::{Assembler, Label};
     use crate::target::opcodes::JUMP_FORWARD;
+
+    #[test]
+    fn swap_runs_preserve_leading_items_and_original_donors() {
+        for prefix_length in [0, 1, 16, 257] {
+            let mut pipeline = Assembler::default().into_optimization_pipeline();
+            let location = SourceLocation::new(5, 5, 0, 1);
+            let mut items = vec![Item::Label(pipeline.label())];
+            items.extend((0..prefix_length).map(|_| {
+                Item::Instruction(Instruction::new(NOP, Operand::Value(0), location, None))
+            }));
+            items.push(Item::Label(pipeline.label()));
+            let donor = Instruction::new(POP_TOP, Operand::Value(0), location, None);
+            items.push(Item::Instruction(donor));
+            let start = items.len();
+            for (opcode, argument) in [(SWAP, 2), (NOP, 0), (SWAP, 2), (STORE_FAST, 0)] {
+                items.push(Item::Instruction(Instruction::new(
+                    opcode,
+                    Operand::Value(argument),
+                    location,
+                    None,
+                )));
+            }
+            pipeline.graph = BlockGraph::from_items(items.clone(), &FxHashSet::default());
+            let (blocks, capture_swaps, changed) = pipeline.optimize_swap_runs();
+            assert!(changed);
+            assert!(capture_swaps.is_empty());
+            let [block] = blocks.as_slice() else {
+                panic!("one logical swap partition");
+            };
+            assert_eq!(block.positions, pipeline.graph.item_positions());
+            assert_eq!(
+                block.original_donors.get(&block.positions[start - 1]),
+                Some(&donor)
+            );
+            assert_eq!(block.rewritten_nops.len(), 2);
+            let actual = pipeline.graph.copy_items();
+            assert_eq!(&actual[..start], &items[..start]);
+            assert_eq!(actual.last(), items.last());
+            for item in &actual[start..start + 3] {
+                let Item::Instruction(instruction) = item else {
+                    unreachable!();
+                };
+                assert_eq!(instruction.opcode, NOP);
+                assert_eq!(instruction.value_argument(), Some(0));
+                assert_eq!(instruction.location, location);
+            }
+        }
+    }
 
     fn composed_capture_items() -> Vec<Item> {
         [
