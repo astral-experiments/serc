@@ -131,7 +131,7 @@ impl Compiler<'_> {
         let source_plan = arena
             .function(scope_id)
             .ok_or_else(|| CompileError::Internal("function scope has no plan".to_string()))?;
-        let mut plan = source_plan.clone();
+        let mut plan = source_plan.clone_for_lowering();
         for &(name, canonical, comprehension_cell) in &source_plan.deferred_comprehension_globals {
             if arena.enclosing_function_binds(scope_id, canonical)
                 || self.symbols.active_temporaries.contains(name)
@@ -1557,6 +1557,27 @@ impl FunctionPlan {
         if self.prepare_to_mark_global(name) {
             self.globals.insert(name);
             self.required.remove(&name);
+        }
+    }
+
+    /// Copies only the state consumed by late closure resolution and lowering.
+    #[inline(never)]
+    fn clone_for_lowering(&self) -> Self {
+        Self {
+            locals: self.locals.clone(),
+            local_aliases: self.local_aliases.clone(),
+            lexical_bindings: FxHashSet::default(),
+            deferred_comprehension_globals: Vec::new(),
+            cell_sort_names: self.cell_sort_names.clone(),
+            globals: self.globals.clone(),
+            annotation_references: self.annotation_references.clone(),
+            cellvars: self.cellvars.clone(),
+            inlined_comprehension_cellvars: self.inlined_comprehension_cellvars.clone(),
+            freevars: self.freevars.clone(),
+            annotation_freevars: self.annotation_freevars.clone(),
+            comprehension_shadowed_targets: self.comprehension_shadowed_targets.clone(),
+            required: self.required.clone(),
+            type_parameter_names: FxHashSet::default(),
         }
     }
 
@@ -8217,6 +8238,9 @@ def trailing():
                 let mut plan = FunctionPlan {
                     locals: vec![local, shadow_local],
                     local_aliases: vec![(alias, local), (shadow_alias, shadow_local)],
+                    lexical_bindings: FxHashSet::from_iter([local, shadow_local]),
+                    deferred_comprehension_globals: vec![(shadow_alias, shadow_local, false)],
+                    type_parameter_names: FxHashSet::from_iter([untouched]),
                     comprehension_shadowed_targets: FxHashSet::from_iter([
                         shadow_local,
                         shadow_alias,
@@ -8258,6 +8282,7 @@ def trailing():
                     captures.extend([local, shadow_alias, global]);
                 }
                 let mut reference = plan.clone();
+                let mut plan = plan.clone_for_lowering();
                 for name in reference.required.iter().copied().collect::<Vec<_>>() {
                     if captures.contains(&name) {
                         reference.insert_freevar(&names, name);
