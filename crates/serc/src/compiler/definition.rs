@@ -56,6 +56,9 @@ impl CompiledFunctionDefaults {
     }
 }
 
+/// A compiled annotation thunk and the names captured by its closure.
+type CompiledAnnotations = (Box<CodeObject>, Vec<NameId>);
+
 impl Compiler<'_> {
     /// Class bindings apply to direct annotation loads; nested functions and comprehensions retain captures.
     fn class_visible_annotation_requirements(
@@ -1848,7 +1851,7 @@ impl Compiler<'_> {
         &self,
         definition: &StmtFunctionDef,
         function_plan: &LoweringFunctionPlan,
-    ) -> Result<Option<(Box<CodeObject>, Vec<NameId>)>, CompileError> {
+    ) -> Result<Option<CompiledAnnotations>, CompileError> {
         let annotations = function_annotations(definition, self.context.python_version);
         if annotations.is_empty() {
             return Ok(None);
@@ -2013,7 +2016,7 @@ impl Compiler<'_> {
     pub(super) fn compile_class_annotations(
         &self,
         body: &[Stmt],
-    ) -> Result<Option<(Box<CodeObject>, Vec<NameId>)>, CompileError> {
+    ) -> Result<Option<CompiledAnnotations>, CompileError> {
         let mut annotations = Vec::new();
         collect_simple_annotations(body, &mut annotations);
         if annotations.is_empty() {
