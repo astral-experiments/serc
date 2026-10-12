@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.1.4
+
+Released on 2026-10-12.
+
+Serc 0.1.4 reduces compilation, assembly, and serialization overhead.
+
+### Performance
+
+- Reduce compilation memory use by deferring full provenance allocation for
+  linear scopes (astral-sh/serc#1252;
+  https://github.com/astral-sh/serc/pull/1252)
+- Speed up marshal serialization by indexing the occurrence stream directly
+  (astral-sh/serc#1242; https://github.com/astral-sh/serc/pull/1242)
+- Reduce name and metadata allocations by reusing interned names and the
+  compiler’s name index (astral-sh/serc#1231;
+  https://github.com/astral-sh/serc/pull/1231) (astral-sh/serc#1235;
+  https://github.com/astral-sh/serc/pull/1235)
+- Reduce name-cache initialization, lookup, and memory overhead
+  (astral-sh/serc#1234; https://github.com/astral-sh/serc/pull/1234)
+  (astral-sh/serc#1241; https://github.com/astral-sh/serc/pull/1241)
+- Speed up assembler graph processing by indexing fusion-owner boundaries and
+  avoiding unnecessary cold-block and reversed-store scans (astral-sh/serc#1236;
+  https://github.com/astral-sh/serc/pull/1236) (astral-sh/serc#1253;
+  https://github.com/astral-sh/serc/pull/1253) (astral-sh/serc#1255;
+  https://github.com/astral-sh/serc/pull/1255)
+- Reduce swap optimization work by indexing instructions from the first swap
+  (astral-sh/serc#1250; https://github.com/astral-sh/serc/pull/1250)
+- Reduce compiler setup overhead by initializing state directly in its final
+  heap allocation (astral-sh/serc#1243;
+  https://github.com/astral-sh/serc/pull/1243)
+- Speed up source-location and scope-exit lookups (astral-sh/serc#1251;
+  https://github.com/astral-sh/serc/pull/1251) (astral-sh/serc#1256;
+  https://github.com/astral-sh/serc/pull/1256)
+- Skip long-decimal pre-scanning for source files too short to exceed the
+  parsing limit (astral-sh/serc#1257;
+  https://github.com/astral-sh/serc/pull/1257)
+- Reduce small-code encoding overhead by avoiding instruction copies
+  (astral-sh/serc#1254; https://github.com/astral-sh/serc/pull/1254)
+
 ## 0.1.3
 
 Released on 2026-10-11.

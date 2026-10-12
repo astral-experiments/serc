@@ -1,6 +1,6 @@
 [package]
 name = "serc-cli"
-version = "0.1.3"
+version = "0.1.4"
 description = "An experimental CPython bytecode compiler, written in Rust."
 default-run = "serc"
 edition = { workspace = true }
@@ -18,7 +18,7 @@ clap = { workspace = true }
 fs-err = { workspace = true }
 libmimalloc-sys = { workspace = true }
 mimalloc = { workspace = true }
-serc = { path = "../serc", version = "0.1.3" }
+serc = { path = "../serc", version = "0.1.4" }
 rayon = { workspace = true }
 same-file = { workspace = true }
 tempfile = { workspace = true }
