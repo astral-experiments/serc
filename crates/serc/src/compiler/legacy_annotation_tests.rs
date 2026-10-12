@@ -4,7 +4,7 @@ use crate::target::opcodes::{MAKE_FUNCTION, SET_FUNCTION_ATTRIBUTE};
 use crate::{CompileOptions, PythonVersion, compile_with_options};
 
 fn compile(source: &str, python_version: PythonVersion) -> CodeObject {
-    compile_with_options(
+    *compile_with_options(
         source,
         "legacy_annotations.py",
         &CompileOptions {

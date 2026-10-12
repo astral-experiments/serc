@@ -85,7 +85,7 @@ pub const CPYTHON_TARGET: CpythonTarget = CpythonTarget {
 /// A compiled module code object and its selected CPython target.
 #[derive(Clone, Debug)]
 pub struct CompiledModule {
-    code: CodeObject,
+    code: Box<CodeObject>,
     python_version: PythonVersion,
     initial_intern_state: InitialInternState,
 }
@@ -957,7 +957,7 @@ fn compile_normalized(
         &options.initial_intern_state,
     )?;
     Ok(CompiledModule {
-        code,
+        code: Box::new(code),
         python_version: options.python_version,
         initial_intern_state: options.initial_intern_state.clone(),
     })
