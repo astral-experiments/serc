@@ -3063,17 +3063,21 @@ impl OptimizationPipeline {
                     .flatten()
             })
             .collect::<FxHashSet<_>>();
-        let loop_anchor_positions = graph
-            .order()
-            .iter()
-            .enumerate()
-            .filter_map(|(position, block)| {
-                // 3.12 erases this empty false-condition array before cold relocation.
-                (self.python_version != crate::PythonVersion::Py312
-                    && loop_anchor_targets.contains(block))
-                .then_some(position)
-            })
-            .collect::<Vec<_>>();
+        let loop_anchor_positions = if loop_anchor_targets.is_empty() {
+            Vec::new()
+        } else {
+            graph
+                .order()
+                .iter()
+                .enumerate()
+                .filter_map(|(position, block)| {
+                    // 3.12 erases this empty false-condition array before cold relocation.
+                    (self.python_version != crate::PythonVersion::Py312
+                        && loop_anchor_targets.contains(block))
+                    .then_some(position)
+                })
+                .collect::<Vec<_>>()
+        };
         for position in loop_anchor_positions.into_iter().rev() {
             let anchor = Label::from_u32(self.next_label);
             self.next_label += 1;
@@ -3083,27 +3087,31 @@ impl OptimizationPipeline {
         // Loop-tail lowering can omit the original array containing the final backedge.
         // CPython keeps that array after its instructions disappear. A surviving FOR_ITER
         // supplies provenance only when its cleanup target is an original recorded label.
-        let omitted_targets = graph
-            .iter()
-            .filter_map(|(_, block)| {
-                let last = block.last_instruction()?;
-                let target = last.forward_target()?;
-                (last.opcode == FOR_ITER && self.borrow_omitted_for_backedges.contains(&target))
-                    .then_some(target)
-            })
-            .collect::<FxHashSet<_>>();
-        let cleanup_positions = graph
-            .order()
-            .iter()
-            .enumerate()
-            .filter_map(|(position, block)| {
-                graph[*block]
-                    .items()
-                    .iter()
-                    .any(|item| matches!(item, Item::Label(label) if omitted_targets.contains(label)))
-                    .then_some(position)
-            })
-            .collect::<Vec<_>>();
+        let cleanup_positions = if self.borrow_omitted_for_backedges.is_empty() {
+            Vec::new()
+        } else {
+            let omitted_targets = graph
+                .iter()
+                .filter_map(|(_, block)| {
+                    let last = block.last_instruction()?;
+                    let target = last.forward_target()?;
+                    (last.opcode == FOR_ITER && self.borrow_omitted_for_backedges.contains(&target))
+                        .then_some(target)
+                })
+                .collect::<FxHashSet<_>>();
+            graph
+                .order()
+                .iter()
+                .enumerate()
+                .filter_map(|(position, block)| {
+                    graph[*block]
+                        .items()
+                        .iter()
+                        .any(|item| matches!(item, Item::Label(label) if omitted_targets.contains(label)))
+                        .then_some(position)
+                })
+                .collect::<Vec<_>>()
+        };
         let mut omitted_backedges = FxHashSet::default();
         let mut omitted_markers = FxHashSet::default();
         for position in cleanup_positions.into_iter().rev() {
