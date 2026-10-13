@@ -3926,41 +3926,45 @@ impl OptimizationPipeline {
         let mut pending_labels = smallvec::SmallVec::<[Label; 4]>::new();
         let mut saw_instruction = false;
         let mut previous_falls_through = false;
-        for item in self.graph.iter_items() {
-            match item {
-                Item::Label(label) => pending_labels.push(*label),
-                Item::Instruction(instruction) => {
-                    if saw_instruction
-                        && !pending_labels.is_empty()
-                        && instruction.location.line < 0
-                        && instruction.pre_fold_extra_instructions() == 0
-                        && pending_labels
-                            .iter()
-                            .all(|label| !self.original_nop_targets.contains(label))
-                    {
-                        let candidate = candidate_has_predecessor.len();
-                        candidate_has_predecessor.push(previous_falls_through);
-                        for label in pending_labels.drain(..) {
-                            candidate_labels.insert(label, candidate);
+        for (_, block) in self.graph.iter() {
+            for item in block.items() {
+                match item {
+                    Item::Label(label) => pending_labels.push(*label),
+                    Item::Instruction(instruction) => {
+                        if saw_instruction
+                            && !pending_labels.is_empty()
+                            && instruction.location.line < 0
+                            && instruction.pre_fold_extra_instructions() == 0
+                            && pending_labels
+                                .iter()
+                                .all(|label| !self.original_nop_targets.contains(label))
+                        {
+                            let candidate = candidate_has_predecessor.len();
+                            candidate_has_predecessor.push(previous_falls_through);
+                            for label in pending_labels.drain(..) {
+                                candidate_labels.insert(label, candidate);
+                            }
+                        } else {
+                            pending_labels.clear();
                         }
-                    } else {
-                        pending_labels.clear();
+                        saw_instruction = true;
+                        previous_falls_through = !ends_scope(instruction.opcode)
+                            && !is_unconditional_jump(instruction.opcode);
                     }
-                    saw_instruction = true;
-                    previous_falls_through = !ends_scope(instruction.opcode)
-                        && !is_unconditional_jump(instruction.opcode);
                 }
             }
         }
-        for item in self.graph.iter_items() {
-            if let Item::Instruction(instruction) = item
-                && let Some(label) = instruction.jump_target()
-                && let Some(&candidate) = candidate_labels.get(&label)
-            {
-                if candidate_has_predecessor[candidate] {
-                    return true;
+        for (_, block) in self.graph.iter() {
+            for item in block.items() {
+                if let Item::Instruction(instruction) = item
+                    && let Some(label) = instruction.jump_target()
+                    && let Some(&candidate) = candidate_labels.get(&label)
+                {
+                    if candidate_has_predecessor[candidate] {
+                        return true;
+                    }
+                    candidate_has_predecessor[candidate] = true;
                 }
-                candidate_has_predecessor[candidate] = true;
             }
         }
         false
