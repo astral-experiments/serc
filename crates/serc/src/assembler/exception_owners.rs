@@ -2682,6 +2682,23 @@ impl ExceptionOwnerProvenance {
         };
         use crate::target::operands::UnaryIntrinsic;
 
+        let mut tail = prefix.iter().rev().filter_map(|item| match item {
+            Item::Instruction(instruction) => Some(instruction),
+            Item::Label(_) => None,
+        });
+        let [Some(marker), Some(condition), Some(conversion)] =
+            [tail.next(), tail.next(), tail.next()]
+        else {
+            return false;
+        };
+        if marker.opcode != NOT_TAKEN
+            || !matches!(condition.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE)
+            || condition.forward_target().is_none()
+            || conversion.opcode != TO_BOOL
+        {
+            return false;
+        }
+
         let empty_class_success = Self::empty_class_success_prefix(prefix, all);
         let leading_labels = prefix
             .iter()
@@ -2824,23 +2841,16 @@ impl ExceptionOwnerProvenance {
                         from_import_members.insert(instructions.len());
                         from_import_members.insert(instructions.len() + 2);
                     }
-                    instructions.push(*instruction);
+                    instructions.push(instruction);
                     if comprehension_restore_count > 0 {
                         instruction_item_positions.push(item_index);
                     }
                 }
             }
         }
-        let [body @ .., condition, marker] = instructions.as_slice() else {
+        let [body @ .., _, _] = instructions.as_slice() else {
             return false;
         };
-        if marker.opcode != NOT_TAKEN
-            || !matches!(condition.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE)
-            || condition.forward_target().is_none()
-            || body.last().is_none_or(|last| last.opcode != TO_BOOL)
-        {
-            return false;
-        }
         // Closure tuples are built from LOAD_CLOSURE, not constants. Capture the
         // complete construction, including its optional deferred annotation function.
         let closure_members = instructions
@@ -2940,7 +2950,7 @@ impl ExceptionOwnerProvenance {
             // TO_BOOL, jump, marker. It cannot contain a constant-fold witness.
             FxHashSet::default()
         } else {
-            self.original_uniform_fold_positions(&instructions.iter().collect::<Vec<_>>())
+            self.original_uniform_fold_positions(&instructions)
         };
         // A discarded async yield retains all four records in the original array.
         // Resume changes only its exception-depth bit, without creating a vacancy.
@@ -3011,7 +3021,7 @@ impl ExceptionOwnerProvenance {
                         BUILD_TUPLE | LIST_EXTEND | LOAD_CONST | LOAD_SMALL_INT
                     )
                 });
-        for (index, instruction) in instructions.iter().enumerate() {
+        for (index, instruction) in instructions.iter().copied().enumerate() {
             let membership_fold = instruction.opcode == LOAD_CONST
                 && original_folds.contains(&index)
                 && instructions
