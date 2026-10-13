@@ -1568,57 +1568,61 @@ impl<'source> Compiler<'source> {
             output_names.len(),
             output_locals.len(),
         );
-        let mut code = Box::new(CodeObject {
-            arg_count: self.unit.arg_count,
-            positional_only_arg_count: self.unit.positional_only_arg_count,
-            keyword_only_arg_count: self.unit.keyword_only_arg_count,
-            stack_size,
-            flags: self.unit.flags,
-            bytecode,
-            constants,
-            names: output_names,
-            locals: output_locals,
-            local_kinds,
-            filename: self.context.filename.clone(),
-            name: self.unit.name,
-            qualified_name: self.unit.qualified_name,
-            first_line_number: self.unit.first_line_number,
-            line_table,
-            exception_table,
-            marshal_provenance: MarshalProvenance {
-                assembly_order: None,
-                interning_events: Vec::new(),
-                interned_metadata_tuples: Vec::new(),
-                locals_identity: if self.unit.annotation_thunk {
-                    LocalsIdentity::Fresh
-                } else {
-                    LocalsIdentity::ByValue
+        let allocation = Box::new_uninit();
+        let mut code = Box::write(
+            allocation,
+            CodeObject {
+                arg_count: self.unit.arg_count,
+                positional_only_arg_count: self.unit.positional_only_arg_count,
+                keyword_only_arg_count: self.unit.keyword_only_arg_count,
+                stack_size,
+                flags: self.unit.flags,
+                bytecode,
+                constants,
+                names: output_names,
+                locals: output_locals,
+                local_kinds,
+                filename: self.context.filename.clone(),
+                name: self.unit.name,
+                qualified_name: self.unit.qualified_name,
+                first_line_number: self.unit.first_line_number,
+                line_table,
+                exception_table,
+                marshal_provenance: MarshalProvenance {
+                    assembly_order: None,
+                    interning_events: Vec::new(),
+                    interned_metadata_tuples: Vec::new(),
+                    locals_identity: if self.unit.annotation_thunk {
+                        LocalsIdentity::Fresh
+                    } else {
+                        LocalsIdentity::ByValue
+                    },
+                    explicitly_interned_strings: self.output.interned_constant_strings,
+                    parser_interned_strings,
+                    generated_mangled_strings: if matches!(self.unit.scope, Scope::Module) {
+                        self.context.generated_mangled_strings.clone()
+                    } else {
+                        FxHashSet::default()
+                    },
+                    canonical_constant_strings,
+                    canonical_constant_strings_complete: matches!(self.unit.scope, Scope::Module),
+                    qualified_name_constant_index: self.output.qualified_name_constant_index,
+                    qualified_name_is_canonical: self.output.qualified_name_is_canonical,
+                    uncached_percent_constant: self.context.has_uncached_percent_constant(),
+                    metadata_ids,
+                    metadata_name_lookup: None,
+                    metadata_tuple_properties: Some(metadata_tuple_properties),
+                    constants_tuple_hash,
+                    constant_hashes: crate::marshal::ConstantHashes::default(),
+                    marshal_occurrence_bound: Some(marshal_occurrence_bound),
+                    marshal_graph_summary: None,
+                    table_hashes: None,
+                    subtree_has_frozenset_constants: self.output.has_frozenset_constants,
+                    metadata_alias_scan_unnecessary: false,
+                    fresh_empty_bytes_constant: self.context.fresh_empty_bytes_constant(),
                 },
-                explicitly_interned_strings: self.output.interned_constant_strings,
-                parser_interned_strings,
-                generated_mangled_strings: if matches!(self.unit.scope, Scope::Module) {
-                    self.context.generated_mangled_strings.clone()
-                } else {
-                    FxHashSet::default()
-                },
-                canonical_constant_strings,
-                canonical_constant_strings_complete: matches!(self.unit.scope, Scope::Module),
-                qualified_name_constant_index: self.output.qualified_name_constant_index,
-                qualified_name_is_canonical: self.output.qualified_name_is_canonical,
-                uncached_percent_constant: self.context.has_uncached_percent_constant(),
-                metadata_ids,
-                metadata_name_lookup: None,
-                metadata_tuple_properties: Some(metadata_tuple_properties),
-                constants_tuple_hash,
-                constant_hashes: crate::marshal::ConstantHashes::default(),
-                marshal_occurrence_bound: Some(marshal_occurrence_bound),
-                marshal_graph_summary: None,
-                table_hashes: None,
-                subtree_has_frozenset_constants: self.output.has_frozenset_constants,
-                metadata_alias_scan_unnecessary: false,
-                fresh_empty_bytes_constant: self.context.fresh_empty_bytes_constant(),
             },
-        });
+        );
         code.marshal_provenance.table_hashes = Some([
             crate::marshal::bytes_hash(&code.line_table),
             crate::marshal::bytes_hash(&code.exception_table),
