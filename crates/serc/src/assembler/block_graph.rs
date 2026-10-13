@@ -261,6 +261,83 @@ pub(super) struct BlockGraph {
     features: PipelineFeatures,
 }
 
+/// Traverses emitted items without maintaining a reverse block cursor.
+struct GraphItems<'a> {
+    graph: &'a BlockGraph,
+    blocks: std::slice::Iter<'a, BasicBlockId>,
+    items: std::slice::Iter<'a, Item>,
+}
+
+impl<'a> Iterator for GraphItems<'a> {
+    type Item = &'a Item;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(item) = self.items.next() {
+                return Some(item);
+            }
+            self.items = self.graph[*self.blocks.next()?].items().iter();
+        }
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.items.len();
+        (
+            remaining,
+            self.blocks.as_slice().is_empty().then_some(remaining),
+        )
+    }
+
+    #[inline]
+    fn nth(&mut self, mut n: usize) -> Option<Self::Item> {
+        loop {
+            let remaining = self.items.len();
+            if let Some(item) = self.items.nth(n) {
+                return Some(item);
+            }
+            n -= remaining;
+            self.items = self.graph[*self.blocks.next()?].items().iter();
+        }
+    }
+
+    #[inline]
+    fn fold<B, F>(self, initial: B, mut fold: F) -> B
+    where
+        F: FnMut(B, Self::Item) -> B,
+    {
+        let Self {
+            graph,
+            blocks,
+            items,
+        } = self;
+        let mut result = items.fold(initial, &mut fold);
+        for block in blocks {
+            result = graph[*block].items().iter().fold(result, &mut fold);
+        }
+        result
+    }
+
+    #[inline]
+    fn any<F>(&mut self, mut predicate: F) -> bool
+    where
+        F: FnMut(Self::Item) -> bool,
+    {
+        loop {
+            if self.items.any(&mut predicate) {
+                return true;
+            }
+            let Some(block) = self.blocks.next() else {
+                return false;
+            };
+            self.items = self.graph[*block].items().iter();
+        }
+    }
+}
+
+impl std::iter::FusedIterator for GraphItems<'_> {}
+
 #[cfg(test)]
 fn normalized_segment_lengths<'a>(
     items: impl IntoIterator<Item = &'a Item>,
@@ -1023,7 +1100,11 @@ impl BlockGraph {
     }
 
     pub(super) fn iter_items(&self) -> impl Iterator<Item = &Item> {
-        self.iter().flat_map(|(_, block)| block.items())
+        GraphItems {
+            graph: self,
+            blocks: self.order.iter(),
+            items: [].iter(),
+        }
     }
 
     /// Copies the ordered item stream into a single allocation.
@@ -1511,6 +1592,79 @@ mod tests {
             SourceLocation::NONE,
             None,
         ))
+    }
+
+    #[test]
+    fn item_iteration_matches_block_flattening() {
+        let items = [
+            Item::Label(Label::from_u32(0)),
+            instruction(NOP, Operand::Value(0)),
+            Item::Label(Label::from_u32(1)),
+            instruction(LOAD_FAST, Operand::Value(1)),
+            instruction(RETURN_VALUE, Operand::Value(0)),
+        ];
+        for first in 0..=items.len() {
+            for second in first..=items.len() {
+                let blocks =
+                    [&items[..first], &items[first..second], &items[second..]].map(|items| {
+                        BasicBlock {
+                            items: items.to_vec(),
+                        }
+                    });
+                let mut graph = BlockGraph {
+                    blocks: blocks.into_iter().collect(),
+                    order: Vec::new(),
+                    label_blocks: Vec::new(),
+                    features: PipelineFeatures::default(),
+                };
+                for order in [
+                    &[][..],
+                    &[0][..],
+                    &[2, 0, 1][..],
+                    &[1, 2][..],
+                    &[0, 1, 2, 0][..],
+                ] {
+                    graph.order = order
+                        .iter()
+                        .copied()
+                        .map(BasicBlockId::from_usize)
+                        .collect();
+                    let reference = || graph.iter().flat_map(|(_, block)| block.items());
+                    let mut actual = graph.iter_items();
+                    let mut expected = reference();
+                    for _ in 0..=items.len() * 2 {
+                        assert_eq!(actual.size_hint(), expected.size_hint());
+                        assert_eq!(actual.next(), expected.next());
+                    }
+                    for skip in [0, 1, 2, items.len(), usize::MAX] {
+                        let mut actual = graph.iter_items();
+                        let mut expected = reference();
+                        assert_eq!(actual.nth(skip), expected.nth(skip));
+                        assert_eq!(actual.size_hint(), expected.size_hint());
+                        assert_eq!(actual.collect::<Vec<_>>(), expected.collect::<Vec<_>>());
+                    }
+                    for stop in 0..=items.len() * 2 {
+                        let mut actual = graph.iter_items();
+                        let mut expected = reference();
+                        let mut visited = Vec::new();
+                        let mut expected_visited = Vec::new();
+                        assert_eq!(
+                            actual.any(|item| {
+                                visited.push(item);
+                                visited.len() == stop
+                            }),
+                            expected.any(|item| {
+                                expected_visited.push(item);
+                                expected_visited.len() == stop
+                            }),
+                        );
+                        assert_eq!(visited, expected_visited);
+                        assert_eq!(actual.size_hint(), expected.size_hint());
+                        assert_eq!(actual.collect::<Vec<_>>(), expected.collect::<Vec<_>>());
+                    }
+                }
+            }
+        }
     }
 
     #[test]
