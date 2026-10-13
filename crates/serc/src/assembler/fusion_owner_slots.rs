@@ -2284,19 +2284,21 @@ impl FusionOwnerCertificates {
         let mut result = Self::default();
         let mut start = 0;
         let mut has_instruction = false;
-        let mut previous = None;
-        for (index, item) in before.iter().copied().enumerate() {
+        let mut previous: Option<(usize, &Instruction)> = None;
+        for (index, item) in before.iter().enumerate() {
             match item {
                 Item::Label(l) => {
-                    if has_instruction && b.labels.is_boundary(l) {
+                    if has_instruction && b.labels.is_boundary(*l) {
                         start = index;
                         has_instruction = false;
                     }
                 }
                 Item::Instruction(marker) => {
                     if marker.opcode == NOT_TAKEN {
-                        if let Some((condition_index, condition)) = previous {
-                            if key(condition, marker).is_some()
+                        let previous_value =
+                            previous.map(|(index, instruction)| (index, *instruction));
+                        if let Some((condition_index, condition)) = previous_value {
+                            if key(condition, *marker).is_some()
                                 && matches!(
                                     marker.exception_policy().owner(),
                                     NormalizedExceptionOwner::Unchanged
@@ -2331,7 +2333,7 @@ impl FusionOwnerCertificates {
                                     let mut cert = Certificate {
                                         anchor,
                                         condition,
-                                        marker,
+                                        marker: *marker,
                                         items: Vec::new(),
                                         labels: FxHashSet::default(),
                                         owner,
@@ -2353,12 +2355,12 @@ impl FusionOwnerCertificates {
                             }
                         }
                         if let Some(certificate) =
-                            ManagerSetupCertificate::capture(b, a, start, index, previous)
+                            ManagerSetupCertificate::capture(b, a, start, index, previous_value)
                         {
                             result.manager_setup_certificates.push(certificate);
                         }
                         if let Some(cert) =
-                            FallbackCertificate::capture(b, a, start, index, previous)
+                            FallbackCertificate::capture(b, a, start, index, previous_value)
                         {
                             result.fallback_certificates.push(cert);
                         }
@@ -2380,7 +2382,7 @@ impl FusionOwnerCertificates {
                             ))
                     {
                         if let Some(cert) =
-                            FallbackCertificate::capture(b, a, start, index, previous)
+                            FallbackCertificate::capture(b, a, start, index, Some((index, *marker)))
                         {
                             result.fallback_certificates.push(cert);
                         }
