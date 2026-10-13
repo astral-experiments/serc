@@ -924,6 +924,29 @@ impl OptimizationPipeline {
             fallthrough_index: usize,
         }
 
+        #[inline(never)]
+        fn has_labeled_copy(graph: &BlockGraph) -> bool {
+            let mut after_label = false;
+            for index in 0..graph.len() {
+                for item in graph[graph.block_at(index)].items() {
+                    match item {
+                        Item::Label(_) => after_label = true,
+                        Item::Instruction(instruction) if instruction.opcode == NOP => {}
+                        Item::Instruction(instruction) => {
+                            if after_label
+                                && instruction.opcode == COPY
+                                && instruction.value_argument() == Some(1)
+                            {
+                                return true;
+                            }
+                            after_label = false;
+                        }
+                    }
+                }
+            }
+            false
+        }
+
         fn value_preserving_jump(
             graph: &BlockGraph,
             positions: &[ItemPosition],
@@ -969,7 +992,11 @@ impl OptimizationPipeline {
         }
         let mut changed = false;
 
-        if has_forward_conditional && features.has_boolean_conversion() && features.has_copy_top() {
+        if has_forward_conditional
+            && features.has_boolean_conversion()
+            && features.has_copy_top()
+            && (!SOURCE_GATES || has_labeled_copy(graph))
+        {
             let mut positions = graph.item_positions();
             let mut conditional_targets = Vec::new();
             let mut conditional_target_count = 0;
@@ -7149,7 +7176,9 @@ mod tests {
             for source_opcode in [POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE, JUMP_FORWARD] {
                 for target_opcode in [POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE] {
                     for target in [entry, exit, missing] {
-                        for copy_argument in [1, 2] {
+                        for (copy_argument, labeled) in
+                            [(1, false), (1, true), (2, false), (2, true)]
+                        {
                             for padded in [false, true] {
                                 let make = || {
                                     let mut marker = Instruction::new(
@@ -7172,8 +7201,18 @@ mod tests {
                                         ordinary(source_opcode, Operand::Forward(target)),
                                         Item::Instruction(marker),
                                         ordinary(POP_TOP, Operand::Value(0)),
-                                        ordinary(LOAD_CONST, Operand::Value(1)),
-                                        Item::Label(entry),
+                                    ]);
+                                    if !labeled {
+                                        items.push(Item::Label(entry));
+                                    }
+                                    items.push(ordinary(LOAD_CONST, Operand::Value(1)));
+                                    if labeled {
+                                        items.push(Item::Label(entry));
+                                    }
+                                    if padded {
+                                        items.push(ordinary(NOP, Operand::Value(0)));
+                                    }
+                                    items.extend([
                                         ordinary(COPY, Operand::Value(1)),
                                         ordinary(TO_BOOL, Operand::Value(0)),
                                         ordinary(target_opcode, Operand::Forward(exit)),
@@ -7197,6 +7236,7 @@ mod tests {
                                         .thread_forward_jumps_with_source_gates::<true, false>()
                                 );
                                 if target == entry
+                                    && labeled
                                     && copy_argument == 1
                                     && source_opcode != JUMP_FORWARD
                                 {
