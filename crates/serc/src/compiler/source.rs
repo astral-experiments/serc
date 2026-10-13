@@ -1704,7 +1704,8 @@ impl Compiler<'_> {
                     }
                 }
             }
-            _ => literal_constant(expression),
+            _ if is_literal_constant(expression) => literal_constant(expression),
+            _ => None,
         };
         let modern = self.context.python_version >= crate::PythonVersion::Py314;
         let constant = fold_constant_with_profile(
