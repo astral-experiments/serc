@@ -1046,6 +1046,15 @@ impl OptimizationPipeline {
                         let Item::Instruction(instruction) = *graph.item(position) else {
                             return None;
                         };
+                        // Only an opposite-polarity target can need a new fallthrough label.
+                        if SOURCE_GATES {
+                            let target = instruction.forward_target()?;
+                            let target =
+                                conditional_targets.get(target.index()).copied().flatten()?;
+                            if instruction.opcode == target.opcode {
+                                return None;
+                            }
+                        }
                         value_preserving_jump(graph, &positions, index)?;
                         let target = instruction.forward_target()?;
                         let target = conditional_targets.get(target.index()).copied().flatten()?;
@@ -1084,6 +1093,18 @@ impl OptimizationPipeline {
                 }
 
                 for (index, position) in positions.iter().copied().enumerate() {
+                    // Unindexed targets cannot change this jump or its owner records.
+                    if SOURCE_GATES
+                        && !self
+                            .graph
+                            .item(position)
+                            .as_instruction()
+                            .and_then(Instruction::forward_target)
+                            .and_then(|target| conditional_targets.get(target.index()))
+                            .is_some_and(Option::is_some)
+                    {
+                        continue;
+                    }
                     let Some(value_jump) = value_preserving_jump(&self.graph, &positions, index)
                     else {
                         continue;
@@ -7108,6 +7129,85 @@ mod tests {
                     },
                     "{incoming}: {mutation}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn value_jump_source_gates_match_full_pattern_scans() {
+        let [start, entry, exit, missing] = [0, 1, 2, 9].map(Label::from_u32);
+        let location = SourceLocation::new(5, 5, 0, 1);
+        let ordinary = |opcode, operand| {
+            Item::Instruction(Instruction::new(opcode, operand, location, Some(1)))
+        };
+        for python_version in [
+            crate::PythonVersion::Py312,
+            crate::PythonVersion::Py313,
+            crate::PythonVersion::Py314,
+            crate::PythonVersion::Py315,
+        ] {
+            for source_opcode in [POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE, JUMP_FORWARD] {
+                for target_opcode in [POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE] {
+                    for target in [entry, exit, missing] {
+                        for copy_argument in [1, 2] {
+                            for padded in [false, true] {
+                                let make = || {
+                                    let mut marker = Instruction::new(
+                                        NOT_TAKEN,
+                                        Operand::Value(0),
+                                        location,
+                                        Some(1),
+                                    );
+                                    marker.set_exception_owner(NormalizedExceptionOwner::Dynamic);
+                                    let mut items = vec![
+                                        Item::Label(start),
+                                        ordinary(LOAD_CONST, Operand::Value(0)),
+                                        ordinary(COPY, Operand::Value(copy_argument)),
+                                    ];
+                                    if padded {
+                                        items.push(ordinary(NOP, Operand::Value(0)));
+                                    }
+                                    items.extend([
+                                        ordinary(TO_BOOL, Operand::Value(0)),
+                                        ordinary(source_opcode, Operand::Forward(target)),
+                                        Item::Instruction(marker),
+                                        ordinary(POP_TOP, Operand::Value(0)),
+                                        ordinary(LOAD_CONST, Operand::Value(1)),
+                                        Item::Label(entry),
+                                        ordinary(COPY, Operand::Value(1)),
+                                        ordinary(TO_BOOL, Operand::Value(0)),
+                                        ordinary(target_opcode, Operand::Forward(exit)),
+                                        Item::Instruction(marker),
+                                        ordinary(POP_TOP, Operand::Value(0)),
+                                        ordinary(LOAD_CONST, Operand::Value(2)),
+                                        Item::Label(exit),
+                                        ordinary(RETURN_VALUE, Operand::Value(0)),
+                                    ]);
+                                    let mut assembler = Assembler::from_linear_items(items);
+                                    assembler.python_version = python_version;
+                                    assembler.next_label = 10;
+                                    assembler.into_optimization_pipeline()
+                                };
+                                let mut actual = make();
+                                let mut expected = make();
+                                let changed = actual.thread_forward_jumps();
+                                assert_eq!(
+                                    changed,
+                                    expected
+                                        .thread_forward_jumps_with_source_gates::<true, false>()
+                                );
+                                if target == entry
+                                    && copy_argument == 1
+                                    && source_opcode != JUMP_FORWARD
+                                {
+                                    assert!(changed);
+                                }
+                                assert_eq!(actual.graph.copy_items(), expected.graph.copy_items());
+                                assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+                            }
+                        }
+                    }
+                }
             }
         }
     }
