@@ -3259,8 +3259,8 @@ mod snapshots;
 #[cfg(test)]
 mod wire_reference_tests {
     use super::{
-        CachedObject, Object, ObjectGraph, ObjectId, ObjectReference, Occurrence,
-        OccurrenceCursor, OccurrenceKind, ReferenceMode,
+        CachedObject, Object, ObjectGraph, ObjectId, ObjectReference, Occurrence, OccurrenceCursor,
+        OccurrenceKind, ReferenceMode,
     };
 
     #[test]
