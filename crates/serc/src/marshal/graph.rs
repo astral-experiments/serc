@@ -757,7 +757,7 @@ impl<'a> ObjectGraph<'a> {
             .filter(|index| *index < self.metadata_slots.len())
         {
             if let Some(id) = self.metadata_slots[index] {
-                self.objects_by_id[id].reference_required = true;
+                debug_assert!(self.objects_by_id[id].reference_required);
                 return (id, false);
             }
             let id = self.new_interned_string();
@@ -767,7 +767,7 @@ impl<'a> ObjectGraph<'a> {
         match self.interned_strings.entry(value) {
             Entry::Occupied(entry) => {
                 let id = *entry.get();
-                self.objects_by_id[id].reference_required = true;
+                debug_assert!(self.objects_by_id[id].reference_required);
                 (id, false)
             }
             Entry::Vacant(entry) => {
@@ -863,7 +863,7 @@ impl<'a> ObjectGraph<'a> {
         };
         if let Some(slot) = direct_slot {
             if let Some(id) = *slot {
-                self.objects_by_id[id].reference_required = true;
+                debug_assert!(self.objects_by_id[id].reference_required);
                 return (id, false);
             }
             let id = self.objects_by_id.next_index();
@@ -880,7 +880,7 @@ impl<'a> ObjectGraph<'a> {
             vec![None; cached_scalar_slots(self.python_version)].into_boxed_slice()
         })[cached.scalar_index(self.python_version)];
         if let Some(id) = *slot {
-            self.objects_by_id[id].reference_required = true;
+            debug_assert!(self.objects_by_id[id].reference_required);
             return (id, false);
         }
 
@@ -3259,9 +3259,42 @@ mod snapshots;
 #[cfg(test)]
 mod wire_reference_tests {
     use super::{
-        Object, ObjectId, ObjectReference, Occurrence, OccurrenceCursor, OccurrenceKind,
-        ReferenceMode,
+        CachedObject, Object, ObjectGraph, ObjectId, ObjectReference, Occurrence, OccurrenceCursor,
+        OccurrenceKind, ReferenceMode,
     };
+
+    #[test]
+    fn cached_and_interned_objects_require_references_on_first_visit() {
+        for python_version in [
+            crate::PythonVersion::Py312,
+            crate::PythonVersion::Py313,
+            crate::PythonVersion::Py314,
+            crate::PythonVersion::Py315,
+        ] {
+            let mut graph = ObjectGraph {
+                python_version,
+                ..ObjectGraph::default()
+            };
+            for cached in [
+                CachedObject::EmptyBytes,
+                CachedObject::EmptyTuple,
+                CachedObject::Int(0),
+                CachedObject::Int(16),
+                CachedObject::SignedInt(0),
+                CachedObject::Byte(b'a'),
+                CachedObject::Character(b'a'),
+            ] {
+                let (id, first) = graph.record_cached(cached);
+                assert!(first);
+                assert!(graph.is_shared_object(id));
+                assert_eq!(graph.record_cached(cached), (id, false));
+            }
+            let (id, first) = graph.interned_string("identifier");
+            assert!(first);
+            assert!(graph.is_shared_object(id));
+            assert_eq!(graph.interned_string("identifier"), (id, false));
+        }
+    }
 
     #[test]
     fn occurrence_iterators_keep_kind_and_completeness_checks() {
