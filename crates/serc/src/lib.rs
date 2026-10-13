@@ -957,7 +957,7 @@ fn compile_normalized(
         &options.initial_intern_state,
     )?;
     Ok(CompiledModule {
-        code: Box::new(code),
+        code,
         python_version: options.python_version,
         initial_intern_state: options.initial_intern_state.clone(),
     })

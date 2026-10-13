@@ -4346,7 +4346,7 @@ impl Compiler<'_> {
         if !closure_names.is_empty() {
             self.emit_closure_tuple(&closure_names)?;
         }
-        let constant = self.add_constant(Constant::Code(Box::new(child)))?;
+        let constant = self.add_constant(Constant::Code(child))?;
         self.emit(LOAD_CONST, constant, 1)?;
         let flags = if closure_names.is_empty() {
             0

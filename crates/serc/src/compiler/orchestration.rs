@@ -640,7 +640,7 @@ impl<'source> Compiler<'source> {
     pub(crate) fn compile_module(
         mut self: Box<Self>,
         body: &Suite,
-    ) -> Result<CodeObject, CompileError> {
+    ) -> Result<Box<CodeObject>, CompileError> {
         self.assembler.reserve_items(body.len().saturating_mul(16));
         if self.context.python_version == PythonVersion::Py312 {
             if super::legacy_native_seed_bound::certifies(body) {
@@ -836,7 +836,7 @@ impl<'source> Compiler<'source> {
             let annotation_child = self.compile_module_annotations(annotation_body)?;
             self.output.deferred_constants_before_return.insert(
                 constant_position,
-                (instruction, Constant::Code(Box::new(annotation_child))),
+                (instruction, Constant::Code(annotation_child)),
             );
         }
         let add_implicit_return =
@@ -868,7 +868,7 @@ impl<'source> Compiler<'source> {
     pub(super) fn compile_function_body(
         mut self: Box<Self>,
         body: &Suite,
-    ) -> Result<CodeObject, CompileError> {
+    ) -> Result<Box<CodeObject>, CompileError> {
         self.assembler.reserve_items(body.len().saturating_mul(16));
         if self.context.python_version == PythonVersion::Py312 {
             if super::legacy_native_seed_bound::certifies(body) {
@@ -1019,7 +1019,7 @@ impl<'source> Compiler<'source> {
     pub(super) fn compile_class_body(
         mut self: Box<Self>,
         body: &Suite,
-    ) -> Result<CodeObject, CompileError> {
+    ) -> Result<Box<CodeObject>, CompileError> {
         if self.context.python_version != PythonVersion::Py312 {
             self.context.begin_class_static_attributes();
         }
@@ -1213,7 +1213,7 @@ impl<'source> Compiler<'source> {
             self.assembler
                 .set_location(SourceLocation::new(line, line, 0, 0));
             self.emit_closure_tuple(&closure_names)?;
-            let annotation = self.add_constant(Constant::Code(Box::new(annotation_child)))?;
+            let annotation = self.add_constant(Constant::Code(annotation_child))?;
             self.emit(LOAD_CONST, annotation, 1)?;
             self.emit(MAKE_FUNCTION, 0, 0)?;
             self.emit_function_attribute(FunctionAttribute::CLOSURE)?;
@@ -1275,14 +1275,14 @@ impl<'source> Compiler<'source> {
         }
     }
 
-    pub(super) fn finish(self: Box<Self>) -> Result<CodeObject, CompileError> {
+    pub(super) fn finish(self: Box<Self>) -> Result<Box<CodeObject>, CompileError> {
         self.finish_inner(true)
     }
 
     pub(super) fn finish_inner(
         mut self: Box<Self>,
         add_implicit_return: bool,
-    ) -> Result<CodeObject, CompileError> {
+    ) -> Result<Box<CodeObject>, CompileError> {
         for (instruction, constant) in
             std::mem::take(&mut self.output.deferred_constants_before_return)
         {
@@ -1568,7 +1568,7 @@ impl<'source> Compiler<'source> {
             output_names.len(),
             output_locals.len(),
         );
-        let mut code = CodeObject {
+        let mut code = Box::new(CodeObject {
             arg_count: self.unit.arg_count,
             positional_only_arg_count: self.unit.positional_only_arg_count,
             keyword_only_arg_count: self.unit.keyword_only_arg_count,
@@ -1618,7 +1618,7 @@ impl<'source> Compiler<'source> {
                 metadata_alias_scan_unnecessary: false,
                 fresh_empty_bytes_constant: self.context.fresh_empty_bytes_constant(),
             },
-        };
+        });
         code.marshal_provenance.table_hashes = Some([
             crate::marshal::bytes_hash(&code.line_table),
             crate::marshal::bytes_hash(&code.exception_table),

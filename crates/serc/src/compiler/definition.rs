@@ -56,6 +56,9 @@ impl CompiledFunctionDefaults {
     }
 }
 
+/// A compiled annotation thunk and the names captured by its closure.
+type CompiledAnnotations = (Box<CodeObject>, Vec<NameId>);
+
 impl Compiler<'_> {
     /// Class bindings apply to direct annotation loads; nested functions and comprehensions retain captures.
     fn class_visible_annotation_requirements(
@@ -644,7 +647,7 @@ impl Compiler<'_> {
         if !closure_names.is_empty() {
             self.emit_closure_tuple(&closure_names)?;
         }
-        let constant = self.add_constant(Constant::Code(Box::new(child)))?;
+        let constant = self.add_constant(Constant::Code(child))?;
         self.emit(LOAD_CONST, constant, 1)?;
         let mut flags = 0;
         if !closure_names.is_empty() {
@@ -682,7 +685,7 @@ impl Compiler<'_> {
     /// Create a function after placing its closure below the code object.
     pub(super) fn emit_function_with_closure(
         &mut self,
-        code: CodeObject,
+        code: Box<CodeObject>,
         closure_names: &[NameId],
     ) -> Result<(), CompileError> {
         let indices = closure_names
@@ -695,13 +698,13 @@ impl Compiler<'_> {
     /// Create a function with a closure resolved across explicit lexical contexts.
     fn emit_function_with_closure_indices(
         &mut self,
-        code: CodeObject,
+        code: Box<CodeObject>,
         indices: &[u32],
     ) -> Result<(), CompileError> {
         if !indices.is_empty() {
             self.emit_closure_indices(indices)?;
         }
-        let code = self.add_constant(Constant::Code(Box::new(code)))?;
+        let code = self.add_constant(Constant::Code(code))?;
         self.emit(LOAD_CONST, code, 1)?;
         self.emit_make_function(if indices.is_empty() {
             0
@@ -1779,7 +1782,7 @@ impl Compiler<'_> {
                 self.emit_closure_tuple(&closure_names)?;
             }
         }
-        let code = self.add_constant(Constant::Code(Box::new(child)))?;
+        let code = self.add_constant(Constant::Code(child))?;
         self.emit(LOAD_CONST, code, 1)?;
         if !closure_names.is_empty() {
             flags |= FunctionAttribute::CLOSURE.argument();
@@ -1848,7 +1851,7 @@ impl Compiler<'_> {
         &self,
         definition: &StmtFunctionDef,
         function_plan: &LoweringFunctionPlan,
-    ) -> Result<Option<(CodeObject, Vec<NameId>)>, CompileError> {
+    ) -> Result<Option<CompiledAnnotations>, CompileError> {
         let annotations = function_annotations(definition, self.context.python_version);
         if annotations.is_empty() {
             return Ok(None);
@@ -2013,7 +2016,7 @@ impl Compiler<'_> {
     pub(super) fn compile_class_annotations(
         &self,
         body: &[Stmt],
-    ) -> Result<Option<(CodeObject, Vec<NameId>)>, CompileError> {
+    ) -> Result<Option<CompiledAnnotations>, CompileError> {
         let mut annotations = Vec::new();
         collect_simple_annotations(body, &mut annotations);
         if annotations.is_empty() {
@@ -2164,7 +2167,7 @@ impl Compiler<'_> {
     pub(super) fn compile_module_annotations(
         &self,
         body: &[Stmt],
-    ) -> Result<CodeObject, CompileError> {
+    ) -> Result<Box<CodeObject>, CompileError> {
         let mut annotations = Vec::new();
         collect_simple_annotations(body, &mut annotations);
         let first = annotations.first().ok_or_else(|| {
