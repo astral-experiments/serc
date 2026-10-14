@@ -190,6 +190,15 @@ fn compiler_scaling(criterion: &mut Criterion) {
         }
     }
 
+    for count in [64, 256] {
+        let mut membership = String::from("def work(value):\n    return value in {");
+        for index in 0..count {
+            write!(membership, "{index},").unwrap();
+        }
+        membership.push_str("}\n");
+        workloads.push(("integer_set_membership", count, membership));
+    }
+
     for (name, python_version) in [
         ("compile_pyc_scaling_3_12", serc::PythonVersion::Py312),
         ("compile_pyc_scaling_3_13", serc::PythonVersion::Py313),
