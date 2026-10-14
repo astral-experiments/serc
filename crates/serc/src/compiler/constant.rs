@@ -3,6 +3,7 @@ use std::borrow::{Borrow, Cow};
 use std::collections::hash_map::Entry;
 use std::hash::{Hash, Hasher};
 
+use hashbrown::HashTable;
 use ruff_python_ast::visitor::{Visitor, walk_expr, walk_pattern, walk_stmt};
 use ruff_python_ast::{
     BoolOp, Expr, ExprBinOp, ExprContext, ExprStringLiteral, ExprUnaryOp, FStringPartRef,
@@ -1673,12 +1674,42 @@ pub(super) fn unique_frozenset_constants<T: Borrow<Constant>>(
 ) -> Vec<Constant> {
     let constants = constants.into_iter();
     let mut unique = Vec::with_capacity(constants.size_hint().0);
+    let mut strings: Option<HashTable<(u64, usize)>> = None;
     for constant in constants {
-        if !unique
-            .iter()
-            .any(|existing| python_constant_values_equal(existing, constant.borrow()))
-        {
-            unique.push(into_constant(constant));
+        let value = constant.borrow();
+        // Strings cannot compare equal to another constant variant.
+        let duplicate =
+            if matches!(value, Constant::String(_)) && unique.len() >= CONSTANT_INDEX_THRESHOLD {
+                let strings = strings.get_or_insert_with(|| {
+                    let mut strings = HashTable::new();
+                    for (index, existing) in unique.iter().enumerate() {
+                        if matches!(existing, Constant::String(_)) {
+                            let hash = constant_pool_fingerprint(existing).unwrap();
+                            strings.insert_unique(hash, (hash, index), |&(hash, _)| hash);
+                        }
+                    }
+                    strings
+                });
+                let hash = constant_pool_fingerprint(value).unwrap();
+                strings
+                    .find(hash, |&(_, index)| {
+                        python_constant_values_equal(&unique[index], value)
+                    })
+                    .is_some()
+            } else {
+                unique
+                    .iter()
+                    .any(|existing| python_constant_values_equal(existing, value))
+            };
+        if !duplicate {
+            let value = into_constant(constant);
+            if let Some(strings) = &mut strings
+                && matches!(value, Constant::String(_))
+            {
+                let hash = constant_pool_fingerprint(&value).unwrap();
+                strings.insert_unique(hash, (hash, unique.len()), |&(hash, _)| hash);
+            }
+            unique.push(value);
         }
     }
     unique
@@ -4538,7 +4569,8 @@ mod tests {
     use super::{
         CONSTANT_INDEX_THRESHOLD, ConstantEquality, ConstantIndices, ConstantPool,
         FORCE_GENERIC_CONSTANT_ADMISSION, NAME_INDEX_THRESHOLD, OutputState,
-        constant_pool_fingerprint, fold_complex_arithmetic,
+        constant_pool_fingerprint, fold_complex_arithmetic, python_constant_values_equal,
+        unique_frozenset_constants,
     };
     use crate::code_object::{
         CodeObject, Constant, LocalsIdentity, MarshalMetadataIds, MarshalProvenance, MetadataId,
@@ -4951,6 +4983,49 @@ def outer(argument):
             constant_pool_fingerprint(&first),
             constant_pool_fingerprint(&different)
         );
+    }
+
+    #[test]
+    fn frozenset_string_indices_preserve_first_representatives() {
+        let mut values = vec![
+            Constant::Bool(true),
+            Constant::Int(1),
+            Constant::Float(1.0),
+            Constant::Float(-0.0),
+            Constant::Int(0),
+            Constant::Tuple(vec![Constant::Bool(true)]),
+            Constant::Tuple(vec![Constant::Int(1)]),
+            Constant::Bytes(b"member 0".to_vec()),
+            Constant::SurrogateString(b"member 0".to_vec()),
+        ];
+        for index in 0..64 {
+            values.push(Constant::String(format!("member {index}")));
+            values.push(Constant::String(format!("member {}", index / 2)));
+            values.push(Constant::Int(1));
+        }
+        for prefix in 0..=values.len() {
+            let mut expected = Vec::new();
+            for value in &values[..prefix] {
+                if !expected
+                    .iter()
+                    .any(|existing| python_constant_values_equal(existing, value))
+                {
+                    expected.push(value.clone());
+                }
+            }
+            for actual in [
+                unique_frozenset_constants(&values[..prefix], Constant::clone),
+                unique_frozenset_constants(values[..prefix].to_vec(), std::convert::identity),
+            ] {
+                assert_eq!(actual.len(), expected.len());
+                assert!(
+                    actual
+                        .iter()
+                        .zip(&expected)
+                        .all(|(left, right)| { ConstantEquality::PoolKey.equal(left, right) })
+                );
+            }
+        }
     }
 
     #[test]
