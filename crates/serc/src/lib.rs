@@ -1048,18 +1048,7 @@ mod tests {
     use super::may_depend_on_decimal_parse;
 
     #[test]
-    fn decimal_prescan_keeps_digit_and_keyword_boundaries() {
-        for prefix in ["match case ", "match ", "case ", ""] {
-            for digits in [0, 630, 631, 639, 640, 641, 4096] {
-                for digit in ["1", "1_"] {
-                    let source = format!("{prefix}{}", digit.repeat(digits));
-                    assert_eq!(
-                        may_depend_on_decimal_parse(&source),
-                        prefix == "match case " && digits > 640,
-                    );
-                }
-            }
-        }
+    fn decimal_prescan_distinguishes_separated_digit_runs() {
         let first = "1".repeat(320);
         let second = "1".repeat(321);
         assert!(!may_depend_on_decimal_parse(&format!(

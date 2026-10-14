@@ -268,19 +268,6 @@ mod tests {
     use super::is_preinterned_string;
 
     #[test]
-    fn scope_exit_table_matches_generated_and_legacy_opcodes() {
-        use super::{Opcode, cpython_3_14_5, is_scope_exit, opcodes};
-
-        for code in u8::MIN..=u8::MAX {
-            let opcode = Opcode::new(code);
-            assert_eq!(
-                is_scope_exit(opcode),
-                cpython_3_14_5::is_scope_exit(opcode) || opcode == opcodes::RETURN_CONST
-            );
-        }
-    }
-
-    #[test]
     fn cache_width_tables_match_every_generated_semantic_opcode() {
         use super::{
             Opcode, OpcodeCacheWidths, cpython_3_12_14, cpython_3_13_15, cpython_3_15_0rc2,

@@ -500,9 +500,8 @@ impl Assembler {
         let mut exception_owner_provenance = self.exception_owner_provenance;
         // The certified linear path has no exception table to replay these records.
         if !self.exception_regions.is_empty() && !self.original_pass_nops.is_empty() {
-            exception_owner_provenance
-                .original_pass_nops
-                .extend(self.original_pass_nops);
+            debug_assert_eq!(exception_owner_provenance.original_pass_nops.len(), 0);
+            exception_owner_provenance.original_pass_nops = self.original_pass_nops;
         }
         Ok(LayoutAssembler {
             python_version: self.python_version,

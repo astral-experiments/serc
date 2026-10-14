@@ -1074,18 +1074,17 @@ impl OptimizationPipeline {
                             return None;
                         };
                         // Only an opposite-polarity target can need a new fallthrough label.
-                        if SOURCE_GATES {
-                            let target = instruction.forward_target()?;
-                            let target =
-                                conditional_targets.get(target.index()).copied().flatten()?;
-                            if instruction.opcode == target.opcode {
-                                return None;
-                            }
+                        let target = instruction
+                            .forward_target()
+                            .and_then(|target| conditional_targets.get(target.index()))
+                            .copied()
+                            .flatten()
+                            .filter(|target| instruction.opcode != target.opcode);
+                        if SOURCE_GATES && target.is_none() {
+                            return None;
                         }
                         value_preserving_jump(graph, &positions, index)?;
-                        let target = instruction.forward_target()?;
-                        let target = conditional_targets.get(target.index()).copied().flatten()?;
-                        (instruction.opcode != target.opcode).then_some(target.fallthrough_index)
+                        target.map(|target| target.fallthrough_index)
                     })
                     .collect::<Vec<_>>();
                 fallthrough_indices.sort_unstable();
