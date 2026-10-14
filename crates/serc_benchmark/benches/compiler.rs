@@ -1,10 +1,11 @@
+use std::fmt::Write;
 use std::hint::black_box;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use serc_benchmark::criterion::{
-    BatchSize, Criterion, Throughput, criterion_group, criterion_main,
+    BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
 };
 use serc_benchmark::{
     COMPILE_MICRO_WORKLOADS, COMPOSITE_WORKLOADS, LARGE_WORKLOADS, MARSHAL_MICRO_WORKLOADS,
@@ -120,11 +121,67 @@ fn compile_pyc_optimized(criterion: &mut Criterion) {
     }
 }
 
+fn compiler_scaling(criterion: &mut Criterion) {
+    let mut workloads = Vec::new();
+    for count in [32, 128] {
+        let mut exceptions = String::from("def work(x):\n");
+        let mut comprehensions = String::from("def work(xs):\n");
+        for index in 0..count {
+            writeln!(
+                exceptions,
+                "    try:\n        x({index})\n    except ValueError:\n        x(-{})",
+                index + 1,
+            )
+            .unwrap();
+            writeln!(
+                comprehensions,
+                "    value_{index} = [y + {index} for y in xs if y]",
+            )
+            .unwrap();
+        }
+        exceptions.push_str("    return x\n");
+        writeln!(comprehensions, "    return value_{}", count - 1).unwrap();
+        workloads.push(("exceptions", count, exceptions));
+        workloads.push(("comprehensions", count, comprehensions));
+    }
+
+    for (name, python_version) in [
+        ("compile_pyc_scaling_3_12", serc::PythonVersion::Py312),
+        ("compile_pyc_scaling_3_13", serc::PythonVersion::Py313),
+        ("compile_pyc_scaling_3_14", serc::PythonVersion::Py314),
+        ("compile_pyc_scaling_3_15", serc::PythonVersion::Py315),
+    ] {
+        let options = serc::CompileOptions {
+            python_version,
+            ..serc::CompileOptions::default()
+        };
+        let mut group = criterion.benchmark_group(name);
+        for (shape, count, source) in &workloads {
+            let source_size = u32::try_from(source.len())
+                .expect("benchmark source must fit in a PYC source-size field");
+            group.throughput(Throughput::Bytes(source.len() as u64));
+            group.bench_function(BenchmarkId::new(*shape, count), |bencher| {
+                bencher.iter(|| {
+                    let module = serc::compile_with_options(
+                        black_box(source),
+                        black_box("benchmark/scaling.py"),
+                        black_box(&options),
+                    )
+                    .unwrap();
+                    black_box(module.to_timestamp_pyc(0, source_size));
+                });
+            });
+        }
+        group.finish();
+    }
+}
+
 criterion_group!(
     benches,
     compiler,
     marshal,
     compile_pyc,
-    compile_pyc_optimized
+    compile_pyc_optimized,
+    compiler_scaling
 );
 criterion_main!(benches);

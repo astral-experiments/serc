@@ -5,14 +5,16 @@ and committed lockfile.
 
 ## Criterion
 
-The benchmark groups measure fixed workloads through Serc's public API:
+The benchmark groups measure fixed and generated workloads through Serc's public
+API:
 
-| Group                              | Timed work                                                                     | Per-iteration setup and cleanup                          |
-| ---------------------------------- | ------------------------------------------------------------------------------ | -------------------------------------------------------- |
-| `compile`                          | Compile source into a fresh module                                             | Module cleanup is outside timing                         |
-| `marshal`                          | Marshal a newly compiled module exactly once                                   | Compilation and module/output cleanup are outside timing |
-| `compile_pyc`                      | Compile source, encode one timestamp PYC in memory, and drop the module/output | All work is timed; no disk I/O                           |
-| `compile_pyc_O1`, `compile_pyc_O2` | The same one-shot PYC workflow at optimization levels 1 and 2                  | All work is timed; no disk I/O                           |
+| Group                                                         | Timed work                                                                     | Per-iteration setup and cleanup                          |
+| ------------------------------------------------------------- | ------------------------------------------------------------------------------ | -------------------------------------------------------- |
+| `compile`                                                     | Compile source into a fresh module                                             | Module cleanup is outside timing                         |
+| `marshal`                                                     | Marshal a newly compiled module exactly once                                   | Compilation and module/output cleanup are outside timing |
+| `compile_pyc`                                                 | Compile source, encode one timestamp PYC in memory, and drop the module/output | All work is timed; no disk I/O                           |
+| `compile_pyc_O1`, `compile_pyc_O2`                            | The same one-shot PYC workflow at optimization levels 1 and 2                  | All work is timed; no disk I/O                           |
+| `compile_pyc_scaling_3_12` through `compile_pyc_scaling_3_15` | One-shot PYC generation for growing functions on each Python target            | Source generation is outside timing                      |
 
 `marshal` compiles a fresh module during batch setup for every iteration,
 including warmup. It does not reuse or clone a previously serialized module.
@@ -22,6 +24,10 @@ into compilation, and includes cleanup costs that phase-isolated measurements
 exclude. It covers all compile and marshal workloads, including the large
 fixture. The original groups use optimization level 0; `compile_pyc_O1` and
 `compile_pyc_O2` use the same workloads with explicit optimization levels.
+
+The scaling groups compile functions with 32 and 128 sequential exception
+regions or comprehensions at optimization level 0. Each shape runs on Python
+3.12 through 3.15, including compilation, PYC encoding, and cleanup.
 
 ```console
 CARGO_INCREMENTAL=0 cargo bench --locked --profile profiling -p serc_benchmark --bench compiler --no-default-features --features benchmarks
