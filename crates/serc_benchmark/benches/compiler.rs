@@ -159,6 +159,14 @@ fn compiler_scaling(criterion: &mut Criterion) {
         workloads.push(("async_with", count, async_with));
         workloads.push(("mapping_captures", count, mapping));
     }
+    for count in [64, 256] {
+        let mut membership = String::from("def work(value):\n    return value in {");
+        for index in 0..count {
+            write!(membership, "'member {index}',").unwrap();
+        }
+        membership.push_str("}\n");
+        workloads.push(("string_set_membership", count, membership));
+    }
 
     for (name, python_version) in [
         ("compile_pyc_scaling_3_12", serc::PythonVersion::Py312),
