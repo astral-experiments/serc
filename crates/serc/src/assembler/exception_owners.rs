@@ -3527,30 +3527,40 @@ impl ExceptionOwnerProvenance {
 
 impl LayoutAssembler {
     /// Keeps only the unchanged `SEND` entry immediately before its authored async setup.
-    fn original_async_with_setups(&self) -> FxHashSet<Label> {
-        let mut result = FxHashSet::default();
-        for origin in &self.exception_owner_provenance.async_with_setups {
-            let Some(first) = origin.prefix.first() else {
-                continue;
-            };
-            let mut entries = self
+    fn original_async_with_setups<const INDEX_ORIGINS: bool>(
+        &self,
+        unique_labels: &OnceCell<UniqueLabelPositions>,
+    ) -> FxHashSet<Label> {
+        let origins = &self.exception_owner_provenance.async_with_setups;
+        let unique_position = |first: &Item| {
+            if INDEX_ORIGINS
+                && let Item::Label(label) = first
+                && (origins.len() > 1 || unique_labels.get().is_some())
+            {
+                return unique_labels
+                    .get_or_init(|| UniqueLabelPositions::new(&self.items))
+                    .get(*label)
+                    .map(|(index, _)| index);
+            }
+            let mut matches = self
                 .items
                 .iter()
                 .enumerate()
                 .filter(|(_, item)| *item == first);
-            let Some((start, _)) = entries.next() else {
+            let (index, _) = matches.next()?;
+            matches.next().is_none().then_some(index)
+        };
+        let mut result = FxHashSet::default();
+        for origin in origins {
+            let Some(first) = origin.prefix.first() else {
+                continue;
+            };
+            let Some(start) = unique_position(first) else {
                 continue;
             };
             let end = start + origin.prefix.len();
-            if entries.next().is_some()
-                || self.items.get(start..end) != Some(origin.prefix.as_slice())
-                || self.items.get(end) != Some(&Item::Label(origin.setup))
-                || self
-                    .items
-                    .iter()
-                    .filter(|item| **item == Item::Label(origin.setup))
-                    .count()
-                    != 1
+            if self.items.get(start..end) != Some(origin.prefix.as_slice())
+                || unique_position(&Item::Label(origin.setup)) != Some(end)
                 || self
                     .exception_owner_provenance
                     .setups
@@ -3564,18 +3574,11 @@ impl LayoutAssembler {
             let Some(first_cleanup) = origin.cleanup.first() else {
                 continue;
             };
-            let mut cleanups = self
-                .items
-                .iter()
-                .enumerate()
-                .filter(|(_, item)| *item == first_cleanup);
-            let Some((cleanup_start, _)) = cleanups.next() else {
+            let Some(cleanup_start) = unique_position(first_cleanup) else {
                 continue;
             };
             let cleanup_end = cleanup_start + origin.cleanup.len();
-            if cleanups.next().is_some()
-                || self.items.get(cleanup_start..cleanup_end) != Some(origin.cleanup.as_slice())
-            {
+            if self.items.get(cleanup_start..cleanup_end) != Some(origin.cleanup.as_slice()) {
                 continue;
             }
             if let Some((label, instruction)) = origin.bridge {
@@ -3583,12 +3586,7 @@ impl LayoutAssembler {
                 // the original cleanup. Equal opcodes or locations are insufficient.
                 if self.items.get(cleanup_end..cleanup_end + 2)
                     != Some([Item::Label(label), Item::Instruction(instruction)].as_slice())
-                    || self
-                        .items
-                        .iter()
-                        .filter(|item| **item == Item::Label(label))
-                        .count()
-                        != 1
+                    || unique_position(&Item::Label(label)) != Some(cleanup_end)
                 {
                     continue;
                 }
@@ -6527,7 +6525,8 @@ impl LayoutAssembler {
         let original_value_jump_positions = self
             .exception_owner_provenance
             .original_value_jump_positions(&self.items, &unique_labels);
-        let original_async_with_setups = self.original_async_with_setups();
+        let original_async_with_setups =
+            self.original_async_with_setups::<GATE_DECISIONS>(&unique_labels);
         let setups: FxHashMap<_, _> = self
             .exception_owner_provenance
             .setups
@@ -14767,6 +14766,172 @@ mod tests {
         assert_eq!(owners.get(&missing), None);
         assert_eq!(owners[&dense_unique], 3);
         assert_eq!(owners[&sparse_unique], 4);
+    }
+
+    #[test]
+    fn async_setup_indexes_preserve_exact_origin_checks() {
+        use std::cell::OnceCell;
+
+        use super::{AsyncWithSetup, ExceptionOwnerProvenance, UniqueLabelPositions};
+        use crate::assembler::{
+            Instruction, Item, Label, LayoutAssembler, Operand, SourceLocation,
+        };
+        use crate::target::opcodes::{CLEANUP_THROW, END_SEND, JUMP_FORWARD, NOP, SEND};
+
+        for count in [1, 2] {
+            for label_base in [0, 1_000_000] {
+                for prefilled in [false, true] {
+                    for (case, accepted) in [
+                        ("original", true),
+                        ("instruction prefix", true),
+                        ("instruction cleanup", true),
+                        ("duplicate entry", false),
+                        ("duplicate cleanup", false),
+                        ("duplicate setup label", false),
+                        ("duplicate setup record", false),
+                        ("missing setup", false),
+                        ("changed prefix", false),
+                        ("empty prefix", false),
+                        ("empty cleanup", false),
+                        ("extra incoming jump", false),
+                        ("changed send", false),
+                        ("bridge", true),
+                        ("duplicate bridge", false),
+                        ("changed bridge", false),
+                    ] {
+                        let mut items = Vec::new();
+                        let mut provenance = ExceptionOwnerProvenance::default();
+                        for index in 0..count {
+                            let cleanup = Label::from_u32(label_base + index * 4);
+                            let entry = Label::from_u32(label_base + index * 4 + 1);
+                            let setup = Label::from_u32(label_base + index * 4 + 2);
+                            let location =
+                                SourceLocation::new(index as i32 + 1, index as i32 + 1, 0, 1);
+                            let send =
+                                Instruction::new(SEND, Operand::Forward(entry), location, None);
+                            let value = |opcode| {
+                                Item::Instruction(Instruction::new(
+                                    opcode,
+                                    Operand::Value(0),
+                                    location,
+                                    None,
+                                ))
+                            };
+                            let cleanup = vec![Item::Label(cleanup), value(CLEANUP_THROW)];
+                            let prefix = vec![Item::Label(entry), value(END_SEND)];
+                            items.push(Item::Instruction(send));
+                            items.extend_from_slice(&cleanup);
+                            items.extend_from_slice(&prefix);
+                            items.push(Item::Label(setup));
+                            provenance.setups.push((setup, None));
+                            provenance.async_with_setups.push(AsyncWithSetup {
+                                setup,
+                                send,
+                                prefix,
+                                cleanup,
+                                bridge: None,
+                            });
+                        }
+                        let origin = &mut provenance.async_with_setups[0];
+                        let entry = Label::from_u32(label_base + 1);
+                        let setup = origin.setup;
+                        match case {
+                            "original" => {}
+                            "instruction prefix" => {
+                                origin.prefix.remove(0);
+                                items.remove(3);
+                                origin.send.retarget(Operand::Forward(setup));
+                                items[0] = Item::Instruction(origin.send);
+                            }
+                            "instruction cleanup" => {
+                                origin.cleanup.remove(0);
+                                items.remove(1);
+                            }
+                            "duplicate entry" => items.push(Item::Label(entry)),
+                            "duplicate cleanup" => items.push(origin.cleanup[0]),
+                            "duplicate setup label" => items.push(Item::Label(setup)),
+                            "duplicate setup record" => provenance.setups.push((setup, None)),
+                            "missing setup" => {
+                                items.remove(5);
+                            }
+                            "changed prefix" => {
+                                let Item::Instruction(instruction) = &mut items[4] else {
+                                    unreachable!()
+                                };
+                                instruction.location.column += 1;
+                            }
+                            "empty prefix" => origin.prefix.clear(),
+                            "empty cleanup" => origin.cleanup.clear(),
+                            "extra incoming jump" => {
+                                items.push(Item::Instruction(Instruction::new(
+                                    JUMP_FORWARD,
+                                    Operand::Forward(entry),
+                                    origin.send.location,
+                                    None,
+                                )))
+                            }
+                            "changed send" => {
+                                let Item::Instruction(instruction) = &mut items[0] else {
+                                    unreachable!()
+                                };
+                                instruction.location.column += 1;
+                            }
+                            "bridge" | "duplicate bridge" | "changed bridge" => {
+                                let label = Label::from_u32(label_base + 3);
+                                let bridge = Instruction::new(
+                                    JUMP_FORWARD,
+                                    Operand::Forward(entry),
+                                    origin.send.location,
+                                    None,
+                                );
+                                origin.bridge = Some((label, bridge));
+                                items.splice(3..3, [Item::Label(label), Item::Instruction(bridge)]);
+                                if case == "duplicate bridge" {
+                                    items.push(Item::Label(label));
+                                }
+                                if case == "changed bridge" {
+                                    let Item::Instruction(instruction) = &mut items[4] else {
+                                        unreachable!()
+                                    };
+                                    instruction.opcode = NOP;
+                                }
+                            }
+                            _ => unreachable!(),
+                        }
+                        let assembler = LayoutAssembler {
+                            python_version: crate::PythonVersion::Py314,
+                            legacy_uniform_jump_seed: false,
+                            items,
+                            exception_regions: Vec::new(),
+                            exception_owner_provenance: Box::new(provenance).into(),
+                            preserved_block_boundaries: rustc_hash::FxHashSet::default(),
+                            removed_max_depth: None,
+                            next_label: label_base + count * 4,
+                            has_next_location: false,
+                        };
+                        let unique = OnceCell::new();
+                        if prefilled {
+                            unique.get_or_init(|| UniqueLabelPositions::new(&assembler.items));
+                        }
+                        let actual = assembler.original_async_with_setups::<true>(&unique);
+                        assert_eq!(
+                            actual,
+                            assembler.original_async_with_setups::<false>(&OnceCell::new()),
+                            "{case}, {count}, {label_base}, {prefilled}"
+                        );
+                        assert_eq!(actual.contains(&setup), accepted, "{case}");
+                        assert_eq!(
+                            actual.len(),
+                            count as usize - 1 + usize::from(accepted),
+                            "{case}"
+                        );
+                        if count == 1 && !prefilled {
+                            assert!(unique.get().is_none());
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
