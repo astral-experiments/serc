@@ -1531,22 +1531,12 @@ impl ConstantEquality {
     fn equal(self, left: &Constant, right: &Constant) -> bool {
         match (left, right) {
             (Constant::NonReflexive(left), Constant::NonReflexive(right)) => {
-                return left.key() == right.key();
+                left.key() == right.key()
             }
-            (Constant::Bool(left), Constant::Bool(right)) => return left == right,
-            (Constant::Int(left), Constant::Int(right)) => return left == right,
-            (Constant::SignedInt(left), Constant::SignedInt(right)) => return left == right,
-            _ => {}
-        }
-        if matches!(self, Self::PythonValue)
-            && let (Some((left_real, left_imag)), Some((right_real, right_imag))) =
-                (numeric_parts(left), numeric_parts(right))
-        {
-            return left_imag == right_imag && numeric_reals_equal(&left_real, &right_real);
-        }
-
-        match (left, right) {
             (Constant::None, Constant::None) | (Constant::Ellipsis, Constant::Ellipsis) => true,
+            (Constant::Bool(left), Constant::Bool(right)) => left == right,
+            (Constant::Int(left), Constant::Int(right)) => left == right,
+            (Constant::SignedInt(left), Constant::SignedInt(right)) => left == right,
             (
                 Constant::BigInt {
                     negative: left_negative,
@@ -1556,8 +1546,12 @@ impl ConstantEquality {
                     negative: right_negative,
                     digits: right_digits,
                 },
-            ) => left_negative == right_negative && left_digits == right_digits,
-            (Constant::Float(left), Constant::Float(right)) => left.to_bits() == right.to_bits(),
+            ) if matches!(self, Self::PoolKey) => {
+                left_negative == right_negative && left_digits == right_digits
+            }
+            (Constant::Float(left), Constant::Float(right)) if matches!(self, Self::PoolKey) => {
+                left.to_bits() == right.to_bits()
+            }
             (
                 Constant::Complex {
                     real: left_real,
@@ -1567,7 +1561,7 @@ impl ConstantEquality {
                     real: right_real,
                     imag: right_imag,
                 },
-            ) => {
+            ) if matches!(self, Self::PoolKey) => {
                 left_real.to_bits() == right_real.to_bits()
                     && left_imag.to_bits() == right_imag.to_bits()
             }
@@ -1610,7 +1604,16 @@ impl ConstantEquality {
                     && Self::PoolKey.equal(left_step, right_step)
             }
             (Constant::Code(left), Constant::Code(right)) => code_objects_equal(left, right),
-            (_, _) => false,
+            (_, _) => {
+                if matches!(self, Self::PythonValue)
+                    && let (Some((left_real, left_imag)), Some((right_real, right_imag))) =
+                        (numeric_parts(left), numeric_parts(right))
+                {
+                    left_imag == right_imag && numeric_reals_equal(&left_real, &right_real)
+                } else {
+                    false
+                }
+            }
         }
     }
 }
