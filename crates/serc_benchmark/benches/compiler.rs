@@ -144,6 +144,21 @@ fn compiler_scaling(criterion: &mut Criterion) {
         workloads.push(("exceptions", count, exceptions));
         workloads.push(("comprehensions", count, comprehensions));
     }
+    for count in [32, 128] {
+        let mut async_with = String::from("async def work(manager, f):\n");
+        let mut mapping = String::from("def work(x):\n    match x:\n        case {");
+        for index in 0..count {
+            writeln!(
+                async_with,
+                "    async with manager({index}) as value:\n        await f(value)",
+            )
+            .unwrap();
+            write!(mapping, "'key_{index}': value_{index},").unwrap();
+        }
+        mapping.push_str("}:\n            return value_0\n");
+        workloads.push(("async_with", count, async_with));
+        workloads.push(("mapping_captures", count, mapping));
+    }
 
     for (name, python_version) in [
         ("compile_pyc_scaling_3_12", serc::PythonVersion::Py312),

@@ -26,8 +26,9 @@ fixture. The original groups use optimization level 0; `compile_pyc_O1` and
 `compile_pyc_O2` use the same workloads with explicit optimization levels.
 
 The scaling groups compile functions with 32 and 128 sequential exception
-regions or comprehensions at optimization level 0. Each shape runs on Python
-3.12 through 3.15, including compilation, PYC encoding, and cleanup.
+regions, comprehensions, or async manager blocks, plus mapping patterns with
+32 and 128 captured values. Each shape runs on Python 3.12 through 3.15 at
+optimization level 0, including compilation, PYC encoding, and cleanup.
 
 ```console
 CARGO_INCREMENTAL=0 cargo bench --locked --profile profiling -p serc_benchmark --bench compiler --no-default-features --features benchmarks
