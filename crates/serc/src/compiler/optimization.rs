@@ -18,7 +18,10 @@ pub(crate) fn prepare(
     body: &Suite,
     level: OptimizationLevel,
     python_version: PythonVersion,
-) -> OptimizedSuite {
+) -> Option<OptimizedSuite> {
+    if !requires_optimization(body, level) {
+        return None;
+    }
     let optimizer = Optimizer {
         strip_docstrings: level == OptimizationLevel::Two,
         future_annotations: future_feature_flags(body) & CO_FUTURE_ANNOTATIONS != 0,
@@ -31,11 +34,77 @@ pub(crate) fn prepare(
         let mut body = body.clone();
         optimizer.scope_body(&mut body);
         optimizer.visit_body(&mut body);
-        OptimizedSuite {
+        Some(OptimizedSuite {
             body,
             locations: optimizer.locations.into_inner(),
-        }
+        })
     })
+}
+
+/// Keep the original tree when none of the preparation transforms can apply.
+fn requires_optimization(body: &Suite, level: OptimizationLevel) -> bool {
+    struct Changes {
+        strip_docstrings: bool,
+        found: bool,
+    }
+
+    impl Changes {
+        fn scope_body(&mut self, body: &[Stmt]) {
+            self.found |= self.strip_docstrings
+                && matches!(body.first(), Some(Stmt::Expr(statement))
+                    if statement.value.is_string_literal_expr());
+        }
+    }
+
+    impl<'ast> Visitor<'ast> for Changes {
+        fn visit_body(&mut self, body: &'ast [Stmt]) {
+            for statement in body {
+                if self.found {
+                    break;
+                }
+                self.visit_stmt(statement);
+            }
+        }
+
+        fn visit_stmt(&mut self, statement: &'ast Stmt) {
+            if self.found {
+                return;
+            }
+            match statement {
+                Stmt::Assert(_) => self.found = true,
+                Stmt::FunctionDef(function) => self.scope_body(&function.body),
+                Stmt::ClassDef(class) => self.scope_body(&class.body),
+                _ => {}
+            }
+            if !self.found {
+                ruff_python_ast::visitor::walk_stmt(self, statement);
+            }
+        }
+
+        fn visit_expr(&mut self, expression: &'ast Expr) {
+            if self.found {
+                return;
+            }
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_expr(expression));
+            }
+            if matches!(expression, Expr::Name(name)
+                if name.ctx == ExprContext::Load && name.id.as_str() == "__debug__")
+            {
+                self.found = true;
+            } else {
+                ruff_python_ast::visitor::walk_expr(self, expression);
+            }
+        }
+    }
+
+    let mut changes = Changes {
+        strip_docstrings: level == OptimizationLevel::Two,
+        found: false,
+    };
+    changes.scope_body(body);
+    changes.visit_body(body);
+    changes.found
 }
 
 pub(crate) struct OptimizedSuite {
@@ -183,6 +252,47 @@ impl Transformer for Optimizer {
             });
         } else {
             walk_expr(self, expression);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preparation_skips_only_unchanged_trees() {
+        let cases = [
+            ("value = 1\n", false, false),
+            ("def f(x):\n    return x\n", false, false),
+            ("class C:\n    value: int = 1\n", false, false),
+            ("value = 1\n'not a docstring'\n", false, false),
+            ("value = '__debug__'\n", false, false),
+            ("'module docstring'\nvalue = 1\n", false, true),
+            ("def f():\n    'function docstring'\n", false, true),
+            ("class C:\n    'class docstring'\n", false, true),
+            ("assert value\n", true, true),
+            ("def f():\n    assert value\n", true, true),
+            ("value = __debug__\n", true, true),
+            ("value = f'{__debug__}'\n", true, true),
+            ("value = lambda: __debug__\n", true, true),
+            ("value = [__debug__ for _ in items]\n", true, true),
+            (
+                "value = __\u{ff44}\u{ff45}\u{ff42}\u{ff55}\u{ff47}__\n",
+                true,
+                true,
+            ),
+        ];
+        for (source, one, two) in cases {
+            let parsed = ruff_python_parser::parse_module(source).unwrap();
+            for (level, expected) in [(OptimizationLevel::One, one), (OptimizationLevel::Two, two)]
+            {
+                assert_eq!(
+                    prepare(parsed.suite(), level, PythonVersion::Py314).is_some(),
+                    expected,
+                    "{source:?}, {level:?}"
+                );
+            }
         }
     }
 }

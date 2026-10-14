@@ -930,13 +930,15 @@ fn compile_normalized(
         options.optimization_level,
         mapping_key_int_max_str_digits,
     )?;
-    let optimized_body = (options.optimization_level != OptimizationLevel::Zero).then(|| {
+    let optimized_body = if options.optimization_level == OptimizationLevel::Zero {
+        None
+    } else {
         compiler::optimization::prepare(
             parsed.suite(),
             options.optimization_level,
             options.python_version,
         )
-    });
+    };
     let body = optimized_body
         .as_ref()
         .map_or_else(|| parsed.suite(), |optimized| &optimized.body);
