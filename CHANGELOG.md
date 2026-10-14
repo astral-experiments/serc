@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.1.5
+
+Released on 2026-10-14.
+
+Serc 0.1.5 improves compilation performance and reduces memory use when
+compiling for Python 3.12.
+
+### Performance
+
+- Speed up `-O` and `-OO` compilation when the syntax tree needs no changes
+  (astral-sh/serc#1275; https://github.com/astral-sh/serc/pull/1275)
+- Speed up compilation of functions with many sequential `try`/`except` blocks
+  on Python 3.12 (astral-sh/serc#1277;
+  https://github.com/astral-sh/serc/pull/1277)
+- Speed up compilation of mapping patterns with many captures on Python 3.14 and
+  3.15 (astral-sh/serc#1284; https://github.com/astral-sh/serc/pull/1284)
+- Speed up compilation of functions with many async context managers
+  (astral-sh/serc#1281; https://github.com/astral-sh/serc/pull/1281)
+- Reduce source-validation overhead when targeting Python 3.12 and 3.13
+  (astral-sh/serc#1279; https://github.com/astral-sh/serc/pull/1279)
+- Reduce memory use when compiling for Python 3.12 (astral-sh/serc#1280;
+  https://github.com/astral-sh/serc/pull/1280)
+- Reduce code-object construction and copying overhead (astral-sh/serc#1262;
+  https://github.com/astral-sh/serc/pull/1262) (astral-sh/serc#1263;
+  https://github.com/astral-sh/serc/pull/1263) (astral-sh/serc#1265;
+  https://github.com/astral-sh/serc/pull/1265)
+- Reduce scope-analysis and closure-lowering overhead (astral-sh/serc#1260;
+  https://github.com/astral-sh/serc/pull/1260) (astral-sh/serc#1261;
+  https://github.com/astral-sh/serc/pull/1261)
+- Reduce allocations during control-flow analysis (astral-sh/serc#1273;
+  https://github.com/astral-sh/serc/pull/1273)
+- Reduce assembler overhead for jumps, source locations, and instruction
+  processing (astral-sh/serc#1268; https://github.com/astral-sh/serc/pull/1268)
+  (astral-sh/serc#1269; https://github.com/astral-sh/serc/pull/1269)
+  (astral-sh/serc#1266; https://github.com/astral-sh/serc/pull/1266)
+  (astral-sh/serc#1267; https://github.com/astral-sh/serc/pull/1267)
+  (astral-sh/serc#1270; https://github.com/astral-sh/serc/pull/1270)
+  (astral-sh/serc#1258; https://github.com/astral-sh/serc/pull/1258)
+- Reduce marshal serialization work (astral-sh/serc#1264;
+  https://github.com/astral-sh/serc/pull/1264)
+- Reduce constant-folding overhead (astral-sh/serc#1272;
+  https://github.com/astral-sh/serc/pull/1272)
+
 ## 0.1.4
 
 Released on 2026-10-12.
