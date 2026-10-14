@@ -411,6 +411,9 @@ impl OptimizationPipeline {
 
     /// Keeps certified SETUP records present until native pseudo-op conversion.
     fn preserve_legacy_setup_nops(&mut self) {
+        if self.exception_owner_provenance.setup_nop_ranges.is_empty() {
+            return;
+        }
         let mut labels = FxHashMap::default();
         let mut instructions = Vec::new();
         for block in self.graph.order().iter().copied() {
