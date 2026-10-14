@@ -11,6 +11,77 @@ use crate::target::opcodes::*;
 use crate::target::operands::{CommonConstant, Conversion, FunctionAttribute, ResumeLocation};
 
 #[test]
+fn normal_pop_block_preservation_requires_folded_sources() {
+    for witness in [
+        "none",
+        "condition",
+        "loop else",
+        "unrelated condition",
+        "unrelated loop else",
+    ] {
+        let mut assembler = Assembler::with_python_version(crate::PythonVersion::Py312);
+        let start = assembler.label();
+        let end = assembler.label();
+        let target = assembler.label();
+        let exit = assembler.label();
+        let unrelated = assembler.label();
+        assembler.mark(start);
+        let jump_item = assembler.linear_items().len();
+        assembler.emit_operand(JUMP_FORWARD, Operand::Forward(target));
+        let Item::Instruction(jump) = &mut assembler.linear_items_mut()[jump_item] else {
+            unreachable!();
+        };
+        jump.fusion_policy.mark_authored_break();
+        assembler.mark(end);
+        assembler.mark(target);
+        let marker_offset = assembler.instruction_count();
+        let marker_item = assembler.linear_items().len();
+        assembler.set_location(SourceLocation::NONE);
+        assembler.emit(NOP, 0);
+        let Item::Instruction(marker) = &mut assembler.linear_items_mut()[marker_item] else {
+            unreachable!();
+        };
+        marker.fusion_policy.mark_converted_pop_block();
+        assembler.set_location(SourceLocation::new(4, 4, 4, 16));
+        for _ in 0..3 {
+            assembler.emit(LOAD_CONST, 0);
+            assembler.emit(POP_TOP, 0);
+        }
+        assembler.emit_operand(JUMP_FORWARD, Operand::Forward(exit));
+        assembler.mark(exit);
+        assembler.emit(LOAD_CONST, 0);
+        assembler.emit(RETURN_VALUE, 0);
+        match witness {
+            "condition" => {
+                assembler.folded_away_condition_targets.insert(target);
+            }
+            "loop else" => {
+                assembler.folded_away_loop_else_targets.insert(target);
+            }
+            "unrelated condition" => {
+                assembler.folded_away_condition_targets.insert(unrelated);
+            }
+            "unrelated loop else" => {
+                assembler.folded_away_loop_else_targets.insert(unrelated);
+            }
+            _ => {}
+        }
+        let mut exclusions = vec![(start, end)];
+        assembler.preserve_folded_bridge_pop_block(marker_offset, &mut exclusions);
+        let Item::Instruction(marker) = assembler.linear_items()[marker_item] else {
+            unreachable!();
+        };
+        let expected = matches!(witness, "condition" | "loop else");
+        assert_eq!(
+            marker.no_location_policy.preserves_location(),
+            expected,
+            "{witness}"
+        );
+        assert_eq!(exclusions.is_empty(), expected, "{witness}");
+    }
+}
+
+#[test]
 fn normal_finally_borrow_source_includes_unlabeled_entry() {
     for (case, expected) in [
         ("entry", true),
