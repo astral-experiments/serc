@@ -4,60 +4,44 @@
 
 Released on 2026-10-14.
 
-Serc 0.1.5 speeds up optimized compilation and improves assembler scaling for
-cleanup-heavy, async, and mapping-pattern code.
+Serc 0.1.5 improves compilation performance and reduces memory use when
+compiling for Python 3.12.
 
 ### Performance
 
-- Speed up `-O` and `-OO` compilation when no AST transformations are needed by
-  reusing the original tree (astral-sh/serc#1275;
-  https://github.com/astral-sh/serc/pull/1275)
-- Speed up cleanup-heavy compilation by skipping normal-exit preservation scans
-  when no folded sources exist (astral-sh/serc#1277;
+- Speed up `-O` and `-OO` compilation when the syntax tree needs no changes
+  (astral-sh/serc#1275; https://github.com/astral-sh/serc/pull/1275)
+- Speed up compilation of functions with many sequential `try`/`except` blocks
+  on Python 3.12 (astral-sh/serc#1277;
   https://github.com/astral-sh/serc/pull/1277)
-- Speed up large mapping patterns on Python 3.14 and 3.15 by tracking rewritten
-  swap slots with dense flags (astral-sh/serc#1284;
-  https://github.com/astral-sh/serc/pull/1284)
-- Scale compilation of functions with many async context managers by indexing
-  captured setup labels (astral-sh/serc#1281;
-  https://github.com/astral-sh/serc/pull/1281)
-- Reduce preprocessing for ordinary source targeting Python 3.12 and 3.13 by
-  masking legacy template strings only when encountered (astral-sh/serc#1279;
-  https://github.com/astral-sh/serc/pull/1279)
-- Reduce Python 3.12 compilation memory use by skipping cleanup snapshots needed
-  only by Python 3.13’s repeated pass (astral-sh/serc#1280;
+- Speed up compilation of mapping patterns with many captures on Python 3.14 and
+  3.15 (astral-sh/serc#1284; https://github.com/astral-sh/serc/pull/1284)
+- Speed up compilation of functions with many async context managers
+  (astral-sh/serc#1281; https://github.com/astral-sh/serc/pull/1281)
+- Reduce source-validation overhead when targeting Python 3.12 and 3.13
+  (astral-sh/serc#1279; https://github.com/astral-sh/serc/pull/1279)
+- Reduce memory use when compiling for Python 3.12 (astral-sh/serc#1280;
   https://github.com/astral-sh/serc/pull/1280)
-- Reduce code-object construction and copying overhead by allocating final
-  storage early and keeping completed objects boxed (astral-sh/serc#1262;
+- Reduce code-object construction and copying overhead (astral-sh/serc#1262;
   https://github.com/astral-sh/serc/pull/1262) (astral-sh/serc#1263;
   https://github.com/astral-sh/serc/pull/1263) (astral-sh/serc#1265;
   https://github.com/astral-sh/serc/pull/1265)
-- Reduce scope-analysis and lowering overhead by deferring empty plans and
-  cloning only the state needed for lowering (astral-sh/serc#1260;
+- Reduce scope-analysis and closure-lowering overhead (astral-sh/serc#1260;
   https://github.com/astral-sh/serc/pull/1260) (astral-sh/serc#1261;
   https://github.com/astral-sh/serc/pull/1261)
-- Reduce conditional-prefix analysis allocations by checking eligibility before
-  collecting instructions or building lookup tables (astral-sh/serc#1273;
+- Reduce allocations during control-flow analysis (astral-sh/serc#1273;
   https://github.com/astral-sh/serc/pull/1273)
-- Reduce jump-threading overhead by skipping scans and index construction when
-  no eligible target exists (astral-sh/serc#1268;
-  https://github.com/astral-sh/serc/pull/1268) (astral-sh/serc#1269;
-  https://github.com/astral-sh/serc/pull/1269)
-- Reduce assembler graph traversal overhead with block-based location scans and
-  a forward-only item iterator (astral-sh/serc#1266;
-  https://github.com/astral-sh/serc/pull/1266) (astral-sh/serc#1267;
-  https://github.com/astral-sh/serc/pull/1267)
-- Reduce marshal serialization work by reusing reference state for cached and
-  interned objects (astral-sh/serc#1264;
+- Reduce assembler overhead for jumps, source locations, and instruction
+  processing (astral-sh/serc#1268; https://github.com/astral-sh/serc/pull/1268)
+  (astral-sh/serc#1269; https://github.com/astral-sh/serc/pull/1269)
+  (astral-sh/serc#1266; https://github.com/astral-sh/serc/pull/1266)
+  (astral-sh/serc#1267; https://github.com/astral-sh/serc/pull/1267)
+  (astral-sh/serc#1270; https://github.com/astral-sh/serc/pull/1270)
+  (astral-sh/serc#1258; https://github.com/astral-sh/serc/pull/1258)
+- Reduce marshal serialization work (astral-sh/serc#1264;
   https://github.com/astral-sh/serc/pull/1264)
-- Reduce fusion-certificate capture overhead by borrowing instructions during
-  scans (astral-sh/serc#1270; https://github.com/astral-sh/serc/pull/1270)
-- Reduce source-aware folding overhead by skipping literal conversion for
-  nonliteral operands (astral-sh/serc#1272;
+- Reduce constant-folding overhead (astral-sh/serc#1272;
   https://github.com/astral-sh/serc/pull/1272)
-- Reduce instruction-update overhead by comparing packed operands without
-  decoding the previous value (astral-sh/serc#1258;
-  https://github.com/astral-sh/serc/pull/1258)
 
 ## 0.1.4
 
