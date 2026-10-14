@@ -7,11 +7,12 @@ and committed lockfile.
 
 The benchmark groups measure fixed workloads through Serc's public API:
 
-| Group         | Timed work                                                                     | Per-iteration setup and cleanup                          |
-| ------------- | ------------------------------------------------------------------------------ | -------------------------------------------------------- |
-| `compile`     | Compile source into a fresh module                                             | Module cleanup is outside timing                         |
-| `marshal`     | Marshal a newly compiled module exactly once                                   | Compilation and module/output cleanup are outside timing |
-| `compile_pyc` | Compile source, encode one timestamp PYC in memory, and drop the module/output | All work is timed; no disk I/O                           |
+| Group                              | Timed work                                                                     | Per-iteration setup and cleanup                          |
+| ---------------------------------- | ------------------------------------------------------------------------------ | -------------------------------------------------------- |
+| `compile`                          | Compile source into a fresh module                                             | Module cleanup is outside timing                         |
+| `marshal`                          | Marshal a newly compiled module exactly once                                   | Compilation and module/output cleanup are outside timing |
+| `compile_pyc`                      | Compile source, encode one timestamp PYC in memory, and drop the module/output | All work is timed; no disk I/O                           |
+| `compile_pyc_O1`, `compile_pyc_O2` | The same one-shot PYC workflow at optimization levels 1 and 2                  | All work is timed; no disk I/O                           |
 
 `marshal` compiles a fresh module during batch setup for every iteration,
 including warmup. It does not reuse or clone a previously serialized module.
@@ -19,20 +20,17 @@ This makes first-serialization preparation visible even if an implementation
 caches work for subsequent calls. `compile_pyc` also measures preparation moved
 into compilation, and includes cleanup costs that phase-isolated measurements
 exclude. It covers all compile and marshal workloads, including the large
-fixture.
-
-The `marshal` group's per-iteration lifecycle has changed. Its first CodSpeed
-comparison against the old benchmark is not directly comparable; establish a new
-baseline after this change. Historical repeated-module results measure a
-different operation.
+fixture. The original groups use optimization level 0; `compile_pyc_O1` and
+`compile_pyc_O2` use the same workloads with explicit optimization levels.
 
 ```console
 CARGO_INCREMENTAL=0 cargo bench --locked --profile profiling -p serc_benchmark --bench compiler --no-default-features --features benchmarks
 ```
 
-Append `-- compile/`, `-- marshal/`, or `-- compile_pyc/` to filter by group,
-`-- --save-baseline main` to save a baseline, or `-- --baseline main` to compare
-against it. Other Criterion options follow `--`.
+Append `-- compile/`, `-- marshal/`, `-- compile_pyc/`, `-- compile_pyc_O1/`, or
+`-- compile_pyc_O2/` to filter by group, `-- --save-baseline main` to save a
+baseline, or `-- --baseline main` to compare against it. Other Criterion options
+follow `--`.
 
 ## CodSpeed simulation
 
