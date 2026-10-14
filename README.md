@@ -15,19 +15,17 @@ An experimental CPython bytecode compiler, written in Rust.
 - Check source files and recursively compile packages from the command line.
 - Embed the compiler via the [Rust library](crates/serc).
 
-In a [single-worker benchmark](BENCHMARKS.md), Serc compiled NumPy faster than
-CPython’s built-in bytecode compiler. Serc also produces byte-for-byte identical
-output on an extensive corpus of real-world Python code, including
-[Django](https://github.com/django/django),
+Serc produces byte-for-byte identical output on an extensive corpus of
+real-world Python code, including [Django](https://github.com/django/django),
 [Airflow](https://github.com/apache/airflow), and
-[Transformers](https://github.com/huggingface/transformers).
+[Transformers](https://github.com/huggingface/transformers), >40% faster than
+CPython's built-in compiler:
 
 | Project                 |              Serc | CPython 3.14.5 `compileall` | Speedup |
 | ----------------------- | ----------------: | --------------------------: | ------: |
 | NumPy 2.4.6 (505 files) | 1.194 s ± 0.023 s |           1.739 s ± 0.060 s |   1.46× |
 
-However, Serc is also experimental, and so may emit incorrect bytecode in some
-cases!
+But Serc is also experimental! And so may emit incorrect bytecode in some cases.
 
 ## Installation
 
