@@ -167,6 +167,28 @@ fn compiler_scaling(criterion: &mut Criterion) {
         membership.push_str("}\n");
         workloads.push(("string_set_membership", count, membership));
     }
+    for count in [64, 256] {
+        for (name, reverse) in [
+            ("repeated_string_sets", false),
+            ("reordered_string_sets", true),
+        ] {
+            let mut source = String::from("def work(value):\n    return (\n");
+            for repetition in 0..8 {
+                source.push_str("        value in {");
+                for index in 0..count {
+                    let index = if reverse && repetition % 2 != 0 {
+                        count - index - 1
+                    } else {
+                        index
+                    };
+                    write!(source, "'member {index}',").unwrap();
+                }
+                source.push_str("},\n");
+            }
+            source.push_str("    )\n");
+            workloads.push((name, count, source));
+        }
+    }
 
     for (name, python_version) in [
         ("compile_pyc_scaling_3_12", serc::PythonVersion::Py312),
