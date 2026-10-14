@@ -1959,6 +1959,32 @@ impl UniqueLabelPositions {
         positions
     }
 
+    /// Indexes selected labels without allocating for their numeric range.
+    fn for_labels(items: &[Item], labels: &FxHashSet<Label>) -> Self {
+        let mut positions = Self {
+            dense: Vec::new(),
+            sparse: FxHashMap::default(),
+            dense_limit: 0,
+        };
+        positions.sparse.reserve(labels.len());
+        let mut instruction_index = 0;
+        for (item_index, item) in items.iter().enumerate() {
+            match item {
+                Item::Label(label) => {
+                    if labels.contains(label) {
+                        positions
+                            .sparse
+                            .entry(*label)
+                            .and_modify(|position| *position = None)
+                            .or_insert(Some((item_index, instruction_index)));
+                    }
+                }
+                Item::Instruction(_) => instruction_index += 1,
+            }
+        }
+        positions
+    }
+
     fn get(&self, label: Label) -> Option<(usize, usize)> {
         let index = label.index();
         if index >= self.dense_limit {
@@ -3532,15 +3558,35 @@ impl LayoutAssembler {
         unique_labels: &OnceCell<UniqueLabelPositions>,
     ) -> FxHashSet<Label> {
         let origins = &self.exception_owner_provenance.async_with_setups;
+        let captured_labels = OnceCell::new();
         let unique_position = |first: &Item| {
             if INDEX_ORIGINS
                 && let Item::Label(label) = first
                 && (origins.len() > 1 || unique_labels.get().is_some())
             {
-                return unique_labels
-                    .get_or_init(|| UniqueLabelPositions::new(&self.items))
-                    .get(*label)
-                    .map(|(index, _)| index);
+                let positions = unique_labels.get().unwrap_or_else(|| {
+                    captured_labels.get_or_init(|| {
+                        let mut labels = FxHashSet::default();
+                        for origin in origins {
+                            labels.insert(origin.setup);
+                            if let Some((label, _)) = origin.bridge {
+                                labels.insert(label);
+                            }
+                            for item in origin
+                                .prefix
+                                .first()
+                                .into_iter()
+                                .chain(origin.cleanup.first())
+                            {
+                                if let Item::Label(label) = item {
+                                    labels.insert(*label);
+                                }
+                            }
+                        }
+                        UniqueLabelPositions::for_labels(&self.items, &labels)
+                    })
+                });
+                return positions.get(*label).map(|(index, _)| index);
             }
             let mut matches = self
                 .items
@@ -14755,6 +14801,16 @@ mod tests {
         assert_eq!(unique.get(dense_unique), Some((3, 1)));
         assert_eq!(unique.get(sparse_unique), Some((4, 1)));
 
+        let selected = UniqueLabelPositions::for_labels(
+            &items,
+            &[dense_unique, sparse, missing].into_iter().collect(),
+        );
+        assert!(selected.dense.is_empty());
+        assert_eq!(selected.get(dense_unique), Some((3, 1)));
+        assert_eq!(selected.get(sparse), None);
+        assert_eq!(selected.get(missing), None);
+        assert_eq!(selected.get(sparse_unique), None);
+
         let mut owners = OwnerLabelPositions::new(items.len());
         for (index, item) in items.iter().enumerate() {
             if let Item::Label(label) = item {
@@ -14805,8 +14861,8 @@ mod tests {
                             let cleanup = Label::from_u32(label_base + index * 4);
                             let entry = Label::from_u32(label_base + index * 4 + 1);
                             let setup = Label::from_u32(label_base + index * 4 + 2);
-                            let location =
-                                SourceLocation::new(index as i32 + 1, index as i32 + 1, 0, 1);
+                            let line = i32::try_from(index).unwrap() + 1;
+                            let location = SourceLocation::new(line, line, 0, 1);
                             let send =
                                 Instruction::new(SEND, Operand::Forward(entry), location, None);
                             let value = |opcode| {
@@ -14868,7 +14924,7 @@ mod tests {
                                     Operand::Forward(entry),
                                     origin.send.location,
                                     None,
-                                )))
+                                )));
                             }
                             "changed send" => {
                                 let Item::Instruction(instruction) = &mut items[0] else {
@@ -14925,9 +14981,7 @@ mod tests {
                             count as usize - 1 + usize::from(accepted),
                             "{case}"
                         );
-                        if count == 1 && !prefilled {
-                            assert!(unique.get().is_none());
-                        }
+                        assert_eq!(unique.get().is_some(), prefilled);
                     }
                 }
             }
