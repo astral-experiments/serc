@@ -85,5 +85,46 @@ fn compile_pyc(criterion: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, compiler, marshal, compile_pyc);
+fn compile_pyc_optimized(criterion: &mut Criterion) {
+    for (name, level) in [
+        ("compile_pyc_O1", serc::OptimizationLevel::One),
+        ("compile_pyc_O2", serc::OptimizationLevel::Two),
+    ] {
+        let options = serc::CompileOptions {
+            optimization_level: level,
+            ..serc::CompileOptions::default()
+        };
+        let mut group = criterion.benchmark_group(name);
+        for workload in COMPILE_MICRO_WORKLOADS
+            .iter()
+            .chain(MARSHAL_MICRO_WORKLOADS)
+            .chain(COMPOSITE_WORKLOADS)
+            .chain(LARGE_WORKLOADS)
+        {
+            let source_size = u32::try_from(workload.source.len())
+                .expect("benchmark source must fit in a PYC source-size field");
+            group.throughput(Throughput::Bytes(workload.source.len() as u64));
+            group.bench_function(workload.id, |bencher| {
+                bencher.iter(|| {
+                    let module = serc::compile_with_options(
+                        black_box(workload.source),
+                        black_box(workload.filename),
+                        black_box(&options),
+                    )
+                    .unwrap();
+                    black_box(module.to_timestamp_pyc(0, source_size));
+                });
+            });
+        }
+        group.finish();
+    }
+}
+
+criterion_group!(
+    benches,
+    compiler,
+    marshal,
+    compile_pyc,
+    compile_pyc_optimized
+);
 criterion_main!(benches);
