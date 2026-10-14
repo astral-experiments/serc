@@ -3984,6 +3984,11 @@ impl Assembler {
         instruction_offset: usize,
         try_exclusions: &mut Vec<(Label, Label)>,
     ) {
+        if self.folded_away_condition_targets.is_empty()
+            && self.folded_away_loop_else_targets.is_empty()
+        {
+            return;
+        }
         let items = self.linear_items();
         let mut instructions = Vec::new();
         let mut entries = FxHashMap::default();
