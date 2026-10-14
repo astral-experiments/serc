@@ -143,7 +143,7 @@ pub(crate) fn validate(
     validate_with_fast_scan::<true>(source, options, version)
 }
 
-/// Validates nesting with an optional byte-scan proof; tests disable it to check lexer parity.
+/// Validates nesting with optional fast paths; tests disable them to check lexer parity.
 fn validate_with_fast_scan<const FAST_SCAN: bool>(
     source: &str,
     options: &ParseOptions,
@@ -159,12 +159,22 @@ fn validate_with_fast_scan<const FAST_SCAN: bool>(
         return Ok(());
     }
 
+    validate_tokens(source, options, version, !FAST_SCAN)
+}
+
+fn validate_tokens(
+    source: &str,
+    options: &ParseOptions,
+    version: PythonVersion,
+    mask_legacy_templates: bool,
+) -> Result<(), CompileError> {
+    let legacy = matches!(version, PythonVersion::Py312 | PythonVersion::Py313);
     // Ruff recognizes template-string prefixes in every target version. CPython
     // 3.12 and 3.13 instead tokenize them as an identifier followed by an opaque
     // ordinary string. Replace only the prefix character, keeping every byte
     // offset and all delimiter, quote, and escape characters unchanged.
     let adjusted;
-    let lexer_source = if matches!(version, PythonVersion::Py312 | PythonVersion::Py313) {
+    let lexer_source = if legacy && mask_legacy_templates {
         let mut bytes = source.as_bytes().to_vec();
         for index in 0..bytes.len() {
             if matches!(bytes[index], b't' | b'T')
@@ -188,6 +198,10 @@ fn validate_with_fast_scan<const FAST_SCAN: bool>(
         let token = lexer.next_token();
         match token {
             TokenKind::EndOfFile => return Ok(()),
+            TokenKind::TStringStart if legacy && !mask_legacy_templates => {
+                // Legacy quotes can expose delimiters hidden inside a template string.
+                return validate_tokens(source, options, version, true);
+            }
             TokenKind::Indent => saw_indent = true,
             TokenKind::Int | TokenKind::Float | TokenKind::Complex
                 if invalid_number_suffix(source, lexer.current_range()) =>
@@ -434,6 +448,48 @@ mod tests {
                     validate_parsed(&source, &options, version, &parsed),
                     "{version:?}: {source}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn lazy_template_masking_preserves_legacy_diagnostics() {
+        let padding = "value = (1)\n".repeat(MAX_NESTING + 1);
+        let deep = format!(
+            "{}0{}",
+            "(".repeat(MAX_NESTING + 1),
+            ")".repeat(MAX_NESTING + 1)
+        );
+        for (version, target) in [
+            (PythonVersion::Py312, ruff_python_ast::PythonVersion::PY312),
+            (PythonVersion::Py313, ruff_python_ast::PythonVersion::PY313),
+        ] {
+            let options = ParseOptions::from(Mode::Module).with_target_version(target);
+            for prefix in [
+                "t", "T", "tr", "Tr", "tR", "TR", "rt", "rT", "Rt", "RT", "bt", "tb", "ft", "tf",
+                "ut", "tu", "ttr", "aT", "not", "await", "import", "assert", "except", "test",
+            ] {
+                for quote in ["'", "\"", "'''", "\"\"\""] {
+                    let literal = format!("{prefix}{quote}text {{value}}{quote}");
+                    let exposed = format!(
+                        "{prefix}{quote}{{{quote}{}{quote}}}{quote}",
+                        "(".repeat(MAX_NESTING + 1),
+                    );
+                    for source in [
+                        format!("{literal}\n{padding}"),
+                        format!("{literal}\n{deep}"),
+                        format!("{padding}{literal}\n{deep}"),
+                        format!("{exposed}\n{padding}"),
+                        format!("def f():\n    {literal}\n    {deep}"),
+                        format!("\u{03bb}{literal}\n{deep}"),
+                    ] {
+                        assert_eq!(
+                            validate_with_fast_scan::<true>(&source, &options, version),
+                            validate_with_fast_scan::<false>(&source, &options, version),
+                            "{version}: {source:?}",
+                        );
+                    }
+                }
             }
         }
     }
