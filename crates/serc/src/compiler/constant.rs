@@ -1580,9 +1580,13 @@ impl ConstantEquality {
             }
             (Constant::FrozenSet(left), Constant::FrozenSet(right)) => {
                 left.len() == right.len()
-                    && left
+                    && (left
                         .iter()
-                        .all(|left| right.iter().any(|right| self.equal(left, right)))
+                        .zip(right)
+                        .all(|(left, right)| self.equal(left, right))
+                        || left
+                            .iter()
+                            .all(|left| right.iter().any(|right| self.equal(left, right))))
             }
             (
                 Constant::Slice {
@@ -4748,6 +4752,51 @@ mod tests {
 
         assert!(!ConstantEquality::PoolKey.equal(&boolean, &integer));
         assert!(ConstantEquality::PythonValue.equal(&boolean, &integer));
+    }
+
+    #[test]
+    fn ordered_frozenset_equality_preserves_unordered_membership() {
+        let cases = [
+            vec![],
+            vec![Constant::Int(1)],
+            vec![Constant::Int(1), Constant::Int(2)],
+            vec![Constant::Int(2), Constant::Int(1)],
+            vec![Constant::Int(1), Constant::Int(1)],
+            vec![Constant::Bool(true), Constant::Float(-0.0)],
+            vec![Constant::Int(1), Constant::Float(0.0)],
+            vec![Constant::Float(f64::NAN)],
+            vec![Constant::Tuple(vec![Constant::Bool(true)])],
+            vec![Constant::Tuple(vec![Constant::Int(1)])],
+            vec![Constant::FrozenSet(vec![
+                Constant::Bool(true),
+                Constant::Float(-0.0),
+            ])],
+            vec![Constant::FrozenSet(vec![
+                Constant::Float(0.0),
+                Constant::Int(1),
+            ])],
+        ]
+        .map(Constant::FrozenSet);
+        for mode in [ConstantEquality::PoolKey, ConstantEquality::PythonValue] {
+            for left in &cases {
+                for right in &cases {
+                    let (Constant::FrozenSet(left_values), Constant::FrozenSet(right_values)) =
+                        (left, right)
+                    else {
+                        unreachable!();
+                    };
+                    let expected = left_values.len() == right_values.len()
+                        && left_values
+                            .iter()
+                            .all(|left| right_values.iter().any(|right| mode.equal(left, right)));
+                    assert_eq!(
+                        mode.equal(left, right),
+                        expected,
+                        "{mode:?}: {left:?}, {right:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
