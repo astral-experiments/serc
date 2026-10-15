@@ -1529,17 +1529,10 @@ impl ConstantEquality {
         reason = "CPython constant deduplication uses exact numeric equality"
     )]
     fn equal(self, left: &Constant, right: &Constant) -> bool {
-        if let (Constant::NonReflexive(left), Constant::NonReflexive(right)) = (left, right) {
-            return left.key() == right.key();
-        }
-        if matches!(self, Self::PythonValue)
-            && let (Some((left_real, left_imag)), Some((right_real, right_imag))) =
-                (numeric_parts(left), numeric_parts(right))
-        {
-            return left_imag == right_imag && numeric_reals_equal(&left_real, &right_real);
-        }
-
         match (left, right) {
+            (Constant::NonReflexive(left), Constant::NonReflexive(right)) => {
+                left.key() == right.key()
+            }
             (Constant::None, Constant::None) | (Constant::Ellipsis, Constant::Ellipsis) => true,
             (Constant::Bool(left), Constant::Bool(right)) => left == right,
             (Constant::Int(left), Constant::Int(right)) => left == right,
@@ -1553,8 +1546,12 @@ impl ConstantEquality {
                     negative: right_negative,
                     digits: right_digits,
                 },
-            ) => left_negative == right_negative && left_digits == right_digits,
-            (Constant::Float(left), Constant::Float(right)) => left.to_bits() == right.to_bits(),
+            ) if matches!(self, Self::PoolKey) => {
+                left_negative == right_negative && left_digits == right_digits
+            }
+            (Constant::Float(left), Constant::Float(right)) if matches!(self, Self::PoolKey) => {
+                left.to_bits() == right.to_bits()
+            }
             (
                 Constant::Complex {
                     real: left_real,
@@ -1564,7 +1561,7 @@ impl ConstantEquality {
                     real: right_real,
                     imag: right_imag,
                 },
-            ) => {
+            ) if matches!(self, Self::PoolKey) => {
                 left_real.to_bits() == right_real.to_bits()
                     && left_imag.to_bits() == right_imag.to_bits()
             }
@@ -1607,7 +1604,16 @@ impl ConstantEquality {
                     && Self::PoolKey.equal(left_step, right_step)
             }
             (Constant::Code(left), Constant::Code(right)) => code_objects_equal(left, right),
-            (_, _) => false,
+            (_, _) => {
+                if matches!(self, Self::PythonValue)
+                    && let (Some((left_real, left_imag)), Some((right_real, right_imag))) =
+                        (numeric_parts(left), numeric_parts(right))
+                {
+                    left_imag == right_imag && numeric_reals_equal(&left_real, &right_real)
+                } else {
+                    false
+                }
+            }
         }
     }
 }
@@ -4573,8 +4579,8 @@ mod tests {
     use super::{
         CONSTANT_INDEX_THRESHOLD, ConstantEquality, ConstantIndices, ConstantPool,
         FORCE_GENERIC_CONSTANT_ADMISSION, NAME_INDEX_THRESHOLD, OutputState,
-        constant_pool_fingerprint, fold_complex_arithmetic, python_constant_values_equal,
-        unique_frozenset_constants,
+        constant_pool_fingerprint, fold_complex_arithmetic, numeric_parts, numeric_reals_equal,
+        python_constant_values_equal, unique_frozenset_constants,
     };
     use crate::code_object::{
         CodeObject, Constant, LocalsIdentity, MarshalMetadataIds, MarshalProvenance, MetadataId,
@@ -4752,6 +4758,54 @@ mod tests {
 
         assert!(!ConstantEquality::PoolKey.equal(&boolean, &integer));
         assert!(ConstantEquality::PythonValue.equal(&boolean, &integer));
+    }
+
+    #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "The reference comparison preserves exact Python numeric equality"
+    )]
+    fn integer_value_equality_matches_numeric_normalization() {
+        let values = [
+            Constant::Bool(false),
+            Constant::Bool(true),
+            Constant::Int(0),
+            Constant::Int(1),
+            Constant::Int(1 << 53),
+            Constant::Int((1 << 53) + 1),
+            Constant::Int(u64::MAX),
+            Constant::SignedInt(i64::MIN),
+            Constant::SignedInt(-1),
+            Constant::SignedInt(0),
+            Constant::SignedInt(1),
+            Constant::SignedInt(i64::MAX),
+            Constant::BigInt {
+                negative: false,
+                digits: vec![1, 0],
+            },
+            Constant::Float(-0.0),
+            Constant::Float(1.0),
+            Constant::Float(9_007_199_254_740_992.0),
+            Constant::Float(f64::INFINITY),
+            Constant::Float(f64::NAN),
+            Constant::Complex {
+                real: 1.0,
+                imag: -0.0,
+            },
+        ];
+        for left in &values {
+            for right in &values {
+                let (left_real, left_imag) = numeric_parts(left).unwrap();
+                let (right_real, right_imag) = numeric_parts(right).unwrap();
+                let expected =
+                    left_imag == right_imag && numeric_reals_equal(&left_real, &right_real);
+                assert_eq!(
+                    python_constant_values_equal(left, right),
+                    expected,
+                    "{left:?}, {right:?}"
+                );
+            }
+        }
     }
 
     #[test]
