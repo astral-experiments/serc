@@ -15,6 +15,181 @@ use serc::{
 };
 
 #[test]
+fn nested_conversion_handlers_keep_shared_cleanup() {
+    let source = r"def sample(items):
+    for item in items:
+        try:
+            first(item)
+        except (ValueError, TypeError):
+            try:
+                second(item)
+            except (ValueError, TypeError):
+                try:
+                    third(item)
+                except (ValueError, TypeError):
+                    fallback(item)
+                else:
+                    success(item)
+            else:
+                success(item)
+        else:
+            success(item)
+    return items
+";
+    assert_matches_cpython(source, "nested_conversion_handlers.py", &LEVELS);
+}
+
+#[test]
+fn erased_nested_assignment_suffix_preserves_join() {
+    let source = r"def sample(flag, condition):
+    with acquire() as manager:
+        values = manager.read()
+    if flag:
+        if condition():
+            assert values
+        else:
+            first, second = values
+            assert first
+            assert second
+    else:
+        assert values
+    finish(values)
+";
+    assert_matches_cpython(source, "erased_nested_assignment_suffix.py", &LEVELS);
+}
+
+#[test]
+fn erased_async_manager_suffix_preserves_conditional_join() {
+    let source = r"async def sample(ordered, items):
+    try:
+        async with acquire() as owner:
+            await owner.wait()
+            for item in items:
+                await work(item)
+            while ready():
+                if done():
+                    break
+                await wait()
+            if ordered:
+                assert items == expected
+            else:
+                assert sorted(items) == expected
+            assert ordered
+    finally:
+        await finish()
+";
+    assert_matches_cpython(source, "erased_async_manager_suffix.py", &LEVELS);
+}
+
+#[test]
+fn erased_named_handler_suffix_preserves_cleanup_copies() {
+    let source = r"def sample():
+    try:
+        work()
+        raise AssertionError('must fail')
+    except TypeError as error:
+        if error.args[0].startswith('prefix'):
+            skip('reason')
+        assert error.args == expected.args
+";
+    assert_matches_cpython(source, "erased_named_handler_suffix.py", &LEVELS);
+}
+
+#[test]
+fn conditional_try_body_preserves_else_return_join() {
+    let source = r"def sample(flag):
+    try:
+        if flag:
+            first()
+        else:
+            second()
+    except ValueError as error:
+        value = error.args
+    except OSError as error:
+        value = str(error)
+        try:
+            value = value.encode(encoding)
+        except AttributeError:
+            value = value.encode('utf8')
+        status = 127
+    else:
+        return None
+    finish(value)
+";
+    assert_matches_cpython(source, "conditional_try_else_return.py", &LEVELS);
+}
+
+#[test]
+fn erased_branch_before_manager_preserves_shared_return() {
+    let source = r"def sample(flag):
+    if flag == first:
+        assert flag
+        assert flag
+    if flag == second:
+        assert flag
+        with acquire():
+            work()
+";
+    assert_matches_cpython(source, "erased_branch_before_manager.py", &LEVELS);
+}
+
+#[test]
+fn legacy_nested_normal_exit_retains_outer_handler() {
+    const SOURCE: &str = r"def sample(flag):
+    if flag:
+        try:
+            if flag == 1:
+                try:
+                    pass
+                except Exception as error:
+                    record('failed', error)
+                    record('done')
+        except Exception as error:
+            pass
+        try:
+            pass
+        except Exception as error:
+            pass
+";
+    const TRACE: &str = r"
+import dis, marshal, sys
+class Fault(Exception):
+    pass
+events = []
+scope = {'record': lambda *args: events.append(args)}
+exec(marshal.loads(sys.stdin.buffer.read()), scope)
+sample = scope['sample']
+targets = [instruction.offset for instruction in dis.get_instructions(sample)
+           if instruction.opname == 'NOP' and instruction.positions.lineno == 6]
+assert len(targets) == 1, targets
+target = targets[0]
+hits = []
+def trace(frame, event, arg):
+    if frame.f_code is sample.__code__:
+        frame.f_trace_opcodes = True
+        if event == 'opcode' and frame.f_lasti == target:
+            hits.append(target)
+            raise Fault()
+    return trace
+# 3.12 enables instruction events when installing the trace function.
+sys._getframe().f_trace_opcodes = True
+sys.settrace(trace)
+try:
+    sample(1)
+finally:
+    sys.settrace(None)
+assert hits == [target], hits
+assert events == [], events
+";
+    assert_matches_cpython(SOURCE, "nested_normal_exit.py", &LEVELS);
+    for level in LEVELS {
+        let [native, actual] =
+            compile_both(SOURCE, "nested_normal_exit.py", PythonVersion::Py312, level);
+        assert_runs(probe(0).args(["-I", "-S", "-c", TRACE]), [&native, &actual]);
+    }
+}
+
+#[test]
 fn guarded_finally_arms_keep_their_manager_exit_location() {
     for body in ["work(item)", "yield item"] {
         for condition in ["ready", "not ready", "ready is not None"] {

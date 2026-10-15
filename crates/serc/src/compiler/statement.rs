@@ -4759,8 +4759,13 @@ impl<'source> Compiler<'source> {
         let nested_312_scope_exit = (plain_312_scope_exit || coroutine_312_scope_exit)
             && !self.control.statements.in_match
             && self.has_nested_erased_branch_scope_exit(statement);
+        let manager_312_scope_exit = plain_312_scope_exit
+            && !self.control.statements.in_match
+            && if_suites(statement)
+                .any(|body| matches!(body.last(), Some(Stmt::With(manager)) if !manager.is_async));
         if self.context.python_version <= crate::PythonVersion::Py313
             && (nested_312_scope_exit
+                || manager_312_scope_exit
                 || if_suites(statement).any(|body| {
                     matches!(body.last(), Some(Stmt::While(_)))
                         || (self.context.python_version == crate::PythonVersion::Py312
@@ -4802,6 +4807,7 @@ impl<'source> Compiler<'source> {
                         && !suite_contains_loop_break(&loop_statement.body));
             self.compile_if(statement)?;
             if nested_312_scope_exit
+                || manager_312_scope_exit
                 || (coroutine_312_scope_exit
                     && !self.control.statements.in_terminal_if_branch_suite
                     && if_suites(statement).any(|body| {
@@ -16340,6 +16346,11 @@ impl<'source> Compiler<'source> {
                                         }))
                             };
                             let populated_arm = |arm: &[Stmt]| {
+                                let live_end = arm
+                                    .iter()
+                                    .rposition(|part| !self.context.is_elided_statement(part))
+                                    .map_or(0, |index| index + 1);
+                                let arm = &arm[..live_end];
                                 suite_has_linear_borrow_fallthrough(arm)
                                     || arm.split_last().is_some_and(|(tail, prefix)| {
                                         // The optimized and fallback call paths join before
@@ -16853,6 +16864,12 @@ impl<'source> Compiler<'source> {
 
         if self.control.exceptions.retained_try_body_if_exit == Some(statement.range) {
             let exit_start = self.assembler.label();
+            if self.context.python_version == crate::PythonVersion::Py313 {
+                // Exit copying leaves this POP_BLOCK in the original conditional
+                // join, separate from the preceding call's instruction array.
+                self.assembler
+                    .record_exception_owner_block_boundary(exit_start);
+            }
             self.assembler.mark(exit_start);
             if let Some(location) = self.assembler.last_instruction_location() {
                 self.assembler.set_location(location);
@@ -25264,10 +25281,11 @@ impl<'source> Compiler<'source> {
             && statement.orelse.is_empty()
             && self.control.loops.uncopied_loop_tail_statement == Some(statement.range)
             && self.control.in_loop_tail_without_nested_cleanup();
-        // CPython folds every successful arm of a trailing nested conversion chain directly onto
+        // CPython 3.13+ folds each successful arm of a trailing conversion chain directly onto
         // the iterator backedge. Restrict that layout to recursive one-call try/except/else arms
         // so ordinary nested handlers keep their shared joins.
-        let nested_loop_conversion_try = self.control.in_iterator_loop()
+        let nested_loop_conversion_try = self.context.python_version >= crate::PythonVersion::Py313
+            && self.control.in_iterator_loop()
             && !self.control.statements.context.has_following
             && is_loop_conversion_try(statement)
             && (!self.control.exceptions.active_exception_handlers.is_empty()
@@ -25284,9 +25302,6 @@ impl<'source> Compiler<'source> {
             && emit_statement_nop
             && !exclude_terminal_body_not_taken
             && !retained_else_break_exit
-            // This eager backedge has already replaced native JUMP TryEnd;
-            // its live loop target cannot supply the original native operand.
-            && !nested_loop_conversion_try
             && loop_tail.is_none()
             && else_loop_tail.is_none()
             && else_match_tail.is_none();
@@ -27928,9 +27943,11 @@ impl<'source> Compiler<'source> {
             let body_ends_with_overridden_return =
                 self.control.finally.active_overriding_finally_returns > 0
                     && matches!(statement.body.last(), Some(Stmt::Return(_)));
-            // A pass-only nested try leaves an ownerless exit NOP unless the enclosing region
-            // is the synthetic protected body of try/finally.
-            let exclude_nested_normal_exit = nested_in_final_outer_try_statement
+            // Modern CFG copying leaves this exit NOP ownerless, except inside the synthetic
+            // protected body of try/finally. Legacy copying retains the original handler.
+            let exclude_nested_normal_exit = self.context.python_version
+                >= crate::PythonVersion::Py314
+                && nested_in_final_outer_try_statement
                 && self
                     .control
                     .finally
@@ -30099,10 +30116,20 @@ impl<'source> Compiler<'source> {
             let can_copy_handler_return = self.context.python_version
                 != crate::PythonVersion::Py312
                 || handler.name.is_none();
+            let return_body = if self.context.python_version >= crate::PythonVersion::Py314 {
+                let live_end = handler
+                    .body
+                    .iter()
+                    .rposition(|part| !self.context.is_elided_statement(part))
+                    .map_or(0, |index| index + 1);
+                &handler.body[..live_end]
+            } else {
+                &handler.body
+            };
             let terminal_handler_if = if terminal
                 && can_copy_handler_return
                 && let Some(name) = &handler.name
-                && let [Stmt::If(statement)] = handler.body.as_slice()
+                && let [Stmt::If(statement)] = return_body
                 && terminal_exception_handler_if_supported(statement)
             {
                 Some((statement, name.as_str()))
@@ -30115,7 +30142,7 @@ impl<'source> Compiler<'source> {
             let terminal_handler_suite = terminal
                 && can_copy_handler_return
                 && terminal_handler_if.is_none()
-                && handler.body.last().is_some_and(|tail| match tail {
+                && return_body.last().is_some_and(|tail| match tail {
                     Stmt::Try(_) => true,
                     Stmt::If(statement) => if_suites(statement).all(|body| !suite_terminates(body)),
                     _ => false,
@@ -30282,7 +30309,7 @@ impl<'source> Compiler<'source> {
                                         compiler.compile_with_strict_owned_loads(
                                             strict_owned_loads,
                                             |compiler| {
-                                                compiler.compile_suite_inner(&handler.body, true)
+                                                compiler.compile_suite_inner(return_body, true)
                                             },
                                         )
                                     })?;
@@ -40630,7 +40657,12 @@ impl<'source> Compiler<'source> {
             suspension_epoch: self.control.generators.coroutine_suspension_epoch,
             body_start_item: self.assembler.item_count(),
             terminal_statement_range: if remaining.is_empty() {
-                body.last().map(Ranged::range)
+                body.iter()
+                    .rfind(|part| {
+                        self.context.python_version < crate::PythonVersion::Py314
+                            || !self.context.is_elided_statement(part)
+                    })
+                    .map(Ranged::range)
             } else {
                 None
             },
