@@ -1546,8 +1546,14 @@ impl ConstantEquality {
                     negative: right_negative,
                     digits: right_digits,
                 },
-            ) if matches!(self, Self::PoolKey) => {
-                left_negative == right_negative && left_digits == right_digits
+            ) => {
+                left_negative == right_negative
+                    && match self {
+                        Self::PoolKey => left_digits == right_digits,
+                        Self::PythonValue => {
+                            significant_digits(left_digits) == significant_digits(right_digits)
+                        }
+                    }
             }
             (Constant::Float(left), Constant::Float(right)) if matches!(self, Self::PoolKey) => {
                 left.to_bits() == right.to_bits()
@@ -1760,6 +1766,13 @@ fn normalized_digits(mut digits: Vec<u16>) -> Vec<u16> {
         digits.pop();
     }
     digits
+}
+
+fn significant_digits(digits: &[u16]) -> &[u16] {
+    &digits[..digits
+        .iter()
+        .rposition(|digit| *digit != 0)
+        .map_or(0, |index| index + 1)]
 }
 
 #[expect(
@@ -4758,6 +4771,17 @@ mod tests {
 
         assert!(!ConstantEquality::PoolKey.equal(&boolean, &integer));
         assert!(ConstantEquality::PythonValue.equal(&boolean, &integer));
+
+        let canonical = Constant::BigInt {
+            negative: true,
+            digits: vec![1],
+        };
+        let padded = Constant::BigInt {
+            negative: true,
+            digits: vec![1, 0],
+        };
+        assert!(!ConstantEquality::PoolKey.equal(&canonical, &padded));
+        assert!(ConstantEquality::PythonValue.equal(&canonical, &padded));
     }
 
     #[test]
@@ -4766,7 +4790,7 @@ mod tests {
         reason = "The reference comparison preserves exact Python numeric equality"
     )]
     fn integer_value_equality_matches_numeric_normalization() {
-        let values = [
+        let mut values = vec![
             Constant::Bool(false),
             Constant::Bool(true),
             Constant::Int(0),
@@ -4779,10 +4803,6 @@ mod tests {
             Constant::SignedInt(0),
             Constant::SignedInt(1),
             Constant::SignedInt(i64::MAX),
-            Constant::BigInt {
-                negative: false,
-                digits: vec![1, 0],
-            },
             Constant::Float(-0.0),
             Constant::Float(1.0),
             Constant::Float(9_007_199_254_740_992.0),
@@ -4793,6 +4813,18 @@ mod tests {
                 imag: -0.0,
             },
         ];
+        for negative in [false, true] {
+            for digits in [
+                vec![],
+                vec![0],
+                vec![1],
+                vec![1, 0],
+                vec![1, 2, 3, 4, 5, 6],
+                vec![1, 2, 3, 4, 5, 6, 0],
+            ] {
+                values.push(Constant::BigInt { negative, digits });
+            }
+        }
         for left in &values {
             for right in &values {
                 let (left_real, left_imag) = numeric_parts(left).unwrap();
