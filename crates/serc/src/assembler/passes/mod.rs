@@ -1365,7 +1365,11 @@ impl LayoutAssembler {
         &self,
         instruction: &Instruction,
     ) -> Result<Operand, CompileError> {
-        if self.python_version == crate::PythonVersion::Py314 {
+        use crate::target::opcodes::{GET_YIELD_FROM_ITER, RESUME};
+
+        if self.python_version == crate::PythonVersion::Py314
+            || !matches!(instruction.opcode, RESUME | GET_YIELD_FROM_ITER)
+        {
             Ok(instruction.operand())
         } else {
             self.encoded_version_specific_operand(instruction)
