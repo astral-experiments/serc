@@ -28,10 +28,10 @@ fixture. The original groups use optimization level 0; `compile_pyc_O1` and
 The scaling groups compile functions with 32 and 128 sequential exception
 regions, comprehensions, or async manager blocks, plus mapping patterns with 32
 and 128 captured values and string- and integer-set membership tests with 64 and
-256 members. Repeated-set workloads reuse each string set eight times, in
-matching order or with alternating reversals. Each shape runs on Python 3.12
-through 3.15 at optimization level 0, including compilation, PYC encoding, and
-cleanup.
+256 members, including large integers starting at `2**100`. Repeated-set
+workloads reuse each string set eight times, in matching order or with
+alternating reversals. Each shape runs on Python 3.12 through 3.15 at
+optimization level 0, including compilation, PYC encoding, and cleanup.
 
 ```console
 CARGO_INCREMENTAL=0 cargo bench --locked --profile profiling -p serc_benchmark --bench compiler --no-default-features --features benchmarks
