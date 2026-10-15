@@ -47,6 +47,76 @@ fn opening_count_is_bounded(bytes: &[u8], maximum: usize) -> bool {
         <= maximum
 }
 
+/// Uses Ruff only for one prefixed string, preserving the surrounding delimiter budget.
+fn shallow_prefixed_string_end(source: &str, quote: usize, outer_depth: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let mut start = quote;
+    while start > 0 && bytes[start - 1].is_ascii_alphabetic() {
+        start -= 1;
+        if quote - start > 2 {
+            return None;
+        }
+    }
+    if start == quote
+        || (start > 0
+            && (bytes[start - 1].is_ascii_alphanumeric()
+                || bytes[start - 1] == b'_'
+                || !bytes[start - 1].is_ascii()))
+    {
+        return None;
+    }
+
+    let mut tokens = lexer::lex(&source[start..], Mode::Module);
+    match tokens.next_token() {
+        TokenKind::String if !tokens.current_flags().contains(TokenFlags::UNCLOSED_STRING) => {
+            return Some(start + tokens.current_range().end().to_usize());
+        }
+        TokenKind::FStringStart => {}
+        _ => return None,
+    }
+
+    let mut stack = [TokenKind::EndOfFile; MAX_NESTING];
+    let mut depth = 0;
+    let mut strings = 1;
+    loop {
+        let token = tokens.next_token();
+        match token {
+            TokenKind::FStringStart => strings += 1,
+            TokenKind::FStringEnd => {
+                strings -= 1;
+                if strings == 0 {
+                    return (depth == 0).then(|| start + tokens.current_range().end().to_usize());
+                }
+            }
+            TokenKind::Lpar | TokenKind::Lsqb | TokenKind::Lbrace => {
+                if outer_depth + depth == MAX_NESTING {
+                    return None;
+                }
+                stack[depth] = token;
+                depth += 1;
+            }
+            TokenKind::Rpar | TokenKind::Rsqb | TokenKind::Rbrace => {
+                if depth == 0
+                    || !matches!(
+                        (stack[depth - 1], token),
+                        (TokenKind::Lpar, TokenKind::Rpar)
+                            | (TokenKind::Lsqb, TokenKind::Rsqb)
+                            | (TokenKind::Lbrace, TokenKind::Rbrace)
+                    )
+                {
+                    return None;
+                }
+                depth -= 1;
+            }
+            TokenKind::String if tokens.current_flags().contains(TokenFlags::UNCLOSED_STRING) => {
+                return None;
+            }
+            TokenKind::TStringStart | TokenKind::Unknown | TokenKind::EndOfFile => return None,
+            _ => {}
+        }
+    }
+}
+
 /// Certifies the nesting limit for ordinary strings and comments without lexing identifiers.
 /// Unrecognized suffixes use the full lexer unless even their raw openings fit the limit.
 fn proves_shallow_nesting(source: &str) -> bool {
@@ -89,6 +159,10 @@ fn proves_shallow_nesting(source: &str) -> bool {
                         || bytes[index - 1] == b'_'
                         || !bytes[index - 1].is_ascii())
                 {
+                    if let Some(end) = shallow_prefixed_string_end(source, index, depth) {
+                        index = end;
+                        continue;
+                    }
                     // Every remaining lexer opening needs a source opening byte,
                     // just as in the whole-file guard. This also bounds interpolation.
                     return opening_count_is_bounded(&bytes[index..], MAX_NESTING - depth);
@@ -520,6 +594,9 @@ mod tests {
                 "'plain (['",
                 "r'escaped\\\'([quote'",
                 "b\"escaped\\\" ([quote\"",
+                "Br'([{}])'",
+                "rB'([{}])'",
+                "u'([{}])'",
                 "'''triple\n([\"quoted\"'''",
                 "\"\"\"triple\n(['quoted'\"\"\"",
                 "f'item {i + 1}'",
@@ -530,6 +607,13 @@ mod tests {
                 "f'{{literal}} {i:{width}}'",
                 "f'{\"(quoted)\"}'",
                 "f'{f\"{i}\"}'",
+                "f'{mapping['key']}'",
+                "f'{f'{value}'}'",
+                "fr'{values[0]:{width}.{precision}f}'",
+                "f'{(lambda: 0)()}'",
+                "f'{t'{value}'}'",
+                "ff'{value}'",
+                "\u{03bb}f'{value}'",
                 "f'''{i\n# } ( [\n}'''",
                 "'unterminated",
                 "f'{unterminated'",
@@ -552,6 +636,19 @@ mod tests {
         }
         assert!(proves_shallow_nesting(&prelude));
         assert!(proves_shallow_nesting("x = f\"Item {i+1}\"\n"));
+        for string in [
+            "r'([{}])'",
+            "Br'([{}])'",
+            "u'([{}])'",
+            "f'{mapping['key']}'",
+            "f'{f'{value}'}'",
+            "fr'{values[0]:{width}.{precision}f}'",
+        ] {
+            assert!(
+                proves_shallow_nesting(&format!("{prelude}{string}\n{prelude}")),
+                "{string:?}",
+            );
+        }
         assert!(proves_shallow_nesting(&format!(
             "# {}\nx = '{}'\n",
             "(".repeat(1000),
