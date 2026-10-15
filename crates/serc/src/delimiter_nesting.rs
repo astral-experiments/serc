@@ -7,15 +7,21 @@ use crate::{CompileError, PythonVersion, indentation, yield_syntax};
 const MAX_NESTING: usize = 200;
 
 /// Reuse a successfully parsed token stream to prove the nesting limit was not exceeded.
-/// Malformed input retains the independent tokenizer's diagnostic precedence. Legacy targets
-/// also retain that tokenizer because their template-string rules differ from Ruff's.
+/// Malformed input and legacy template strings retain the independent tokenizer's
+/// diagnostic precedence.
 pub(crate) fn validate_parsed(
     source: &str,
     options: &ParseOptions,
     version: PythonVersion,
     parsed: &ruff_python_parser::Parsed<ruff_python_ast::ModModule>,
 ) -> Result<(), CompileError> {
-    if version >= PythonVersion::Py314 && parsed.errors().is_empty() {
+    if parsed.errors().is_empty()
+        && (version >= PythonVersion::Py314
+            || !parsed
+                .tokens()
+                .iter()
+                .any(|token| token.kind() == TokenKind::TStringStart))
+    {
         if parsed.tokens().len() <= MAX_NESTING {
             return Ok(());
         }
@@ -508,20 +514,33 @@ mod tests {
             format!("x = 0b12\ny = {deep}"),
             format!("x = $\ny = {deep}"),
         ] {
-            for version in [PythonVersion::Py314, PythonVersion::Py315] {
-                let target = match version {
-                    PythonVersion::Py314 => ruff_python_ast::PythonVersion::PY314,
-                    _ => ruff_python_ast::PythonVersion::PY315,
-                };
+            for (version, target) in [
+                (PythonVersion::Py312, ruff_python_ast::PythonVersion::PY312),
+                (PythonVersion::Py313, ruff_python_ast::PythonVersion::PY313),
+                (PythonVersion::Py314, ruff_python_ast::PythonVersion::PY314),
+                (PythonVersion::Py315, ruff_python_ast::PythonVersion::PY315),
+            ] {
                 let options = ParseOptions::from(Mode::Module).with_target_version(target);
                 let parsed = ruff_python_parser::parse_unchecked(&source, options.clone())
                     .try_into_module()
                     .unwrap();
+                let expected = validate_with_fast_scan::<false>(&source, &options, version);
                 assert_eq!(
-                    validate_with_fast_scan::<false>(&source, &options, version),
+                    expected,
                     validate_parsed(&source, &options, version, &parsed),
                     "{version:?}: {source}"
                 );
+                if let Err(expected) = expected {
+                    let options = crate::CompileOptions {
+                        python_version: version,
+                        ..crate::CompileOptions::default()
+                    };
+                    assert_eq!(
+                        crate::compile_with_options(&source, "nesting.py", &options).unwrap_err(),
+                        expected,
+                        "{version:?}: {source}"
+                    );
+                }
             }
         }
     }
@@ -553,12 +572,21 @@ mod tests {
                         format!("{literal}\n{padding}"),
                         format!("{literal}\n{deep}"),
                         format!("{padding}{literal}\n{deep}"),
+                        format!("{exposed}\n"),
                         format!("{exposed}\n{padding}"),
                         format!("def f():\n    {literal}\n    {deep}"),
                         format!("\u{03bb}{literal}\n{deep}"),
                     ] {
                         assert_eq!(
                             validate_with_fast_scan::<true>(&source, &options, version),
+                            validate_with_fast_scan::<false>(&source, &options, version),
+                            "{version}: {source:?}",
+                        );
+                        let parsed = ruff_python_parser::parse_unchecked(&source, options.clone())
+                            .try_into_module()
+                            .unwrap();
+                        assert_eq!(
+                            validate_parsed(&source, &options, version, &parsed),
                             validate_with_fast_scan::<false>(&source, &options, version),
                             "{version}: {source:?}",
                         );

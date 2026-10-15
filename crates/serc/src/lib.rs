@@ -776,30 +776,15 @@ fn compile_normalized(
         .with_target_version(target_version);
     let may_depend_on_decimal_parse =
         parse_int_max_str_digits.is_none() && may_depend_on_decimal_parse(source);
-    if options.python_version <= PythonVersion::Py313
-        && let Err(error) =
-            delimiter_nesting::validate(source, &parse_options, options.python_version)
-    {
-        return Err(if may_depend_on_decimal_parse {
-            unknown_decimal_parse()
-        } else {
-            error
-        });
-    }
     let parsed = ruff_python_parser::parse_unchecked(source, parse_options.clone())
         .try_into_module()
         .ok_or_else(|| CompileError::Internal("parser did not return a module".to_string()))?;
     let parsed = ParsedModule(Some(parsed));
     let parsed = parsed.0.as_ref().expect("parsed module is present");
-    // Ruff grows its parser stack for deeply nested expressions. Successful modern parses can
+    // Ruff grows its parser stack for deeply nested expressions. Successful parses can
     // reuse its tokens; malformed input still uses the independent tokenizer before diagnostics.
-    if options.python_version >= PythonVersion::Py314
-        && let Err(error) = delimiter_nesting::validate_parsed(
-            source,
-            &parse_options,
-            options.python_version,
-            parsed,
-        )
+    if let Err(error) =
+        delimiter_nesting::validate_parsed(source, &parse_options, options.python_version, parsed)
     {
         return Err(if may_depend_on_decimal_parse {
             unknown_decimal_parse()
