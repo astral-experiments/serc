@@ -1186,18 +1186,12 @@ impl OptimizationPipeline {
                 previous_line = -1;
             }
             previous_array = array;
-            let positions = self.graph[block]
-                .items()
-                .iter()
-                .enumerate()
-                .filter_map(|(offset, item)| match item {
-                    Item::Instruction(_) => Some(ItemPosition::new(block, offset)),
-                    Item::Label(_) => None,
-                })
-                .collect::<Vec<_>>();
             let mut removed = Vec::new();
-            for (index, position) in positions.iter().copied().enumerate() {
-                let instruction = *self.graph.instruction_mut(position).unwrap();
+            for offset in 0..self.graph[block].items().len() {
+                let Item::Instruction(instruction) = self.graph[block].items()[offset] else {
+                    continue;
+                };
+                let position = ItemPosition::new(block, offset);
                 // SETUP records, and 3.12 POP_BLOCK, stay real records until
                 // pseudo-op conversion. Their locations still precede later NOPs.
                 if instruction.opcode == NOP
@@ -1210,7 +1204,11 @@ impl OptimizationPipeline {
                         // Metadata labels split physical blocks without ending the native
                         // instruction array. A NOP can still donate its location to the
                         // next original instruction across those fragments.
-                        let next = positions.get(index + 1).copied().or_else(|| {
+                        let next_in_block = self.graph[block].items()[offset + 1..]
+                            .iter()
+                            .position(|item| matches!(item, Item::Instruction(_)))
+                            .map(|next| ItemPosition::new(block, offset + 1 + next));
+                        let next = next_in_block.or_else(|| {
                             array?;
                             order[block_index + 1..]
                                 .iter()
