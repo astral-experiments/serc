@@ -190,13 +190,18 @@ fn compiler_scaling(criterion: &mut Criterion) {
         }
     }
 
-    for count in [64, 256] {
-        let mut membership = String::from("def work(value):\n    return value in {");
-        for index in 0..count {
-            write!(membership, "{index},").unwrap();
+    for (name, start) in [
+        ("integer_set_membership", 0_u128),
+        ("big_integer_set_membership", 1_u128 << 100),
+    ] {
+        for count in [64, 256] {
+            let mut membership = String::from("def work(value):\n    return value in {");
+            for index in 0..count {
+                write!(membership, "{},", start + u128::try_from(index).unwrap()).unwrap();
+            }
+            membership.push_str("}\n");
+            workloads.push((name, count, membership));
         }
-        membership.push_str("}\n");
-        workloads.push(("integer_set_membership", count, membership));
     }
 
     for (name, python_version) in [
