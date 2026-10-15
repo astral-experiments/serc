@@ -1,9 +1,41 @@
 //! Exact native labels retained independently of Serc's physical block labels.
 
+use std::ops::Index;
+
 use rustc_hash::FxHashMap;
 
 use super::block_graph::{BasicBlockId, BlockGraph};
 use super::ir::{Item, Label};
+
+/// Original arrays keyed by stable block IDs; later copied blocks remain absent.
+#[derive(Debug)]
+pub(super) struct LegacyInstructionArrays(Vec<Option<usize>>);
+
+impl LegacyInstructionArrays {
+    pub(super) fn with_capacity(capacity: usize) -> Self {
+        Self(Vec::with_capacity(capacity))
+    }
+
+    pub(super) fn insert(&mut self, block: BasicBlockId, array: usize) {
+        let index = block.index();
+        if index >= self.0.len() {
+            self.0.resize(index + 1, None);
+        }
+        self.0[index] = Some(array);
+    }
+
+    pub(super) fn get(&self, block: BasicBlockId) -> Option<&usize> {
+        self.0.get(block.index()).and_then(Option::as_ref)
+    }
+}
+
+impl Index<&BasicBlockId> for LegacyInstructionArrays {
+    type Output = usize;
+
+    fn index(&self, block: &BasicBlockId) -> &Self::Output {
+        self.get(*block).expect("no entry found for key")
+    }
+}
 
 #[derive(Debug, Default)]
 pub(super) struct LegacyNativeLabels {
@@ -43,7 +75,7 @@ impl LegacyNativeLabels {
     pub(super) fn initialize_blocks(
         &mut self,
         graph: &BlockGraph,
-        original_arrays: &FxHashMap<BasicBlockId, usize>,
+        original_arrays: &LegacyInstructionArrays,
     ) {
         if !self.certified {
             return;
@@ -74,7 +106,7 @@ impl LegacyNativeLabels {
         // unreferenced codegen entries retain the physical-block fallback.
         let mut groups = FxHashMap::<usize, (Option<u32>, bool, bool)>::default();
         for block in graph.order().iter().copied() {
-            let Some(&array) = original_arrays.get(&block) else {
+            let Some(&array) = original_arrays.get(block) else {
                 continue;
             };
             let (label, seen_instruction, valid) =
@@ -90,7 +122,7 @@ impl LegacyNativeLabels {
             *seen_instruction |= graph[block].last_instruction().is_some();
         }
         for block in graph.order().iter().copied() {
-            let Some(&array) = original_arrays.get(&block) else {
+            let Some(&array) = original_arrays.get(block) else {
                 continue;
             };
             let &(label, _, valid) = &groups[&array];
@@ -157,6 +189,31 @@ mod tests {
     use crate::assembler::{Instruction, Operand, SourceLocation};
     use crate::target::opcodes::{NOP, RETURN_VALUE};
     use rustc_hash::FxHashSet;
+
+    impl FromIterator<(BasicBlockId, usize)> for LegacyInstructionArrays {
+        fn from_iter<T: IntoIterator<Item = (BasicBlockId, usize)>>(iter: T) -> Self {
+            let iter = iter.into_iter();
+            let mut arrays = Self::with_capacity(iter.size_hint().0);
+            for (block, array) in iter {
+                arrays.insert(block, array);
+            }
+            arrays
+        }
+    }
+
+    #[test]
+    fn indexed_arrays_preserve_missing_entries_and_stable_ids() {
+        let first = BasicBlockId::from_usize(0);
+        let later = BasicBlockId::from_usize(3);
+        let entries = [(later, 0), (first, usize::MAX), (later, 7)];
+        let expected = entries.into_iter().collect::<FxHashMap<_, _>>();
+        let actual = entries.into_iter().collect::<LegacyInstructionArrays>();
+        for index in 0..8 {
+            let block = BasicBlockId::from_usize(index);
+            assert_eq!(actual.get(block), expected.get(&block));
+        }
+        assert_eq!(actual[&later], 7);
+    }
 
     fn fragmented_graph() -> BlockGraph {
         BlockGraph::from_items(

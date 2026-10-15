@@ -3326,7 +3326,7 @@ impl OptimizationPipeline {
             );
             if graph[current].last_instruction().is_none()
                 && let Some(arrays) = &legacy_arrays
-                && let Some(array) = arrays.get(&current)
+                && let Some(array) = arrays.get(current)
             {
                 // Native propagation sees the last instruction before an unused
                 // range label in this same array. An actual original empty array
@@ -3334,7 +3334,7 @@ impl OptimizationPipeline {
                 if let Some(previous) = order[..position]
                     .iter()
                     .rev()
-                    .take_while(|block| arrays.get(*block) == Some(array))
+                    .take_while(|block| arrays.get(**block) == Some(array))
                     .find_map(|block| graph[*block].last_instruction())
                 {
                     location = previous.location;

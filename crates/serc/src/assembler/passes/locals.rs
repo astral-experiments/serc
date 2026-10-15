@@ -22,8 +22,9 @@ use super::super::{
     block_jump_target, ends_scope, opcode_stack_counts, opcode_stack_effect,
 };
 use crate::assembler::OptimizationPipeline;
-use crate::assembler::block_graph::{BasicBlockId, ItemMut};
+use crate::assembler::block_graph::ItemMut;
 use crate::assembler::ir::{ThreadedBorrowEntries, ThreadedBorrowSnapshot};
+use crate::assembler::legacy_native_labels::LegacyInstructionArrays;
 use crate::target::{
     is_conditional_jump, is_unconditional_jump,
     opcodes::{
@@ -2436,7 +2437,7 @@ impl OptimizationPipeline {
     fn preserve_high_local_initialization(
         &mut self,
         local_count: usize,
-        original_arrays: Option<&FxHashMap<BasicBlockId, usize>>,
+        original_arrays: Option<&LegacyInstructionArrays>,
     ) {
         if local_count <= 64 {
             return;
@@ -2469,7 +2470,7 @@ impl OptimizationPipeline {
         let mut previous_array = None;
         for block_index in 0..self.graph.len() {
             let block = self.graph.block_at(block_index);
-            let original_array = original_arrays.and_then(|arrays| arrays.get(&block).copied());
+            let original_array = original_arrays.and_then(|arrays| arrays.get(block).copied());
             let continues_region = previous_has_fallthrough
                 && if original_arrays.is_some() {
                     // Folding a conditional does not merge its native instruction arrays.
@@ -2643,7 +2644,7 @@ impl OptimizationPipeline {
         &mut self,
         local_count: usize,
         parameter_count: usize,
-        original_arrays: &FxHashMap<BasicBlockId, usize>,
+        original_arrays: &LegacyInstructionArrays,
     ) {
         self.add_checks_for_uninitialized_loads_in_arrays::<false>(
             local_count,
@@ -2722,7 +2723,7 @@ impl OptimizationPipeline {
         &mut self,
         local_count: usize,
         parameter_count: usize,
-        original_arrays: Option<&FxHashMap<BasicBlockId, usize>>,
+        original_arrays: Option<&LegacyInstructionArrays>,
         nop_donors: Option<&LocalNopDonors>,
     ) {
         #[cfg(test)]
@@ -2756,7 +2757,7 @@ impl OptimizationPipeline {
         &mut self,
         local_count: usize,
         parameter_count: usize,
-        original_arrays: Option<&FxHashMap<BasicBlockId, usize>>,
+        original_arrays: Option<&LegacyInstructionArrays>,
         nop_donors: Option<&LocalNopDonors>,
     ) {
         if local_count == 0 {

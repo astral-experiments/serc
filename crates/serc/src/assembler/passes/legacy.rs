@@ -3,6 +3,7 @@ use std::cmp::Reverse;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::super::block_graph::{BasicBlockId, BlockGraph, ItemPosition};
+use super::super::legacy_native_labels::LegacyInstructionArrays;
 use super::super::{
     Assembler, ConstantTable, ExceptionPolicy, ExceptionRegionPriority, Instruction, Item, Label,
     LayoutAssembler, Operand, OptimizationPipeline, SourceLocation, block_has_fallthrough,
@@ -312,10 +313,7 @@ impl OptimizationPipeline {
     }
 
     /// Freezes native jump operands before any pointer-only CFG retargeting.
-    fn initialize_legacy_native_jump_seeds(
-        &mut self,
-        original_arrays: &FxHashMap<BasicBlockId, usize>,
-    ) {
+    fn initialize_legacy_native_jump_seeds(&mut self, original_arrays: &LegacyInstructionArrays) {
         let Some(native) = self.legacy_native_labels.as_mut() else {
             return;
         };
@@ -445,7 +443,7 @@ impl OptimizationPipeline {
     ///
     /// Source and preserved CFG entries, jump targets and exception handlers start arrays.
     /// Exception-range endpoints alone do not; they only split Serc's physical blocks.
-    pub(super) fn legacy_instruction_arrays(&self) -> FxHashMap<BasicBlockId, usize> {
+    pub(super) fn legacy_instruction_arrays(&self) -> LegacyInstructionArrays {
         let mut boundaries = self.preserved_block_boundaries.clone();
         boundaries.extend(&self.exception_owner_provenance.block_boundaries);
         boundaries.extend(&self.exception_owner_provenance.source_boundaries);
@@ -468,7 +466,7 @@ impl OptimizationPipeline {
             Item::Label(_) => None,
         }));
 
-        let mut arrays = FxHashMap::default();
+        let mut arrays = LegacyInstructionArrays::with_capacity(self.graph.len());
         let mut array = 0;
         for block in self.graph.order().iter().copied() {
             if self.graph[block]
@@ -497,7 +495,7 @@ impl OptimizationPipeline {
     /// Copies native four-slot exit blocks, plus 3.13's unlocated terminal blocks.
     fn inline_legacy_exit_blocks(
         &mut self,
-        original_arrays: &FxHashMap<BasicBlockId, usize>,
+        original_arrays: &LegacyInstructionArrays,
         before_folding: bool,
     ) {
         if before_folding {
@@ -532,7 +530,7 @@ impl OptimizationPipeline {
                 let targets = order[target_index..]
                     .iter()
                     .copied()
-                    .take_while(|target| original_arrays.get(target) == Some(&target_array))
+                    .take_while(|target| original_arrays.get(*target) == Some(&target_array))
                     .collect::<Vec<_>>();
                 if targets.contains(&block) {
                     // Metadata splits do not make a native self-loop eligible for copying.
@@ -1111,7 +1109,7 @@ impl OptimizationPipeline {
 
     fn remove_legacy_nops_and_jumps(
         &mut self,
-        original_arrays: &FxHashMap<BasicBlockId, usize>,
+        original_arrays: &LegacyInstructionArrays,
         convert_pseudo_ops: bool,
     ) {
         loop {
@@ -1123,7 +1121,7 @@ impl OptimizationPipeline {
         }
     }
 
-    fn remove_legacy_nops_and_pairs(&mut self, original_arrays: &FxHashMap<BasicBlockId, usize>) {
+    fn remove_legacy_nops_and_pairs(&mut self, original_arrays: &LegacyInstructionArrays) {
         loop {
             self.remove_legacy_nops(original_arrays, false);
             let mut changed = false;
@@ -1170,7 +1168,7 @@ impl OptimizationPipeline {
 
     fn remove_legacy_nops(
         &mut self,
-        original_arrays: &FxHashMap<BasicBlockId, usize>,
+        original_arrays: &LegacyInstructionArrays,
         convert_pseudo_ops: bool,
     ) -> bool {
         let preserve_pop_blocks =
@@ -1180,7 +1178,7 @@ impl OptimizationPipeline {
         let mut previous_line = -1;
         let order = self.graph.order().to_vec();
         for (block_index, block) in order.iter().copied().enumerate() {
-            let array = original_arrays.get(&block).copied();
+            let array = original_arrays.get(block).copied();
             // Copies inserted after the snapshot have their own native arrays.
             if array.is_none() || array != previous_array {
                 previous_line = -1;
@@ -1212,7 +1210,7 @@ impl OptimizationPipeline {
                             array?;
                             order[block_index + 1..]
                                 .iter()
-                                .take_while(|next| original_arrays.get(next).copied() == array)
+                                .take_while(|next| original_arrays.get(**next).copied() == array)
                                 .find_map(|next| {
                                     self.graph[*next]
                                         .items()
@@ -1282,7 +1280,7 @@ impl OptimizationPipeline {
     /// Restores original constant-loop false edges for 3.13's first line pass.
     fn legacy_predecessors_before_folding(
         &self,
-        original_arrays: &FxHashMap<BasicBlockId, usize>,
+        original_arrays: &LegacyInstructionArrays,
     ) -> FxHashMap<BasicBlockId, usize> {
         let mut predecessors = self.legacy_predecessors();
         if self.folded_predecessor_sources.is_empty() {
@@ -1322,8 +1320,8 @@ impl OptimizationPipeline {
                 let Some(next) = order.get(positions[&target] + 1) else {
                     break;
                 };
-                if original_arrays.get(&target).is_none()
-                    || original_arrays.get(&target) != original_arrays.get(next)
+                if original_arrays.get(target).is_none()
+                    || original_arrays.get(target) != original_arrays.get(*next)
                 {
                     break;
                 }
@@ -1355,7 +1353,7 @@ impl OptimizationPipeline {
     /// cleanup must preserve before restoring the native count for line propagation.
     fn legacy_repeated_tail_predecessors(
         &self,
-        original_arrays: &FxHashMap<BasicBlockId, usize>,
+        original_arrays: &LegacyInstructionArrays,
     ) -> Vec<(BasicBlockId, Instruction, usize, usize)> {
         let full_order = self.graph.order();
         // Avoid building provenance maps when no conditional can queue its
@@ -1424,7 +1422,7 @@ impl OptimizationPipeline {
             for (index, &block) in full_order[..prefix_len].iter().enumerate() {
                 if self.graph[block].last_instruction().is_none()
                     || !original_arrays
-                        .get(&block)
+                        .get(block)
                         .is_some_and(|array| prefix_arrays.insert(*array))
                 {
                     prefix_len = index;
@@ -1468,7 +1466,7 @@ impl OptimizationPipeline {
         for &block in order {
             if self.graph[block].last_instruction().is_none()
                 || !original_arrays
-                    .get(&block)
+                    .get(block)
                     .is_some_and(|array| arrays.insert(*array))
             {
                 return Vec::new();
@@ -1602,7 +1600,7 @@ impl OptimizationPipeline {
     /// Return `None` when the retained provenance cannot establish this graph.
     fn legacy_repeated_tails_with_setups(
         &self,
-        original_arrays: &FxHashMap<BasicBlockId, usize>,
+        original_arrays: &LegacyInstructionArrays,
     ) -> Option<Vec<(BasicBlockId, Instruction, usize, usize)>> {
         let setups = &self.exception_owner_provenance.setups;
         let captured = &self.exception_owner_provenance.legacy_native_setup_targets;
@@ -1649,7 +1647,7 @@ impl OptimizationPipeline {
         let mut seen_arrays = FxHashSet::default();
         let mut previous = None;
         for &block in self.graph.order() {
-            let array = *original_arrays.get(&block)?;
+            let array = *original_arrays.get(block)?;
             if previous != Some(array) {
                 if !seen_arrays.insert(array) {
                     return None;
@@ -2120,7 +2118,7 @@ impl OptimizationPipeline {
     fn resolve_legacy_locations(
         &mut self,
         mut predecessors: FxHashMap<BasicBlockId, usize>,
-        original_arrays: &FxHashMap<BasicBlockId, usize>,
+        original_arrays: &LegacyInstructionArrays,
     ) {
         let mut next_native_label = self
             .legacy_native_labels
@@ -2148,14 +2146,14 @@ impl OptimizationPipeline {
                 .iter()
                 .position(|block| *block == target)
                 .unwrap();
-            let target_array = original_arrays.get(&target).copied();
+            let target_array = original_arrays.get(target).copied();
             let targets = self.graph.order()[target_index..]
                 .iter()
                 .copied()
                 .take_while(|block| {
                     *block == target
                         || (target_array.is_some()
-                            && original_arrays.get(block).copied() == target_array)
+                            && original_arrays.get(*block).copied() == target_array)
                 })
                 .collect::<Vec<_>>();
             let last_target = *targets.last().unwrap();
