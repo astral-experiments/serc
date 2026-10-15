@@ -393,11 +393,8 @@ impl MediumNameKey {
 
 /// Remembers exact spellings without hashing or probing the full interner again.
 #[derive(Debug, Default)]
-struct ShortNameCache(OnceCell<Box<NameCaches>>);
-
-#[derive(Debug)]
-struct NameCaches {
-    short: [Cell<ShortNameEntry>; NAME_CACHE_SIZE],
+struct ShortNameCache {
+    short: OnceCell<Box<[Cell<ShortNameEntry>; NAME_CACHE_SIZE]>>,
     medium: OnceCell<Box<[Cell<MediumNameEntry>; NAME_CACHE_SIZE]>>,
 }
 
@@ -416,25 +413,10 @@ struct MediumNameEntry {
     length: u8,
 }
 
-impl Default for NameCaches {
-    fn default() -> Self {
-        Self {
-            short: [const {
-                Cell::new(ShortNameEntry {
-                    packed: 0,
-                    id: None,
-                    length: 0,
-                })
-            }; NAME_CACHE_SIZE],
-            medium: OnceCell::new(),
-        }
-    }
-}
-
 impl ShortNameCache {
     #[inline]
     fn get(&self, key: ShortNameKey) -> Option<NameId> {
-        let entry = self.0.get()?.short[key.slot()].get();
+        let entry = self.short.get()?[key.slot()].get();
         if entry.packed == key.packed && entry.length == key.length {
             entry.id
         } else {
@@ -444,7 +426,18 @@ impl ShortNameCache {
 
     #[inline]
     fn insert(&self, key: ShortNameKey, id: NameId) {
-        self.0.get_or_init(Box::default).short[key.slot()].set(ShortNameEntry {
+        let entries = self.short.get_or_init(|| {
+            Box::new(
+                [const {
+                    Cell::new(ShortNameEntry {
+                        packed: 0,
+                        id: None,
+                        length: 0,
+                    })
+                }; NAME_CACHE_SIZE],
+            )
+        });
+        entries[key.slot()].set(ShortNameEntry {
             packed: key.packed,
             id: Some(id),
             length: key.length,
@@ -453,7 +446,7 @@ impl ShortNameCache {
 
     #[inline]
     fn get_medium(&self, key: MediumNameKey) -> Option<NameId> {
-        let entry = self.0.get()?.medium.get()?[key.slot()].get();
+        let entry = self.medium.get()?[key.slot()].get();
         if entry.first == key.first && entry.last == key.last && entry.length == key.length {
             entry.id
         } else {
@@ -463,7 +456,7 @@ impl ShortNameCache {
 
     #[inline]
     fn insert_medium(&self, key: MediumNameKey, id: NameId) {
-        let entries = self.0.get_or_init(Box::default).medium.get_or_init(|| {
+        let entries = self.medium.get_or_init(|| {
             Box::new(
                 [const {
                     Cell::new(MediumNameEntry {
@@ -9063,7 +9056,8 @@ def function():
         let seed = "super";
         let seed_id = names.get(seed).unwrap();
         let seed_key = ShortNameKey::new(seed).unwrap();
-        assert!(names.short_names.0.get().is_none());
+        assert!(names.short_names.short.get().is_none());
+        assert!(names.short_names.medium.get().is_none());
 
         let colliding = (0..1000)
             .map(|index| format!("v{index}"))
@@ -9085,17 +9079,23 @@ def function():
     #[test]
     fn medium_name_cache_allocates_only_after_a_successful_medium_lookup() {
         let mut names = NameInterner::seeded();
-        assert!(names.short_names.0.get().is_none());
+        assert!(names.short_names.short.get().is_none());
+        assert!(names.short_names.medium.get().is_none());
         assert_eq!(names.get("not_present"), None);
-        assert!(names.short_names.0.get().is_none());
+        assert!(names.short_names.medium.get().is_none());
         assert_eq!(
             names.get("__annotations__"),
             Some(NameInterner::seed_id("__annotations__").unwrap())
         );
-        assert!(names.short_names.0.get().is_none());
+        assert!(names.short_names.medium.get().is_none());
         let dynamic = names.intern("new_medium_name");
         assert_eq!(names.get("new_medium_name"), Some(dynamic));
-        assert!(names.short_names.0.get().unwrap().medium.get().is_some());
+        assert!(names.short_names.short.get().is_none());
+        assert!(names.short_names.medium.get().is_some());
+        let short = names.intern("short");
+        assert!(names.short_names.short.get().is_some());
+        assert_eq!(names.get("short"), Some(short));
+        assert_eq!(names.get("new_medium_name"), Some(dynamic));
     }
 
     #[test]
