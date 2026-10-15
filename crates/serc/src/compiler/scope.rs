@@ -2350,7 +2350,9 @@ impl ScopeArena {
     ) {
         // Flat bodies have no closure or evaluation-order edge cases. Their runtime bindings
         // were already collected; a nongeneric function's own annotations are separate.
-        if let Some(inputs) = flat.filter(|_| self.assertion_mode == AssertionMode::Keep) {
+        if let Some(inputs) = flat
+            .filter(|inputs| self.assertion_mode == AssertionMode::Keep || !inputs.has_assertions)
+        {
             let annotation_references = if inputs.has_annotations && !future_annotations {
                 self.names.intern_set(FunctionPlan::annotation_references(
                     definition,
@@ -2737,6 +2739,7 @@ struct FlatFunctionInputs {
     names: Vec<(NameId, bool)>,
     name_positions: Option<FxHashMap<NameId, usize>>,
     has_annotations: bool,
+    has_assertions: bool,
     implicit_class_reference: bool,
     complex: bool,
 }
@@ -2959,6 +2962,11 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
             self.mark_flat_complex();
         }
         match statement {
+            Stmt::Assert(_) => {
+                if let Some(flat) = &mut self.flat_function {
+                    flat.has_assertions = true;
+                }
+            }
             Stmt::AnnAssign(assignment)
                 if self
                     .flat_function
@@ -3018,6 +3026,7 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
                                 .parameters
                                 .iter()
                                 .any(|parameter| parameter.annotation().is_some())),
+                    has_assertions: false,
                     implicit_class_reference: false,
                     complex: generic,
                 };
@@ -7895,8 +7904,8 @@ mod tests {
 
     use super::super::statement::function_body_contains_yield;
     use super::{
-        FlatFunctionInputs, FunctionPlan, LocalCollector, ModuleNameCollector, NameId,
-        NameInterner, NameSet, SCOPE_SEED_NAMES, ScopeArena, ScopeDefinition, ScopeId,
+        AssertionMode, FlatFunctionInputs, FunctionPlan, LocalCollector, ModuleNameCollector,
+        NameId, NameInterner, NameSet, SCOPE_SEED_NAMES, ScopeArena, ScopeDefinition, ScopeId,
         definitely_evaluated_references, has_annotations,
     };
 
@@ -9272,6 +9281,7 @@ def function():
             names: Vec::new(),
             name_positions: None,
             has_annotations: false,
+            has_assertions: false,
             implicit_class_reference: false,
             complex: false,
         };
@@ -9462,6 +9472,13 @@ def enclosing_class():
     def inner_super():
         return super()
     return inner_super
+
+def conditional_assert(value):
+    if value:
+        assert first, detail
+    second = 1
+    first = 2
+    return first, second
 ";
         for version in [
             PythonVersion::Py312,
@@ -9469,26 +9486,40 @@ def enclosing_class():
             PythonVersion::Py314,
             PythonVersion::Py315,
         ] {
-            for future in [false, true] {
+            for (future, optimization_level) in [false, true]
+                .into_iter()
+                .flat_map(|future| (0..=2).map(move |level| (future, level)))
+            {
                 let source = if future {
                     format!("from __future__ import annotations\n{body}")
                 } else {
                     body.to_owned()
                 };
                 let parsed = parse_module(&source).unwrap();
-                let fast = ScopeArena::analyze_with_python_version(parsed.suite(), version);
+                let assertion_mode = if optimization_level == 0 {
+                    AssertionMode::Keep
+                } else {
+                    AssertionMode::Elide
+                };
+                let fast = ScopeArena::analyze_with_source_options(
+                    parsed.suite(),
+                    version,
+                    &mut super::SourceAnalysis::new(version, optimization_level),
+                    assertion_mode,
+                );
                 let deferred = matches!(version, PythonVersion::Py314 | PythonVersion::Py315);
                 let mut full = ScopeArena {
                     names: NameInterner::seeded(),
                     deferred_annotations: deferred,
                     python_version: version,
+                    assertion_mode,
                     ..ScopeArena::default()
                 };
                 let (_, mut definitions, _) = ModuleNameCollector::collect_with_source(
                     &mut full.names,
                     parsed.suite(),
                     !deferred && !future,
-                    &mut super::SourceAnalysis::new(version, 0),
+                    &mut super::SourceAnalysis::new(version, optimization_level),
                 );
                 let functions = definitions
                     .iter_mut()
@@ -9540,15 +9571,17 @@ def enclosing_class():
                         ("outside_class", true),
                         ("enclosing_class", false),
                         ("inner_super", true),
+                        ("conditional_assert", true),
                     ],
-                    "{version:?}, future={future}"
+                    "{version:?}, future={future}, O{optimization_level}"
                 );
                 full.build_scopes(definitions, future);
 
                 for (name, id, _) in &functions {
                     let fast_plan = fast.function(*id).unwrap();
                     let full_plan = full.function(*id).unwrap();
-                    let context = format!("{version:?}, future={future}, {name}");
+                    let context =
+                        format!("{version:?}, future={future}, O{optimization_level}, {name}");
                     assert_eq!(fast_plan.locals, full_plan.locals, "{context}");
                     assert_eq!(
                         fast_plan.local_aliases, full_plan.local_aliases,
@@ -9697,6 +9730,7 @@ def enclosing_class():
             names: Vec::new(),
             name_positions: None,
             has_annotations: false,
+            has_assertions: false,
             implicit_class_reference: false,
             complex: false,
         };
@@ -9726,6 +9760,7 @@ def enclosing_class():
                 (NameId::from_u32(2), 1),
             ])),
             has_annotations: false,
+            has_assertions: false,
             implicit_class_reference: false,
             complex: false,
         };
