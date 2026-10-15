@@ -469,6 +469,7 @@ impl OptimizationPipeline {
         }));
 
         let mut arrays = FxHashMap::default();
+        arrays.reserve(self.graph.order().len());
         let mut array = 0;
         for block in self.graph.order().iter().copied() {
             if self.graph[block]
