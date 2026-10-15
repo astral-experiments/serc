@@ -204,6 +204,14 @@ fn compiler_scaling(criterion: &mut Criterion) {
         }
     }
 
+    for count in [256, 1024] {
+        let mut source = String::from("pattern = r'[()]'\ndescription = f'item {value}'\n");
+        for index in 0..count {
+            writeln!(source, "value_{index} = (value + {index})").unwrap();
+        }
+        workloads.push(("prefixed_strings", count, source));
+    }
+
     for (name, python_version) in [
         ("compile_pyc_scaling_3_12", serc::PythonVersion::Py312),
         ("compile_pyc_scaling_3_13", serc::PythonVersion::Py313),
