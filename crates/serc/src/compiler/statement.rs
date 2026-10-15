@@ -25302,9 +25302,6 @@ impl<'source> Compiler<'source> {
             && emit_statement_nop
             && !exclude_terminal_body_not_taken
             && !retained_else_break_exit
-            // This eager backedge has already replaced native JUMP TryEnd;
-            // its live loop target cannot supply the original native operand.
-            && !nested_loop_conversion_try
             && loop_tail.is_none()
             && else_loop_tail.is_none()
             && else_match_tail.is_none();
