@@ -39,12 +39,9 @@ pub(crate) fn validate_parsed(
 
 #[inline]
 fn opening_count_is_bounded(bytes: &[u8], maximum: usize) -> bool {
-    bytes
-        .iter()
-        .filter(|byte| matches!(byte, b'(' | b'[' | b'{'))
-        .take(maximum + 1)
-        .count()
-        <= maximum
+    memchr::memchr3_iter(b'(', b'[', b'{', bytes)
+        .nth(maximum)
+        .is_none()
 }
 
 /// Uses Ruff only for one prefixed string, preserving the surrounding delimiter budget.
@@ -408,9 +405,22 @@ pub(crate) fn invalid_number_suffix(source: &str, range: TextRange) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_NESTING, proves_shallow_nesting, validate_parsed, validate_with_fast_scan};
+    use super::{
+        MAX_NESTING, opening_count_is_bounded, proves_shallow_nesting, validate_parsed,
+        validate_with_fast_scan,
+    };
     use crate::PythonVersion;
     use ruff_python_parser::{Mode, ParseOptions};
+
+    #[test]
+    fn opening_count_respects_boundary() {
+        for count in 0..=MAX_NESTING + 1 {
+            let bytes = b"(\xff\0x)]y".repeat(count);
+            for maximum in [0, count.saturating_sub(1), count] {
+                assert_eq!(opening_count_is_bounded(&bytes, maximum), count <= maximum);
+            }
+        }
+    }
 
     #[test]
     fn bounded_scan_preserves_lexer_diagnostics() {
