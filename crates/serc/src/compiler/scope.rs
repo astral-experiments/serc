@@ -24,6 +24,7 @@ use super::{Compiler, SHADOWED_SUPER_SENTINEL, Scope, comprehension_parts};
 #[cfg(test)]
 thread_local! {
     static FORCE_GENERIC_SUSPENSION_SEARCH: Cell<bool> = const { Cell::new(false) };
+    static FORCE_FULL_LOWERED_SCOPES: Cell<bool> = const { Cell::new(false) };
 }
 
 impl Compiler<'_> {
@@ -823,6 +824,7 @@ pub(super) struct ScopeBodyFacts {
     pub(super) has_generic_definition: bool,
     pub(super) has_type_alias: bool,
     pub(super) has_annotations: bool,
+    has_assertions: bool,
     has_inlined_comprehension: bool,
     local_annotation_references: BTreeSet<String>,
     local_annotation_bindings: FxHashSet<String>,
@@ -1012,6 +1014,7 @@ impl FunctionPlan {
             nested_annotation_scope_requirements: annotation_scope_requirements,
             generator_named_targets,
             inlined_comprehension_cellvars,
+            has_assertions,
             has_inlined_comprehension,
             local_annotation_references,
             local_annotation_bindings,
@@ -1075,7 +1078,7 @@ impl FunctionPlan {
         for name in local_annotation_bindings {
             locals.insert_annotation_only(&name);
         }
-        let mut optimized_locals = (assertion_mode == AssertionMode::Elide)
+        let mut optimized_locals = (assertion_mode == AssertionMode::Elide && has_assertions)
             .then(|| {
                 let mut optimized = locals.clone();
                 optimized.elide_assertions = true;
@@ -1986,6 +1989,96 @@ pub(super) struct ScopeArena {
     assertion_mode: AssertionMode,
 }
 
+/// The only optimized scope facts retained after restoring the original symbol table.
+pub(super) struct LoweredScopeFacts {
+    names: NameInterner,
+    module_targets: Vec<NameId>,
+    classes: FxHashMap<ScopeOrigin, Vec<(NameId, bool)>>,
+    has_nested_classes: bool,
+}
+
+impl LoweredScopeFacts {
+    pub(super) fn analyze<'ast>(
+        body: &'ast [Stmt],
+        python_version: PythonVersion,
+        source: &mut SourceAnalysis<'ast>,
+        has_original_class_comprehensions: bool,
+    ) -> Self {
+        // Class comprehensions can require a full rebuild; retain its reusable function inputs.
+        let inputs = ScopeInputs::collect(
+            body,
+            python_version,
+            source,
+            AssertionMode::Keep,
+            has_original_class_comprehensions,
+        );
+        let has_nested_classes = inputs.definitions.iter().any(|input| {
+            input.parent != ScopeId::MODULE
+                && matches!(input.definition, ScopeDefinition::Class(..))
+        });
+        let full_analysis = inputs.facts.has_class_comprehensions;
+        #[cfg(test)]
+        let full_analysis = full_analysis || FORCE_FULL_LOWERED_SCOPES.get();
+        if full_analysis {
+            let mut arena = inputs.build();
+            let classes = arena
+                .by_parent_and_origin
+                .iter()
+                .filter_map(|((_, origin), &id)| {
+                    let ScopePlan::Class(plan) = &mut arena.nodes[id].plan else {
+                        return None;
+                    };
+                    Some((*origin, std::mem::take(&mut plan.comprehension_targets)))
+                })
+                .collect();
+            return Self {
+                names: arena.names,
+                module_targets: arena.module.comprehension_targets,
+                classes,
+                has_nested_classes,
+            };
+        }
+
+        // Without class comprehensions, no child scope plan can affect these facts.
+        let classes = inputs
+            .definitions
+            .iter()
+            .filter_map(|input| match input.definition {
+                ScopeDefinition::Class(definition, _) => {
+                    Some((ScopeOrigin::class(definition), Vec::new()))
+                }
+                ScopeDefinition::Function(..) => None,
+            })
+            .collect();
+        let module_targets = inputs
+            .bindings
+            .comprehension_targets
+            .iter()
+            .map(|name| {
+                inputs
+                    .arena
+                    .names
+                    .get(name.as_str())
+                    .expect("module comprehension names are interned")
+            })
+            .collect();
+        Self {
+            names: inputs.arena.names,
+            module_targets,
+            classes,
+            has_nested_classes,
+        }
+    }
+
+    pub(super) fn has_class_scopes(&self) -> bool {
+        !self.classes.is_empty()
+    }
+
+    pub(super) const fn has_nested_class_scopes(&self) -> bool {
+        self.has_nested_classes
+    }
+}
+
 #[derive(Debug, Default)]
 pub(super) struct ModulePlan {
     pub(super) future_flags: u32,
@@ -1995,6 +2088,7 @@ pub(super) struct ModulePlan {
     pub(super) comprehension_cell_names: NameSet,
     pub(super) has_annotations: bool,
     pub(super) has_simple_annotations: bool,
+    pub(super) has_class_comprehensions: bool,
     has_suspension_expressions: bool,
     yield_offsets: Vec<TextSize>,
 }
@@ -2007,6 +2101,7 @@ struct ModulePlanBuilder {
     has_annotations: bool,
     has_simple_annotations: bool,
     has_suspension_expressions: bool,
+    has_class_comprehensions: bool,
     yield_offsets: Vec<TextSize>,
 }
 
@@ -2023,6 +2118,10 @@ impl ModulePlan {
     /// Statement ranges include nested definition decorators and headers. Nested bodies can produce
     /// false positives; the scope-aware walk remains authoritative.
     pub(super) fn may_contain_yield(&self, body: &[Stmt]) -> bool {
+        #[cfg(test)]
+        if FORCE_GENERIC_SUSPENSION_SEARCH.get() {
+            return true;
+        }
         if self.yield_offsets.is_empty() {
             return false;
         }
@@ -2085,6 +2184,7 @@ impl ModulePlan {
                 .collect(),
             has_annotations: facts.has_annotations,
             has_simple_annotations: facts.has_simple_annotations,
+            has_class_comprehensions: facts.has_class_comprehensions,
             has_suspension_expressions: facts.has_suspension_expressions,
             yield_offsets: facts.yield_offsets,
         }
@@ -2119,15 +2219,14 @@ impl ScopeArena {
     }
 
     /// Comprehension temporaries are allocated during lowering, after assertion removal.
-    pub(super) fn retain_lowered_comprehension_locals(&mut self, lowered: &Self) {
+    pub(super) fn retain_lowered_comprehension_locals(&mut self, lowered: &LoweredScopeFacts) {
         let original_name = |name| {
             self.names
                 .get(lowered.names.resolve(name))
                 .expect("a lowered comprehension name occurs in the original scope")
         };
         let lowered_module_targets = lowered
-            .module
-            .comprehension_targets
+            .module_targets
             .iter()
             .copied()
             .map(original_name)
@@ -2145,11 +2244,6 @@ impl ScopeArena {
         self.elided_comprehension_cells
             .insert(ScopeId::MODULE, elided_module_cells);
         self.module.comprehension_targets = lowered_module_targets;
-        let lowered_scopes = lowered
-            .by_parent_and_origin
-            .iter()
-            .map(|((_, origin), &id)| (*origin, id))
-            .collect::<FxHashMap<_, _>>();
         let mut original_scopes = self
             .by_parent_and_origin
             .iter()
@@ -2157,14 +2251,11 @@ impl ScopeArena {
             .collect::<Vec<_>>();
         original_scopes.sort_unstable_by_key(|(_, id)| id.index());
         for (origin, id) in original_scopes {
-            let Some(&lowered_id) = lowered_scopes.get(&origin) else {
+            let Some(lowered_targets) = lowered.classes.get(&origin) else {
                 continue;
             };
-            if let (ScopePlan::Class(plan), ScopePlan::Class(lowered_plan)) =
-                (&mut self.nodes[id].plan, &lowered.nodes[lowered_id].plan)
-            {
-                let lowered_targets = lowered_plan
-                    .comprehension_targets
+            if let ScopePlan::Class(plan) = &mut self.nodes[id].plan {
+                let lowered_targets = lowered_targets
                     .iter()
                     .map(|&(name, requires_free)| {
                         let name = original_name(name);
@@ -2243,41 +2334,7 @@ impl ScopeArena {
         source: &mut SourceAnalysis<'ast>,
         assertion_mode: AssertionMode,
     ) -> Self {
-        let future_flags = future_feature_flags(body);
-        let future_annotations = future_flags & CO_FUTURE_ANNOTATIONS != 0;
-        let deferred_annotations =
-            !matches!(python_version, PythonVersion::Py312 | PythonVersion::Py313);
-        let eager_annotations = !deferred_annotations && !future_annotations;
-        let mut arena = Self {
-            names: NameInterner::seeded(),
-            deferred_annotations,
-            python_version,
-            assertion_mode,
-            ..Self::default()
-        };
-        // The name walk also records scope definitions in preorder. Allocating their nodes first
-        // and then finishing plans in reverse preserves lexical child order and closure
-        // requirements without walking the statement tree a second time.
-        let (facts, definitions, requires_module_bindings) =
-            ModuleNameCollector::collect_with_source(
-                &mut arena.names,
-                body,
-                eager_annotations,
-                source,
-            );
-        let mut bindings = LocalCollector {
-            eager_function_annotations: eager_annotations,
-            eager_statement_annotations: eager_annotations,
-            module_references_super: Some(false),
-            global_comprehension_saves: true,
-            ..LocalCollector::default()
-        };
-        if requires_module_bindings {
-            bindings.collect_suite(body);
-        }
-        arena.build_scopes(definitions, future_annotations);
-        arena.module = ModulePlan::build(&arena.names, future_flags, facts, bindings);
-        arena
+        ScopeInputs::collect(body, python_version, source, assertion_mode, true).build()
     }
 
     pub(super) const fn module(&self) -> &ModulePlan {
@@ -2702,6 +2759,80 @@ impl ScopeArena {
     }
 }
 
+struct ScopeInputs<'ast> {
+    arena: ScopeArena,
+    facts: ModulePlanBuilder,
+    bindings: LocalCollector,
+    definitions: Vec<ScopeBuildInput<'ast>>,
+    future_flags: u32,
+}
+
+impl<'ast> ScopeInputs<'ast> {
+    fn collect(
+        body: &'ast [Stmt],
+        python_version: PythonVersion,
+        source: &mut SourceAnalysis<'ast>,
+        assertion_mode: AssertionMode,
+        collect_flat_inputs: bool,
+    ) -> Self {
+        #[cfg(test)]
+        let collect_flat_inputs = collect_flat_inputs || FORCE_FULL_LOWERED_SCOPES.get();
+        let future_flags = future_feature_flags(body);
+        let future_annotations = future_flags & CO_FUTURE_ANNOTATIONS != 0;
+        let deferred_annotations =
+            !matches!(python_version, PythonVersion::Py312 | PythonVersion::Py313);
+        let eager_annotations = !deferred_annotations && !future_annotations;
+        let mut arena = ScopeArena {
+            names: NameInterner::seeded(),
+            deferred_annotations,
+            python_version,
+            assertion_mode,
+            ..ScopeArena::default()
+        };
+        let (facts, definitions, requires_module_bindings) =
+            ModuleNameCollector::collect_with_source(
+                &mut arena.names,
+                body,
+                eager_annotations,
+                source,
+                collect_flat_inputs,
+            );
+        let mut bindings = LocalCollector {
+            eager_function_annotations: eager_annotations,
+            eager_statement_annotations: eager_annotations,
+            module_references_super: Some(false),
+            global_comprehension_saves: true,
+            ..LocalCollector::default()
+        };
+        if requires_module_bindings {
+            bindings.collect_suite(body);
+        }
+        Self {
+            arena,
+            facts,
+            bindings,
+            definitions,
+            future_flags,
+        }
+    }
+
+    fn build(mut self) -> ScopeArena {
+        // Preorder allocation followed by reverse construction preserves lexical child order
+        // and closure requirements without walking the statement tree a second time.
+        self.arena.build_scopes(
+            self.definitions,
+            self.future_flags & CO_FUTURE_ANNOTATIONS != 0,
+        );
+        self.arena.module = ModulePlan::build(
+            &self.arena.names,
+            self.future_flags,
+            self.facts,
+            self.bindings,
+        );
+        self.arena
+    }
+}
+
 struct ScopeBuildInput<'ast> {
     parent: ScopeId,
     definition: ScopeDefinition<'ast>,
@@ -2726,8 +2857,10 @@ struct ModuleNameCollector<'a, 'ast> {
     generator_depth: usize,
     current_scope: ScopeId,
     in_module_header: bool,
+    in_class_body: bool,
     requires_module_bindings: bool,
     flat_function: Option<FlatFunctionInputs>,
+    collect_flat_inputs: bool,
     definitions: Vec<ScopeBuildInput<'ast>>,
     eager_annotations: bool,
 }
@@ -2846,6 +2979,7 @@ impl<'a, 'ast> ModuleNameCollector<'a, 'ast> {
             body,
             eager_annotations,
             &mut SourceAnalysis::new(PythonVersion::Py314, 0),
+            true,
         )
     }
 
@@ -2854,6 +2988,7 @@ impl<'a, 'ast> ModuleNameCollector<'a, 'ast> {
         body: &'ast [Stmt],
         eager_annotations: bool,
         source: &'a mut SourceAnalysis<'ast>,
+        collect_flat_inputs: bool,
     ) -> (ModulePlanBuilder, Vec<ScopeBuildInput<'ast>>, bool) {
         let mut collector = Self {
             names,
@@ -2865,8 +3000,10 @@ impl<'a, 'ast> ModuleNameCollector<'a, 'ast> {
             generator_depth: 0,
             current_scope: ScopeId::MODULE,
             in_module_header: false,
+            in_class_body: false,
             requires_module_bindings: false,
             flat_function: None,
+            collect_flat_inputs,
             definitions: Vec::new(),
             eager_annotations,
         };
@@ -2896,7 +3033,9 @@ impl<'a, 'ast> ModuleNameCollector<'a, 'ast> {
     }
 
     fn record_flat(&mut self, name: NameId, bound: bool) {
-        if let Some(flat) = &mut self.flat_function {
+        if self.collect_flat_inputs
+            && let Some(flat) = &mut self.flat_function
+        {
             flat.record(name, bound);
         }
     }
@@ -3018,7 +3157,11 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
                 let outer_flat = self.flat_function.take();
                 let generic = definition.type_params.is_some();
                 let mut flat = FlatFunctionInputs {
-                    names: Vec::with_capacity(8),
+                    names: if self.collect_flat_inputs {
+                        Vec::with_capacity(8)
+                    } else {
+                        Vec::new()
+                    },
                     name_positions: None,
                     has_annotations: !generic
                         && (definition.returns.is_some()
@@ -3031,7 +3174,10 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
                     complex: generic,
                 };
                 for parameter in parameters_in_locals_order(&definition.parameters) {
-                    flat.record(self.intern(parameter.name.as_str()), true);
+                    let name = self.intern(parameter.name.as_str());
+                    if self.collect_flat_inputs {
+                        flat.record(name, true);
+                    }
                 }
                 self.collect_type_parameters(definition.type_params.as_deref());
                 self.nested_scope_depth += 1;
@@ -3067,14 +3213,17 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
                     self.visit_annotation(returns);
                 }
                 self.in_module_header = outer_header;
+                // Keep traversal decisions identical even when the collected records are unused.
                 self.flat_function = Some(flat);
+                let outer_class_body = std::mem::replace(&mut self.in_class_body, false);
                 self.collect_suite(&definition.body);
+                self.in_class_body = outer_class_body;
                 self.nested_scope_depth -= 1;
                 let flat = self
                     .flat_function
                     .take()
                     .expect("function name collection should retain its flat inputs");
-                if !flat.complex {
+                if self.collect_flat_inputs && !flat.complex {
                     let ScopeDefinition::Function(_, inputs, _) =
                         &mut self.definitions[scope.index() - 1].definition
                     else {
@@ -3088,6 +3237,7 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
             }
             Stmt::ClassDef(definition) => {
                 self.intern(definition.name.as_str());
+                let outer_class_body = std::mem::replace(&mut self.in_class_body, true);
                 let parent = self.current_scope;
                 self.current_scope = ScopeId::from_usize(self.definitions.len() + 1);
                 self.definitions.push(ScopeBuildInput {
@@ -3137,6 +3287,7 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
                 self.source.enter_class_body(definition);
                 self.collect_suite(&definition.body);
                 self.source.leave_class(outer_source_class);
+                self.in_class_body = outer_class_body;
                 self.private_name = outer_private_name;
                 self.nested_scope_depth -= 1;
                 self.current_scope = parent;
@@ -3283,6 +3434,14 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
 
         if matches!(expression, Expr::Yield(_) | Expr::YieldFrom(_)) {
             self.facts.yield_offsets.push(expression.start());
+        }
+        if self.in_class_body
+            && matches!(
+                expression,
+                Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_) | Expr::Generator(_)
+            )
+        {
+            self.facts.has_class_comprehensions = true;
         }
         if !self.facts.has_suspension_expressions {
             let generators = match expression {
@@ -5013,6 +5172,7 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
 impl<'ast> Visitor<'ast> for ScopeBodyFactsCollector<'ast> {
     fn visit_stmt(&mut self, statement: &'ast Stmt) {
         match statement {
+            Stmt::Assert(_) => self.facts.has_assertions = true,
             Stmt::FunctionDef(definition) => {
                 // The child body is represented by a separate `ScopeArena` node and plan.
                 self.collect_function_header(definition);
@@ -7910,6 +8070,163 @@ mod tests {
     };
 
     #[test]
+    fn class_comprehension_detection_excludes_method_bodies_but_keeps_headers() {
+        for (source, expected) in [
+            ("result = [x for x in values]\n", false),
+            (
+                "class C:\n    def method(self):\n        return [x for x in values]\n",
+                false,
+            ),
+            (
+                "class C:\n    @decorate([x for x in values])\n    def method(self):\n        pass\n",
+                true,
+            ),
+            (
+                "class C:\n    def method(self, value=[x for x in values]):\n        pass\n",
+                true,
+            ),
+            (
+                "class C:\n    def method(self, value: [x for x in values]):\n        pass\n",
+                true,
+            ),
+            ("class C:\n    values = {x: x for x in values}\n", true),
+            ("class C:\n    values = (x for x in values)\n", true),
+            ("class C(*(base for base in bases)):\n    pass\n", true),
+            (
+                "def outer():\n    class C:\n        values = {x for x in values}\n",
+                true,
+            ),
+            (
+                "class C:\n    def method(self):\n        class D:\n            pass\n        return [x for x in values]\n",
+                false,
+            ),
+        ] {
+            let parsed = parse_module(source).unwrap();
+            let (facts, _, _) =
+                ModuleNameCollector::collect(&mut NameInterner::seeded(), parsed.suite(), true);
+            assert_eq!(facts.has_class_comprehensions, expected, "{source}");
+            let scopes = ScopeArena::analyze_with_source(
+                parsed.suite(),
+                PythonVersion::Py312,
+                &mut super::SourceAnalysis::new(PythonVersion::Py312, 0),
+            );
+            assert_eq!(
+                scopes.module().has_class_comprehensions,
+                expected,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn omitted_flat_records_preserve_name_interning_order() {
+        let parsed = parse_module(
+            "def f(parameter):\n    target += value\n    annotated: annotation = initializer\n    return target, annotated, parameter\n",
+        )
+        .unwrap();
+        let collect = |keep| {
+            super::ScopeInputs::collect(
+                parsed.suite(),
+                PythonVersion::Py314,
+                &mut super::SourceAnalysis::new(PythonVersion::Py314, 0),
+                AssertionMode::Keep,
+                keep,
+            )
+        };
+        let complete = collect(true);
+        let partial = collect(false);
+        assert!(
+            complete
+                .definitions
+                .iter()
+                .any(|input| matches!(input.definition, ScopeDefinition::Function(_, Some(_), _)))
+        );
+        assert!(
+            partial
+                .definitions
+                .iter()
+                .all(|input| matches!(input.definition, ScopeDefinition::Function(_, None, _)))
+        );
+        for name in [
+            "f",
+            "parameter",
+            "target",
+            "value",
+            "initializer",
+            "annotation",
+            "annotated",
+        ] {
+            let expected = complete.arena.names.get(name).unwrap();
+            assert_eq!(partial.arena.names.get(name), Some(expected), "{name}");
+        }
+    }
+
+    #[test]
+    fn lowered_scope_facts_match_full_analysis_for_all_targets() {
+        struct ResetFull(bool);
+
+        impl Drop for ResetFull {
+            fn drop(&mut self) {
+                super::FORCE_FULL_LOWERED_SCOPES.set(self.0);
+            }
+        }
+
+        let sources = [
+            "assert hidden\ndef f(value):\n    return value\n",
+            "assert hidden\ndef f(parameter):\n    target += value\n    annotated: annotation = initializer\n    return target, annotated, parameter\n",
+            "assert hidden\nclass C:\n    values = [x for x in iterable]\n    def method(self):\n        target += value\n        annotated: annotation = initializer\n        return target, annotated\n",
+            "assert [lambda: item for item in values]\nresult = [x for x in values]\n",
+            "class C:\n    'docstring'\n    __field = 1\n    def method(self):\n        assert hidden\n        return [self.__field for x in values]\n",
+            "class C:\n    assert [lambda: item for item in values]\n    field = 1\n",
+            "class C:\n    assert hidden\n    values = [lambda: item for item in values]\n",
+            "class C:\n    assert hidden\n    @decorate([x for x in values])\n    def method(self, value={x for x in values}):\n        return value\n",
+            "class C:\n    assert hidden\n    def method(self, value: [x for x in values]):\n        return value\n",
+            "from __future__ import annotations\nclass C:\n    assert hidden\n    field: [x for x in values]\n",
+            "def outer(value):\n    assert hidden\n    class C:\n        def method(self):\n            return value, __class__\n    return C\n",
+            "class Outer[T]:\n    assert hidden\n    class Inner:\n        def method(self):\n            return super(), T\n",
+            "assert caf\u{e9}\nclass C:\n    __field = ''\n    def method(self):\n        return '\u{e9}', self.__field\n",
+            "def generator(value):\n    assert (yield value)\nasync def coroutine():\n    assert await work()\n",
+        ];
+        for python_version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            for optimization_level in [
+                crate::OptimizationLevel::Zero,
+                crate::OptimizationLevel::One,
+                crate::OptimizationLevel::Two,
+            ] {
+                let options = crate::CompileOptions {
+                    python_version,
+                    optimization_level,
+                    ..crate::CompileOptions::default()
+                };
+                for source in sources {
+                    let fast = crate::compile_with_options(source, "lowered_scopes.py", &options);
+                    let full = {
+                        let _reset = ResetFull(super::FORCE_FULL_LOWERED_SCOPES.replace(true));
+                        crate::compile_with_options(source, "lowered_scopes.py", &options)
+                    };
+                    match (fast, full) {
+                        (Ok(fast), Ok(full)) => assert_eq!(
+                            fast.marshal(),
+                            full.marshal(),
+                            "{python_version:?} {optimization_level:?}: {source}"
+                        ),
+                        (fast, full) => assert_eq!(
+                            format!("{fast:?}"),
+                            format!("{full:?}"),
+                            "{python_version:?} {optimization_level:?}: {source}"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn module_suspension_certificate_matches_forced_scope_walk_for_all_targets() {
         struct ResetGeneric(bool);
 
@@ -8218,6 +8535,79 @@ def trailing():
             let plain_scope = ScopeArena::analyze_with_python_version(plain.suite(), version);
             assert!(plain_scope.module().yield_offsets.is_empty());
             assert!(!plain_scope.module().may_contain_yield(plain.suite()));
+        }
+    }
+
+    #[test]
+    fn optimized_yield_index_matches_the_full_scope_walk() {
+        struct ResetGeneric(bool);
+
+        impl Drop for ResetGeneric {
+            fn drop(&mut self) {
+                super::FORCE_GENERIC_SUSPENSION_SEARCH.set(self.0);
+            }
+        }
+
+        let sources = [
+            "\"\"\"module docstring\"\"\"\ndef plain(value):\n    return value\n",
+            "def plain(value):\n    assert value\n    return value\n",
+            "def erased():\n    assert (yield 1)\n",
+            "def erased_from(values):\n    assert (yield from values)\n",
+            "def outer():\n    assert ready\n    def inner():\n        yield 1\n    return inner\n",
+            "def header():\n    assert ready\n    @(yield decorator)\n    def child(value=(yield default)):\n        pass\n",
+            "assert ready\ndef outer():\n    @(yield decorator)\n    def child():\n        pass\n",
+            "assert ready\ndef outer():\n    @(yield decorator)\n    class Child:\n        pass\n",
+            "def annotation():\n    assert ready\n    def child(value: (yield annotation)):\n        pass\n",
+            "def lambda_body():\n    assert ready\n    return lambda: (yield 1)\n",
+            "def lambda_default():\n    assert (lambda value=(yield 1): value)\n",
+            "async def asynchronous():\n    assert (yield 1)\n",
+            "def legacy_coroutine():\n    assert await task()\n",
+            "def legacy_comprehension(values):\n    assert [value async for value in values]\n",
+        ];
+        for python_version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            for optimization_level in [
+                crate::OptimizationLevel::Zero,
+                crate::OptimizationLevel::One,
+                crate::OptimizationLevel::Two,
+            ] {
+                let options = crate::CompileOptions {
+                    python_version,
+                    optimization_level,
+                    ..crate::CompileOptions::default()
+                };
+                for source in sources {
+                    let fast = crate::compile_with_options(source, "yield_index.py", &options);
+                    let generic = {
+                        let _reset =
+                            ResetGeneric(super::FORCE_GENERIC_SUSPENSION_SEARCH.replace(true));
+                        crate::compile_with_options(source, "yield_index.py", &options)
+                    };
+                    match (fast, generic) {
+                        (Ok(fast), Ok(generic)) => {
+                            assert_eq!(
+                                fast.marshal(),
+                                generic.marshal(),
+                                "{python_version:?} {optimization_level:?}: {source}"
+                            );
+                        }
+                        (Err(fast), Err(generic)) => {
+                            assert_eq!(
+                                format!("{fast:?}"),
+                                format!("{generic:?}"),
+                                "{python_version:?} {optimization_level:?}: {source}"
+                            );
+                        }
+                        _ => panic!(
+                            "indexed and generic compilation disagree: {python_version:?} {optimization_level:?}: {source}"
+                        ),
+                    }
+                }
+            }
         }
     }
 
@@ -8884,6 +9274,39 @@ def function():
     }
 
     #[test]
+    fn scope_assertion_facts_match_local_collection_boundaries() {
+        for (source, expected) in [
+            ("value = [item for item in values]\n", false),
+            ("assert check\n", true),
+            ("if condition:\n    assert check\n", true),
+            ("for value in values:\n    assert value\n", true),
+            (
+                "while condition:\n    pass\nelse:\n    assert check\n",
+                true,
+            ),
+            (
+                "try:\n    operation()\nexcept Error:\n    assert check\n",
+                true,
+            ),
+            ("try:\n    pass\nfinally:\n    assert check\n", true),
+            ("match subject:\n    case _:\n        assert check\n", true),
+            ("def nested():\n    assert check\n", false),
+            ("class Nested:\n    assert check\n", false),
+            ("return result\nassert check\n", true),
+        ] {
+            let parsed = parse_module(source).unwrap();
+            let facts = super::ScopeBodyFacts::for_function(parsed.suite());
+            let mut locals = LocalCollector {
+                elide_assertions: true,
+                ..LocalCollector::default()
+            };
+            locals.collect_suite(parsed.suite());
+            assert_eq!(facts.has_assertions, expected, "{source}");
+            assert_eq!(facts.has_assertions, locals.elided_assertion, "{source}");
+        }
+    }
+
+    #[test]
     fn nested_first_iterables_reserve_each_scope_once() {
         let collector = LocalCollector {
             nonlocals: FxHashSet::from_iter(["unused".to_string()]),
@@ -9520,6 +9943,7 @@ def conditional_assert(value):
                     parsed.suite(),
                     !deferred && !future,
                     &mut super::SourceAnalysis::new(version, optimization_level),
+                    true,
                 );
                 let functions = definitions
                     .iter_mut()

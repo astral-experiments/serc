@@ -332,17 +332,15 @@ impl<'source> Compiler<'source> {
         native_build_profile: crate::NativeBuildProfile,
         optimized: Option<&super::optimization::OptimizedSuite>,
     ) -> Box<Self> {
-        let mut context = CompilationContext::with_profile(
+        let mut context = CompilationContext::with_scopes(
             filename.into(),
             source,
             tokens,
             body,
+            original_scopes,
             python_version,
             native_build_profile,
         );
-        if let Some(original_scopes) = original_scopes {
-            context.preserve_unoptimized_scopes(original_scopes);
-        }
         if let Some(optimized) = optimized {
             context.optimized_locations.clone_from(&optimized.locations);
         }

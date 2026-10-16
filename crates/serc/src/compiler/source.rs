@@ -25,7 +25,9 @@ use super::constant::{
     constant_slice_with_literals, explicit_surrogate_string, fold_constant,
     fold_constant_for_version, fold_constant_with_profile, is_literal_constant, literal_constant,
 };
-use super::scope::{ModulePlan, NameId, ScopeArena, parameter_default_expressions};
+use super::scope::{
+    LoweredScopeFacts, ModulePlan, NameId, ScopeArena, parameter_default_expressions,
+};
 use super::statement::function_body_contains_yield;
 use super::symbol::mangle_name;
 use super::{CachedSourceLine, Compiler};
@@ -243,6 +245,10 @@ pub(super) struct CallShape<'a> {
 /// Owns the binding and source facts that must survive AST optimization.
 pub(crate) struct OriginalScopes {
     scopes: ScopeArena,
+    metadata: OriginalMetadata,
+}
+
+struct OriginalMetadata {
     names: Vec<Name>,
     dotted_import_names: Vec<String>,
     generators: FxHashSet<TextRange>,
@@ -256,17 +262,20 @@ impl OriginalScopes {
         body: &Suite,
         python_version: crate::PythonVersion,
     ) -> Self {
-        struct GeneratorCollector {
+        struct GeneratorCollector<'a> {
+            module: &'a ModulePlan,
             ranges: FxHashSet<TextRange>,
             coroutines: FxHashSet<TextRange>,
             eager_annotations: bool,
             legacy_coroutines: bool,
         }
 
-        impl<'ast> Visitor<'ast> for GeneratorCollector {
+        impl<'ast> Visitor<'ast> for GeneratorCollector<'_> {
             fn visit_stmt(&mut self, statement: &'ast Stmt) {
                 if let Stmt::FunctionDef(function) = statement {
-                    if function_body_contains_yield(&function.body, self.eager_annotations) {
+                    if self.module.may_contain_yield(&function.body)
+                        && function_body_contains_yield(&function.body, self.eager_annotations)
+                    {
                         self.ranges.insert(function.range);
                     }
                     if self.legacy_coroutines
@@ -279,12 +288,8 @@ impl OriginalScopes {
                 walk_stmt(self, statement);
             }
 
-            fn visit_expr(&mut self, expression: &'ast Expr) {
-                if crate::stack_growth_required() {
-                    return crate::grow_stack(|| self.visit_expr(expression));
-                }
-                walk_expr(self, expression);
-            }
+            // Expressions cannot contain function declarations.
+            fn visit_expr(&mut self, _: &'ast Expr) {}
         }
 
         let mut original = SourceAnalysis::new(python_version, 0);
@@ -306,22 +311,30 @@ impl OriginalScopes {
             .collect();
         let eager_annotations = python_version <= crate::PythonVersion::Py313
             && scopes.module().future_flags & crate::target::code_flags::CO_FUTURE_ANNOTATIONS == 0;
-        let module_contains_yield = function_body_contains_yield(body, eager_annotations);
+        let may_contain_yield = scopes.module().may_contain_yield(body);
+        let module_contains_yield =
+            may_contain_yield && function_body_contains_yield(body, eager_annotations);
         let mut collector = GeneratorCollector {
+            module: scopes.module(),
             ranges: FxHashSet::default(),
             coroutines: FxHashSet::default(),
             eager_annotations,
             legacy_coroutines: python_version <= crate::PythonVersion::Py313
                 && (source.contains("await") || source.contains("async")),
         };
-        collector.visit_body(body);
+        if may_contain_yield || collector.legacy_coroutines {
+            collector.visit_body(body);
+        }
+        let (generators, coroutines) = (collector.ranges, collector.coroutines);
         Self {
             scopes,
-            names,
-            dotted_import_names,
-            generators: collector.ranges,
-            coroutines: collector.coroutines,
-            module_contains_yield,
+            metadata: OriginalMetadata {
+                names,
+                dotted_import_names,
+                generators,
+                coroutines,
+                module_contains_yield,
+            },
         }
     }
 }
@@ -364,21 +377,23 @@ impl<'source> CompilationContext<'source> {
         body: &'source Suite,
         python_version: crate::PythonVersion,
     ) -> Self {
-        Self::with_profile(
+        Self::with_scopes(
             filename,
             source,
             tokens,
             body,
+            None,
             python_version,
             crate::NativeBuildProfile::Default,
         )
     }
 
-    pub(super) fn with_profile(
+    pub(super) fn with_scopes(
         filename: CodeFilename,
         source: &'source str,
         tokens: &'source Tokens,
         body: &'source Suite,
+        original: Option<OriginalScopes>,
         python_version: crate::PythonVersion,
         native_build_profile: crate::NativeBuildProfile,
     ) -> Self {
@@ -388,7 +403,32 @@ impl<'source> CompilationContext<'source> {
             body.len().max(tokens.len() / 20).clamp(32, 4096)
         };
         let mut source_analysis = SourceAnalysis::new(python_version, name_capacity);
-        let scopes = ScopeArena::analyze_with_source(body, python_version, &mut source_analysis);
+        let (scopes, original_source, has_class_scopes, has_nested_class_scopes) =
+            if let Some(OriginalScopes {
+                mut scopes,
+                metadata,
+            }) = original
+            {
+                let lowered = LoweredScopeFacts::analyze(
+                    body,
+                    python_version,
+                    &mut source_analysis,
+                    scopes.module().has_class_comprehensions,
+                );
+                scopes.retain_lowered_comprehension_locals(&lowered);
+                (
+                    scopes,
+                    Some(metadata),
+                    lowered.has_class_scopes(),
+                    lowered.has_nested_class_scopes(),
+                )
+            } else {
+                let scopes =
+                    ScopeArena::analyze_with_source(body, python_version, &mut source_analysis);
+                let has_classes = scopes.has_class_scopes();
+                let has_nested_classes = scopes.has_nested_class_scopes();
+                (scopes, None, has_classes, has_nested_classes)
+            };
         let mut generated_mangled_strings = FxHashSet::default();
         let mut requires_interning_trace = false;
         let mut static_attribute_names = FxHashSet::default();
@@ -409,9 +449,9 @@ impl<'source> CompilationContext<'source> {
         );
         let legacy = python_version <= crate::PythonVersion::Py313;
         let has_relevant_class = if legacy {
-            scopes.has_class_scopes()
+            has_class_scopes
         } else {
-            scopes.has_nested_class_scopes()
+            has_nested_class_scopes
         };
         let constant_origins = (has_relevant_class || has_percent_replacement).then(|| {
             RefCell::new(ConstantOrigins {
@@ -423,7 +463,7 @@ impl<'source> CompilationContext<'source> {
             .keys()
             .any(|name| !name.is_ascii())
             .then(RefCell::default);
-        Self {
+        let mut context = Self {
             python_version,
             native_build_profile,
             filename,
@@ -449,7 +489,11 @@ impl<'source> CompilationContext<'source> {
             requires_empty_bytes_cache_trace,
             empty_bytes_origin: Cell::default(),
             interning_events: RefCell::new(Vec::new()),
+        };
+        if let Some(original_source) = original_source {
+            context.preserve_unoptimized_metadata(original_source);
         }
+        context
     }
 
     pub(super) fn is_elided_statement(&self, statement: &Stmt) -> bool {
@@ -459,9 +503,8 @@ impl<'source> CompilationContext<'source> {
         )
     }
 
-    /// Preserve symbol-table and suspension facts established before assertion removal.
-    pub(super) fn preserve_unoptimized_scopes(&mut self, original: OriginalScopes) {
-        let mut scopes = original.scopes;
+    /// Preserve metadata and suspension facts established before assertion removal.
+    fn preserve_unoptimized_metadata(&mut self, original: OriginalMetadata) {
         // Parsing interns identifiers even when a later optimization removes their
         // expressions. Preserve those raw names, but retain all lowering and cache
         // facts from the optimized tree and do not mark literal objects canonical.
@@ -480,8 +523,6 @@ impl<'source> CompilationContext<'source> {
                     .insert(Cow::Owned(name.as_str().to_owned()), Cell::default());
             }
         }
-        scopes.retain_lowered_comprehension_locals(&self.scopes);
-        self.scopes = scopes;
         self.module_contains_yield = original.module_contains_yield;
         self.original_generator_functions = Some(original.generators);
         self.original_legacy_coroutine_functions = original.coroutines;
