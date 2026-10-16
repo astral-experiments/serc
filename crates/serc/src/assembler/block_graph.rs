@@ -5,10 +5,10 @@ use rustc_hash::FxHashSet;
 use smallvec::SmallVec;
 
 use crate::target::opcodes::{
-    COPY, IS_OP, JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD, KW_NAMES, LOAD_CONST,
-    LOAD_FAST, LOAD_FAST_BORROW, LOAD_FAST_CHECK, LOAD_FAST_LOAD_FAST, NOP, NOT_TAKEN,
-    POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE, POP_JUMP_IF_TRUE, RETURN_CONST,
-    STORE_FAST, SWAP, TO_BOOL, UNARY_NOT,
+    CALL_INTRINSIC_1, COPY, IS_OP, JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD,
+    KW_NAMES, LIST_APPEND, LOAD_CONST, LOAD_FAST, LOAD_FAST_BORROW, LOAD_FAST_CHECK,
+    LOAD_FAST_LOAD_FAST, NOP, NOT_TAKEN, POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE,
+    POP_JUMP_IF_TRUE, RETURN_CONST, SET_ADD, STORE_FAST, SWAP, TO_BOOL, UNARY_NOT,
 };
 
 #[cfg(test)]
@@ -97,31 +97,32 @@ impl BasicBlock {
 
 /// Conservative opcode and IR-policy summary for gating assembler passes.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(super) struct PipelineFeatures(u16);
+pub(super) struct PipelineFeatures(u32);
 
 impl PipelineFeatures {
-    const FORWARD_JUMP: u16 = 1 << 0;
-    const FORWARD_CONDITIONAL: u16 = 1 << 1;
-    const SWAP_TRIGGER: u16 = 1 << 2;
-    const FAST_LOAD: u16 = 1 << 3;
-    const STORE_FAST_TRIGGER: u16 = 1 << 4;
-    const BOOLEAN_CONVERSION: u16 = 1 << 5;
-    const BORROW_EMPTY_BLOCK: u16 = 1 << 6;
-    const JUMP: u16 = 1 << 7;
-    const POP_CONDITIONAL: u16 = 1 << 8;
-    const COPY_TOP: u16 = 1 << 9;
-    const CHECKED_FAST_LOAD: u16 = 1 << 10;
-    const IDENTITY_COMPARISON: u16 = 1 << 11;
-    const NOT_TAKEN: u16 = 1 << 12;
-    const ORIGINAL_FUSION_OWNER_CANDIDATE: u16 = 1 << 13;
-    const CHECK_COPY: u16 = 1 << 14;
-    const CHECK_FUSION_OWNER: u16 = 1 << 15;
+    const FORWARD_JUMP: u32 = 1 << 0;
+    const FORWARD_CONDITIONAL: u32 = 1 << 1;
+    const SWAP_TRIGGER: u32 = 1 << 2;
+    const FAST_LOAD: u32 = 1 << 3;
+    const STORE_FAST_TRIGGER: u32 = 1 << 4;
+    const BOOLEAN_CONVERSION: u32 = 1 << 5;
+    const BORROW_EMPTY_BLOCK: u32 = 1 << 6;
+    const JUMP: u32 = 1 << 7;
+    const POP_CONDITIONAL: u32 = 1 << 8;
+    const COPY_TOP: u32 = 1 << 9;
+    const CHECKED_FAST_LOAD: u32 = 1 << 10;
+    const IDENTITY_COMPARISON: u32 = 1 << 11;
+    const NOT_TAKEN: u32 = 1 << 12;
+    const ORIGINAL_FUSION_OWNER_CANDIDATE: u32 = 1 << 13;
+    const CHECK_COPY: u32 = 1 << 14;
+    const CHECK_FUSION_OWNER: u32 = 1 << 15;
+    const SEQUENCE_TARGET: u32 = 1 << 16;
 
-    const FORWARD_FEATURES: u16 = Self::FORWARD_JUMP | Self::FORWARD_CONDITIONAL;
-    const CHECK_FEATURES: u16 = Self::CHECK_COPY | Self::CHECK_FUSION_OWNER;
+    const FORWARD_FEATURES: u32 = Self::FORWARD_JUMP | Self::FORWARD_CONDITIONAL;
+    const CHECK_FEATURES: u32 = Self::CHECK_COPY | Self::CHECK_FUSION_OWNER;
 
     /// Static features and the policy checks relevant to each semantic IR opcode.
-    const BY_OPCODE: [u16; 256] = {
+    const BY_OPCODE: [u32; 256] = {
         let mut flags = [0; 256];
         flags[JUMP_BACKWARD.code() as usize] = Self::FORWARD_JUMP;
         flags[JUMP_BACKWARD_NO_INTERRUPT.code() as usize] = Self::FORWARD_JUMP;
@@ -146,6 +147,9 @@ impl PipelineFeatures {
         flags[LOAD_CONST.code() as usize] = Self::CHECK_FUSION_OWNER;
         flags[RETURN_CONST.code() as usize] = Self::CHECK_FUSION_OWNER;
         flags[KW_NAMES.code() as usize] = Self::CHECK_FUSION_OWNER;
+        flags[CALL_INTRINSIC_1.code() as usize] = Self::SEQUENCE_TARGET;
+        flags[LIST_APPEND.code() as usize] = Self::SEQUENCE_TARGET;
+        flags[SET_ADD.code() as usize] = Self::SEQUENCE_TARGET;
         flags
     };
 
@@ -240,6 +244,10 @@ impl PipelineFeatures {
 
     pub(super) const fn has_not_taken(self) -> bool {
         self.0 & Self::NOT_TAKEN != 0
+    }
+
+    pub(super) const fn has_sequence_target(self) -> bool {
+        self.0 & Self::SEQUENCE_TARGET != 0
     }
 
     /// Whether an authored marker or folded assertion could carry an original fusion owner.
@@ -1671,7 +1679,7 @@ mod tests {
     fn opcode_feature_table_matches_instruction_classification() {
         use crate::assembler::OperandPatchId;
         use crate::target::opcodes::{
-            BEFORE_WITH, CALL, COMPARE_OP, CONTAINS_OP, COPY_FREE_VARS, FOR_ITER, LIST_APPEND,
+            BEFORE_WITH, CALL, COMPARE_OP, CONTAINS_OP, COPY_FREE_VARS, FOR_ITER,
             LOAD_FAST_AND_CLEAR, LOAD_FAST_BORROW_LOAD_FAST_BORROW, LOAD_GLOBAL, LOAD_SMALL_INT,
             MATCH_CLASS, POP_TOP, RAISE_VARARGS, RESUME, SEND, STORE_FAST_LOAD_FAST,
             STORE_FAST_STORE_FAST, UNPACK_EX, WITH_EXCEPT_START,
@@ -1698,6 +1706,7 @@ mod tests {
                 STORE_FAST => Features::STORE_FAST_TRIGGER,
                 TO_BOOL | UNARY_NOT => Features::BOOLEAN_CONVERSION,
                 IS_OP => Features::IDENTITY_COMPARISON,
+                CALL_INTRINSIC_1 | LIST_APPEND | SET_ADD => Features::SEQUENCE_TARGET,
                 COPY if instruction.operand() == Operand::Value(1) => Features::COPY_TOP,
                 NOT_TAKEN => {
                     Features::NOT_TAKEN
@@ -1762,6 +1771,9 @@ mod tests {
             LOAD_CONST,
             RETURN_CONST,
             KW_NAMES,
+            CALL_INTRINSIC_1,
+            LIST_APPEND,
+            SET_ADD,
         ];
         for (index, flags) in PipelineFeatures::BY_OPCODE.into_iter().enumerate() {
             let expected = classified
@@ -1777,7 +1789,6 @@ mod tests {
             CONTAINS_OP,
             COPY_FREE_VARS,
             FOR_ITER,
-            LIST_APPEND,
             LOAD_FAST_AND_CLEAR,
             LOAD_FAST_BORROW_LOAD_FAST_BORROW,
             LOAD_GLOBAL,
@@ -1887,6 +1898,7 @@ mod tests {
                 instruction(TO_BOOL, Operand::Value(0)),
                 instruction(IS_OP, Operand::Value(0)),
                 instruction(COPY, Operand::Value(1)),
+                instruction(LIST_APPEND, Operand::Value(1)),
                 Item::Instruction(borrow_marker),
                 Item::Instruction(branch_marker),
                 Item::Label(target),
@@ -1909,6 +1921,7 @@ mod tests {
         assert!(features.has_pop_conditional());
         assert!(features.has_copy_top());
         assert!(features.has_not_taken());
+        assert!(features.has_sequence_target());
         assert!(features.has_original_fusion_owner_candidate());
     }
 
@@ -1940,6 +1953,7 @@ mod tests {
         assert!(features.has_pop_conditional());
         assert!(!features.has_copy_top());
         assert!(!features.has_not_taken());
+        assert!(!features.has_sequence_target());
         assert!(!features.has_original_fusion_owner_candidate());
     }
 
