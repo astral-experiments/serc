@@ -823,6 +823,7 @@ pub(super) struct ScopeBodyFacts {
     pub(super) has_generic_definition: bool,
     pub(super) has_type_alias: bool,
     pub(super) has_annotations: bool,
+    has_assertions: bool,
     has_inlined_comprehension: bool,
     local_annotation_references: BTreeSet<String>,
     local_annotation_bindings: FxHashSet<String>,
@@ -1012,6 +1013,7 @@ impl FunctionPlan {
             nested_annotation_scope_requirements: annotation_scope_requirements,
             generator_named_targets,
             inlined_comprehension_cellvars,
+            has_assertions,
             has_inlined_comprehension,
             local_annotation_references,
             local_annotation_bindings,
@@ -1075,7 +1077,7 @@ impl FunctionPlan {
         for name in local_annotation_bindings {
             locals.insert_annotation_only(&name);
         }
-        let mut optimized_locals = (assertion_mode == AssertionMode::Elide)
+        let mut optimized_locals = (assertion_mode == AssertionMode::Elide && has_assertions)
             .then(|| {
                 let mut optimized = locals.clone();
                 optimized.elide_assertions = true;
@@ -5013,6 +5015,7 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
 impl<'ast> Visitor<'ast> for ScopeBodyFactsCollector<'ast> {
     fn visit_stmt(&mut self, statement: &'ast Stmt) {
         match statement {
+            Stmt::Assert(_) => self.facts.has_assertions = true,
             Stmt::FunctionDef(definition) => {
                 // The child body is represented by a separate `ScopeArena` node and plan.
                 self.collect_function_header(definition);
@@ -8880,6 +8883,39 @@ def function():
         }
         for omitted in ["first", "inner", "chain", "skipped", "method", "attribute"] {
             assert!(!candidates.contains_key(omitted), "unexpected {omitted}");
+        }
+    }
+
+    #[test]
+    fn scope_assertion_facts_match_local_collection_boundaries() {
+        for (source, expected) in [
+            ("value = [item for item in values]\n", false),
+            ("assert check\n", true),
+            ("if condition:\n    assert check\n", true),
+            ("for value in values:\n    assert value\n", true),
+            (
+                "while condition:\n    pass\nelse:\n    assert check\n",
+                true,
+            ),
+            (
+                "try:\n    operation()\nexcept Error:\n    assert check\n",
+                true,
+            ),
+            ("try:\n    pass\nfinally:\n    assert check\n", true),
+            ("match subject:\n    case _:\n        assert check\n", true),
+            ("def nested():\n    assert check\n", false),
+            ("class Nested:\n    assert check\n", false),
+            ("return result\nassert check\n", true),
+        ] {
+            let parsed = parse_module(source).unwrap();
+            let facts = super::ScopeBodyFacts::for_function(parsed.suite());
+            let mut locals = LocalCollector {
+                elide_assertions: true,
+                ..LocalCollector::default()
+            };
+            locals.collect_suite(parsed.suite());
+            assert_eq!(facts.has_assertions, expected, "{source}");
+            assert_eq!(facts.has_assertions, locals.elided_assertion, "{source}");
         }
     }
 
