@@ -22,19 +22,12 @@ impl OptimizationPipeline {
         &mut self,
         constants: &mut dyn ConstantTable,
     ) -> Result<Option<u32>, CompileError> {
-        if self.python_version != PythonVersion::Py315 {
+        if self.python_version != PythonVersion::Py315
+            || !self.graph.features().has_sequence_target()
+        {
             return Ok(None);
         }
-        let mut boundaries = self.preserved_block_boundaries.clone();
-        boundaries.extend(&self.exception_owner_provenance.block_boundaries);
-        boundaries.extend(&self.exception_owner_provenance.source_boundaries);
-        boundaries.extend(&self.original_nop_targets);
-        boundaries.extend(&self.original_jump_head_targets);
-        boundaries.extend(self.exception_regions.iter().map(|region| region.target));
-        boundaries.extend(self.graph.iter_items().filter_map(|item| match item {
-            Item::Instruction(instruction) => instruction.jump_target(),
-            Item::Label(_) => None,
-        }));
+        let mut boundaries = None;
         let mut removed_max_depth = None;
         let order = self.graph.order().to_vec();
         for (block_index, block) in order.iter().copied().enumerate() {
@@ -44,6 +37,9 @@ impl OptimizationPipeline {
                 };
                 let intrinsic = target.opcode == CALL_INTRINSIC_1
                     && target.operand() == Operand::Value(UnaryIntrinsic::LIST_TO_TUPLE.argument());
+                if !intrinsic && !matches!(target.opcode, LIST_APPEND | SET_ADD) {
+                    continue;
+                }
                 // The Boolean pass can move CONTAINS_OP into a following TO_BOOL
                 // or UNARY_NOT slot. Only its certified retired slots are transparent.
                 let next_opcode = self.graph[block].items()[offset + 1..]
@@ -121,6 +117,21 @@ impl OptimizationPipeline {
                 };
                 values.reverse();
                 let index = constants.fold_sequence(values, is_set)?;
+                // Folding only rewrites non-jump instructions, so the original boundaries
+                // can be collected when a fold first needs them.
+                let boundaries = boundaries.get_or_insert_with(|| {
+                    let mut boundaries = self.preserved_block_boundaries.clone();
+                    boundaries.extend(&self.exception_owner_provenance.block_boundaries);
+                    boundaries.extend(&self.exception_owner_provenance.source_boundaries);
+                    boundaries.extend(&self.original_nop_targets);
+                    boundaries.extend(&self.original_jump_head_targets);
+                    boundaries.extend(self.exception_regions.iter().map(|region| region.target));
+                    boundaries.extend(self.graph.iter_items().filter_map(|item| match item {
+                        Item::Instruction(instruction) => instruction.jump_target(),
+                        Item::Label(_) => None,
+                    }));
+                    boundaries
+                });
                 // Authored statement NOPs can be separated by bookkeeping labels
                 // from the original array they locate. CPython transfers their span
                 // through the newly cleared records before removing the donor NOP.

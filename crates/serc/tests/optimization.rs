@@ -12769,6 +12769,20 @@ fn copied_sequence_folds_preserve_locations_and_constant_order() {
 }
 
 #[test]
+fn sequence_folds_after_dynamic_tuple_iteration_preserve_boundaries() {
+    let values = std::iter::repeat_n("value", 31)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let constants = std::iter::repeat_n("'constant'", 31)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let source = format!(
+        "def sample(value):\n    for item in ({values}):\n        pass\n    ()\n    for item in [{constants}]:\n        pass\n    ()\n    for item in {{{constants}}}:\n        pass\n"
+    );
+    assert_matches_cpython(&source, "sequence_boundaries.py", &LEVELS);
+}
+
+#[test]
 fn copied_empty_bytes_folds_preserve_cache_admission() {
     for prefix in ["", "empty = b''\n", "def earlier():\n    return None\n"] {
         for expression in [
