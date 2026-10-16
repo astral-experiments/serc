@@ -2660,7 +2660,7 @@ impl OptimizationPipeline {
         local_count: usize,
         parameter_count: usize,
     ) -> bool {
-        if self.python_version != crate::PythonVersion::Py314
+        if self.python_version < crate::PythonVersion::Py314
             || local_count > 64
             || self.graph.features().has_checked_fast_load()
         {
@@ -2737,7 +2737,7 @@ impl OptimizationPipeline {
         #[cfg(test)]
         {
             let optimized = std::mem::replace(&mut self.graph, original);
-            self.add_checks_for_uninitialized_loads_with_writeback::<PROVE_INITIALIZED, false>(
+            self.add_checks_for_uninitialized_loads_with_writeback::<false, false>(
                 local_count,
                 parameter_count,
                 original_arrays,
@@ -4450,7 +4450,7 @@ impl OptimizationPipeline {
                 continue;
             }
             if DIRECT
-                && python_version == crate::PythonVersion::Py314
+                && python_version >= crate::PythonVersion::Py314
                 && !has_local_mutation
                 && !requires_stack_analysis
             {
@@ -4702,6 +4702,7 @@ mod tests {
         BorrowBoundaryLabels, assertion_borrow_block_ranges, borrow_block_ranges,
         borrow_block_ranges_with_label_count,
     };
+    use crate::PythonVersion::{self, Py314, Py315};
     use crate::assembler::{
         BorrowFallthrough, BorrowLoopExitPolicy, Instruction, Item, JUMP_BACKWARD_NO_INTERRUPT,
         JUMP_FORWARD, LOAD_COMMON_CONSTANT, LOAD_CONST, LOAD_FAST, LOAD_FAST_BORROW, Label, NOP,
@@ -4775,7 +4776,11 @@ mod tests {
         Item::Instruction(instruction)
     }
 
-    fn general_borrow<const DIRECT: bool>(items: &mut [Item], unreachable: &FxHashSet<Label>) {
+    fn general_borrow<const DIRECT: bool>(
+        python_version: PythonVersion,
+        items: &mut [Item],
+        unreachable: &FxHashSet<Label>,
+    ) {
         let mut eagerly_scanned = items.to_vec();
         let empty_labels = FxHashSet::default();
         let empty_entries = FxHashMap::default();
@@ -4790,7 +4795,7 @@ mod tests {
             authored_finally_break_entries: &FxHashMap::default(),
         };
         super::OptimizationPipeline::optimize_load_fast_with_retained_entries_inner::<DIRECT, true>(
-            crate::PythonVersion::Py314,
+            python_version,
             items,
             &[],
             entries,
@@ -4800,7 +4805,7 @@ mod tests {
             &empty_entries,
         );
         super::OptimizationPipeline::optimize_load_fast_with_retained_entries_inner::<DIRECT, false>(
-            crate::PythonVersion::Py314,
+            python_version,
             &mut eagerly_scanned,
             &[],
             entries,
@@ -4852,9 +4857,9 @@ mod tests {
             for direct in [false, true] {
                 let mut observed = items.clone();
                 if direct {
-                    general_borrow::<true>(&mut observed, &FxHashSet::default());
+                    general_borrow::<true>(Py314, &mut observed, &FxHashSet::default());
                 } else {
-                    general_borrow::<false>(&mut observed, &FxHashSet::default());
+                    general_borrow::<false>(Py314, &mut observed, &FxHashSet::default());
                 }
                 assert_eq!(
                     borrow_opcodes(&observed),
@@ -4893,8 +4898,9 @@ mod tests {
         eligible: bool,
         expected_loads: &[crate::target::Opcode],
     ) {
-        let make_pipeline = || {
+        let make_pipeline = |python_version| {
             let mut assembler = crate::assembler::Assembler::from_linear_items(items.to_vec());
+            assembler.python_version = python_version;
             assembler.next_label = items
                 .iter()
                 .filter_map(|item| match item {
@@ -4906,42 +4912,44 @@ mod tests {
             assembler.exception_regions = regions.to_vec();
             assembler.into_optimization_pipeline()
         };
-        let mut direct = make_pipeline();
-        let mut generic = make_pipeline();
-        assert_eq!(
-            direct.local_loads_are_known_initialized(local_count, parameter_count),
-            eligible,
-        );
-        direct.add_checks_for_uninitialized_loads_in_arrays::<true>(
-            local_count,
-            parameter_count,
-            None,
-            Some(&FxHashSet::default()),
-        );
-        generic.add_checks_for_uninitialized_loads_in_arrays::<false>(
-            local_count,
-            parameter_count,
-            None,
-            Some(&FxHashSet::default()),
-        );
-        assert_eq!(direct.graph.copy_items(), generic.graph.copy_items());
-        assert_eq!(
-            direct.graph.features().has_checked_fast_load(),
-            generic.graph.features().has_checked_fast_load(),
-        );
-        let loads = direct
-            .graph
-            .iter_items()
-            .filter_map(|item| match item {
-                Item::Instruction(instruction)
-                    if matches!(instruction.opcode, LOAD_FAST | super::LOAD_FAST_CHECK) =>
-                {
-                    Some(instruction.opcode)
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(loads, expected_loads);
+        for python_version in [Py314, Py315] {
+            let mut direct = make_pipeline(python_version);
+            let mut generic = make_pipeline(python_version);
+            assert_eq!(
+                direct.local_loads_are_known_initialized(local_count, parameter_count),
+                eligible,
+            );
+            direct.add_checks_for_uninitialized_loads_in_arrays::<true>(
+                local_count,
+                parameter_count,
+                None,
+                Some(&FxHashSet::default()),
+            );
+            generic.add_checks_for_uninitialized_loads_in_arrays::<false>(
+                local_count,
+                parameter_count,
+                None,
+                Some(&FxHashSet::default()),
+            );
+            assert_eq!(direct.graph.copy_items(), generic.graph.copy_items());
+            assert_eq!(
+                direct.graph.features().has_checked_fast_load(),
+                generic.graph.features().has_checked_fast_load(),
+            );
+            let loads = direct
+                .graph
+                .iter_items()
+                .filter_map(|item| match item {
+                    Item::Instruction(instruction)
+                        if matches!(instruction.opcode, LOAD_FAST | super::LOAD_FAST_CHECK) =>
+                    {
+                        Some(instruction.opcode)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(loads, expected_loads);
+        }
     }
 
     #[test]
@@ -5445,7 +5453,9 @@ mod tests {
 
     #[test]
     fn general_direct_borrow_matches_stack_analysis_and_owned_policies() {
-        use crate::target::opcodes::{BUILD_TUPLE, DELETE_FAST, LOAD_FAST_LOAD_FAST, STORE_FAST};
+        use crate::target::opcodes::{
+            BUILD_TUPLE, DELETE_FAST, LOAD_ATTR, LOAD_FAST_LOAD_FAST, STORE_FAST,
+        };
 
         let target = Label::from_u32(0);
         for (name, items, expected) in [
@@ -5459,6 +5469,16 @@ mod tests {
                     borrow_instruction(RETURN_VALUE, Operand::Value(0), 0),
                 ],
                 vec![LOAD_FAST_BORROW, super::LOAD_FAST_BORROW_LOAD_FAST_BORROW],
+            ),
+            (
+                "method receiver consumed on return",
+                vec![
+                    borrow_instruction(LOAD_FAST, Operand::Value(0), 1),
+                    borrow_instruction(LOAD_ATTR, Operand::Value(1), 2),
+                    borrow_instruction(POP_TOP, Operand::Value(0), 1),
+                    borrow_instruction(RETURN_VALUE, Operand::Value(0), 0),
+                ],
+                vec![LOAD_FAST_BORROW],
             ),
             (
                 "conditional and both return arms",
@@ -5537,12 +5557,53 @@ mod tests {
                 vec![LOAD_FAST_BORROW],
             ),
         ] {
-            let mut direct = items.clone();
-            let mut generic = items;
-            general_borrow::<true>(&mut direct, &FxHashSet::default());
-            general_borrow::<false>(&mut generic, &FxHashSet::default());
-            assert_eq!(direct, generic, "{name}");
-            assert_eq!(borrow_opcodes(&direct), expected, "{name}");
+            for version in [Py314, Py315] {
+                let mut direct = items.clone();
+                let mut generic = items.clone();
+                general_borrow::<true>(version, &mut direct, &FxHashSet::default());
+                general_borrow::<false>(version, &mut generic, &FxHashSet::default());
+                assert_eq!(direct, generic, "{name}, {version:?}");
+                assert_eq!(borrow_opcodes(&direct), expected, "{name}, {version:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn general_direct_borrow_preserves_versioned_iterator_owners() {
+        use crate::target::opcodes::{COPY, GET_ITER, SWAP};
+
+        for (version, release_owner) in [(Py314, false), (Py315, false), (Py315, true)] {
+            let iterator_depth = if version == Py315 { 2 } else { 1 };
+            let mut items = vec![
+                borrow_instruction(LOAD_FAST, Operand::Value(0), 1),
+                borrow_instruction(GET_ITER, Operand::Value(0), iterator_depth),
+                borrow_instruction(COPY, Operand::Value(1), iterator_depth + 1),
+                borrow_instruction(POP_TOP, Operand::Value(0), iterator_depth),
+            ];
+            if release_owner {
+                items.extend([
+                    borrow_instruction(SWAP, Operand::Value(2), 2),
+                    borrow_instruction(POP_TOP, Operand::Value(0), 1),
+                ]);
+            }
+            let retained_owner = version == Py315 && !release_owner;
+            items.push(borrow_instruction(
+                RETURN_VALUE,
+                Operand::Value(0),
+                u32::from(retained_owner),
+            ));
+            let mut generic = items.clone();
+            general_borrow::<true>(version, &mut items, &FxHashSet::default());
+            general_borrow::<false>(version, &mut generic, &FxHashSet::default());
+            assert_eq!(items, generic, "{version:?}, {release_owner}");
+            assert_eq!(
+                borrow_opcodes(&items),
+                [if retained_owner {
+                    LOAD_FAST
+                } else {
+                    LOAD_FAST_BORROW
+                }],
+            );
         }
     }
 
@@ -5581,8 +5642,8 @@ mod tests {
             };
             let mut direct = items.clone();
             let mut generic = items.clone();
-            general_borrow::<true>(&mut direct, &unreachable);
-            general_borrow::<false>(&mut generic, &unreachable);
+            general_borrow::<true>(Py314, &mut direct, &unreachable);
+            general_borrow::<false>(Py314, &mut generic, &unreachable);
             assert_eq!(direct, generic, "blocked: {blocked}");
             assert_eq!(
                 borrow_opcodes(&direct),

@@ -1454,9 +1454,11 @@ impl LayoutAssembler {
             self.resolve_next_locations();
         }
         let mut labels = vec![None; usize::try_from(self.next_label).unwrap()];
-        if self.python_version == crate::PythonVersion::Py314
-            && let Some((bytecode, line_table, max_depth)) =
-                self.encode_small_final_artifacts(&mut labels, first_line_number)?
+        if matches!(
+            self.python_version,
+            crate::PythonVersion::Py314 | crate::PythonVersion::Py315
+        ) && let Some((bytecode, line_table, max_depth)) =
+            self.encode_small_final_artifacts(&mut labels, first_line_number)?
         {
             #[cfg(any(test, debug_assertions))]
             self.validate_structure(AssemblerStage::FinalLayout)?;
