@@ -27,7 +27,27 @@ impl LayoutAssembler {
         if self.items.len() > usize::from(u8::MAX) {
             return Ok(None);
         }
-        debug_assert_eq!(self.python_version, crate::PythonVersion::Py314);
+        match self.python_version {
+            crate::PythonVersion::Py314 => {
+                self.encode_small_final_artifacts_for::<true>(labels, first_line_number)
+            }
+            crate::PythonVersion::Py315 => {
+                self.encode_small_final_artifacts_for::<false>(labels, first_line_number)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn encode_small_final_artifacts_for<const PY314: bool>(
+        &self,
+        labels: &mut [Option<u32>],
+        first_line_number: u32,
+    ) -> Result<Option<FinalArtifacts>, CompileError> {
+        let version = if PY314 {
+            crate::PythonVersion::Py314
+        } else {
+            crate::PythonVersion::Py315
+        };
 
         let mut bytecode = Vec::with_capacity(self.items.len().saturating_mul(4));
         let mut line_table = Vec::with_capacity(self.items.len().saturating_mul(3));
@@ -36,7 +56,7 @@ impl LayoutAssembler {
         let mut current_line = i32::try_from(first_line_number).unwrap_or(i32::MAX);
         let mut run = None::<(SourceLocation, u32)>;
         let mut max_depth = 0;
-        let cache_widths = OpcodeCacheWidths::for_version(crate::PythonVersion::Py314);
+        let cache_widths = OpcodeCacheWidths::for_version(version);
 
         for (item_index, item) in self.items.iter().enumerate() {
             let instruction = match item {
@@ -49,7 +69,12 @@ impl LayoutAssembler {
             let caches = cache_widths.get(instruction.opcode);
             let size = 1 + u32::from(caches);
             position += size;
-            let argument = match instruction.operand() {
+            let operand = if PY314 {
+                instruction.operand()
+            } else {
+                self.encoded_operand(instruction)?
+            };
+            let argument = match operand {
                 Operand::Value(argument) => {
                     let Ok(argument) = u8::try_from(argument) else {
                         return Ok(None);
@@ -63,10 +88,7 @@ impl LayoutAssembler {
                 // Let ordinary layout report malformed streams in instruction order.
                 Operand::Deferred(_) => return Ok(None),
             };
-            bytecode.extend_from_slice(&[
-                instruction.opcode.code_for(crate::PythonVersion::Py314),
-                argument,
-            ]);
+            bytecode.extend_from_slice(&[instruction.opcode.code_for(version), argument]);
             bytecode.resize(bytecode.len() + usize::from(caches) * 2, 0);
 
             if let Some((location, length)) = &mut run
@@ -99,7 +121,7 @@ impl LayoutAssembler {
                     let target = label_position(labels, label).ok_or_else(|| {
                         CompileError::Internal("unbound backward jump label".to_string())
                     })?;
-                    backward_argument(crate::PythonVersion::Py314, instruction, jump_base, target)?
+                    backward_argument(version, instruction, jump_base, target)?
                 }
                 Operand::Value(_) | Operand::Deferred(_) => {
                     unreachable!("only jump instructions are recorded");
@@ -1218,6 +1240,75 @@ mod tests {
             assert_eq!(default.2, 4);
             if let Some(unextended) = default_unextended {
                 assert_eq!(default, unextended);
+            }
+        }
+    }
+
+    #[test]
+    fn small_layout_preserves_python315_wire_operands() {
+        use crate::PythonVersion::Py315;
+        use crate::target::GENEXPR_RESUME_ARGUMENT;
+        use crate::target::opcodes::{
+            GET_YIELD_FROM_ITER, JUMP_BACKWARD, JUMP_FORWARD, LOAD_CONST, RESUME, RETURN_VALUE,
+        };
+        use crate::target::operands::ResumeLocation;
+
+        let first = Label::from_u32(0);
+        let last = Label::from_u32(1);
+        let instruction = |opcode, operand| {
+            Item::Instruction(Instruction::new(
+                opcode,
+                operand,
+                SourceLocation::new(2, 2, 0, 8),
+                Some(4),
+            ))
+        };
+        let cache_expanded =
+            usize::from(u8::MAX) / (1 + usize::from(LOAD_GLOBAL.caches_for(Py315))) + 1;
+        for (argument, padding) in [(30, 0), (300, 0), (30, cache_expanded)] {
+            let mut items = vec![
+                Item::Label(first),
+                instruction(
+                    RESUME,
+                    Operand::Value(ResumeLocation::AFTER_YIELD.at_depth(true)),
+                ),
+                instruction(RESUME, Operand::Value(GENEXPR_RESUME_ARGUMENT)),
+                instruction(GET_YIELD_FROM_ITER, Operand::Value(0)),
+                instruction(LOAD_GLOBAL, Operand::Value(0)),
+                instruction(JUMP_FORWARD, Operand::Forward(last)),
+            ];
+            items.extend(std::iter::repeat_n(
+                instruction(LOAD_GLOBAL, Operand::Value(0)),
+                padding,
+            ));
+            items.extend([
+                instruction(LOAD_CONST, Operand::Value(argument)),
+                Item::Label(last),
+                instruction(JUMP_BACKWARD, Operand::Backward(first)),
+                instruction(RETURN_VALUE, Operand::Value(0)),
+            ]);
+            let widths = vec![0; items.len() - 2];
+            let mut assembler = layout(items, vec![region(0, 1, 1, 0, false)]);
+            assembler.python_version = Py315;
+            let mut labels = [None; 2];
+            let units = assembler.label_positions(&widths, &mut labels);
+            let expected = assembler
+                .encode_unextended_final_artifacts(&labels, units, 1)
+                .unwrap();
+            let mut direct_labels = [None; 2];
+            let direct = assembler
+                .encode_small_final_artifacts(&mut direct_labels, 1)
+                .unwrap();
+            assert_eq!(direct.is_some(), argument == 30 && padding == 0);
+            assert_eq!(direct, expected);
+            if direct.is_some() {
+                assert_eq!(direct_labels, labels);
+                assert_eq!(
+                    assembler
+                        .unextended_exception_table(&direct_labels)
+                        .unwrap(),
+                    assembler.exception_table(&widths, &labels).unwrap()
+                );
             }
         }
     }
