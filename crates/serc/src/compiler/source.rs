@@ -3,6 +3,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
+use ruff_python_ast::name::Name;
 use ruff_python_ast::token::{TokenKind, Tokens};
 use ruff_python_ast::visitor::transformer::{Transformer, walk_expr as transform_expr};
 use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
@@ -239,6 +240,92 @@ pub(super) struct CallShape<'a> {
     pub(super) imported_module_callable: Option<&'a ruff_python_ast::ExprAttribute>,
 }
 
+/// Owns the binding and source facts that must survive AST optimization.
+pub(crate) struct OriginalScopes {
+    scopes: ScopeArena,
+    names: Vec<Name>,
+    dotted_import_names: Vec<String>,
+    generators: FxHashSet<TextRange>,
+    coroutines: FxHashSet<TextRange>,
+    module_contains_yield: bool,
+}
+
+impl OriginalScopes {
+    pub(crate) fn analyze(
+        source: &str,
+        body: &Suite,
+        python_version: crate::PythonVersion,
+    ) -> Self {
+        struct GeneratorCollector {
+            ranges: FxHashSet<TextRange>,
+            coroutines: FxHashSet<TextRange>,
+            eager_annotations: bool,
+            legacy_coroutines: bool,
+        }
+
+        impl<'ast> Visitor<'ast> for GeneratorCollector {
+            fn visit_stmt(&mut self, statement: &'ast Stmt) {
+                if let Stmt::FunctionDef(function) = statement {
+                    if function_body_contains_yield(&function.body, self.eager_annotations) {
+                        self.ranges.insert(function.range);
+                    }
+                    if self.legacy_coroutines
+                        && !function.is_async
+                        && function_has_elided_coroutine_assertion(&function.body)
+                    {
+                        self.coroutines.insert(function.range);
+                    }
+                }
+                walk_stmt(self, statement);
+            }
+
+            fn visit_expr(&mut self, expression: &'ast Expr) {
+                if crate::stack_growth_required() {
+                    return crate::grow_stack(|| self.visit_expr(expression));
+                }
+                walk_expr(self, expression);
+            }
+        }
+
+        let mut original = SourceAnalysis::new(python_version, 0);
+        let scopes =
+            ScopeArena::analyze_with_optimized_assertions(body, python_version, &mut original);
+        original
+            .generated_mangled_strings
+            .retain(|name| !original.raw_private_identifiers.contains(name.as_str()));
+        let names = original
+            .origins
+            .into_keys()
+            .filter(|name| !original.generated_mangled_strings.contains(name.as_ref()))
+            .map(Name::new)
+            .collect();
+        let dotted_import_names = original
+            .dotted_import_names
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let eager_annotations = python_version <= crate::PythonVersion::Py313
+            && scopes.module().future_flags & crate::target::code_flags::CO_FUTURE_ANNOTATIONS == 0;
+        let module_contains_yield = function_body_contains_yield(body, eager_annotations);
+        let mut collector = GeneratorCollector {
+            ranges: FxHashSet::default(),
+            coroutines: FxHashSet::default(),
+            eager_annotations,
+            legacy_coroutines: python_version <= crate::PythonVersion::Py313
+                && (source.contains("await") || source.contains("async")),
+        };
+        collector.visit_body(body);
+        Self {
+            scopes,
+            names,
+            dotted_import_names,
+            generators: collector.ranges,
+            coroutines: collector.coroutines,
+            module_contains_yield,
+        }
+    }
+}
+
 impl<'source> CompilationContext<'source> {
     pub(super) fn fold_constant(&self, expression: &Expr) -> Option<Constant> {
         if self.native_build_profile == crate::NativeBuildProfile::Default {
@@ -373,92 +460,31 @@ impl<'source> CompilationContext<'source> {
     }
 
     /// Preserve symbol-table and suspension facts established before assertion removal.
-    pub(super) fn preserve_unoptimized_scopes(&mut self, body: &Suite) {
-        struct GeneratorCollector {
-            ranges: FxHashSet<TextRange>,
-            coroutines: FxHashSet<TextRange>,
-            eager_annotations: bool,
-            legacy_coroutines: bool,
-        }
-
-        impl<'ast> Visitor<'ast> for GeneratorCollector {
-            fn visit_stmt(&mut self, statement: &'ast Stmt) {
-                if let Stmt::FunctionDef(function) = statement {
-                    if function_body_contains_yield(&function.body, self.eager_annotations) {
-                        self.ranges.insert(function.range);
-                    }
-                    if self.legacy_coroutines
-                        && !function.is_async
-                        && function_has_elided_coroutine_assertion(&function.body)
-                    {
-                        self.coroutines.insert(function.range);
-                    }
-                }
-                walk_stmt(self, statement);
-            }
-
-            fn visit_expr(&mut self, expression: &'ast Expr) {
-                if crate::stack_growth_required() {
-                    return crate::grow_stack(|| self.visit_expr(expression));
-                }
-                walk_expr(self, expression);
-            }
-        }
-
-        let mut original_source = SourceAnalysis::new(self.python_version, 0);
-        let mut original_scopes = ScopeArena::analyze_with_optimized_assertions(
-            body,
-            self.python_version,
-            &mut original_source,
-        );
+    pub(super) fn preserve_unoptimized_scopes(&mut self, original: OriginalScopes) {
+        let mut scopes = original.scopes;
         // Parsing interns identifiers even when a later optimization removes their
         // expressions. Preserve those raw names, but retain all lowering and cache
         // facts from the optimized tree and do not mark literal objects canonical.
-        self.dotted_import_names.extend(
-            original_source
-                .dotted_import_names
-                .iter()
-                .map(|name| (*name).to_owned()),
-        );
+        self.dotted_import_names
+            .extend(original.dotted_import_names);
         self.dotted_import_names.sort_unstable();
         self.dotted_import_names.dedup();
-        original_source.generated_mangled_strings.retain(|name| {
-            !original_source
-                .raw_private_identifiers
-                .contains(name.as_str())
-        });
         // The retained names are used only for membership.
-        for name in original_source.origins.into_keys() {
-            if !original_source
-                .generated_mangled_strings
-                .contains(name.as_ref())
-            {
-                self.generated_mangled_strings.remove(name.as_ref());
-                if !name.is_ascii() && self.interned_metadata_tuples.is_none() {
-                    self.interned_metadata_tuples = Some(RefCell::default());
-                }
-                if !self.constant_string_origins.contains_key(name.as_ref()) {
-                    self.constant_string_origins
-                        .insert(Cow::Owned(name.into_owned()), Cell::default());
-                }
+        for name in original.names {
+            self.generated_mangled_strings.remove(name.as_str());
+            if !name.is_ascii() && self.interned_metadata_tuples.is_none() {
+                self.interned_metadata_tuples = Some(RefCell::default());
+            }
+            if !self.constant_string_origins.contains_key(name.as_str()) {
+                self.constant_string_origins
+                    .insert(Cow::Owned(name.as_str().to_owned()), Cell::default());
             }
         }
-        original_scopes.retain_lowered_comprehension_locals(&self.scopes);
-        self.scopes = original_scopes;
-        let eager_annotations = self.python_version <= crate::PythonVersion::Py313
-            && self.module_plan().future_flags & crate::target::code_flags::CO_FUTURE_ANNOTATIONS
-                == 0;
-        self.module_contains_yield = function_body_contains_yield(body, eager_annotations);
-        let mut collector = GeneratorCollector {
-            ranges: FxHashSet::default(),
-            coroutines: FxHashSet::default(),
-            eager_annotations,
-            legacy_coroutines: self.python_version <= crate::PythonVersion::Py313
-                && (self.source.contains("await") || self.source.contains("async")),
-        };
-        collector.visit_body(body);
-        self.original_generator_functions = Some(collector.ranges);
-        self.original_legacy_coroutine_functions = collector.coroutines;
+        scopes.retain_lowered_comprehension_locals(&self.scopes);
+        self.scopes = scopes;
+        self.module_contains_yield = original.module_contains_yield;
+        self.original_generator_functions = Some(original.generators);
+        self.original_legacy_coroutine_functions = original.coroutines;
     }
 
     /// Legacy symbol tables retain coroutine flags from assertions removed by optimization.

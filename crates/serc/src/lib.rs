@@ -649,6 +649,15 @@ fn with_stack_reentry_bypass<T>(callback: impl FnOnce() -> T) -> T {
 /// Owns the parser output while allowing deeply nested expressions to be dropped safely.
 struct ParsedModule(Option<ruff_python_parser::Parsed<ruff_python_ast::ModModule>>);
 
+impl ParsedModule {
+    fn take_suite(&mut self) -> ruff_python_ast::Suite {
+        self.0
+            .take()
+            .expect("parsed module is present")
+            .into_suite()
+    }
+}
+
 impl Drop for ParsedModule {
     fn drop(&mut self) {
         use ruff_python_ast::visitor::transformer::{Transformer, walk_expr};
@@ -779,8 +788,8 @@ fn compile_normalized(
     let parsed = ruff_python_parser::parse_unchecked(source, parse_options.clone())
         .try_into_module()
         .ok_or_else(|| CompileError::Internal("parser did not return a module".to_string()))?;
-    let parsed = ParsedModule(Some(parsed));
-    let parsed = parsed.0.as_ref().expect("parsed module is present");
+    let mut parsed_module = ParsedModule(Some(parsed));
+    let parsed = parsed_module.0.as_ref().expect("parsed module is present");
     // Ruff grows its parser stack for deeply nested expressions. Successful parses can
     // reuse its tokens; malformed input still uses the independent tokenizer before diagnostics.
     if let Err(error) =
@@ -915,24 +924,46 @@ fn compile_normalized(
         options.optimization_level,
         mapping_key_int_max_str_digits,
     )?;
-    let optimized_body = if options.optimization_level == OptimizationLevel::Zero {
-        None
-    } else {
-        compiler::optimization::prepare(
-            parsed.suite(),
-            options.optimization_level,
-            options.python_version,
+    let mut owned_tokens = None;
+    let (optimized_body, original_scopes) = if compiler::optimization::requires_optimization(
+        parsed.suite(),
+        options.optimization_level,
+    ) {
+        let scopes =
+            compiler::OriginalScopes::analyze(source, parsed.suite(), options.python_version);
+        // Parsed exposes its AST by value but only lends its compact token buffer.
+        owned_tokens = Some(parsed.tokens().clone());
+        #[cfg(test)]
+        let cloned_body = compiler::optimization::cloned_body_for_test(parsed.suite());
+        #[cfg(test)]
+        let body = cloned_body.unwrap_or_else(|| parsed_module.take_suite());
+        #[cfg(not(test))]
+        let body = parsed_module.take_suite();
+        (
+            Some(compiler::optimization::prepare(
+                body,
+                options.optimization_level,
+                options.python_version,
+            )),
+            Some(scopes),
         )
+    } else {
+        (None, None)
     };
-    let body = optimized_body
+    let parsed = parsed_module.0.as_ref();
+    let body = optimized_body.as_ref().map_or_else(
+        || parsed.expect("unoptimized module is present").suite(),
+        |optimized| &optimized.body,
+    );
+    let tokens = owned_tokens
         .as_ref()
-        .map_or_else(|| parsed.suite(), |optimized| &optimized.body);
-    let code = Compiler::module_with_scope_body(
+        .unwrap_or_else(|| parsed.expect("unoptimized module is present").tokens());
+    let code = Compiler::module_with_scopes(
         filename,
         source,
-        parsed.tokens(),
+        tokens,
         body,
-        parsed.suite(),
+        original_scopes,
         options.python_version,
         options.native_build_profile,
         optimized_body.as_ref(),

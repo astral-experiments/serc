@@ -13,36 +13,49 @@ use crate::{OptimizationLevel, PythonVersion};
 use super::scope::future_feature_flags;
 use crate::target::code_flags::CO_FUTURE_ANNOTATIONS;
 
-/// Keep source ranges while applying the transformations that precede code generation.
+/// Transform an owned tree after preserving its unoptimized binding facts.
 pub(crate) fn prepare(
-    body: &Suite,
+    body: Suite,
     level: OptimizationLevel,
     python_version: PythonVersion,
-) -> Option<OptimizedSuite> {
-    if !requires_optimization(body, level) {
-        return None;
-    }
+) -> OptimizedSuite {
+    let mut optimized = OptimizedSuite {
+        body,
+        locations: FxHashMap::default(),
+    };
     let optimizer = Optimizer {
         strip_docstrings: level == OptimizationLevel::Two,
-        future_annotations: future_feature_flags(body) & CO_FUTURE_ANNOTATIONS != 0,
+        future_annotations: future_feature_flags(&optimized.body) & CO_FUTURE_ANNOTATIONS != 0,
         python_version,
         locations: RefCell::default(),
     };
     let mut depth = crate::stack::ExpressionDepth::default();
-    depth.visit_body(body);
+    depth.visit_body(&optimized.body);
     crate::stack::with_depth(depth.maximum(), || {
-        let mut body = body.clone();
-        optimizer.scope_body(&mut body);
-        optimizer.visit_body(&mut body);
-        Some(OptimizedSuite {
-            body,
-            locations: optimizer.locations.into_inner(),
-        })
-    })
+        optimizer.scope_body(&mut optimized.body);
+        optimizer.visit_body(&mut optimized.body);
+    });
+    optimized.locations = optimizer.locations.into_inner();
+    optimized
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FORCE_CLONED_AST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn cloned_body_for_test(body: &Suite) -> Option<Suite> {
+    if !FORCE_CLONED_AST.get() {
+        return None;
+    }
+    let mut depth = crate::stack::ExpressionDepth::default();
+    depth.visit_body(body);
+    crate::stack::with_depth(depth.maximum(), || Some(body.clone()))
 }
 
 /// Keep the original tree when none of the preparation transforms can apply.
-fn requires_optimization(body: &Suite, level: OptimizationLevel) -> bool {
+pub(crate) fn requires_optimization(body: &Suite, level: OptimizationLevel) -> bool {
     struct Changes {
         strip_docstrings: bool,
         found: bool,
@@ -96,6 +109,10 @@ fn requires_optimization(body: &Suite, level: OptimizationLevel) -> bool {
                 ruff_python_ast::visitor::walk_expr(self, expression);
             }
         }
+    }
+
+    if level == OptimizationLevel::Zero {
+        return false;
     }
 
     let mut changes = Changes {
@@ -260,6 +277,94 @@ impl Transformer for Optimizer {
 mod tests {
     use super::*;
 
+    fn assert_owned_matches_cloned(source: &str, options: &crate::CompileOptions) {
+        struct ResetClone(bool);
+
+        impl Drop for ResetClone {
+            fn drop(&mut self) {
+                FORCE_CLONED_AST.set(self.0);
+            }
+        }
+
+        let owned = crate::compile_with_options(source, "owned_optimization.py", options);
+        let cloned = {
+            let _reset = ResetClone(FORCE_CLONED_AST.replace(true));
+            crate::compile_with_options(source, "owned_optimization.py", options)
+        };
+        match (owned, cloned) {
+            (Ok(owned), Ok(cloned)) => {
+                assert_eq!(owned.marshal(), cloned.marshal(), "{options:?}: {source}");
+            }
+            (owned, cloned) => {
+                assert_eq!(
+                    format!("{owned:?}"),
+                    format!("{cloned:?}"),
+                    "{options:?}: {source}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn owned_optimization_matches_cloned_trees_for_all_targets() {
+        let sources = [
+            "value = 1\n",
+            "'docstring'\n'not a docstring'\nvalue = __debug__\n",
+            "assert hidden\ndef f(value):\n    return value\n",
+            "def f():\n    assert (value := 1)\n    return value\n",
+            "def f(value):\n    assert (yield value)\n",
+            "def f(value):\n    assert (yield from value)\n",
+            "async def f():\n    assert await work()\n",
+            "def f():\n    assert await work()\n",
+            "class C:\n    'docstring'\n    __field = 1\n    def method(self):\n        assert hidden\n        return [self.__field for item in values]\n",
+            "class C:\n    assert [lambda: item for item in values]\n    values = [lambda: item for item in values]\n",
+            "from __future__ import annotations\nclass C:\n    assert hidden\n    field: [x for x in values]\n",
+            "def outer(value):\n    assert hidden\n    class C:\n        def method(self):\n            return value, __class__\n    return C\n",
+            "assert caf\u{e9}\nclass C:\n    __field = ''\n    def method(self):\n        return '\u{e9}', self.__field\n",
+            "assert package.submodule\nimport package.submodule\n",
+            "def f():\n    try:\n        work()\n    finally:\n        assert hidden\n",
+            "value = __\u{ff44}\u{ff45}\u{ff42}\u{ff55}\u{ff47}__\n",
+        ];
+        for python_version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            for optimization_level in [
+                OptimizationLevel::Zero,
+                OptimizationLevel::One,
+                OptimizationLevel::Two,
+            ] {
+                let options = crate::CompileOptions {
+                    python_version,
+                    optimization_level,
+                    ..crate::CompileOptions::default()
+                };
+                for source in sources {
+                    assert_owned_matches_cloned(source, &options);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn owned_optimization_drops_deep_trees_on_small_stacks() {
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                let source = format!("assert hidden\nvalue = {}0\n", "value + ".repeat(512));
+                let options = crate::CompileOptions {
+                    optimization_level: OptimizationLevel::Two,
+                    ..crate::CompileOptions::default()
+                };
+                assert_owned_matches_cloned(&source, &options);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     #[test]
     fn preparation_skips_only_unchanged_trees() {
         let cases = [
@@ -285,10 +390,13 @@ mod tests {
         ];
         for (source, one, two) in cases {
             let parsed = ruff_python_parser::parse_module(source).unwrap();
-            for (level, expected) in [(OptimizationLevel::One, one), (OptimizationLevel::Two, two)]
-            {
+            for (level, expected) in [
+                (OptimizationLevel::Zero, false),
+                (OptimizationLevel::One, one),
+                (OptimizationLevel::Two, two),
+            ] {
                 assert_eq!(
-                    prepare(parsed.suite(), level, PythonVersion::Py314).is_some(),
+                    requires_optimization(parsed.suite(), level),
                     expected,
                     "{source:?}, {level:?}"
                 );
