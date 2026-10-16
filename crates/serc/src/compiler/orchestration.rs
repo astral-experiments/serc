@@ -36,7 +36,7 @@ use super::scope::{
     LoweringFunctionPlan, NameId, NameInterner, NameSet, ScopeId,
     collect_conditional_simple_annotations, collect_simple_annotations, has_annotations,
 };
-use super::source::{CompilationContext, implicit_return_range};
+use super::source::{CompilationContext, OriginalScopes, implicit_return_range};
 use super::statement::{
     ControlFlowState, suite_terminates, terminal_statement_uses_implicit_return_location,
 };
@@ -310,24 +310,24 @@ impl<'source> Compiler<'source> {
         body: &'source Suite,
         python_version: crate::PythonVersion,
     ) -> Box<Self> {
-        Self::module_with_scope_body(
+        Self::module_with_scopes(
             filename,
             source,
             tokens,
             body,
-            body,
+            None,
             python_version,
             crate::NativeBuildProfile::Default,
             None,
         )
     }
 
-    pub(crate) fn module_with_scope_body(
+    pub(crate) fn module_with_scopes(
         filename: impl Into<CodeFilename>,
         source: &'source str,
         tokens: &'source Tokens,
         body: &'source Suite,
-        scope_body: &Suite,
+        original_scopes: Option<OriginalScopes>,
         python_version: crate::PythonVersion,
         native_build_profile: crate::NativeBuildProfile,
         optimized: Option<&super::optimization::OptimizedSuite>,
@@ -340,10 +340,8 @@ impl<'source> Compiler<'source> {
             python_version,
             native_build_profile,
         );
-        if !std::ptr::eq(body, scope_body) {
-            // CPython resolves bindings, closures, and suspension flags before removing
-            // assertions. Keep that symbol table even when code generation has no asserts.
-            context.preserve_unoptimized_scopes(scope_body);
+        if let Some(original_scopes) = original_scopes {
+            context.preserve_unoptimized_scopes(original_scopes);
         }
         if let Some(optimized) = optimized {
             context.optimized_locations.clone_from(&optimized.locations);
