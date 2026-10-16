@@ -11,6 +11,8 @@ mod snapshots;
 #[cfg(test)]
 mod tests;
 
+use std::cell::LazyCell;
+
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::CompileError;
@@ -349,14 +351,18 @@ fn sequence_capture_cleanup_rotation(items: &[Item]) -> Option<CaptureCleanupRot
 }
 
 fn capture_cleanup_rotation(items: &[Item]) -> Option<CaptureCleanupRotation<'_>> {
+    let [Item::Instruction(prefix), Item::Instruction(first_swap), ..] = items else {
+        return None;
+    };
+    // All three rotation forms start with a swap after the prefix.
+    if first_swap.opcode != SWAP {
+        return None;
+    }
     if let Some(rotation) =
         mapping_capture_cleanup_rotation(items).or_else(|| sequence_capture_cleanup_rotation(items))
     {
         return Some(rotation);
     }
-    let [Item::Instruction(prefix), Item::Instruction(first_swap), ..] = items else {
-        return None;
-    };
     let unpacked =
         prefix.opcode == UNPACK_SEQUENCE && matches!(prefix.operand(), Operand::Value(0 | 1));
     let starred = prefix.opcode == UNPACK_EX && prefix.value_argument() == Some(0);
@@ -364,7 +370,6 @@ fn capture_cleanup_rotation(items: &[Item]) -> Option<CaptureCleanupRotation<'_>
     let popped = prefix.opcode == POP_TOP && prefix.value_argument() == Some(0);
     if !(unpacked || starred || conditional || popped)
         || prefix.location.line < 0
-        || first_swap.opcode != SWAP
         || first_swap.location.line < 0
         || (!conditional && first_swap.location.line != prefix.location.line)
     {
@@ -5051,7 +5056,7 @@ impl Assembler {
         }
 
         let items = self.linear_items();
-        let block_labels = cross_labels.then(|| {
+        let block_labels = LazyCell::new(|| {
             let mut block_labels = self.preserved_block_boundaries.clone();
             block_labels.extend(&self.exception_owner_provenance.block_boundaries);
             for region in &self.exception_regions {
@@ -5066,7 +5071,7 @@ impl Assembler {
             }
             block_labels
         });
-        let start = if let Some(block_labels) = &block_labels {
+        let start = if cross_labels {
             items
                 .iter()
                 .rposition(|item| match item {
@@ -5109,9 +5114,7 @@ impl Assembler {
                         .exception_owner_provenance
                         .fusion_boundaries
                         .contains(&label)
-                        || block_labels
-                            .as_ref()
-                            .is_some_and(|block_labels| !block_labels.contains(&label)) =>
+                        || (cross_labels && !block_labels.contains(&label)) =>
                 {
                     index += 1;
                     continue;
@@ -5163,9 +5166,10 @@ impl Assembler {
                 index = capture_start + consumed;
                 continue;
             }
-            if let Some(rotation) = index
-                .checked_sub(1)
-                .and_then(|previous| items.get(previous..index + 5))
+            if instruction.opcode == SWAP
+                && let Some(rotation) = index
+                    .checked_sub(1)
+                    .and_then(|previous| items.get(previous..index + 5))
                 && let Some(vacancies) = single_capture_cleanup_vacancies(rotation)
             {
                 // Consume the complete rotation: after the store moves, neither trailing pop
@@ -5180,7 +5184,7 @@ impl Assembler {
                 index += 5;
                 continue;
             }
-            if block_labels.is_some() {
+            if cross_labels {
                 late_inserted_slots +=
                     usize::from(matches!(instruction.opcode, COPY_FREE_VARS | MAKE_CELL));
                 nop_count += usize::from(instruction.opcode == NOP);
@@ -5190,22 +5194,23 @@ impl Assembler {
                 Item::Instruction(instruction) => Some(*instruction),
                 Item::Label(_) => None,
             });
-            let following_location = if let Some(block_labels) = &block_labels {
-                let mut following = None;
-                for item in &items[index + 1..] {
-                    match item {
-                        Item::Instruction(instruction) => {
-                            following = Some(*instruction);
-                            break;
+            let following_location =
+                if instruction.opcode == NOP && instruction.location.line >= 0 && cross_labels {
+                    let mut following = None;
+                    for item in &items[index + 1..] {
+                        match item {
+                            Item::Instruction(instruction) => {
+                                following = Some(*instruction);
+                                break;
+                            }
+                            Item::Label(label) if block_labels.contains(label) => break,
+                            Item::Label(_) => {}
                         }
-                        Item::Label(label) if block_labels.contains(label) => break,
-                        Item::Label(_) => {}
                     }
-                }
-                following
-            } else {
-                following
-            };
+                    following
+                } else {
+                    following
+                };
             let removable_nop = instruction.opcode == NOP
                 && (instruction.location.line < 0
                     || following_location.is_some_and(|following| {
