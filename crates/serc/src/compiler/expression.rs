@@ -3365,6 +3365,8 @@ impl Compiler<'_> {
             return self.compile_optimized_generator_call(call, callable);
         }
 
+        let call_location = self.assembler.location();
+        debug_assert_eq!(call_location, self.source_location(call.range()));
         let shape = self.call_shape(call);
         let direct_method = if let Some(attribute) = shape.direct_method {
             if self.compile_super_attribute(attribute, SuperAttributeKind::Method)?
@@ -3415,7 +3417,8 @@ impl Compiler<'_> {
                 .set_location(self.source_location(call.func.range()));
             self.emit(PUSH_NULL, 0, 1)?;
         }
-        let call_location = self.call_opcode_location_with_method(call, shape.direct_method);
+        let call_location =
+            self.call_opcode_location_with_method(call, shape.direct_method, call_location);
         self.assembler.set_location(call_location);
 
         if !shape.has_starred
@@ -3498,6 +3501,8 @@ impl Compiler<'_> {
         &mut self,
         call: &ruff_python_ast::ExprCall,
     ) -> Result<(), CompileError> {
+        let call_location = self.assembler.location();
+        debug_assert_eq!(call_location, self.source_location(call.range()));
         let shape = self.call_shape(call);
         let python312 = self.context.python_version == PythonVersion::Py312;
         let direct_method = if let Some(attribute) = shape.direct_method {
@@ -3538,7 +3543,8 @@ impl Compiler<'_> {
                 self.emit(PUSH_NULL, 0, 1)?;
             }
         }
-        let call_location = self.call_opcode_location_with_method(call, shape.direct_method);
+        let call_location =
+            self.call_opcode_location_with_method(call, shape.direct_method, call_location);
         if !shape.has_starred
             && !shape.has_keyword_unpack
             && (direct_method || shape.positional_count + shape.keyword_count * 2 <= 30)

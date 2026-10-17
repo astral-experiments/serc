@@ -356,6 +356,63 @@ fn opcode_locations_preserve_multiline_attribute_and_call_ranges() {
     );
 }
 
+#[test]
+fn call_lowering_preserves_opcode_and_enclosing_locations() {
+    for source in [
+        "outer(inner(value))",
+        "value.method(argument)",
+        "(value\n .method)(argument)",
+        "(imported\n .method)(argument)",
+        "value.method(*args, **kwargs)",
+        "call(key=argument)",
+        "(super(Base, self)\n .method)(argument)",
+    ] {
+        let parsed = parse_module(source).unwrap();
+        let [Stmt::Expr(statement)] = parsed.suite().as_slice() else {
+            panic!("expected an expression statement");
+        };
+        let Expr::Call(call) = statement.value.as_ref() else {
+            panic!("expected a call");
+        };
+        for python_version in [
+            crate::PythonVersion::Py312,
+            crate::PythonVersion::Py313,
+            crate::PythonVersion::Py314,
+            crate::PythonVersion::Py315,
+        ] {
+            for iterable in [false, true] {
+                let mut compiler = Compiler::module_with_python_version(
+                    "example.py",
+                    source,
+                    parsed.tokens(),
+                    parsed.suite(),
+                    python_version,
+                );
+                if source.starts_with("(imported") {
+                    let imported = compiler.required_name_id("imported");
+                    compiler.symbols.imported_scope_names.insert(imported);
+                }
+                let expected = compiler.call_opcode_location(call);
+                let enclosing = SourceLocation::new(20, 21, 3, 4);
+                compiler.assembler.set_location(enclosing);
+                if iterable {
+                    compiler
+                        .compile_iterable_expression(&statement.value)
+                        .unwrap();
+                } else {
+                    compiler.compile_expression(&statement.value).unwrap();
+                }
+                assert_eq!(
+                    compiler.assembler.last_instruction_location(),
+                    Some(expected),
+                    "{python_version:?}, iterable={iterable}, {source:?}"
+                );
+                assert_eq!(compiler.assembler.location(), enclosing);
+            }
+        }
+    }
+}
+
 fn read_exception_varint(table: &[u8], index: &mut usize) -> u32 {
     let mut byte = table[*index];
     *index += 1;
