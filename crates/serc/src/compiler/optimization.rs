@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use ruff_python_ast::visitor::Visitor;
 use ruff_python_ast::visitor::transformer::{Transformer, walk_expr, walk_stmt};
 use ruff_python_ast::{self as ast, Expr, ExprContext, Stmt, Suite};
-use ruff_text_size::TextRange;
+use ruff_text_size::{Ranged, TextRange, TextSize};
 use rustc_hash::FxHashMap;
 
 use crate::{OptimizationLevel, PythonVersion};
@@ -127,11 +127,15 @@ pub(crate) struct OptimizedSuite {
 
 impl Drop for OptimizedSuite {
     fn drop(&mut self) {
-        ClearExpressions.visit_body(&mut self.body);
+        let shallow_drop = stacker::remaining_stack()
+            .is_some_and(|remaining| remaining >= crate::STACK_SEGMENT_SIZE);
+        ClearExpressions { shallow_drop }.visit_body(&mut self.body);
     }
 }
 
-struct ClearExpressions;
+struct ClearExpressions {
+    shallow_drop: bool,
+}
 
 impl Transformer for ClearExpressions {
     fn visit_expr(&self, expression: &mut Expr) {
@@ -146,6 +150,11 @@ impl Transformer for ClearExpressions {
                 | Expr::NoneLiteral(_)
                 | Expr::EllipsisLiteral(_)
         ) {
+            return;
+        }
+        // Optimization never deepens expressions, so short source ranges retain the
+        // parsed tree's shallow-drop bound when a full stack segment is available.
+        if self.shallow_drop && expression.range().len() <= TextSize::new(256) {
             return;
         }
         if crate::stack_growth_required() {
@@ -253,9 +262,12 @@ impl Transformer for Optimizer {
                     .borrow_mut()
                     .insert(assertion.range, OptimizedLocation::Elided);
                 // Erased assertions can also contain deeply nested expressions.
-                ClearExpressions.visit_expr(&mut assertion.test);
+                let clear = ClearExpressions {
+                    shallow_drop: false,
+                };
+                clear.visit_expr(&mut assertion.test);
                 if let Some(message) = assertion.msg.as_deref_mut() {
-                    ClearExpressions.visit_expr(message);
+                    clear.visit_expr(message);
                 }
                 *statement = elided_statement(assertion.range);
                 return;
@@ -344,6 +356,7 @@ mod tests {
             "assert package.submodule\nimport package.submodule\n",
             "def f():\n    try:\n        work()\n    finally:\n        assert hidden\n",
             "value = __\u{ff44}\u{ff45}\u{ff42}\u{ff55}\u{ff47}__\n",
+            "value = (__debug__, f'{(__debug__, 1)}')\n",
         ];
         for python_version in [
             PythonVersion::Py312,
@@ -369,24 +382,65 @@ mod tests {
     }
 
     #[test]
-    fn owned_optimization_drops_deep_trees_on_small_stacks() {
-        std::thread::Builder::new()
-            .stack_size(128 * 1024)
-            .spawn(|| {
-                let chain = "value + ".repeat(512);
-                let source = format!(
-                    "assert {chain}value, {chain}'message'\n\
-                     value = {chain}(value, 0, 'value', b'value', True, None, ...)\n"
-                );
-                let options = crate::CompileOptions {
-                    optimization_level: OptimizationLevel::Two,
-                    ..crate::CompileOptions::default()
+    fn owned_optimization_drops_deep_trees_on_varied_stacks() {
+        for stack_size in [128 * 1024, 2 * crate::STACK_SEGMENT_SIZE] {
+            std::thread::Builder::new()
+                .stack_size(stack_size)
+                .spawn(|| {
+                    let chain = "value + ".repeat(512);
+                    let source = format!(
+                        "assert {chain}value, {chain}'message'\n\
+                         value = {chain}(value, 0, 'value', b'value', True, None, ...)\n\
+                         value = f'{{{chain}value}}'\n"
+                    );
+                    for python_version in [
+                        PythonVersion::Py312,
+                        PythonVersion::Py313,
+                        PythonVersion::Py314,
+                        PythonVersion::Py315,
+                    ] {
+                        let options = crate::CompileOptions {
+                            python_version,
+                            optimization_level: OptimizationLevel::Two,
+                            ..crate::CompileOptions::default()
+                        };
+                        assert_owned_matches_cloned(&source, &options);
+                    }
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn shallow_drop_preserves_short_optimized_expressions() {
+        for python_version in [PythonVersion::Py314, PythonVersion::Py315] {
+            for source in [
+                "(__debug__, f'{__debug__}')\n",
+                "f'{(__debug__, 1)}'\n",
+                "'docstring'\n'exposed string'\n",
+            ] {
+                let body = ruff_python_parser::parse_module(source)
+                    .unwrap()
+                    .into_suite();
+                let mut optimized = prepare(body, OptimizationLevel::Two, python_version);
+                let Stmt::Expr(statement) = &mut optimized.body[0] else {
+                    panic!("expected an expression");
                 };
-                assert_owned_matches_cloned(&source, &options);
-            })
-            .unwrap()
-            .join()
-            .unwrap();
+                let expression = statement.value.as_mut();
+                let range = expression.range();
+                assert!(range.len() <= TextSize::new(256));
+                ClearExpressions { shallow_drop: true }.visit_expr(expression);
+                assert!(matches!(expression, Expr::Tuple(_) | Expr::FString(_)));
+                assert_eq!(expression.range(), range);
+                ClearExpressions {
+                    shallow_drop: false,
+                }
+                .visit_expr(expression);
+                assert!(expression.is_none_literal_expr());
+            }
+        }
     }
 
     #[test]
