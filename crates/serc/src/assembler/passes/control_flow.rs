@@ -5820,7 +5820,7 @@ impl OptimizationPipeline {
     }
 
     /// Gives an unchanged normal-finally POP its sole surviving original jump's line.
-    fn propagate_original_normal_finally_entry_locations(&mut self) {
+    fn propagate_original_normal_finally_entry_locations(&mut self) -> bool {
         let origins = &self
             .exception_owner_provenance
             .original_normal_finally_arrays;
@@ -5828,7 +5828,7 @@ impl OptimizationPipeline {
             .iter()
             .any(|origin| origin.retained_setup.is_some() && origin.incoming.len() > 1)
         {
-            return;
+            return false;
         }
         let items = self
             .graph
@@ -5942,10 +5942,12 @@ impl OptimizationPipeline {
         for (position, location) in updates {
             self.graph.instruction_mut(position).unwrap().location = location;
         }
+        true
     }
 
-    pub(in crate::assembler) fn propagate_locations_within_blocks(&mut self) {
-        self.propagate_original_normal_finally_entry_locations();
+    /// Returns whether locations or their provenance may have changed.
+    pub(in crate::assembler) fn propagate_locations_within_blocks(&mut self) -> bool {
+        let mut changed = self.propagate_original_normal_finally_entry_locations();
         let graph = &mut self.graph;
         for block_index in 0..graph.len() {
             let block = graph.block_at(block_index);
@@ -5965,6 +5967,7 @@ impl OptimizationPipeline {
                         {
                             if let Some(location) = previous {
                                 instruction.location = location;
+                                changed = true;
                             }
                         } else {
                             previous = Some(instruction.location);
@@ -5978,18 +5981,19 @@ impl OptimizationPipeline {
                 }
             }
         }
-        self.propagate_copied_finally_iterator_return_locations();
+        changed |= self.propagate_copied_finally_iterator_return_locations();
+        changed
     }
 
     /// Replays a finalizer donor only through its unchanged original cleanup array.
-    fn propagate_copied_finally_iterator_return_locations(&mut self) {
+    fn propagate_copied_finally_iterator_return_locations(&mut self) -> bool {
         let origins = std::mem::take(
             &mut self
                 .exception_owner_provenance
                 .copied_finally_iterator_returns,
         );
         if origins.is_empty() {
-            return;
+            return false;
         }
         let mut forbidden = self.exception_owner_provenance.block_boundaries.clone();
         forbidden.extend(&self.exception_owner_provenance.source_boundaries);
@@ -6075,6 +6079,7 @@ impl OptimizationPipeline {
                 .expect("captured original return")
                 .location = donor;
         }
+        true
     }
 
     /// Removes NOPs and reports possible edits and remaining physical forward jumps.

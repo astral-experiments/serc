@@ -1069,9 +1069,12 @@ impl OptimizationPipeline {
         }
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::RemoveRedundantCheckedLoads)?;
-        self.resolve_folded_sequence_locations();
-        self.propagate_locations_within_blocks();
-        fusion_owners.retain_pipeline(&self);
+        let mut locations_changed = self.resolve_folded_sequence_locations();
+        locations_changed |= self.propagate_locations_within_blocks();
+        // Assertion-only paths skip cold-block retention and still need this checkpoint.
+        if assertion_side_exits || locations_changed {
+            fusion_owners.retain_pipeline(&self);
+        }
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::PropagateLocationsWithinBlocks)?;
         if self.remove_redundant_swaps_before_pops() {
