@@ -656,6 +656,13 @@ impl NameInterner {
         self.insert(Name::new(name))
     }
 
+    fn intern_name(&mut self, name: &Name) -> NameId {
+        if let Some(id) = self.get(name) {
+            return id;
+        }
+        self.insert(name.clone())
+    }
+
     fn intern_owned(&mut self, name: String) -> NameId {
         if let Some(id) = self.get(&name) {
             return id;
@@ -3016,16 +3023,28 @@ impl<'a, 'ast> ModuleNameCollector<'a, 'ast> {
     }
 
     fn intern(&mut self, name: &str) -> NameId {
+        self.intern_with(name, |names| names.intern(name))
+    }
+
+    fn intern_name(&mut self, name: &Name) -> NameId {
+        self.intern_with(name, |names| names.intern_name(name))
+    }
+
+    fn intern_with(
+        &mut self,
+        name: &str,
+        intern: impl FnOnce(&mut NameInterner) -> NameId,
+    ) -> NameId {
         // A module symbol named `super` disables specialized super calls. Be conservative
         // about nested/header occurrences so the module-local walk can be skipped
         // only when the sentinel is definitely irrelevant.
         self.requires_module_bindings |= name == "super";
         if self.private_name.is_none() {
-            return self.names.intern(name);
+            return intern(self.names);
         }
 
         let mangled = mangle_name(name, self.private_name.as_deref());
-        let id = self.names.intern(name);
+        let id = intern(self.names);
         if let Cow::Owned(mangled) = mangled {
             self.names.intern_owned(mangled);
         }
@@ -3042,7 +3061,7 @@ impl<'a, 'ast> ModuleNameCollector<'a, 'ast> {
 
     fn record_flat_name(&mut self, name: &ruff_python_ast::ExprName) -> NameId {
         let spelling = name.id.as_str();
-        let id = self.intern(spelling);
+        let id = self.intern_name(&name.id);
         if spelling == "super" && name.ctx == ExprContext::Load {
             if let Some(flat) = &mut self.flat_function {
                 // A load of super also requests __class__, even when super is shadowed.
@@ -3068,14 +3087,14 @@ impl<'a, 'ast> ModuleNameCollector<'a, 'ast> {
 
     fn collect_parameters(&mut self, parameters: &ruff_python_ast::Parameters) {
         for parameter in parameters_in_locals_order(parameters) {
-            self.intern(parameter.name.as_str());
+            self.intern_name(&parameter.name.id);
         }
     }
 
     fn collect_type_parameters(&mut self, parameters: Option<&ruff_python_ast::TypeParams>) {
         if let Some(parameters) = parameters {
             for parameter in parameters {
-                self.intern(parameter.name().as_str());
+                self.intern_name(&parameter.name().id);
             }
         }
     }
@@ -3142,7 +3161,7 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
             }
             Stmt::FunctionDef(definition) => {
                 self.mark_flat_complex();
-                self.intern(definition.name.as_str());
+                self.intern_name(&definition.name.id);
                 let parent = self.current_scope;
                 let scope = ScopeId::from_usize(self.definitions.len() + 1);
                 self.definitions.push(ScopeBuildInput {
@@ -3174,7 +3193,7 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
                     complex: generic,
                 };
                 for parameter in parameters_in_locals_order(&definition.parameters) {
-                    let name = self.intern(parameter.name.as_str());
+                    let name = self.intern_name(&parameter.name.id);
                     if self.collect_flat_inputs {
                         flat.record(name, true);
                     }
@@ -3236,7 +3255,7 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
                 return;
             }
             Stmt::ClassDef(definition) => {
-                self.intern(definition.name.as_str());
+                self.intern_name(&definition.name.id);
                 let outer_class_body = std::mem::replace(&mut self.in_class_body, true);
                 let parent = self.current_scope;
                 self.current_scope = ScopeId::from_usize(self.definitions.len() + 1);
@@ -3302,7 +3321,7 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
             }
             Stmt::Global(statement) => {
                 for name in &statement.names {
-                    self.intern(name.as_str());
+                    self.intern_name(&name.id);
                     self.facts.module_globals.insert(
                         mangle_name(name.as_str(), self.private_name.as_deref()).into_owned(),
                     );
@@ -3310,13 +3329,13 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
             }
             Stmt::Nonlocal(statement) => {
                 for name in &statement.names {
-                    self.intern(name.as_str());
+                    self.intern_name(&name.id);
                 }
             }
             Stmt::Import(statement) => {
                 for alias in &statement.names {
                     let module = alias.name.as_str();
-                    self.intern(module);
+                    self.intern_name(&alias.name.id);
                     for part in module.split('.').skip(1) {
                         self.intern(part);
                     }
@@ -3342,7 +3361,7 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
                 );
                 for alias in &statement.names {
                     if alias.name.as_str() != "*" {
-                        self.intern(alias.name.as_str());
+                        self.intern_name(&alias.name.id);
                         let bound_name = alias
                             .asname
                             .as_ref()
@@ -3364,7 +3383,7 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
                     if let Some(handler) = handler.as_except_handler()
                         && let Some(name) = &handler.name
                     {
-                        self.intern(name.as_str());
+                        self.intern_name(&name.id);
                     }
                 }
                 if self
@@ -3386,7 +3405,7 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
                                 if spelling == "super" {
                                     self.mark_flat_complex();
                                 }
-                                let id = self.intern(spelling);
+                                let id = self.intern_name(&name.id);
                                 self.record_flat(id, true);
                             }
                             self.visit_body(&handler.body);
@@ -3412,7 +3431,7 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
                 return;
             }
             Expr::Attribute(attribute) => {
-                let id = self.intern(attribute.attr.as_str());
+                let id = self.intern_name(&attribute.attr.id);
                 self.source.observe_attribute_with_id(attribute, id);
                 if let Expr::Name(name) = attribute.value.as_ref() {
                     let id = self.record_flat_name(name);
@@ -3556,7 +3575,7 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
             _ => None,
         };
         if let Some(name) = name {
-            self.intern(name.as_str());
+            self.intern_name(&name.id);
         }
         walk_pattern(self, pattern);
     }
@@ -8064,7 +8083,7 @@ mod tests {
 
     use super::super::statement::function_body_contains_yield;
     use super::{
-        AssertionMode, FlatFunctionInputs, FunctionPlan, LocalCollector, ModuleNameCollector,
+        AssertionMode, FlatFunctionInputs, FunctionPlan, LocalCollector, ModuleNameCollector, Name,
         NameId, NameInterner, NameSet, SCOPE_SEED_NAMES, ScopeArena, ScopeDefinition, ScopeId,
         definitely_evaluated_references, has_annotations,
     };
@@ -9375,6 +9394,7 @@ def function():
         for (index, name) in SCOPE_SEED_NAMES.into_iter().enumerate() {
             let id = NameId::from_usize(index);
             assert_eq!(names.get(name), Some(id));
+            assert_eq!(names.intern_name(&Name::new(name)), id);
             assert_eq!(names.resolve(id), name);
             assert_eq!(names.clone_name(id), name);
             assert_eq!(names.seed_names[index], name);
@@ -9385,6 +9405,18 @@ def function():
         assert_eq!(names.names[0], "__user_name__");
         assert_eq!(names.intern("super"), NameId::from_u32(25));
         assert_eq!(names.intern_owned("super".to_owned()), NameId::from_u32(25));
+    }
+
+    #[test]
+    fn interned_ast_names_retain_heap_storage() {
+        let spelling = Name::new("identifier_that_does_not_fit_inline");
+        for mut names in [NameInterner::seeded(), NameInterner::default()] {
+            let id = names.intern_name(&spelling);
+            assert_eq!(names.resolve(id).as_ptr(), spelling.as_str().as_ptr());
+            assert_eq!(names.intern(spelling.as_str()), id);
+            assert_eq!(names.intern_name(&Name::new(spelling.as_str())), id);
+            assert_eq!(names.names.len(), 1);
+        }
     }
 
     #[test]
