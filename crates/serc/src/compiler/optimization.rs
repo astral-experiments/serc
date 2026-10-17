@@ -29,12 +29,8 @@ pub(crate) fn prepare(
         python_version,
         locations: RefCell::default(),
     };
-    let mut depth = crate::stack::ExpressionDepth::default();
-    depth.visit_body(&optimized.body);
-    crate::stack::with_depth(depth.maximum(), || {
-        optimizer.scope_body(&mut optimized.body);
-        optimizer.visit_body(&mut optimized.body);
-    });
+    optimizer.scope_body(&mut optimized.body);
+    optimizer.visit_body(&mut optimized.body);
     optimized.locations = optimizer.locations.into_inner();
     optimized
 }
@@ -131,21 +127,34 @@ pub(crate) struct OptimizedSuite {
 
 impl Drop for OptimizedSuite {
     fn drop(&mut self) {
-        struct ClearExpressions;
-
-        impl Transformer for ClearExpressions {
-            fn visit_expr(&self, expression: &mut Expr) {
-                if crate::stack_growth_required() {
-                    return crate::grow_stack(|| self.visit_expr(expression));
-                }
-                walk_expr(self, expression);
-                // Clear children before replacing their parent so destruction cannot recurse
-                // through a deeply nested expression after the compilation stack has unwound.
-                *expression = Expr::NoneLiteral(ast::ExprNoneLiteral::default());
-            }
-        }
-
         ClearExpressions.visit_body(&mut self.body);
+    }
+}
+
+struct ClearExpressions;
+
+impl Transformer for ClearExpressions {
+    fn visit_expr(&self, expression: &mut Expr) {
+        // Leaves cannot recurse during destruction, so their parent can drop them.
+        if matches!(
+            expression,
+            Expr::Name(_)
+                | Expr::NumberLiteral(_)
+                | Expr::StringLiteral(_)
+                | Expr::BytesLiteral(_)
+                | Expr::BooleanLiteral(_)
+                | Expr::NoneLiteral(_)
+                | Expr::EllipsisLiteral(_)
+        ) {
+            return;
+        }
+        if crate::stack_growth_required() {
+            return crate::grow_stack(|| self.visit_expr(expression));
+        }
+        walk_expr(self, expression);
+        // Clear children before replacing their parent so destruction cannot recurse
+        // through a deeply nested expression after the compilation stack has unwound.
+        *expression = Expr::NoneLiteral(ast::ExprNoneLiteral::default());
     }
 }
 
@@ -235,11 +244,19 @@ fn elided_statement(range: ruff_text_size::TextRange) -> Stmt {
 
 impl Transformer for Optimizer {
     fn visit_stmt(&self, statement: &mut Stmt) {
+        if crate::stack_growth_required() {
+            return crate::grow_stack(|| self.visit_stmt(statement));
+        }
         match statement {
             Stmt::Assert(assertion) => {
                 self.locations
                     .borrow_mut()
                     .insert(assertion.range, OptimizedLocation::Elided);
+                // Erased assertions can also contain deeply nested expressions.
+                ClearExpressions.visit_expr(&mut assertion.test);
+                if let Some(message) = assertion.msg.as_deref_mut() {
+                    ClearExpressions.visit_expr(message);
+                }
                 *statement = elided_statement(assertion.range);
                 return;
             }
@@ -258,6 +275,9 @@ impl Transformer for Optimizer {
     }
 
     fn visit_expr(&self, expression: &mut Expr) {
+        if crate::stack_growth_required() {
+            return crate::grow_stack(|| self.visit_expr(expression));
+        }
         if let Expr::Name(name) = expression
             && name.ctx == ExprContext::Load
             && name.id.as_str() == "__debug__"
@@ -353,7 +373,11 @@ mod tests {
         std::thread::Builder::new()
             .stack_size(128 * 1024)
             .spawn(|| {
-                let source = format!("assert hidden\nvalue = {}0\n", "value + ".repeat(512));
+                let chain = "value + ".repeat(512);
+                let source = format!(
+                    "assert {chain}value, {chain}'message'\n\
+                     value = {chain}(value, 0, 'value', b'value', True, None, ...)\n"
+                );
                 let options = crate::CompileOptions {
                     optimization_level: OptimizationLevel::Two,
                     ..crate::CompileOptions::default()
