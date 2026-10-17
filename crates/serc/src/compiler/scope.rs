@@ -2414,9 +2414,15 @@ impl ScopeArena {
     ) {
         // Flat bodies have no closure or evaluation-order edge cases. Their runtime bindings
         // were already collected; a nongeneric function's own annotations are separate.
-        if let Some(inputs) = flat
-            .filter(|inputs| self.assertion_mode == AssertionMode::Keep || !inputs.has_assertions)
-        {
+        // Eliding assertions preserves local ordering when each bound name first occurs outside
+        // them. Private aliases can share a binding, so keep those scopes on the complete path.
+        if let Some(inputs) = flat.filter(|inputs| {
+            self.assertion_mode == AssertionMode::Keep
+                || !inputs.has_assertions
+                || inputs.names.iter().all(|(_, bound, in_assertion)| {
+                    !bound || (!in_assertion && private_name.is_none())
+                })
+        }) {
             let annotation_references = if inputs.has_annotations && !future_annotations {
                 self.names.intern_set(FunctionPlan::annotation_references(
                     definition,
@@ -2426,7 +2432,7 @@ impl ScopeArena {
                 FxHashSet::default()
             };
             if private_name.is_none()
-                || !inputs.names.iter().any(|(name, _)| {
+                || !inputs.names.iter().any(|(name, ..)| {
                     mangle_name(self.names.resolve(*name), private_name)
                         != self.names.resolve(*name)
                 })
@@ -2434,7 +2440,7 @@ impl ScopeArena {
                 let mut locals = Vec::with_capacity(inputs.names.len());
                 let mut required = FxHashSet::default();
                 required.reserve(inputs.names.len());
-                for (name, bound) in inputs.names {
+                for (name, bound, _) in inputs.names {
                     if bound {
                         locals.push(name);
                     } else {
@@ -2460,15 +2466,15 @@ impl ScopeArena {
             let mut ordered_names: Vec<_> = inputs
                 .names
                 .iter()
-                .map(|(name, _)| Name::new(self.names.resolve(*name)))
+                .map(|(name, ..)| Name::new(self.names.resolve(*name)))
                 .collect();
             let local_aliases =
                 coalesce_private_locals(&mut ordered_names, private_name, std::iter::empty());
             let bound: FxHashSet<_> = inputs
                 .names
                 .iter()
-                .filter(|(_, bound)| *bound)
-                .map(|(name, _)| mangle_name(self.names.resolve(*name), private_name).into_owned())
+                .filter(|(_, bound, _)| *bound)
+                .map(|(name, ..)| mangle_name(self.names.resolve(*name), private_name).into_owned())
                 .collect();
             let mut locals = Vec::with_capacity(inputs.names.len());
             let mut required = FxHashSet::default();
@@ -2483,11 +2489,11 @@ impl ScopeArena {
                 inputs
                     .names
                     .iter()
-                    .filter(|(name, _)| {
+                    .filter(|(name, ..)| {
                         !bound
                             .contains(mangle_name(self.names.resolve(*name), private_name).as_ref())
                     })
-                    .map(|(name, _)| *name),
+                    .map(|(name, ..)| *name),
             );
             if inputs.implicit_class_reference {
                 let class = self.names.get("__class__").expect("__class__ is seeded");
@@ -2875,11 +2881,13 @@ struct ModuleNameCollector<'a, 'ast> {
 #[derive(Debug)]
 struct FlatFunctionInputs {
     // Preserve the first runtime occurrence of each name; a later store upgrades the existing
-    // entry without moving it, matching CPython's load-before-store local ordering.
-    names: Vec<(NameId, bool)>,
+    // entry without moving it, matching CPython's load-before-store local ordering. The final bit
+    // records whether that first occurrence was in an assertion.
+    names: Vec<(NameId, bool, bool)>,
     name_positions: Option<FxHashMap<NameId, usize>>,
     has_annotations: bool,
     has_assertions: bool,
+    in_assertion: bool,
     implicit_class_reference: bool,
     complex: bool,
 }
@@ -2897,22 +2905,22 @@ impl FlatFunctionInputs {
                 self.names[position].1 |= bound;
             } else {
                 name_positions.insert(name, self.names.len());
-                self.names.push((name, bound));
+                self.names.push((name, bound, self.in_assertion));
             }
             return;
         }
 
-        if let Some((_, was_bound)) = self
+        if let Some((_, was_bound, _)) = self
             .names
             .iter_mut()
-            .find(|(existing, _)| *existing == name)
+            .find(|(existing, ..)| *existing == name)
         {
             *was_bound |= bound;
             return;
         }
 
         if self.names.len() < Self::LINEAR_SEARCH_LIMIT {
-            self.names.push((name, bound));
+            self.names.push((name, bound, self.in_assertion));
             return;
         }
 
@@ -2922,10 +2930,10 @@ impl FlatFunctionInputs {
             self.names
                 .iter()
                 .enumerate()
-                .map(|(position, (name, _))| (*name, position)),
+                .map(|(position, (name, ..))| (*name, position)),
         );
         name_positions.insert(name, self.names.len());
-        self.names.push((name, bound));
+        self.names.push((name, bound, self.in_assertion));
         self.name_positions = Some(name_positions);
     }
 
@@ -3123,7 +3131,13 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
             Stmt::Assert(_) => {
                 if let Some(flat) = &mut self.flat_function {
                     flat.has_assertions = true;
+                    flat.in_assertion = true;
                 }
+                walk_stmt(self, statement);
+                if let Some(flat) = &mut self.flat_function {
+                    flat.in_assertion = false;
+                }
+                return;
             }
             Stmt::AnnAssign(assignment)
                 if self
@@ -3189,6 +3203,7 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
                                 .iter()
                                 .any(|parameter| parameter.annotation().is_some())),
                     has_assertions: false,
+                    in_assertion: false,
                     implicit_class_reference: false,
                     complex: generic,
                 };
@@ -9737,19 +9752,30 @@ def function():
             name_positions: None,
             has_annotations: false,
             has_assertions: false,
+            in_assertion: true,
             implicit_class_reference: false,
             complex: false,
         };
 
         inputs.record(NameId::from_u32(2), false);
+        inputs.in_assertion = false;
         inputs.record(NameId::from_u32(1), true);
         inputs.record(NameId::from_u32(2), true);
+        inputs.in_assertion = true;
+        inputs.record(NameId::from_u32(1), false);
 
         assert_eq!(
             inputs.names,
-            [(NameId::from_u32(2), true), (NameId::from_u32(1), true)]
+            [
+                (NameId::from_u32(2), true, true),
+                (NameId::from_u32(1), true, false),
+            ]
         );
         assert!(inputs.name_positions.is_none());
+        assert_eq!(
+            std::mem::size_of::<(NameId, bool, bool)>(),
+            std::mem::size_of::<(NameId, bool)>(),
+        );
     }
 
     #[test]
@@ -9934,6 +9960,93 @@ def conditional_assert(value):
     second = 1
     first = 2
     return first, second
+
+def assert_no_names():
+    assert True
+
+def assert_global() -> Result:
+    assert external, detail
+
+def assert_generator():
+    assert (yield value), detail
+
+async def assert_coroutine():
+    assert await work()
+
+def assert_binding_order():
+    assert later
+    earlier = 1
+    later = 2
+    return earlier, later
+
+def assert_binding_first(value):
+    first = value
+    assert first, detail
+    second = first
+    return first, second
+
+def assert_load_first():
+    first = later
+    assert later
+    later = second = value
+    return first, later, second
+
+def assert_mixed(first):
+    assert first, later
+    earlier = first
+    later = value
+    return earlier, later
+
+def assert_parameters(pos, /, normal, *args, only, **kwargs):
+    assert pos, normal
+    assert only, args
+    assert kwargs
+    return normal
+
+def assert_deleted():
+    del local
+    assert local
+
+def assert_walrus():
+    assert (bound := value)
+    return bound
+
+def assert_walrus_after_binding(value):
+    bound = value
+    assert (bound := other)
+    return bound
+
+def assert_enclosing():
+    captured = value
+    def assert_capture():
+        assert captured
+    def assert_capture_with_local(value):
+        local = value
+        assert captured, local
+        return local
+    return assert_capture, assert_capture_with_local
+
+class AssertOwner:
+    def assert_private():
+        assert __hidden, __class__
+        assert super()
+
+    def assert_alias_before(self):
+        assert __slot
+        earlier = value
+        _AssertOwner__slot = other
+        return earlier, __slot
+
+    def assert_alias_after(self):
+        _AssertOwner__slot = value
+        assert __slot
+        return _AssertOwner__slot
+
+    def assert_canonical_before(self):
+        assert _AssertOwner__slot
+        earlier = value
+        __slot = other
+        return earlier, _AssertOwner__slot
 ";
         for version in [
             PythonVersion::Py312,
@@ -10028,6 +10141,25 @@ def conditional_assert(value):
                         ("enclosing_class", false),
                         ("inner_super", true),
                         ("conditional_assert", true),
+                        ("assert_no_names", true),
+                        ("assert_global", true),
+                        ("assert_generator", true),
+                        ("assert_coroutine", true),
+                        ("assert_binding_order", true),
+                        ("assert_binding_first", true),
+                        ("assert_load_first", true),
+                        ("assert_mixed", true),
+                        ("assert_parameters", true),
+                        ("assert_deleted", true),
+                        ("assert_walrus", false),
+                        ("assert_walrus_after_binding", false),
+                        ("assert_enclosing", false),
+                        ("assert_capture", true),
+                        ("assert_capture_with_local", true),
+                        ("assert_private", true),
+                        ("assert_alias_before", true),
+                        ("assert_alias_after", true),
+                        ("assert_canonical_before", true),
                     ],
                     "{version:?}, future={future}, O{optimization_level}"
                 );
@@ -10187,21 +10319,24 @@ def conditional_assert(value):
             name_positions: None,
             has_annotations: false,
             has_assertions: false,
+            in_assertion: false,
             implicit_class_reference: false,
             complex: false,
         };
 
         for name in 0..=FlatFunctionInputs::LINEAR_SEARCH_LIMIT {
+            inputs.in_assertion = name % 2 == 0;
             inputs.record(NameId::from_usize(name), false);
         }
         for name in (0..=FlatFunctionInputs::LINEAR_SEARCH_LIMIT).rev() {
+            inputs.in_assertion = name % 2 != 0;
             inputs.record(NameId::from_usize(name), true);
         }
 
         assert_eq!(
             inputs.names,
             (0..=FlatFunctionInputs::LINEAR_SEARCH_LIMIT)
-                .map(|name| (NameId::from_usize(name), true))
+                .map(|name| (NameId::from_usize(name), true, name % 2 == 0))
                 .collect::<Vec<_>>()
         );
         assert!(inputs.name_positions.is_some());
@@ -10210,13 +10345,17 @@ def conditional_assert(value):
     #[test]
     fn complex_function_inputs_discard_and_stop_recording_names() {
         let mut inputs = FlatFunctionInputs {
-            names: vec![(NameId::from_u32(1), false), (NameId::from_u32(2), true)],
+            names: vec![
+                (NameId::from_u32(1), false, true),
+                (NameId::from_u32(2), true, false),
+            ],
             name_positions: Some(FxHashMap::from_iter([
                 (NameId::from_u32(1), 0),
                 (NameId::from_u32(2), 1),
             ])),
             has_annotations: false,
             has_assertions: false,
+            in_assertion: false,
             implicit_class_reference: false,
             complex: false,
         };
