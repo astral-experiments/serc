@@ -17,7 +17,7 @@ criterion = { version = "=0.8.0", default-features = false }
 encoding_rs = "0.8.35"
 hashbrown = { version = "0.17.1", default-features = false }
 libmimalloc-sys = { version = "0.1.49", default-features = false }
-mimalloc = { version = "0.1.52", default-features = false }
+mimalloc = { version = "0.1.52", default-features = false, features = ["no_thp"] }
 ruff_index = "0.0.15"
 ruff_python_ast = "0.0.15"
 ruff_python_codegen = "0.0.15"
