@@ -1918,13 +1918,18 @@ impl Compiler<'_> {
         if attribute_location.line == attribute_location.end_line {
             return self.source_location(call.range());
         }
-        self.call_opcode_location_with_method(call, self.call_shape(call).direct_method)
+        self.call_opcode_location_with_method(
+            call,
+            self.call_shape(call).direct_method,
+            self.source_location(call.range()),
+        )
     }
 
     pub(super) fn call_opcode_location_with_method(
         &self,
         call: &ruff_python_ast::ExprCall,
         direct_method: Option<&ruff_python_ast::ExprAttribute>,
+        fallback: SourceLocation,
     ) -> SourceLocation {
         if let Some(attribute) = direct_method {
             let attribute_location = self.source_location(attribute.range);
@@ -1935,7 +1940,7 @@ impl Compiler<'_> {
                 ));
             }
         }
-        self.source_location(call.range())
+        fallback
     }
 
     pub(super) fn call_shape<'a>(&self, call: &'a ruff_python_ast::ExprCall) -> CallShape<'a> {
