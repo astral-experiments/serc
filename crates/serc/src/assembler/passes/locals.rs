@@ -1236,7 +1236,7 @@ fn original_entry_has_live_prefix(
 
 /// Final-borrowing label categories indexed only as far as the last bound label.
 struct BorrowBoundaryLabels {
-    flags: Vec<u8>,
+    flags: SmallVec<[u8; 32]>,
     has_empty_borrow_edge: bool,
 }
 
@@ -1279,7 +1279,7 @@ impl BorrowBoundaryLabels {
                 },
             }
         }
-        let mut labels = vec![0; highest_bound_label.map_or(0, |index| index + 1)];
+        let mut labels = SmallVec::from_elem(0, highest_bound_label.map_or(0, |index| index + 1));
         for (target, flags) in targets {
             if let Some(slot) = labels.get_mut(target.index()) {
                 *slot |= flags;
@@ -3702,22 +3702,20 @@ impl OptimizationPipeline {
         }
 
         let (blocks, reachable) = if python_version == crate::PythonVersion::Py315 {
-            let mut boundaries = preserved_block_boundaries.clone();
-            boundaries.extend(borrow_unreachable_labels.iter().copied());
-            boundaries.extend(exception_regions.iter().map(|region| region.target));
-            for item in items.iter() {
-                if let Item::Instruction(instruction) = item
-                    && let Some(target) = instruction.jump_target()
-                {
-                    boundaries.insert(target);
-                }
-            }
-            let (blocks, label_blocks, _) = borrow_block_ranges(
+            let labels = BorrowBoundaryLabels::collect(
                 items,
-                &boundaries,
-                &FxHashSet::default(),
+                exception_regions.iter().map(|region| region.target),
+                borrow_unreachable_labels,
                 preserved_block_boundaries,
             );
+            let (blocks, label_blocks, _) = borrow_block_ranges_with_label_count(
+                items,
+                |label| labels.is_boundary(label),
+                &FxHashSet::default(),
+                preserved_block_boundaries,
+                labels.len(),
+            );
+            drop(labels);
             let mut reachable = vec![false; blocks.len()];
             let mut pending = if blocks.is_empty() {
                 Vec::new()
@@ -6409,16 +6407,19 @@ mod tests {
         }
         assert!(!dense.is_boundary(unbound));
         assert!(!dense.is_cold_join(unbound));
-        assert_eq!(
-            borrow_block_ranges_with_label_count(
-                &items,
-                |label| dense.is_boundary(label),
-                &unreachable,
-                &preserved,
-                dense.len(),
-            ),
-            borrow_block_ranges(&items, &boundaries, &unreachable, &preserved),
-        );
+        let no_unreachable = FxHashSet::default();
+        for unreachable in [&unreachable, &no_unreachable] {
+            assert_eq!(
+                borrow_block_ranges_with_label_count(
+                    &items,
+                    |label| dense.is_boundary(label),
+                    unreachable,
+                    &preserved,
+                    dense.len(),
+                ),
+                borrow_block_ranges(&items, &boundaries, unreachable, &preserved),
+            );
+        }
 
         let no_bound_items = [instruction(
             JUMP_BACKWARD_NO_INTERRUPT,
@@ -6428,6 +6429,24 @@ mod tests {
             BorrowBoundaryLabels::collect(&no_bound_items, [unbound], &unreachable, &preserved);
         assert_eq!(no_bound.len(), 0);
         assert!(!no_bound.is_cold_join(unbound));
+
+        for index in [31, 32] {
+            let label = Label::from_u32(index);
+            let items = [
+                Item::Label(label),
+                instruction(JUMP_BACKWARD_NO_INTERRUPT, Operand::Backward(label)),
+            ];
+            let labels = BorrowBoundaryLabels::collect(
+                &items,
+                [],
+                &FxHashSet::default(),
+                &FxHashSet::default(),
+            );
+            assert_eq!(labels.len(), label.index() + 1);
+            assert_eq!(labels.flags.spilled(), index == 32);
+            assert!(labels.is_boundary(label));
+            assert!(labels.is_cold_join(label));
+        }
     }
 
     #[test]
