@@ -54,6 +54,11 @@ use super::symbol::{
 };
 use super::{Compiler, Scope};
 
+#[cfg(test)]
+thread_local! {
+    static FORCE_STATEMENT_LOCATIONS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 #[derive(Clone, Copy, Debug)]
 struct LoopContext {
     body_start: usize,
@@ -6326,8 +6331,20 @@ impl<'source> Compiler<'source> {
         following_return: Option<&ruff_python_ast::StmtReturn>,
     ) -> Result<(), CompileError> {
         let previous = self.assembler.location();
-        self.assembler
-            .set_location(self.source_location(statement.range()));
+        // These paths set expression, target, or definition locations before emitting.
+        let sets_own_location = match statement {
+            Stmt::Assign(assignment) => {
+                matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+            }
+            Stmt::FunctionDef(_) | Stmt::ClassDef(_) => true,
+            _ => false,
+        };
+        #[cfg(test)]
+        let sets_own_location = sets_own_location && !FORCE_STATEMENT_LOCATIONS.get();
+        if !sets_own_location {
+            self.assembler
+                .set_location(self.source_location(statement.range()));
+        }
         let result = self.compile_statement_inner(statement, following_return);
         self.assembler.set_location(previous);
         result
@@ -52157,6 +52174,63 @@ mod tests {
     };
     use ruff_python_ast::Stmt;
     use ruff_python_parser::parse_module;
+
+    #[test]
+    fn statement_locations_match_explicit_setup_for_all_targets() {
+        use crate::{CompileOptions, OptimizationLevel, PythonVersion, compile_with_options};
+
+        struct ResetLocations(bool);
+
+        impl Drop for ResetLocations {
+            fn drop(&mut self) {
+                super::FORCE_STATEMENT_LOCATIONS.set(self.0);
+            }
+        }
+
+        let sources = [
+            "value = (1,\n         2)\nleft = right = value\nfirst, second = value\nobj.attr = value\nvalue[0] = first\nassert value\nif __debug__:\n    result = call(value)\n",
+            "def protected(values, manager):\n    item = 0\n    try:\n        with manager:\n            result = [item for item in values]\n    except ValueError as error:\n        result = recover(error)\n    finally:\n        result = finalize(result)\n    return result\n",
+            "async def restore(values):\n    item = 0\n    result = [item async for item in values]\n    result = {item async for item in values}\n    result = {item: item async for item in values}\n    item = [item async for item in values]\n    result = (\n        [item async for item in values]\n    )\n    return result\n",
+            "async def captured(values):\n    result = None\n    def read():\n        return result\n    try:\n        result = [item async for item in values]\n    finally:\n        result = cleanup(result)\n    return read\n",
+            "def outer(bound, items):\n    @decorate('shared')\n    def plain(value: 'shared' = ('shared', 'shared'), *, key: bound = bound) -> 'shared':\n        'docstring'\n        assert value\n        return value, key\n    @decorate([item for item in items])\n    async def generic[T: bound](value: T = plain(), *, key = 1 + 2) -> T:\n        return value\n    return plain, generic\n",
+            "def definitions(bound):\n    @decorate\n    class Ordinary(base(bound), metaclass=Meta):\n        'docstring'\n        __field = (1, 2)\n        @decorate\n        def method(self, value: bound = 3) -> bound:\n            return self.__field, __class__\n    @decorate\n    class Generic[T: bound](base(bound), metaclass=Meta):\n        'docstring'\n        __field = (1, 2)\n        @decorate\n        def method(self, value: T = 3) -> T:\n            return T, self.__field, __class__\n    return Ordinary, Generic\n",
+            "from __future__ import annotations\n@decorate\ndef annotated(value: list[int] = (1, 2)) -> tuple[int, ...]:\n    return value\nclass Generic[T]:\n    @decorate\n    def method(self, value: T = 1) -> T:\n        return value\n",
+            "def protected():\n    try:\n        @decorate\n        def nested(value=call()):\n            return value\n        raise ValueError\n    except ValueError as error:\n        result = str(error)\n    finally:\n        @decorate\n        class Final(base()):\n            value = result\n    return nested, Final\n",
+            "def generator():\n    value = (yield 'shared')\n    try:\n        @decorate\n        def nested(argument=(yield value)):\n            return argument\n        result = nested\n    finally:\n        value = cleanup(value)\n    yield result\n",
+            "caf\u{e9} = ('\u{e9}',\r\n        '\u{e9}')\r\nresult = caf\u{e9}; other = result\r\n",
+        ];
+        for python_version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            for optimization_level in [
+                OptimizationLevel::Zero,
+                OptimizationLevel::One,
+                OptimizationLevel::Two,
+            ] {
+                let options = CompileOptions {
+                    python_version,
+                    optimization_level,
+                    ..CompileOptions::default()
+                };
+                for source in sources {
+                    let fast =
+                        compile_with_options(source, "statement_locations.py", &options).unwrap();
+                    let explicit = {
+                        let _reset = ResetLocations(super::FORCE_STATEMENT_LOCATIONS.replace(true));
+                        compile_with_options(source, "statement_locations.py", &options).unwrap()
+                    };
+                    assert_eq!(
+                        fast.marshal(),
+                        explicit.marshal(),
+                        "{python_version:?} {optimization_level:?}: {source}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn copied_terminal_manager_requires_a_live_current_scope_return() {
