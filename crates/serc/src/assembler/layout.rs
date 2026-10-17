@@ -104,7 +104,7 @@ impl LayoutAssembler {
             max_depth = max_depth.max(instruction.maximum_stack_depth());
         }
 
-        for (item_index, argument_index, jump_base) in jumps {
+        for &(item_index, argument_index, jump_base) in &jumps {
             let Item::Instruction(instruction) = &self.items[item_index] else {
                 unreachable!("only jump instructions are recorded");
             };
@@ -132,6 +132,7 @@ impl LayoutAssembler {
             };
             bytecode[argument_index] = argument;
         }
+        drop(jumps);
         if let Some((location, length)) = run {
             write_location_run(&mut line_table, location, length, &mut current_line);
         }
