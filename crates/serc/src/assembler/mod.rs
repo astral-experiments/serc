@@ -5056,26 +5056,37 @@ impl Assembler {
         }
 
         let items = self.linear_items();
-        let block_labels = LazyCell::new(|| {
-            let mut block_labels = self.preserved_block_boundaries.clone();
-            block_labels.extend(&self.exception_owner_provenance.block_boundaries);
+        let jump_targets = LazyCell::new(|| {
+            let mut jump_targets = Vec::new();
             for region in &self.exception_regions {
-                block_labels.insert(region.target);
+                jump_targets.push(region.target);
             }
             for item in items {
                 if let Item::Instruction(instruction) = item
                     && let Some(label) = instruction.jump_target()
                 {
-                    block_labels.insert(label);
+                    jump_targets.push(label);
                 }
             }
-            block_labels
+            jump_targets.sort_unstable_by_key(|label| label.as_u32());
+            jump_targets.dedup();
+            jump_targets
         });
+        let is_block_label = |label: &Label| {
+            self.preserved_block_boundaries.contains(label)
+                || self
+                    .exception_owner_provenance
+                    .block_boundaries
+                    .contains(label)
+                || jump_targets
+                    .binary_search_by_key(&label.as_u32(), |target| target.as_u32())
+                    .is_ok()
+        };
         let start = if cross_labels {
             items
                 .iter()
                 .rposition(|item| match item {
-                    Item::Label(label) => block_labels.contains(label),
+                    Item::Label(label) => is_block_label(label),
                     Item::Instruction(instruction) => {
                         instruction.opcode == NOT_TAKEN
                             || (!is_conditional_jump(instruction.opcode)
@@ -5114,7 +5125,7 @@ impl Assembler {
                         .exception_owner_provenance
                         .fusion_boundaries
                         .contains(&label)
-                        || (cross_labels && !block_labels.contains(&label)) =>
+                        || (cross_labels && !is_block_label(&label)) =>
                 {
                     index += 1;
                     continue;
@@ -5203,7 +5214,7 @@ impl Assembler {
                                 following = Some(*instruction);
                                 break;
                             }
-                            Item::Label(label) if block_labels.contains(label) => break,
+                            Item::Label(label) if is_block_label(label) => break,
                             Item::Label(_) => {}
                         }
                     }
