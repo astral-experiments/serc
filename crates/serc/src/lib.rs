@@ -713,7 +713,20 @@ impl Drop for ParsedModule {
 // parsing limit is separate from the limit supplied for formatting. This raw scan
 // overapproximates a long decimal token even when Ruff stops on an earlier error.
 fn may_depend_on_decimal_parse(source: &str) -> bool {
-    if source.len() <= 640 || !source.contains("match") || !source.contains("case") {
+    if source.len() <= 640 {
+        return false;
+    }
+    // A run of 641 digits, allowing underscores, contains a full aligned 320-byte
+    // block. Reject files without one before scanning every byte.
+    let (chunks, _) = source.as_bytes().as_chunks::<320>();
+    if !chunks.iter().any(|chunk| {
+        chunk
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || *byte == b'_')
+    }) {
+        return false;
+    }
+    if !source.contains("match") || !source.contains("case") {
         return false;
     }
     let mut digits = 0_usize;
@@ -1075,5 +1088,35 @@ mod tests {
         assert!(may_depend_on_decimal_parse(&format!(
             "match case {first}_{second}"
         )));
+    }
+
+    #[test]
+    fn decimal_prescan_matches_digit_runs_at_all_alignments() {
+        let half = "1".repeat(320);
+        let runs = [
+            "1".repeat(640),
+            "1".repeat(641),
+            "1_".repeat(640),
+            "1_".repeat(641),
+            "_".repeat(641),
+            format!("{half}x{half}1"),
+            format!("{half}\u{0661}{half}1"),
+        ];
+        for run in runs {
+            let expected = run
+                .as_bytes()
+                .split(|byte| !byte.is_ascii_digit() && *byte != b'_')
+                .any(|part| part.iter().filter(|byte| byte.is_ascii_digit()).count() > 640);
+            for keywords in ["", "match ", "case ", "match case "] {
+                for padding in 0..320 {
+                    let source = format!("{keywords}{}{run}", ".".repeat(padding));
+                    assert_eq!(
+                        may_depend_on_decimal_parse(&source),
+                        expected && keywords == "match case ",
+                        "keywords={keywords:?}, padding={padding}, run={run:?}"
+                    );
+                }
+            }
+        }
     }
 }
