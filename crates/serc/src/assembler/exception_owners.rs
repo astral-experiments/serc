@@ -9250,6 +9250,9 @@ impl LayoutAssembler {
                         && tail.late_removals == 0
                         && tail.post_compaction_fusions == 0
                         && original_array_start > 0
+                        && let Some(marker) = indexed_instructions.get(instruction_index + 1)
+                        && marker.opcode == NOT_TAKEN
+                        && marker.exception_policy() == super::ExceptionPolicy::NonePresent
                         && self
                             .exception_owner_provenance
                             .block_boundaries
@@ -9275,9 +9278,6 @@ impl LayoutAssembler {
                             .any(|label| {
                                 label_positions.get(label) == Some(&(instruction_index + 1))
                             })
-                        && let Some(marker) = indexed_instructions.get(instruction_index + 1)
-                        && marker.opcode == NOT_TAKEN
-                        && marker.exception_policy() == super::ExceptionPolicy::NonePresent
                         && marker.location == instruction.location
                         && marker.depth_after() == instruction.depth_after()
                         && marker.pre_fold_extra_instructions() == 0
