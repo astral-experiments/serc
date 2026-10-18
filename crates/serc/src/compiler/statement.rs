@@ -3552,6 +3552,9 @@ impl<'source> Compiler<'source> {
             }
             if statement_terminates(statement) {
                 let unreachable = &body[index + 1..];
+                if unreachable.is_empty() {
+                    break;
+                }
                 // A simple keyword call interns its names tuple after visiting all arguments;
                 // name/attribute-only operands retain either folded `__debug__` or that tuple first.
                 if self.output.constants.is_empty()
