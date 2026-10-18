@@ -409,12 +409,8 @@ impl<'source> CompilationContext<'source> {
                 metadata,
             }) = original
             {
-                let lowered = LoweredScopeFacts::analyze(
-                    body,
-                    python_version,
-                    &mut source_analysis,
-                    scopes.module().has_class_comprehensions,
-                );
+                let lowered =
+                    LoweredScopeFacts::analyze(body, python_version, &mut source_analysis, &scopes);
                 scopes.retain_lowered_comprehension_locals(&lowered);
                 (
                     scopes,
@@ -1106,6 +1102,8 @@ impl<'ast> SourceAnalysis<'ast> {
         }
     }
 
+    #[expect(clippy::inline_always, reason = "avoid per-node visitor calls")]
+    #[inline(always)]
     pub(super) fn observe_stmt(&mut self, statement: &'ast Stmt) {
         if let Stmt::Try(statement) = statement
             && !statement.finalbody.is_empty()
@@ -1158,6 +1156,7 @@ impl<'ast> SourceAnalysis<'ast> {
         }
     }
 
+    #[inline]
     pub(super) fn enter_class_header(
         &mut self,
         definition: &'ast ruff_python_ast::StmtClassDef,
@@ -1180,11 +1179,13 @@ impl<'ast> SourceAnalysis<'ast> {
         previous
     }
 
+    #[inline]
     pub(super) fn enter_class_body(&mut self, definition: &ruff_python_ast::StmtClassDef) {
         self.private_name = Some(definition.name.to_string());
         self.mangled_names = None;
     }
 
+    #[inline]
     pub(super) fn leave_class(&mut self, previous: SourceClassState) {
         self.private_name = previous.private_name;
         self.mangled_names = previous.mangled_names;
@@ -1205,6 +1206,8 @@ impl<'ast> SourceAnalysis<'ast> {
         }
     }
 
+    #[expect(clippy::inline_always, reason = "avoid per-node visitor calls")]
+    #[inline(always)]
     pub(super) fn observe_expr(&mut self, expression: &'ast Expr) {
         match expression {
             Expr::Name(name) => {
@@ -1256,6 +1259,8 @@ impl<'ast> SourceAnalysis<'ast> {
         self.record_attribute_effects(attribute);
     }
 
+    #[expect(clippy::inline_always, reason = "avoid per-node visitor calls")]
+    #[inline(always)]
     fn record_attribute_effects(&mut self, attribute: &ruff_python_ast::ExprAttribute) {
         // Collect a conservative cache filter in this existing traversal.
         // Actual class ownership is determined by the lowering Store path.
@@ -1334,9 +1339,12 @@ impl<'ast> SourceAnalysis<'ast> {
     }
 }
 
-#[cfg(test)]
 impl<'ast> Visitor<'ast> for SourceAnalysis<'ast> {
     fn visit_stmt(&mut self, statement: &'ast Stmt) {
+        if crate::stack_growth_required() {
+            return crate::grow_stack(|| self.visit_stmt(statement));
+        }
+
         self.observe_stmt(statement);
         if let Stmt::ClassDef(definition) = statement {
             for decorator in &definition.decorator_list {
@@ -3686,6 +3694,42 @@ class RepeatOuter[__T: (__shared, prefix__suffix)]:
             assert_eq!(
                 combined.requires_empty_bytes_cache_trace,
                 reference.requires_empty_bytes_cache_trace
+            );
+        }
+    }
+
+    #[test]
+    fn independent_source_walk_preserves_private_collision_origins() {
+        use crate::PythonVersion::{Py312, Py313, Py314, Py315};
+
+        let parsed = ruff_python_parser::parse_module(
+            "class Collision:\n    def method(self):\n        self._Collision__field += (lambda *, __field=0: None)\n",
+        )
+        .unwrap();
+        for version in [Py312, Py313, Py314, Py315] {
+            let mut independent = SourceAnalysis::new(version, 0);
+            independent.visit_body(parsed.suite());
+            let mut combined = SourceAnalysis::new(version, 0);
+            ScopeArena::analyze_with_source(parsed.suite(), version, &mut combined);
+            let origins = |analysis: &SourceAnalysis<'_>| {
+                analysis
+                    .origins
+                    .iter()
+                    .map(|(name, origin)| (name.to_string(), origin.get()))
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            };
+            assert_eq!(origins(&combined), origins(&independent));
+            assert_eq!(
+                combined.generated_mangled_strings,
+                independent.generated_mangled_strings
+            );
+            assert_eq!(
+                combined.raw_private_identifiers,
+                independent.raw_private_identifiers
+            );
+            assert_eq!(
+                combined.static_attribute_names,
+                independent.static_attribute_names
             );
         }
     }
