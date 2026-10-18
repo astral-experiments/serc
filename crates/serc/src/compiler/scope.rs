@@ -656,8 +656,9 @@ impl NameInterner {
         self.insert(Name::new(name))
     }
 
-    fn intern_name(&mut self, name: &Name) -> NameId {
-        if let Some(id) = self.get(name) {
+    fn intern_name(&mut self, name: &Name, spelling: &str) -> NameId {
+        debug_assert_eq!(name.as_str(), spelling);
+        if let Some(id) = self.get(spelling) {
             return id;
         }
         self.insert(name.clone())
@@ -3035,7 +3036,11 @@ impl<'a, 'ast> ModuleNameCollector<'a, 'ast> {
     }
 
     fn intern_name(&mut self, name: &Name) -> NameId {
-        self.intern_with(name, |names| names.intern_name(name))
+        self.intern_name_with_spelling(name, name.as_str())
+    }
+
+    fn intern_name_with_spelling(&mut self, name: &Name, spelling: &str) -> NameId {
+        self.intern_with(spelling, |names| names.intern_name(name, spelling))
     }
 
     fn intern_with(
@@ -3069,7 +3074,7 @@ impl<'a, 'ast> ModuleNameCollector<'a, 'ast> {
 
     fn record_flat_name(&mut self, name: &ruff_python_ast::ExprName) -> NameId {
         let spelling = name.id.as_str();
-        let id = self.intern_name(&name.id);
+        let id = self.intern_name_with_spelling(&name.id, spelling);
         if spelling == "super" && name.ctx == ExprContext::Load {
             if let Some(flat) = &mut self.flat_function {
                 // A load of super also requests __class__, even when super is shadowed.
@@ -9409,7 +9414,7 @@ def function():
         for (index, name) in SCOPE_SEED_NAMES.into_iter().enumerate() {
             let id = NameId::from_usize(index);
             assert_eq!(names.get(name), Some(id));
-            assert_eq!(names.intern_name(&Name::new(name)), id);
+            assert_eq!(names.intern_name(&Name::new(name), name), id);
             assert_eq!(names.resolve(id), name);
             assert_eq!(names.clone_name(id), name);
             assert_eq!(names.seed_names[index], name);
@@ -9426,10 +9431,13 @@ def function():
     fn interned_ast_names_retain_heap_storage() {
         let spelling = Name::new("identifier_that_does_not_fit_inline");
         for mut names in [NameInterner::seeded(), NameInterner::default()] {
-            let id = names.intern_name(&spelling);
+            let id = names.intern_name(&spelling, spelling.as_str());
             assert_eq!(names.resolve(id).as_ptr(), spelling.as_str().as_ptr());
             assert_eq!(names.intern(spelling.as_str()), id);
-            assert_eq!(names.intern_name(&Name::new(spelling.as_str())), id);
+            assert_eq!(
+                names.intern_name(&Name::new(spelling.as_str()), spelling.as_str()),
+                id
+            );
             assert_eq!(names.names.len(), 1);
         }
     }

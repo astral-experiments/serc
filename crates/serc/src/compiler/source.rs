@@ -1055,6 +1055,19 @@ impl<'ast> SourceAnalysis<'ast> {
     #[inline]
     fn record_raw_name_with_id(&mut self, name: &'ast str, name_id: NameId) {
         let index = name_id.index();
+        let bit = 1 << (index % u64::BITS as usize);
+        if self
+            .expression_origin_names
+            .get(index / u64::BITS as usize)
+            .is_some_and(|word| word.seen & bit != 0 && word.private & bit == 0)
+        {
+            return;
+        }
+        self.record_raw_name_with_id_slow(name, name_id);
+    }
+
+    fn record_raw_name_with_id_slow(&mut self, name: &'ast str, name_id: NameId) {
+        let index = name_id.index();
         let word_index = index / u64::BITS as usize;
         if word_index >= self.expression_origin_names.len() {
             self.expression_origin_names
