@@ -17075,6 +17075,9 @@ impl Assembler {
             }
         }
 
+        // Each patch belongs to one deferred instruction. Resolved witnesses
+        // cannot match a later deferred operand, so the index stays valid.
+        let mut original_uniform_fold_indices = None;
         for (item_index, item) in items.iter_mut().enumerate() {
             let Item::Instruction(instruction) = item else {
                 continue;
@@ -17109,14 +17112,30 @@ impl Assembler {
             let original_uniform_fold = if instruction.opcode == LOAD_CONST
                 && instruction.jump_policy.has_original_uniform_fold()
             {
-                let mut originals = self
-                    .exception_owner_provenance
-                    .original_uniform_folds
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, original)| **original == *instruction);
-                let original = originals.next().map(|(index, _)| index);
-                original.filter(|_| originals.next().is_none())
+                let originals = &self.exception_owner_provenance.original_uniform_folds;
+                if originals.len() < 32 {
+                    let mut matches = originals
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, original)| **original == *instruction);
+                    let original = matches.next().map(|(index, _)| index);
+                    original.filter(|_| matches.next().is_none())
+                } else {
+                    original_uniform_fold_indices
+                        .get_or_insert_with(|| {
+                            let mut indices = FxHashMap::default();
+                            for (index, original) in originals.iter().enumerate() {
+                                indices
+                                    .entry(*original)
+                                    .and_modify(|index| *index = None)
+                                    .or_insert(Some(index));
+                            }
+                            indices
+                        })
+                        .get(&*instruction)
+                        .copied()
+                        .flatten()
+                }
             } else {
                 None
             };

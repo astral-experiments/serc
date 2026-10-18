@@ -18067,10 +18067,10 @@ mod tests {
 
     #[test]
     fn deferred_tuple_fold_resolution_preserves_only_unchanged_origins() {
-        use crate::assembler::{Assembler, ExceptionPolicy, Item, Operand};
+        use crate::assembler::{Assembler, ExceptionPolicy, Item, Operand, SourceLocation};
         use crate::target::opcodes::LOAD_CONST;
 
-        for (count, mutation) in [
+        for (count, mutation, witness_count) in [
             (4, "none"),
             (9, "none"),
             (30, "none"),
@@ -18082,7 +18082,12 @@ mod tests {
             (9, "extra hidden slot"),
             (9, "physical copy"),
             (9, "duplicate witness"),
-        ] {
+            (9, "converging operands"),
+        ]
+        .into_iter()
+        .flat_map(|(count, mutation)| {
+            [1, 31, 32, 33].map(|witness_count| (count, mutation, witness_count))
+        }) {
             let mut assembler = Assembler::default();
             let patch = assembler.emit_placeholder_with_depth(LOAD_CONST, 1);
             assembler.add_last_constant_fold_slots(count);
@@ -18090,6 +18095,14 @@ mod tests {
             let Item::Instruction(mut instruction) = assembler.linear_items()[0] else {
                 unreachable!();
             };
+            for line in 1..witness_count {
+                let mut witness = instruction;
+                witness.location = SourceLocation::new(line, line, 0, 1);
+                assembler
+                    .exception_owner_provenance
+                    .original_uniform_folds
+                    .push(witness);
+            }
             match mutation {
                 "foreign fold" => instruction.add_pre_fold_extra_instructions(1),
                 "operand round trip" => {
@@ -18106,6 +18119,12 @@ mod tests {
                     .exception_owner_provenance
                     .original_uniform_folds
                     .push(instruction),
+                "converging operands" => {
+                    let next = assembler.emit_placeholder_with_depth(LOAD_CONST, 1);
+                    assembler.add_last_constant_fold_slots(count);
+                    assembler.record_last_uniform_fold_owner_slots(count);
+                    assembler.patch_argument(next, 17).unwrap();
+                }
                 "none" => {}
                 _ => unreachable!(),
             }
@@ -18116,13 +18135,25 @@ mod tests {
                 unreachable!();
             };
             assert_eq!(resolved.operand(), Operand::Value(17));
+            if mutation == "converging operands" {
+                assert_eq!(assembler.linear_items()[0], assembler.linear_items()[1]);
+                assert_eq!(
+                    assembler
+                        .exception_owner_provenance
+                        .original_uniform_folds
+                        .iter()
+                        .filter(|original| **original == resolved)
+                        .count(),
+                    2,
+                );
+            }
             assert_eq!(
                 assembler
                     .exception_owner_provenance
                     .original_uniform_fold_positions(&[&resolved])
                     .contains(&0),
                 count <= 30 && mutation == "none",
-                "{count}: {mutation}",
+                "{count}: {mutation}, {witness_count} witnesses",
             );
         }
     }
