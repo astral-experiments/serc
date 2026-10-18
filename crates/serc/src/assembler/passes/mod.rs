@@ -3,6 +3,7 @@ use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use super::block_graph::BlockGraph;
+use super::exception_owners::OwnerLabelPositions;
 use super::fusion_owner_slots::FusionOwnerCertificates;
 use super::layout::{backward_argument, label_position};
 use super::{
@@ -454,21 +455,19 @@ impl Assembler {
         {
             // Original setup order expresses nesting even when copied cleanup code makes an
             // inner range longer than its parent, or exclusions split the parent into fragments.
-            let label_positions = graph
-                .iter_items()
-                .enumerate()
-                .filter_map(|(index, item)| match item {
-                    Item::Label(label) => Some((*label, index)),
-                    Item::Instruction(_) => None,
-                })
-                .collect::<rustc_hash::FxHashMap<_, _>>();
+            let mut label_positions = OwnerLabelPositions::new(graph.item_count());
+            for (index, item) in graph.iter_items().enumerate() {
+                if let Item::Label(label) = item {
+                    label_positions.insert(*label, index);
+                }
+            }
             // Removed source labels cannot certify an intact original await.
             exception_owner_provenance
                 .ordinary_await_cleanups
                 .retain(|region| {
-                    label_positions.contains_key(&region.start)
-                        && label_positions.contains_key(&region.end)
-                        && label_positions.contains_key(&region.target)
+                    label_positions.get(&region.start).is_some()
+                        && label_positions.get(&region.end).is_some()
+                        && label_positions.get(&region.target).is_some()
                 });
             for region in self
                 .exception_regions
