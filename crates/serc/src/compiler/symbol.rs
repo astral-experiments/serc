@@ -2766,11 +2766,19 @@ fn validate_compiler_stack_effect_for(
     }
 }
 
+#[inline]
 pub(super) fn mangle_name<'a>(name: &'a str, private_name: Option<&str>) -> Cow<'a, str> {
     let Some(private_name) = private_name else {
         return Cow::Borrowed(name);
     };
-    if !name.starts_with("__") || name.ends_with("__") || name.contains('.') {
+    if !name.starts_with("__") {
+        return Cow::Borrowed(name);
+    }
+    mangle_private_name(name, private_name)
+}
+
+fn mangle_private_name<'a>(name: &'a str, private_name: &str) -> Cow<'a, str> {
+    if name.ends_with("__") || name.contains('.') {
         return Cow::Borrowed(name);
     }
     let class_name = private_name.trim_start_matches('_');
@@ -2866,4 +2874,48 @@ pub(super) fn has_untracked_discarded_collection(body: &[Stmt]) -> bool {
         visitor.visit_stmt(statement);
     }
     visitor.0
+}
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+
+    use super::mangle_name;
+
+    #[test]
+    fn mangle_name_preserves_spelling_and_ownership() {
+        for (name, private_name, expected, owned) in [
+            ("", None, "", false),
+            ("", Some("C"), "", false),
+            ("name", None, "name", false),
+            ("name", Some("C"), "name", false),
+            ("_", Some("C"), "_", false),
+            ("__", Some("C"), "__", false),
+            ("__name", None, "__name", false),
+            ("__name", Some("C"), "_C__name", true),
+            ("__name", Some("_C"), "_C__name", true),
+            ("__name", Some("___C"), "_C__name", true),
+            ("__name", Some(""), "__name", false),
+            ("__name", Some("___"), "__name", false),
+            ("__name__", Some("C"), "__name__", false),
+            ("__name_", Some("C"), "_C__name_", true),
+            ("__name.part", Some("C"), "__name.part", false),
+            ("__\u{e9}", Some("_\u{e9}"), "_\u{e9}__\u{e9}", true),
+            (
+                "\u{ff3f}\u{ff3f}name",
+                Some("C"),
+                "\u{ff3f}\u{ff3f}name",
+                false,
+            ),
+            ("__name", Some("\u{ff3f}C"), "_\u{ff3f}C__name", true),
+        ] {
+            let actual = mangle_name(name, private_name);
+            assert_eq!(actual.as_ref(), expected, "{name:?}, {private_name:?}");
+            assert_eq!(
+                matches!(actual, Cow::Owned(_)),
+                owned,
+                "{name:?}, {private_name:?}"
+            );
+        }
+    }
 }
