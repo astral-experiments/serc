@@ -9114,6 +9114,41 @@ fn no_location_block_inlining_reaches_a_fixed_point() {
 }
 
 #[test]
+fn location_propagation_reports_edits_and_consumed_provenance() {
+    let mut assembler = optimization_pipeline(vec![
+        pass_instruction(LOAD_CONST, 0, 1),
+        pass_instruction(POP_TOP, 0, -1),
+    ]);
+    assert!(assembler.propagate_locations_within_blocks());
+    assert!(!assembler.propagate_locations_within_blocks());
+
+    let items = assembler.graph.copy_items();
+    for change_location in [false, true] {
+        if change_location {
+            let block = assembler.graph.block_at(0);
+            let pop = assembler.graph.instructions_mut(block).last().unwrap();
+            pop.location = SourceLocation::NONE;
+        }
+        assembler
+            .exception_owner_provenance
+            .copied_finally_iterator_returns
+            .push((
+                SourceLocation::NONE,
+                vec![Item::Label(super::Label::from_u32(99))],
+            ));
+        assert!(assembler.propagate_locations_within_blocks());
+        assert!(
+            assembler
+                .exception_owner_provenance
+                .copied_finally_iterator_returns
+                .is_empty()
+        );
+        assert_eq!(assembler.graph.copy_items(), items);
+        assert!(!assembler.propagate_locations_within_blocks());
+    }
+}
+
+#[test]
 fn shared_inlined_cleanup_locations_distinguish_exit_and_continuation() {
     for terminal in [JUMP_BACKWARD_NO_INTERRUPT, RERAISE, JUMP_BACKWARD] {
         let restart = super::Label::from_u32(0);

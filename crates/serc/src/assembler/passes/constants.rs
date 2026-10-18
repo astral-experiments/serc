@@ -204,13 +204,14 @@ impl OptimizationPipeline {
     }
 
     /// Resolves newly unlocated sequence loads after local fusion, as CPython does.
-    pub(super) fn resolve_folded_sequence_locations(&mut self) {
+    /// Returns whether the pass ran and may have changed locations.
+    pub(super) fn resolve_folded_sequence_locations(&mut self) -> bool {
         if self.python_version != PythonVersion::Py315
             || !self.graph.iter_items().any(|item| {
                 matches!(item, Item::Instruction(instruction) if instruction.has_late_fold_location())
             })
         {
-            return;
+            return false;
         }
         let order = self.graph.order().to_vec();
         let mut predecessors = FxHashMap::default();
@@ -273,6 +274,7 @@ impl OptimizationPipeline {
             }
             final_locations.insert(block, previous);
         }
+        true
     }
 
     /// Lowers 3.15's immortal constants after value-based graph optimizations.
