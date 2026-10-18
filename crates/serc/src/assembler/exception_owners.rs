@@ -18129,10 +18129,10 @@ mod tests {
 
     #[test]
     fn tuple_fold_constant_remapping_preserves_identity_and_duplicates() {
-        use crate::assembler::{Assembler, ExceptionPolicy, Item, Operand};
+        use crate::assembler::{Assembler, ExceptionPolicy, Item, Operand, SourceLocation};
         use crate::target::opcodes::{LOAD_CONST, NOP};
 
-        for mutation in [
+        for (mutation, witness_count) in [
             "none",
             "foreign fold",
             "operand round trip",
@@ -18141,8 +18141,12 @@ mod tests {
             "physical copy",
             "duplicate survivor",
             "duplicate witness",
+            "converging witnesses",
             "removed constant",
-        ] {
+        ]
+        .into_iter()
+        .flat_map(|mutation| [1, 31, 32, 33].map(|count| (mutation, count)))
+        {
             let mut assembler = Assembler::default();
             let patch = assembler.emit_placeholder_with_depth(LOAD_CONST, 1);
             assembler.add_last_constant_fold_slots(9);
@@ -18152,6 +18156,14 @@ mod tests {
             let Item::Instruction(mut instruction) = assembler.linear_items()[0] else {
                 unreachable!();
             };
+            for line in 1..witness_count {
+                let mut witness = instruction;
+                witness.location = SourceLocation::new(line, line, 0, 1);
+                assembler
+                    .exception_owner_provenance
+                    .original_uniform_folds
+                    .push(witness);
+            }
             match mutation {
                 "foreign fold" => instruction.add_pre_fold_extra_instructions(1),
                 "operand round trip" => {
@@ -18169,17 +18181,49 @@ mod tests {
                     .exception_owner_provenance
                     .original_uniform_folds
                     .push(instruction),
+                "converging witnesses" => {
+                    let mut other = instruction;
+                    other.set_operand(Operand::Value(3));
+                    other.jump_policy.mark_original_uniform_fold();
+                    assembler
+                        .exception_owner_provenance
+                        .original_uniform_folds
+                        .push(other);
+                    assembler.push_linear_item(Item::Instruction(other));
+                }
                 "none" | "removed constant" => {}
                 _ => unreachable!(),
             }
             assembler.linear_items_mut()[0] = Item::Instruction(instruction);
             let retained = mutation != "removed constant";
-            assembler.remap_constant_indices(&[Some(0), None, retained.then_some(1)]);
+            let unique = instruction.jump_policy.has_original_uniform_fold()
+                && assembler
+                    .exception_owner_provenance
+                    .original_uniform_folds
+                    .iter()
+                    .filter(|original| **original == instruction)
+                    .count()
+                    == 1;
+            let mut expected = instruction;
+            if !retained {
+                expected.opcode = NOP;
+            }
+            expected.set_operand(Operand::Value(u32::from(retained)));
+            if retained && unique {
+                expected.jump_policy.mark_original_uniform_fold();
+            }
+            assembler.remap_constant_indices(&[Some(0), None, retained.then_some(1), Some(1)]);
             let instructions = assembler
                 .linear_items()
                 .iter()
                 .filter_map(Item::as_instruction)
                 .collect::<Vec<_>>();
+            assert!(
+                instructions
+                    .iter()
+                    .all(|instruction| **instruction == expected),
+                "{mutation}: {witness_count} witnesses",
+            );
             assert_eq!(
                 instructions[0].opcode,
                 if retained { LOAD_CONST } else { NOP }

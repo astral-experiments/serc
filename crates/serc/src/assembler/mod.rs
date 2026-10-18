@@ -17254,6 +17254,16 @@ impl Assembler {
         // Retain the pre-remap witnesses throughout the pass so duplicate live
         // survivors stay duplicates when their constant indices change together.
         let original_uniform_folds = &self.exception_owner_provenance.original_uniform_folds;
+        let unique_uniform_folds = LazyCell::new(|| {
+            let mut unique = FxHashMap::default();
+            for original in original_uniform_folds {
+                unique
+                    .entry(original)
+                    .and_modify(|unique| *unique = false)
+                    .or_insert(true);
+            }
+            unique
+        });
         let remap = |instruction: &mut Instruction| {
             if !uses_constant_index(instruction.opcode) {
                 return;
@@ -17271,11 +17281,15 @@ impl Assembler {
             } else if let Some(new_index) = index_map[usize::try_from(index).unwrap()] {
                 original_uniform_fold = instruction.opcode == LOAD_CONST
                     && instruction.jump_policy.has_original_uniform_fold()
-                    && original_uniform_folds
-                        .iter()
-                        .filter(|original| **original == *instruction)
-                        .count()
-                        == 1;
+                    && if original_uniform_folds.len() < 32 {
+                        original_uniform_folds
+                            .iter()
+                            .filter(|original| **original == *instruction)
+                            .count()
+                            == 1
+                    } else {
+                        unique_uniform_folds.get(&*instruction) == Some(&true)
+                    };
                 index = new_index;
             } else {
                 // This unreachable load's constant was removed from the pool. Retain
@@ -17299,6 +17313,7 @@ impl Assembler {
             }
             UnoptimizedCode::Prepared { graph, .. } => graph.for_each_instruction_mut(remap),
         }
+        drop(unique_uniform_folds);
         let Some(provenance) = self.exception_owner_provenance.as_mut_if_present() else {
             return;
         };
