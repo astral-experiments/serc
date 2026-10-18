@@ -1579,6 +1579,7 @@ impl LayoutAssembler {
         }
 
         let mut extended_args = Vec::with_capacity(instruction_count);
+        let mut resolved_arguments = Vec::with_capacity(instruction_count);
         for item in &self.items {
             let Item::Instruction(instruction) = item else {
                 continue;
@@ -1603,8 +1604,8 @@ impl LayoutAssembler {
                 extended_arg_count(argument)
             };
             extended_args.push(width);
+            resolved_arguments.push(argument);
         }
-        let mut resolved_arguments = vec![0_u32; instruction_count];
 
         for _ in 0..8 {
             let code_units = self.label_positions(&extended_args, &mut labels);
@@ -1621,8 +1622,12 @@ impl LayoutAssembler {
                     + 1
                     + u32::from(instruction.opcode.caches_for(self.python_version));
                 position = jump_base;
-                let argument = match self.encoded_operand(instruction)? {
-                    Operand::Value(argument) => argument,
+                let argument = match instruction.operand() {
+                    Operand::Value(_) => {
+                        // Value operands and their encoded widths do not depend on layout.
+                        instruction_index += 1;
+                        continue;
+                    }
                     Operand::Deferred(id) => {
                         return Err(CompileError::Internal(format!(
                             "unresolved operand patch {} reached final layout",
@@ -1845,6 +1850,103 @@ mod uniform_jump_seed_tests {
                 assert_eq!(sparse.exception_table, bare.exception_table);
                 assert_eq!(sparse.max_depth, bare.max_depth);
                 assert_eq!(sparse.removed_max_depth, bare.removed_max_depth);
+            }
+        }
+    }
+
+    #[test]
+    fn general_layout_preserves_target_specific_value_operands() {
+        use crate::PythonVersion::{Py312, Py313, Py314, Py315};
+        use crate::target::GENEXPR_RESUME_ARGUMENT;
+        use crate::target::opcodes::{GET_YIELD_FROM_ITER, RESUME};
+        use crate::target::operands::ResumeLocation;
+
+        let depth = ResumeLocation::AFTER_YIELD.at_depth(true);
+        for (version, expected_depth, expected_genexpr, expected_iter) in [
+            (Py312, 1, 0, 0),
+            (Py313, depth, 0, 0),
+            (Py314, depth, GENEXPR_RESUME_ARGUMENT, 0),
+            (Py315, 9, 4, 3),
+        ] {
+            let original = boundary_layout(version, false, None, true)
+                .finish(1)
+                .unwrap();
+            for (opcode, argument, expected) in [
+                (RESUME, depth, expected_depth),
+                (RESUME, GENEXPR_RESUME_ARGUMENT, expected_genexpr),
+                (GET_YIELD_FROM_ITER, 0, expected_iter),
+            ] {
+                let mut layout = boundary_layout(version, false, None, true);
+                layout.items.insert(
+                    0,
+                    Item::Instruction(Instruction::new(
+                        opcode,
+                        Operand::Value(argument),
+                        SourceLocation::NONE,
+                        None,
+                    )),
+                );
+                let mut bytecode = Vec::new();
+                if expected == 0x100 {
+                    bytecode.extend([EXTENDED_ARG.code_for(version), 1]);
+                }
+                bytecode.extend([
+                    opcode.code_for(version),
+                    u8::try_from(expected & 0xff).unwrap(),
+                ]);
+                bytecode.resize(
+                    bytecode.len() + 2 * usize::from(opcode.caches_for(version)),
+                    0,
+                );
+                bytecode.extend_from_slice(&original.bytecode);
+                assert_eq!(layout.finish(1).unwrap().bytecode, bytecode);
+            }
+        }
+    }
+
+    #[test]
+    fn general_layout_preserves_operand_error_order() {
+        use crate::assembler::OperandPatchId;
+        use crate::target::opcodes::{JUMP_FORWARD, RESUME};
+
+        let deferred = (LOAD_CONST, Operand::Deferred(OperandPatchId::from_u32(7)));
+        let unbound = (JUMP_FORWARD, Operand::Forward(Label::from_u32(1)));
+        let invalid_resume = (RESUME, Operand::Value(99));
+        let deferred_error = "unresolved operand patch 7 reached final layout";
+        for version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            for (prefix, expected) in [
+                ([deferred, unbound], deferred_error),
+                ([unbound, deferred], "unbound forward jump label"),
+                (
+                    [deferred, invalid_resume],
+                    if version == PythonVersion::Py315 {
+                        "unknown semantic RESUME location"
+                    } else {
+                        deferred_error
+                    },
+                ),
+            ] {
+                let mut layout = boundary_layout(version, false, None, true);
+                layout.items.splice(
+                    0..0,
+                    prefix.map(|(opcode, operand)| {
+                        Item::Instruction(Instruction::new(
+                            opcode,
+                            operand,
+                            SourceLocation::NONE,
+                            None,
+                        ))
+                    }),
+                );
+                assert_eq!(
+                    layout.finish(1).err().unwrap(),
+                    crate::CompileError::Internal(expected.to_owned())
+                );
             }
         }
     }
