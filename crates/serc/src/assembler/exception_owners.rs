@@ -1779,15 +1779,15 @@ impl UncompactedPrefixIndexes {
     }
 }
 
-/// Final instruction positions, with compiler-generated labels indexed without hashing.
-struct OwnerLabelPositions {
+/// Label positions, with compiler-generated labels indexed without hashing.
+pub(super) struct OwnerLabelPositions {
     dense: Vec<usize>,
     sparse: FxHashMap<Label, usize>,
     dense_limit: usize,
 }
 
 impl OwnerLabelPositions {
-    fn new(item_count: usize) -> Self {
+    pub(super) fn new(item_count: usize) -> Self {
         Self {
             dense: Vec::new(),
             sparse: FxHashMap::default(),
@@ -1796,7 +1796,7 @@ impl OwnerLabelPositions {
     }
 
     #[inline]
-    fn insert(&mut self, label: Label, position: usize) {
+    pub(super) fn insert(&mut self, label: Label, position: usize) {
         let index = label.index();
         if index >= self.dense_limit {
             self.sparse.insert(label, position);
@@ -1813,7 +1813,7 @@ impl OwnerLabelPositions {
         clippy::trivially_copy_pass_by_ref,
         reason = "The shared lookup interface takes the same borrowed labels as its sparse map."
     )]
-    fn get(&self, label: &Label) -> Option<&usize> {
+    pub(super) fn get(&self, label: &Label) -> Option<&usize> {
         let index = label.index();
         if index >= self.dense_limit {
             return self.sparse.get(label);
@@ -14822,6 +14822,107 @@ mod tests {
         assert_eq!(owners.get(&missing), None);
         assert_eq!(owners[&dense_unique], 3);
         assert_eq!(owners[&sparse_unique], 4);
+
+        for item_count in [0, 32, 33, 128] {
+            let mut owners = OwnerLabelPositions::new(item_count);
+            let limit = item_count.saturating_mul(2).max(64);
+            let last_dense = Label::from_usize(limit - 1);
+            owners.insert(last_dense, 1);
+            let dense_capacity = owners.dense.capacity();
+            for sparse in [Label::from_usize(limit), Label::from_u32(u32::MAX - 1)] {
+                owners.insert(sparse, 2);
+                assert_eq!(owners.get(&sparse), Some(&2));
+            }
+            assert_eq!(owners.get(&last_dense), Some(&1));
+            assert_eq!(owners.dense.len(), limit);
+            assert_eq!(owners.dense.capacity(), dense_capacity);
+            assert_eq!(owners.sparse.len(), 2);
+        }
+    }
+
+    #[test]
+    fn initial_region_priorities_preserve_item_positions_and_missing_await_labels() {
+        use crate::PythonVersion::{Py312, Py313, Py314, Py315};
+        use crate::assembler::{Assembler, ExceptionRegion, ExceptionRegionPriority};
+        use crate::target::opcodes::{LOAD_CONST, RETURN_VALUE};
+
+        for version in [Py312, Py313, Py314, Py315] {
+            for label_base in [0, 63, 64, 1024] {
+                let mut assembler = Assembler::with_python_version(version);
+                assembler.next_label = label_base;
+                let start = assembler.label();
+                let end = assembler.label();
+                let target = assembler.label();
+                let missing = assembler.label();
+                assembler.mark(start);
+                assembler.emit(LOAD_CONST, 0);
+                assembler.mark(end);
+                assembler.emit(RETURN_VALUE, 0);
+                assembler.mark(target);
+                assembler.emit(LOAD_CONST, 0);
+                assembler.emit(RETURN_VALUE, 0);
+                let region = ExceptionRegion {
+                    start,
+                    end,
+                    target,
+                    depth: 0,
+                    preserve_lasti: false,
+                    is_scope_fallback: false,
+                    priority: ExceptionRegionPriority::OriginalRange(start, end),
+                };
+                assembler.exception_regions.push(region);
+                assembler
+                    .exception_owner_provenance
+                    .normal_try_jump_owners
+                    .insert((start, end), vec![region]);
+                assembler.exception_owner_provenance.ordinary_await_cleanups = vec![
+                    region,
+                    ExceptionRegion {
+                        start: missing,
+                        priority: ExceptionRegionPriority::OriginalRange(missing, end),
+                        ..region
+                    },
+                    ExceptionRegion { depth: 1, ..region },
+                    ExceptionRegion {
+                        end: missing,
+                        priority: ExceptionRegionPriority::OriginalRange(start, missing),
+                        ..region
+                    },
+                    ExceptionRegion {
+                        target: missing,
+                        ..region
+                    },
+                    ExceptionRegion {
+                        depth: 2,
+                        priority: ExceptionRegionPriority::Resolved { start: 7, end: 9 },
+                        ..region
+                    },
+                ];
+                let pipeline = assembler.into_optimization_pipeline();
+                let provenance = &pipeline.exception_owner_provenance;
+                assert_eq!(
+                    provenance
+                        .ordinary_await_cleanups
+                        .iter()
+                        .map(|region| region.depth)
+                        .collect::<Vec<_>>(),
+                    [0, 1, 2]
+                );
+                let priorities = pipeline
+                    .exception_regions
+                    .iter()
+                    .chain(&provenance.normal_try_jump_owners[&(start, end)])
+                    .chain(&provenance.ordinary_await_cleanups)
+                    .map(|region| match region.priority {
+                        ExceptionRegionPriority::Resolved { start, end } => (start, end),
+                        ExceptionRegionPriority::OriginalRange(..) => {
+                            panic!("unresolved original range")
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(priorities, [(0, 2), (0, 2), (0, 2), (0, 2), (7, 9)]);
+            }
+        }
     }
 
     #[test]
