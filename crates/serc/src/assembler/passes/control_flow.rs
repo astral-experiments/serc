@@ -5127,6 +5127,7 @@ impl OptimizationPipeline {
         let mut redundant = FxHashSet::default();
         let mut removed_cross_block_line_events = FxHashSet::default();
         let mut revisit = FxHashSet::default();
+        // On the first scan, only previously visited positions can be redundant.
         let mut first_scan = true;
         loop {
             let removed_before = redundant.len();
@@ -5139,7 +5140,7 @@ impl OptimizationPipeline {
                     let Item::Instruction(mut instruction) = *graph.item(position) else {
                         continue;
                     };
-                    if redundant.contains(&position) {
+                    if !first_scan && redundant.contains(&position) {
                         continue;
                     }
                     if !first_scan && !revisit.contains(&position) {
@@ -5292,7 +5293,7 @@ impl OptimizationPipeline {
                                         continue;
                                     }
                                     let position = ItemPosition::new(next_block, next_offset);
-                                    if !redundant.contains(&position) {
+                                    if first_scan || !redundant.contains(&position) {
                                         next = Some(position);
                                         break 'next;
                                     }
