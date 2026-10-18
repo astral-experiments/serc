@@ -16774,6 +16774,19 @@ assert (sets[0] is sets[1]) == (sys.argv[1] == 'shared')
 }
 
 #[test]
+fn empty_unreachable_tails_preserve_discarded_cache_admissions() {
+    for tail in [
+        "",
+        "                def discarded(default=(\"shared\",)):\n                    return default\n                self.__discarded = discarded\n",
+    ] {
+        let source = format!(
+            "class Outer:\n    class Inner:\n        def method(self, flag):\n            self.__seen = flag\n            if flag:\n                return (\"shared\",)\n{tail}            return (\"shared\",)\n"
+        );
+        assert_matches_cpython(&source, "empty_unreachable_tail.py", &LEVELS);
+    }
+}
+
+#[test]
 fn elided_non_ascii_identifier_preserves_discarded_builders() {
     const PREFIX: &str = "def marker():\n    assert probe.élève\n\n";
     let discarded = [
