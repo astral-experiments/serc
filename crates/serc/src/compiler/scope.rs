@@ -2010,8 +2010,31 @@ impl LoweredScopeFacts {
         body: &'ast [Stmt],
         python_version: PythonVersion,
         source: &mut SourceAnalysis<'ast>,
-        has_original_class_comprehensions: bool,
+        original: &ScopeArena,
     ) -> Self {
+        let has_original_class_comprehensions = original.module.has_class_comprehensions;
+        let empty_targets =
+            !has_original_class_comprehensions && original.module.comprehension_targets.is_empty();
+        #[cfg(test)]
+        let empty_targets = empty_targets && !FORCE_FULL_LOWERED_SCOPES.get();
+        if empty_targets {
+            // Without comprehension locals, only source-dependent metadata needs another walk.
+            source.visit_body(body);
+            return Self {
+                names: NameInterner::seeded(),
+                module_targets: Vec::new(),
+                classes: original
+                    .by_parent_and_origin
+                    .keys()
+                    .filter_map(|&(_, origin)| match origin {
+                        ScopeOrigin::Class(..) => Some((origin, Vec::new())),
+                        ScopeOrigin::Function(..) => None,
+                    })
+                    .collect(),
+                has_nested_classes: original.has_nested_class_scopes(),
+            };
+        }
+
         // Class comprehensions can require a full rebuild; retain its reusable function inputs.
         let inputs = ScopeInputs::collect(
             body,
@@ -8225,6 +8248,10 @@ mod tests {
             "class Outer[T]:\n    assert hidden\n    class Inner:\n        def method(self):\n            return super(), T\n",
             "assert caf\u{e9}\nclass C:\n    __field = ''\n    def method(self):\n        return '\u{e9}', self.__field\n",
             "def generator(value):\n    assert (yield value)\nasync def coroutine():\n    assert await work()\n",
+            "assert hidden\nclass C:\n    def before(self):\n        self._C__first += (lambda *, __first=0: None)\n        assert hidden\n    def after(self):\n        assert hidden\n        self._C__second += (lambda *, __second=0: None)\n",
+            "assert hidden\nglobal shared\ndef outer():\n    value = 1\n    def inner():\n        nonlocal value\n        global shared\n        value += shared\n    return inner\n",
+            "assert hidden\ndef f():\n    try:\n        return '%%' % value\n    finally:\n        assert cleanup()\n        empty = b'value' * 0\n",
+            "assert hidden\nresult = [__debug__ for () in [()]]\n",
         ];
         for python_version in [
             PythonVersion::Py312,
