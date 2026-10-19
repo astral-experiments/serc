@@ -135,6 +135,11 @@ impl OptimizationPipeline {
             return Ok(());
         }
         for block in self.graph.order().to_vec() {
+            if !self.graph[block].items().iter().any(
+                |item| matches!(item, Item::Instruction(instruction) if instruction.opcode == BUILD_TUPLE),
+            ) {
+                continue;
+            }
             let positions = self.graph[block]
                 .items()
                 .iter()
