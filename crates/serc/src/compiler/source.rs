@@ -1762,6 +1762,13 @@ impl Compiler<'_> {
             if runtime_operand(&binary.left) || runtime_operand(&binary.right) {
                 return None;
             }
+            let mut left = binary.left.as_ref();
+            while let Expr::BinOp(binary) = left {
+                left = &binary.left;
+            }
+            if runtime_operand(left) {
+                return None;
+            }
         }
 
         let literal = |expression: &Expr| match expression {
@@ -3279,13 +3286,17 @@ mod tests {
             ("__debug__", true, true),
             ("__debug__ + 1", true, true),
             ("1 + __debug__", true, true),
+            ("__debug__ + 1 + 2 + 3", true, true),
             ("name", false, false),
             ("name + (1 + 2)", false, false),
             ("(1 + 2) + name", false, false),
+            ("name + 1 + 2 + 3", false, false),
             ("object.value + 1", false, false),
             ("1 + object.value", false, false),
+            ("object.value + 1 + 2 + 3", false, false),
             ("function() + 1", false, false),
             ("1 + function()", false, false),
+            ("function() + 1 + 2 + 3", false, false),
             ("(1e999 - 1e999) + name", false, false),
             ("('a' '\\ud800' + 'b') + function()", false, false),
             ("(1, 2).real", false, false),
