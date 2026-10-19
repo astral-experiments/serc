@@ -1,7 +1,13 @@
-name: Build release binaries
+name: Build binaries
 
 on:
   workflow_call:
+    inputs:
+      plan:
+        description: cargo-dist release plan
+        required: false
+        default: ""
+        type: string
     outputs:
       distributions:
         description: Artifact ID containing all verified release distributions
@@ -15,6 +21,7 @@ env:
   CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 10
   CARGO_TERM_COLOR: always
+  PYTHONUTF8: "1"
   RUSTUP_MAX_RETRIES: 10
 
 jobs:
@@ -51,7 +58,7 @@ jobs:
   native-wheels:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -65,11 +72,13 @@ jobs:
               target: aarch64-apple-darwin,
               runner: macos-15,
               python-arch: arm64,
+              pgo: true,
             }
           - {
               target: x86_64-pc-windows-msvc,
               runner: windows-2025,
               python-arch: x64,
+              pgo: true,
             }
           - {
               target: i686-pc-windows-msvc,
@@ -88,17 +97,43 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          submodules: ${{ matrix.pgo && 'true' || 'false' }}
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        id: python
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.pgo && '3.14.5' || '3.11' }}
           architecture: ${{ matrix.python-arch }}
+      - name: Train release profile
+        if: matrix.pgo
+        id: pgo
+        uses: ./.github/actions/train-pgo
+        with:
+          python: ${{ steps.python.outputs.python-path }}
       - name: Build wheel
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        env:
+          RUSTFLAGS: ${{ steps.pgo.outputs.rustflags || (runner.os == 'Windows' && '-Ctarget-feature=+crt-static' || '') }}
+          CFLAGS: ${{ steps.pgo.outputs.cflags }}
+          CXXFLAGS: ${{ steps.pgo.outputs.cflags }}
         with:
           maturin-version: v1.14.1
           sccache: false
           target: ${{ matrix.target }}
+          rust-toolchain: ${{ steps.pgo.outputs.toolchain }}
           args: --release --locked --out dist --compatibility pypi
+      - name: Verify PGO executable
+        if: matrix.pgo
+        shell: bash
+        env:
+          PYTHON_ORACLE: ${{ steps.python.outputs.python-path }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          binary="target/$TARGET/release/serc"
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            binary="$binary.exe"
+          fi
+          python scripts/build-pgo-release "$PYTHON_ORACLE" \
+            --profile-output target/pgo-release/training.profdata --verify-binary "$binary"
       - name: Test installed wheel
         run: python scripts/test-release-wheel.py dist
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -106,18 +141,75 @@ jobs:
           name: serc-wheels-${{ matrix.target }}
           path: dist/*.whl
           if-no-files-found: error
+      - name: Archive binary
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TARGET=${{ matrix.target }}
+          ARCHIVE_NAME=serc-$TARGET
+          ARCHIVE_FILE=$ARCHIVE_NAME.tar.gz
+
+          mkdir -p "$ARCHIVE_NAME"
+          cp "target/$TARGET/release/serc" "$ARCHIVE_NAME/serc"
+          tar czvf "$ARCHIVE_FILE" "$ARCHIVE_NAME"
+          shasum -a 256 "$ARCHIVE_FILE" > "$ARCHIVE_FILE.sha256"
+      - name: Archive binary
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TARGET=${{ matrix.target }}
+          ARCHIVE_FILE=serc-$TARGET.zip
+
+          7z a "$ARCHIVE_FILE" "./target/$TARGET/release/serc.exe"
+          sha256sum "$ARCHIVE_FILE" > "$ARCHIVE_FILE.sha256"
+      - name: Upload binary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: serc-archives-${{ matrix.target }}
+          path: |
+            *.tar.gz
+            *.zip
+            *.sha256
+          if-no-files-found: error
+      - name: Upload PGO diagnostics
+        if: ${{ always() && matrix.pgo }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: serc-pgo-${{ matrix.target }}
+          path: |
+            target/pgo-release/*.profdata
+            target/pgo-release/*.json
+            target/pgo-release/run-*/manifest.json
+            target/pgo-release/run-*/*.stdout
+            target/pgo-release/run-*/*.stderr
+          if-no-files-found: ignore
+          retention-days: 7
 
   linux-wheels:
     name: ${{ matrix.target }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    runs-on: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { target: x86_64-unknown-linux-gnu, manylinux: "2_17", test: true }
+          - {
+              target: x86_64-unknown-linux-gnu,
+              manylinux: "2_17",
+              test: true,
+              pgo: true,
+            }
           - { target: i686-unknown-linux-gnu, manylinux: "2_17" }
-          - { target: aarch64-unknown-linux-gnu, manylinux: "2_28" }
+          - {
+              target: aarch64-unknown-linux-gnu,
+              manylinux: "2_28",
+              test: true,
+              pgo: true,
+            }
           - { target: armv7-unknown-linux-gnueabihf, manylinux: "2_17" }
           - { target: powerpc64le-unknown-linux-gnu, manylinux: "2_17" }
           - { target: s390x-unknown-linux-gnu, manylinux: "2_17" }
@@ -132,15 +224,27 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          submodules: ${{ matrix.pgo && 'true' || 'false' }}
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        id: python
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.pgo && '3.14.5' || '3.11' }}
+      - name: Train release profile
+        if: matrix.pgo
+        id: pgo
+        uses: ./.github/actions/train-pgo
+        with:
+          python: ${{ steps.python.outputs.python-path }}
       - name: Build portable wheel
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        env:
+          # RISC-V musl defaults to dynamic linking; standalone archives need a static executable.
+          RUSTFLAGS: ${{ steps.pgo.outputs.rustflags || (matrix.target == 'riscv64gc-unknown-linux-musl' && '-Ctarget-feature=+crt-static' || '') }}
         with:
           maturin-version: v1.14.1
           sccache: false
           target: ${{ matrix.target }}
+          rust-toolchain: ${{ steps.pgo.outputs.toolchain }}
           manylinux: ${{ matrix.manylinux }}
           args: --release --locked --out dist --compatibility pypi
           before-script-linux: |
@@ -165,6 +269,15 @@ jobs:
               # psm uses long-displacement instructions; match Rust's z10 baseline.
               export CFLAGS_s390x_unknown_linux_gnu="-march=z10"
             fi
+      - name: Verify PGO executable
+        if: matrix.pgo
+        env:
+          PYTHON_ORACLE: ${{ steps.python.outputs.python-path }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          python scripts/build-pgo-release "$PYTHON_ORACLE" \
+            --profile-output target/pgo-release/training.profdata \
+            --verify-binary "target/$TARGET/release/serc"
       - name: Test installed wheel
         if: matrix.test
         run: python scripts/test-release-wheel.py dist
@@ -173,6 +286,40 @@ jobs:
           name: serc-wheels-${{ matrix.target }}
           path: dist/*.whl
           if-no-files-found: error
+      - name: Archive binary
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TARGET=${{ matrix.target }}
+          ARCHIVE_NAME=serc-$TARGET
+          ARCHIVE_FILE=$ARCHIVE_NAME.tar.gz
+
+          mkdir -p "$ARCHIVE_NAME"
+          cp "target/$TARGET/release/serc" "$ARCHIVE_NAME/serc"
+          tar czvf "$ARCHIVE_FILE" "$ARCHIVE_NAME"
+          shasum -a 256 "$ARCHIVE_FILE" > "$ARCHIVE_FILE.sha256"
+      - name: Upload binary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: serc-archives-${{ matrix.target }}
+          path: |
+            *.tar.gz
+            *.sha256
+          if-no-files-found: error
+      - name: Upload PGO diagnostics
+        if: ${{ always() && matrix.pgo }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: serc-pgo-${{ matrix.target }}
+          path: |
+            target/pgo-release/*.profdata
+            target/pgo-release/*.json
+            target/pgo-release/run-*/manifest.json
+            target/pgo-release/run-*/*.stdout
+            target/pgo-release/run-*/*.stderr
+          if-no-files-found: ignore
+          retention-days: 7
 
   collect:
     needs: [sdist, native-wheels, linux-wheels]
@@ -192,8 +339,21 @@ jobs:
         with:
           name: serc-sdist
           path: dist
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: serc-archives-*
+          path: standalone
+          merge-multiple: true
+      - name: Check standalone archives
+        working-directory: standalone
+        run: sha256sum -c *.sha256
       - name: Check distribution contents
         run: python3 scripts/check-release-distributions.py dist --expected-wheels 18
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: artifacts-build-binaries
+          path: standalone/*
+          if-no-files-found: error
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         id: upload
         with:

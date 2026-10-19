@@ -4,26 +4,31 @@ import re
 import tomllib
 from pathlib import Path
 
+from release_version import python_version
+
 
 def update_versions(root: Path) -> str:
-    """Copy Rooster's new changelog version into both package manifests and the CLI pin."""
-    heading = re.search(
-        r"^## (\d+\.\d+\.\d+)\s*$", (root / "CHANGELOG.md").read_text(), re.M
-    )
+    """Copy Rooster's changelog version into package manifests and release metadata."""
+    heading = re.search(r"^## (\S+)\s*$", (root / "CHANGELOG.md").read_text(), re.M)
     if heading is None:
-        raise ValueError("Missing stable release version in CHANGELOG.md")
+        raise ValueError("Missing release version in CHANGELOG.md")
     version = heading[1]
+    normalized_python_version = python_version(version)
     for filename, section in [
         ("pyproject.toml", "project"),
         ("crates/serc/Cargo.toml", "package"),
         ("crates/serc_cli/Cargo.toml", "package"),
+        ("dist-workspace.toml", "workspace"),
     ]:
         path = root / filename
         content = path.read_text()
         old = tomllib.loads(content)[section]["version"]
+        new_version = (
+            normalized_python_version if filename == "pyproject.toml" else version
+        )
         content, count = re.subn(
             rf'^version = "{re.escape(old)}"$',
-            f'version = "{version}"',
+            f'version = "{new_version}"',
             content,
             count=1,
             flags=re.M,

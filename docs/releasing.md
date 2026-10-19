@@ -1,83 +1,119 @@
 # Releasing Serc
 
-Serc uses uv's Maturin packaging and trusted publishing pattern. Releases are
-manually dispatched from `main` and publish after successful build checks, with
-no separate environment approval. The GitHub repository can remain private. The
-Python package contains the native `serc` executable and supports both `serc`
-and `python -m serc`. Cargo publishes the `serc` library and the `serc-cli`
-package (`cargo install serc-cli`).
+Serc follows ty's release workflow: Cargo Dist plans the release and generates
+standalone installers and manifests; Maturin builds the native executables,
+Python wheels, and source distribution. Releases publish standalone archives and
+SHA-256 checksums to GitHub and Astral's R2 mirror, Python packages to PyPI, and
+`serc` and `serc-cli` to crates.io. The Python package supports both `serc` and
+`python -m serc`; `cargo install serc-cli` installs the Rust CLI.
+
+Release wheels and standalone archives use profile-guided optimization on macOS
+ARM64, Windows x64, and GNU Linux x64 and ARM64. Each platform trains on the
+pinned production-source and Ruff corpora with CPython 3.14.5, then builds the
+wheel with the same Rust toolchain and merged profile. Before archiving, the
+final executable must reproduce the ordinary build's bytecode in serial and
+parallel compilation. Training manifests, profiles, and logs are retained as
+workflow artifacts for seven days.
+
+Native archives are unsigned. GitHub build-provenance attestations identify the
+workflow and source commit that produced the release artifacts.
 
 ## One-time setup
 
-1. On PyPI, register a
-   [pending trusted publisher](https://docs.pypi.org/trusted-publishers/creating-a-project-through-oidc/)
-   with project name `serc`, owner `astral-sh`, repository `serc`, workflow
-   `release.yml`, and environment `release`. A pending publisher does not
-   reserve the package name until the first upload. Transfer the project to
-   Astral's PyPI organization after creation, as appropriate.
-2. Merge the Serc policy in `astral-sh/crates-policies`, then run its **Apply**
-   workflow with `confirm=true`. The utility publishes `0.0.0` placeholders for
-   `serc` and `serc-cli`, then configures trusted publishing from repository
-   owner `astral-sh`, repository `serc`, workflow `release.yml`, environment
-   `release`, with `trustpub_only: true`. Its existing production token handles
-   bootstrapping; Serc does not need a registry token. A successful dry run
-   makes no changes.
-3. Add Serc to the release policies in
-   [`astral-sh/github-policies`](https://github.com/astral-sh/github-policies/blob/main/releases/README.md):
-   the Serc entry in `environments/release.json` and
-   `rulesets/tags-require-release.json`. The `release` environment permits only
-   `main`, with no required reviewers or custom deployment protection rules.
-   Keep this environment name because the registry trusted publishers are bound
-   to it. Serc does not use a `release-gate` environment or require the
-   `release-environment-gate` App. This is an explicit exception to uv's
-   separate approval step while Serc remains private.
-4. Grant the existing `astral-automations-bot` GitHub App access to Serc. The
-   broker reads `.github/secure-token-service.json` from Serc's `main` branch;
-   the checked-in policy permits only `release-prepare.yml`, dispatched on
-   `main` in the `automations` environment, to request `contents: write` and
-   `pull_requests: write` for Serc. It pins Serc's repository ID and immutable
-   OIDC identity. Add an `STS_API_URL` secret to the `automations` environment
-   with the same base URL used by uv (without `/exchange`). Obtain it from the
-   service administrator or the deployed stack's `PolicyAudience` output; GitHub
-   does not reveal existing secret values. No new broker deployment or App
-   private key is needed. This token allows the release PR to trigger ordinary
-   CI.
-5. Grant the existing `astral-releases-bot` GitHub App access to Serc and add
-   `RELEASES_STS_API_URL` to the `release` environment, using the same release
-   broker base URL as uv. Its policy is
-   `.github/secure-token-service-release.json` and permits `release.yml` on
-   `main` to request `contents: write` and `workflows: write`. The latter allows
-   the release to tag its selected commit even if `main` advances across
-   workflow changes while artifacts are building.
+The settings below are managed outside this repository. Configure them before
+publishing with this workflow; a dry run does not verify publishing credentials
+or deployment protection rules.
 
-The trusted publisher uses the calling workflow filename (`release.yml`), even
-though the publishing jobs are implemented in reusable workflows. No persistent
-registry tokens are needed after the crates.io bootstrap.
+1. Apply the same release protection as ty through
+   [`astral-sh/github-policies`](https://github.com/astral-sh/github-policies/blob/main/releases/README.md).
+   Add Serc to `environments/release-gate.json`, the `release-environment-gate`
+   entry in `environments/release.json`, and
+   `rulesets/tags-require-release.json`. Grant the `release-environment-gate`
+   GitHub App access to Serc before applying the policy. Both environments must
+   permit only `main`. The `release-gate` environment requires a reviewer from
+   Astral's `full-time` team, prevents self-review, and disallows administrator
+   bypass. Its approval unlocks the `release` environment's custom deployment
+   rule for the remaining publishing jobs. Keep the `release` environment name:
+   the registry trusted publishers are bound to it.
+2. Add these secrets to the `release` environment for the same R2 bucket used by
+   ty. Obtain the values from the service administrator; GitHub does not reveal
+   existing secret values:
+   - `MIRROR_R2_ACCESS_KEY_ID`
+   - `MIRROR_R2_SECRET_ACCESS_KEY`
+   - `MIRROR_R2_CLOUDFLARE_ACCOUNT_ID`
+   - `MIRROR_R2_BUCKET_NAME`
+
+   Versioned downloads are mirrored under
+   `https://releases.astral.sh/github/serc/releases/download/VERSION/` with
+   immutable caching. Stable releases also update
+   `installers/serc/latest/serc-installer.sh` and
+   `installers/serc/latest/serc-installer.ps1` with five-minute caching.
+
+   Configure `astral.sh/serc/install.sh` and `astral.sh/serc/install.ps1` as
+   permanent redirects to their corresponding latest installer URLs under
+   `https://releases.astral.sh/installers/serc/latest/`. These redirects are
+   managed outside this repository. Versioned URLs,
+   `astral.sh/serc/VERSION/install.{sh,ps1}`, must redirect to
+   `https://releases.astral.sh/github/serc/releases/download/VERSION/serc-installer.{sh,ps1}`.
+
+3. Grant `astral-releases-bot` access to Serc and configure
+   `RELEASES_STS_API_URL` in the `release` environment with the existing release
+   broker's base URL. Serc's `.github/secure-token-service-release.json` permits
+   `release.yml` on `main` to request `contents: write` and `workflows: write`.
+   The latter allows tagging the selected commit even if `main` advances across
+   workflow changes while artifacts are building.
+4. Configure Serc authorization in
+   [`astral-sh/versions`](https://github.com/astral-sh/versions/blob/main/.github/secure-token-service-release.json)
+   before publishing version metadata. The policy must identify Serc by
+   repository ID `1385584662`, owner ID `115962839`, and its immutable OIDC
+   subject. It permits `release.yml` to call `publish-versions.yml` from `main`
+   in the `release` environment and request `contents: write` and
+   `pull_requests: write` for `astral-sh/versions`. The release bot must also
+   have access to that repository. The first release creates `v1/serc.ndjson`;
+   the versions repository's existing workflow mirrors it to R2.
+5. Configure PyPI trusted publishing for project `serc`, owner `astral-sh`,
+   repository `serc`, workflow `release.yml`, and environment `release`. For a
+   new project, register a
+   [pending trusted publisher](https://docs.pypi.org/trusted-publishers/creating-a-project-through-oidc/)
+   and transfer the project to Astral's PyPI organization after creation.
+6. Apply the Serc policy in `astral-sh/crates-policies` with `confirm=true`. Its
+   existing production token bootstraps `serc` and `serc-cli`, then enables
+   trusted publishing from `astral-sh/serc`, workflow `release.yml`, environment
+   `release`, with `trustpub_only: true`. Serc does not need a registry token.
+7. For release preparation, grant `astral-automations-bot` access to Serc and
+   configure `STS_API_URL` in the `automations` environment. The broker reads
+   `.github/secure-token-service.json` from `main`; its policy permits
+   `release-prepare.yml` on `main` to request `contents: write` and
+   `pull_requests: write` for Serc. This token allows the release PR to trigger
+   ordinary CI. Configure `OPENAI_API_KEY` in that environment for the changelog
+   rewrite step.
+
+The registry trusted publishers use the calling workflow filename,
+`release.yml`, even when publishing runs in reusable workflows.
 
 ## Release procedure
 
 Run **Prepare release** on `main`. Rooster generates the changelog and chooses
 the next version from PR labels; an optional `version` input overrides that
-choice. The first release defaults to the current package version, `0.1.0`. The
-workflow updates Python and Cargo versions, the CLI's library dependency, and
-both lockfiles, then opens a PR from `charlie/release-VERSION`. Review and merge
-that PR before publishing. The same preparation is available locally through
-`scripts/release.sh`.
+choice. The workflow updates Python and Cargo versions, Cargo Dist metadata, the
+CLI's library dependency, and both lockfiles, then opens a PR from
+`release/VERSION`. Review and merge that PR before publishing. The same
+preparation is available locally through `scripts/release.sh`.
 
-Like
-[uv's release workflow](https://github.com/astral-sh/uv/blob/c73db78f0b00580b3c67279b59b85153a9d0264d/.github/workflows/release.yml),
-**Release** is manually dispatched with a **Release Tag** input that defaults to
-`dry-run`. Run it on `main` with that default to build and check all wheels, the
-source distribution, and Cargo packages without publishing. To publish, enter
-the version from the merged release PR (for example, `0.1.0`). The workflow
-checks that the tag matches the packages being released, as Cargo Dist does for
-uv.
+Run **Release** on `main` with its default **Release Tag**, `dry-run`, to build
+and check the wheels, source distribution, standalone archives, installers,
+release manifest, and Cargo packages without publishing. To publish, enter the
+version from the merged release PR. The workflow checks that the tag matches the
+packages being released and builds from the selected commit.
 
-After successful builds, the workflow publishes to PyPI, then starts crates.io
-publishing and creates the GitHub release using the prepared changelog. A
-crates.io failure does not block the GitHub release, matching uv. There is no
-separate approval job. Published packages, including the source distribution and
-crate sources, are public even when the GitHub repository is private.
+Publishing requires another full-time Astral employee to approve the
+`release-gate` job.
+
+After the build checks pass, the workflow publishes to PyPI and crates.io and
+creates the GitHub release with its manifest, checksums, and provenance
+attestations. It then mirrors standalone downloads and installers to R2 and
+updates the versions repository. A crates.io failure does not block the GitHub
+release.
 
 The crates publisher skips versions already on crates.io, allowing an
 interrupted release to resume. PyPI's publisher likewise checks existing files

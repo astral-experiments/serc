@@ -21,7 +21,7 @@ class LibrarySelectionTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
         self.prefix = self.root / "prefix"
         self.libdir = self.prefix / "lib"
         self.libdir.mkdir(parents=True)
@@ -107,7 +107,7 @@ class LoadedLibraryTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
         self.library = self.root / "libpython3.14.so.1.0"
         self.library.touch()
 
@@ -163,6 +163,76 @@ class LoadedLibraryTests(unittest.TestCase):
         self.library.unlink()
         with self.assertRaises(FileNotFoundError):
             self.resolve(mapping)
+
+
+class NativeLibraryTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.prefix = Path(self.temporary.name).resolve()
+        self.addCleanup(mock.patch.stopall)
+        mock.patch.object(builder.sys, "base_prefix", str(self.prefix)).start()
+
+    def test_macos_uses_the_library_containing_python_symbols(self):
+        library = self.prefix / "Python"
+        library.touch()
+
+        def identify(_symbol, info):
+            info._obj.filename = os.fsencode(library)
+            return 1
+
+        library_handle = mock.Mock()
+        library_handle.dladdr.side_effect = identify
+        with mock.patch.object(builder.ctypes, "CDLL", return_value=library_handle):
+            self.assertEqual(builder.macos_library(), library)
+
+    def test_macos_rejects_unrelated_loaded_library(self):
+        library = self.prefix / "outside.dylib"
+        library.touch()
+        prefix = self.prefix / "python"
+        prefix.mkdir()
+
+        def identify(_symbol, info):
+            info._obj.filename = os.fsencode(library)
+            return 1
+
+        library_handle = mock.Mock()
+        library_handle.dladdr.side_effect = identify
+        with (
+            mock.patch.object(builder.sys, "base_prefix", str(prefix)),
+            mock.patch.object(builder.ctypes, "CDLL", return_value=library_handle),
+            self.assertRaisesRegex(ValueError, "escapes"),
+        ):
+            builder.macos_library()
+
+    def test_windows_uses_import_library_for_loaded_runtime(self):
+        runtime = self.prefix / "python314.dll"
+        runtime.touch()
+        library = self.prefix / "libs/python314.lib"
+        library.parent.mkdir()
+        library.touch()
+
+        def identify(_handle, buffer, _size):
+            buffer.value = str(runtime)
+            return len(buffer.value)
+
+        kernel32 = mock.Mock()
+        kernel32.GetModuleFileNameW.side_effect = identify
+        with (
+            mock.patch.object(
+                builder.ctypes, "WinDLL", return_value=kernel32, create=True
+            ),
+            mock.patch.object(builder.sys, "dllhandle", 1, create=True),
+            mock.patch.object(
+                builder.sysconfig, "get_config_var", return_value="python314.dll"
+            ),
+        ):
+            self.assertEqual(builder.windows_library(), library)
+            other = self.prefix / "other.dll"
+            other.touch()
+            runtime = other
+            with self.assertRaisesRegex(ValueError, "differs"):
+                builder.windows_library()
 
 
 if __name__ == "__main__":
