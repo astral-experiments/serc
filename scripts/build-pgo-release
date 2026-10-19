@@ -275,6 +275,13 @@ def main():
             ],
             reference_environment,
         )
+        # Resolve PATH explicitly: Windows otherwise finds the WSL launcher first.
+        bash = shutil.which("bash")
+        if not bash:
+            raise ValueError("Bash is required to read the pinned corpus expectations")
+        expectations = run(
+            [bash, (repo / "scripts/ruff-corpus-expectations").as_posix(), "3.14"]
+        ).splitlines()
 
         common = {
             "CARGO_INCREMENTAL": "0",
@@ -427,9 +434,6 @@ def main():
             f"-Cprofile-generate={raw}",
         )
         # Use the comparator's default roots.
-        expectations = run(
-            ["bash", repo / "scripts/ruff-corpus-expectations", "3.14"]
-        ).splitlines()
         run(
             [
                 training,

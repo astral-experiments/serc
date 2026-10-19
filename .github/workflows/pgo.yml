@@ -5,7 +5,6 @@ on:
     branches: [main]
     paths: &pgo-paths
       - .github/workflows/pgo.yml
-      - .github/actions/setup-python/**
       - scripts/build-pgo-release
       - scripts/build-cpython-reference.py
       - scripts/cpython-reference*.c
@@ -31,30 +30,60 @@ concurrency:
 
 jobs:
   pgo-smoke:
-    name: "PGO pipeline smoke"
+    name: "PGO pipeline smoke (${{ matrix.os }})"
     timeout-minutes: 30
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
     permissions:
       contents: read
     env:
       CARGO_NET_RETRY: 10
       CARGO_TERM_COLOR: always
+      PYTHONUTF8: "1"
       RUSTUP_MAX_RETRIES: 10
     steps:
+      - name: Enable long paths for Ruff's Git checkout
+        if: runner.os == 'Windows'
+        run: git config --global core.longpaths true
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
           submodules: true
-      - uses: ./.github/actions/setup-python
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        id: python
+        with:
+          python-version: "3.14.5"
+      - name: Set up the Windows reference compiler
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          arch: x64
       - name: "Install LLVM profile tools"
         run: rustup component add llvm-tools-preview
       - name: "Exercise PGO pipeline"
-        run: ./scripts/build-pgo-release --debug "$SERC_TEST_PYTHON"
+        shell: bash
+        env:
+          PYTHON_ORACLE: ${{ steps.python.outputs.python-path }}
+        run: |
+          set -euo pipefail
+
+          args=(--debug)
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            # Git Bash puts its own link.exe ahead of the MSVC linker.
+            compiler="$(command -v cl.exe)"
+            export PATH="$(dirname "$compiler"):$PATH"
+            args+=(--rustflag=-Ctarget-feature=+crt-static)
+          fi
+
+          python scripts/build-pgo-release "$PYTHON_ORACLE" "${args[@]}"
       - name: "Upload PGO diagnostics"
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: pgo-diagnostics
+          name: pgo-diagnostics-${{ matrix.os }}
           path: |
             target/pgo-release/run-*/manifest.json
             target/pgo-release/run-*/*.stdout
