@@ -10,6 +10,11 @@ authors = { workspace = true }
 license = { workspace = true }
 readme = "README.md"
 
+[features]
+# Disabling default features restricts compilation to CPython 3.14.5.
+default = ["all-python-versions"]
+all-python-versions = []
+
 [lib]
 doctest = false
 

@@ -603,12 +603,15 @@ impl OptimizationPipeline {
         mut constants: Option<&mut dyn ConstantTable>,
     ) -> Result<LayoutAssembler, CompileError> {
         if self.python_version <= crate::PythonVersion::Py313 {
-            return self.optimize_legacy(
-                first_line_number,
-                local_count,
-                parameter_count,
-                constants,
-            );
+            if cfg!(feature = "all-python-versions") {
+                return self.optimize_legacy(
+                    first_line_number,
+                    local_count,
+                    parameter_count,
+                    constants,
+                );
+            }
+            return Err(self.python_version.disabled_error());
         }
         let local_nop_donors = self.capture_local_nop_donors();
         let reversed_store_exits = self.capture_reversed_store_exits();

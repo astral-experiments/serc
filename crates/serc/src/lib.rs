@@ -190,7 +190,7 @@ pub enum CompileError {
         /// The byte range of the docstring literal in the normalized source.
         range: TextRange,
     },
-    /// The source uses valid Python syntax that this backend does not support yet.
+    /// The source or selected target uses functionality unavailable in this build.
     Unsupported(String),
     /// CPython raises `ValueError` when formatting an integer exceeds the selected limit.
     IntegerStringConversionLimit {
@@ -368,6 +368,7 @@ fn compile_text_source(
     parse_int_max_str_digits: Option<u32>,
     mapping_key_int_max_str_digits: Option<u32>,
 ) -> Result<CompiledModule, CompileError> {
+    options.python_version.ensure_enabled()?;
     if source.contains('\0') {
         return Err(CompileError::Decode(SourceDecodeError::NullByte));
     }
@@ -544,6 +545,7 @@ fn compile_byte_source(
     parse_int_max_str_digits: Option<u32>,
     mapping_key_int_max_str_digits: Option<u32>,
 ) -> Result<CompiledModule, CompileError> {
+    options.python_version.ensure_enabled()?;
     let decoded = source::decode_source_with_codec(source).map_err(CompileError::Decode)?;
     let mut options = Cow::Borrowed(options);
     if options

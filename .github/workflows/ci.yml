@@ -237,6 +237,8 @@ jobs:
         run: rustup show
       - name: "Cargo test"
         run: cargo test --workspace --all-targets --all-features --locked
+      - name: "Test default-target-only build"
+        run: cargo test -p serc --test target_features --no-default-features --locked
 
   test-other:
     name: "cargo test (${{ matrix.os }})"

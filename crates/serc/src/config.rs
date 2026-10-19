@@ -2,7 +2,7 @@ use std::error::Error;
 use std::fmt;
 use std::str::FromStr;
 
-use crate::{CPYTHON_TARGET, CpythonTarget, InitialInternState, target};
+use crate::{CPYTHON_TARGET, CompileError, CpythonTarget, InitialInternState, target};
 
 /// The Python language and bytecode version used for compilation.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -19,6 +19,29 @@ pub enum PythonVersion {
 }
 
 impl PythonVersion {
+    /// Return whether this build can compile for the selected version.
+    ///
+    /// All versions are enabled by default. Disabling the `all-python-versions` Cargo
+    /// feature restricts compilation to CPython 3.14.5.
+    pub const fn is_enabled(self) -> bool {
+        cfg!(feature = "all-python-versions") || matches!(self, Self::Py314)
+    }
+
+    pub(crate) fn ensure_enabled(self) -> Result<(), CompileError> {
+        if self.is_enabled() {
+            Ok(())
+        } else {
+            Err(self.disabled_error())
+        }
+    }
+
+    #[cold]
+    pub(crate) fn disabled_error(self) -> CompileError {
+        CompileError::Unsupported(format!(
+            "Python {self} support requires the `all-python-versions` feature"
+        ))
+    }
+
     /// Return the exact CPython release and bytecode format for this version.
     pub const fn target(self) -> CpythonTarget {
         match self {
