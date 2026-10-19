@@ -127,6 +127,20 @@ static OPCODE_CACHE_WIDTHS: [[u8; 256]; 4] = {
     widths
 };
 
+static OPCODE_CODES_315: [Option<u8>; 256] = {
+    let mut codes = [None; 256];
+    let mut code = 0_u8;
+    loop {
+        codes[code as usize] = Some(cpython_3_15_0rc2::code(Opcode::new(code)));
+        if code == opcodes::YIELD_VALUE.code() {
+            break;
+        }
+        code += 1;
+    }
+    codes[opcodes::RESUME.code() as usize] = Some(cpython_3_15_0rc2::code(opcodes::RESUME));
+    codes
+};
+
 impl Opcode {
     /// Read mnemonics from the same generated metadata that defines the IR opcodes.
     #[cfg(test)]
@@ -170,6 +184,15 @@ impl Opcode {
                 self.code()
             }
             PythonVersion::Py315 => cpython_3_15_0rc2::code(self),
+        }
+    }
+
+    /// Returns the cached CPython 3.15 encoding, preserving generated validity checks.
+    #[inline]
+    pub(crate) const fn code_for_315(self) -> u8 {
+        match OPCODE_CODES_315[self.code() as usize] {
+            Some(code) => code,
+            None => cpython_3_15_0rc2::code(self),
         }
     }
 
@@ -266,6 +289,24 @@ pub(crate) const fn end_send_offset_for(version: PythonVersion) -> u32 {
 mod tests {
     use super::cpython_3_14_5::{COMPILER_INTERNED_STRINGS, PREINTERNED_STRINGS};
     use super::is_preinterned_string;
+
+    #[test]
+    fn python315_opcode_table_preserves_generated_bytes_and_panics() {
+        use super::{Opcode, cpython_3_15_0rc2};
+
+        for code in u8::MIN..=u8::MAX {
+            let opcode = Opcode::new(code);
+            let encode = |mapping: fn(Opcode) -> u8| {
+                std::panic::catch_unwind(|| mapping(opcode))
+                    .map_err(|payload| *payload.downcast::<&str>().unwrap())
+            };
+            assert_eq!(
+                encode(Opcode::code_for_315),
+                encode(cpython_3_15_0rc2::code),
+                "opcode {code}"
+            );
+        }
+    }
 
     #[test]
     fn cache_width_tables_match_every_generated_semantic_opcode() {
