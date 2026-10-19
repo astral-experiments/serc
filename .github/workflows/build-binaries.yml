@@ -219,6 +219,7 @@ jobs:
           - { target: aarch64-unknown-linux-musl, manylinux: musllinux_1_1 }
           - { target: armv7-unknown-linux-musleabihf, manylinux: musllinux_1_1 }
           - { target: arm-unknown-linux-musleabihf, manylinux: auto }
+          - { target: riscv64gc-unknown-linux-musl, manylinux: musllinux_1_1 }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -237,7 +238,8 @@ jobs:
       - name: Build portable wheel
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         env:
-          RUSTFLAGS: ${{ steps.pgo.outputs.rustflags }}
+          # RISC-V musl defaults to dynamic linking; standalone archives need a static executable.
+          RUSTFLAGS: ${{ steps.pgo.outputs.rustflags || (matrix.target == 'riscv64gc-unknown-linux-musl' && '-Ctarget-feature=+crt-static' || '') }}
         with:
           maturin-version: v1.14.1
           sccache: false
@@ -346,7 +348,7 @@ jobs:
         working-directory: standalone
         run: sha256sum -c *.sha256
       - name: Check distribution contents
-        run: python3 scripts/check-release-distributions.py dist --expected-wheels 17
+        run: python3 scripts/check-release-distributions.py dist --expected-wheels 18
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: artifacts-build-binaries
