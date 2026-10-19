@@ -5137,7 +5137,7 @@ impl OptimizationPipeline {
                 let previous_at_block_entry = previous;
                 for offset in 0..graph[block].items().len() {
                     let position = ItemPosition::new(block, offset);
-                    let Item::Instruction(mut instruction) = *graph.item(position) else {
+                    let Item::Instruction(instruction) = graph.item(position) else {
                         continue;
                     };
                     if !first_scan && redundant.contains(&position) {
@@ -5182,6 +5182,7 @@ impl OptimizationPipeline {
                         continue;
                     }
 
+                    let mut instruction = *instruction;
                     let mut target_is_next = false;
                     let mut crossed_located_folded_marker = false;
                     let mut crossed_other_located_marker = false;
