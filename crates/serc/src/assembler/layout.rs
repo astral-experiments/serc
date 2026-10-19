@@ -88,7 +88,12 @@ impl LayoutAssembler {
                 // Let ordinary layout report malformed streams in instruction order.
                 Operand::Deferred(_) => return Ok(None),
             };
-            bytecode.extend_from_slice(&[instruction.opcode.code_for(version), argument]);
+            let opcode = if PY314 {
+                instruction.opcode.code_for(version)
+            } else {
+                instruction.opcode.code_for_315()
+            };
+            bytecode.extend_from_slice(&[opcode, argument]);
             bytecode.resize(bytecode.len() + usize::from(caches) * 2, 0);
 
             if let Some((location, length)) = &mut run
