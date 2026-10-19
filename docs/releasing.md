@@ -3,8 +3,8 @@
 Serc follows ty's release workflow: Cargo Dist plans the release and generates
 standalone installers and manifests; Maturin builds the native executables,
 Python wheels, and source distribution. Releases publish standalone archives and
-SHA-256 checksums to GitHub and Astral Labs, Python packages to PyPI, and `serc`
-and `serc-cli` to crates.io. The Python package supports both `serc` and
+SHA-256 checksums to GitHub and Astral's R2 mirror, Python packages to PyPI, and
+`serc` and `serc-cli` to crates.io. The Python package supports both `serc` and
 `python -m serc`; `cargo install serc-cli` installs the Rust CLI.
 
 Native archives are unsigned. GitHub build-provenance attestations identify the
@@ -27,20 +27,26 @@ or deployment protection rules.
    bypass. Its approval unlocks the `release` environment's custom deployment
    rule for the remaining publishing jobs. Keep the `release` environment name:
    the registry trusted publishers are bound to it.
-2. Configure the Labs R2 bucket served at `labs.astral.sh`, using credentials
-   scoped to that bucket. In the `release` environment, store
-   `MIRROR_R2_ACCESS_KEY_ID` and `MIRROR_R2_SECRET_ACCESS_KEY` as secrets, and
-   `MIRROR_R2_CLOUDFLARE_ACCOUNT_ID` and `MIRROR_R2_BUCKET_NAME` as variables.
-   This follows Ohm's Labs publishing configuration. Obtain credentials from the
-   service administrator; GitHub does not reveal existing secret values.
+2. Add these secrets to the `release` environment for the same R2 bucket used by
+   ty. Obtain the values from the service administrator; GitHub does not reveal
+   existing secret values:
+   - `MIRROR_R2_ACCESS_KEY_ID`
+   - `MIRROR_R2_SECRET_ACCESS_KEY`
+   - `MIRROR_R2_CLOUDFLARE_ACCOUNT_ID`
+   - `MIRROR_R2_BUCKET_NAME`
 
-   Versioned archives, checksums, and installers are published under
-   `https://labs.astral.sh/serc/releases/VERSION/` with immutable caching. Each
-   release contains the canonical `serc-installer.sh` and `serc-installer.ps1`
-   files, plus `install.sh` and `install.ps1` aliases. Stable releases also
-   update `https://labs.astral.sh/serc/install.sh` and
-   `https://labs.astral.sh/serc/install.ps1` with five-minute caching. These
-   URLs serve objects directly from the Labs bucket.
+   Versioned downloads are mirrored under
+   `https://releases.astral.sh/github/serc/releases/download/VERSION/` with
+   immutable caching. Stable releases also update
+   `installers/serc/latest/serc-installer.sh` and
+   `installers/serc/latest/serc-installer.ps1` with five-minute caching.
+
+   Configure `astral.sh/serc/install.sh` and `astral.sh/serc/install.ps1` as
+   permanent redirects to their corresponding latest installer URLs under
+   `https://releases.astral.sh/installers/serc/latest/`. These redirects are
+   managed outside this repository. Versioned URLs,
+   `astral.sh/serc/VERSION/install.{sh,ps1}`, must redirect to
+   `https://releases.astral.sh/github/serc/releases/download/VERSION/serc-installer.{sh,ps1}`.
 
 3. Grant `astral-releases-bot` access to Serc and configure
    `RELEASES_STS_API_URL` in the `release` environment with the existing release
@@ -56,8 +62,7 @@ or deployment protection rules.
    in the `release` environment and request `contents: write` and
    `pull_requests: write` for `astral-sh/versions`. The release bot must also
    have access to that repository. The first release creates `v1/serc.ndjson`;
-   its artifact URLs point to GitHub releases. The versions repository's
-   existing workflow mirrors this metadata to its ordinary R2 destination.
+   the versions repository's existing workflow mirrors it to R2.
 5. Configure PyPI trusted publishing for project `serc`, owner `astral-sh`,
    repository `serc`, workflow `release.yml`, and environment `release`. For a
    new project, register a
