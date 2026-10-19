@@ -1,5 +1,122 @@
 # Changelog
 
+## 0.1.6
+
+Released on 2026-10-19.
+
+Serc 0.1.6 adds standalone release binaries, improves CPython compatibility, and
+reduces compilation overhead.
+
+### Enhancements
+
+- Download standalone Serc binaries for uv’s 18 release targets from checksummed
+  archives or shell and PowerShell installers, with provenance attestations and
+  a release mirror (astral-sh/serc#1352;
+  https://github.com/astral-sh/serc/pull/1352)
+
+### Bug fixes
+
+- Preserve CPython-compatible control-flow joins and exception ownership when
+  optimization removes assertions in conditionals, nested handlers, and context
+  managers (astral-sh/serc#1304; https://github.com/astral-sh/serc/pull/1304)
+
+### Performance
+
+- Improve release-wheel and archive performance with profile-guided optimization
+  on macOS ARM64, Windows x64, and GNU/Linux x64 and ARM64 (astral-sh/serc#1352;
+  https://github.com/astral-sh/serc/pull/1352)
+- Speed up `-O` and `-OO` compilation by reusing function scope analysis when
+  assertion removal cannot change bindings or local ordering
+  (astral-sh/serc#1305; https://github.com/astral-sh/serc/pull/1305)
+  (astral-sh/serc#1321; https://github.com/astral-sh/serc/pull/1321)
+- Reduce optimized-compilation scope analysis by retaining original scope state
+  and skipping collection when no comprehension locals need reconciliation
+  (astral-sh/serc#1309; https://github.com/astral-sh/serc/pull/1309)
+  (astral-sh/serc#1333; https://github.com/astral-sh/serc/pull/1333)
+- Speed up folding large string frozensets and reusing repeated frozenset
+  constants (astral-sh/serc#1287; https://github.com/astral-sh/serc/pull/1287)
+  (astral-sh/serc#1290; https://github.com/astral-sh/serc/pull/1290)
+- Speed up integer-set folding by avoiding temporary numeric representations,
+  including for large integers (astral-sh/serc#1292;
+  https://github.com/astral-sh/serc/pull/1292) (astral-sh/serc#1297;
+  https://github.com/astral-sh/serc/pull/1297)
+- Speed up tuple-heavy compilation by indexing tuple-folding witnesses during
+  constant remapping and operand resolution (astral-sh/serc#1332;
+  https://github.com/astral-sh/serc/pull/1332) (astral-sh/serc#1334;
+  https://github.com/astral-sh/serc/pull/1334)
+- Reduce Python 3.12 cleanup overhead by skipping unused setup indexes and
+  walking legacy `NOP` instructions directly (astral-sh/serc#1293;
+  https://github.com/astral-sh/serc/pull/1293) (astral-sh/serc#1294;
+  https://github.com/astral-sh/serc/pull/1294)
+- Reduce legacy cleanup overhead by indexing instructions by block and avoiding
+  copies when a pass makes no changes (astral-sh/serc#1301;
+  https://github.com/astral-sh/serc/pull/1301) (astral-sh/serc#1339;
+  https://github.com/astral-sh/serc/pull/1339)
+- Speed up source validation on Python 3.12 and 3.13 by bounding prefixed-string
+  scans and reusing parser tokens (astral-sh/serc#1299;
+  https://github.com/astral-sh/serc/pull/1299) (astral-sh/serc#1306;
+  https://github.com/astral-sh/serc/pull/1306)
+- Reduce optimized-compilation time and memory use by rewriting the parsed
+  syntax tree in place (astral-sh/serc#1310;
+  https://github.com/astral-sh/serc/pull/1310)
+- Avoid extra depth and cleanup passes for optimized expression trees
+  (astral-sh/serc#1314; https://github.com/astral-sh/serc/pull/1314)
+  (astral-sh/serc#1320; https://github.com/astral-sh/serc/pull/1320)
+- Skip repeated constant-folding work for binary expressions and chains that
+  require runtime evaluation (astral-sh/serc#1341;
+  https://github.com/astral-sh/serc/pull/1341) (astral-sh/serc#1343;
+  https://github.com/astral-sh/serc/pull/1343)
+- Skip inapplicable sequence and tuple-folding passes on Python 3.13 and 3.15
+  (astral-sh/serc#1307; https://github.com/astral-sh/serc/pull/1307)
+  (astral-sh/serc#1340; https://github.com/astral-sh/serc/pull/1340)
+- Speed up Python 3.15 assembly by reusing compact-layout and borrowing fast
+  paths and caching opcode encodings (astral-sh/serc#1311;
+  https://github.com/astral-sh/serc/pull/1311) (astral-sh/serc#1336;
+  https://github.com/astral-sh/serc/pull/1336)
+- Reduce assembler ownership and local-simulation overhead by avoiding
+  unnecessary scans and reusing dense borrowing boundaries (astral-sh/serc#1312;
+  https://github.com/astral-sh/serc/pull/1312) (astral-sh/serc#1319;
+  https://github.com/astral-sh/serc/pull/1319)
+- Skip redundant assembler certificate checks during `NOP` removal and unchanged
+  source-location propagation (astral-sh/serc#1323;
+  https://github.com/astral-sh/serc/pull/1323) (astral-sh/serc#1324;
+  https://github.com/astral-sh/serc/pull/1324)
+- Speed up exception-owner analysis by indexing range labels, rejecting
+  irrelevant markers before provenance scans, and decoding tail operands once
+  (astral-sh/serc#1330; https://github.com/astral-sh/serc/pull/1330)
+  (astral-sh/serc#1331; https://github.com/astral-sh/serc/pull/1331)
+  (astral-sh/serc#1337; https://github.com/astral-sh/serc/pull/1337)
+- Reduce jump-layout overhead by borrowing inline fixups and reusing
+  already-resolved operands (astral-sh/serc#1313;
+  https://github.com/astral-sh/serc/pull/1313) (astral-sh/serc#1327;
+  https://github.com/astral-sh/serc/pull/1327)
+- Reduce forward-jump cleanup overhead by skipping first-pass lookups and
+  deferring instruction copies (astral-sh/serc#1335;
+  https://github.com/astral-sh/serc/pull/1335) (astral-sh/serc#1342;
+  https://github.com/astral-sh/serc/pull/1342)
+- Reduce symbol and scope-name analysis allocations by reusing parsed
+  identifiers, streamlining collection, and inlining common mangling checks
+  (astral-sh/serc#1317; https://github.com/astral-sh/serc/pull/1317)
+  (astral-sh/serc#1326; https://github.com/astral-sh/serc/pull/1326)
+  (astral-sh/serc#1329; https://github.com/astral-sh/serc/pull/1329)
+- Reduce source-location lookup overhead for calls, simple assignments, and
+  definitions (astral-sh/serc#1318; https://github.com/astral-sh/serc/pull/1318)
+  (astral-sh/serc#1322; https://github.com/astral-sh/serc/pull/1322)
+- Speed up source validation with a fast prefilter for oversized decimal
+  literals (astral-sh/serc#1325; https://github.com/astral-sh/serc/pull/1325)
+- Skip compiler setup for empty unreachable tails after terminating statements
+  (astral-sh/serc#1328; https://github.com/astral-sh/serc/pull/1328)
+- Reduce assembler memory use with compact storage for preserved jump targets
+  (astral-sh/serc#1316; https://github.com/astral-sh/serc/pull/1316)
+- Reduce multi-version assembly overhead by translating operands only when their
+  encoding depends on the target Python version (astral-sh/serc#1295;
+  https://github.com/astral-sh/serc/pull/1295)
+
+### Other changes
+
+- Disable explicit transparent huge-page requests in Serc’s bundled allocator
+  (astral-sh/serc#1315; https://github.com/astral-sh/serc/pull/1315)
+
 ## 0.1.5
 
 Released on 2026-10-14.
