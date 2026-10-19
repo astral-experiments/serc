@@ -12,9 +12,6 @@ on:
       distributions:
         description: Artifact ID containing all verified release distributions
         value: ${{ jobs.collect.outputs.distributions }}
-      archives:
-        description: Artifact ID containing verified standalone archives
-        value: ${{ jobs.collect.outputs.archives }}
 
 permissions:
   contents: read
@@ -329,7 +326,6 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       distributions: ${{ steps.upload.outputs.artifact-id }}
-      archives: ${{ steps.upload-archives.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -354,7 +350,6 @@ jobs:
       - name: Check distribution contents
         run: python3 scripts/check-release-distributions.py dist --expected-wheels 18
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        id: upload-archives
         with:
           name: artifacts-build-binaries
           path: standalone/*

@@ -85,7 +85,8 @@ or deployment protection rules.
    `.github/secure-token-service.json` from `main`; its policy permits
    `release-prepare.yml` on `main` to request `contents: write` and
    `pull_requests: write` for Serc. This token allows the release PR to trigger
-   ordinary CI.
+   ordinary CI. Configure `OPENAI_API_KEY` in that environment for the changelog
+   rewrite step.
 8. For Docker publishing, allow this repository's `GITHUB_TOKEN` to write
    packages and link `ghcr.io/astral-sh/serc` to Serc. Configure
    `DOCKERHUB_TOKEN_RO` for the `astralshbot` Docker Hub account so the
@@ -100,7 +101,7 @@ Run **Prepare release** on `main`. Rooster generates the changelog and chooses
 the next version from PR labels; an optional `version` input overrides that
 choice. The workflow updates Python and Cargo versions, Cargo Dist metadata, the
 CLI's library dependency, and both lockfiles, then opens a PR from
-`charlie/release-VERSION`. Review and merge that PR before publishing. The same
+`release/VERSION`. Review and merge that PR before publishing. The same
 preparation is available locally through `scripts/release.sh`.
 
 Run **Release** on `main` with its default **Release Tag**, `dry-run`, to build
