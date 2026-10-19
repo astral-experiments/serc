@@ -149,7 +149,13 @@ def main() -> None:
         f"SERC_PYTHON_MAGIC={int.from_bytes(importlib.util.MAGIC_NUMBER, 'little')}",
     ]
     includes = [sysconfig.get_path("include"), sysconfig.get_path("platinclude")]
-    source = str(Path(__file__).with_name("cpython-reference.c"))
+    source = str(
+        Path(__file__).with_name(
+            "cpython-reference-windows.c"
+            if sys.platform == "win32"
+            else "cpython-reference.c"
+        )
+    )
     command = [
         *shlex.split(os.environ.get("CC", "cc")),
         "-std=c11",

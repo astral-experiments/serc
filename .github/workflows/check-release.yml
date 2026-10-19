@@ -16,7 +16,7 @@ on:
       - "python/**"
       - "scripts/*release*"
       - "scripts/build-cpython-reference.py"
-      - "scripts/cpython-reference.c"
+      - "scripts/cpython-reference*.c"
       - "scripts/pgo_corpus.py"
       - "scripts/check-ruff-pin"
       - "scripts/ruff-corpus-expectations"

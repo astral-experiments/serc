@@ -6,11 +6,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifdef _WIN32
-#include <fcntl.h>
-#include <io.h>
-#endif
-
 #if !defined(SERC_PYTHON_HOME) || !defined(SERC_PYTHON_MAGIC)
 #error "Build with scripts/build-cpython-reference.py"
 #endif
@@ -159,13 +154,6 @@ static int compile_file(const char *path, int optimization) {
 }
 
 int main(int argc, char **argv) {
-#ifdef _WIN32
-    /* Marshal data must not undergo Windows text-mode newline conversion. */
-    if (_setmode(_fileno(stdout), _O_BINARY) == -1) {
-        perror("stdout");
-        return 1;
-    }
-#endif
     int print_identity = argc == 2 && strcmp(argv[1], "--identity") == 0;
     int compile = argc == 4 && strcmp(argv[1], "--optimize") == 0
                   && strlen(argv[2]) == 1 && argv[2][0] >= '0' && argv[2][0] <= '2';

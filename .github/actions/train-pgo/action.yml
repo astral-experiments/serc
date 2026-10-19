@@ -39,6 +39,9 @@ runs:
         args=(--train-only --profile-output "$profile")
         flags="-Cprofile-use=$profile"
         if [[ "$RUNNER_OS" == Windows ]]; then
+          # Git Bash puts its own link.exe ahead of the MSVC linker.
+          compiler="$(command -v cl.exe)"
+          export PATH="$(dirname "$compiler"):$PATH"
           args+=(--rustflag=-Ctarget-feature=+crt-static)
           flags="$flags -Ctarget-feature=+crt-static"
         elif [[ "$RUNNER_OS" == macOS ]]; then

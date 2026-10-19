@@ -8,7 +8,7 @@ on:
       - .github/actions/setup-python/**
       - scripts/build-pgo-release
       - scripts/build-cpython-reference.py
-      - scripts/cpython-reference.c
+      - scripts/cpython-reference*.c
       - scripts/check-cpython-compatibility
       - scripts/check-ruff-pin
       - scripts/ruff-corpus-expectations
