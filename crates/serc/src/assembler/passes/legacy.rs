@@ -168,12 +168,10 @@ impl OptimizationPipeline {
         };
         self.remove_unreachable_instructions();
         loop {
-            let before =
-                (self.python_version != PythonVersion::Py312).then(|| self.graph.copy_items());
-            self.remove_legacy_nops(&original_arrays, false);
+            let removed_nops = self.remove_legacy_nops(&original_arrays, false);
             // Native redundant jumps leave a located NOP for the next cleanup.
-            self.remove_legacy_redundant_jumps();
-            if before.is_none_or(|before| self.graph.copy_items() == before) {
+            let removed_jumps = self.remove_legacy_redundant_jumps();
+            if self.python_version == PythonVersion::Py312 || (!removed_nops && !removed_jumps) {
                 break;
             }
         }
