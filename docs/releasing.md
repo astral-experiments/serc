@@ -87,10 +87,6 @@ or deployment protection rules.
    `pull_requests: write` for Serc. This token allows the release PR to trigger
    ordinary CI. Configure `OPENAI_API_KEY` in that environment for the changelog
    rewrite step.
-8. For Docker publishing, allow this repository's `GITHUB_TOKEN` to write
-   packages and link `ghcr.io/astral-sh/serc` to Serc. Configure
-   `DOCKERHUB_TOKEN_RO` for the `astralshbot` Docker Hub account so the
-   additional base-image variants can authenticate when pulling images.
 
 The registry trusted publishers use the calling workflow filename,
 `release.yml`, even when publishing runs in reusable workflows.
@@ -111,10 +107,7 @@ version from the merged release PR. The workflow checks that the tag matches the
 packages being released and builds from the selected commit.
 
 Publishing requires another full-time Astral employee to approve the
-`release-gate` job. The workflow builds and publishes Docker images to GHCR as
-part of the local artifact phase. Docker images support Linux x86-64 and ARM64,
-with version tags and Alpine and Debian variants. Stable releases also update
-major/minor, `latest`, and rolling variant tags.
+`release-gate` job.
 
 After the build checks pass, the workflow publishes to PyPI and crates.io and
 creates the GitHub release with its manifest, checksums, and provenance

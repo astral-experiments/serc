@@ -123,21 +123,6 @@ jobs:
     permissions:
       contents: read
 
-  custom-build-docker:
-    needs:
-      - plan
-      - release-gate
-    if: ${{ always() && !cancelled() && needs.plan.result == 'success' && (needs.release-gate.result == 'success' || needs.release-gate.result == 'skipped') && (needs.plan.outputs.publishing == 'true' || fromJson(needs.plan.outputs.val).ci.github.pr_run_mode == 'upload' || inputs.tag == 'dry-run') }}
-    uses: ./.github/workflows/build-docker.yml
-    with:
-      plan: ${{ needs.plan.outputs.val }}
-    secrets: inherit # zizmor: ignore[secrets-inherit] -- trusted workflow in this repository
-    permissions:
-      "attestations": "write"
-      "contents": "read"
-      "id-token": "write"
-      "packages": "write"
-
   # The custom binary jobs produce checksum sidecars outside cargo-dist.
   # Include them in a local manifest before generating the installers.
   generate-checksum-manifest:
@@ -188,7 +173,6 @@ jobs:
     needs:
       - plan
       - custom-build-binaries
-      - custom-build-docker
       - generate-checksum-manifest
     permissions:
       "contents": "read"
@@ -246,11 +230,10 @@ jobs:
       - check-crates
       - plan
       - custom-build-binaries
-      - custom-build-docker
       - build-global-artifacts
       - generate-checksum-manifest
     # Require checksums for all built archives before publishing. Other build jobs may be skipped.
-    if: ${{ always() && !cancelled() && needs.release-gate.result == 'success' && needs.check-crates.result == 'success' && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && needs.generate-checksum-manifest.result == 'success' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.custom-build-binaries.result == 'skipped' || needs.custom-build-binaries.result == 'success') && (needs.custom-build-docker.result == 'skipped' || needs.custom-build-docker.result == 'success') }}
+    if: ${{ always() && !cancelled() && needs.release-gate.result == 'success' && needs.check-crates.result == 'success' && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && needs.generate-checksum-manifest.result == 'success' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.custom-build-binaries.result == 'skipped' || needs.custom-build-binaries.result == 'success') }}
     permissions:
       "contents": "read"
     env:
