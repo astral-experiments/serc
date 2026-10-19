@@ -1752,6 +1752,18 @@ impl Compiler<'_> {
             }
         }
 
+        if let Expr::BinOp(binary) = expression {
+            let runtime_operand = |operand: &Expr| match operand {
+                Expr::Name(name) => name.id.as_str() != "__debug__",
+                Expr::Attribute(_) | Expr::Call(_) => true,
+                _ => false,
+            };
+            // Avoid folding and discarding the other operand.
+            if runtime_operand(&binary.left) || runtime_operand(&binary.right) {
+                return None;
+            }
+        }
+
         let literal = |expression: &Expr| match expression {
             Expr::UnaryOp(unary)
                 if !self.has_deferred_annotations()
@@ -3265,7 +3277,17 @@ mod tests {
 
         for (source, legacy, modern) in [
             ("__debug__", true, true),
+            ("__debug__ + 1", true, true),
+            ("1 + __debug__", true, true),
             ("name", false, false),
+            ("name + (1 + 2)", false, false),
+            ("(1 + 2) + name", false, false),
+            ("object.value + 1", false, false),
+            ("1 + object.value", false, false),
+            ("function() + 1", false, false),
+            ("1 + function()", false, false),
+            ("(1e999 - 1e999) + name", false, false),
+            ("('a' '\\ud800' + 'b') + function()", false, false),
             ("(1, 2).real", false, false),
             ("[1, 2]", false, false),
             ("{1, 2}", false, false),
