@@ -952,8 +952,15 @@ impl FunctionPlan {
         definition: &StmtFunctionDef,
         private_name: Option<&str>,
     ) -> FxHashSet<String> {
-        let annotation_required = |expression: &Expr| {
-            private_name.map_or_else(
+        let mut annotation_references = FxHashSet::default();
+        let mut collect_annotation = |expression: &Expr| {
+            if private_name.is_none()
+                && let Some(references) = definitely_evaluated_references(expression)
+            {
+                annotation_references.extend(references.into_iter().map(str::to_owned));
+                return;
+            }
+            annotation_references.extend(private_name.map_or_else(
                 || expression_required_names(expression),
                 |private_name| {
                     contextual_expression_requirements(
@@ -962,9 +969,8 @@ impl FunctionPlan {
                         expression_required_names,
                     )
                 },
-            )
+            ));
         };
-        let mut annotation_references = FxHashSet::default();
         for parameter in definition
             .parameters
             .posonlyargs
@@ -972,26 +978,26 @@ impl FunctionPlan {
             .chain(&definition.parameters.args)
         {
             if let Some(annotation) = parameter.parameter.annotation.as_deref() {
-                annotation_references.extend(annotation_required(annotation));
+                collect_annotation(annotation);
             }
         }
         if let Some(parameter) = &definition.parameters.vararg
             && let Some(annotation) = parameter.annotation.as_deref()
         {
-            annotation_references.extend(annotation_required(annotation));
+            collect_annotation(annotation);
         }
         for parameter in &definition.parameters.kwonlyargs {
             if let Some(annotation) = parameter.parameter.annotation.as_deref() {
-                annotation_references.extend(annotation_required(annotation));
+                collect_annotation(annotation);
             }
         }
         if let Some(parameter) = &definition.parameters.kwarg
             && let Some(annotation) = parameter.annotation.as_deref()
         {
-            annotation_references.extend(annotation_required(annotation));
+            collect_annotation(annotation);
         }
         if let Some(annotation) = definition.returns.as_deref() {
-            annotation_references.extend(annotation_required(annotation));
+            collect_annotation(annotation);
         }
         annotation_references
     }
@@ -10272,6 +10278,38 @@ class AssertOwner:
                 );
             }
         }
+    }
+
+    #[test]
+    fn annotation_references_preserve_name_order() {
+        let parsed = parse_module(
+            r#"def annotated(
+    positional: tuple[Z, A, Z, B, C, D, E], /,
+    ordinary: package.Type[α, super],
+    empty: "Forward",
+    *args: list[A],
+    only: (lambda: captured)(),
+    **kwargs: left if condition else right,
+) -> tuple[result, A]:
+    pass
+"#,
+        )
+        .unwrap();
+        let Stmt::FunctionDef(definition) = &parsed.suite()[0] else {
+            panic!("expected a function");
+        };
+        let fast = FunctionPlan::annotation_references(definition, None);
+        // An all-underscore class forces the private path without changing spellings.
+        let full = FunctionPlan::annotation_references(definition, Some("___"));
+        assert_eq!(fast.capacity(), full.capacity());
+        assert_eq!(
+            fast.iter().collect::<Vec<_>>(),
+            full.iter().collect::<Vec<_>>()
+        );
+        let mut fast_names = NameInterner::seeded();
+        let mut full_names = NameInterner::seeded();
+        assert_eq!(fast_names.intern_set(fast), full_names.intern_set(full));
+        assert_eq!(fast_names.names, full_names.names);
     }
 
     #[test]
