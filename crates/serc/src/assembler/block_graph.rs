@@ -866,29 +866,31 @@ impl BlockGraph {
         let mut prefix = 0;
         let mut length = 0;
         let mut has_instruction = false;
-        for item in self.iter_items() {
-            if let Item::Label(label) = item
-                && (has_instruction || (length > 0 && boundaries.contains(label)))
-            {
-                if physical_lengths.next() != Some(length) {
-                    return Err(prefix);
+        for block in &self.order {
+            for item in self[*block].items() {
+                if let Item::Label(label) = item
+                    && (has_instruction || (length > 0 && boundaries.contains(label)))
+                {
+                    if physical_lengths.next() != Some(length) {
+                        return Err(prefix);
+                    }
+                    prefix += 1;
+                    length = 0;
+                    has_instruction = false;
                 }
-                prefix += 1;
-                length = 0;
-                has_instruction = false;
-            }
-            let ends_block = matches!(item, Item::Instruction(instruction) if
-                instruction.value_argument().is_none()
-                    || ends_scope(instruction.opcode));
-            length += 1;
-            has_instruction |= matches!(item, Item::Instruction(_));
-            if ends_block {
-                if physical_lengths.next() != Some(length) {
-                    return Err(prefix);
+                let ends_block = matches!(item, Item::Instruction(instruction) if
+                    instruction.value_argument().is_none()
+                        || ends_scope(instruction.opcode));
+                length += 1;
+                has_instruction |= matches!(item, Item::Instruction(_));
+                if ends_block {
+                    if physical_lengths.next() != Some(length) {
+                        return Err(prefix);
+                    }
+                    prefix += 1;
+                    length = 0;
+                    has_instruction = false;
                 }
-                prefix += 1;
-                length = 0;
-                has_instruction = false;
             }
         }
         if length > 0 {
