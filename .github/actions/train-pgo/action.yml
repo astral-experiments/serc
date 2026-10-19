@@ -1,0 +1,53 @@
+name: Train release PGO
+description: Train Serc on its pinned corpus and export the release compiler flags.
+
+inputs:
+  python:
+    description: Exact CPython 3.14.5 oracle executable
+    required: true
+
+outputs:
+  toolchain:
+    description: Rust toolchain used to generate the profile
+    value: ${{ steps.train.outputs.toolchain }}
+  rustflags:
+    description: Rust compiler flags for the final release build
+    value: ${{ steps.train.outputs.rustflags }}
+  cflags:
+    description: Native compiler flags for the final release build
+    value: ${{ steps.train.outputs.cflags }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up the Windows reference compiler
+      if: runner.os == 'Windows'
+      uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+      with:
+        arch: x64
+    - name: Train PGO
+      id: train
+      shell: bash
+      env:
+        PYTHON_ORACLE: ${{ inputs.python }}
+      run: |
+        set -euo pipefail
+
+        rustup component add llvm-tools-preview
+        echo "toolchain=$(rustc --version | cut -d ' ' -f2)" >> "$GITHUB_OUTPUT"
+        profile="$(python -c 'from pathlib import Path; print(Path("target/pgo-release/training.profdata").resolve().as_posix())')"
+        args=()
+        flags="-Cprofile-use=$profile"
+        if [[ "$RUNNER_OS" == Windows ]]; then
+          args+=(--rustflag=-Ctarget-feature=+crt-static)
+          flags="$flags -Ctarget-feature=+crt-static"
+        elif [[ "$RUNNER_OS" == macOS ]]; then
+          # Apple Clang's profiles need not match Rust's LLVM profile format.
+          export CFLAGS="-fno-profile-generate -fno-profile-use"
+          export CXXFLAGS="$CFLAGS"
+          echo "cflags=$CFLAGS" >> "$GITHUB_OUTPUT"
+        fi
+
+        python scripts/build-pgo-release "$PYTHON_ORACLE" \
+          --train-only --profile-output "$profile" "${args[@]}"
+        echo "rustflags=$flags" >> "$GITHUB_OUTPUT"

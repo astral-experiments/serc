@@ -7,6 +7,14 @@ SHA-256 checksums to GitHub and Astral's R2 mirror, Python packages to PyPI, and
 `serc` and `serc-cli` to crates.io. The Python package supports both `serc` and
 `python -m serc`; `cargo install serc-cli` installs the Rust CLI.
 
+Release wheels and standalone archives use profile-guided optimization on macOS
+ARM64, Windows x64, and GNU Linux x64 and ARM64. Each platform trains on the
+pinned production-source and Ruff corpora with CPython 3.14.5, then builds the
+wheel with the same Rust toolchain and merged profile. Before archiving, the
+final executable must reproduce the ordinary build's bytecode in serial and
+parallel compilation. Training manifests, profiles, and logs are retained as
+workflow artifacts for seven days.
+
 Native archives are unsigned. GitHub build-provenance attestations identify the
 workflow and source commit that produced the release artifacts.
 

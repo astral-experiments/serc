@@ -41,6 +41,22 @@ def main():
         help="Produce a merged profile without building the final executable",
     )
     parser.add_argument(
+        "--profile-output",
+        type=Path,
+        help="Export the verified profile and a sibling .json build manifest",
+    )
+    parser.add_argument(
+        "--verify-binary",
+        type=Path,
+        help="Check a packaged executable against the --profile-output training run",
+    )
+    parser.add_argument(
+        "--rustflag",
+        action="append",
+        default=[],
+        help="Rust flag shared by control, instrumented, and final builds; repeat as needed",
+    )
+    parser.add_argument(
         "--toolchain", help="Rustup toolchain, e.g. ohm for local development"
     )
     parser.add_argument(
@@ -49,6 +65,11 @@ def main():
         help="build/profile root (default: target/pgo-release)",
     )
     args = parser.parse_args()
+    if args.verify_binary and (not args.profile_output or args.train_only):
+        parser.error("--verify-binary requires --profile-output without --train-only")
+    if any("profile-" in flag for flag in args.rustflag):
+        parser.error("--rustflag must not set PGO instrumentation or profile paths")
+    profile_output = args.profile_output.resolve() if args.profile_output else None
     repo = Path(__file__).resolve().parent.parent
     output = (args.output_dir or repo / "target/pgo-release").resolve()
     if (
@@ -106,9 +127,12 @@ def main():
         return digest.hexdigest()
 
     try:
-        if os.environ.get("RUSTFLAGS") or os.environ.get("CARGO_ENCODED_RUSTFLAGS"):
+        if not args.verify_binary and (
+            os.environ.get("RUSTFLAGS") or os.environ.get("CARGO_ENCODED_RUSTFLAGS")
+        ):
             raise ValueError(
-                "unset RUSTFLAGS and CARGO_ENCODED_RUSTFLAGS before building"
+                "unset RUSTFLAGS and CARGO_ENCODED_RUSTFLAGS before building; "
+                "pass shared target flags with --rustflag"
             )
         selector = [f"+{args.toolchain}"] if args.toolchain else []
         cargo, rustc = ["cargo", *selector], ["rustc", *selector]
@@ -117,7 +141,11 @@ def main():
         llvm_version = re.search(r"^LLVM version: (.+)$", rust_version, re.M).group(1)
         sysroot = Path(run([*rustc, "--print", "sysroot"]))
         profdata = os.environ.get("LLVM_PROFDATA") or str(
-            sysroot / "lib/rustlib" / host / "bin/llvm-profdata"
+            sysroot
+            / "lib/rustlib"
+            / host
+            / "bin"
+            / ("llvm-profdata.exe" if sys.platform == "win32" else "llvm-profdata")
         )
         profdata_version = run([profdata, "--version"])
         match = re.search(r"LLVM version (\d+)\.(\d+)", profdata_version)
@@ -125,7 +153,8 @@ def main():
             raise ValueError(
                 "llvm-profdata must match rustc's LLVM major and minor versions"
             )
-        run([repo / "scripts/check-ruff-pin"])
+        pin_environment = {"RUSTUP_TOOLCHAIN": args.toolchain} if args.toolchain else {}
+        run([sys.executable, repo / "scripts/check-ruff-pin"], pin_environment)
         python_identity = json.loads(
             run(
                 [
@@ -159,6 +188,7 @@ def main():
                 "llvm_profdata": profdata_version,
                 "ruff_revision": run(["git", "-C", "vendor/ruff", "rev-parse", "HEAD"]),
                 "python": python_identity,
+                "rustflags": args.rustflag,
                 "build_environment": {
                     key: value
                     for key, value in os.environ.items()
@@ -177,6 +207,54 @@ def main():
             raise ValueError(
                 "the shared build directory must be separate from the PGO output directory"
             )
+
+        if args.verify_binary:
+            training_manifest = profile_output.with_suffix(".json")
+            training = json.loads(training_manifest.read_text())
+            if training["status"] != "complete":
+                raise ValueError("the training run did not complete")
+            if sha(profile_output) != training["profile_sha256"]:
+                raise ValueError("the exported PGO profile changed after training")
+            if training["source_sha256"] != manifest["source_sha256"]:
+                raise ValueError("source changed after PGO training")
+            if (
+                training["python"] != python_identity
+                or training["rustc"] != rust_version
+            ):
+                raise ValueError("the Python or Rust toolchain changed after training")
+            corpus = Path(training["corpus"])
+            if tree_summary(corpus, ".py") != training["corpus_sources"]:
+                raise ValueError("training sources changed after training")
+            binary = args.verify_binary.resolve(strict=True)
+            for jobs in (1, min(4, os.cpu_count() or 1)):
+                clean_bytecode(corpus)
+                run(
+                    [
+                        binary,
+                        "compile",
+                        "--quiet",
+                        "--python-version",
+                        "3.14",
+                        "--jobs",
+                        jobs,
+                        corpus,
+                    ]
+                )
+                verify_bytecode(corpus, training["control_outputs"])
+            if tree_summary(corpus, ".py") != training["corpus_sources"]:
+                raise ValueError("training sources changed during verification")
+            if source_hash() != manifest["source_sha256"]:
+                raise ValueError("source changed during verification")
+            manifest.update(
+                {
+                    "status": "complete",
+                    "training_manifest": str(training_manifest),
+                    "binary": str(binary),
+                    "binary_sha256": sha(binary),
+                }
+            )
+            print(f"Verified PGO executable: {binary}\nBuild manifest: {manifest_path}")
+            return 0
 
         common = {
             "CARGO_INCREMENTAL": "0",
@@ -202,7 +280,9 @@ def main():
                 common
                 | {
                     "CARGO_TARGET_DIR": str(target_dir),
-                    "CARGO_ENCODED_RUSTFLAGS": flags,
+                    "CARGO_ENCODED_RUSTFLAGS": "\x1f".join(
+                        [*args.rustflag, *([flags] if flags else [])]
+                    ),
                 },
             )
             artifacts = [
@@ -220,6 +300,7 @@ def main():
             )
 
         corpus = run_dir / "corpus"
+        manifest["corpus"] = str(corpus)
         manifest["projects"] = prepare_corpus(output / "corpus-cache", corpus, run)
         manifest["corpus_sources"] = tree_summary(corpus, ".py")
 
@@ -325,7 +406,14 @@ def main():
             output / "generate-target",
             f"-Cprofile-generate={raw}",
         )
-        reference = run_dir / "cpython-reference"
+        reference = run_dir / (
+            "cpython-reference.exe" if sys.platform == "win32" else "cpython-reference"
+        )
+        reference_environment = {
+            "PATH": str(Path(python_identity["executable"]).parent)
+            + os.pathsep
+            + os.environ.get("PATH", "")
+        }
         run(
             [
                 args.python,
@@ -334,11 +422,12 @@ def main():
                 repo / "scripts/build-cpython-reference.py",
                 "--output",
                 reference,
-            ]
+            ],
+            reference_environment,
         )
         # Use the comparator's default roots.
         expectations = run(
-            [repo / "scripts/ruff-corpus-expectations", "3.14"]
+            ["bash", repo / "scripts/ruff-corpus-expectations", "3.14"]
         ).splitlines()
         run(
             [
@@ -349,7 +438,8 @@ def main():
                 "3.14",
                 *expectations,
             ],
-            {
+            reference_environment
+            | {
                 "RAYON_NUM_THREADS": "1",
                 "LLVM_PROFILE_FILE": str(raw / "ruff-%m-%p.profraw"),
             },
@@ -378,13 +468,18 @@ def main():
             raise ValueError(
                 "source changed during the PGO build; rerun with an unchanged checkout"
             )
-        run([repo / "scripts/check-ruff-pin"])
+        run([sys.executable, repo / "scripts/check-ruff-pin"], pin_environment)
         manifest.update(
             {
                 "status": "complete",
                 "profile_sha256": sha(merged),
             }
         )
+        if profile_output:
+            profile_output.parent.mkdir(parents=True, exist_ok=True)
+            save()
+            shutil.copy2(merged, profile_output)
+            shutil.copy2(manifest_path, profile_output.with_suffix(".json"))
         print(f"Merged PGO profile: {merged}\nBuild manifest: {manifest_path}")
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
         manifest.update({"status": "failed", "error": str(error)})

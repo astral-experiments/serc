@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import importlib.util
 import json
 import os
@@ -65,25 +66,90 @@ def reference_library(library_dir: Path, library_name: str) -> Path:
     return library
 
 
+def macos_library() -> Path:
+    """Find the loaded framework or shared library, including relocated Python installs."""
+
+    class DlInfo(ctypes.Structure):
+        _fields_ = [
+            ("filename", ctypes.c_char_p),
+            ("base", ctypes.c_void_p),
+            ("symbol_name", ctypes.c_char_p),
+            ("symbol", ctypes.c_void_p),
+        ]
+
+    dladdr = ctypes.CDLL(None).dladdr
+    dladdr.argtypes = [ctypes.c_void_p, ctypes.POINTER(DlInfo)]
+    dladdr.restype = ctypes.c_int
+    info = DlInfo()
+    if not dladdr(
+        ctypes.cast(ctypes.pythonapi.Py_GetVersion, ctypes.c_void_p), ctypes.byref(info)
+    ):
+        raise ValueError(
+            "Cannot identify the loaded CPython framework or shared library"
+        )
+    library = Path(os.fsdecode(info.filename)).resolve(strict=True)
+    if not library.is_relative_to(Path(sys.base_prefix).resolve(strict=True)):
+        raise ValueError("Loaded libpython escapes the interpreter prefix")
+    return library
+
+
+def windows_library() -> Path:
+    """Link the import library belonging to the running interpreter's loaded DLL."""
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_module_filename = kernel32.GetModuleFileNameW
+    get_module_filename.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint32]
+    get_module_filename.restype = ctypes.c_uint32
+    buffer = ctypes.create_unicode_buffer(32768)
+    length = get_module_filename(sys.dllhandle, buffer, len(buffer))
+    if not length or length == len(buffer):
+        raise ValueError("Cannot identify the running CPython DLL")
+    runtime = Path(buffer.value).resolve(strict=True)
+    prefix = Path(sys.base_prefix).resolve(strict=True)
+    name = (
+        sysconfig.get_config_var("LIBRARY")
+        or f"python{sys.version_info.major}{sys.version_info.minor}.lib"
+    )
+    if Path(name).name != name or Path(name).suffix != ".lib":
+        raise ValueError("Invalid CPython import library filename")
+    if runtime != (prefix / Path(name).with_suffix(".dll")).resolve(strict=True):
+        raise ValueError("Loaded CPython DLL differs from the interpreter prefix")
+    library = (prefix / "libs" / name).resolve(strict=True)
+    if not library.is_relative_to(prefix):
+        raise ValueError("CPython import library escapes the interpreter prefix")
+    return library
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if sys.implementation.name != "cpython" or sys.version_info < (3, 12):
         parser.error("use the target CPython interpreter (3.12 or newer)")
-    if sys.platform != "linux" or not sysconfig.get_config_var("Py_ENABLE_SHARED"):
-        parser.error("the reference requires Linux and a shared CPython library")
-
     try:
-        library = reference_library(
-            Path(sysconfig.get_config_var("LIBDIR")),
-            sysconfig.get_config_var("LDLIBRARY"),
-        )
+        if sys.platform == "linux" and sysconfig.get_config_var("Py_ENABLE_SHARED"):
+            library = reference_library(
+                Path(sysconfig.get_config_var("LIBDIR")),
+                sysconfig.get_config_var("LDLIBRARY"),
+            )
+        elif sys.platform == "darwin":
+            library = macos_library()
+        elif sys.platform == "win32":
+            library = windows_library()
+        else:
+            parser.error(
+                "the reference requires a shared CPython library on Linux, macOS, or Windows"
+            )
     except (OSError, ValueError) as error:
         parser.error(str(error))
     library_dir = library.parent
     output = args.output.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
+    definitions = [
+        f"SERC_PYTHON_HOME={json.dumps(sys.base_prefix, ensure_ascii=False)}",
+        f"SERC_PYTHON_MAGIC={int.from_bytes(importlib.util.MAGIC_NUMBER, 'little')}",
+    ]
+    includes = [sysconfig.get_path("include"), sysconfig.get_path("platinclude")]
+    source = str(Path(__file__).with_name("cpython-reference.c"))
     command = [
         *shlex.split(os.environ.get("CC", "cc")),
         "-std=c11",
@@ -91,11 +157,9 @@ def main() -> None:
         "-Wall",
         "-Wextra",
         "-Werror",
-        f"-I{sysconfig.get_path('include')}",
-        f"-I{sysconfig.get_path('platinclude')}",
-        f"-DSERC_PYTHON_HOME={json.dumps(sys.base_prefix, ensure_ascii=False)}",
-        f"-DSERC_PYTHON_MAGIC={int.from_bytes(importlib.util.MAGIC_NUMBER, 'little')}",
-        str(Path(__file__).with_name("cpython-reference.c")),
+        *(f"-I{directory}" for directory in includes),
+        *(f"-D{definition}" for definition in definitions),
+        source,
         str(library),
         "-Xlinker",
         "-rpath",
@@ -106,9 +170,31 @@ def main() -> None:
         "-o",
         str(output),
     ]
+    if sys.platform == "win32":
+        command = [
+            *shlex.split(os.environ.get("CC", "cl")),
+            "/nologo",
+            "/std:c11",
+            "/O2",
+            "/W4",
+            "/WX",
+            "/MD",
+            "/D_CRT_SECURE_NO_WARNINGS",
+            *(f"/I{directory}" for directory in includes),
+            *(f"/D{definition}" for definition in definitions),
+            source,
+            str(library),
+            f"/Fo{output.with_suffix('.obj')}",
+            f"/Fe{output}",
+        ]
     subprocess.run(command, check=True)
     identity = subprocess.run(
-        [str(output), "--identity"], check=True, capture_output=True, text=True
+        [str(output), "--identity"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=os.environ
+        | {"PATH": sys.base_prefix + os.pathsep + os.environ.get("PATH", "")},
     )
     expected = {
         "protocol": "minimal-v2",
