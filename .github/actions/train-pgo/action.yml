@@ -36,7 +36,7 @@ runs:
         rustup component add llvm-tools-preview
         echo "toolchain=$(rustc --version | cut -d ' ' -f2)" >> "$GITHUB_OUTPUT"
         profile="$(python -c 'from pathlib import Path; print(Path("target/pgo-release/training.profdata").resolve().as_posix())')"
-        args=()
+        args=(--train-only --profile-output "$profile")
         flags="-Cprofile-use=$profile"
         if [[ "$RUNNER_OS" == Windows ]]; then
           args+=(--rustflag=-Ctarget-feature=+crt-static)
@@ -48,6 +48,5 @@ runs:
           echo "cflags=$CFLAGS" >> "$GITHUB_OUTPUT"
         fi
 
-        python scripts/build-pgo-release "$PYTHON_ORACLE" \
-          --train-only --profile-output "$profile" "${args[@]}"
+        python scripts/build-pgo-release "$PYTHON_ORACLE" "${args[@]}"
         echo "rustflags=$flags" >> "$GITHUB_OUTPUT"
