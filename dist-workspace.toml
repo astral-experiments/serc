@@ -73,9 +73,9 @@ install-updater = false
 install-path = ["$XDG_BIN_HOME/", "$XDG_DATA_HOME/../bin", "~/.local/bin"]
 # Whether source tarballs should include submodules
 recursive-tarball = true
-# Prefer simple hosting for downloads, falling back to GitHub releases
+# Prefer Astral Labs for downloads, falling back to GitHub releases
 hosting = ["simple", "github"]
-simple-download-url = "https://releases.astral.sh/github/serc/releases/download/{tag}"
+simple-download-url = "https://labs.astral.sh/serc/releases/{tag}"
 
 # Match the manylinux baselines used by the custom binary builds.
 [dist.min-glibc-version]

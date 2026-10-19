@@ -1,4 +1,4 @@
-# Publish serc releases to a mirror
+# Publish serc releases to Astral Labs
 #
 # Assumed to run as a subworkflow of .github/workflows/release.yml as a custom publish job
 name: publish-mirror
@@ -33,9 +33,9 @@ jobs:
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.MIRROR_R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.MIRROR_R2_SECRET_ACCESS_KEY }}
-          AWS_ENDPOINT_URL: https://${{ secrets.MIRROR_R2_CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          AWS_ENDPOINT_URL: https://${{ vars.MIRROR_R2_CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com
           AWS_DEFAULT_REGION: auto
-          R2_BUCKET: ${{ secrets.MIRROR_R2_BUCKET_NAME }}
+          R2_BUCKET: ${{ vars.MIRROR_R2_BUCKET_NAME }}
           PROJECT: serc
         run: |
           aws s3 cp --recursive --output table --color on \
@@ -45,19 +45,26 @@ jobs:
             --include sha256.sum --include '*.ps1' --include '*.sh' \
             --cache-control "public, max-age=31536000, immutable" \
             artifacts/ \
-            "s3://${R2_BUCKET}/github/${PROJECT}/releases/download/${VERSION}/"
+            "s3://${R2_BUCKET}/${PROJECT}/releases/${VERSION}/"
+
+          for extension in sh ps1; do
+            aws s3 cp --output table --color on \
+              --cache-control "public, max-age=31536000, immutable" \
+              "artifacts/serc-installer.${extension}" \
+              "s3://${R2_BUCKET}/${PROJECT}/releases/${VERSION}/install.${extension}"
+          done
       - name: "Upload latest installers to R2"
         if: ${{ !fromJson(inputs.plan).announcement_is_prerelease }}
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.MIRROR_R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.MIRROR_R2_SECRET_ACCESS_KEY }}
-          AWS_ENDPOINT_URL: https://${{ secrets.MIRROR_R2_CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          AWS_ENDPOINT_URL: https://${{ vars.MIRROR_R2_CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com
           AWS_DEFAULT_REGION: auto
-          R2_BUCKET: ${{ secrets.MIRROR_R2_BUCKET_NAME }}
+          R2_BUCKET: ${{ vars.MIRROR_R2_BUCKET_NAME }}
         run: |
-          for installer in serc-installer.sh serc-installer.ps1; do
+          for extension in sh ps1; do
             aws s3 cp --output table --color on \
               --cache-control "public, max-age=300" \
-              "artifacts/${installer}" \
-              "s3://${R2_BUCKET}/installers/serc/latest/${installer}"
+              "artifacts/serc-installer.${extension}" \
+              "s3://${R2_BUCKET}/serc/install.${extension}"
           done
