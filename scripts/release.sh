@@ -21,7 +21,7 @@ else
     uv run --locked --python 3.12 --only-group release rooster release "$@"
 fi
 
-# Keep the CLI's dependency on the library in step with both crate versions.
+# Keep the Python package, crate versions, CLI dependency, and dist metadata in step.
 version="$(python3 scripts/update-release-version.py)"
 python3 scripts/check-release.py
 

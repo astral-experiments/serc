@@ -1,0 +1,3 @@
+# Release artifacts use the executable name instead of the Cargo package name.
+[package]
+name = "serc"

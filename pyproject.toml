@@ -37,9 +37,11 @@ include = [
 ]
 
 [dependency-groups]
+docker = ["cargo-zigbuild>=0.23.4"]
 release = ["rooster==0.1.1"]
 
 [tool.uv.dependency-groups]
+docker = { requires-python = ">=3.12" }
 release = { requires-python = ">=3.12" }
 
 [tool.rooster]
@@ -47,7 +49,7 @@ changelog-contributors = false
 major-labels = []
 minor-labels = ["breaking"]
 ignore-labels = ["internal", "internal:ci", "internal:testing", "internal:automations"]
-version-files = ["pyproject.toml", "crates/serc/Cargo.toml", "crates/serc_cli/Cargo.toml"]
+version-files = ["pyproject.toml", "crates/serc/Cargo.toml", "crates/serc_cli/Cargo.toml", "dist-workspace.toml"]
 
 [tool.rooster.section-labels]
 "Breaking changes" = ["breaking"]

@@ -2,18 +2,19 @@ from __future__ import annotations
 
 import argparse
 import os
-import re
 import tomllib
 from pathlib import Path
+
+from release_version import python_version
 
 ROOT = Path(__file__).resolve().parent.parent
 
 
 def release_version(root: Path) -> str:
     manifests = [
-        ("pyproject.toml", "project"),
         ("crates/serc/Cargo.toml", "package"),
         ("crates/serc_cli/Cargo.toml", "package"),
+        ("dist-workspace.toml", "workspace"),
     ]
     versions = {
         filename: tomllib.loads((root / filename).read_text())[section]["version"]
@@ -23,7 +24,13 @@ def release_version(root: Path) -> str:
     versions["CLI serc dependency"] = cli["dependencies"]["serc"]["version"]
     if len(set(versions.values())) != 1:
         raise ValueError(f"Release versions disagree: {versions}")
-    return next(iter(versions.values()))
+    version = next(iter(versions.values()))
+    python_project = tomllib.loads((root / "pyproject.toml").read_text())["project"]
+    if python_project["version"] != python_version(version):
+        raise ValueError(
+            f"Release versions disagree: Python {python_project['version']}, Rust {version}"
+        )
+    return version
 
 
 def main() -> None:
@@ -31,8 +38,6 @@ def main() -> None:
     parser.add_argument("tag", nargs="?", default="dry-run")
     args = parser.parse_args()
     version = release_version(ROOT)
-    if not re.fullmatch(r"\d+\.\d+\.\d+", version):
-        raise ValueError(f"Expected a stable release version, got {version!r}")
     publishing = args.tag != "dry-run"
     if publishing:
         if args.tag not in {version, f"v{version}"}:

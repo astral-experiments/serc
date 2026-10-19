@@ -5,6 +5,9 @@ on:
     paths:
       - ".github/workflows/*release*.yml"
       - ".github/workflows/*publish*.yml"
+      - ".github/workflows/build-binaries.yml"
+      - "dist-workspace.toml"
+      - "crates/**/dist.toml"
       - "Cargo.toml"
       - "Cargo.lock"
       - "crates/**/Cargo.toml"
@@ -22,10 +25,10 @@ concurrency:
 
 jobs:
   wheels:
-    uses: ./.github/workflows/build-release-binaries.yml
+    uses: $/.github/workflows/build-binaries.yml
     permissions:
       contents: read
   crates:
-    uses: ./.github/workflows/check-publish.yml
+    uses: $/.github/workflows/check-publish.yml
     permissions:
       contents: read

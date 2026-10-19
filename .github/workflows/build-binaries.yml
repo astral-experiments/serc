@@ -1,7 +1,13 @@
-name: Build release binaries
+name: Build binaries
 
 on:
   workflow_call:
+    inputs:
+      plan:
+        description: cargo-dist release plan
+        required: false
+        default: ""
+        type: string
     outputs:
       distributions:
         description: Artifact ID containing all verified release distributions
@@ -271,7 +277,7 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         id: upload-archives
         with:
-          name: serc-standalone-archives
+          name: artifacts-build-binaries
           path: standalone/*
           if-no-files-found: error
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

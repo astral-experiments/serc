@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -37,29 +38,51 @@ class ReleaseTests(unittest.TestCase):
                     "# Changelog\n\n## 0.2.0\n\nRewritten.\n" + history,
                 )
 
-    def test_version_update_keeps_python_library_and_cli_in_sync(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            for filename in (
-                "pyproject.toml",
-                "crates/serc/Cargo.toml",
-                "crates/serc_cli/Cargo.toml",
+    def test_version_update_keeps_python_library_cli_and_dist_in_sync(self):
+        for version, python_version in (
+            ("0.2.0", "0.2.0"),
+            ("0.2.0-alpha.1", "0.2.0a1"),
+            ("0.2.0-beta.2", "0.2.0b2"),
+            ("0.2.0-rc.3", "0.2.0rc3"),
+            ("0.2.0-dev.4", "0.2.0.dev4"),
+        ):
+            with (
+                self.subTest(version=version),
+                tempfile.TemporaryDirectory() as directory,
             ):
-                target = root / filename
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(ROOT / filename, target)
-            (root / "CHANGELOG.md").write_text("# Changelog\n\n## 0.2.0\n\nChanges.\n")
-            self.assertEqual(UPDATE["update_versions"](root), "0.2.0")
-            self.assertEqual(CHECK["release_version"](root), "0.2.0")
-            cli = root / "crates/serc_cli/Cargo.toml"
-            cli.write_text(
-                cli.read_text().replace(
-                    'path = "../serc", version = "0.2.0"',
-                    'path = "../serc", version = "0.1.0"',
+                root = Path(directory)
+                for filename in (
+                    "pyproject.toml",
+                    "crates/serc/Cargo.toml",
+                    "crates/serc_cli/Cargo.toml",
+                    "dist-workspace.toml",
+                ):
+                    target = root / filename
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(ROOT / filename, target)
+                (root / "CHANGELOG.md").write_text(
+                    f"# Changelog\n\n## {version}\n\nChanges.\n"
                 )
-            )
-            with self.assertRaisesRegex(ValueError, "Release versions disagree"):
-                CHECK["release_version"](root)
+                self.assertEqual(UPDATE["update_versions"](root), version)
+                self.assertEqual(CHECK["release_version"](root), version)
+                project = tomllib.loads((root / "pyproject.toml").read_text())[
+                    "project"
+                ]
+                self.assertEqual(project["version"], python_version)
+                dist = root / "dist-workspace.toml"
+                dist.write_text(dist.read_text().replace(f'"{version}"', '"0.1.0"'))
+                with self.assertRaisesRegex(ValueError, "Release versions disagree"):
+                    CHECK["release_version"](root)
+                UPDATE["update_versions"](root)
+                cli = root / "crates/serc_cli/Cargo.toml"
+                cli.write_text(
+                    cli.read_text().replace(
+                        f'path = "../serc", version = "{version}"',
+                        'path = "../serc", version = "0.1.0"',
+                    )
+                )
+                with self.assertRaisesRegex(ValueError, "Release versions disagree"):
+                    CHECK["release_version"](root)
 
     def test_publishing_requires_serc_main(self):
         version = CHECK["release_version"](ROOT)
