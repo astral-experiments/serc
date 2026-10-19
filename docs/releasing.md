@@ -41,6 +41,13 @@ or deployment protection rules.
    `installers/serc/latest/serc-installer.sh` and
    `installers/serc/latest/serc-installer.ps1` with five-minute caching.
 
+   Configure `astral.sh/serc/install.sh` and `astral.sh/serc/install.ps1` as
+   permanent redirects to their corresponding latest installer URLs under
+   `https://releases.astral.sh/installers/serc/latest/`. These redirects are
+   managed outside this repository. Versioned URLs,
+   `astral.sh/serc/VERSION/install.{sh,ps1}`, must redirect to
+   `https://releases.astral.sh/github/serc/releases/download/VERSION/serc-installer.{sh,ps1}`.
+
 3. Grant `astral-releases-bot` access to Serc and configure
    `RELEASES_STS_API_URL` in the `release` environment with the existing release
    broker's base URL. Serc's `.github/secure-token-service-release.json` permits

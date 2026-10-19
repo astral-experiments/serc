@@ -109,7 +109,7 @@ jobs:
     needs:
       - plan
     if: ${{ needs.plan.outputs.publishing == 'true' || fromJson(needs.plan.outputs.val).ci.github.pr_run_mode == 'upload' || inputs.tag == 'dry-run' }}
-    uses: $/.github/workflows/build-binaries.yml
+    uses: ./.github/workflows/build-binaries.yml
     with:
       plan: ${{ needs.plan.outputs.val }}
     secrets: inherit # zizmor: ignore[secrets-inherit] -- trusted workflow in this repository
@@ -119,7 +119,7 @@ jobs:
   check-crates:
     needs: plan
     if: ${{ needs.plan.outputs.publishing == 'true' || inputs.tag == 'dry-run' }}
-    uses: $/.github/workflows/check-publish.yml
+    uses: ./.github/workflows/check-publish.yml
     permissions:
       contents: read
 
@@ -128,7 +128,7 @@ jobs:
       - plan
       - release-gate
     if: ${{ always() && !cancelled() && needs.plan.result == 'success' && (needs.release-gate.result == 'success' || needs.release-gate.result == 'skipped') && (needs.plan.outputs.publishing == 'true' || fromJson(needs.plan.outputs.val).ci.github.pr_run_mode == 'upload' || inputs.tag == 'dry-run') }}
-    uses: $/.github/workflows/build-docker.yml
+    uses: ./.github/workflows/build-docker.yml
     with:
       plan: ${{ needs.plan.outputs.val }}
     secrets: inherit # zizmor: ignore[secrets-inherit] -- trusted workflow in this repository
@@ -304,7 +304,7 @@ jobs:
       - host
       - release-gate
     if: ${{ !fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases }}
-    uses: $/.github/workflows/publish-pypi.yml
+    uses: ./.github/workflows/publish-pypi.yml
     with:
       distributions: ${{ needs.custom-build-binaries.outputs.distributions }}
     secrets: inherit # zizmor: ignore[secrets-inherit] -- trusted workflow in this repository
@@ -317,7 +317,7 @@ jobs:
       - host
       - release-gate
       - custom-publish-pypi
-    uses: $/.github/workflows/publish-crates.yml
+    uses: ./.github/workflows/publish-crates.yml
     permissions:
       contents: read
       id-token: write
@@ -408,7 +408,7 @@ jobs:
     needs:
       - plan
       - announce
-    uses: $/.github/workflows/publish-versions.yml
+    uses: ./.github/workflows/publish-versions.yml
     with:
       plan: ${{ needs.plan.outputs.val }}
     secrets: inherit # zizmor: ignore[secrets-inherit] -- trusted workflow in this repository
@@ -420,7 +420,7 @@ jobs:
     needs:
       - plan
       - announce
-    uses: $/.github/workflows/publish-mirror.yml
+    uses: ./.github/workflows/publish-mirror.yml
     with:
       plan: ${{ needs.plan.outputs.val }}
     secrets: inherit # zizmor: ignore[secrets-inherit] -- trusted workflow in this repository

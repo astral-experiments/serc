@@ -25,10 +25,10 @@ concurrency:
 
 jobs:
   wheels:
-    uses: $/.github/workflows/build-binaries.yml
+    uses: ./.github/workflows/build-binaries.yml
     permissions:
       contents: read
   crates:
-    uses: $/.github/workflows/check-publish.yml
+    uses: ./.github/workflows/check-publish.yml
     permissions:
       contents: read
