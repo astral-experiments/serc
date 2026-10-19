@@ -1762,12 +1762,14 @@ impl Compiler<'_> {
             if runtime_operand(&binary.left) || runtime_operand(&binary.right) {
                 return None;
             }
-            let mut left = binary.left.as_ref();
-            while let Expr::BinOp(binary) = left {
-                left = &binary.left;
-            }
-            if runtime_operand(left) {
-                return None;
+            if let Expr::BinOp(binary) = binary.left.as_ref() {
+                let mut left = binary.left.as_ref();
+                while let Expr::BinOp(binary) = left {
+                    left = &binary.left;
+                }
+                if runtime_operand(left) {
+                    return None;
+                }
             }
         }
 
