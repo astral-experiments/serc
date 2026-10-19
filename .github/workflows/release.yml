@@ -91,6 +91,11 @@ jobs:
         with:
           artifact-ids: ${{ needs.build.outputs.distributions }}
           path: dist
+      - name: Download standalone archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.build.outputs.archives }}
+          path: standalone
       - name: Get release token
         id: release-token
         uses: open-security-tools/ost-simple-sts@974a63a2daaaa40f7c6dec40d334f3da4421469e
@@ -117,5 +122,5 @@ jobs:
               found { print }
             ' CHANGELOG.md > "$RUNNER_TEMP/notes.txt"
             test -s "$RUNNER_TEMP/notes.txt"
-            gh release create "$RELEASE_TAG" --target "$RELEASE_SHA" --title "$RELEASE_TAG" --notes-file "$RUNNER_TEMP/notes.txt" dist/*
+            gh release create "$RELEASE_TAG" --target "$RELEASE_SHA" --title "$RELEASE_TAG" --notes-file "$RUNNER_TEMP/notes.txt" dist/* standalone/*
           fi

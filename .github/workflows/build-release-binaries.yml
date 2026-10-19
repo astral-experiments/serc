@@ -6,6 +6,9 @@ on:
       distributions:
         description: Artifact ID containing all verified release distributions
         value: ${{ jobs.collect.outputs.distributions }}
+      archives:
+        description: Artifact ID containing verified standalone archives
+        value: ${{ jobs.collect.outputs.archives }}
 
 permissions:
   contents: read
@@ -111,6 +114,9 @@ jobs:
     name: ${{ matrix.target }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    env:
+      # RISC-V musl defaults to dynamic linking; standalone archives need a static executable.
+      CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_MUSL_RUSTFLAGS: "-C target-feature=+crt-static"
     strategy:
       fail-fast: false
       matrix:
@@ -179,6 +185,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       distributions: ${{ steps.upload.outputs.artifact-id }}
+      archives: ${{ steps.upload-archives.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -186,14 +193,21 @@ jobs:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: serc-wheels-*
-          path: dist
-          merge-multiple: true
+          path: wheels
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: serc-sdist
           path: dist
+      - name: Create and check standalone archives
+        run: python3 scripts/build-release-archives.py wheels dist standalone
       - name: Check distribution contents
         run: python3 scripts/check-release-distributions.py dist --expected-wheels 18
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        id: upload-archives
+        with:
+          name: serc-standalone-archives
+          path: standalone/*
+          if-no-files-found: error
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         id: upload
         with:
