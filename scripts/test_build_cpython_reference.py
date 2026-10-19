@@ -224,7 +224,7 @@ class NativeLibraryTests(unittest.TestCase):
             ),
             mock.patch.object(builder.sys, "dllhandle", 1, create=True),
             mock.patch.object(
-                builder.sysconfig, "get_config_var", return_value="python314.lib"
+                builder.sysconfig, "get_config_var", return_value="python314.dll"
             ),
         ):
             self.assertEqual(builder.windows_library(), library)

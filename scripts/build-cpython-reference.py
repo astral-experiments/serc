@@ -107,13 +107,13 @@ def windows_library() -> Path:
     prefix = Path(sys.base_prefix).resolve(strict=True)
     name = (
         sysconfig.get_config_var("LIBRARY")
-        or f"python{sys.version_info.major}{sys.version_info.minor}.lib"
+        or f"python{sys.version_info.major}{sys.version_info.minor}.dll"
     )
-    if Path(name).name != name or Path(name).suffix != ".lib":
-        raise ValueError("Invalid CPython import library filename")
-    if runtime != (prefix / Path(name).with_suffix(".dll")).resolve(strict=True):
+    if Path(name).name != name or Path(name).suffix != ".dll":
+        raise ValueError("Invalid CPython runtime library filename")
+    if runtime != (prefix / name).resolve(strict=True):
         raise ValueError("Loaded CPython DLL differs from the interpreter prefix")
-    library = (prefix / "libs" / name).resolve(strict=True)
+    library = (prefix / "libs" / Path(name).with_suffix(".lib")).resolve(strict=True)
     if not library.is_relative_to(prefix):
         raise ValueError("CPython import library escapes the interpreter prefix")
     return library

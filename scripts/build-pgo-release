@@ -256,6 +256,26 @@ def main():
             print(f"Verified PGO executable: {binary}\nBuild manifest: {manifest_path}")
             return 0
 
+        reference = run_dir / (
+            "cpython-reference.exe" if sys.platform == "win32" else "cpython-reference"
+        )
+        reference_environment = {
+            "PATH": str(Path(python_identity["executable"]).parent)
+            + os.pathsep
+            + os.environ.get("PATH", "")
+        }
+        run(
+            [
+                args.python,
+                "-I",
+                "-S",
+                repo / "scripts/build-cpython-reference.py",
+                "--output",
+                reference,
+            ],
+            reference_environment,
+        )
+
         common = {
             "CARGO_INCREMENTAL": "0",
             "CARGO_PROFILE_RELEASE_PANIC": "unwind",
@@ -405,25 +425,6 @@ def main():
             ["--example", "compare_cpython_corpus"],
             output / "generate-target",
             f"-Cprofile-generate={raw}",
-        )
-        reference = run_dir / (
-            "cpython-reference.exe" if sys.platform == "win32" else "cpython-reference"
-        )
-        reference_environment = {
-            "PATH": str(Path(python_identity["executable"]).parent)
-            + os.pathsep
-            + os.environ.get("PATH", "")
-        }
-        run(
-            [
-                args.python,
-                "-I",
-                "-S",
-                repo / "scripts/build-cpython-reference.py",
-                "--output",
-                reference,
-            ],
-            reference_environment,
         )
         # Use the comparator's default roots.
         expectations = run(
