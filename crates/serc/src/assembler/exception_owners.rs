@@ -1565,13 +1565,15 @@ impl ExceptionOwnerTail {
         ) {
             self.post_compaction_fusions += 1;
             self.early_removals += 1;
-        } else if matches!((instruction.opcode, instruction.operand()), (LOAD_GLOBAL, Operand::Value(argument)) if argument & 1 != 0)
+        }
+        let operand = instruction.operand();
+        if matches!((instruction.opcode, operand), (LOAD_GLOBAL, Operand::Value(argument)) if argument & 1 != 0)
         {
             self.early_removals += 1;
         }
         // Boolean comparison specialization removes the original COMPARE_OP before
         // its TO_BOOL slot becomes the surviving instruction.
-        if matches!((instruction.opcode, instruction.operand()),
+        if matches!((instruction.opcode, operand),
             (COMPARE_OP, Operand::Value(argument)) if argument & 16 != 0)
         {
             self.early_removals += 1;
@@ -15340,6 +15342,43 @@ mod tests {
             }
             .has_owner_after_insertions(2)
         );
+    }
+
+    #[test]
+    fn tail_operand_validation_preserves_prior_updates() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        use crate::assembler::{Instruction, Label, Operand, SourceLocation};
+        use crate::target::opcodes::{COPY_FREE_VARS, LOAD_FAST_LOAD_FAST};
+
+        let location = SourceLocation::new(1, 1, 0, 1);
+        let symbolic_policy = Instruction::new(
+            COPY_FREE_VARS,
+            Operand::Forward(Label::from_u32(0)),
+            location,
+            None,
+        )
+        .fusion_policy;
+        for (opcode, fusions) in [(COPY_FREE_VARS, 0), (LOAD_FAST_LOAD_FAST, 1)] {
+            let mut instruction =
+                Instruction::new(opcode, Operand::Value(u32::MAX), location, None);
+            instruction.fusion_policy = symbolic_policy;
+            instruction.local_policy.add_hidden_exception_owner_slots(2);
+            let mut tail = ExceptionOwnerTail::default();
+
+            assert!(
+                catch_unwind(AssertUnwindSafe(|| tail.instruction(&instruction, None))).is_err()
+            );
+            assert_eq!(
+                (
+                    tail.early_removals,
+                    tail.insertions,
+                    tail.late_removals,
+                    tail.post_compaction_fusions,
+                ),
+                (2 + fusions, 0, 0, fusions)
+            );
+        }
     }
 
     #[test]
