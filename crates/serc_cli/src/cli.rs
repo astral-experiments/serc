@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::hint::black_box;
 use std::io::{self, Read, Write};
@@ -185,26 +185,38 @@ fn compile_command(command: CompileCommand) -> Result<ExitCode, String> {
     };
     let jobs = jobs_for_inputs(command.jobs, paths.len());
     let compile = || -> Result<_, String> {
-        // Validate every manifest input before writing any output. Preserve input order when
-        // reporting preparation errors, even when the filesystem checks run in parallel.
-        let inputs: Vec<_> = if jobs <= 1 {
-            paths
-                .iter()
-                .map(|path| compilation.prepare(path, manifest, |path| fs_err::metadata(path)))
-                .collect()
+        // Validate every manifest input before writing any output.
+        let prepare = |path| {
+            (
+                path,
+                compilation.prepare(path, manifest, |path| fs_err::metadata(path)),
+            )
+        };
+        let mut inputs: Vec<_> = if jobs <= 1 {
+            paths.iter().map(PathBuf::as_path).map(prepare).collect()
         } else {
             paths
                 .par_iter()
-                .map(|path| compilation.prepare(path, manifest, |path| fs_err::metadata(path)))
+                .map(PathBuf::as_path)
+                .map(prepare)
                 .collect()
         };
-        let inputs = inputs.into_iter().collect::<Result<Vec<_>, _>>()?;
-        if inputs
-            .iter()
-            .all(|input| input.current.as_ref().is_ok_and(|current| *current))
-        {
+        if inputs.iter().all(|(_, input)| {
+            input
+                .as_ref()
+                .is_ok_and(|input| input.current.as_ref().is_ok_and(|current| *current))
+        }) {
             return Ok((inputs.len(), Vec::new()));
         }
+        // Successful cache checks need no ordering. Errors and colliding outputs follow
+        // path order, regardless of the order in which the manifest lists its inputs.
+        if manifest {
+            inputs.sort_by_key(|(path, _)| *path);
+        }
+        let inputs = inputs
+            .into_iter()
+            .map(|(_, input)| input)
+            .collect::<Result<Vec<_>, _>>()?;
 
         // A stale input may overwrite a cache shared by a later, initially-current input.
         // Only the all-current case can bypass grouping; colliding groups recheck in order.
@@ -314,6 +326,7 @@ fn read_file_list(manifest: &Path, null: bool) -> Result<Vec<PathBuf>, String> {
     }
     let separator = if null { b'\0' } else { b'\n' };
     let mut paths = Vec::new();
+    let mut seen = HashSet::new();
     for path in contents.split(|&byte| byte == separator) {
         let path = if null {
             path
@@ -326,17 +339,17 @@ fn read_file_list(manifest: &Path, null: bool) -> Result<Vec<PathBuf>, String> {
         #[cfg(unix)]
         let path = {
             use std::os::unix::ffi::OsStrExt;
-            PathBuf::from(std::ffi::OsStr::from_bytes(path))
+            Path::new(std::ffi::OsStr::from_bytes(path))
         };
         #[cfg(not(unix))]
-        let path = PathBuf::from(
+        let path = Path::new(
             std::str::from_utf8(path)
                 .map_err(|error| format!("file paths must be UTF-8 on this platform: {error}"))?,
         );
-        paths.push(path);
+        if seen.insert(path) {
+            paths.push(path.to_path_buf());
+        }
     }
-    paths.sort();
-    paths.dedup();
     Ok(paths)
 }
 
@@ -391,9 +404,8 @@ fn prioritize_compilation_groups(
     groups
 }
 
-/// Keep inputs that share an output in discovery order so the same cache wins as in serial mode.
+/// Keep inputs that share an output in path order so the same cache wins as in serial mode.
 fn compilation_groups<'a>(inputs: &'a [PreparedInput<'a>]) -> Vec<CompilationGroup<'a>> {
-    use std::collections::HashSet;
     use std::sync::Arc;
 
     let mut directories = HashMap::new();
@@ -886,7 +898,7 @@ mod tests {
     use super::{
         CompilationGroup, InvalidationMode, PreparedInput, cache_path, cache_suffix, cache_tag,
         compilation_groups, compile_path_with_metadata, discover, encode_mtime, has_python_suffix,
-        prioritize_compilation_groups,
+        prioritize_compilation_groups, read_file_list,
     };
     use super::{default_jobs, jobs_for_inputs};
     use serc::{CompileOptions, PythonVersion};
@@ -1326,6 +1338,25 @@ mod tests {
             )
         };
         assert!(error.starts_with(&expected), "{error}");
+    }
+
+    #[test]
+    fn file_list_retains_first_spelling_of_normalized_duplicates() {
+        let directory = tempfile::tempdir().unwrap();
+        let manifest = directory.path().join("inputs.txt");
+        fs_err::write(
+            &manifest,
+            b"dir/./module.py\0dir/module.py\0dir//module.py\0",
+        )
+        .unwrap();
+
+        let paths = read_file_list(&manifest, true).unwrap();
+
+        assert_eq!(paths.len(), 1);
+        assert_eq!(
+            paths[0].as_os_str(),
+            Path::new("dir/./module.py").as_os_str()
+        );
     }
 
     #[test]
