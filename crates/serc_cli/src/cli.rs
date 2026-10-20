@@ -146,19 +146,17 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
 }
 
 fn compile_command(command: CompileCommand) -> Result<ExitCode, String> {
-    let (paths, source_sizes) = if let Some(manifest) = &command.files_from {
-        let (paths, source_sizes) = read_file_list(manifest, command.null)?;
-        (paths, Some(source_sizes))
+    let manifest = command.files_from.is_some();
+    let paths = if let Some(manifest) = &command.files_from {
+        read_file_list(manifest, command.null)?
     } else {
         let roots = if command.paths.is_empty() {
             vec![PathBuf::from(".")]
         } else {
             command.paths
         };
-        (discover(&roots)?, None)
+        discover(&roots)?
     };
-    let mut failures = 0_usize;
-    let skipped = AtomicUsize::new(0);
     // Code generation has three levels, but Python keeps every `-O` in the cache tag.
     let cache_optimization = command
         .optimize
@@ -178,83 +176,101 @@ fn compile_command(command: CompileCommand) -> Result<ExitCode, String> {
         ..CompileOptions::default()
     };
 
-    let (jobs, output_groups) = prepare_compilation(
-        &paths,
-        options.python_version,
-        cache_optimization,
-        command.check,
-        jobs_for_inputs(command.jobs, paths.len()),
-    );
-    if jobs <= 1 {
-        for path in &paths {
-            match compile_path(
-                path,
-                command.check,
-                command.force,
-                command.invalidation_mode,
-                &options,
-                cache_optimization,
-            ) {
-                Ok(true) => {}
-                Ok(false) => {
-                    skipped.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(message) => {
-                    failures += 1;
-                    write_error(&message);
+    let compilation = Compilation {
+        options,
+        cache_suffix: cache_suffix(command.python_version, cache_optimization),
+        invalidation_mode: command.invalidation_mode,
+        check: command.check,
+        force: command.force,
+    };
+    let jobs = jobs_for_inputs(command.jobs, paths.len());
+    let compile = || -> Result<_, String> {
+        // Validate every manifest input before writing any output. Preserve input order when
+        // reporting preparation errors, even when the filesystem checks run in parallel.
+        let inputs: Vec<_> = if jobs <= 1 {
+            paths
+                .iter()
+                .map(|path| compilation.prepare(path, manifest, |path| fs_err::metadata(path)))
+                .collect()
+        } else {
+            paths
+                .par_iter()
+                .map(|path| compilation.prepare(path, manifest, |path| fs_err::metadata(path)))
+                .collect()
+        };
+        let inputs = inputs.into_iter().collect::<Result<Vec<_>, _>>()?;
+        if inputs
+            .iter()
+            .all(|input| input.current.as_ref().is_ok_and(|current| *current))
+        {
+            return Ok((inputs.len(), Vec::new()));
+        }
+
+        // A stale input may overwrite a cache shared by a later, initially-current input.
+        // Only the all-current case can bypass grouping; colliding groups recheck in order.
+        let groups = if jobs <= 1 {
+            vec![inputs.iter().enumerate().collect()]
+        } else if compilation.check {
+            inputs.iter().enumerate().map(|input| vec![input]).collect()
+        } else {
+            prioritize_compilation_groups(compilation_groups(&inputs), jobs)
+        };
+        let compile_group = |group: &CompilationGroup<'_>| {
+            let mut skipped = 0;
+            let mut errors = Vec::new();
+            let recheck = group.len() > 1;
+            for &(index, input) in group {
+                match compilation.compile(input, recheck) {
+                    Ok(true) => {}
+                    Ok(false) => skipped += 1,
+                    Err(message) => errors.push((index, message)),
                 }
             }
-        }
-    } else {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(jobs)
-            // Nested Python expressions and scopes use recursive compiler traversals.
-            .stack_size(8 * 1024 * 1024)
-            .build()
-            .map_err(|error| format!("failed to start compilation workers: {error}"))?;
-        let mut errors: Vec<(usize, String)> = pool.install(|| {
-            let groups = output_groups.unwrap_or_else(|| {
-                paths
-                    .iter()
-                    .enumerate()
-                    .map(|(index, path)| vec![(index, path.as_path())])
-                    .collect()
-            });
-            let groups = prioritize_compilation_groups(groups, jobs, source_sizes.as_deref());
+            (skipped, errors)
+        };
+        Ok(if jobs <= 1 {
+            groups.first().map_or((0, Vec::new()), compile_group)
+        } else {
             let next_group = AtomicUsize::new(0);
             (0..jobs.min(groups.len()))
                 .into_par_iter()
                 .with_max_len(1)
-                .flat_map_iter(|_| {
-                    // Each worker takes the largest remaining group. Splitting the sorted slice
-                    // into Rayon chunks would strand some large inputs behind a worker's backlog.
-                    std::iter::from_fn(|| groups.get(next_group.fetch_add(1, Ordering::Relaxed)))
-                        .flatten()
-                        .filter_map(|&(index, path)| {
-                            match compile_path(
-                                path,
-                                command.check,
-                                command.force,
-                                command.invalidation_mode,
-                                &options,
-                                cache_optimization,
-                            ) {
-                                Ok(true) => None,
-                                Ok(false) => {
-                                    skipped.fetch_add(1, Ordering::Relaxed);
-                                    None
-                                }
-                                Err(message) => Some((index, message)),
-                            }
-                        })
+                .map(|_| {
+                    // Take the largest remaining group, without stranding large inputs in
+                    // another worker's Rayon chunk. Counts are local to each worker.
+                    let mut skipped = 0;
+                    let mut errors = Vec::new();
+                    while let Some(group) = groups.get(next_group.fetch_add(1, Ordering::Relaxed)) {
+                        let (group_skipped, group_errors) = compile_group(group);
+                        skipped += group_skipped;
+                        errors.extend(group_errors);
+                    }
+                    (skipped, errors)
                 })
-                .collect()
-        });
-        errors.sort_unstable_by_key(|(index, _)| *index);
-        failures = errors.len();
-        for (_, message) in errors {
-            write_error(&message);
-        }
+                .reduce(
+                    || (0, Vec::new()),
+                    |(left_skipped, mut left_errors), (right_skipped, right_errors)| {
+                        left_errors.extend(right_errors);
+                        (left_skipped + right_skipped, left_errors)
+                    },
+                )
+        })
+    };
+    let (skipped, mut errors) = if jobs <= 1 {
+        compile()?
+    } else {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(jobs)
+            // Nested Python expressions and scopes use recursive compiler traversals.
+            .stack_size(8 * 1024 * 1024)
+            .build()
+            .map_err(|error| format!("failed to start compilation workers: {error}"))?
+            .install(compile)?
+    };
+    errors.sort_unstable_by_key(|(index, _)| *index);
+    let failures = errors.len();
+    for (_, message) in errors {
+        write_error(&message);
     }
 
     if failures > 0 {
@@ -266,7 +282,6 @@ fn compile_command(command: CompileCommand) -> Result<ExitCode, String> {
     }
 
     if !command.quiet {
-        let skipped = skipped.load(Ordering::Relaxed);
         let compiled = paths.len() - skipped;
         let noun = if compiled == 1 { "file" } else { "files" };
         let mut stdout = io::stdout().lock();
@@ -286,9 +301,7 @@ fn compile_command(command: CompileCommand) -> Result<ExitCode, String> {
 }
 
 /// Read exact file paths without applying directory discovery or a default input.
-///
-/// Retain validated sizes as scheduling hints; workers still load fresh metadata before reading.
-fn read_file_list(manifest: &Path, null: bool) -> Result<(Vec<PathBuf>, Vec<u64>), String> {
+fn read_file_list(manifest: &Path, null: bool) -> Result<Vec<PathBuf>, String> {
     let mut contents = Vec::new();
     if manifest == Path::new("-") {
         io::stdin()
@@ -320,16 +333,11 @@ fn read_file_list(manifest: &Path, null: bool) -> Result<(Vec<PathBuf>, Vec<u64>
             std::str::from_utf8(path)
                 .map_err(|error| format!("file paths must be UTF-8 on this platform: {error}"))?,
         );
-        let metadata = fs_err::metadata(&path)
-            .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?;
-        if !metadata.is_file() {
-            return Err(format!("{} is not a file", path.display()));
-        }
-        paths.push((path, metadata.len()));
+        paths.push(path);
     }
-    paths.sort_by(|(left, _), (right, _)| left.cmp(right));
-    paths.dedup_by(|(left, _), (right, _)| left == right);
-    Ok(paths.into_iter().unzip())
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
 }
 
 /// Follow Rayon's environment and CPU defaults without starting idle workers for small inputs.
@@ -365,36 +373,17 @@ fn default_jobs(
     }
 }
 
-type CompilationGroup<'a> = Vec<(usize, &'a Path)>;
+type CompilationGroup<'a> = Vec<(usize, &'a PreparedInput<'a>)>;
 
-/// Limit cache-writing workers to groups that can make progress independently.
-fn prepare_compilation(
-    paths: &[PathBuf],
-    python_version: PythonVersion,
-    cache_optimization: usize,
-    check: bool,
+/// Prioritize expensive independent groups without reordering aliased outputs.
+fn prioritize_compilation_groups(
+    mut groups: Vec<CompilationGroup<'_>>,
     jobs: usize,
-) -> (usize, Option<Vec<CompilationGroup<'_>>>) {
-    if check || jobs <= 1 {
-        return (jobs, None);
-    }
-    let groups = compilation_groups(paths, python_version, cache_optimization);
-    (jobs.min(groups.len()), Some(groups))
-}
-
-/// Start the most expensive independent groups first, retaining order within aliased outputs.
-fn prioritize_compilation_groups<'a>(
-    mut groups: Vec<CompilationGroup<'a>>,
-    jobs: usize,
-    source_sizes: Option<&[u64]>,
-) -> Vec<CompilationGroup<'a>> {
+) -> Vec<CompilationGroup<'_>> {
     if groups.len() > jobs {
         groups.sort_by_cached_key(|group| {
-            let size = group.iter().fold(0_u64, |total, (index, path)| {
-                total.saturating_add(source_sizes.map_or_else(
-                    || fs_err::metadata(path).map_or(0, |metadata| metadata.len()),
-                    |sizes| sizes[*index],
-                ))
+            let size = group.iter().fold(0_u64, |total, (_, input)| {
+                total.saturating_add(input.metadata.as_ref().map_or(0, std::fs::Metadata::len))
             });
             (std::cmp::Reverse(size), group[0].0)
         });
@@ -403,43 +392,37 @@ fn prioritize_compilation_groups<'a>(
 }
 
 /// Keep inputs that share an output in discovery order so the same cache wins as in serial mode.
-fn compilation_groups(
-    paths: &[PathBuf],
-    python_version: PythonVersion,
-    cache_optimization: usize,
-) -> Vec<CompilationGroup<'_>> {
+fn compilation_groups<'a>(inputs: &'a [PreparedInput<'a>]) -> Vec<CompilationGroup<'a>> {
     use std::collections::HashSet;
     use std::sync::Arc;
 
     let mut directories = HashMap::new();
     let mut non_ascii_directories = HashSet::new();
     let mut unknown_directory = false;
-    let mut identities = Vec::with_capacity(paths.len());
-    for path in paths {
-        let output = cache_path(path, python_version, cache_optimization)
-            .ok()
-            .and_then(|output| {
-                let parent = output.parent()?;
-                let filename = output.file_name()?;
-                let directory = if let Some(directory) = directories.get(parent) {
-                    Arc::clone(directory)
-                } else {
-                    let directory = Arc::new(cache_directory_identity(parent));
-                    directories.insert(parent.to_owned(), Arc::clone(&directory));
-                    directory
-                };
-                unknown_directory |= matches!(directory.as_ref(), CacheDirectoryIdentity::Unknown);
-                if !filename.as_encoded_bytes().is_ascii() {
-                    non_ascii_directories.insert(Arc::clone(&directory));
-                }
-                Some((directory, filename.to_ascii_lowercase()))
-            });
+    let mut identities = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let output = input.output.as_deref().and_then(|output| {
+            let parent = output.parent()?;
+            let filename = output.file_name()?;
+            let directory = if let Some(directory) = directories.get(parent) {
+                Arc::clone(directory)
+            } else {
+                let directory = Arc::new(cache_directory_identity(parent));
+                directories.insert(parent.to_owned(), Arc::clone(&directory));
+                directory
+            };
+            unknown_directory |= matches!(directory.as_ref(), CacheDirectoryIdentity::Unknown);
+            if !filename.as_encoded_bytes().is_ascii() {
+                non_ascii_directories.insert(Arc::clone(&directory));
+            }
+            Some((directory, filename.to_ascii_lowercase()))
+        });
         identities.push(output);
     }
 
     let mut groups = Vec::<Vec<_>>::new();
     let mut outputs = HashMap::new();
-    for (index, (path, output)) in paths.iter().zip(identities).enumerate() {
+    for (index, (input, output)) in inputs.iter().zip(identities).enumerate() {
         let output = output.map(|(directory, filename)| {
             // Filesystems disagree on Unicode normalization and case folding, including aliases
             // between Unicode and ASCII names. Serialize the directory when either may occur.
@@ -457,7 +440,7 @@ fn compilation_groups(
         if group == groups.len() {
             groups.push(Vec::new());
         }
-        groups[group].push((index, path.as_path()));
+        groups[group].push((index, input));
     }
     groups
 }
@@ -552,28 +535,195 @@ fn has_python_suffix(path: &Path) -> bool {
         .is_some_and(|name| name.as_encoded_bytes().ends_with(b".py"))
 }
 
-fn compile_path(
-    path: &Path,
+struct Compilation {
+    options: CompileOptions,
+    cache_suffix: String,
+    invalidation_mode: InvalidationMode,
     check: bool,
     force: bool,
-    invalidation_mode: InvalidationMode,
-    options: &CompileOptions,
-    cache_optimization: usize,
-) -> Result<bool, String> {
-    compile_path_with_metadata(
-        path,
-        check,
-        force,
-        invalidation_mode,
-        options,
-        cache_optimization,
-        |path| fs_err::metadata(path),
-    )
 }
 
-/// Compile a source file, returning false when its existing cache is current.
-///
-/// Check mode skips both the metadata loader and cache output.
+struct PreparedInput<'a> {
+    path: &'a Path,
+    metadata: Option<std::fs::Metadata>,
+    output: Option<PathBuf>,
+    current: Result<bool, String>,
+}
+
+impl Compilation {
+    /// Snapshot source metadata before reading and validate the destination before any writes.
+    fn prepare<'a>(
+        &self,
+        path: &'a Path,
+        manifest: bool,
+        load_metadata: impl FnOnce(&Path) -> io::Result<std::fs::Metadata>,
+    ) -> Result<PreparedInput<'a>, String> {
+        let mut input = PreparedInput {
+            path,
+            metadata: None,
+            output: None,
+            current: Ok(false),
+        };
+        let metadata = (!self.check || manifest)
+            .then(|| {
+                load_metadata(path)
+                    .map_err(|error| format!("failed to inspect {}: {error}", path.display()))
+            })
+            .transpose();
+        input.metadata = match metadata {
+            Ok(metadata) => metadata,
+            Err(error) if manifest => return Err(error),
+            Err(error) => {
+                input.current = Err(error);
+                return Ok(input);
+            }
+        };
+        if manifest
+            && input
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| !metadata.is_file())
+        {
+            return Err(format!("{} is not a file", path.display()));
+        }
+        input.output = (!self.check)
+            .then(|| cache_path(path, &self.cache_suffix))
+            .transpose()?;
+        let header = input
+            .output
+            .as_deref()
+            .map(|output| read_cache_header(output, self.force))
+            .transpose()?
+            .flatten();
+        // Source-read failures are compilation errors, not manifest or destination errors.
+        // Keep them per-file so other independent inputs can still compile.
+        input.current = self.cache_status(&input, header);
+        Ok(input)
+    }
+
+    /// Compare a cache header without retaining source buffers beyond this worker.
+    fn cache_status(
+        &self,
+        input: &PreparedInput<'_>,
+        header: Option<[u8; 16]>,
+    ) -> Result<bool, String> {
+        let Some(header) = header else {
+            return Ok(false);
+        };
+        let mut expected = [0; 16];
+        expected[..4].copy_from_slice(&self.options.python_version.target().magic_number);
+        expected[4..8].copy_from_slice(&self.invalidation_mode.flags().to_le_bytes());
+        if header[..8] != expected[..8] {
+            return Ok(false);
+        }
+        match self.invalidation_mode {
+            InvalidationMode::Timestamp => {
+                let Some(metadata) = &input.metadata else {
+                    return Ok(false);
+                };
+                expected[8..12].copy_from_slice(&source_mtime(input.path, metadata)?.to_le_bytes());
+                expected[12..].copy_from_slice(&low_u32(metadata.len()).to_le_bytes());
+                Ok(header == expected)
+            }
+            InvalidationMode::CheckedHash | InvalidationMode::UncheckedHash => {
+                let source = read_source(input.path, input.metadata.as_ref())
+                    .map_err(|error| format!("failed to read {}: {error}", input.path.display()))?;
+                expected[8..]
+                    .copy_from_slice(&self.options.python_version.target().source_hash(&source));
+                Ok(header == expected)
+            }
+        }
+    }
+
+    /// Compile a prepared source; aliased outputs must be checked again after earlier writes.
+    fn compile(&self, input: &PreparedInput<'_>, recheck: bool) -> Result<bool, String> {
+        let current = *input.current.as_ref().map_err(Clone::clone)?;
+        let current = if recheck {
+            let header = input
+                .output
+                .as_deref()
+                .map(|output| read_cache_header(output, self.force))
+                .transpose()?
+                .flatten();
+            self.cache_status(input, header)?
+        } else {
+            current
+        };
+        if current {
+            return Ok(false);
+        }
+        let source_bytes = read_source(input.path, input.metadata.as_ref())
+            .map_err(|error| format!("failed to read {}: {error}", input.path.display()))?;
+        let module = compile_bytes_with_path_and_options(&source_bytes, input.path, &self.options)
+            .map_err(|error| match &error {
+                CompileError::Decode(error) => {
+                    format!("failed to decode {}: {error}", input.path.display())
+                }
+                _ => format!("failed to compile {}: {error}", input.path.display()),
+            })?;
+        let (Some(metadata), Some(output)) = (&input.metadata, &input.output) else {
+            black_box(module);
+            return Ok(true);
+        };
+        let pyc = match self.invalidation_mode {
+            InvalidationMode::Timestamp => module
+                .to_timestamp_pyc(source_mtime(input.path, metadata)?, low_u32(metadata.len())),
+            InvalidationMode::CheckedHash | InvalidationMode::UncheckedHash => module.to_hash_pyc(
+                &source_bytes,
+                matches!(self.invalidation_mode, InvalidationMode::CheckedHash),
+            ),
+        };
+        let parent = output.parent().ok_or_else(|| {
+            format!(
+                "failed to determine the cache directory for {}",
+                input.path.display()
+            )
+        })?;
+        let mut temporary = if let Ok(temporary) = temporary_cache_file(parent, metadata) {
+            temporary
+        } else {
+            fs_err::create_dir_all(parent)
+                .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+            temporary_cache_file(parent, metadata)
+                .map_err(|error| format!("failed to create a temporary cache file: {error}"))?
+        };
+        temporary
+            .write_all(&pyc)
+            .map_err(|error| format!("failed to write a temporary cache file: {error}"))?;
+        temporary
+            .persist(output)
+            .map(|_| true)
+            .map_err(|error| format!("failed to replace {}: {error}", output.display()))
+    }
+}
+
+fn source_mtime(path: &Path, metadata: &std::fs::Metadata) -> Result<u32, String> {
+    metadata
+        .modified()
+        .map(encode_mtime)
+        .map_err(|error| format!("failed to read the mtime for {}: {error}", path.display()))
+}
+
+/// Reject symlinks and special files; missing, unreadable, or truncated regular caches are misses.
+fn read_cache_header(output: &Path, force: bool) -> Result<Option<[u8; 16]>, String> {
+    match fs_err::symlink_metadata(output) {
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(format!("{} is not a regular file", output.display()));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("failed to inspect {}: {error}", output.display())),
+    }
+    if force {
+        return Ok(None);
+    }
+    let mut header = [0; 16];
+    Ok(fs_err::File::open(output)
+        .ok()
+        .and_then(|mut file| file.read_exact(&mut header).ok().map(|()| header)))
+}
+
+#[cfg(test)]
 fn compile_path_with_metadata(
     path: &Path,
     check: bool,
@@ -583,104 +733,15 @@ fn compile_path_with_metadata(
     cache_optimization: usize,
     load_metadata: impl FnOnce(&Path) -> io::Result<std::fs::Metadata>,
 ) -> Result<bool, String> {
-    // Snapshot timestamp-cache metadata before reading. If the path changes during compilation,
-    // the resulting header describes the old state and cannot validate the new source as fresh.
-    let metadata = (!check)
-        .then(|| {
-            load_metadata(path)
-                .map_err(|error| format!("failed to inspect {}: {error}", path.display()))
-        })
-        .transpose()?;
-    let output = (!check)
-        .then(|| cache_path(path, options.python_version, cache_optimization))
-        .transpose()?;
-    let cached = output
-        .as_deref()
-        .filter(|_| !force)
-        .and_then(read_cache_header);
-    let mut expected = [0; 16];
-    let mut source_mtime = 0;
-    expected[..4].copy_from_slice(&options.python_version.target().magic_number);
-    expected[4..8].copy_from_slice(&invalidation_mode.flags().to_le_bytes());
-    if let Some(metadata) = &metadata
-        && let InvalidationMode::Timestamp = invalidation_mode
-    {
-        let modified = metadata
-            .modified()
-            .map_err(|error| format!("failed to read the mtime for {}: {error}", path.display()))?;
-        source_mtime = encode_mtime(modified);
-        expected[8..12].copy_from_slice(&source_mtime.to_le_bytes());
-        expected[12..].copy_from_slice(&low_u32(metadata.len()).to_le_bytes());
-        if cached == Some(expected) {
-            return Ok(false);
-        }
-    }
-    let source_bytes = read_source(path, metadata.as_ref())
-        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
-    let source_hash = (!check && invalidation_mode.flags() != 0)
-        .then(|| options.python_version.target().source_hash(&source_bytes));
-    if let Some(source_hash) = source_hash {
-        expected[8..].copy_from_slice(&source_hash);
-        if cached == Some(expected) {
-            return Ok(false);
-        }
-    }
-    let module =
-        compile_bytes_with_path_and_options(&source_bytes, path, options).map_err(|error| {
-            match &error {
-                CompileError::Decode(error) => {
-                    format!("failed to decode {}: {error}", path.display())
-                }
-                _ => format!("failed to compile {}: {error}", path.display()),
-            }
-        })?;
-
-    let (Some(metadata), Some(output)) = (metadata, output) else {
-        black_box(module);
-        return Ok(true);
+    let compilation = Compilation {
+        options: options.clone(),
+        cache_suffix: cache_suffix(options.python_version, cache_optimization),
+        invalidation_mode,
+        check,
+        force,
     };
-
-    let pyc = if let Some(source_hash) = source_hash {
-        module.to_hash_pyc_with_hash(source_hash, invalidation_mode.flags() == 3)
-    } else {
-        module.to_timestamp_pyc(source_mtime, low_u32(metadata.len()))
-    };
-
-    let parent = output.parent().ok_or_else(|| {
-        format!(
-            "failed to determine the cache directory for {}",
-            path.display()
-        )
-    })?;
-    let mut temporary = if let Ok(temporary) = temporary_cache_file(parent, &metadata) {
-        temporary
-    } else {
-        fs_err::create_dir_all(parent)
-            .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
-        temporary_cache_file(parent, &metadata)
-            .map_err(|error| format!("failed to create a temporary cache file: {error}"))?
-    };
-    temporary
-        .write_all(&pyc)
-        .map_err(|error| format!("failed to write a temporary cache file: {error}"))?;
-    temporary
-        .persist(&output)
-        .map(|_| true)
-        .map_err(|error| format!("failed to replace {}: {error}", output.display()))
-}
-
-/// Treat missing, unreadable, truncated, and nonregular cache destinations as misses.
-fn read_cache_header(output: &Path) -> Option<[u8; 16]> {
-    // Never follow an output symlink. Compilation replaces it atomically instead.
-    if !fs_err::symlink_metadata(output).ok()?.is_file() {
-        return None;
-    }
-    let mut header = [0; 16];
-    fs_err::File::open(output)
-        .ok()?
-        .read_exact(&mut header)
-        .ok()?;
-    Some(header)
+    let input = compilation.prepare(path, false, load_metadata)?;
+    compilation.compile(&input, false)
 }
 
 /// Reuse the timestamp snapshot as a size hint without querying the opened file again.
@@ -766,11 +827,7 @@ fn temporary_cache_file(
     tempfile::NamedTempFile::new_in(parent)
 }
 
-fn cache_path(
-    path: &Path,
-    python_version: PythonVersion,
-    cache_optimization: usize,
-) -> Result<PathBuf, String> {
+fn cache_path(path: &Path, suffix: &str) -> Result<PathBuf, String> {
     let filename = path
         .file_name()
         .ok_or_else(|| format!("{} has no file name", path.display()))?;
@@ -797,15 +854,20 @@ fn cache_path(
     if separator.is_some() {
         filename.push(".");
     }
-    filename.push(cache_tag(python_version));
-    if cache_optimization > 0 {
-        filename.push(format!(".opt-{cache_optimization}"));
-    }
-    filename.push(".pyc");
+    filename.push(suffix);
     let parent = path
         .parent()
         .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
     Ok(parent.join("__pycache__").join(filename))
+}
+
+fn cache_suffix(python_version: PythonVersion, optimization: usize) -> String {
+    let tag = cache_tag(python_version);
+    if optimization == 0 {
+        format!("{tag}.pyc")
+    } else {
+        format!("{tag}.opt-{optimization}.pyc")
+    }
 }
 
 fn cache_tag(python_version: PythonVersion) -> String {
@@ -822,9 +884,9 @@ fn write_error(message: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        InvalidationMode, cache_path, cache_tag, compilation_groups, compile_path_with_metadata,
-        discover, encode_mtime, has_python_suffix, prepare_compilation,
-        prioritize_compilation_groups, read_file_list,
+        CompilationGroup, InvalidationMode, PreparedInput, cache_path, cache_suffix, cache_tag,
+        compilation_groups, compile_path_with_metadata, discover, encode_mtime, has_python_suffix,
+        prioritize_compilation_groups,
     };
     use super::{default_jobs, jobs_for_inputs};
     use serc::{CompileOptions, PythonVersion};
@@ -849,47 +911,16 @@ mod tests {
         assert_eq!(jobs_for_inputs(NonZeroUsize::new(8), 4), 4);
     }
 
-    #[test]
-    fn cache_writing_limits_workers_to_independent_outputs() {
-        let directory = tempfile::tempdir().unwrap();
-        let paths = [
-            directory.path().join("Alpha.py"),
-            directory.path().join("alpha.py"),
-            directory.path().join("other.py"),
-            directory.path().join("caf\u{e9}.py"),
-        ];
-
-        let (jobs, groups) = prepare_compilation(&paths[..3], PythonVersion::Py314, 0, false, 3);
-        assert_eq!(jobs, 2);
-        assert_eq!(groups.unwrap().len(), 2);
-
-        let (jobs, groups) = prepare_compilation(&paths, PythonVersion::Py314, 0, false, 4);
-        assert_eq!(jobs, 1);
-        assert_eq!(
-            groups.unwrap()[0]
-                .iter()
-                .map(|(index, _)| *index)
-                .collect::<Vec<_>>(),
-            [0, 1, 2, 3]
-        );
-        assert_eq!(
-            prepare_compilation(&paths, PythonVersion::Py314, 0, true, 4),
-            (4, None)
-        );
-        assert_eq!(
-            prepare_compilation(&paths, PythonVersion::Py314, 0, false, 1),
-            (1, None)
-        );
-        assert_eq!(
-            prepare_compilation(
-                &paths[..1],
-                PythonVersion::Py314,
-                0,
-                false,
-                jobs_for_inputs(None, 1)
-            ),
-            (1, None)
-        );
+    fn prepared_inputs(paths: &[PathBuf]) -> Vec<PreparedInput<'_>> {
+        paths
+            .iter()
+            .map(|path| PreparedInput {
+                path,
+                metadata: fs_err::metadata(path).ok(),
+                output: Some(cache_path(path, "cpython-314.pyc").unwrap()),
+                current: Ok(false),
+            })
+            .collect()
     }
 
     #[test]
@@ -921,7 +952,7 @@ mod tests {
             other.join("a.py"),
         ];
         let indices = || {
-            compilation_groups(&paths, PythonVersion::Py314, 0)
+            compilation_groups(&prepared_inputs(&paths))
                 .into_iter()
                 .map(|group| {
                     group
@@ -950,7 +981,7 @@ mod tests {
             missing.join("\u{212a}.py"),
         ];
         let indices = |paths: &[PathBuf]| {
-            compilation_groups(paths, PythonVersion::Py314, 0)
+            compilation_groups(&prepared_inputs(paths))
                 .into_iter()
                 .map(|group| {
                     group
@@ -973,13 +1004,14 @@ mod tests {
         for (path, size) in paths.iter().zip([1, 4, 12, 9, 6]) {
             fs_err::write(path, vec![b' '; size]).unwrap();
         }
+        let inputs = prepared_inputs(&paths);
         let groups = vec![
-            vec![(0, paths[0].as_path()), (3, paths[3].as_path())],
-            vec![(1, paths[1].as_path()), (4, paths[4].as_path())],
-            vec![(2, paths[2].as_path())],
-            vec![(5, paths[5].as_path())],
+            vec![(0, &inputs[0]), (3, &inputs[3])],
+            vec![(1, &inputs[1]), (4, &inputs[4])],
+            vec![(2, &inputs[2])],
+            vec![(5, &inputs[5])],
         ];
-        let indices = |groups: Vec<Vec<(usize, &Path)>>| {
+        let indices = |groups: Vec<CompilationGroup<'_>>| {
             groups
                 .into_iter()
                 .map(|group| {
@@ -991,63 +1023,47 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(
-            indices(prioritize_compilation_groups(groups.clone(), 4, None)),
+            indices(prioritize_compilation_groups(groups.clone(), 4)),
             [vec![0, 3], vec![1, 4], vec![2], vec![5]]
         );
         assert_eq!(
-            indices(prioritize_compilation_groups(groups.clone(), 2, None)),
+            indices(prioritize_compilation_groups(groups, 2)),
             [vec![2], vec![0, 3], vec![1, 4], vec![5]]
-        );
-        assert_eq!(
-            indices(prioritize_compilation_groups(
-                groups,
-                2,
-                Some(&[1, 4, 12, 9, 6, 20]),
-            )),
-            [vec![5], vec![2], vec![0, 3], vec![1, 4]]
-        );
-    }
-
-    #[test]
-    fn file_lists_keep_source_sizes_aligned_after_sorting_and_deduplication() {
-        let directory = tempfile::tempdir().unwrap();
-        let first = directory.path().join("first.py");
-        let second = directory.path().join("second.py");
-        fs_err::write(&first, b"x = 1\n").unwrap();
-        fs_err::write(&second, b"x = 123\n").unwrap();
-        let manifest = directory.path().join("files.txt");
-        fs_err::write(
-            &manifest,
-            format!(
-                "{}\n{}\n{}\n",
-                second.display(),
-                first.display(),
-                second.display()
-            ),
-        )
-        .unwrap();
-        assert_eq!(
-            read_file_list(&manifest, false).unwrap(),
-            (vec![first, second], vec![6, 8])
         );
     }
 
     #[test]
     fn builds_cache_path() {
         assert_eq!(
-            cache_path(Path::new("package/module.py"), PythonVersion::Py314, 0).unwrap(),
+            cache_path(
+                Path::new("package/module.py"),
+                &cache_suffix(PythonVersion::Py314, 0)
+            )
+            .unwrap(),
             PathBuf::from("package/__pycache__/module.cpython-314.pyc")
         );
         assert_eq!(
-            cache_path(Path::new("package/.py"), PythonVersion::Py314, 0).unwrap(),
+            cache_path(
+                Path::new("package/.py"),
+                &cache_suffix(PythonVersion::Py314, 0)
+            )
+            .unwrap(),
             PathBuf::from("package/__pycache__/py.cpython-314.pyc")
         );
         assert_eq!(
-            cache_path(Path::new("package/module.py"), PythonVersion::Py315, 0).unwrap(),
+            cache_path(
+                Path::new("package/module.py"),
+                &cache_suffix(PythonVersion::Py315, 0)
+            )
+            .unwrap(),
             PathBuf::from("package/__pycache__/module.cpython-315.pyc")
         );
         assert_eq!(
-            cache_path(Path::new("package/module"), PythonVersion::Py315, 0).unwrap(),
+            cache_path(
+                Path::new("package/module"),
+                &cache_suffix(PythonVersion::Py315, 0)
+            )
+            .unwrap(),
             PathBuf::from("package/__pycache__/modulecpython-315.pyc")
         );
         for (version, tag) in [
@@ -1055,11 +1071,11 @@ mod tests {
             (PythonVersion::Py313, "cpython-313"),
         ] {
             assert_eq!(
-                cache_path(Path::new("package/module.py"), version, 0).unwrap(),
+                cache_path(Path::new("package/module.py"), &cache_suffix(version, 0)).unwrap(),
                 PathBuf::from(format!("package/__pycache__/module.{tag}.pyc")),
             );
             assert_eq!(
-                cache_path(Path::new("package/module"), version, 0).unwrap(),
+                cache_path(Path::new("package/module"), &cache_suffix(version, 0)).unwrap(),
                 PathBuf::from(format!("package/__pycache__/module{tag}.pyc")),
             );
         }
@@ -1078,7 +1094,11 @@ mod tests {
             (b"\xff", b"\xffcpython-314.pyc"),
         ] {
             assert_eq!(
-                cache_path(Path::new(OsStr::from_bytes(name)), PythonVersion::Py314, 0).unwrap(),
+                cache_path(
+                    Path::new(OsStr::from_bytes(name)),
+                    &cache_suffix(PythonVersion::Py314, 0)
+                )
+                .unwrap(),
                 Path::new("__pycache__").join(OsStr::from_bytes(expected))
             );
         }
@@ -1142,7 +1162,8 @@ mod tests {
             .unwrap()
             .to_timestamp_pyc(1_700_000_000, u32::try_from(replacement.len()).unwrap());
         assert_eq!(
-            fs_err::read(cache_path(&source_path, PythonVersion::Py314, 0).unwrap()).unwrap(),
+            fs_err::read(cache_path(&source_path, &cache_suffix(PythonVersion::Py314, 0)).unwrap())
+                .unwrap(),
             expected
         );
     }
@@ -1178,6 +1199,57 @@ mod tests {
         )
         .unwrap();
         assert!(!compiled);
+    }
+
+    #[test]
+    fn discovered_metadata_errors_remain_per_file_compilation_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("missing.py");
+        let compilation = super::Compilation {
+            options: CompileOptions::default(),
+            cache_suffix: cache_suffix(PythonVersion::Py314, 0),
+            invalidation_mode: InvalidationMode::Timestamp,
+            check: false,
+            force: false,
+        };
+        let input = compilation
+            .prepare(&source, false, |path| fs_err::metadata(path))
+            .unwrap();
+        let error = compilation.compile(&input, true).unwrap_err();
+        assert!(error.starts_with(&format!("failed to inspect {}:", source.display())));
+        assert!(
+            compilation
+                .prepare(&source, true, |path| fs_err::metadata(path))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn hash_cache_read_errors_remain_per_file_compilation_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("module.py");
+        fs_err::write(&source, "pass\n").unwrap();
+        let compilation = super::Compilation {
+            options: CompileOptions::default(),
+            cache_suffix: cache_suffix(PythonVersion::Py314, 0),
+            invalidation_mode: InvalidationMode::CheckedHash,
+            check: false,
+            force: false,
+        };
+        let input = compilation
+            .prepare(&source, true, |path| fs_err::metadata(path))
+            .unwrap();
+        assert!(compilation.compile(&input, false).unwrap());
+
+        let input = compilation
+            .prepare(&source, true, |path| {
+                let metadata = fs_err::metadata(path)?;
+                fs_err::remove_file(path)?;
+                Ok(metadata)
+            })
+            .unwrap();
+        let error = compilation.compile(&input, false).unwrap_err();
+        assert!(error.starts_with(&format!("failed to read {}:", source.display())));
     }
 
     #[test]
@@ -1218,7 +1290,10 @@ mod tests {
                     .unwrap()
                     .to_timestamp_pyc(1_700_000_000, u32::try_from(original.len()).unwrap());
             assert_eq!(
-                fs_err::read(cache_path(&source_path, PythonVersion::Py314, 0).unwrap()).unwrap(),
+                fs_err::read(
+                    cache_path(&source_path, &cache_suffix(PythonVersion::Py314, 0)).unwrap()
+                )
+                .unwrap(),
                 expected
             );
         }
@@ -1242,7 +1317,15 @@ mod tests {
             |path| fs_err::metadata(path),
         )
         .unwrap_err();
-        assert!(error.starts_with(&format!("failed to create {}:", cache_directory.display())));
+        let expected = if cfg!(windows) {
+            format!("failed to create {}:", cache_directory.display())
+        } else {
+            format!(
+                "failed to inspect {}:",
+                cache_directory.join("module.cpython-314.pyc").display()
+            )
+        };
+        assert!(error.starts_with(&expected), "{error}");
     }
 
     #[test]

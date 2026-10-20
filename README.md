@@ -81,7 +81,8 @@ Current `.pyc` files are left untouched by default. We compare the target
 bytecode format and invalidation mode, then the source's timestamp and size or
 its content hash. Pass `-f` or `--force` to rebuild every file, including after
 changing the compiler or native build profile. `--check` always compiles the
-sources without writing bytecode.
+sources without writing bytecode. Existing bytecode destinations must be regular
+files; compilation rejects symlinks and special files, including with `--force`.
 
 For integrations, `--output-format json` reports the numbers of compiled and
 skipped files:

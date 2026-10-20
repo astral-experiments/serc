@@ -84,17 +84,23 @@ fn compile_empty_file_list_does_not_discover_current_directory() {
 }
 
 #[test]
-fn compile_file_list_rejects_directories() {
+fn compile_file_list_rejects_directories_before_writing() {
     let directory = tempfile::tempdir().unwrap();
     fs_err::write(directory.path().join("module.py"), "pass\n").unwrap();
+    fs_err::create_dir(directory.path().join("subdirectory")).unwrap();
     let output = with_stdin(
-        serc()
-            .current_dir(directory.path())
-            .args(["compile", "--files-from", "-", "--null"]),
-        b".\0",
+        serc().current_dir(directory.path()).args([
+            "compile",
+            "--files-from",
+            "-",
+            "--null",
+            "--jobs",
+            "2",
+        ]),
+        b"module.py\0subdirectory\0",
     );
     assert_eq!(output.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&output.stderr).contains(". is not a file"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("subdirectory is not a file"));
     assert!(!directory.path().join("__pycache__").exists());
 }
 
@@ -1918,6 +1924,50 @@ fn parallel_compile_orders_outputs_in_aliased_cache_directories() {
     assert_eq!(fs_err::read(output).unwrap(), expected);
 }
 
+/// An earlier stale source can invalidate a later source's initially-current shared cache.
+#[cfg(unix)]
+#[test]
+fn parallel_compile_rechecks_current_outputs_after_aliased_writes() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().unwrap();
+    let first = directory.path().join("a");
+    let last = directory.path().join("z");
+    let shared = directory.path().join("shared");
+    fs_err::create_dir(&first).unwrap();
+    fs_err::create_dir(&last).unwrap();
+    fs_err::create_dir(&shared).unwrap();
+    let first_source = first.join("module.py");
+    let last_source = last.join("module.py");
+    fs_err::write(&first_source, "value = 'first'\n").unwrap();
+    fs_err::write(&last_source, "value = 'last source'\n").unwrap();
+    symlink(&shared, first.join("__pycache__")).unwrap();
+    symlink(&shared, last.join("__pycache__")).unwrap();
+    let cache = shared.join("module.cpython-314.pyc");
+
+    let seed = serc().arg("compile").arg(&last_source).output().unwrap();
+    assert!(seed.status.success(), "{seed:?}");
+    let expected = fs_err::read(&cache).unwrap();
+
+    let serial = serc()
+        .args(["compile", "--jobs", "1", "--output-format", "json"])
+        .args([&first_source, &last_source])
+        .output()
+        .unwrap();
+    assert!(serial.status.success(), "{serial:?}");
+    assert_eq!(serial.stdout, b"{\"compiled\":2,\"skipped\":0}\n");
+    assert_eq!(fs_err::read(&cache).unwrap(), expected);
+
+    let parallel = serc()
+        .args(["compile", "--jobs", "2", "--output-format", "json"])
+        .args([&first_source, &last_source])
+        .output()
+        .unwrap();
+    assert!(parallel.status.success(), "{parallel:?}");
+    assert_eq!(parallel.stdout, b"{\"compiled\":2,\"skipped\":0}\n");
+    assert_eq!(fs_err::read(&cache).unwrap(), expected);
+}
+
 #[test]
 fn parallel_compile_matches_serial_for_filesystem_case_and_unicode_aliases() {
     for (original, alias) in [
@@ -2445,35 +2495,37 @@ fn compile_honors_umask_for_cache_permissions() {
     assert_eq!(mode, 0o600);
 }
 
-#[cfg(unix)]
 #[test]
-fn compile_replaces_a_cache_symlink_without_following_it() {
-    use std::os::unix::fs::symlink;
-
+fn compile_rejects_directory_destinations_even_when_forced() {
     let directory = tempfile::tempdir().unwrap();
-    let source_path = directory.path().join("module.py");
-    let cache_directory = directory.path().join("__pycache__");
-    let pyc_path = cache_directory.join("module.cpython-314.pyc");
-    let victim = directory.path().join("victim");
-    fs_err::write(&source_path, "answer = 42\n").unwrap();
-    fs_err::write(&victim, "keep me").unwrap();
-    fs_err::create_dir(&cache_directory).unwrap();
-    symlink(&victim, &pyc_path).unwrap();
+    let source = directory.path().join("module.py");
+    let cache = directory.path().join("__pycache__/module.cpython-314.pyc");
+    fs_err::write(&source, "answer = 42\n").unwrap();
+    fs_err::create_dir_all(&cache).unwrap();
+    let marker = cache.join("keep.txt");
+    fs_err::write(&marker, "keep me").unwrap();
 
     let output = serc()
-        .args(["compile", "--quiet"])
-        .arg(&source_path)
+        .args(["compile", "--force", "--quiet"])
+        .arg(&source)
         .output()
         .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("is not a regular file"));
+    assert_eq!(fs_err::read_to_string(&marker).unwrap(), "keep me");
 
+    let output = serc()
+        .args(["compile", "--check", "--quiet"])
+        .arg(&source)
+        .output()
+        .unwrap();
     assert!(output.status.success(), "{output:?}");
-    assert_eq!(fs_err::read_to_string(victim).unwrap(), "keep me");
-    assert!(fs_err::symlink_metadata(pyc_path).unwrap().is_file());
+    assert_eq!(fs_err::read_to_string(&marker).unwrap(), "keep me");
 }
 
 #[cfg(unix)]
 #[test]
-fn compile_does_not_reuse_cache_symlinks_with_current_headers() {
+fn compile_rejects_cache_symlinks_with_current_headers() {
     use std::os::unix::fs::symlink;
 
     let directory = tempfile::tempdir().unwrap();
@@ -2492,9 +2544,10 @@ fn compile_does_not_reuse_cache_symlinks_with_current_headers() {
     symlink(&target, &cache).unwrap();
 
     let output = command.output().unwrap();
-    assert!(output.status.success(), "{output:?}");
-    assert_eq!(output.stdout, b"{\"compiled\":1,\"skipped\":0}\n");
-    assert!(fs_err::symlink_metadata(&cache).unwrap().is_file());
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("is not a regular file"));
+    assert!(fs_err::symlink_metadata(&cache).unwrap().is_symlink());
     assert_eq!(fs_err::read(target).unwrap(), expected);
 }
 
