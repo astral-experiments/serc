@@ -12,8 +12,6 @@ destinations before writing.
 - Reject symlinks and other non-regular `.pyc` destinations before writing,
   including with `--force` (astral-sh/serc#1357;
   https://github.com/astral-sh/serc/pull/1357)
-- Validate every `--files-from` input before writing any bytecode caches
-  (astral-sh/serc#1357; https://github.com/astral-sh/serc/pull/1357)
 
 ### Performance
 
