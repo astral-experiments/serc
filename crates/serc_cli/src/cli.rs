@@ -1317,10 +1317,15 @@ mod tests {
             |path| fs_err::metadata(path),
         )
         .unwrap_err();
-        assert!(error.starts_with(&format!(
-            "failed to inspect {}:",
-            cache_directory.join("module.cpython-314.pyc").display()
-        )));
+        let expected = if cfg!(windows) {
+            format!("failed to create {}:", cache_directory.display())
+        } else {
+            format!(
+                "failed to inspect {}:",
+                cache_directory.join("module.cpython-314.pyc").display()
+            )
+        };
+        assert!(error.starts_with(&expected), "{error}");
     }
 
     #[test]
