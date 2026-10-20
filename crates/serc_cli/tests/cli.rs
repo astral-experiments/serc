@@ -47,7 +47,7 @@ fn compile_file_lists_preserve_paths_and_deduplicate() {
     assert_eq!(output.stdout, b"{\"compiled\":2,\"skipped\":0}\n");
 
     let manifest = directory.path().join("inputs.txt");
-    fs_err::write(&manifest, "first file.py\r\nsecond.py\n").unwrap();
+    fs_err::write(&manifest, "second.py\nfirst file.py\r\nsecond.py\n").unwrap();
     let output = serc()
         .current_dir(directory.path())
         .args([
@@ -87,7 +87,8 @@ fn compile_empty_file_list_does_not_discover_current_directory() {
 fn compile_file_list_rejects_directories_before_writing() {
     let directory = tempfile::tempdir().unwrap();
     fs_err::write(directory.path().join("module.py"), "pass\n").unwrap();
-    fs_err::create_dir(directory.path().join("subdirectory")).unwrap();
+    fs_err::create_dir(directory.path().join("a")).unwrap();
+    fs_err::create_dir(directory.path().join("z")).unwrap();
     let output = with_stdin(
         serc().current_dir(directory.path()).args([
             "compile",
@@ -97,10 +98,10 @@ fn compile_file_list_rejects_directories_before_writing() {
             "--jobs",
             "2",
         ]),
-        b"module.py\0subdirectory\0",
+        b"z\0module.py\0a\0",
     );
     assert_eq!(output.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("subdirectory is not a file"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("a is not a file"));
     assert!(!directory.path().join("__pycache__").exists());
 }
 
@@ -1948,21 +1949,38 @@ fn parallel_compile_rechecks_current_outputs_after_aliased_writes() {
     let seed = serc().arg("compile").arg(&last_source).output().unwrap();
     assert!(seed.status.success(), "{seed:?}");
     let expected = fs_err::read(&cache).unwrap();
+    let manifest = format!("{}\0{}\0", last_source.display(), first_source.display());
 
-    let serial = serc()
-        .args(["compile", "--jobs", "1", "--output-format", "json"])
-        .args([&first_source, &last_source])
-        .output()
-        .unwrap();
+    let serial = with_stdin(
+        serc().args([
+            "compile",
+            "--files-from",
+            "-",
+            "--null",
+            "--jobs",
+            "1",
+            "--output-format",
+            "json",
+        ]),
+        manifest.as_bytes(),
+    );
     assert!(serial.status.success(), "{serial:?}");
     assert_eq!(serial.stdout, b"{\"compiled\":2,\"skipped\":0}\n");
     assert_eq!(fs_err::read(&cache).unwrap(), expected);
 
-    let parallel = serc()
-        .args(["compile", "--jobs", "2", "--output-format", "json"])
-        .args([&first_source, &last_source])
-        .output()
-        .unwrap();
+    let parallel = with_stdin(
+        serc().args([
+            "compile",
+            "--files-from",
+            "-",
+            "--null",
+            "--jobs",
+            "2",
+            "--output-format",
+            "json",
+        ]),
+        manifest.as_bytes(),
+    );
     assert!(parallel.status.success(), "{parallel:?}");
     assert_eq!(parallel.stdout, b"{\"compiled\":2,\"skipped\":0}\n");
     assert_eq!(fs_err::read(&cache).unwrap(), expected);
