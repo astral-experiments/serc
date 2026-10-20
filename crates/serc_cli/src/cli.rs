@@ -146,15 +146,16 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
 }
 
 fn compile_command(command: CompileCommand) -> Result<ExitCode, String> {
-    let paths = if let Some(manifest) = &command.files_from {
-        read_file_list(manifest, command.null)?
+    let (paths, source_sizes) = if let Some(manifest) = &command.files_from {
+        let (paths, source_sizes) = read_file_list(manifest, command.null)?;
+        (paths, Some(source_sizes))
     } else {
         let roots = if command.paths.is_empty() {
             vec![PathBuf::from(".")]
         } else {
             command.paths
         };
-        discover(&roots)?
+        (discover(&roots)?, None)
     };
     let mut failures = 0_usize;
     let skipped = AtomicUsize::new(0);
@@ -219,7 +220,7 @@ fn compile_command(command: CompileCommand) -> Result<ExitCode, String> {
                     .map(|(index, path)| vec![(index, path.as_path())])
                     .collect()
             });
-            let groups = prioritize_compilation_groups(groups, jobs);
+            let groups = prioritize_compilation_groups(groups, jobs, source_sizes.as_deref());
             let next_group = AtomicUsize::new(0);
             (0..jobs.min(groups.len()))
                 .into_par_iter()
@@ -285,7 +286,9 @@ fn compile_command(command: CompileCommand) -> Result<ExitCode, String> {
 }
 
 /// Read exact file paths without applying directory discovery or a default input.
-fn read_file_list(manifest: &Path, null: bool) -> Result<Vec<PathBuf>, String> {
+///
+/// Retain validated sizes as scheduling hints; workers still load fresh metadata before reading.
+fn read_file_list(manifest: &Path, null: bool) -> Result<(Vec<PathBuf>, Vec<u64>), String> {
     let mut contents = Vec::new();
     if manifest == Path::new("-") {
         io::stdin()
@@ -322,11 +325,11 @@ fn read_file_list(manifest: &Path, null: bool) -> Result<Vec<PathBuf>, String> {
         if !metadata.is_file() {
             return Err(format!("{} is not a file", path.display()));
         }
-        paths.push(path);
+        paths.push((path, metadata.len()));
     }
-    paths.sort();
-    paths.dedup();
-    Ok(paths)
+    paths.sort_by(|(left, _), (right, _)| left.cmp(right));
+    paths.dedup_by(|(left, _), (right, _)| left == right);
+    Ok(paths.into_iter().unzip())
 }
 
 /// Follow Rayon's environment and CPU defaults without starting idle workers for small inputs.
@@ -380,14 +383,18 @@ fn prepare_compilation(
 }
 
 /// Start the most expensive independent groups first, retaining order within aliased outputs.
-fn prioritize_compilation_groups(
-    mut groups: Vec<CompilationGroup<'_>>,
+fn prioritize_compilation_groups<'a>(
+    mut groups: Vec<CompilationGroup<'a>>,
     jobs: usize,
-) -> Vec<CompilationGroup<'_>> {
+    source_sizes: Option<&[u64]>,
+) -> Vec<CompilationGroup<'a>> {
     if groups.len() > jobs {
         groups.sort_by_cached_key(|group| {
-            let size = group.iter().fold(0_u64, |total, (_, path)| {
-                total.saturating_add(fs_err::metadata(path).map_or(0, |metadata| metadata.len()))
+            let size = group.iter().fold(0_u64, |total, (index, path)| {
+                total.saturating_add(source_sizes.map_or_else(
+                    || fs_err::metadata(path).map_or(0, |metadata| metadata.len()),
+                    |sizes| sizes[*index],
+                ))
             });
             (std::cmp::Reverse(size), group[0].0)
         });
@@ -414,11 +421,13 @@ fn compilation_groups(
             .and_then(|output| {
                 let parent = output.parent()?;
                 let filename = output.file_name()?;
-                let directory = Arc::clone(
-                    directories
-                        .entry(parent.to_owned())
-                        .or_insert_with(|| Arc::new(cache_directory_identity(parent))),
-                );
+                let directory = if let Some(directory) = directories.get(parent) {
+                    Arc::clone(directory)
+                } else {
+                    let directory = Arc::new(cache_directory_identity(parent));
+                    directories.insert(parent.to_owned(), Arc::clone(&directory));
+                    directory
+                };
                 unknown_directory |= matches!(directory.as_ref(), CacheDirectoryIdentity::Unknown);
                 if !filename.as_encoded_bytes().is_ascii() {
                     non_ascii_directories.insert(Arc::clone(&directory));
@@ -815,7 +824,7 @@ mod tests {
     use super::{
         InvalidationMode, cache_path, cache_tag, compilation_groups, compile_path_with_metadata,
         discover, encode_mtime, has_python_suffix, prepare_compilation,
-        prioritize_compilation_groups,
+        prioritize_compilation_groups, read_file_list,
     };
     use super::{default_jobs, jobs_for_inputs};
     use serc::{CompileOptions, PythonVersion};
@@ -982,12 +991,44 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(
-            indices(prioritize_compilation_groups(groups.clone(), 4)),
+            indices(prioritize_compilation_groups(groups.clone(), 4, None)),
             [vec![0, 3], vec![1, 4], vec![2], vec![5]]
         );
         assert_eq!(
-            indices(prioritize_compilation_groups(groups, 2)),
+            indices(prioritize_compilation_groups(groups.clone(), 2, None)),
             [vec![2], vec![0, 3], vec![1, 4], vec![5]]
+        );
+        assert_eq!(
+            indices(prioritize_compilation_groups(
+                groups,
+                2,
+                Some(&[1, 4, 12, 9, 6, 20]),
+            )),
+            [vec![5], vec![2], vec![0, 3], vec![1, 4]]
+        );
+    }
+
+    #[test]
+    fn file_lists_keep_source_sizes_aligned_after_sorting_and_deduplication() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.py");
+        let second = directory.path().join("second.py");
+        fs_err::write(&first, b"x = 1\n").unwrap();
+        fs_err::write(&second, b"x = 123\n").unwrap();
+        let manifest = directory.path().join("files.txt");
+        fs_err::write(
+            &manifest,
+            format!(
+                "{}\n{}\n{}\n",
+                second.display(),
+                first.display(),
+                second.display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            read_file_list(&manifest, false).unwrap(),
+            (vec![first, second], vec![6, 8])
         );
     }
 
