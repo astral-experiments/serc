@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.1.7
+
+Released on 2026-10-20.
+
+Serc 0.1.7 improves batch compilation and avoids rebuilding current bytecode
+caches.
+
+### Enhancements
+
+- Compile explicit source-file lists with `--files-from`, using
+  newline-delimited paths by default or NUL-delimited paths with `--null`,
+  without scanning directories (astral-sh/serc#1355;
+  https://github.com/astral-sh/serc/pull/1355)
+- Skip current `.pyc` files by default when their target format, invalidation
+  mode, and source fingerprint match; use `--force` to rebuild them, while
+  `--check` always compiles without writing bytecode (astral-sh/serc#1355;
+  https://github.com/astral-sh/serc/pull/1355)
+- Report compiled and skipped file counts with `--output-format json`
+  (astral-sh/serc#1355; https://github.com/astral-sh/serc/pull/1355)
+
 ## 0.1.6
 
 Released on 2026-10-19.
