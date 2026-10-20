@@ -77,16 +77,17 @@ find path/to/package -type f -name '*.py' -print0 | serc compile --files-from - 
 The list selects individual files without scanning directories. On Unix, paths
 retain their original bytes; on Windows, the list must use UTF-8.
 
-Pass `--skip-current` to leave current `.pyc` files untouched. We compare the
-target bytecode format and invalidation mode, then the source's timestamp and
-size or its content hash. Omit this flag to rebuild every file, including after
-changing the compiler or native build profile.
+Current `.pyc` files are left untouched by default. We compare the target
+bytecode format and invalidation mode, then the source's timestamp and size or
+its content hash. Pass `-f` or `--force` to rebuild every file, including after
+changing the compiler or native build profile. `--check` always compiles the
+sources without writing bytecode.
 
 For integrations, `--output-format json` reports the numbers of compiled and
 skipped files:
 
 ```console
-serc compile --files-from - --null --skip-current --output-format json
+serc compile --files-from - --null --output-format json
 ```
 
 ### Python version

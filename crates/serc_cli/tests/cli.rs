@@ -38,7 +38,6 @@ fn compile_file_lists_preserve_paths_and_deduplicate() {
             "--null",
             "--jobs",
             "2",
-            "--skip-current",
             "--output-format",
             "json",
         ]),
@@ -55,7 +54,6 @@ fn compile_file_lists_preserve_paths_and_deduplicate() {
             "compile",
             "--files-from",
             "inputs.txt",
-            "--skip-current",
             "--output-format",
             "json",
         ])
@@ -75,7 +73,6 @@ fn compile_empty_file_list_does_not_discover_current_directory() {
             "--files-from",
             "-",
             "--null",
-            "--skip-current",
             "--output-format",
             "json",
         ]),
@@ -177,7 +174,7 @@ fn compile_reuses_current_timestamp_caches() {
     fs_err::write(&source, "answer = 42\n").unwrap();
     let modified = fs_err::metadata(&source).unwrap().modified().unwrap();
     let output = serc()
-        .args(["compile", "--skip-current", "--output-format", "json"])
+        .args(["compile", "--output-format", "json"])
         .arg(&source)
         .output()
         .unwrap();
@@ -200,7 +197,7 @@ fn compile_reuses_current_timestamp_caches() {
         .set_modified(modified)
         .unwrap();
     let output = serc()
-        .args(["compile", "--skip-current", "--output-format", "json"])
+        .args(["compile", "--output-format", "json"])
         .arg(&source)
         .output()
         .unwrap();
@@ -220,7 +217,7 @@ fn compile_reuses_current_timestamp_caches() {
         .set_modified(modified)
         .unwrap();
     let output = serc()
-        .args(["compile", "--skip-current", "--output-format", "json"])
+        .args(["compile", "--output-format", "json"])
         .arg(&source)
         .output()
         .unwrap();
@@ -235,7 +232,7 @@ fn compile_reuses_current_timestamp_caches() {
         .set_modified(modified + Duration::from_secs(2))
         .unwrap();
     let output = serc()
-        .args(["compile", "--skip-current", "--output-format", "json"])
+        .args(["compile", "--output-format", "json"])
         .arg(&source)
         .output()
         .unwrap();
@@ -252,7 +249,7 @@ fn compile_reuses_hash_caches_and_refreshes_changed_sources() {
     fs_err::write(&source, "answer = 42\n").unwrap();
     let mut command = serc();
     command
-        .args(["compile", "--skip-current", "--output-format", "json"])
+        .args(["compile", "--output-format", "json"])
         .arg(&source)
         .args(["--invalidation-mode", "checked-hash"]);
     let output = command.output().unwrap();
@@ -265,7 +262,7 @@ fn compile_reuses_hash_caches_and_refreshes_changed_sources() {
 
     let mut command = serc();
     command
-        .args(["compile", "--skip-current", "--output-format", "json"])
+        .args(["compile", "--output-format", "json"])
         .arg(&source)
         .args(["--invalidation-mode", "unchecked-hash"]);
     let output = command.output().unwrap();
@@ -301,7 +298,7 @@ fn compile_refreshes_invalid_cache_headers() {
     fs_err::write(&source, "pass\n").unwrap();
     let mut command = serc();
     command
-        .args(["compile", "--skip-current", "--output-format", "json"])
+        .args(["compile", "--output-format", "json"])
         .arg(&source);
     let output = command.output().unwrap();
     assert!(output.status.success(), "{output:?}");
@@ -323,18 +320,53 @@ fn compile_refreshes_invalid_cache_headers() {
 }
 
 #[test]
-fn compile_cache_reuse_is_opt_in_and_incompatible_with_check() {
+fn compile_force_rebuilds_current_cache() {
     let directory = tempfile::tempdir().unwrap();
     let source = directory.path().join("module.py");
+    let cache = directory.path().join("__pycache__/module.cpython-314.pyc");
     fs_err::write(&source, "pass\n").unwrap();
-    let mut command = serc();
-    command.args(["compile"]).arg(&source);
-    let output = command.output().unwrap();
+    let output = serc().arg("compile").arg(&source).output().unwrap();
     assert!(output.status.success(), "{output:?}");
     assert_eq!(output.stdout, b"Compiled 1 file\n");
-    let output = command.output().unwrap();
+    let expected = fs_err::read(&cache).unwrap();
+    let marker = UNIX_EPOCH + Duration::from_secs(1_000_000);
+    fs_err::File::options()
+        .write(true)
+        .open(&cache)
+        .unwrap()
+        .set_modified(marker)
+        .unwrap();
+
+    let output = serc()
+        .args(["compile", "--force", "--output-format", "json"])
+        .arg(&source)
+        .output()
+        .unwrap();
     assert!(output.status.success(), "{output:?}");
-    assert_eq!(output.stdout, b"Compiled 1 file\n");
+    assert_eq!(output.stdout, b"{\"compiled\":1,\"skipped\":0}\n");
+    assert_eq!(fs_err::read(&cache).unwrap(), expected);
+    assert_ne!(
+        fs_err::metadata(&cache).unwrap().modified().unwrap(),
+        marker
+    );
+}
+
+#[test]
+fn check_compiles_current_caches_without_writing() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("module.py");
+    let cache = directory.path().join("__pycache__/module.cpython-314.pyc");
+    fs_err::write(&source, "pass\n").unwrap();
+    let output = serc().arg("compile").arg(&source).output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let expected = fs_err::read(&cache).unwrap();
+    let marker = UNIX_EPOCH + Duration::from_secs(1_000_000);
+    fs_err::File::options()
+        .write(true)
+        .open(&cache)
+        .unwrap()
+        .set_modified(marker)
+        .unwrap();
 
     let output = serc()
         .args(["compile", "--check", "--output-format", "json"])
@@ -343,33 +375,19 @@ fn compile_cache_reuse_is_opt_in_and_incompatible_with_check() {
         .unwrap();
     assert!(output.status.success(), "{output:?}");
     assert_eq!(output.stdout, b"{\"compiled\":1,\"skipped\":0}\n");
-    let output = serc()
-        .args(["compile", "--check", "--skip-current"])
-        .arg(&source)
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(2));
-
-    let output = serc()
-        .args([
-            "compile",
-            "--skip-current",
-            "--output-format",
-            "json",
-            "--quiet",
-        ])
-        .arg(&source)
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "{output:?}");
-    assert!(output.stdout.is_empty());
+    assert_eq!(fs_err::read(&cache).unwrap(), expected);
+    assert_eq!(
+        fs_err::metadata(&cache).unwrap().modified().unwrap(),
+        marker
+    );
 }
 
-/// Compiles a source with the CLI while leaving its assertions to the caller.
+/// Recompiles a source with the CLI while leaving its assertions to the caller.
 fn compile_for_version(source: &Path, version: serc::PythonVersion) -> Output {
     serc()
         .args([
             "compile",
+            "--force",
             "--quiet",
             "--python-version",
             &version.to_string(),
@@ -558,6 +576,7 @@ fn compile_optimization_modes_match_cpython_and_use_distinct_caches() {
             let output = serc()
                 .args([
                     "compile",
+                    "--force",
                     "--quiet",
                     "--python-version",
                     &version.to_string(),
@@ -1861,7 +1880,7 @@ fn parallel_compile_orders_outputs_in_aliased_cache_directories() {
         [alias.join("module.py"), first.join("module.py")],
     ] {
         let serial = serc()
-            .args(["compile", "--jobs", "1"])
+            .args(["compile", "--force", "--jobs", "1"])
             .args(&sources)
             .output()
             .unwrap();
@@ -1869,7 +1888,7 @@ fn parallel_compile_orders_outputs_in_aliased_cache_directories() {
         let expected = fs_err::read(&output).unwrap();
         fs_err::remove_file(&output).unwrap();
         let parallel = serc()
-            .args(["compile", "--jobs", "2"])
+            .args(["compile", "--force", "--jobs", "2"])
             .args(sources)
             .output()
             .unwrap();
@@ -1883,7 +1902,7 @@ fn parallel_compile_orders_outputs_in_aliased_cache_directories() {
     let output = first.join("__pycache__/module.cpython-314.pyc");
     let sources = [alias.join("module.py"), first.join("module.py")];
     let serial = serc()
-        .args(["compile", "--jobs", "1"])
+        .args(["compile", "--force", "--jobs", "1"])
         .args(&sources)
         .output()
         .unwrap();
@@ -1891,7 +1910,7 @@ fn parallel_compile_orders_outputs_in_aliased_cache_directories() {
     let expected = fs_err::read(&output).unwrap();
     fs_err::remove_dir_all(first.join("__pycache__")).unwrap();
     let parallel = serc()
-        .args(["compile", "--jobs", "2"])
+        .args(["compile", "--force", "--jobs", "2"])
         .args(sources)
         .output()
         .unwrap();
@@ -1919,7 +1938,7 @@ fn parallel_compile_matches_serial_for_filesystem_case_and_unicode_aliases() {
 
         let inputs = [&second, &first, &other];
         let serial = serc()
-            .args(["compile", "--jobs", "1"])
+            .args(["compile", "--force", "--jobs", "1"])
             .args(inputs)
             .output()
             .unwrap();
@@ -1931,7 +1950,7 @@ fn parallel_compile_matches_serial_for_filesystem_case_and_unicode_aliases() {
         for _ in 0..3 {
             fs_err::remove_dir_all(&cache_directory).unwrap();
             let parallel = serc()
-                .args(["compile", "--jobs", "4"])
+                .args(["compile", "--force", "--jobs", "4"])
                 .args(inputs)
                 .output()
                 .unwrap();
@@ -2339,7 +2358,7 @@ fn compile_matches_cpython_for_utf8_encoding_cookies() {
         let expected = fs_err::read(&pyc_path).unwrap();
 
         let output = serc()
-            .args(["compile", "--quiet"])
+            .args(["compile", "--force", "--quiet"])
             .arg(&source_path)
             .output()
             .unwrap();
@@ -2464,7 +2483,7 @@ fn compile_does_not_reuse_cache_symlinks_with_current_headers() {
     fs_err::write(&source, "pass\n").unwrap();
     let mut command = serc();
     command
-        .args(["compile", "--skip-current", "--output-format", "json"])
+        .args(["compile", "--output-format", "json"])
         .arg(&source);
     let output = command.output().unwrap();
     assert!(output.status.success(), "{output:?}");

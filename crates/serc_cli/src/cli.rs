@@ -113,12 +113,12 @@ struct CompileCommand {
     #[arg(long)]
     check: bool,
 
-    /// Reuse caches whose headers match the source and requested invalidation mode.
+    /// Recompile even when the existing cache is current.
     ///
-    /// Cache headers do not identify native build profiles. Omit this option to regenerate
+    /// Cache headers do not identify native build profiles. Use this option to regenerate
     /// bytecode after changing the compiler or native build profile.
-    #[arg(long, conflicts_with = "check")]
-    skip_current: bool,
+    #[arg(short, long)]
+    force: bool,
 
     /// Format of the success summary.
     #[arg(long, value_enum, default_value = "text")]
@@ -190,7 +190,7 @@ fn compile_command(command: CompileCommand) -> Result<ExitCode, String> {
             match compile_path(
                 path,
                 command.check,
-                command.skip_current,
+                command.force,
                 command.invalidation_mode,
                 &options,
                 cache_optimization,
@@ -234,7 +234,7 @@ fn compile_command(command: CompileCommand) -> Result<ExitCode, String> {
                             match compile_path(
                                 path,
                                 command.check,
-                                command.skip_current,
+                                command.force,
                                 command.invalidation_mode,
                                 &options,
                                 cache_optimization,
@@ -555,7 +555,7 @@ fn has_python_suffix(path: &Path) -> bool {
 fn compile_path(
     path: &Path,
     check: bool,
-    skip_current: bool,
+    force: bool,
     invalidation_mode: InvalidationMode,
     options: &CompileOptions,
     cache_optimization: usize,
@@ -563,7 +563,7 @@ fn compile_path(
     compile_path_with_metadata(
         path,
         check,
-        skip_current,
+        force,
         invalidation_mode,
         options,
         cache_optimization,
@@ -577,7 +577,7 @@ fn compile_path(
 fn compile_path_with_metadata(
     path: &Path,
     check: bool,
-    skip_current: bool,
+    force: bool,
     invalidation_mode: InvalidationMode,
     options: &CompileOptions,
     cache_optimization: usize,
@@ -596,7 +596,7 @@ fn compile_path_with_metadata(
         .transpose()?;
     let cached = output
         .as_deref()
-        .filter(|_| skip_current)
+        .filter(|_| !force)
         .and_then(read_cache_header);
     let mut expected = [0; 16];
     let mut source_mtime = 0;
@@ -1166,7 +1166,7 @@ mod tests {
         let compiled = compile_path_with_metadata(
             &source,
             false,
-            true,
+            false,
             InvalidationMode::Timestamp,
             &options,
             0,
