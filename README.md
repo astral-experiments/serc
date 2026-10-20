@@ -66,6 +66,30 @@ with `RAYON_NUM_THREADS`:
 serc compile --jobs 4 path/to/package
 ```
 
+Use `--files-from -` to read a list of files from standard input. Paths are
+newline-delimited by default; `--null` accepts NUL-delimited paths, including
+filenames that contain newlines:
+
+```console
+find path/to/package -type f -name '*.py' -print0 | serc compile --files-from - --null
+```
+
+The list selects individual files without scanning directories. On Unix, paths
+retain their original bytes; on Windows, the list must use UTF-8.
+
+Current `.pyc` files are left untouched by default. We compare the target
+bytecode format and invalidation mode, then the source's timestamp and size or
+its content hash. Pass `-f` or `--force` to rebuild every file, including after
+changing the compiler or native build profile. `--check` always compiles the
+sources without writing bytecode.
+
+For integrations, `--output-format json` reports the numbers of compiled and
+skipped files:
+
+```console
+serc compile --files-from - --null --output-format json
+```
+
 ### Python version
 
 Serc emits Python 3.14-compatible bytecode by default, but supports target

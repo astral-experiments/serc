@@ -86,6 +86,9 @@ fn hash_pyc_matches_cpython_for_raw_source_and_all_targets() {
             let module = compile_bytes_with_options(source, "module.py", &options).unwrap();
             let checked = module.to_hash_pyc(source, true);
             let unchecked = module.to_hash_pyc(source, false);
+            let source_hash = python_version.target().source_hash(source);
+            assert_eq!(module.to_hash_pyc_with_hash(source_hash, true), checked);
+            assert_eq!(module.to_hash_pyc_with_hash(source_hash, false), unchecked);
             let timestamp = module.to_timestamp_pyc(123, u32::try_from(source.len()).unwrap());
 
             assert_eq!(&checked[..4], &python_version.target().magic_number);

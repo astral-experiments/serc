@@ -54,6 +54,15 @@ pub struct CpythonTarget {
 }
 
 impl CpythonTarget {
+    /// Hash original source bytes for this target's hash-invalidated cache header.
+    pub fn source_hash(self, source: &[u8]) -> [u8; 8] {
+        // CPython's _imp.source_hash uses SipHash-1-3 keyed by the target magic.
+        let key = u64::from(u32::from_le_bytes(self.magic_number));
+        SipHasher13::new_with_keys(key, 0)
+            .hash(source)
+            .to_le_bytes()
+    }
+
     /// Return the dotted form of [`Self::version`].
     pub fn version_string(self) -> String {
         let (major, minor, micro) = self.version;
@@ -138,11 +147,15 @@ impl CompiledModule {
     ///
     /// Root-object references follow `py_compile`, as in [`Self::to_timestamp_pyc`].
     pub fn to_hash_pyc(&self, source: &[u8], checked: bool) -> Vec<u8> {
-        // CPython's _imp.source_hash uses SipHash-1-3 keyed by the target's magic
-        // number and serializes the resulting hash in little-endian order.
-        let key = u64::from(u32::from_le_bytes(self.target().magic_number));
-        let hash = SipHasher13::new_with_keys(key, 0).hash(source);
-        self.to_pyc(1 | (u32::from(checked) << 1), hash.to_le_bytes())
+        self.to_hash_pyc_with_hash(self.target().source_hash(source), checked)
+    }
+
+    /// Build a hash-invalidated cache using a previously computed source hash.
+    ///
+    /// Compute `source_hash` with [`CpythonTarget::source_hash`] using this module's target
+    /// and the original source bytes. `checked` has the same meaning as in [`Self::to_hash_pyc`].
+    pub fn to_hash_pyc_with_hash(&self, source_hash: [u8; 8], checked: bool) -> Vec<u8> {
+        self.to_pyc(1 | (u32::from(checked) << 1), source_hash)
     }
 
     fn to_pyc(&self, flags: u32, metadata: [u8; 8]) -> Vec<u8> {

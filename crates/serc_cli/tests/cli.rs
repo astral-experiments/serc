@@ -3,19 +3,391 @@ mod common;
 mod except_star_transfers;
 
 use std::fmt::Write as _;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, UNIX_EPOCH};
 
 fn serc() -> Command {
     Command::new(env!("CARGO_BIN_EXE_serc"))
 }
 
-/// Compiles a source with the CLI while leaving its assertions to the caller.
+fn with_stdin(command: &mut Command, input: &[u8]) -> Output {
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn compile_file_lists_preserve_paths_and_deduplicate() {
+    let directory = tempfile::tempdir().unwrap();
+    fs_err::write(directory.path().join("first file.py"), "answer = 42\n").unwrap();
+    fs_err::write(directory.path().join("second.py"), "pass\n").unwrap();
+    fs_err::write(directory.path().join("ignored.py"), "invalid syntax\n").unwrap();
+
+    let output = with_stdin(
+        serc().current_dir(directory.path()).args([
+            "compile",
+            "--files-from",
+            "-",
+            "--null",
+            "--jobs",
+            "2",
+            "--output-format",
+            "json",
+        ]),
+        b"second.py\0first file.py\0second.py\0",
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"{\"compiled\":2,\"skipped\":0}\n");
+
+    let manifest = directory.path().join("inputs.txt");
+    fs_err::write(&manifest, "first file.py\r\nsecond.py\n").unwrap();
+    let output = serc()
+        .current_dir(directory.path())
+        .args([
+            "compile",
+            "--files-from",
+            "inputs.txt",
+            "--output-format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"{\"compiled\":0,\"skipped\":2}\n");
+}
+
+#[test]
+fn compile_empty_file_list_does_not_discover_current_directory() {
+    let directory = tempfile::tempdir().unwrap();
+    fs_err::write(directory.path().join("invalid.py"), "invalid syntax\n").unwrap();
+    let output = with_stdin(
+        serc().current_dir(directory.path()).args([
+            "compile",
+            "--files-from",
+            "-",
+            "--null",
+            "--output-format",
+            "json",
+        ]),
+        b"",
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"{\"compiled\":0,\"skipped\":0}\n");
+    assert!(!directory.path().join("__pycache__").exists());
+}
+
+#[test]
+fn compile_file_list_rejects_directories() {
+    let directory = tempfile::tempdir().unwrap();
+    fs_err::write(directory.path().join("module.py"), "pass\n").unwrap();
+    let output = with_stdin(
+        serc()
+            .current_dir(directory.path())
+            .args(["compile", "--files-from", "-", "--null"]),
+        b".\0",
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains(". is not a file"));
+    assert!(!directory.path().join("__pycache__").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn compile_null_file_list_preserves_newline_names() {
+    let directory = tempfile::tempdir().unwrap();
+    fs_err::write(directory.path().join("new\nline.py"), "pass\n").unwrap();
+    let output = with_stdin(
+        serc().current_dir(directory.path()).args([
+            "compile",
+            "--files-from",
+            "-",
+            "--null",
+            "--output-format",
+            "json",
+        ]),
+        b"new\nline.py\0",
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"{\"compiled\":1,\"skipped\":0}\n");
+    assert!(
+        directory
+            .path()
+            .join("__pycache__/new\nline.cpython-314.pyc")
+            .is_file()
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn compile_null_file_list_preserves_non_utf8_names() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let name = OsStr::from_bytes(b"new\nline \xff.py");
+    fs_err::write(directory.path().join(name), "pass\n").unwrap();
+    let output = with_stdin(
+        serc().current_dir(directory.path()).args([
+            "compile",
+            "--files-from",
+            "-",
+            "--null",
+            "--output-format",
+            "json",
+        ]),
+        b"new\nline \xff.py\0",
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"{\"compiled\":1,\"skipped\":0}\n");
+    assert!(
+        directory
+            .path()
+            .join("__pycache__")
+            .join(OsStr::from_bytes(b"new\nline \xff.cpython-314.pyc"))
+            .is_file()
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn compile_file_list_rejects_invalid_utf8() {
+    let output = with_stdin(
+        serc().args(["compile", "--files-from", "-", "--null"]),
+        b"\xff.py\0",
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("file paths must be UTF-8"));
+}
+
+#[test]
+fn compile_reuses_current_timestamp_caches() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("module.py");
+    let cache = directory.path().join("__pycache__/module.cpython-314.pyc");
+    fs_err::write(&source, "answer = 42\n").unwrap();
+    let modified = fs_err::metadata(&source).unwrap().modified().unwrap();
+    let output = serc()
+        .args(["compile", "--output-format", "json"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"{\"compiled\":1,\"skipped\":0}\n");
+    let original = fs_err::read(&cache).unwrap();
+    let marker = UNIX_EPOCH + Duration::from_secs(1_000_000);
+    fs_err::File::options()
+        .write(true)
+        .open(&cache)
+        .unwrap()
+        .set_modified(marker)
+        .unwrap();
+
+    fs_err::write(&source, "answer = 43\n").unwrap();
+    fs_err::File::options()
+        .write(true)
+        .open(&source)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    let output = serc()
+        .args(["compile", "--output-format", "json"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"{\"compiled\":0,\"skipped\":1}\n");
+    assert_eq!(fs_err::read(&cache).unwrap(), original);
+    assert_eq!(
+        fs_err::metadata(&cache).unwrap().modified().unwrap(),
+        marker
+    );
+
+    fs_err::write(&source, "answer = 430\n").unwrap();
+    fs_err::File::options()
+        .write(true)
+        .open(&source)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    let output = serc()
+        .args(["compile", "--output-format", "json"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"{\"compiled\":1,\"skipped\":0}\n");
+
+    fs_err::write(&source, "answer = 431\n").unwrap();
+    fs_err::File::options()
+        .write(true)
+        .open(&source)
+        .unwrap()
+        .set_modified(modified + Duration::from_secs(2))
+        .unwrap();
+    let output = serc()
+        .args(["compile", "--output-format", "json"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"{\"compiled\":1,\"skipped\":0}\n");
+    assert_ne!(fs_err::read(&cache).unwrap(), original);
+}
+
+#[test]
+fn compile_reuses_hash_caches_and_refreshes_changed_sources() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("module.py");
+    let cache = directory.path().join("__pycache__/module.cpython-314.pyc");
+    fs_err::write(&source, "answer = 42\n").unwrap();
+    let mut command = serc();
+    command
+        .args(["compile", "--output-format", "json"])
+        .arg(&source)
+        .args(["--invalidation-mode", "checked-hash"]);
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"{\"compiled\":1,\"skipped\":0}\n");
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"{\"compiled\":0,\"skipped\":1}\n");
+    assert_eq!(&fs_err::read(&cache).unwrap()[4..8], &[3, 0, 0, 0]);
+
+    let mut command = serc();
+    command
+        .args(["compile", "--output-format", "json"])
+        .arg(&source)
+        .args(["--invalidation-mode", "unchecked-hash"]);
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"{\"compiled\":1,\"skipped\":0}\n");
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"{\"compiled\":0,\"skipped\":1}\n");
+    assert_eq!(&fs_err::read(&cache).unwrap()[4..8], &[1, 0, 0, 0]);
+
+    let modified = fs_err::metadata(&source).unwrap().modified().unwrap();
+    fs_err::write(&source, "answer = 43\n").unwrap();
+    fs_err::File::options()
+        .write(true)
+        .open(&source)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"{\"compiled\":1,\"skipped\":0}\n");
+    assert_eq!(
+        &fs_err::read(&cache).unwrap()[8..16],
+        serc::CPYTHON_TARGET.source_hash(b"answer = 43\n")
+    );
+}
+
+#[test]
+fn compile_refreshes_invalid_cache_headers() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("module.py");
+    let cache = directory.path().join("__pycache__/module.cpython-314.pyc");
+    fs_err::write(&source, "pass\n").unwrap();
+    let mut command = serc();
+    command
+        .args(["compile", "--output-format", "json"])
+        .arg(&source);
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let expected = fs_err::read(&cache).unwrap();
+
+    let mut wrong_magic = expected.clone();
+    wrong_magic[0] = 0;
+    fs_err::write(&cache, wrong_magic).unwrap();
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"{\"compiled\":1,\"skipped\":0}\n");
+    assert_eq!(fs_err::read(&cache).unwrap(), expected);
+
+    fs_err::write(&cache, &expected[..12]).unwrap();
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"{\"compiled\":1,\"skipped\":0}\n");
+    assert_eq!(fs_err::read(&cache).unwrap(), expected);
+}
+
+#[test]
+fn compile_force_rebuilds_current_cache() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("module.py");
+    let cache = directory.path().join("__pycache__/module.cpython-314.pyc");
+    fs_err::write(&source, "pass\n").unwrap();
+    let output = serc().arg("compile").arg(&source).output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"Compiled 1 file\n");
+    let expected = fs_err::read(&cache).unwrap();
+    let marker = UNIX_EPOCH + Duration::from_secs(1_000_000);
+    fs_err::File::options()
+        .write(true)
+        .open(&cache)
+        .unwrap()
+        .set_modified(marker)
+        .unwrap();
+
+    let output = serc()
+        .args(["compile", "--force", "--output-format", "json"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"{\"compiled\":1,\"skipped\":0}\n");
+    assert_eq!(fs_err::read(&cache).unwrap(), expected);
+    assert_ne!(
+        fs_err::metadata(&cache).unwrap().modified().unwrap(),
+        marker
+    );
+}
+
+#[test]
+fn check_compiles_current_caches_without_writing() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("module.py");
+    let cache = directory.path().join("__pycache__/module.cpython-314.pyc");
+    fs_err::write(&source, "pass\n").unwrap();
+    let output = serc().arg("compile").arg(&source).output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let expected = fs_err::read(&cache).unwrap();
+    let marker = UNIX_EPOCH + Duration::from_secs(1_000_000);
+    fs_err::File::options()
+        .write(true)
+        .open(&cache)
+        .unwrap()
+        .set_modified(marker)
+        .unwrap();
+
+    let output = serc()
+        .args(["compile", "--check", "--output-format", "json"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"{\"compiled\":1,\"skipped\":0}\n");
+    assert_eq!(fs_err::read(&cache).unwrap(), expected);
+    assert_eq!(
+        fs_err::metadata(&cache).unwrap().modified().unwrap(),
+        marker
+    );
+}
+
+/// Recompiles a source with the CLI while leaving its assertions to the caller.
 fn compile_for_version(source: &Path, version: serc::PythonVersion) -> Output {
     serc()
         .args([
             "compile",
+            "--force",
             "--quiet",
             "--python-version",
             &version.to_string(),
@@ -204,6 +576,7 @@ fn compile_optimization_modes_match_cpython_and_use_distinct_caches() {
             let output = serc()
                 .args([
                     "compile",
+                    "--force",
                     "--quiet",
                     "--python-version",
                     &version.to_string(),
@@ -1507,7 +1880,7 @@ fn parallel_compile_orders_outputs_in_aliased_cache_directories() {
         [alias.join("module.py"), first.join("module.py")],
     ] {
         let serial = serc()
-            .args(["compile", "--jobs", "1"])
+            .args(["compile", "--force", "--jobs", "1"])
             .args(&sources)
             .output()
             .unwrap();
@@ -1515,7 +1888,7 @@ fn parallel_compile_orders_outputs_in_aliased_cache_directories() {
         let expected = fs_err::read(&output).unwrap();
         fs_err::remove_file(&output).unwrap();
         let parallel = serc()
-            .args(["compile", "--jobs", "2"])
+            .args(["compile", "--force", "--jobs", "2"])
             .args(sources)
             .output()
             .unwrap();
@@ -1529,7 +1902,7 @@ fn parallel_compile_orders_outputs_in_aliased_cache_directories() {
     let output = first.join("__pycache__/module.cpython-314.pyc");
     let sources = [alias.join("module.py"), first.join("module.py")];
     let serial = serc()
-        .args(["compile", "--jobs", "1"])
+        .args(["compile", "--force", "--jobs", "1"])
         .args(&sources)
         .output()
         .unwrap();
@@ -1537,7 +1910,7 @@ fn parallel_compile_orders_outputs_in_aliased_cache_directories() {
     let expected = fs_err::read(&output).unwrap();
     fs_err::remove_dir_all(first.join("__pycache__")).unwrap();
     let parallel = serc()
-        .args(["compile", "--jobs", "2"])
+        .args(["compile", "--force", "--jobs", "2"])
         .args(sources)
         .output()
         .unwrap();
@@ -1565,7 +1938,7 @@ fn parallel_compile_matches_serial_for_filesystem_case_and_unicode_aliases() {
 
         let inputs = [&second, &first, &other];
         let serial = serc()
-            .args(["compile", "--jobs", "1"])
+            .args(["compile", "--force", "--jobs", "1"])
             .args(inputs)
             .output()
             .unwrap();
@@ -1577,7 +1950,7 @@ fn parallel_compile_matches_serial_for_filesystem_case_and_unicode_aliases() {
         for _ in 0..3 {
             fs_err::remove_dir_all(&cache_directory).unwrap();
             let parallel = serc()
-                .args(["compile", "--jobs", "4"])
+                .args(["compile", "--force", "--jobs", "4"])
                 .args(inputs)
                 .output()
                 .unwrap();
@@ -1985,7 +2358,7 @@ fn compile_matches_cpython_for_utf8_encoding_cookies() {
         let expected = fs_err::read(&pyc_path).unwrap();
 
         let output = serc()
-            .args(["compile", "--quiet"])
+            .args(["compile", "--force", "--quiet"])
             .arg(&source_path)
             .output()
             .unwrap();
@@ -2096,6 +2469,33 @@ fn compile_replaces_a_cache_symlink_without_following_it() {
     assert!(output.status.success(), "{output:?}");
     assert_eq!(fs_err::read_to_string(victim).unwrap(), "keep me");
     assert!(fs_err::symlink_metadata(pyc_path).unwrap().is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn compile_does_not_reuse_cache_symlinks_with_current_headers() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("module.py");
+    let cache = directory.path().join("__pycache__/module.cpython-314.pyc");
+    let target = directory.path().join("target.pyc");
+    fs_err::write(&source, "pass\n").unwrap();
+    let mut command = serc();
+    command
+        .args(["compile", "--output-format", "json"])
+        .arg(&source);
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let expected = fs_err::read(&cache).unwrap();
+    fs_err::rename(&cache, &target).unwrap();
+    symlink(&target, &cache).unwrap();
+
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"{\"compiled\":1,\"skipped\":0}\n");
+    assert!(fs_err::symlink_metadata(&cache).unwrap().is_file());
+    assert_eq!(fs_err::read(target).unwrap(), expected);
 }
 
 #[test]

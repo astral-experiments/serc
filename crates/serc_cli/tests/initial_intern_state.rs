@@ -41,6 +41,7 @@ def second(x):
             let mut compiler = Command::new(env!("CARGO_BIN_EXE_serc"));
             compiler.current_dir(directory.path()).args([
                 "compile",
+                "--force",
                 "--quiet",
                 "--invalidation-mode",
                 "checked-hash",

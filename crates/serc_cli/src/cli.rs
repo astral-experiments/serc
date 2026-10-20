@@ -54,11 +54,35 @@ enum InvalidationMode {
     UncheckedHash,
 }
 
+impl InvalidationMode {
+    fn flags(self) -> u32 {
+        match self {
+            Self::Timestamp => 0,
+            Self::CheckedHash => 3,
+            Self::UncheckedHash => 1,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum OutputFormat {
+    Text,
+    Json,
+}
+
 #[derive(Debug, clap::Args)]
 struct CompileCommand {
     /// Python files or directories to compile [default: .]
     #[arg(value_hint = ValueHint::AnyPath)]
     paths: Vec<PathBuf>,
+
+    /// Read file paths from a newline-delimited manifest, or standard input with -.
+    #[arg(long, value_name = "FILE", conflicts_with = "paths")]
+    files_from: Option<PathBuf>,
+
+    /// Separate manifest paths with NUL bytes instead of newlines.
+    #[arg(long, requires = "files_from")]
+    null: bool,
 
     /// Python language and bytecode version to target (3.12, 3.13, 3.14, or 3.15).
     #[arg(long, default_value_t = PythonVersion::default())]
@@ -89,6 +113,17 @@ struct CompileCommand {
     #[arg(long)]
     check: bool,
 
+    /// Recompile even when the existing cache is current.
+    ///
+    /// Cache headers do not identify native build profiles. Use this option to regenerate
+    /// bytecode after changing the compiler or native build profile.
+    #[arg(short, long)]
+    force: bool,
+
+    /// Format of the success summary.
+    #[arg(long, value_enum, default_value = "text")]
+    output_format: OutputFormat,
+
     /// Suppress the success summary.
     #[arg(short, long)]
     quiet: bool,
@@ -111,13 +146,19 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
 }
 
 fn compile_command(command: CompileCommand) -> Result<ExitCode, String> {
-    let roots = if command.paths.is_empty() {
-        vec![PathBuf::from(".")]
+    let (paths, source_sizes) = if let Some(manifest) = &command.files_from {
+        let (paths, source_sizes) = read_file_list(manifest, command.null)?;
+        (paths, Some(source_sizes))
     } else {
-        command.paths
+        let roots = if command.paths.is_empty() {
+            vec![PathBuf::from(".")]
+        } else {
+            command.paths
+        };
+        (discover(&roots)?, None)
     };
-    let paths = discover(&roots)?;
     let mut failures = 0_usize;
+    let skipped = AtomicUsize::new(0);
     // Code generation has three levels, but Python keeps every `-O` in the cache tag.
     let cache_optimization = command
         .optimize
@@ -146,15 +187,22 @@ fn compile_command(command: CompileCommand) -> Result<ExitCode, String> {
     );
     if jobs <= 1 {
         for path in &paths {
-            if let Err(message) = compile_path(
+            match compile_path(
                 path,
                 command.check,
+                command.force,
                 command.invalidation_mode,
                 &options,
                 cache_optimization,
             ) {
-                failures += 1;
-                write_error(&message);
+                Ok(true) => {}
+                Ok(false) => {
+                    skipped.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(message) => {
+                    failures += 1;
+                    write_error(&message);
+                }
             }
         }
     } else {
@@ -172,7 +220,7 @@ fn compile_command(command: CompileCommand) -> Result<ExitCode, String> {
                     .map(|(index, path)| vec![(index, path.as_path())])
                     .collect()
             });
-            let groups = prioritize_compilation_groups(groups, jobs);
+            let groups = prioritize_compilation_groups(groups, jobs, source_sizes.as_deref());
             let next_group = AtomicUsize::new(0);
             (0..jobs.min(groups.len()))
                 .into_par_iter()
@@ -183,15 +231,21 @@ fn compile_command(command: CompileCommand) -> Result<ExitCode, String> {
                     std::iter::from_fn(|| groups.get(next_group.fetch_add(1, Ordering::Relaxed)))
                         .flatten()
                         .filter_map(|&(index, path)| {
-                            compile_path(
+                            match compile_path(
                                 path,
                                 command.check,
+                                command.force,
                                 command.invalidation_mode,
                                 &options,
                                 cache_optimization,
-                            )
-                            .err()
-                            .map(|message| (index, message))
+                            ) {
+                                Ok(true) => None,
+                                Ok(false) => {
+                                    skipped.fetch_add(1, Ordering::Relaxed);
+                                    None
+                                }
+                                Err(message) => Some((index, message)),
+                            }
                         })
                 })
                 .collect()
@@ -212,13 +266,70 @@ fn compile_command(command: CompileCommand) -> Result<ExitCode, String> {
     }
 
     if !command.quiet {
-        let noun = if paths.len() == 1 { "file" } else { "files" };
+        let skipped = skipped.load(Ordering::Relaxed);
+        let compiled = paths.len() - skipped;
+        let noun = if compiled == 1 { "file" } else { "files" };
         let mut stdout = io::stdout().lock();
-        writeln!(stdout, "Compiled {} {noun}", paths.len())
-            .map_err(|error| format!("failed to write to stdout: {error}"))?;
+        match command.output_format {
+            OutputFormat::Json => {
+                writeln!(stdout, "{{\"compiled\":{compiled},\"skipped\":{skipped}}}")
+            }
+            OutputFormat::Text if skipped == 0 => writeln!(stdout, "Compiled {compiled} {noun}"),
+            OutputFormat::Text => {
+                writeln!(stdout, "Compiled {compiled} {noun}, skipped {skipped}")
+            }
+        }
+        .map_err(|error| format!("failed to write to stdout: {error}"))?;
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+/// Read exact file paths without applying directory discovery or a default input.
+///
+/// Retain validated sizes as scheduling hints; workers still load fresh metadata before reading.
+fn read_file_list(manifest: &Path, null: bool) -> Result<(Vec<PathBuf>, Vec<u64>), String> {
+    let mut contents = Vec::new();
+    if manifest == Path::new("-") {
+        io::stdin()
+            .lock()
+            .read_to_end(&mut contents)
+            .map_err(|error| format!("failed to read file paths from stdin: {error}"))?;
+    } else {
+        contents = fs_err::read(manifest)
+            .map_err(|error| format!("failed to read {}: {error}", manifest.display()))?;
+    }
+    let separator = if null { b'\0' } else { b'\n' };
+    let mut paths = Vec::new();
+    for path in contents.split(|&byte| byte == separator) {
+        let path = if null {
+            path
+        } else {
+            path.strip_suffix(b"\r").unwrap_or(path)
+        };
+        if path.is_empty() {
+            continue;
+        }
+        #[cfg(unix)]
+        let path = {
+            use std::os::unix::ffi::OsStrExt;
+            PathBuf::from(std::ffi::OsStr::from_bytes(path))
+        };
+        #[cfg(not(unix))]
+        let path = PathBuf::from(
+            std::str::from_utf8(path)
+                .map_err(|error| format!("file paths must be UTF-8 on this platform: {error}"))?,
+        );
+        let metadata = fs_err::metadata(&path)
+            .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?;
+        if !metadata.is_file() {
+            return Err(format!("{} is not a file", path.display()));
+        }
+        paths.push((path, metadata.len()));
+    }
+    paths.sort_by(|(left, _), (right, _)| left.cmp(right));
+    paths.dedup_by(|(left, _), (right, _)| left == right);
+    Ok(paths.into_iter().unzip())
 }
 
 /// Follow Rayon's environment and CPU defaults without starting idle workers for small inputs.
@@ -272,14 +383,18 @@ fn prepare_compilation(
 }
 
 /// Start the most expensive independent groups first, retaining order within aliased outputs.
-fn prioritize_compilation_groups(
-    mut groups: Vec<CompilationGroup<'_>>,
+fn prioritize_compilation_groups<'a>(
+    mut groups: Vec<CompilationGroup<'a>>,
     jobs: usize,
-) -> Vec<CompilationGroup<'_>> {
+    source_sizes: Option<&[u64]>,
+) -> Vec<CompilationGroup<'a>> {
     if groups.len() > jobs {
         groups.sort_by_cached_key(|group| {
-            let size = group.iter().fold(0_u64, |total, (_, path)| {
-                total.saturating_add(fs_err::metadata(path).map_or(0, |metadata| metadata.len()))
+            let size = group.iter().fold(0_u64, |total, (index, path)| {
+                total.saturating_add(source_sizes.map_or_else(
+                    || fs_err::metadata(path).map_or(0, |metadata| metadata.len()),
+                    |sizes| sizes[*index],
+                ))
             });
             (std::cmp::Reverse(size), group[0].0)
         });
@@ -306,11 +421,13 @@ fn compilation_groups(
             .and_then(|output| {
                 let parent = output.parent()?;
                 let filename = output.file_name()?;
-                let directory = Arc::clone(
-                    directories
-                        .entry(parent.to_owned())
-                        .or_insert_with(|| Arc::new(cache_directory_identity(parent))),
-                );
+                let directory = if let Some(directory) = directories.get(parent) {
+                    Arc::clone(directory)
+                } else {
+                    let directory = Arc::new(cache_directory_identity(parent));
+                    directories.insert(parent.to_owned(), Arc::clone(&directory));
+                    directory
+                };
                 unknown_directory |= matches!(directory.as_ref(), CacheDirectoryIdentity::Unknown);
                 if !filename.as_encoded_bytes().is_ascii() {
                     non_ascii_directories.insert(Arc::clone(&directory));
@@ -438,13 +555,15 @@ fn has_python_suffix(path: &Path) -> bool {
 fn compile_path(
     path: &Path,
     check: bool,
+    force: bool,
     invalidation_mode: InvalidationMode,
     options: &CompileOptions,
     cache_optimization: usize,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     compile_path_with_metadata(
         path,
         check,
+        force,
         invalidation_mode,
         options,
         cache_optimization,
@@ -452,17 +571,18 @@ fn compile_path(
     )
 }
 
-/// Compiles a source file, optionally replacing its cache.
+/// Compile a source file, returning false when its existing cache is current.
 ///
 /// Check mode skips both the metadata loader and cache output.
 fn compile_path_with_metadata(
     path: &Path,
     check: bool,
+    force: bool,
     invalidation_mode: InvalidationMode,
     options: &CompileOptions,
     cache_optimization: usize,
     load_metadata: impl FnOnce(&Path) -> io::Result<std::fs::Metadata>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     // Snapshot timestamp-cache metadata before reading. If the path changes during compilation,
     // the resulting header describes the old state and cannot validate the new source as fresh.
     let metadata = (!check)
@@ -471,8 +591,40 @@ fn compile_path_with_metadata(
                 .map_err(|error| format!("failed to inspect {}: {error}", path.display()))
         })
         .transpose()?;
+    let output = (!check)
+        .then(|| cache_path(path, options.python_version, cache_optimization))
+        .transpose()?;
+    let cached = output
+        .as_deref()
+        .filter(|_| !force)
+        .and_then(read_cache_header);
+    let mut expected = [0; 16];
+    let mut source_mtime = 0;
+    expected[..4].copy_from_slice(&options.python_version.target().magic_number);
+    expected[4..8].copy_from_slice(&invalidation_mode.flags().to_le_bytes());
+    if let Some(metadata) = &metadata
+        && let InvalidationMode::Timestamp = invalidation_mode
+    {
+        let modified = metadata
+            .modified()
+            .map_err(|error| format!("failed to read the mtime for {}: {error}", path.display()))?;
+        source_mtime = encode_mtime(modified);
+        expected[8..12].copy_from_slice(&source_mtime.to_le_bytes());
+        expected[12..].copy_from_slice(&low_u32(metadata.len()).to_le_bytes());
+        if cached == Some(expected) {
+            return Ok(false);
+        }
+    }
     let source_bytes = read_source(path, metadata.as_ref())
         .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    let source_hash = (!check && invalidation_mode.flags() != 0)
+        .then(|| options.python_version.target().source_hash(&source_bytes));
+    if let Some(source_hash) = source_hash {
+        expected[8..].copy_from_slice(&source_hash);
+        if cached == Some(expected) {
+            return Ok(false);
+        }
+    }
     let module =
         compile_bytes_with_path_and_options(&source_bytes, path, options).map_err(|error| {
             match &error {
@@ -483,22 +635,16 @@ fn compile_path_with_metadata(
             }
         })?;
 
-    let Some(metadata) = metadata else {
+    let (Some(metadata), Some(output)) = (metadata, output) else {
         black_box(module);
-        return Ok(());
+        return Ok(true);
     };
 
-    let pyc = match invalidation_mode {
-        InvalidationMode::Timestamp => {
-            let modified = metadata.modified().map_err(|error| {
-                format!("failed to read the mtime for {}: {error}", path.display())
-            })?;
-            module.to_timestamp_pyc(encode_mtime(modified), low_u32(metadata.len()))
-        }
-        InvalidationMode::CheckedHash => module.to_hash_pyc(&source_bytes, true),
-        InvalidationMode::UncheckedHash => module.to_hash_pyc(&source_bytes, false),
+    let pyc = if let Some(source_hash) = source_hash {
+        module.to_hash_pyc_with_hash(source_hash, invalidation_mode.flags() == 3)
+    } else {
+        module.to_timestamp_pyc(source_mtime, low_u32(metadata.len()))
     };
-    let output = cache_path(path, options.python_version, cache_optimization)?;
 
     let parent = output.parent().ok_or_else(|| {
         format!(
@@ -519,8 +665,22 @@ fn compile_path_with_metadata(
         .map_err(|error| format!("failed to write a temporary cache file: {error}"))?;
     temporary
         .persist(&output)
-        .map(|_| ())
+        .map(|_| true)
         .map_err(|error| format!("failed to replace {}: {error}", output.display()))
+}
+
+/// Treat missing, unreadable, truncated, and nonregular cache destinations as misses.
+fn read_cache_header(output: &Path) -> Option<[u8; 16]> {
+    // Never follow an output symlink. Compilation replaces it atomically instead.
+    if !fs_err::symlink_metadata(output).ok()?.is_file() {
+        return None;
+    }
+    let mut header = [0; 16];
+    fs_err::File::open(output)
+        .ok()?
+        .read_exact(&mut header)
+        .ok()?;
+    Some(header)
 }
 
 /// Reuse the timestamp snapshot as a size hint without querying the opened file again.
@@ -664,7 +824,7 @@ mod tests {
     use super::{
         InvalidationMode, cache_path, cache_tag, compilation_groups, compile_path_with_metadata,
         discover, encode_mtime, has_python_suffix, prepare_compilation,
-        prioritize_compilation_groups,
+        prioritize_compilation_groups, read_file_list,
     };
     use super::{default_jobs, jobs_for_inputs};
     use serc::{CompileOptions, PythonVersion};
@@ -831,12 +991,44 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(
-            indices(prioritize_compilation_groups(groups.clone(), 4)),
+            indices(prioritize_compilation_groups(groups.clone(), 4, None)),
             [vec![0, 3], vec![1, 4], vec![2], vec![5]]
         );
         assert_eq!(
-            indices(prioritize_compilation_groups(groups, 2)),
+            indices(prioritize_compilation_groups(groups.clone(), 2, None)),
             [vec![2], vec![0, 3], vec![1, 4], vec![5]]
+        );
+        assert_eq!(
+            indices(prioritize_compilation_groups(
+                groups,
+                2,
+                Some(&[1, 4, 12, 9, 6, 20]),
+            )),
+            [vec![5], vec![2], vec![0, 3], vec![1, 4]]
+        );
+    }
+
+    #[test]
+    fn file_lists_keep_source_sizes_aligned_after_sorting_and_deduplication() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.py");
+        let second = directory.path().join("second.py");
+        fs_err::write(&first, b"x = 1\n").unwrap();
+        fs_err::write(&second, b"x = 123\n").unwrap();
+        let manifest = directory.path().join("files.txt");
+        fs_err::write(
+            &manifest,
+            format!(
+                "{}\n{}\n{}\n",
+                second.display(),
+                first.display(),
+                second.display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            read_file_list(&manifest, false).unwrap(),
+            (vec![first, second], vec![6, 8])
         );
     }
 
@@ -933,6 +1125,7 @@ mod tests {
         compile_path_with_metadata(
             &source_path,
             false,
+            false,
             InvalidationMode::Timestamp,
             &CompileOptions::default(),
             0,
@@ -955,6 +1148,39 @@ mod tests {
     }
 
     #[test]
+    fn current_timestamp_cache_does_not_read_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("module.py");
+        fs_err::write(&source, "pass\n").unwrap();
+        let options = CompileOptions::default();
+        compile_path_with_metadata(
+            &source,
+            false,
+            false,
+            InvalidationMode::Timestamp,
+            &options,
+            0,
+            |path| fs_err::metadata(path),
+        )
+        .unwrap();
+        let compiled = compile_path_with_metadata(
+            &source,
+            false,
+            false,
+            InvalidationMode::Timestamp,
+            &options,
+            0,
+            |path| {
+                let metadata = fs_err::metadata(path)?;
+                fs_err::remove_file(path)?;
+                Ok(metadata)
+            },
+        )
+        .unwrap();
+        assert!(!compiled);
+    }
+
+    #[test]
     fn reads_replaced_sources_through_eof_with_the_original_metadata() {
         let directory = tempfile::tempdir().unwrap();
         let source_path = directory.path().join("module.py");
@@ -972,6 +1198,7 @@ mod tests {
             drop(source);
             compile_path_with_metadata(
                 &source_path,
+                false,
                 false,
                 InvalidationMode::Timestamp,
                 &CompileOptions::default(),
@@ -1007,6 +1234,7 @@ mod tests {
 
         let error = compile_path_with_metadata(
             &source_path,
+            false,
             false,
             InvalidationMode::Timestamp,
             &CompileOptions::default(),
