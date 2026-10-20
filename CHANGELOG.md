@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.1.8
+
+Released on 2026-10-20.
+
+Serc 0.1.8 speeds up fully cached compilation and validates bytecode
+destinations before writing.
+
+### Bug fixes
+
+- Reject symlinks and other non-regular `.pyc` destinations before writing,
+  including with `--force` (astral-sh/serc#1357;
+  https://github.com/astral-sh/serc/pull/1357)
+
+### Performance
+
+- Speed up fully cached compilation batches by skipping output grouping and
+  compilation scheduling when every requested `.pyc` file is current
+  (astral-sh/serc#1357; https://github.com/astral-sh/serc/pull/1357)
+
 ## 0.1.7
 
 Released on 2026-10-20.
