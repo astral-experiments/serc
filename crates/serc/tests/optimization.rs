@@ -18959,6 +18959,33 @@ fn erased_assertions_preserve_original_conditional_and_handler_blocks() {
         pass
 
 
+def generator_join(flag, items):
+    if flag:
+        result = set(item.value for item in items)
+        assert result
+    else:
+        consume(items)
+
+
+def tuple_join(flag, items):
+    if flag:
+        result = tuple(item + 1 for item in items)
+        assert result
+    else:
+        result = items
+
+
+def nested_generator_join(outer, flag, items):
+    if outer:
+        if flag:
+            result = all(item.value for item in items)
+            assert result
+        else:
+            items.pop()
+    else:
+        fallback()
+
+
 def consecutive_cleanups(condition):
     try:
         work()

@@ -63,3 +63,29 @@ def manager_shared_exit(manager, a, b):
             assert a
         else:
             return b
+
+
+def nested_validation(enabled, cached, check, value):
+    if enabled:
+        if cached:
+            assert value
+        else:
+            prepare(value)
+            if check:
+                assert value
+    else:
+        assert enabled
+    finish()
+
+
+def nested_range_validation(enabled, cached, low, value, high):
+    if enabled:
+        if cached:
+            assert value
+        else:
+            if low < value < high:
+                assert value
+            assert high
+    else:
+        assert enabled
+    finish()

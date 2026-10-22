@@ -160,7 +160,9 @@ def get_projects():
         with self.assertRaisesRegex(corpus.CorpusError, "invalid revision"):
             corpus.validate_lock(short)
 
-    def test_check_compares_selected_levels_against_one_verified_reference(self) -> None:
+    def test_check_compares_selected_levels_against_one_verified_reference(
+        self,
+    ) -> None:
         lock = {"repositories": [{"id": "example"}]}
         for options, levels in (
             ([], [0, 1, 2]),
@@ -188,7 +190,10 @@ def get_projects():
                     [int(cmd[cmd.index("--optimize") + 1]) for cmd in commands], levels
                 )
                 self.assertTrue(
-                    all(cmd[cmd.index("--reference") + 1] == reference for cmd in commands)
+                    all(
+                        cmd[cmd.index("--reference") + 1] == reference
+                        for cmd in commands
+                    )
                 )
 
     def test_compatibility_command_accounts_for_every_outcome(self) -> None:

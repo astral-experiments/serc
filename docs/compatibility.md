@@ -107,6 +107,6 @@ all 73,537 files at optimization levels 0, 1, and 2. Each level must produce
 mismatches. CPython must reject 160 inputs at each level, with 157 matched
 rejections, one rejection mismatch, and two compiler failures.
 
-Append `--optimize 1` to check one level. Append `--limit 100` to check a
-sorted prefix with `--require-all`. Snapshot identity and update instructions
-live in the [corpus guide](../corpora/README.md).
+Append `--optimize 1` to check one level. Append `--limit 100` to check a sorted
+prefix with `--require-all`. Snapshot identity and update instructions live in
+the [corpus guide](../corpora/README.md).

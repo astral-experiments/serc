@@ -674,6 +674,8 @@ pub(super) struct StatementState {
     pub(super) in_terminal_if_branch_suite: bool,
     // A sibling terminal arm delays copying a nested while break onto the comparison edge.
     terminal_if_branch_has_siblings: bool,
+    // An enclosing tested arm jumps past a later clause before reaching the return.
+    terminal_if_branch_has_forward_exit: bool,
     // An assignment whose implicit return starts at the terminal if's outer join.
     terminal_assignment_return_boundary: Option<TextRange>,
     // Whether a final assertion may split its successful terminal-branch returns.
@@ -3679,13 +3681,17 @@ impl<'source> Compiler<'source> {
             .is_some_and(|statement| {
                 // A conditional value can leave only STORE_FAST before the outer jump,
                 // so its copied return still fits four slots. A linear value adds a load,
-                // and a call adds CALL after its arguments rejoin. Together with the
-                // replaced jump NOP, either puts the exit over the four-slot limit.
+                // and an ordinary call adds CALL after its arguments rejoin. A
+                // specialized generator call rejoins after its fast and fallback
+                // paths have produced the result, leaving only the store there. An
+                // enclosing arm's exit jump pushes this copy past four slots.
                 matches!(statement, Stmt::Assign(assignment)
                     if !has_later_arm
                         || !matches!(assignment.targets.as_slice(), [Expr::Name(_)])
                         || ((!expression_contains_inline_branch(&assignment.value)
-                            || matches!(assignment.value.as_ref(), Expr::Call(_)))
+                            || matches!(assignment.value.as_ref(), Expr::Call(call)
+                                if optimized_generator_callable_for_target(call, self.context.python_version).is_none()
+                                    || self.control.statements.terminal_if_branch_has_forward_exit))
                             && !expression_suspends_current_scope(&assignment.value))
                         || body.last().map(Ranged::range) == Some(assignment.range))
             });
@@ -5328,10 +5334,25 @@ impl<'source> Compiler<'source> {
                             true,
                             |compiler| {
                                 compiler.with_fallthrough_tracking(|compiler| {
-                                    compiler.compile_terminal_if_branch_suite(
-                                        body,
-                                        false,
-                                        !statement.elif_else_clauses.is_empty(),
+                                    let has_forward_exit = compiler
+                                        .control
+                                        .statements
+                                        .terminal_if_branch_has_forward_exit
+                                        || branch_index < statement.elif_else_clauses.len();
+                                    compiler.with_control_override(
+                                        |control| {
+                                            &mut control
+                                                .statements
+                                                .terminal_if_branch_has_forward_exit
+                                        },
+                                        has_forward_exit,
+                                        |compiler| {
+                                            compiler.compile_terminal_if_branch_suite(
+                                                body,
+                                                false,
+                                                !statement.elif_else_clauses.is_empty(),
+                                            )
+                                        },
                                     )
                                 })
                             },
@@ -16629,13 +16650,18 @@ impl<'source> Compiler<'source> {
                             if clause.test.is_none() && is_elided_suite(&clause.body));
                     let nested_else_has_donor = matches!(effective_nested_else_body.last(), Some(Stmt::If(inner))
                         if inner.elif_else_clauses.last().is_some_and(|clause|
-                            clause.test.is_none() && (!is_elided_suite(&clause.body)
-                                || original_condition_has_unique_jump_target(&inner.test, false)
-                                || matches!(inner.test.as_ref(), Expr::Compare(chain) if chain.ops.len() > 1))));
+                            clause.test.is_none()
+                                && !matches!(clause.body.iter().rfind(|part| !self.context.is_elided_statement(part)),
+                                    Some(Stmt::If(tail)) if open_if_has_two_fallthrough_edges(tail))
+                                && (!is_elided_suite(&clause.body)
+                                    || original_condition_has_unique_jump_target(&inner.test, false)
+                                    || matches!(inner.test.as_ref(), Expr::Compare(chain) if chain.ops.len() > 1))));
                     let erased_join_has_donor = self.context.python_version
                         == crate::PythonVersion::Py314
                         && original_condition_has_unique_jump_target(test, true)
-                        && ((erased_else && is_elided_suite(body))
+                        && ((erased_else && is_elided_suite(body)
+                            // A folded guard emits no branch into the erased suite.
+                            && condition_has_only_runtime_tests(test))
                             || (nested_else_has_donor
                                 && (erased_else || effective_nested_else_body.len() < body.len())));
                     if erased_join_has_donor
@@ -41487,6 +41513,28 @@ fn condition_has_cleanup_jump_target(expression: &Expr, jump_on: bool) -> bool {
         Expr::Compare(comparison) => !jump_on && comparison.ops.len() > 1,
         _ => false,
     }
+}
+
+// A trailing conditional without an else shares its enclosing join when its
+// final true arm falls through and its final false jump also reaches the join.
+// A folded predecessor can bypass the tail, and chained comparisons have a
+// separate false cleanup block.
+fn open_if_has_two_fallthrough_edges(statement: &ruff_python_ast::StmtIf) -> bool {
+    let mut test = statement.test.as_ref();
+    let mut body = statement.body.as_slice();
+    for clause in &statement.elif_else_clauses {
+        if !condition_has_only_runtime_tests(test) {
+            return false;
+        }
+        let Some(next) = clause.test.as_ref() else {
+            return false;
+        };
+        test = next;
+        body = &clause.body;
+    }
+    condition_has_only_runtime_tests(test)
+        && original_condition_has_unique_jump_target(test, false)
+        && suite_has_normal_fallthrough(body)
 }
 
 // The first line-resolution pass sees the predecessors from codegen_jump_if, including
