@@ -18948,3 +18948,79 @@ fn managed_finalizer_loops_preserve_empty_borrow_exit() {
         }
     }
 }
+
+#[test]
+fn erased_assertions_preserve_original_conditional_and_handler_blocks() {
+    let source = r"def call_join(flag, left, right):
+    if flag:
+        result = action(left if flag else right)
+        assert result
+    else:
+        pass
+
+
+def consecutive_cleanups(condition):
+    try:
+        work()
+    finally:
+        cleanup()
+    try:
+        assert condition
+    except Error:
+        recover()
+    finally:
+        finish()
+
+
+def empty_selected_else(value):
+    try:
+        if False:
+            pass
+        else:
+            assert value
+    except Error:
+        pass
+    item = value
+    item.use()
+
+
+def copied_handler_return(owner, condition):
+    try:
+        work()
+    except Error as exc:
+        if condition:
+            assert exc
+            return
+        recover()
+    finally:
+        owner.finish()
+";
+    assert_matches_cpython(source, "erased_assertion_blocks.py", &LEVELS);
+}
+
+#[test]
+fn nested_conditional_arms_donate_implicit_return_locations() {
+    let source = r"def sample(first, second, third, items):
+    if first:
+        if second:
+            for item in items:
+                work(item)
+        else:
+            if third:
+                left()
+            else:
+                right()
+        assert second
+    else:
+        if second:
+            if third:
+                for item in items:
+                    work(item)
+            else:
+                left()
+        else:
+            right()
+        assert third
+";
+    assert_matches_cpython(source, "nested_implicit_returns.py", &LEVELS);
+}

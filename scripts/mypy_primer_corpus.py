@@ -26,7 +26,7 @@ DEFAULT_CORPUS = REPO_ROOT / "target" / "corpora" / "mypy-primer"
 CATALOG_URL = "https://github.com/hauntsaninja/mypy_primer"
 SOURCE_SUFFIXES = (".py", ".pyi")
 LOCK_FORMAT = 1
-EXPECTED_BYTE_MISMATCHES = 6
+EXPECTED_BYTE_MISMATCHES = 0
 EXPECTED_CPYTHON_REJECTED = 160
 EXPECTED_MATCHED_REJECTIONS = 157
 EXPECTED_REJECTION_MISMATCHES = 1
@@ -583,6 +583,7 @@ def compatibility_command(
     roots: Sequence[Path],
     files: int,
     limit: int | None,
+    optimize: int,
 ) -> list[str]:
     command = [
         "cargo",
@@ -597,6 +598,8 @@ def compatibility_command(
         "--",
         "--reference",
         str(reference),
+        "--optimize",
+        str(optimize),
         "--expected-files",
         str(files),
         "--extension",
@@ -651,9 +654,16 @@ def check_compatibility(args: argparse.Namespace) -> None:
                 reference,
             ]
         )
-        command = compatibility_command(reference, roots, content["files"], args.limit)
-        if subprocess.run(command, check=False).returncode:
-            raise CorpusError("compatibility comparison failed")
+        levels = (0, 1, 2) if args.optimize is None else (args.optimize,)
+        for level in levels:
+            print(f"Checking compatibility at optimization level {level}", flush=True)
+            command = compatibility_command(
+                reference, roots, content["files"], args.limit, level
+            )
+            if subprocess.run(command, check=False).returncode:
+                raise CorpusError(
+                    f"compatibility comparison failed at optimization level {level}"
+                )
 
 
 def positive_int(value: str) -> int:
@@ -709,6 +719,12 @@ def parser() -> argparse.ArgumentParser:
         "--python", default=os.environ.get("CPYTHON", "python3.14")
     )
     check_parser.add_argument("--limit", type=positive_int)
+    check_parser.add_argument(
+        "--optimize",
+        type=int,
+        choices=(0, 1, 2),
+        help="compare only this optimization level (default: all three levels)",
+    )
     check_parser.set_defaults(handler=check_compatibility)
     return result
 

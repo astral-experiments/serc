@@ -1248,10 +1248,7 @@ fn exit_block_analysis(
                     .map(|item| match item {
                         Item::Instruction(instruction) => {
                             at_target_entry = false;
-                            let fused_push_null = instruction.opcode == LOAD_GLOBAL
-                                && matches!(instruction.operand(), Operand::Value(argument) if argument & 1 != 0);
-                            1 + usize::from(fused_push_null)
-                                + usize::from(instruction.pre_fold_extra_instructions())
+                            instruction.pre_fusion_width()
                         }
                         Item::Label(label) => usize::from(
                             target_chain_end > target_position
@@ -3311,6 +3308,16 @@ impl OptimizationPipeline {
                     marker.set_operand(Operand::Value(0));
                     graph[current].last_instruction() == Some(&marker)
                 });
+            let empty_match_tail = self
+                .exception_owner_provenance
+                .erased_match_tails
+                .iter()
+                .any(|&(end, mut original)| {
+                    original.opcode = NOP;
+                    original.set_operand(Operand::Value(0));
+                    graph.label_block(end) == Some(next)
+                        && graph[current].last_instruction() == Some(&original)
+                });
             let (mut location, exception_exclusion) = graph[current].last_instruction().map_or(
                 (SourceLocation::NONE, ExceptionExclusion::None),
                 |instruction| {
@@ -3361,12 +3368,27 @@ impl OptimizationPipeline {
                     bridge.set_legacy_initial_jump_argument(argument);
                 }
             }
-            if empty_while_anchor {
-                // CPython's empty original anchor separates the authored break NOP
+            if empty_while_anchor || empty_match_tail {
+                // CPython's empty original block separates the preceding NOP
                 // from this new cold bridge. It cannot donate its line across that
                 // array, and must survive the later equal-next-line NOP removal.
                 bridge.location = SourceLocation::NONE;
                 bridge.no_location_policy.preserve_location();
+            }
+            if empty_match_tail {
+                let mut tail = graph[current]
+                    .items()
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .filter_map(|(offset, item)| Some((offset, item.as_instruction()?)));
+                if let (Some((offset, marker)), Some((_, previous))) = (tail.next(), tail.next())
+                    && previous.location.line == marker.location.line
+                {
+                    // The eliminated case jump did not start a new line before
+                    // CPython reached the empty array where it inserted the bridge.
+                    graph.remove_item(ItemPosition::new(current, offset));
+                }
             }
             for origin in &mut self.exception_owner_provenance.async_with_setups {
                 if origin.bridge.is_some()
@@ -3721,6 +3743,7 @@ impl OptimizationPipeline {
     /// Only a located target that cannot be copied before line resolution certifies
     /// that the converted `POP_BLOCK` had no sole predecessor from which to inherit a line.
     pub(in crate::assembler) fn preserve_folded_pop_block_locations(&mut self) {
+        self.compact_folded_handler_passes();
         if self.folded_predecessor_sources.is_empty() {
             return;
         }
@@ -5899,10 +5922,7 @@ impl OptimizationPipeline {
                 .map(|item| match item {
                     Item::Instruction(instruction) => {
                         at_target_entry = false;
-                        let fused_push_null = instruction.opcode == LOAD_GLOBAL
-                            && matches!(instruction.operand(), Operand::Value(argument) if argument & 1 != 0);
-                        1 + usize::from(fused_push_null)
-                            + usize::from(instruction.pre_fold_extra_instructions())
+                        instruction.pre_fusion_width()
                     }
                     Item::Label(label) => usize::from(
                         target_chain_end > target_position
@@ -5922,7 +5942,11 @@ impl OptimizationPipeline {
                 })
                 .try_fold(0, |size, width| {
                     let size = size + width;
-                    if size >= size_limit { Err(size) } else { Ok(size) }
+                    if size >= size_limit {
+                        Err(size)
+                    } else {
+                        Ok(size)
+                    }
                 })
                 .unwrap_or_else(std::convert::identity);
             if let Some(width) = planned_width {
@@ -6611,7 +6635,7 @@ impl OptimizationPipeline {
             // Match-success jumps are originally unlocated. A located replacement
             // may be retained only after their sole surviving fallthrough has supplied
             // the donor; copying it into another predecessor would carry the wrong line.
-            let preserve_single_fallthrough_match_nop = !planned_copy
+            let single_entry_match_join = !planned_copy
                 && inline_unprotected_return
                 && target_chain_end == target_position
                 && (super::control_flow::is_original_constant_return(graph, target_label)
@@ -6632,11 +6656,14 @@ impl OptimizationPipeline {
                     == 1
                 && graph[source].last_instruction().is_some_and(|instruction| {
                     instruction.opcode == JUMP_FORWARD
-                        && instruction.jump_policy.is_original_match_success()
                         && instruction.pre_fold_extra_instructions() == 0
                         && !instruction.no_location_policy.preserves_location()
                         && instruction.exception_policy() == ExceptionPolicy::default()
-                })
+                });
+            let preserve_single_fallthrough_match_nop = single_entry_match_join
+                && graph[source]
+                    .last_instruction()
+                    .is_some_and(|jump| jump.jump_policy.is_original_match_success())
                 && jump_sources[source.index()].iter().all(|predecessor| {
                     drop_blocks[predecessor.index()]
                         || block_jump_target(graph[*predecessor].items())
@@ -6652,6 +6679,27 @@ impl OptimizationPipeline {
                         && graph[previous]
                             .last_instruction()
                             .is_some_and(|instruction| instruction.location == source_location)
+                });
+            // After the successful cases copy the return, the final pattern's
+            // failed condition donates its span to the original empty match end.
+            let preserve_final_pattern_nop = single_entry_match_join
+                && super::normal_try_copies::original_local_return(graph[target].items())
+                && jump_sources[source.index()].iter().any(|predecessor| {
+                    !drop_blocks[predecessor.index()]
+                        && graph[*predecessor]
+                            .last_instruction()
+                            .is_some_and(|condition| {
+                                condition.opcode == POP_JUMP_IF_FALSE
+                                    && condition.location == source_location
+                                    && condition.pre_fold_extra_instructions() == 0
+                                    && condition.forward_target().is_some_and(|entry| {
+                                        !self
+                                            .exception_owner_provenance
+                                            .original_match_join_boundaries
+                                            .contains(&entry)
+                                            && graph.label_block(entry) == Some(source)
+                                    })
+                            })
                 });
             // A shared match end can still be copied into an earlier pass arm.
             // Keep its original jump slot unlocated through every copy round; only
@@ -6695,6 +6743,7 @@ impl OptimizationPipeline {
                     && (preserve_unlocated_join_nop
                         || preserve_threaded_join_nop
                         || preserve_single_fallthrough_match_nop
+                        || preserve_final_pattern_nop
                         || (source_location.line >= 0
                             && graph[source].last_instruction().is_some_and(|instruction| {
                                 instruction
@@ -7212,15 +7261,19 @@ impl OptimizationPipeline {
                     })
                     .collect::<FxHashMap<_, _>>()
             };
+            let copied_inline_entry_labels = copied_labels
+                .iter()
+                .filter_map(|(original, copied)| {
+                    copied_exit_or_eval_entry_labels
+                        .contains(original)
+                        .then_some(*copied)
+                })
+                .collect::<FxHashSet<_>>();
             if inherit_copied_locations && !planned_copy {
                 // Exception boundaries split the IR into blocks after CPython has already treated
                 // the synthetic cleanup as one source-less exit. Every copied split therefore
                 // inherits the same predecessor location as the entry block.
                 let copied_exception_split_labels = exception_split_labels
-                    .iter()
-                    .filter_map(|label| copied_labels.get(label).copied())
-                    .collect::<FxHashSet<_>>();
-                let copied_inline_entry_labels = copied_exit_or_eval_entry_labels
                     .iter()
                     .filter_map(|label| copied_labels.get(label).copied())
                     .collect::<FxHashSet<_>>();
@@ -7589,6 +7642,9 @@ impl OptimizationPipeline {
                     || target_has_artificial_eval_break
                 {
                     copied_exit_or_eval_entry_labels.insert(copied_label);
+                    // A later copy of this array must also cross copied interior
+                    // entries, including an eval-check jump after nested POP_EXCEPTs.
+                    copied_exit_or_eval_entry_labels.extend(copied_inline_entry_labels);
                 }
                 if let Some(position) = graph[source]
                     .items()

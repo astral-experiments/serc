@@ -263,6 +263,8 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) ordinary_await_ends: Vec<OrdinaryAwaitEnd>,
     // Empty runtime-while anchor, shared exit, and exact terminal authored break.
     pub(super) empty_while_break_anchors: Vec<(Label, Label, Instruction)>,
+    // Case-success jumps whose intervening original failure blocks were erased.
+    pub(super) erased_match_tails: Vec<(Label, Instruction)>,
     // Authored return NOP, immediately following finally POP, and original try target.
     pub(super) early_return_nop_pairs: Vec<(Instruction, Instruction, Label)>,
     // Authored return NOP, iterator disposal, finally POP, and original try target.
@@ -692,6 +694,9 @@ impl ExceptionOwnerProvenance {
         }
         for record in &mut self.empty_while_break_anchors {
             visit(&mut record.2);
+        }
+        for (_, jump) in &mut self.erased_match_tails {
+            visit(jump);
         }
         for record in &mut self.early_return_nop_pairs {
             visit(&mut record.0);
