@@ -16648,11 +16648,46 @@ impl<'source> Compiler<'source> {
                     let erased_else = branch_index + 2 == branch_count
                         && matches!(statement.elif_else_clauses.last(), Some(clause)
                             if clause.test.is_none() && is_elided_suite(&clause.body));
+                    let tail_shares_enclosing_join = |suite: &[Stmt]| {
+                        let is_elided = |part: &Stmt| self.context.is_elided_statement(part);
+                        let Some(Stmt::If(tail)) = suite.iter().rfind(|part| !is_elided(part))
+                        else {
+                            return false;
+                        };
+                        let erased_suffix = suite.last().is_some_and(&is_elided);
+                        let (test, body) = match tail.elif_else_clauses.last() {
+                            Some(clause) => {
+                                let Some(test) = clause.test.as_ref() else {
+                                    // A folded true guard leaves no live alternative to the
+                                    // nested exit when all later arms and the suffix are erased.
+                                    return erased_suffix
+                                        && early_condition_truthiness(&tail.test) == Some(true)
+                                        && tail
+                                            .elif_else_clauses
+                                            .iter()
+                                            .all(|clause| is_elided_suite(&clause.body));
+                                };
+                                (test, clause.body.as_slice())
+                            }
+                            None => (tail.test.as_ref(), tail.body.as_slice()),
+                        };
+                        // An open conditional falls through to the enclosing join. A
+                        // cleanup block can still supply its own location across an
+                        // erased statement on the protected arm or the comparison exit.
+                        let protected_exit = body.last().is_some_and(&is_elided)
+                            && matches!(
+                                body.iter().rfind(|part| !is_elided(part)),
+                                Some(Stmt::With(_) | Stmt::Try(_))
+                            );
+                        let comparison_exit = erased_suffix
+                            && is_elided_suite(body)
+                            && condition_has_cleanup_jump_target(test, false);
+                        !protected_exit && !comparison_exit
+                    };
                     let nested_else_has_donor = matches!(effective_nested_else_body.last(), Some(Stmt::If(inner))
                         if inner.elif_else_clauses.last().is_some_and(|clause|
                             clause.test.is_none()
-                                && !matches!(clause.body.iter().rfind(|part| !self.context.is_elided_statement(part)),
-                                    Some(Stmt::If(tail)) if open_if_has_two_fallthrough_edges(tail))
+                                && !tail_shares_enclosing_join(&clause.body)
                                 && (!is_elided_suite(&clause.body)
                                     || original_condition_has_unique_jump_target(&inner.test, false)
                                     || matches!(inner.test.as_ref(), Expr::Compare(chain) if chain.ops.len() > 1))));
@@ -41513,28 +41548,6 @@ fn condition_has_cleanup_jump_target(expression: &Expr, jump_on: bool) -> bool {
         Expr::Compare(comparison) => !jump_on && comparison.ops.len() > 1,
         _ => false,
     }
-}
-
-// A trailing conditional without an else shares its enclosing join when its
-// final true arm falls through and its final false jump also reaches the join.
-// A folded predecessor can bypass the tail, and chained comparisons have a
-// separate false cleanup block.
-fn open_if_has_two_fallthrough_edges(statement: &ruff_python_ast::StmtIf) -> bool {
-    let mut test = statement.test.as_ref();
-    let mut body = statement.body.as_slice();
-    for clause in &statement.elif_else_clauses {
-        if !condition_has_only_runtime_tests(test) {
-            return false;
-        }
-        let Some(next) = clause.test.as_ref() else {
-            return false;
-        };
-        test = next;
-        body = &clause.body;
-    }
-    condition_has_only_runtime_tests(test)
-        && original_condition_has_unique_jump_target(test, false)
-        && suite_has_normal_fallthrough(body)
 }
 
 // The first line-resolution pass sees the predecessors from codegen_jump_if, including

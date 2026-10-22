@@ -89,3 +89,20 @@ def nested_range_validation(enabled, cached, low, value, high):
     else:
         assert enabled
     finish()
+
+
+def folded_inner_alternatives(enabled, cached, value):
+    if enabled:
+        if cached:
+            assert value
+        else:
+            if True:
+                value = convert(value)
+            elif cached:
+                assert value
+            else:
+                assert value
+            assert value
+    else:
+        assert value
+    consume(value)
