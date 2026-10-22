@@ -18948,3 +18948,106 @@ fn managed_finalizer_loops_preserve_empty_borrow_exit() {
         }
     }
 }
+
+#[test]
+fn erased_assertions_preserve_original_conditional_and_handler_blocks() {
+    let source = r"def call_join(flag, left, right):
+    if flag:
+        result = action(left if flag else right)
+        assert result
+    else:
+        pass
+
+
+def generator_join(flag, items):
+    if flag:
+        result = set(item.value for item in items)
+        assert result
+    else:
+        consume(items)
+
+
+def tuple_join(flag, items):
+    if flag:
+        result = tuple(item + 1 for item in items)
+        assert result
+    else:
+        result = items
+
+
+def nested_generator_join(outer, flag, items):
+    if outer:
+        if flag:
+            result = all(item.value for item in items)
+            assert result
+        else:
+            items.pop()
+    else:
+        fallback()
+
+
+def consecutive_cleanups(condition):
+    try:
+        work()
+    finally:
+        cleanup()
+    try:
+        assert condition
+    except Error:
+        recover()
+    finally:
+        finish()
+
+
+def empty_selected_else(value):
+    try:
+        if False:
+            pass
+        else:
+            assert value
+    except Error:
+        pass
+    item = value
+    item.use()
+
+
+def copied_handler_return(owner, condition):
+    try:
+        work()
+    except Error as exc:
+        if condition:
+            assert exc
+            return
+        recover()
+    finally:
+        owner.finish()
+";
+    assert_matches_cpython(source, "erased_assertion_blocks.py", &LEVELS);
+}
+
+#[test]
+fn nested_conditional_arms_donate_implicit_return_locations() {
+    let source = r"def sample(first, second, third, items):
+    if first:
+        if second:
+            for item in items:
+                work(item)
+        else:
+            if third:
+                left()
+            else:
+                right()
+        assert second
+    else:
+        if second:
+            if third:
+                for item in items:
+                    work(item)
+            else:
+                left()
+        else:
+            right()
+        assert third
+";
+    assert_matches_cpython(source, "nested_implicit_returns.py", &LEVELS);
+}

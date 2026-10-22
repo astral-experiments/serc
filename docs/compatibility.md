@@ -101,13 +101,12 @@ required Ruff gate:
 ./scripts/check-mypy-primer-compatibility /path/to/python3.14.5
 ```
 
-The minimal-reference baseline has 73,371 exact matches, 157 matched rejections,
-one rejection mismatch, six byte mismatches, and two compiler failures. CPython
-rejects 160 inputs; there are no unsupported inputs, parse/decode mismatches, or
-oracle failures.
+The check verifies the snapshot, builds the minimal reference once, and compares
+all 73,537 files at optimization levels 0, 1, and 2. Each level must produce
+73,377 byte-for-byte matches on CPython-accepted inputs and zero byte
+mismatches. CPython must reject 160 inputs at each level, with 157 matched
+rejections, one rejection mismatch, and two compiler failures.
 
-The check verifies the snapshot, builds the minimal reference with the selected
-interpreter, and compares source bytes, freezing each outcome category
-independently. Append `--limit 100` to check a prefix with `--require-all`
-instead of the full outcome baseline. Snapshot identity and update instructions
-live in the [corpus guide](../corpora/README.md).
+Append `--optimize 1` to check one level. Append `--limit 100` to check a sorted
+prefix with `--require-all`. Snapshot identity and update instructions live in
+the [corpus guide](../corpora/README.md).

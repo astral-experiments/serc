@@ -332,11 +332,7 @@ fn targets_small_scope_exit(graph: &BlockGraph, target: Label) -> bool {
             Item::Label(_) if size > 0 => return Some(false),
             Item::Label(_) => {}
             Item::Instruction(instruction) => {
-                let fused_push_null = instruction.opcode == LOAD_GLOBAL
-                    && matches!(instruction.operand(), Operand::Value(argument) if argument & 1 != 0);
-                size += 1
-                    + usize::from(fused_push_null)
-                    + usize::from(instruction.pre_fold_extra_instructions());
+                size += instruction.pre_fusion_width();
                 if size > 4 {
                     return Some(false);
                 }
@@ -670,9 +666,28 @@ impl OptimizationPipeline {
         let mut removed_max_depth = None;
         let mut empty = FxHashSet::default();
         let mut discarded_admissions = Vec::new();
+        let mut previous_live = None;
+        let mut erased_original_block = false;
         for block_index in 0..graph.len() {
             let block = graph.block_at(block_index);
             if reachable[block.index()] {
+                if erased_original_block
+                    && let Some(jump) = previous_live
+                        .and_then(|block: BasicBlockId| graph[block].last_instruction())
+                    && jump.opcode == JUMP_FORWARD
+                    && jump.jump_policy.is_original_match_success()
+                    && jump.jump_policy.always_retains_nop()
+                    && let Some(end) = jump.forward_target()
+                    && graph.label_block(end) == Some(block)
+                {
+                    // CPython keeps the empty failure block between this case and
+                    // the join. It cannot supply a line to a later cold bridge.
+                    self.exception_owner_provenance
+                        .erased_match_tails
+                        .push((end, *jump));
+                }
+                previous_live = Some(block);
+                erased_original_block = false;
                 if !discarded_admissions.is_empty()
                     && let Some(label) = graph[block].first_label()
                 {
@@ -685,6 +700,16 @@ impl OptimizationPipeline {
                 continue;
             }
             let had_instructions = graph[block].last_instruction().is_some();
+            erased_original_block |= self.python_version >= crate::PythonVersion::Py314
+                && had_instructions
+                && graph[block]
+                    .items()
+                    .iter()
+                    .take_while(|item| matches!(item, Item::Label(_)))
+                    .any(|item| {
+                        matches!(item, Item::Label(label)
+                        if self.exception_owner_provenance.block_boundaries.contains(label))
+                    });
             // Keep evidence of the actual erasure, not merely an emitted jump
             // which threading or copying may have retained elsewhere.
             if had_instructions
@@ -3325,6 +3350,32 @@ impl OptimizationPipeline {
                 self.next_label += 2;
                 let (block, offset) = instruction_positions[source];
                 let (target_block, target_offset) = instruction_positions[target];
+                let items = graph[block].items();
+                if matches!(items[offset], Item::Instruction(jump)
+                    if jump.fusion_policy.is_authored_break() && jump.location.line < 0)
+                    && matches!(items[..offset].last(), Some(Item::Instruction(pop)) if pop.opcode == POP_TOP)
+                    && let Some(location) = items[..offset]
+                        .iter()
+                        .rev()
+                        .take_while(|item| matches!(item, Item::Instruction(_)))
+                        .find_map(|item| match item {
+                            Item::Instruction(instruction)
+                                if instruction.location.line >= 0
+                                    || instruction.no_location_policy.preserves_location() =>
+                            {
+                                Some(instruction.location)
+                            }
+                            _ => None,
+                        })
+                {
+                    // These labels record the replacement's exception owner. CPython
+                    // still propagates the iterator cleanup's position to the break
+                    // within the original instruction array.
+                    graph
+                        .instruction_mut(ItemPosition::new(block, offset))
+                        .expect("threaded break")
+                        .location = location;
+                }
                 for origin in &mut self
                     .exception_owner_provenance
                     .initial_borrow_normal_try_exits
@@ -4096,6 +4147,100 @@ impl OptimizationPipeline {
         }
     }
 
+    /// Restores the original folded Pass/handler cleanup array before NOP compaction.
+    pub(in crate::assembler) fn compact_folded_handler_passes(&mut self) {
+        if self.folded_condition_exit_targets.is_empty() {
+            return;
+        }
+        let folded_target = |jump: &Instruction| {
+            jump.forward_target().filter(|target| {
+                jump.opcode == JUMP_FORWARD
+                    && jump.jump_policy.borrow_empty_block()
+                    && self.folded_condition_exit_targets.contains(target)
+            })
+        };
+        let order = self.graph.order();
+        let compact = order
+            .iter()
+            .enumerate()
+            .filter_map(|(position, &block)| {
+                let mut records = self.graph[block]
+                    .items()
+                    .iter()
+                    .filter_map(Item::as_instruction);
+                let pass = records.next()?;
+                let jump = records.next()?;
+                let mut target = folded_target(jump)?;
+                if pass.opcode != NOP
+                    || pass.location.line < 0
+                    || pass.location != jump.location
+                    || !pass.jump_policy.preserves_explicit_nop()
+                    || records.next().is_some()
+                {
+                    return None;
+                }
+                // The selected branch jumps across its discarded else. Its original
+                // unlocated join jumps can also copy an entirely unlocated handler footer.
+                for &next in &order[position + 1..] {
+                    if self.graph.label_block(target) != Some(next) {
+                        return None;
+                    }
+                    let mut records = self.graph[next]
+                        .items()
+                        .iter()
+                        .filter_map(Item::as_instruction);
+                    let first = records.next()?;
+                    if first.location != pass.location {
+                        return None;
+                    }
+                    if let Some(join) = folded_target(first) {
+                        if records.next().is_some() {
+                            return None;
+                        }
+                        target = join;
+                        continue;
+                    }
+                    if first.opcode != POP_EXCEPT {
+                        return None;
+                    }
+                    let tail = records.next()?;
+                    let copyable = if tail.opcode == JUMP_FORWARD
+                        && tail.location == pass.location
+                        && records.next().is_none()
+                    {
+                        // Copying a small located return onto POP_BLOCK, POP_EXCEPT, JUMP
+                        // first makes that footer too large and located. An ordinary
+                        // continuation leaves the original three unlocated records intact.
+                        let exit = tail.forward_target()?;
+                        let destination = self.graph.label_block(exit)?;
+                        // A directly adjacent footer is copied in the first sweep, before
+                        // that footer's own outgoing edge can inline the continuation.
+                        next == order[position + 1]
+                            || (!is_unconditional_jump(
+                                self.graph[destination].last_instruction()?.opcode,
+                            ) && !targets_small_scope_exit(&self.graph, exit))
+                    } else {
+                        // The compiler has already folded an unlocated implicit return
+                        // into the footer. Its native copy is still entirely unlocated.
+                        tail.opcode == LOAD_CONST
+                            && tail.location == pass.location
+                            && records.next().is_some_and(|ret| {
+                                ret.opcode == RETURN_VALUE && ret.location == pass.location
+                            })
+                            && records.next().is_none()
+                    };
+                    return copyable.then_some(block);
+                }
+                None
+            })
+            .collect::<Vec<_>>();
+        for block in compact {
+            if let Some(pass) = self.graph.instructions_mut(block).next() {
+                pass.jump_policy.allow_explicit_nop_compaction();
+            }
+        }
+    }
+
     /// Preserves separate branch locations when a match joins another branch exit.
     pub(in crate::assembler) fn prepare_original_conditional_jump_targets(&mut self) {
         self.prepare_original_match_continuation_exits();
@@ -4110,8 +4255,8 @@ impl OptimizationPipeline {
             .filter_map(|(label, location)| {
                 let block = self.graph.label_block(*label)?;
                 let jump = self.graph[block].last_instruction()?;
-                let target = jump.forward_target()?;
-                let target = self.graph.label_block(target)?;
+                let target_label = jump.forward_target()?;
+                let target = self.graph.label_block(target_label)?;
                 let first = self.graph[target]
                     .items()
                     .iter()
@@ -4224,6 +4369,26 @@ impl OptimizationPipeline {
                         expected.jump_policy.resolve_deferred_removal();
                     }
                     shared_match_donors.push((entry, (expected, *donor)));
+                    return None;
+                }
+                // A falling-through case body and its failed conditions reach the
+                // same original case-success jump. A small local return is copied
+                // onto the enclosing branch exit before conditional threading.
+                if previous_falls_through
+                    && jump.opcode == JUMP_FORWARD
+                    && jump.location == SourceLocation::NONE
+                    && jump.pre_fold_extra_instructions() == 0
+                    && first.pre_fold_extra_instructions() == 0
+                    && jump.exception_policy() == ExceptionPolicy::default()
+                    && first.exception_policy() == ExceptionPolicy::default()
+                    && self.exception_owner_provenance.original_match_join_boundaries
+                        .contains(&target_label)
+                    && self.graph[block].items().iter().filter_map(Item::as_instruction).count() == 1
+                    && self.graph[target].items().iter().filter_map(Item::as_instruction).count() == 1
+                    && first.opcode == JUMP_FORWARD
+                    && let Some(ret) = first.forward_target().and_then(|label| self.graph.label_block(label))
+                    && super::normal_try_copies::original_local_return(self.graph[ret].items())
+                {
                     return None;
                 }
                 if !previous_falls_through {

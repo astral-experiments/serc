@@ -17521,6 +17521,11 @@ impl Assembler {
                 label_positions.insert(*label, index);
             }
         }
+        let jump_targets: FxHashSet<_> = items
+            .iter()
+            .filter_map(Item::as_instruction)
+            .filter_map(Instruction::jump_target)
+            .collect();
         let mut replacements = Vec::new();
         for index in 0..items.len().saturating_sub(1) {
             let [Item::Instruction(load), Item::Instruction(jump)] = items[index..index + 2] else {
@@ -17543,11 +17548,21 @@ impl Assembler {
                     Item::Instruction(instruction) => Some((position, *instruction)),
                     Item::Label(_) => None,
                 });
-            let (Some((pop_position, pop)), Some(return_load), return_value) =
+            let (Some((pop_position, pop)), Some(mut return_load), return_value) =
                 (target.next(), target.next(), target.next())
             else {
                 continue;
             };
+            // The original POP_TOP block ends at the next jump target. Its
+            // fallthrough successor cannot participate in small-exit copying.
+            let crosses_target = |start: usize, end: usize| {
+                items[start + 1..end]
+                    .iter()
+                    .any(|item| matches!(item, Item::Label(label) if jump_targets.contains(label)))
+            };
+            if crosses_target(pop_position, return_load.0) {
+                continue;
+            }
             if pop.opcode == POP_TOP
                 && matches!(
                     return_load.1.opcode,
@@ -17566,11 +17581,19 @@ impl Assembler {
                 let mut discarded = pop;
                 discarded.opcode = NOP;
                 discarded.set_operand(Operand::Value(0));
+                if return_load.1.opcode == JUMP_BACKWARD
+                    && return_load.1.location == SourceLocation::NONE
+                {
+                    // The removed folded operand is the last located cell in
+                    // this copy before CPython propagates the backedge's position.
+                    return_load.1.location = load.location;
+                }
                 replacements.push((index, return_load, (pop_position, discarded)));
             } else if pop.opcode == POP_TOP
                 && is_constant_load(return_load.1.opcode)
                 && let Some(return_value) = return_value
                 && return_value.1.opcode == RETURN_VALUE
+                && !crosses_target(return_load.0, return_value.0)
             {
                 replacements.push((index, return_load, return_value));
             }

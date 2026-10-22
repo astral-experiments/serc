@@ -855,13 +855,27 @@ impl Compiler<'_> {
                     .body
                     .iter()
                     .all(|statement| self.context.is_elided_statement(statement));
-                // An erased class/OR case keeps its subject pop unlocated. A refutable
-                // folded true guard before a small copied return does likewise, so its
-                // original NOP survives before the pop through line compaction.
-                let elided_case_body = self.context.python_version >= PythonVersion::Py314
+                let erased_subject = self.context.python_version >= PythonVersion::Py314
                     && copied_subject
-                    && ((case.guard.is_none()
-                        && matches!(case.pattern, Pattern::MatchClass(_) | Pattern::MatchOr(_)))
+                    && !case.body.is_empty()
+                    && body_is_elided;
+                // The subject pop takes its location from the next instruction.
+                // An empty case retains the last comparison's location on its
+                // exit, unless a capture or trailing wildcard starts a new array.
+                let unlocated_pattern_exit = erased_subject
+                    && case.guard.is_none()
+                    && matches!(
+                        case.pattern,
+                        Pattern::MatchClass(_) | Pattern::MatchSequence(_)
+                    )
+                    && self.assembler.instruction_opcode_at(
+                        self.assembler.instruction_count().saturating_sub(1),
+                    ) != Some(NOT_TAKEN);
+                // A refutable folded true guard before a small copied return
+                // keeps its original NOP through line compaction.
+                let elided_case_body = erased_subject
+                    && ((matches!(case.pattern, Pattern::MatchClass(_)) && unlocated_pattern_exit)
+                        || (matches!(case.pattern, Pattern::MatchOr(_)) && case.guard.is_none())
                         || (match_has_following
                             && !irrefutable_true_guard
                             && !self.control.in_loop()
@@ -885,13 +899,12 @@ impl Compiler<'_> {
                         .is_empty()
                     && self.control.withs.active_with_region_exclusions.is_empty()
                     && !self.control.in_exception_handler()
-                    && self.control.finally.is_inactive_for_return_unwind()
-                    && !case.body.is_empty()
-                    && body_is_elided;
+                    && self.control.finally.is_inactive_for_return_unwind();
+                let unlocated_subject_exit = elided_case_body || unlocated_pattern_exit;
                 if copied_subject {
                     let location = if self.context.python_version <= PythonVersion::Py313 {
                         self.source_location(case.pattern.range())
-                    } else if elided_case_body {
+                    } else if unlocated_subject_exit {
                         SourceLocation::NONE
                     } else {
                         case.body.first().map_or(SourceLocation::NONE, |statement| {
@@ -903,7 +916,7 @@ impl Compiler<'_> {
                     };
                     self.assembler.set_location(location);
                     self.emit(POP_TOP, 0, -1)?;
-                    if elided_case_body {
+                    if unlocated_subject_exit {
                         self.assembler.preserve_last_no_location();
                     }
                     if self.context.python_version >= PythonVersion::Py314 {
@@ -1066,7 +1079,7 @@ impl Compiler<'_> {
                         self.set_branch_end_location(&case.body, body_start);
                     }
                     self.set_match_case_backedge_location(&case.body);
-                    if elided_case_body {
+                    if unlocated_subject_exit {
                         self.assembler.set_location(SourceLocation::NONE);
                     }
                     if self.context.python_version <= crate::PythonVersion::Py313
@@ -1078,7 +1091,7 @@ impl Compiler<'_> {
                     }
                     if terminal {
                         self.emit_deferred_implicit_return()?;
-                        if elided_case_body {
+                        if unlocated_subject_exit {
                             self.assembler.preserve_last_no_location();
                         }
                         // CPython copies the implicit return onto the original case-success

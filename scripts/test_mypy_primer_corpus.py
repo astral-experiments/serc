@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from itertools import pairwise
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 import mypy_primer_corpus as corpus
 
@@ -159,11 +160,48 @@ def get_projects():
         with self.assertRaisesRegex(corpus.CorpusError, "invalid revision"):
             corpus.validate_lock(short)
 
+    def test_check_compares_selected_levels_against_one_verified_reference(
+        self,
+    ) -> None:
+        lock = {"repositories": [{"id": "example"}]}
+        for options, levels in (
+            ([], [0, 1, 2]),
+            (["--optimize", "0"], [0]),
+            (["--optimize", "2"], [2]),
+        ):
+            with (
+                self.subTest(options=options),
+                patch.object(corpus, "read_lock", return_value=lock),
+                patch.object(
+                    corpus, "verify_checkouts", return_value={"files": 73_537}
+                ) as verify,
+                patch.object(corpus, "run") as build,
+                patch.object(
+                    corpus.subprocess, "run", return_value=Mock(returncode=0)
+                ) as compare,
+            ):
+                args = corpus.parser().parse_args(["check", *options])
+                args.handler(args)
+                verify.assert_called_once_with(args.corpus_root, lock)
+                build.assert_called_once()
+                reference = str(build.call_args.args[0][-1])
+                commands = [call.args[0] for call in compare.call_args_list]
+                self.assertEqual(
+                    [int(cmd[cmd.index("--optimize") + 1]) for cmd in commands], levels
+                )
+                self.assertTrue(
+                    all(
+                        cmd[cmd.index("--reference") + 1] == reference
+                        for cmd in commands
+                    )
+                )
+
     def test_compatibility_command_accounts_for_every_outcome(self) -> None:
         roots = [Path("/corpus/first"), Path("/corpus/second")]
         files = 100_000
         reference = Path("/tmp/cpython-reference")
-        full = corpus.compatibility_command(reference, roots, files, None)
+        full = corpus.compatibility_command(reference, roots, files, None, 2)
+        self.assertEqual(full[full.index("--optimize") + 1], "2")
         self.assertEqual(full[full.index("--reference") + 1], str(reference))
         expected_outcomes = {
             value.split("=", 1)[0]: int(value.split("=", 1)[1])
@@ -197,7 +235,8 @@ def get_projects():
         self.assertLessEqual(expected_rejected, files - expected_exact)
         self.assertNotIn("--require-all", full)
 
-        limited = corpus.compatibility_command(reference, roots, files, 100)
+        limited = corpus.compatibility_command(reference, roots, files, 100, 1)
+        self.assertEqual(limited[limited.index("--optimize") + 1], "1")
         self.assertEqual(limited[limited.index("--reference") + 1], str(reference))
         self.assertNotIn("--expected-outcome", limited)
         self.assertNotIn("--expected-cpython-rejected", limited)

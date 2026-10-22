@@ -2674,6 +2674,79 @@ impl OptimizationPipeline {
         prefixes
     }
 
+    /// Keep the join where CPython copies a four-slot return after a shared try exit.
+    fn preserve_shared_try_return_joins(&mut self) {
+        use crate::target::opcodes::RETURN_VALUE;
+
+        let graph = &self.graph;
+        let unlocated_jump = |block: BasicBlockId| {
+            let mut instructions = graph[block].items().iter().filter_map(Item::as_instruction);
+            let jump = instructions.next()?;
+            if jump.opcode != JUMP_FORWARD
+                || jump.location != SourceLocation::NONE
+                || instructions.next().is_some()
+            {
+                return None;
+            }
+            graph.label_block(jump.forward_target()?)
+        };
+        let mut joins = Vec::new();
+        for &(entry_label, join_label) in &self.exception_owner_provenance.normal_try_exits {
+            let Some((entry, join)) = graph
+                .label_block(entry_label)
+                .zip(graph.label_block(join_label))
+            else {
+                continue;
+            };
+            if unlocated_jump(entry) != Some(join) {
+                continue;
+            }
+            let Some(tail) = unlocated_jump(join) else {
+                continue;
+            };
+            let instructions = graph[tail].items().iter().filter_map(Item::as_instruction);
+            if graph[tail]
+                .last_instruction()
+                .is_none_or(|op| op.opcode != RETURN_VALUE)
+                || !instructions
+                    .clone()
+                    .all(|op| op.location != SourceLocation::NONE)
+                || instructions
+                    .map(Instruction::pre_fusion_width)
+                    .sum::<usize>()
+                    != 4
+            {
+                continue;
+            }
+            // The two earlier jumps first copy the normal POP_BLOCK/JUMP array. By
+            // the time the join copies the return, its old jump is a fifth (NOP)
+            // slot. Later copies through the join therefore exceed CPython's limit.
+            let mut incoming = graph
+                .iter()
+                .take_while(|(block, _)| *block != entry)
+                .filter(|(_, block)| {
+                    block.last_instruction().is_some_and(|op| {
+                        op.opcode == JUMP_FORWARD
+                            && op
+                                .forward_target()
+                                .and_then(|label| graph.label_block(label))
+                                == Some(entry)
+                    })
+                });
+            if incoming.nth(1).is_some() {
+                joins.push(join);
+            }
+        }
+        for join in joins {
+            self.graph
+                .instructions_mut(join)
+                .next_back()
+                .expect("singleton try join")
+                .jump_policy
+                .prevent_threading_target();
+        }
+    }
+
     /// Restores original cleanup arrays for a closed ordinary-try/short-return graph.
     ///
     /// These records precede location propagation and NOP compaction in CPython. Keeping
@@ -2691,6 +2764,7 @@ impl OptimizationPipeline {
         {
             return;
         }
+        self.preserve_shared_try_return_joins();
         let pass_prefixes = self.restore_normal_try_pass_prefixes();
         let mut discard_joins = self.original_discard_try_exit_joins();
         let handler_joins = self.original_discard_handler_exit_joins();

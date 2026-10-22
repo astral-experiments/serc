@@ -1414,6 +1414,13 @@ impl Instruction {
         self.metadata.pre_fold_extra_instructions()
     }
 
+    /// Original instruction slots counted by CPython's small-exit copy limit.
+    pub(super) fn pre_fusion_width(&self) -> usize {
+        let fused_push_null = self.opcode == crate::target::opcodes::LOAD_GLOBAL
+            && matches!(self.operand(), Operand::Value(argument) if argument & 1 != 0);
+        1 + usize::from(self.pre_fold_extra_instructions()) + usize::from(fused_push_null)
+    }
+
     pub(super) fn add_pre_fold_extra_instructions(&mut self, count: u8) {
         if count > 0 {
             // A positive addition is observable even when the four-slot budget
