@@ -28,8 +28,8 @@ use crate::target::opcodes::{
     MATCH_SEQUENCE, NOP, NOT_TAKEN, POP_EXCEPT, POP_ITER, POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE,
     POP_JUMP_IF_NOT_NONE, POP_JUMP_IF_TRUE, POP_TOP, PUSH_EXC_INFO, RAISE_VARARGS, RERAISE, RESUME,
     RETURN_VALUE, SEND, SET_ADD, SET_FUNCTION_ATTRIBUTE, SET_UPDATE, STORE_DEREF, STORE_FAST,
-    STORE_FAST_LOAD_FAST, STORE_FAST_STORE_FAST, STORE_GLOBAL, SWAP, TO_BOOL, UNARY_NOT, UNPACK_EX,
-    UNPACK_SEQUENCE, WITH_EXCEPT_START,
+    STORE_FAST_LOAD_FAST, STORE_FAST_STORE_FAST, STORE_GLOBAL, STORE_NAME, SWAP, TO_BOOL,
+    UNARY_NOT, UNPACK_EX, UNPACK_SEQUENCE, WITH_EXCEPT_START,
 };
 use crate::target::operands::ResumeLocation;
 use crate::target::{
@@ -286,10 +286,15 @@ fn sequence_capture_cleanup_rotation(items: &[Item]) -> Option<CaptureCleanupRot
     let [Item::Instruction(prefix), Item::Instruction(first), ..] = items else {
         return None;
     };
-    let unpacked = usize::try_from(prefix.value_argument()?).ok()?;
     let depth = usize::try_from(first.value_argument()?).ok()?;
-    if prefix.opcode != UNPACK_SEQUENCE
-        || unpacked < 3
+    let operand = usize::try_from(prefix.value_argument()?).ok()?;
+    let unpacked = match prefix.opcode {
+        UNPACK_SEQUENCE => operand,
+        UNPACK_EX => (operand & 0xff) + 1 + (operand >> 8),
+        POP_TOP if operand == 0 => depth,
+        _ => return None,
+    };
+    if unpacked < 3
         || !(unpacked..=unpacked.checked_add(1)?).contains(&depth)
         || prefix.location.line < 0
     {
@@ -320,7 +325,12 @@ fn sequence_capture_cleanup_rotation(items: &[Item]) -> Option<CaptureCleanupRot
     let Item::Instruction(following) = items.get(consumed)? else {
         return None;
     };
-    if !matches!(following.opcode, SWAP | MATCH_SEQUENCE | STORE_FAST)
+    // Namespace and cell stores cannot be exchanged with a pop. The smaller swaps
+    // still rotate the discarded values when the complete pop prefix is present.
+    let terminal_store =
+        matches!(following.opcode, STORE_NAME | STORE_GLOBAL | STORE_DEREF) && count + 1 == depth;
+    if (prefix.opcode == POP_TOP && !terminal_store)
+        || (!terminal_store && !matches!(following.opcode, SWAP | MATCH_SEQUENCE | STORE_FAST))
         || following.value_argument().is_none()
         || following.location.line < 0
     {

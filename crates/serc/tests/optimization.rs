@@ -8606,6 +8606,21 @@ fn unpacked_or_captures_apply_static_cleanup_swaps() {
 }
 
 #[test]
+fn sequence_capture_before_trailing_wildcards_matches_cpython() {
+    for pattern in ["[*a, _, _, _]", "[_, *a, _, _, _]", "[a, _, _, _]"] {
+        for source in [
+            format!("match x:\n    case {pattern}: pass\n"),
+            format!("def f(x):\n    match x:\n        case {pattern}: return a\n"),
+            format!(
+                "try:\n    match x:\n        case {pattern}: pass\nexcept Exception:\n    pass\n"
+            ),
+        ] {
+            assert_matches_cpython(&source, "sequence_capture.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn sequence_capture_wildcard_cleanup_matrix() {
     let source = r#"
 def run(value):
