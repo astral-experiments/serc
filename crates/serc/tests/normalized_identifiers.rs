@@ -41,3 +41,41 @@ fn normalized_singleton_identifiers_follow_the_target_parser() {
         serc::compile(source, "case.py").unwrap();
     }
 }
+
+#[test]
+fn normalized_names_follow_parser_error_order() {
+    let options = CompileOptions {
+        python_version: PythonVersion::Py313,
+        ..CompileOptions::default()
+    };
+    for source in [
+        "Ｔrue\nif :",
+        "1 = Ｔrue",
+        "1 += Ｔrue",
+        "del 0, Ｔrue",
+        "1: Ｔrue",
+        "t\"{Ｎｏｎｅ}\" + Ｔrue",
+        "Ｔrue\nt\"\"",
+    ] {
+        assert_eq!(
+            compile_bytes_with_options(source.as_bytes(), "case.py", &options).unwrap_err(),
+            CompileError::InvalidIdentifier("True".to_owned()),
+            "{source}"
+        );
+    }
+    for source in [
+        "if :\n    Ｔrue",
+        "1 = 1; Ｔrue",
+        "1 = 1\nＴrue",
+        "t\"{Ｔrue}\"",
+        "t\"\"\nＴrue",
+    ] {
+        assert!(
+            matches!(
+                compile_bytes_with_options(source.as_bytes(), "case.py", &options),
+                Err(CompileError::InvalidSyntax { .. } | CompileError::Parse(_))
+            ),
+            "{source}"
+        );
+    }
+}
