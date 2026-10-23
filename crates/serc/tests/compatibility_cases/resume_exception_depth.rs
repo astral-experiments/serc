@@ -47,3 +47,20 @@ fn preserves_resume_depth_under_outer_managers_and_inner_handlers() {
         }
     }
 }
+
+#[test]
+fn preserves_resume_depth_in_exception_types_and_group_handlers() {
+    for definition in ["def", "async def"] {
+        for handler in [
+            "except (yield Error): pass",
+            "except* (yield Error): pass",
+            "except* Error: yield value",
+            "except* Error as caught: yield caught",
+        ] {
+            let source = format!(
+                "{definition} f():\n    yield before\n    try: work()\n    {handler}\n    yield after\n"
+            );
+            common::assert_matches_cpython_marshal(&source, "handler_yield.py");
+        }
+    }
+}

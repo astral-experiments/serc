@@ -797,6 +797,7 @@ pub(super) struct ControlFlowState<'ast> {
 impl ControlFlowState<'_> {
     fn collected_exception_depth(&self) -> usize {
         self.exceptions.active_exception_region_exclusions.len()
+            + self.exceptions.active_exception_group_handlers
             + self.withs.active_with_region_exclusions.len()
     }
 
@@ -25432,6 +25433,25 @@ impl<'source> Compiler<'source> {
         self.compile_try_except(statement, options)
     }
 
+    fn compile_exception_type(
+        &mut self,
+        exception_type: &Expr,
+        first_handler: bool,
+    ) -> Result<(), CompileError> {
+        let bool_marker_state = matches!(exception_type, Expr::BoolOp(_)).then(|| {
+            ExceptionTypeBoolMarkerState::new(first_handler, self.assembler.current_block_token())
+        });
+        // The common handler cleanup protects evaluation of the exception type.
+        let depth = self.control.suspension_exception_depth() + 1;
+        self.with_suspension_exception_depth(depth, |compiler| {
+            compiler.with_control_override(
+                |control| &mut control.exceptions.exception_type_bool_marker_state,
+                bool_marker_state,
+                |compiler| compiler.compile_expression(exception_type),
+            )
+        })
+    }
+
     fn compile_try_except(
         &mut self,
         statement: &ruff_python_ast::StmtTry,
@@ -30005,19 +30025,8 @@ impl<'source> Compiler<'source> {
                     .into_iter()
                     .filter(|name| self.symbols.owned_load_locals.insert(*name))
                     .collect();
-                let bool_marker_state =
-                    matches!(exception_type.as_ref(), Expr::BoolOp(_)).then(|| {
-                        ExceptionTypeBoolMarkerState::new(
-                            handler_index == 0,
-                            self.assembler.current_block_token(),
-                        )
-                    });
                 let exception_type_start = self.assembler.item_count();
-                self.with_control_override(
-                    |control| &mut control.exceptions.exception_type_bool_marker_state,
-                    bool_marker_state,
-                    |compiler| compiler.compile_expression(exception_type),
-                )?;
+                self.compile_exception_type(exception_type, handler_index == 0)?;
                 for name in newly_owned {
                     self.symbols.owned_load_locals.remove(name);
                 }
@@ -32296,17 +32305,7 @@ impl<'source> Compiler<'source> {
             let exception_type = handler.type_.as_ref().ok_or_else(|| {
                 CompileError::Internal("exception-group handler has no type".to_string())
             })?;
-            let bool_marker_state = matches!(exception_type.as_ref(), Expr::BoolOp(_)).then(|| {
-                ExceptionTypeBoolMarkerState::new(
-                    handler_index == 0,
-                    self.assembler.current_block_token(),
-                )
-            });
-            self.with_control_override(
-                |control| &mut control.exceptions.exception_type_bool_marker_state,
-                bool_marker_state,
-                |compiler| compiler.compile_expression(exception_type),
-            )?;
+            self.compile_exception_type(exception_type, handler_index == 0)?;
             self.assembler.set_location(handler_location);
             self.emit(CHECK_EG_MATCH, 0, 0)?;
             self.emit(COPY, 1, 1)?;
