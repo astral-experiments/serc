@@ -2202,15 +2202,11 @@ impl Compiler<'_> {
             return self.emit(POP_TOP, 0, -1);
         }
         if let Some(starred) = starred {
-            let before = to_u32(starred, "sequence pattern prefix length")?;
-            let after = to_u32(
-                pattern.patterns.len() - starred - 1,
-                "sequence pattern suffix length",
-            )?;
-            self.emit(
-                UNPACK_EX,
-                before | (after << 8),
-                i32::try_from(pattern.patterns.len()).unwrap() - 1,
+            self.emit_star_unpack(
+                starred,
+                pattern.patterns.len(),
+                pattern.range,
+                "too many expressions in star-unpacking sequence pattern",
             )?;
         } else {
             self.emit(
@@ -10026,22 +10022,41 @@ impl Compiler<'_> {
                     self.emit(STORE_SUBSCR, 0, -3)
                 }
             }
-            Expr::List(list) => self.compile_unpack_target(&list.elts),
-            Expr::Tuple(tuple) => self.compile_unpack_target(&tuple.elts),
+            Expr::List(list) => self.compile_unpack_target(&list.elts, list.range),
+            Expr::Tuple(tuple) => self.compile_unpack_target(&tuple.elts, tuple.range),
             Expr::Starred(starred) => self.compile_store_target(&starred.value),
             _ => Err(unsupported("assignment target")),
         }
     }
 
-    fn compile_unpack_target(&mut self, elements: &[Expr]) -> Result<(), CompileError> {
+    fn emit_star_unpack(
+        &mut self,
+        before: usize,
+        count: usize,
+        range: ruff_text_size::TextRange,
+        overflow_message: &'static str,
+    ) -> Result<(), CompileError> {
+        let after = count - before - 1;
+        // CPython packs the prefix into one byte and bounds the suffix by INT_MAX >> 8.
+        if before > usize::from(u8::MAX) || after >= (i32::MAX as usize >> 8) {
+            return Err(CompileError::invalid_syntax(overflow_message, range));
+        }
+        let argument = u32::try_from(before | (after << 8)).unwrap();
+        self.emit(UNPACK_EX, argument, i32::try_from(count).unwrap() - 1)
+    }
+
+    fn compile_unpack_target(
+        &mut self,
+        elements: &[Expr],
+        range: ruff_text_size::TextRange,
+    ) -> Result<(), CompileError> {
         let starred = elements.iter().position(Expr::is_starred_expr);
         if let Some(starred) = starred {
-            let before = to_u32(starred, "unpack target count")?;
-            let after = to_u32(elements.len() - starred - 1, "unpack target count")?;
-            self.emit(
-                UNPACK_EX,
-                before | (after << 8),
-                i32::try_from(elements.len()).unwrap() - 1,
+            self.emit_star_unpack(
+                starred,
+                elements.len(),
+                range,
+                "too many expressions in star-unpacking assignment",
             )?;
         } else {
             let count = to_u32(elements.len(), "unpack target count")?;
