@@ -93,3 +93,15 @@ fn matches_cpython_generator_dispatch_at_original_while_entries() {
         }
     }
 }
+
+#[test]
+fn matches_cpython_handler_dispatch_after_yield_from() {
+    for clause in ["except", "except*"] {
+        for first in [String::new(), format!("    {clause} Other: pass\n")] {
+            let source = format!(
+                "def f(items):\n    try: work()\n{first}    {clause} (yield from items): pass\n"
+            );
+            common::assert_matches_cpython_marshal(&source, "delegating_exception_type.py");
+        }
+    }
+}

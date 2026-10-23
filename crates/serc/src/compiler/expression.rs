@@ -2831,6 +2831,7 @@ impl Compiler<'_> {
                     .set_location(self.source_location(expression.range));
                 self.set_depth(starting_depth + 3 + self.iterator_extra_slots());
                 self.emit(CLEANUP_THROW, 0, -1)?;
+                self.assembler.record_exception_owner_block_boundary(end);
                 self.assembler.mark(end);
                 self.set_depth(starting_depth + 2 + self.iterator_extra_slots());
                 self.emit(END_SEND, 0, -self.iterator_slots())?;
