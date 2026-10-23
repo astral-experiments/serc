@@ -639,7 +639,7 @@ fn compile_input(source: &[u8], filename: &str, options: &CompileOptions) -> Com
 fn capture_compiler(compile: impl FnOnce() -> Result<Vec<u8>, CompileError>) -> CompilerOutcome {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(compile)) {
         Ok(Ok(marshal)) => CompilerOutcome::Compiled(marshal),
-        Ok(Err(error @ CompileError::InvalidFilename)) => {
+        Ok(Err(error @ (CompileError::InvalidFilename | CompileError::InvalidIdentifier(_)))) => {
             CompilerOutcome::Rejected(error.to_string())
         }
         Ok(Err(CompileError::Unsupported(message))) => CompilerOutcome::Unsupported(message),

@@ -180,6 +180,8 @@ pub enum CompileError {
     InvalidFilename,
     /// The Python source bytes could not be decoded.
     Decode(SourceDecodeError),
+    /// The parser rejected an identifier that normalizes to a singleton constant.
+    InvalidIdentifier(String),
     /// Ruff rejected the Python source.
     Parse(ruff_python_parser::ParseError),
     /// A pattern violates Python's semantic restrictions.
@@ -230,6 +232,7 @@ impl CompileError {
             | Self::InvalidSyntax { range, .. }
             | Self::InvalidDocstring { range, .. } => Some(*range),
             Self::InvalidFilename
+            | Self::InvalidIdentifier(_)
             | Self::Decode(_)
             | Self::Unsupported(_)
             | Self::IntegerStringConversionLimit { .. }
@@ -250,6 +253,12 @@ impl CompileError {
 impl fmt::Display for CompileError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidIdentifier(name) => {
+                write!(
+                    formatter,
+                    "identifier field can't represent '{name}' constant"
+                )
+            }
             Self::InvalidFilename => formatter.write_str("embedded null character"),
             Self::Decode(error) => write!(formatter, "failed to decode Python source: {error}"),
             Self::Parse(error) => write!(formatter, "failed to parse Python source: {error}"),
@@ -279,6 +288,7 @@ impl Error for CompileError {
             Self::Decode(error) => Some(error),
             Self::Parse(error) => Some(error),
             Self::InvalidFilename
+            | Self::InvalidIdentifier(_)
             | Self::InvalidPattern { .. }
             | Self::InvalidSyntax { .. }
             | Self::InvalidDocstring { .. }
@@ -883,6 +893,24 @@ fn compile_normalized(
             CompileError::Parse(error.clone())
         };
         return Err(prefer_type_alias_error(error));
+    }
+    // From 3.13 onward, CPython's parser rejects these names after NFKC normalization.
+    // ASCII spellings are keyword tokens, so ordinary singleton literals still compile.
+    if options.python_version >= PythonVersion::Py313 && !source.is_ascii() {
+        use ruff_python_ast::token::TokenKind;
+        use unicode_normalization::UnicodeNormalization as _;
+
+        for token in parsed.tokens() {
+            if token.kind() == TokenKind::Identifier {
+                let spelling = &source[token.range()];
+                if !spelling.is_ascii() {
+                    let name: String = spelling.nfkc().collect();
+                    if matches!(name.as_str(), "True" | "False" | "None") {
+                        return Err(CompileError::InvalidIdentifier(name));
+                    }
+                }
+            }
+        }
     }
     if let Some(error) = yield_syntax::earlier_unsupported(
         source,
