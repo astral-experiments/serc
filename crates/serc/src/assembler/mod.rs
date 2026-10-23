@@ -327,13 +327,13 @@ fn sequence_capture_cleanup_rotation(items: &[Item]) -> Option<CaptureCleanupRot
     };
     // Namespace and cell stores cannot be exchanged with a pop. The smaller swaps
     // still rotate the discarded values when the complete pop prefix is present.
-    let terminal_store =
-        matches!(following.opcode, STORE_NAME | STORE_GLOBAL | STORE_DEREF) && count + 1 == depth;
-    if (prefix.opcode == POP_TOP && !terminal_store)
-        || (!terminal_store && !matches!(following.opcode, SWAP | MATCH_SEQUENCE | STORE_FAST))
-        || following.value_argument().is_none()
-        || following.location.line < 0
-    {
+    let supported_tail = match following.opcode {
+        STORE_NAME | STORE_GLOBAL | STORE_DEREF => count + 1 == depth,
+        STORE_FAST if prefix.opcode == UNPACK_EX => count + 1 == depth,
+        SWAP | MATCH_SEQUENCE | STORE_FAST => prefix.opcode == UNPACK_SEQUENCE,
+        _ => false,
+    };
+    if !supported_tail || following.value_argument().is_none() || following.location.line < 0 {
         return None;
     }
     for item in &items[..consumed] {
