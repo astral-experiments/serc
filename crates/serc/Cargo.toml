@@ -30,6 +30,7 @@ rustc-hash = { workspace = true }
 siphasher = { workspace = true }
 smallvec = { workspace = true }
 stacker = { workspace = true }
+unicode-normalization = { workspace = true }
 
 [dev-dependencies]
 datatest-stable = { workspace = true }

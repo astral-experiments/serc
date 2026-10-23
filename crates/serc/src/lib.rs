@@ -180,6 +180,8 @@ pub enum CompileError {
     InvalidFilename,
     /// The Python source bytes could not be decoded.
     Decode(SourceDecodeError),
+    /// The parser rejected an identifier that normalizes to a singleton constant.
+    InvalidIdentifier(String),
     /// Ruff rejected the Python source.
     Parse(ruff_python_parser::ParseError),
     /// A pattern violates Python's semantic restrictions.
@@ -230,6 +232,7 @@ impl CompileError {
             | Self::InvalidSyntax { range, .. }
             | Self::InvalidDocstring { range, .. } => Some(*range),
             Self::InvalidFilename
+            | Self::InvalidIdentifier(_)
             | Self::Decode(_)
             | Self::Unsupported(_)
             | Self::IntegerStringConversionLimit { .. }
@@ -250,6 +253,12 @@ impl CompileError {
 impl fmt::Display for CompileError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidIdentifier(name) => {
+                write!(
+                    formatter,
+                    "identifier field can't represent '{name}' constant"
+                )
+            }
             Self::InvalidFilename => formatter.write_str("embedded null character"),
             Self::Decode(error) => write!(formatter, "failed to decode Python source: {error}"),
             Self::Parse(error) => write!(formatter, "failed to parse Python source: {error}"),
@@ -279,6 +288,7 @@ impl Error for CompileError {
             Self::Decode(error) => Some(error),
             Self::Parse(error) => Some(error),
             Self::InvalidFilename
+            | Self::InvalidIdentifier(_)
             | Self::InvalidPattern { .. }
             | Self::InvalidSyntax { .. }
             | Self::InvalidDocstring { .. }
@@ -780,6 +790,70 @@ fn has_large_decimal_token(source: &str, tokens: &ruff_python_ast::token::Tokens
     })
 }
 
+/// CPython creates identifier objects as its PEG parser consumes names.
+fn invalid_singleton_identifier(
+    source: &str,
+    parsed: &ruff_python_parser::Parsed<ruff_python_ast::ModModule>,
+    version: PythonVersion,
+) -> Option<CompileError> {
+    use ruff_python_ast::token::TokenKind;
+    use ruff_python_parser::{ParseErrorType, UnsupportedSyntaxErrorKind};
+    use unicode_normalization::UnicodeNormalization as _;
+
+    if version < PythonVersion::Py313 || source.is_ascii() {
+        return None;
+    }
+    let mut statement_start = TextSize::default();
+    'tokens: for token in parsed.tokens() {
+        match token.kind() {
+            TokenKind::Newline | TokenKind::Semi => statement_start = token.end(),
+            TokenKind::Identifier => {
+                let spelling = &source[token.range()];
+                if spelling.is_ascii() {
+                    continue;
+                }
+                let name: String = spelling.nfkc().collect();
+                if !matches!(name.as_str(), "True" | "False" | "None") {
+                    continue;
+                }
+                // Invalid assignment and deletion targets are diagnosed after parsing
+                // the expressions in their statement. Other earlier errors stop parsing.
+                if parsed.errors().iter().any(|error| {
+                    error.location.start() < token.start()
+                        && (error.location.start() < statement_start
+                            || !matches!(
+                                error.error,
+                                ParseErrorType::InvalidAssignmentTarget
+                                    | ParseErrorType::InvalidAnnotatedAssignmentTarget
+                                    | ParseErrorType::InvalidAugmentedAssignmentTarget
+                                    | ParseErrorType::InvalidDeleteTarget
+                            ))
+                }) {
+                    return None;
+                }
+                for error in parsed.unsupported_syntax_errors() {
+                    if error.range.start() > token.start() {
+                        continue;
+                    }
+                    if error.range.start() < statement_start
+                        || !matches!(error.kind, UnsupportedSyntaxErrorKind::TemplateStrings)
+                    {
+                        return None;
+                    }
+                    // Before 3.14, a t-prefix is a name followed by an ordinary
+                    // string token. Its replacement fields never become names.
+                    if error.range.contains(token.start()) {
+                        continue 'tokens;
+                    }
+                }
+                return Some(CompileError::InvalidIdentifier(name));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn compile_normalized(
     source: &str,
     filename: CodeFilename,
@@ -853,6 +927,9 @@ fn compile_normalized(
         )
         .unwrap_or(error)
     };
+    if let Some(error) = invalid_singleton_identifier(source, parsed, options.python_version) {
+        return Err(error);
+    }
     if let Some(error) = parse_error {
         if may_depend_on_decimal_parse {
             return Err(unknown_decimal_parse());
