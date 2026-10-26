@@ -8950,7 +8950,7 @@ fn constant_return_pop_requires_authored_default_records() {
             for item in tail {
                 assembler.push_linear_item(item);
             }
-            assembler.record_copied_return_fallthrough_pop(2);
+            assembler.record_copied_exit_fallthrough_pop(2);
             assert_eq!(
                 assembler
                     .exception_owner_provenance

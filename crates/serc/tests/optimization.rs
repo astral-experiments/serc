@@ -96,6 +96,22 @@ fn erased_named_handler_suffix_preserves_cleanup_copies() {
 }
 
 #[test]
+fn conditional_try_arms_share_the_normal_exit_before_copying() {
+    for exit in [
+        "return item",
+        "return finish(item)",
+        "raise Error",
+        "raise Error(item)",
+        "break",
+    ] {
+        let source = format!(
+            "def run(items, choose):\n    for item in items:\n        try:\n            if choose:\n                first(item)\n            else:\n                second(item)\n        except ValueError as err:\n            report(err)\n        else:\n            {exit}\n"
+        );
+        assert_matches_cpython(&source, "conditional_try_exit_copy.py", &LEVELS);
+    }
+}
+
+#[test]
 fn conditional_try_body_preserves_else_return_join() {
     let source = r"def sample(flag):
     try:

@@ -423,9 +423,6 @@ pub(super) struct ExceptionState {
     // A direct None-condition after an earlier branch or synchronous with in a plain try body
     // can reuse the removed protected block slot. Keep selections local to the innermost try.
     shifted_try_none_owner_statements: Vec<TextRange>,
-    // The complete final if whose fallthrough retains a converted POP_BLOCK before a terminal
-    // try-else suite. The range keeps nested and preceding if statements from consuming it.
-    retained_try_body_if_exit: Option<ruff_text_size::TextRange>,
     // Exact final if whose folded Pass compacts into an ordinary try normal-exit marker.
     compacting_try_body_pass_join: Option<TextRange>,
     pub(super) active_exception_region_exclusions: Vec<Vec<(Label, Label)>>,
@@ -16979,33 +16976,6 @@ impl<'source> Compiler<'source> {
             }
         }
 
-        if self.control.exceptions.retained_try_body_if_exit == Some(statement.range) {
-            let exit_start = self.assembler.label();
-            if self.context.python_version == crate::PythonVersion::Py313 {
-                // Exit copying leaves this POP_BLOCK in the original conditional
-                // join, separate from the preceding call's instruction array.
-                self.assembler
-                    .record_exception_owner_block_boundary(exit_start);
-            }
-            self.assembler.mark(exit_start);
-            if let Some(location) = self.assembler.last_instruction_location() {
-                self.assembler.set_location(location);
-            }
-            // This retained normal exit is the original POP_BLOCK. Native exception
-            // labeling pops the protected region without assigning this record an
-            // owner, including any enclosing try or coroutine stop handler.
-            self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
-            self.assembler.mark_last_as_converted_pop_block();
-            self.assembler.preserve_last_nop();
-            let exit_end = self.assembler.label();
-            self.assembler.mark(exit_end);
-            self.control
-                .exceptions
-                .active_exception_region_exclusions
-                .last_mut()
-                .expect("retained try-body if exit requires an active try")
-                .push((exit_start, exit_end));
-        }
         if self.control.in_loop()
             || self
                 .control
@@ -25773,17 +25743,6 @@ impl<'source> Compiler<'source> {
                 _ => None,
             })
             .flatten();
-        let retained_try_body_if_exit = (suite_terminates(&statement.orelse)
-            && matches!(
-                statement.body.last(),
-                Some(Stmt::If(statement))
-                    if early_condition_truthiness(&statement.test).is_none()
-                        && matches!(statement.body.as_slice(), [Stmt::Expr(_)])
-                        && matches!(statement.elif_else_clauses.as_slice(), [clause]
-                            if clause.test.is_none()
-                                && matches!(clause.body.as_slice(), [Stmt::Expr(_)]))
-            ))
-        .then(|| statement.body.last().expect("matched final if").range());
         // A terminating nested recovery can leave an empty normal-exit block after
         // cold handlers move away, including through synchronous cleanup wrappers.
         let handler_contains_terminal_nested_try = statement.handlers.iter().any(|handler| {
@@ -26757,64 +26716,58 @@ impl<'source> Compiler<'source> {
                                 include_try_none_condition_owner,
                                 |compiler| {
                                     compiler.with_control_override(
-                                        |control| &mut control.exceptions.retained_try_body_if_exit,
-                                        retained_try_body_if_exit,
+                                        |control| {
+                                            &mut control.exceptions.ownerless_handler_assignment_branch
+                                        },
+                                        ownerless_handler_assignment_branch,
                                         |compiler| {
-                                            compiler.with_control_override(
-                                                |control| {
-                                                    &mut control.exceptions.ownerless_handler_assignment_branch
-                                                },
-                                                ownerless_handler_assignment_branch,
-                                                |compiler| {
-                                                    if pass_only_handlers
-                                                        && statement.handlers.len() == 1
-                                                        && statement.body.len() == 4
-                                                        && matches!(compiler.unit.scope, Scope::Function { .. })
-                                                        && compiler.control.exceptions.active_exception_region_exclusions.len() == 1
-                                                        && compiler.control.withs.active_with_region_exclusions.is_empty()
-                                                        && compiler.control.finally.active_normal_finally_bodies == 0
-                                                        && compiler.control.finally.active_finally_try_bodies == 0
-                                                        && compiler.control.loops.contexts.is_empty()
-                                                        && compiler.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
-                                                        && is_direct_try_tuple_unpack_return(statement)
-                                                    {
-                                                        // CPython leaves the first early-return condition marker
-                                                        // outside this handler range, but keeps the later one.
-                                                        let [first, condition, tail @ ..] = statement.body.as_slice() else {
-                                                            unreachable!();
-                                                        };
-                                                        compiler.with_control_override(
-                                                            |control| &mut control.statements.context.has_following,
-                                                            true,
-                                                            |compiler| compiler.compile_statement(first),
-                                                        )?;
-                                                        compiler.with_control_override(
-                                                            |control| &mut control.statements.context.has_following,
-                                                            true,
+                                            if pass_only_handlers
+                                                && statement.handlers.len() == 1
+                                                && statement.body.len() == 4
+                                                && matches!(compiler.unit.scope, Scope::Function { .. })
+                                                && compiler.control.exceptions.active_exception_region_exclusions.len() == 1
+                                                && compiler.control.withs.active_with_region_exclusions.is_empty()
+                                                && compiler.control.finally.active_normal_finally_bodies == 0
+                                                && compiler.control.finally.active_finally_try_bodies == 0
+                                                && compiler.control.loops.contexts.is_empty()
+                                                && compiler.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                                                && is_direct_try_tuple_unpack_return(statement)
+                                            {
+                                                // CPython leaves the first early-return condition marker
+                                                // outside this handler range, but keeps the later one.
+                                                let [first, condition, tail @ ..] = statement.body.as_slice() else {
+                                                    unreachable!();
+                                                };
+                                                compiler.with_control_override(
+                                                    |control| &mut control.statements.context.has_following,
+                                                    true,
+                                                    |compiler| compiler.compile_statement(first),
+                                                )?;
+                                                compiler.with_control_override(
+                                                    |control| &mut control.statements.context.has_following,
+                                                    true,
+                                                    |compiler| compiler.with_control_override(
+                                                        |control| &mut control.statements.context.followed_by_name_return,
+                                                        false,
+                                                        |compiler| compiler.with_control_override(
+                                                            |control| &mut control.statements.context.followed_by_return_or_raise,
+                                                            false,
                                                             |compiler| compiler.with_control_override(
-                                                                |control| &mut control.statements.context.followed_by_name_return,
-                                                                false,
+                                                                |control| &mut control.statements.context.propagates_following_to_suites,
+                                                                true,
                                                                 |compiler| compiler.with_control_override(
-                                                                    |control| &mut control.statements.context.followed_by_return_or_raise,
-                                                                    false,
-                                                                    |compiler| compiler.with_control_override(
-                                                                        |control| &mut control.statements.context.propagates_following_to_suites,
-                                                                        true,
-                                                                        |compiler| compiler.with_control_override(
-                                                                            |control| &mut control.conditions.exclude_condition_not_taken_from_exception,
-                                                                            true,
-                                                                            |compiler| compiler.compile_statement(condition),
-                                                                        ),
-                                                                    ),
+                                                                    |control| &mut control.conditions.exclude_condition_not_taken_from_exception,
+                                                                    true,
+                                                                    |compiler| compiler.compile_statement(condition),
                                                                 ),
                                                             ),
-                                                        )?;
-                                                        compiler.compile_suite(tail)
-                                                    } else {
-                                                        compiler.compile_suite(&statement.body)
-                                                    }
-                                                },
-                                            )
+                                                        ),
+                                                    ),
+                                                )?;
+                                                compiler.compile_suite(tail)
+                                            } else {
+                                                compiler.compile_suite(&statement.body)
+                                            }
                                         },
                                     )
                                 },
@@ -27338,7 +27291,7 @@ impl<'source> Compiler<'source> {
             && statement.finalbody.is_empty()
         {
             self.assembler
-                .record_copied_return_fallthrough_pop(deferred_try_pop_instruction);
+                .record_copied_exit_fallthrough_pop(deferred_try_pop_instruction);
         }
         if removed_try_pop_block && !deferred_try_pop_block {
             self.assembler.transfer_linear_try_pop_block_slot(try_end);

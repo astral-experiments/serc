@@ -3189,12 +3189,12 @@ impl Assembler {
         .then_some(previous.location)
     }
 
-    /// Records an original POP whose jumping predecessors copy a small return.
+    /// Records an original POP whose jumping predecessors copy a small return or raise.
     ///
     /// Native pre-line copying counts the POP itself and stops at four original
     /// records. The remaining physical predecessor supplies only the location;
     /// the POP retains its own owner and starts a fresh NOP-compaction array.
-    pub(crate) fn record_copied_return_fallthrough_pop(&mut self, instruction_offset: usize) {
+    pub(crate) fn record_copied_exit_fallthrough_pop(&mut self, instruction_offset: usize) {
         if self.python_version <= crate::PythonVersion::Py313 {
             return;
         }
@@ -3308,7 +3308,7 @@ impl Assembler {
                         && *ret
                             == Instruction::value_with_depth(RETURN_VALUE, 0, nop.location, depth)
                 });
-        let mut returned = false;
+        let mut exits = false;
         let mut original_size = 1;
         for item in items.iter().skip(marker_item + 1).take(3) {
             let Item::Instruction(instruction) = item else {
@@ -3334,11 +3334,11 @@ impl Assembler {
                 return;
             }
             if ends_scope(instruction.opcode) {
-                returned = instruction.opcode == RETURN_VALUE;
+                exits = matches!(instruction.opcode, RETURN_VALUE | RAISE_VARARGS);
                 break;
             }
         }
-        if !returned {
+        if !exits {
             return;
         }
         // Keep the marker unlocated through copying: each copied POP must inherit
