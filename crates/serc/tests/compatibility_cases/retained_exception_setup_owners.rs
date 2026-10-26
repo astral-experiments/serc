@@ -142,3 +142,13 @@ fn matches_cpython_retained_setup_after_removed_finally_pop_block() {
         }
     }
 }
+
+#[test]
+fn retained_setup_after_a_conditional_finally_entry() {
+    for guard in ["not flag", "item.value"] {
+        let source = format!(
+            "def f(manager, item, flag):\n    with manager:\n        try:\n            assert flag\n        finally:\n            try:\n                if {guard}:\n                    close(item)\n            finally:\n                finish()\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "conditional_finally_setup.py");
+    }
+}

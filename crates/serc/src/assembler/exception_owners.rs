@@ -1312,6 +1312,26 @@ pub(super) struct OriginalNormalFinallyArray {
     pub(super) borrow_join: Option<(Label, Instruction)>,
 }
 
+impl OriginalNormalFinallyArray {
+    /// A retained setup can share its array head with a sole conditional predecessor.
+    pub(super) fn has_forward_predecessors(
+        entry: Label,
+        incoming: &[Instruction],
+        retained_setup: bool,
+    ) -> bool {
+        match incoming {
+            [] => false,
+            [jump] if retained_setup && is_conditional_jump(jump.opcode) => {
+                jump.forward_target() == Some(entry) && jump.location.line >= 0
+            }
+            _ => incoming.iter().all(|jump| {
+                crate::target::is_unconditional_jump(jump.opcode)
+                    && jump.forward_target() == Some(entry)
+            }),
+        }
+    }
+}
+
 /// Whether a slot is protected, with its exact source region when known.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum ExceptionOwner {
@@ -4494,20 +4514,19 @@ impl LayoutAssembler {
                 }
                 _ => None,
             };
-            if origin.incoming.is_empty()
-                || origin.incoming.iter().any(|jump| {
-                    !crate::target::is_unconditional_jump(jump.opcode)
-                        || jump.operand() != Operand::Forward(origin.entry)
-                })
-                || ((!self
+            if !OriginalNormalFinallyArray::has_forward_predecessors(
+                origin.entry,
+                &origin.incoming,
+                origin.retained_setup.is_some(),
+            ) || ((!self
+                .exception_owner_provenance
+                .source_boundaries
+                .contains(&origin.entry)
+                || !self
                     .exception_owner_provenance
-                    .source_boundaries
-                    .contains(&origin.entry)
-                    || !self
-                        .exception_owner_provenance
-                        .block_boundaries
-                        .contains(&origin.entry))
-                    && authored_break_location.is_none())
+                    .block_boundaries
+                    .contains(&origin.entry))
+                && authored_break_location.is_none())
             {
                 continue;
             }
@@ -4822,7 +4841,11 @@ impl LayoutAssembler {
             if excluded_pop_owner_refined {
                 original_marker.set_exception_owner(NormalizedExceptionOwner::Absent);
             }
-            if let Some(location) = authored_break_location {
+            let predecessor_location = match origin.incoming.as_slice() {
+                [jump] if is_conditional_jump(jump.opcode) => Some(jump.location),
+                _ => authored_break_location,
+            };
+            if let Some(location) = predecessor_location {
                 // CP propagates its sole jump predecessor's location before
                 // NOP removal. A distinct next line retains this original slot.
                 let next = current[marker_at + 1..]

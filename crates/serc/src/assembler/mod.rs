@@ -13829,12 +13829,11 @@ impl Assembler {
                         Item::Instruction(jump) if matches!(jump.operand(), Operand::Forward(target) | Operand::Backward(target) if labels.contains(&target)) => Some(*jump),
                         _ => None,
                     }).collect::<Vec<_>>();
-                    if incoming.is_empty()
-                        || incoming.iter().any(|jump| {
-                            !is_unconditional_jump(jump.opcode)
-                                || jump.operand() != Operand::Forward(*entry)
-                        })
-                    {
+                    if !exception_owners::OriginalNormalFinallyArray::has_forward_predecessors(
+                        *entry,
+                        &incoming,
+                        retained_setup.is_some(),
+                    ) {
                         return;
                     }
                     // This recorder runs after the finalizer suite and before its
