@@ -10286,6 +10286,30 @@ fn elided_conditional_preserves_jump_before_nested_finalizers() {
 }
 
 #[test]
+fn nested_named_cleanups_share_the_fallthrough_line() {
+    let source = r"async def execute(items, ready):
+    for item in items:
+        try:
+            prepare(item)
+        except ValueError as problem:
+            if ready:
+                try:
+                    prepare(item)
+                except OSError as recovered:
+                    if ready:
+                        pass
+                    else:
+                        read(item)
+";
+    assert_matches_cpython_versions(
+        source,
+        "nested_name_cleanup.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn elided_handler_assertion_preserves_shared_false_cleanup() {
     for (condition, suffix) in [
         ("config.recover and not stopped", "assert False"),

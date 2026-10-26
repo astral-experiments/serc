@@ -2097,7 +2097,12 @@ fn fused_store_tail_location(source: &[Item]) -> Option<SourceLocation> {
 }
 
 /// Carries a named-handler cleanup's line across its exception-end split.
-fn named_handler_cleanup_exit_location(source: &[Item], target: &[Item]) -> Option<SourceLocation> {
+fn named_handler_cleanup_exit_location(
+    source: &[Item],
+    target: &[Item],
+    regions: &[ExceptionRegion],
+    is_boundary: impl Fn(&Label) -> bool,
+) -> Option<SourceLocation> {
     let source_entry_len = source
         .iter()
         .take_while(|item| matches!(item, Item::Label(_)))
@@ -2111,6 +2116,18 @@ fn named_handler_cleanup_exit_location(source: &[Item], target: &[Item]) -> Opti
     else {
         return None;
     };
+    if pop.opcode != POP_EXCEPT
+        || pop.location.line < 0
+        || load.opcode != LOAD_CONST
+        || store.opcode != STORE_FAST
+        || delete.opcode != DELETE_FAST
+        || store.operand() != delete.operand()
+        || [load, store, delete].iter().any(|instruction| {
+            instruction.location.line >= 0 || instruction.no_location_policy.preserves_location()
+        })
+    {
+        return None;
+    }
     let target_entry_len = target
         .iter()
         .take_while(|item| matches!(item, Item::Label(_)))
@@ -2122,6 +2139,28 @@ fn named_handler_cleanup_exit_location(source: &[Item], target: &[Item]) -> Opti
                 && jump.location.line < 0
                 && jump.no_location_policy.allows_block_inlining()
                 && !jump.no_location_policy.preserves_location()
+        }
+        [
+            Item::Instruction(outer_pop),
+            Item::Instruction(clear),
+            Item::Instruction(outer_store),
+            Item::Instruction(outer_delete),
+            Item::Instruction(jump),
+            trailing @ ..,
+        ] if is_unconditional_jump(jump.opcode) => {
+            outer_pop.opcode == POP_EXCEPT
+                && clear.opcode == LOAD_CONST
+                && clear.operand() == load.operand()
+                && outer_store.opcode == STORE_FAST
+                && outer_delete.opcode == DELETE_FAST
+                && outer_store.operand() == outer_delete.operand()
+                && trailing.iter().all(|item| matches!(item, Item::Label(_)))
+                && [outer_pop, clear, outer_store, outer_delete, jump]
+                    .iter()
+                    .all(|instruction| {
+                        instruction.location.line < 0
+                            && !instruction.no_location_policy.preserves_location()
+                    })
         }
         [
             Item::Instruction(outer_pop),
@@ -2156,18 +2195,29 @@ fn named_handler_cleanup_exit_location(source: &[Item], target: &[Item]) -> Opti
         }
         _ => false,
     };
-    (pop.opcode == POP_EXCEPT
-        && pop.location.line >= 0
-        && load.opcode == LOAD_CONST
-        && store.opcode == STORE_FAST
-        && delete.opcode == DELETE_FAST
-        && store.operand() == delete.operand()
-        && [load, store, delete].iter().all(|instruction| {
-            instruction.location.line < 0 && !instruction.no_location_policy.preserves_location()
-        })
-        && target_entry_len > 0
-        && supported_exit)
-        .then_some(pop.location)
+    if !supported_exit {
+        return None;
+    }
+    // A split can have unused aliases from copied cleanup blocks. A live
+    // region end is required and no independent entry may supply another line.
+    let mut split = false;
+    for item in &target[..target_entry_len] {
+        let Item::Label(label) = item else {
+            unreachable!()
+        };
+        if is_boundary(label) {
+            return None;
+        }
+        if regions.iter().any(|region| region.end == *label) {
+            split = true;
+        } else if regions
+            .iter()
+            .any(|region| region.start == *label || region.target == *label)
+        {
+            return None;
+        }
+    }
+    split.then_some(pop.location)
 }
 
 /// Resolves only an original match cleanup whose complete fallthrough array still matches.
@@ -2395,21 +2445,14 @@ fn propagate_exit_block_locations_inner<const SKIP_LOCATED: bool>(
                 && let Some(location) = named_handler_cleanup_exit_location(
                     graph[source].items(),
                     graph[target].items(),
+                    exception_regions,
+                    |label| {
+                        preserved_boundaries.contains(label)
+                            || source_boundaries.contains(label)
+                            || original_boundaries.contains(label)
+                            || setups.iter().any(|(setup, _)| setup == label)
+                    },
                 )
-                && graph[target]
-                    .items()
-                    .iter()
-                    .take_while(|item| matches!(item, Item::Label(_)))
-                    .all(|item| {
-                        let Item::Label(label) = item else {
-                            unreachable!();
-                        };
-                        exception_regions.iter().any(|region| region.end == *label)
-                            && !preserved_boundaries.contains(label)
-                            && !source_boundaries.contains(label)
-                            && !original_boundaries.contains(label)
-                            && !setups.iter().any(|(setup, _)| setup == label)
-                    })
             {
                 // The inner POP_EXCEPT has its sole predecessor's line already.
                 // Its unlocated name-clearing tail receives that line later.
@@ -8624,33 +8667,24 @@ impl OptimizationPipeline {
                     && let Some(location) = named_handler_cleanup_exit_location(
                         graph[source].items(),
                         graph[target].items(),
-                    )
-                    && graph[target]
-                        .items()
-                        .iter()
-                        .take_while(|item| matches!(item, Item::Label(_)))
-                        .all(|item| {
-                            let Item::Label(label) = item else {
-                                unreachable!();
-                            };
-                            self.exception_regions
-                                .iter()
-                                .any(|region| region.end == *label)
-                                && !self.preserved_block_boundaries.contains(label)
-                                && !self
+                        &self.exception_regions,
+                        |label| {
+                            self.preserved_block_boundaries.contains(label)
+                                || self
                                     .exception_owner_provenance
                                     .source_boundaries
                                     .contains(label)
-                                && !self
+                                || self
                                     .exception_owner_provenance
                                     .block_boundaries
                                     .contains(label)
-                                && !self
+                                || self
                                     .exception_owner_provenance
                                     .setups
                                     .iter()
                                     .any(|(setup, _)| setup == label)
-                        })
+                        },
+                    )
                 {
                     // The POP_EXCEPT donor is already resolved. Its name-clearing tail
                     // receives that line later, after this original exit is visited.
