@@ -13152,6 +13152,68 @@ impl Assembler {
             });
     }
 
+    /// Records the final POP and the first local test of the copied finally suite.
+    pub(crate) fn record_copied_return_guard(&mut self, pop_item: usize, ordinary_pops: usize) {
+        let items = self.linear_items();
+        let Some(cleanup) = items[..pop_item].iter().rev().find_map(|item| match item {
+            Item::Instruction(i) => Some(*i),
+            Item::Label(_) => None,
+        }) else {
+            return;
+        };
+        if !matches!(cleanup.opcode, POP_EXCEPT | POP_TOP) {
+            return;
+        }
+        let mut records = items[pop_item..].iter().filter_map(|item| match item {
+            Item::Instruction(i) => Some(*i),
+            Item::Label(_) => None,
+        });
+        let Some(pop) = records.next() else { return };
+        if pop.opcode != NOP
+            || !pop.fusion_policy.is_converted_pop_block()
+            || pop.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
+            || pop.local_policy.hidden_exception_owner_slots() != 0
+        {
+            return;
+        }
+        let mut guard = Vec::new();
+        for record in records.take(5) {
+            guard.push(record);
+            if record.opcode == NOT_TAKEN {
+                break;
+            }
+        }
+        let [load, operands @ .., condition, marker] = guard.as_slice() else {
+            return;
+        };
+        if !matches!(load.opcode, LOAD_FAST | crate::target::opcodes::LOAD_DEREF)
+            || load.local_policy.hidden_exception_owner_slots() != 0
+            || marker.opcode != NOT_TAKEN
+            || condition.forward_target().is_none()
+            || condition.location != marker.location
+            || !(matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+                && operands.is_empty()
+                || matches!(condition.opcode, POP_JUMP_IF_TRUE | POP_JUMP_IF_FALSE)
+                    && (matches!(operands, [to_bool] if to_bool.opcode==TO_BOOL)
+                        || matches!(operands, [value, compare] if matches!(value.opcode, LOAD_CONST | crate::target::opcodes::LOAD_SMALL_INT)
+                            && compare.opcode==COMPARE_OP && compare.value_argument().is_some_and(|arg| arg & 16!=0))))
+        {
+            return;
+        }
+        let marker = *marker;
+        let condition = *condition;
+        guard.truncate(guard.len() - 2);
+        self.exception_owner_provenance.copied_return_guards.push(
+            exception_owners::CopiedReturnGuard {
+                cleanup,
+                operands: guard,
+                condition,
+                marker,
+                ordinary_pops,
+            },
+        );
+    }
+
     /// Captures the actual manager unwind and first None test of its copied finally.
     pub(crate) fn record_copied_manager_return_compaction(
         &mut self,

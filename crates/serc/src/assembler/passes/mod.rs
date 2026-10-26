@@ -769,6 +769,25 @@ impl OptimizationPipeline {
         // Exit duplication changes this surviving conditional's target, not its
         // original array or the normal-finally comparison cells recorded within it.
         for (before, after) in &copied_exit_owner_retargets {
+            // Duplicating the exit retargets the surviving guard. Preserve that exact
+            // substitution only for a unique captured and live instruction.
+            let mut returns = self
+                .exception_owner_provenance
+                .copied_return_guards
+                .iter_mut()
+                .filter(|origin| origin.condition == *before);
+            if let Some(origin) = returns.next()
+                && returns.next().is_none()
+                && self
+                    .graph
+                    .iter_items()
+                    .filter(|item| matches!(item, Item::Instruction(record) if record == after))
+                    .count()
+                    == 1
+            {
+                origin.condition = *after;
+            }
+
             if self
                 .exception_owner_provenance
                 .copied_handler_cleanups

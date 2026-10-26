@@ -8757,6 +8757,7 @@ impl<'source> Compiler<'source> {
                     && self.plain_handler_chain_has_outer_try();
                 let mut protected_outer_pop_except_start = None;
                 let mut preserves_managed_handler_try_pops = false;
+                let mut emitted_named_handler_pops = false;
                 let mut next_loop =
                     loops_before_finally_end.unwrap_or(self.control.loops.contexts.len());
                 let mut with_unwind_before_exception_start = with_unwind_starts.len();
@@ -9860,6 +9861,7 @@ impl<'source> Compiler<'source> {
                                     && return_finally_contexts[0].exception_region_depth + 1 == region_depth
                                     && self.control.exceptions.active_try_marker_slots.is_empty()
                                     && self.control.withs.active_with_exits.iter().all(|manager| !manager.is_async)));
+                        emitted_named_handler_pops |= preserve_named_handler_pop_slots;
                         let preserve_legacy_inner_try_pop_slots = self.context.python_version
                             <= crate::PythonVersion::Py313
                             && handler_count == 1
@@ -11809,6 +11811,63 @@ impl<'source> Compiler<'source> {
                                     && handler.try_body_depth == 0
                                     && handler.exception_region_depth == index + 1
                             });
+                    // Ordinary tries surrounding the handler or iterator unwind after its
+                    // last cleanup, immediately before this finally's original POP.
+                    let ordinary_pops = self.control.exceptions.active_try_marker_slots.len();
+                    let mut iterators = self
+                        .control
+                        .loops
+                        .contexts
+                        .iter()
+                        .filter(|context| context.iterator_cleanup != IteratorCleanup::None);
+                    let iterator = iterators.next();
+                    let return_guard_pops = (self.context.python_version
+                        == crate::PythonVersion::Py314
+                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                            == CO_COROUTINE
+                        && !return_is_overridden
+                        && context_index == 0
+                        && return_finally_contexts.len() == 1
+                        && finally_context.handler_depth == 0
+                        && finally_context.loop_depth == 0
+                        && finally_context.try_body_depth == 0
+                        && finally_context.exception_region_depth == 0
+                        && finally_context.with_depth
+                            == self.control.withs.active_with_exits.len()
+                        && with_unwind_starts.is_empty()
+                        && next_with == finally_context.with_depth
+                        && self.control.finally.active_normal_finally_bodies == 0
+                        && self.control.finally.active_copied_finally_bodies == 0
+                        && self.control.finally.active_finally_end_blocks == 0
+                        && self.control.exceptions.active_exception_group_handlers == 0
+                        && ordinary_pops <= 2
+                        && self
+                            .control
+                            .exceptions
+                            .active_exception_region_exclusions
+                            .len()
+                            == 1 + handler_count + ordinary_pops
+                        && handler_count <= 1
+                        && self
+                            .control
+                            .exceptions
+                            .active_exception_handlers
+                            .iter()
+                            .all(|handler| {
+                                (handler.name.is_none() || emitted_named_handler_pops)
+                                    && handler.with_depth == finally_context.with_depth
+                                    && handler.loop_depth == self.control.loops.contexts.len()
+                                    && handler.try_body_depth == ordinary_pops
+                                    && handler.exception_region_depth == handler.try_body_depth + 1
+                            })
+                        && iterators.next().is_none()
+                        && iterator.is_none_or(|context| {
+                            context.iterator_cleanup == IteratorCleanup::Sync
+                                && context.with_depth == finally_context.with_depth
+                                && context.exception_region_depth == ordinary_pops + 1
+                        })
+                        && (handler_count == 1 || iterator.is_some()))
+                    .then(|| (self.assembler.item_count(), ordinary_pops));
                     let copied_handler_none_pop = (preserve_tos
                         && !return_is_overridden
                         && context_index == 0
@@ -12333,6 +12392,12 @@ impl<'source> Compiler<'source> {
                             }
                         },
                     );
+                    if result.is_ok()
+                        && let Some((pop, ordinary_pops)) = return_guard_pops
+                    {
+                        self.assembler
+                            .record_copied_return_guard(pop, ordinary_pops);
+                    }
                     if result.is_ok() && preserve_tos {
                         self.assembler
                             .record_copied_finally_none_prefix(copied_finally_pop_instruction);
