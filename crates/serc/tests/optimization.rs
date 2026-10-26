@@ -2224,6 +2224,24 @@ fn erased_loop_exit_stays_inside_managed_finally() {
 }
 
 #[test]
+fn bare_while_return_keeps_the_guard_slot_inside_an_outer_manager() {
+    let source = r"def sample(item, flag, enabled):
+    with acquire():
+        try:
+            while True:
+                if enabled:
+                    work(item)
+                    return
+        except ValueError:
+            raise
+        finally:
+            if flag is not None and flag.ready():
+                finish()
+";
+    assert_matches_cpython(source, "managed_while_return.py", &LEVELS);
+}
+
+#[test]
 fn copied_return_through_nested_loops_keeps_none_guard_owner() {
     let source = r#"async def sample(client, response):
     for attempt in range(client.attempts):
