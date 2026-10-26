@@ -17287,6 +17287,21 @@ fn completed_managers_preserve_coroutine_match_returns() {
 }
 
 #[test]
+fn final_pass_before_terminal_match_default_threads_to_outer_exit() {
+    for default in ["return value", "raise ValueError"] {
+        let source = format!(
+            "def run(outer, inner, value):\n    match outer:\n        case 1:\n            match inner:\n                case 2:\n                    return value\n                case 3:\n                    pass\n                case _:\n                    {default}\n        case _:\n            pass\n    observe(value)\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "nested_case_exit.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn nested_match_arms_preserve_tuple_return_copy_budget() {
     for otherwise in ["assert False", "pass", "result = [7]; tag = 'seven'"] {
         for returned in ["result, tag", "result", "result, tag, kind"] {
