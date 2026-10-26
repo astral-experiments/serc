@@ -5935,6 +5935,7 @@ impl Compiler<'_> {
             return self.compile_conditional_filter(
                 conditional,
                 accepted,
+                true,
                 |compiler, arm, accepted| {
                     compiler.compile_generator_filter(arm, element, accepted, restart)
                 },
@@ -6220,6 +6221,7 @@ impl Compiler<'_> {
             return self.compile_conditional_filter(
                 conditional,
                 accepted,
+                !negated,
                 |compiler, arm, accepted| {
                     compiler.compile_filter_condition(
                         arm,
@@ -6467,6 +6469,7 @@ impl Compiler<'_> {
         &mut self,
         conditional: &ruff_python_ast::ExprIf,
         accepted: Label,
+        jump_on: bool,
         mut compile_arm: impl FnMut(&mut Self, &Expr, Label) -> Result<(), CompileError>,
     ) -> Result<(), CompileError> {
         let otherwise = self.assembler.label();
@@ -6482,8 +6485,11 @@ impl Compiler<'_> {
             SourceLocation::NONE
         } else {
             let range = if comprehension_filter_truthiness(&conditional.body).is_none() {
-                // Branch lowering strips transparent `not`; the operand owns this exit.
-                synthetic_condition_exit_range(&conditional.body)
+                // An unlocated join with one incoming edge inherits that operand's location.
+                unique_condition_jump_target(&conditional.body, jump_on).map_or_else(
+                    || synthetic_condition_exit_range(&conditional.body),
+                    Ranged::range,
+                )
             } else {
                 conditional.body.range()
             };
@@ -6530,6 +6536,7 @@ impl Compiler<'_> {
             return self.compile_conditional_filter(
                 conditional,
                 accepted,
+                true,
                 |compiler, arm, accepted| {
                     compiler.compile_comprehension_filter(
                         arm,

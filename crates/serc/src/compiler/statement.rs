@@ -22588,6 +22588,7 @@ impl<'source> Compiler<'source> {
             return self.compile_conditional_filter(
                 conditional,
                 success,
+                jump_on,
                 |compiler, arm, success| {
                     compiler.compile_loop_tail_condition(
                         arm,

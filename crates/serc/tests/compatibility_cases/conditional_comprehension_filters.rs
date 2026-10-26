@@ -8,6 +8,8 @@ fn matches_cpython_conditional_comprehension_filters() {
         "(item is None if flag else item > 0)",
         "not (item if flag else other)",
         "((item or other) if flag else (item and other))",
+        "((item and check(item)) if flag else other)",
+        "not ((item or check(item)) if flag else other)",
         "(item if flag else True)",
         "(item if True else other)",
         "(item if False else other)",
