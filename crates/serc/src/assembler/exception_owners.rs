@@ -1205,6 +1205,7 @@ pub(super) struct RetainedManagerReturnNonePrefix {
 /// Exact manager cleanup and first copied-finally test, before either compaction pass.
 #[derive(Debug)]
 pub(super) struct CopiedManagerReturnCompaction {
+    pub(super) inner_try_pop: bool,
     pub(super) ordinary_try_pops: usize,
     /// A still-live manager can be replaced only by a captured original cleanup cell.
     pub(super) retained_outer_handler: Option<Label>,
@@ -12860,10 +12861,22 @@ impl LayoutAssembler {
                         })
                         .eq([1]),
             );
+            let inner_setup =
+                origin.inner_try_pop
+                    && offset == 0
+                    && instruction.opcode == NOP
+                    && instruction.exception_policy() == super::ExceptionPolicy::EXCLUDE_ALWAYS
+                    && self.exception_owner_provenance.setup_nop_ranges.iter().any(
+                        |(begin, end)| {
+                            positions.get(begin) == Some(&array_start)
+                                && positions.get(end) == Some(&(array_start + 1))
+                        },
+                    );
             if usize::from(instruction.local_policy.hidden_exception_owner_slots())
                 != authored_return_slots + literal_slots + linear_try_pop_slots
                 || usize::from(instruction.pre_fold_extra_instructions()) != literal_slots
                 || (instruction.exception_policy() != super::ExceptionPolicy::NoneUnchanged
+                    && !inner_setup
                     && !origin
                         .constant_return_prefix
                         .as_ref()
@@ -12874,6 +12887,7 @@ impl LayoutAssembler {
                                     == super::ExceptionPolicy::EXCLUDE_ALWAYS
                         }))
                 || (instruction.opcode == NOP
+                    && !inner_setup
                     && !origin
                         .constant_return_prefix
                         .as_ref()
@@ -12935,6 +12949,8 @@ impl LayoutAssembler {
                         .as_ref()
                         .map_or(0, |prefix| prefix.missing_null_pops),
                 )?
+                // A try inside the manager unwinds before the manager POP.
+                .checked_add(usize::from(origin.inner_try_pop))?
                 .checked_add(1)?;
             let source = marker.checked_sub(original_start)?;
             if source < origin.cleanup.len() {
@@ -13923,6 +13939,7 @@ mod tests {
                         rustc_hash::FxHashMap::default()
                     },
                     copied_manager_return_compactions: vec![CopiedManagerReturnCompaction {
+                        inner_try_pop: false,
                         ordinary_try_pops: 1,
                         retained_outer_handler: None,
                         cleanup: cleanup.to_vec(),

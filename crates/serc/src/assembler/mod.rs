@@ -13156,12 +13156,12 @@ impl Assembler {
     pub(crate) fn record_copied_manager_return_compaction(
         &mut self,
         pop_item: usize,
-        ordinary_try_pops: usize,
+        (inner_try_pop, ordinary_try_pops): (bool, usize),
         manager_count: usize,
         retained_outer_handler: Option<Label>,
         named_handler: bool,
     ) {
-        use crate::target::opcodes::{CALL, DELETE_FAST, LOAD_CONST, STORE_FAST, SWAP};
+        use crate::target::opcodes::{CALL, DELETE_FAST, LOAD_CONST, LOAD_DEREF, STORE_FAST, SWAP};
 
         let items = self.linear_items();
         let Some(before) = items.get(..pop_item) else {
@@ -13264,29 +13264,47 @@ impl Assembler {
         else {
             return;
         };
+        let (to_bool, condition) = if condition.opcode == TO_BOOL {
+            let Some(jump) = suffix.next() else {
+                return;
+            };
+            if !matches!(jump.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE)
+                || condition.value_argument() != Some(0)
+                || condition.local_policy.hidden_exception_owner_slots() != 0
+                || condition.pre_fold_extra_instructions() != 0
+            {
+                return;
+            }
+            (Some(condition), jump)
+        } else if matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE) {
+            (None, condition)
+        } else {
+            return;
+        };
         if pop.opcode == NOP
             && pop.fusion_policy.is_converted_pop_block()
             && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
             && pop.local_policy.hidden_exception_owner_slots() == 0
             && pop.pre_fold_extra_instructions() == 0
-            && load.opcode == LOAD_FAST
+            && matches!(load.opcode, LOAD_FAST | LOAD_DEREF)
             && load.local_policy.hidden_exception_owner_slots() == 0
             && load.pre_fold_extra_instructions() == 0
-            && matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
             && condition.forward_target().is_some()
-            && condition.local_policy.hidden_exception_owner_slots() == 3
+            && condition.local_policy.hidden_exception_owner_slots()
+                == if to_bool.is_some() { 0 } else { 3 }
             && condition.pre_fold_extra_instructions() == 0
         {
             self.exception_owner_provenance
                 .copied_manager_return_compactions
                 .push(exception_owners::CopiedManagerReturnCompaction {
+                    inner_try_pop,
                     ordinary_try_pops,
                     retained_outer_handler,
                     cleanup,
                     earlier_cleanup,
                     named_handler_cleanup,
                     constant_return_prefix: None,
-                    to_bool: None,
+                    to_bool,
                     pop,
                     load,
                     condition,
@@ -13431,6 +13449,7 @@ impl Assembler {
             self.exception_owner_provenance
                 .copied_manager_return_compactions
                 .push(exception_owners::CopiedManagerReturnCompaction {
+                    inner_try_pop: false,
                     retained_outer_handler: None,
                     ordinary_try_pops: outer_try_pops,
                     cleanup: cleanup.to_vec(),
@@ -13617,6 +13636,7 @@ impl Assembler {
         self.exception_owner_provenance
             .copied_manager_return_compactions
             .push(exception_owners::CopiedManagerReturnCompaction {
+                inner_try_pop: false,
                 retained_outer_handler: None,
                 ordinary_try_pops: usize::from(!retained_inner_try),
                 cleanup: cleanup.to_vec(),
