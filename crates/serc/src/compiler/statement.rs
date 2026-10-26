@@ -22214,6 +22214,15 @@ impl<'source> Compiler<'source> {
                         && body.iter().all(|part| {
                             let single = std::slice::from_ref(part);
                             self.context.is_elided_statement(part)
+                                // A Pass or a guard whose body was erased still finishes
+                                // before the enclosing condition reaches its false edge.
+                                || (self.unit.flags & CO_COROUTINE != 0
+                                    && (matches!(part, Stmt::Pass(_))
+                                        || matches!(part, Stmt::If(inner)
+                                            if inner.elif_else_clauses.is_empty()
+                                                && condition_has_only_runtime_tests(&inner.test)
+                                                && !expression_suspends_current_scope(&inner.test)
+                                                && inner.body.iter().all(|stmt| self.context.is_elided_statement(stmt)))))
                                 || (suite_has_linear_borrow_fallthrough(single)
                                     && suite_has_nonsuspending_conditional_work(single)
                                     && !suite_contains_yield(single))
