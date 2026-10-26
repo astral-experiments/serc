@@ -604,6 +604,21 @@ fn coroutine_guarded_recovery_reaches_nested_cleanup() {
 }
 
 #[test]
+fn compound_handler_loop_exits_keep_separate_cleanup_copies() {
+    let source = "async def sample(outer, ready, active):
+    while outer:
+        try:
+            await work()
+        except OSError:
+            if stop():
+                raise
+            while ready and active():
+                recover()
+";
+    assert_matches_cpython(source, "compound_handler_loop_exits.py", &LEVELS);
+}
+
+#[test]
 fn conditional_stored_reraise_copies_local_join() {
     let source = "async def sample(owner, target, cleanup, started, observed):\n    try:\n        try:\n            outcome, reason = 'accepted', 'acknowledged'\n        except AlreadyStarted:\n            return\n        except RemoteError as error:\n            raise Unavailable() from None\n        except TimeoutError as error:\n            raise Unavailable() from None\n    except BaseException as error:\n        if isinstance(error, Cancelled):\n            reason = 'during_dispatch' if started else 'before_dispatch'\n        elif isinstance(error, Disabled):\n            reason = 'disabled'\n        elif started:\n            if isinstance(observed, RemoteError) and observed.status in {Invalid, Unauthorized, Denied, Failed}:\n                reason = 'rejected'\n            else:\n                reason = 'transport' if isinstance(observed, (RemoteError, TimeoutError)) else 'other'\n        raise\n    finally:\n        if not cleanup:\n            owner.record(target, outcome, reason, observed)\n";
     for source in [
