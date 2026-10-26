@@ -5605,6 +5605,28 @@ fn erased_nested_else_preserves_coroutine_loop_exits() {
 }
 
 #[test]
+fn a_guard_donates_the_jump_location_after_a_manager_and_erased_assertion() {
+    let source = r"def run(flag, ready, other):
+    with outer():
+        if flag:
+            pass
+        elif ready:
+            if other:
+                with inner():
+                    work()
+                assert other
+        else:
+            finish()
+";
+    assert_matches_cpython_versions(
+        source,
+        "manager_guard_jump.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn erased_final_else_suffix_preserves_coroutine_loop_exits() {
     let source = r"async def sample(items, selected, prepare, work, verify):
     for item in items:
