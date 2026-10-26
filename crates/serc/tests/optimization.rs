@@ -1414,6 +1414,12 @@ fn recovery_loop_comprehension_keeps_continuation_cold() {
 }
 
 #[test]
+fn nested_try_branches_share_captured_subscript_return() {
+    let source = "def outer(items):\n    def lookup(key, enabled, primary, secondary):\n        if enabled:\n            try:\n                if primary:\n                    if key:\n                        use()\n                    elif secondary:\n                        visit()\n                else:\n                    items[key] = fallback()\n            except ValueError as error:\n                report(error)\n        return items[key]\n    return lookup\n";
+    assert_matches_cpython(source, "captured_subscript_return.py", &LEVELS);
+}
+
+#[test]
 fn conditional_deletion_keeps_cleanup_reachable() {
     for scope in ["def", "async def"] {
         for target in ["pending[item]", "owner.slot", "started"] {
