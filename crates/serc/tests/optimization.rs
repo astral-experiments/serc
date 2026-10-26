@@ -2392,6 +2392,23 @@ fn nested_handler_raise_keeps_empty_outer_exit() {
 }
 
 #[test]
+fn negated_disjunction_keeps_chained_comparison_backedges() {
+    let source = r"def run(items, ok, low, high):
+    for value in items:
+        if skip(value):
+            continue
+        elif not (ok or low < value < high):
+            work(value)
+";
+    assert_matches_cpython_versions(
+        source,
+        "negated_loop_disjunction.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn loop_raise_comparison_chain_reaches_cleanup() {
     for scope in ["def", "async def"] {
         for condition in [
