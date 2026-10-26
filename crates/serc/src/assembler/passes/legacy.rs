@@ -2286,6 +2286,12 @@ impl OptimizationPipeline {
                     && let Some(first) = self.graph.instructions_mut(successor).next()
                     && first.location.line < 0
                     && !legacy_pop_block_keeps_no_location(self.python_version, first)
+                    // A cold bridge beyond an erased loop test has no located
+                    // predecessor in its original layout.
+                    && !(self.python_version == PythonVersion::Py313
+                        && original_arrays.get(successor).is_none()
+                        && first.opcode == JUMP_BACKWARD_NO_INTERRUPT
+                        && first.no_location_policy.preserves_location())
                 {
                     first.location = location;
                 }

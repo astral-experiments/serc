@@ -3912,17 +3912,33 @@ impl Assembler {
                 }
                 Item::Instruction(instruction) => Some(*instruction),
             });
-        let Some(original) = original else {
-            return;
-        };
-        if !has_anchor
-            || original.opcode != JUMP_FORWARD
+        if let Some(original) = original.filter(|_| has_anchor) {
+            self.record_terminal_while_break(anchor, end, original);
+        }
+    }
+
+    /// Captures the break before a legacy loop emits its repeated condition.
+    pub(crate) fn record_while_break_before_repeated_test(&mut self, anchor: Label, end: Label) {
+        if let Some(original) = self
+            .linear_items()
+            .iter()
+            .rev()
+            .find_map(Item::as_instruction)
+            .copied()
+        {
+            self.record_terminal_while_break(anchor, end, original);
+        }
+    }
+
+    fn record_terminal_while_break(&mut self, anchor: Label, end: Label, original: Instruction) {
+        if original.opcode != JUMP_FORWARD
             || original.operand() != Operand::Forward(end)
             || original.location.line < 0
             || !original.fusion_policy.is_authored_break()
             || original.jump_policy.retained_nop() != ir::RetainedJumpNop::DirectTarget
-            // Jump emission compacts the authored break NOP into this one slot.
-            || original.pre_fold_extra_instructions() != 1
+            // Legacy lowering emits the break NOP separately. Modern lowering
+            // records it in the jump's original instruction count.
+            || original.pre_fold_extra_instructions() != u8::from(self.python_version != crate::PythonVersion::Py313)
             || original.local_policy.hidden_exception_owner_slots() != 0
         {
             return;

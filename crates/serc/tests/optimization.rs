@@ -9073,6 +9073,28 @@ fn completed_manager_work_preserves_retained_loop_owners() {
 }
 
 #[test]
+fn python313_cold_break_before_an_erased_while_test_keeps_its_line() {
+    let source = r"def drain(ready):
+    try:
+        while ready:
+            while True:
+                try:
+                    step()
+                except LookupError:
+                    break
+            break
+    finally:
+        finish()
+";
+    assert_matches_cpython_versions(
+        source,
+        "cold_while_break.py",
+        &LEVELS,
+        &[PythonVersion::Py313],
+    );
+}
+
+#[test]
 fn protected_conditional_store_preserves_erased_else_backedge() {
     let protected = r"def collect(batches, left, right, cleanup, sink):
     try:
