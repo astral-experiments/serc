@@ -42548,10 +42548,8 @@ fn with_body_ends_in_terminal_try(body: &[Stmt]) -> bool {
         })
 }
 
-// A converted `POP_BLOCK` after a final try normally inherits its location from a sole jump
-// predecessor. If a direct return, raise, or break terminates the try body and the only normal predecessor
-// instead comes from an exception handler, CPython propagates that handler's fallthrough location
-// onto the marker.
+// When the try body exits on every path, only a fallthrough handler can donate a
+// location to the manager's converted POP_BLOCK.
 fn with_body_handler_exit_location(compiler: &Compiler<'_>, body: &[Stmt]) -> Option<TextRange> {
     // Removed assertions leave the handler's last live statement adjacent to its
     // cleanup, and the try's normal join adjacent to the manager's POP_BLOCK.
@@ -42563,14 +42561,14 @@ fn with_body_handler_exit_location(compiler: &Compiler<'_>, body: &[Stmt]) -> Op
     let Some(Stmt::Try(statement)) = body.iter().rev().find(|statement| is_live(statement)) else {
         return None;
     };
-    if statement.is_star
-        || !statement.finalbody.is_empty()
-        || !suite_terminates(&statement.body)
-        || !statement
+    let direct_exit = suite_terminates(&statement.body)
+        && statement
             .body
             .iter()
-            .any(|statement| matches!(statement, Stmt::Return(_) | Stmt::Raise(_) | Stmt::Break(_)))
-    {
+            .any(|statement| matches!(statement, Stmt::Return(_) | Stmt::Raise(_) | Stmt::Break(_)));
+    let nested_exit = compiler.context.python_version >= crate::PythonVersion::Py314
+        && with_body_ends_in_terminal_try(&statement.body);
+    if statement.is_star || !statement.finalbody.is_empty() || !(direct_exit || nested_exit) {
         return None;
     }
 
