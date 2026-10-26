@@ -6808,6 +6808,30 @@ fn continue_copies_inner_cleanup_inside_an_enclosing_finalizer() {
 }
 
 #[test]
+fn continue_from_a_named_handler_preserves_the_name_cleanup_owner() {
+    let source = r"async def run(items, flag):
+    for item in items:
+        try:
+            try:
+                try:
+                    work(item)
+                except ValueError as error:
+                    await recover()
+                    continue
+            except LookupError:
+                pass
+        finally:
+            (finish if flag is not None else fallback)(item)
+";
+    assert_matches_cpython_versions(
+        source,
+        "continued_handler.py",
+        &LEVELS,
+        &[PythonVersion::Py314],
+    );
+}
+
+#[test]
 fn negated_finally_guard_preserves_copied_continue_owner() {
     let source = r"async def sample(state, cleanup, recover):
     while True:
