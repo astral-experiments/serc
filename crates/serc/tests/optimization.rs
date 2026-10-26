@@ -9073,6 +9073,21 @@ fn completed_manager_work_preserves_retained_loop_owners() {
 }
 
 #[test]
+fn unnamed_handler_breaks_preserve_finally_guard_owners() {
+    for scope in ["def", "async def"] {
+        let source = format!(
+            "{scope} watch(active, state):\n    while active:\n        yield state\n        try:\n            check()\n        except LookupError:\n            raise\n        except OSError:\n            if active:\n                break\n        finally:\n            if STATE is None:\n                release()\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "break_finally_guard.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn protected_conditional_store_preserves_erased_else_backedge() {
     let protected = r"def collect(batches, left, right, cleanup, sink):
     try:
