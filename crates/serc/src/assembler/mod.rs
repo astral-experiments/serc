@@ -13981,7 +13981,7 @@ impl Assembler {
             );
     }
 
-    /// Records the original empty prefix before a retained normal-finally `POP_BLOCK`.
+    /// Records the original empty prefix used to resolve a normal-finally `POP_BLOCK`.
     pub(crate) fn record_retained_pop_block_origin(&mut self, entry: Label) {
         let items = self.linear_items();
         let Some(Item::Instruction(marker)) = items.last() else {
@@ -13989,7 +13989,6 @@ impl Assembler {
         };
         if marker.opcode != NOP
             || !marker.fusion_policy.is_converted_pop_block()
-            || !marker.jump_policy.preserves_explicit_nop()
             || marker.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
             || !self.preserved_block_boundaries.contains(&entry)
         {

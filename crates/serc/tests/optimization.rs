@@ -16178,6 +16178,30 @@ fn nested_function_finally_retains_terminating_handler_boundary() {
 }
 
 #[test]
+fn guarded_handler_donates_nested_finally_entry_marker() {
+    let source = r"def run(flag, item):
+    try:
+        return item
+    except ValueError as error:
+        if flag:
+            raise
+    finally:
+        try:
+            finish()
+        except OSError:
+            recover()
+";
+    for source in [source.to_owned(), source.replace("return item", "work()")] {
+        assert_matches_cpython_versions(
+            &source,
+            "guarded_handler_finally_entry.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn sole_handler_retains_nested_finally_entry_marker() {
     for (header, suspension) in [("def", ""), ("async def", "await ")] {
         for recovery in ["pass", "recover(resource)"] {
