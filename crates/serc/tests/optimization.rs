@@ -15,6 +15,22 @@ use serc::{
 };
 
 #[test]
+fn inlined_tuple_return_compacts_its_finally_entry() {
+    let source = r"def collect(values):
+    try:
+        return tuple(convert(item) for item in values)
+    finally:
+        del values
+";
+    assert_matches_cpython_versions(
+        source,
+        "inlined_tuple_return.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn nested_conversion_handlers_keep_shared_cleanup() {
     let source = r"def sample(items):
     for item in items:
