@@ -2124,7 +2124,7 @@ impl OptimizationPipeline {
                 continue;
             };
             if instructions.next().is_some()
-                || jump.opcode != JUMP_FORWARD
+                || !matches!(jump.opcode, JUMP_FORWARD | JUMP_BACKWARD)
                 || jump.location != SourceLocation::NONE
                 || tails.iter().any(|(block, ..)| *block == exit)
             {

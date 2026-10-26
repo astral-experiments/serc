@@ -96,6 +96,27 @@ fn erased_named_handler_suffix_preserves_cleanup_copies() {
 }
 
 #[test]
+fn repeated_loop_guards_keep_the_fallthrough_backedge_unlocated() {
+    let source = r"def finish(items, ready):
+    try:
+        work()
+    finally:
+        for item in items:
+            if ready:
+                assert item
+            if item:
+                assert ready
+        return items
+";
+    assert_matches_cpython_versions(
+        source,
+        "repeated_loop_guards.py",
+        &LEVELS,
+        &[PythonVersion::Py312],
+    );
+}
+
+#[test]
 fn python312_counts_both_visits_to_an_erased_condition_successor() {
     for action in ["assert check(first)", "check(first)"] {
         let source = format!(
