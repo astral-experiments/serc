@@ -15635,6 +15635,14 @@ impl<'source> Compiler<'source> {
                             start
                         });
                         let branch_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, end)?;
+                        if matches!(body.last(), Some(Stmt::Match(matched))
+                            if self.has_erased_final_value_case(matched))
+                        {
+                            // Successful cases bypass this join. The unmatched final
+                            // pattern supplies its line when the join becomes a NOP.
+                            self.assembler
+                                .preserve_redundant_jump_nop_after_threading(branch_exit);
+                        }
                         if let Some(start) = direct_try_body_exit_start {
                             let exclusion_end = self.assembler.label();
                             self.assembler.mark(exclusion_end);
