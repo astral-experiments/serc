@@ -2096,6 +2096,26 @@ fn erased_coroutine_join_preserves_predating_async_managers() {
 }
 
 #[test]
+fn erased_assertions_after_finally_preserve_conditional_and_loop_returns() {
+    for definition in ["def", "async def"] {
+        for cleanup in [
+            "if ready:\n            work()\n        assert value",
+            "while ready and value:\n            work()",
+        ] {
+            let source = format!(
+                "{definition} run(ready, value):\n    try:\n        prepare()\n    finally:\n        {cleanup}\n    assert value\n"
+            );
+            assert_matches_cpython_versions(
+                &source,
+                "terminal_cleanup_before_assertions.py",
+                &LEVELS,
+                &[PythonVersion::Py314, PythonVersion::Py315],
+            );
+        }
+    }
+}
+
+#[test]
 fn folded_while_breaks_copy_unnamed_handler_cleanup() {
     let source = r"def sample(values, limit):
     try:
