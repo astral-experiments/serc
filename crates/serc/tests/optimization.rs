@@ -12183,6 +12183,8 @@ fn elided_assertions_preserve_legacy_nested_call_footers() {
 #[test]
 fn empty_conditionals_preserve_legacy_terminal_return_locations() {
     for (case, source) in [
+        "def f(a, b, items):\n    if a:\n        assert a\n    if b:\n        for item in items:\n            pass\n",
+        "def f(a, b):\n    if a:\n        pass\n    else:\n        if b:\n            assert b\n        work()\n",
         "def f(a, b, obj):\n    if a:\n        assert a\n    if b:\n        obj.action()\n",
         "def f(a, b, obj):\n    if a:\n        global marker\n    if b:\n        obj.action()\n",
         "def f(a, b, obj):\n    if a:\n        assert a\n    obj.action()\n    if b:\n        obj.action()\n",
@@ -13224,6 +13226,7 @@ fn elided_assertions_preserve_linear_assignment_return_boundary() {
 #[test]
 fn elided_assertions_preserve_conditional_assignment_return_boundary() {
     for (case, source) in [
+        "async def f(flag, choose, left, right):\n    if flag:\n        value = left if choose else right\n        assert value\n    else:\n        assert choose\n",
         "def f(flag, value):\n    if value is not None:\n        result = 1 if flag else 2\n        assert result\n",
         "def f(flag, value):\n    if value is None:\n        consume()\n    else:\n        result = 1 if flag else 2\n        assert result\n        assert flag\n",
         "def f(obj, flag, value):\n    if value is not None:\n        obj.result = 1 if flag else 2\n        assert obj.result\n    else:\n        obj.result = None\n",
@@ -19087,4 +19090,10 @@ fn nested_conditional_arms_donate_implicit_return_locations() {
         assert third
 ";
     assert_matches_cpython(source, "nested_implicit_returns.py", &LEVELS);
+    assert_matches_cpython_versions(
+        "async def pick(outer, inner):\n    if outer:\n        pass\n    else:\n        if inner:\n            value = inner\n        else:\n            value = await outer\n        assert value\n",
+        "nested_assignment_returns.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
 }

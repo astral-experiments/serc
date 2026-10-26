@@ -4508,6 +4508,27 @@ impl<'source> Compiler<'source> {
         statement: &ruff_python_ast::StmtIf,
         preserve_protected_folded_nop: bool,
     ) -> Result<(), CompileError> {
+        // The legacy optimizer copies small exits and then resolves their locations.
+        // On newer targets, erasing a statement after a nested if/else exposes the
+        // same shared footer. Preserve its edges until locations are assigned.
+        if self.supports_elided_terminal_if()
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && (self.context.python_version <= crate::PythonVersion::Py313
+                || if_suites(statement).any(|arm| {
+                    arm.last().is_some_and(|part| self.context.is_elided_statement(part))
+                        && matches!(arm.iter().rfind(|part| !self.context.is_elided_statement(part)),
+                            Some(Stmt::If(nested)) if nested.elif_else_clauses.last().is_some_and(|clause| clause.test.is_none()))
+                }))
+        {
+            self.compile_if(statement)?;
+            self.assembler.record_current_original_scope_exit();
+            self.assembler.set_location(SourceLocation::NONE);
+            return self.emit_deferred_implicit_return();
+        }
         // Removed assertions are represented as empty declarations.
         let empty_comparison_arms: Vec<_> =
             std::iter::once((statement.test.as_ref(), statement.body.as_slice()))
