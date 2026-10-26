@@ -438,7 +438,7 @@ pub(super) struct ExceptionState {
     // Linear item offset and suspension epoch of the innermost ordinary try body.
     active_try_body_start: Option<(usize, usize)>,
     // Direct final statement of the innermost ordinary try body.
-    active_try_body_tail: Option<TextRange>,
+    pub(super) active_try_body_tail: Option<TextRange>,
     active_try_marker_slots: Vec<Option<TryMarkerSlotContext>>,
     active_exception_handlers: Vec<ExceptionHandlerContext>,
     // Exception-group handlers retain their body marker owner after coroutine suspension.
@@ -27308,7 +27308,7 @@ impl<'source> Compiler<'source> {
                             // Preserve the else prefix's authored following statement, then
                             // reuse the case helper's separate taken and false success exits.
                             compiler.compile_loop_tail_prefix(leading)?;
-                            compiler.compile_match_case_tail_if(tail, match_end, true, false)
+                            compiler.compile_match_case_tail_if(tail, match_end, true, false, false)
                         } else if terminal
                             && let Some(end) = statement
                                 .orelse

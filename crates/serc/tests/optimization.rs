@@ -15,6 +15,29 @@ use serc::{
 };
 
 #[test]
+fn guarded_value_patterns_share_the_normal_try_exit() {
+    let source = r"async def sample(key, value, ready, enabled):
+    try:
+        match key:
+            case Keys.FIRST if value is not None:
+                if value and ready:
+                    if enabled:
+                        run()
+            case Keys.SECOND if value is not None:
+                del value
+    except ValueError:
+        recover()
+    finish()
+";
+    assert_matches_cpython_versions(
+        source,
+        "guarded_values.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn nested_conversion_handlers_keep_shared_cleanup() {
     let source = r"def sample(items):
     for item in items:
