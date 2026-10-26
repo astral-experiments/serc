@@ -21622,16 +21622,6 @@ impl<'source> Compiler<'source> {
                     return Ok(LoopBackedge::Emitted);
                 }
                 let body_label = self.assembler.label();
-                let split_final_boolean_chain = !non_final_branch
-                    && !self.has_active_control_flow_region()
-                    && matches!(test, Expr::BoolOp(_))
-                    && condition_has_only_runtime_tests(test)
-                    && (final_chained_comparison_jump(test).is_some()
-                        || (!expression_suspends_current_scope(test)
-                            && matches!(test, Expr::BoolOp(boolean)
-                            if boolean.values.iter().any(|operand| {
-                                final_chained_comparison_jump(operand).is_some()
-                            }))));
                 let (comparison_test, negated) = if let Expr::UnaryOp(unary) = test
                     && unary.op == UnaryOp::Not
                 {
@@ -21639,6 +21629,16 @@ impl<'source> Compiler<'source> {
                 } else {
                     (test, false)
                 };
+                let split_final_boolean_chain = !non_final_branch
+                    && !self.has_active_control_flow_region()
+                    && matches!(comparison_test, Expr::BoolOp(_))
+                    && condition_has_only_runtime_tests(test)
+                    && (final_chained_comparison_jump(test).is_some()
+                        || (!expression_suspends_current_scope(test)
+                            && matches!(comparison_test, Expr::BoolOp(boolean)
+                            if boolean.values.iter().any(|operand| {
+                                final_chained_comparison_jump(operand).is_some()
+                            }))));
                 // A final chain keeps separate success and cleanup arrays, including when
                 // negated or in a coroutine whose comparison operands do not suspend.
                 // Leading AND operands also keep their separate false-edge backedges.
