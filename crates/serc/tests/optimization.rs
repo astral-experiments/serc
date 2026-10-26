@@ -6641,6 +6641,30 @@ COMPANION    finally:
 }
 
 #[test]
+fn post_try_call_guard_reuses_the_folded_global_call_slot() {
+    for argument in ["convert(arg)", "key=convert(arg)", "arg"] {
+        let source = format!(
+            "async def run(item, arg, values):
+    try:
+        first, second = values
+        saved = item
+    except ValueError:
+        pass
+    if not item.check({argument}):
+        return False
+    return True
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "post_try_call_guard.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn conditional_handler_return_preserves_normal_finally_borrows() {
     let source = r"def sample(item):
     try:

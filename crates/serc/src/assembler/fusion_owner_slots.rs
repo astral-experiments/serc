@@ -1024,7 +1024,7 @@ impl View<'_> {
         (removed == usize::from(fused)).then_some(owner)
     }
 
-    /// Certifies literal-fold vacancies in one uninterrupted post-try source array.
+    /// Certifies fold vacancies in one uninterrupted post-try source array.
     fn post_try_fold_array(
         &self,
         start: usize,
@@ -1055,14 +1055,11 @@ impl View<'_> {
                 self.label_index(*label)
                     .is_none_or(|&index| start <= index && index <= marker)
             })
-            || !self.items[start..condition].iter().any(|item| {
-                matches!(item, Item::Instruction(instruction)
-                    if self.uniform_literal_fold_slots(*instruction).is_some())
-            })
         {
             return None;
         }
         self.uniform_owned_interval(start, condition, false, None, true)
+            .filter(|(_, removed)| *removed > 0)
     }
 
     /// Matches the unsaturated literal-fold count to its unique recorded survivor.
