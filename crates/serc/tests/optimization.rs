@@ -6808,6 +6808,34 @@ fn continue_copies_inner_cleanup_inside_an_enclosing_finalizer() {
 }
 
 #[test]
+fn bare_loop_return_retains_the_inner_finalizer_pop() {
+    let source = r"async def run(items, flag):
+    try:
+        for item in items:
+            try:
+                await advance()
+                report()
+                flag = None
+                return
+            except ValueError:
+                recover()
+            finally:
+                if flag is not None:
+                    close()
+    except LookupError:
+        recover()
+    finally:
+        finish()
+";
+    assert_matches_cpython_versions(
+        source,
+        "nested_loop_return.py",
+        &LEVELS,
+        &[PythonVersion::Py314],
+    );
+}
+
+#[test]
 fn continue_from_nested_handlers_preserves_the_outer_cleanup_owner() {
     let source = r"async def run(items, flag):
     for item in items:
