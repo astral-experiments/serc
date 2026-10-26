@@ -161,7 +161,7 @@ impl OptimizationPipeline {
         if self.python_version == PythonVersion::Py312 {
             self.inline_legacy_exit_blocks(&original_arrays, false);
         }
-        let repeated_predecessors = if self.python_version == PythonVersion::Py312 {
+        let mut repeated_predecessors = if self.python_version == PythonVersion::Py312 {
             self.legacy_repeated_tail_predecessors(&original_arrays)
         } else {
             Vec::new()
@@ -176,7 +176,21 @@ impl OptimizationPipeline {
             }
         }
         if let Some(constants) = constants {
-            self.prune_legacy_constants(constants);
+            let indices = self.prune_legacy_constants(constants);
+            // These exits must still match their live instructions after constant compaction.
+            repeated_predecessors.retain_mut(|(_, expected, _, _)| {
+                if expected.opcode != RETURN_CONST {
+                    return true;
+                }
+                let Some(index) = expected
+                    .value_argument()
+                    .and_then(|index| indices[index as usize])
+                else {
+                    return false;
+                };
+                expected.set_operand(Operand::Value(index));
+                true
+            });
         }
         self.add_legacy_checks_for_uninitialized_loads(
             local_count,

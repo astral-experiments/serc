@@ -12786,6 +12786,31 @@ fn copied_sequence_folds_preserve_locations_and_constant_order() {
 }
 
 #[test]
+fn pruned_constants_preserve_repeated_return_predecessors() {
+    for body in ["visit(items)", "for item in items:\n            pass"] {
+        let source = format!(
+            "from __future__ import annotations
+
+def run(ready, flag, items):
+    'Keep constant slot zero occupied.'
+    def inner(value: Kind) -> Result:
+        pass
+    if ready:
+        assert flag
+    if flag:
+        {body}
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "pruned_legacy_return.py",
+            &LEVELS,
+            &[PythonVersion::Py312],
+        );
+    }
+}
+
+#[test]
 fn sequence_folds_after_dynamic_tuple_iteration_preserve_boundaries() {
     let values = std::iter::repeat_n("value", 31)
         .collect::<Vec<_>>()
