@@ -10843,7 +10843,7 @@ impl Assembler {
                 .iter()
                 .rposition(|item| matches!(item, Item::Instruction(_)))
             {
-                self.record_copied_break_handler_cleanup(break_item);
+                self.record_copied_loop_none_handler_cleanup(break_item, 1, false);
             }
             self.prepare_no_location_block_for_inlining(emitted);
             self.mark_as_artificial_eval_break(emitted);
@@ -10857,7 +10857,7 @@ impl Assembler {
             if named_handler {
                 // Preserve the authored break and name-clear prefix before the None
                 // marker replays its original exception-owner slot.
-                self.record_copied_break_handler_cleanup(break_item);
+                self.record_copied_loop_none_handler_cleanup(break_item, 1, false);
             }
             self.prepare_no_location_block_for_inlining(emitted);
             self.mark_as_artificial_eval_break(emitted);
@@ -15761,7 +15761,14 @@ impl Assembler {
         return_item: usize,
         named: bool,
     ) {
-        self.record_copied_handler_cleanup_inner(start, end, return_item, named, None, false);
+        self.record_copied_handler_cleanup_inner(
+            start,
+            end,
+            return_item,
+            usize::from(named),
+            None,
+            false,
+        );
     }
 
     /// Captures a named handler followed by one compiler-certified synchronous iterator.
@@ -15797,7 +15804,7 @@ impl Assembler {
             start,
             end,
             return_item,
-            false,
+            0,
             Some(handler_end),
             false,
         );
@@ -15810,7 +15817,7 @@ impl Assembler {
         end: Label,
         return_item: usize,
     ) {
-        self.record_copied_handler_cleanup_inner(start, end, return_item, true, None, true);
+        self.record_copied_handler_cleanup_inner(start, end, return_item, 1, None, true);
     }
 
     fn record_copied_handler_cleanup_inner(
@@ -15818,10 +15825,11 @@ impl Assembler {
         start: Label,
         end: Label,
         return_item: usize,
-        named: bool,
+        named_handlers: usize,
         assignment_pop_boundary: Option<Label>,
         inner_iterator: bool,
     ) {
+        let named = named_handlers != 0;
         let copied_assignment = assignment_pop_boundary.is_some();
         let items = self.linear_items();
         let Some(Item::Instruction(return_nop)) = items.get(return_item) else {
@@ -15877,7 +15885,7 @@ impl Assembler {
             (3, 0)
         } else {
             match (named, prefix.as_slice()) {
-                (true, [_]) => (2, 1),
+                (true, [_]) => (2 * named_handlers, 1),
                 (true, [_, first, second])
                     if return_nop.exception_policy() == ExceptionPolicy::NoneUnchanged
                         && return_nop.local_policy.hidden_exception_owner_slots() == 0
@@ -15953,17 +15961,20 @@ impl Assembler {
         let expected_len = if copied_assignment {
             3
         } else if named {
-            4
+            4 * named_handlers
         } else {
             1
         };
         if instructions.len() != expected_len
             || instructions[0].opcode != crate::target::opcodes::POP_EXCEPT
             || (named
-                && (instructions[1].opcode != crate::target::opcodes::LOAD_CONST
-                    || instructions[2].opcode != crate::target::opcodes::STORE_FAST
-                    || instructions[3].opcode != crate::target::opcodes::DELETE_FAST
-                    || instructions[2].operand() != instructions[3].operand()))
+                && instructions.chunks_exact(4).any(|cleanup| {
+                    cleanup[0].opcode != POP_EXCEPT
+                        || cleanup[1].opcode != LOAD_CONST
+                        || cleanup[2].opcode != STORE_FAST
+                        || cleanup[3].opcode != DELETE_FAST
+                        || cleanup[2].operand() != cleanup[3].operand()
+                }))
         {
             return;
         }
@@ -15984,34 +15995,36 @@ impl Assembler {
             });
     }
 
-    /// Captures a direct named-handler break followed by its copied local None test.
-    pub(crate) fn record_copied_break_handler_cleanup(&mut self, break_item: usize) {
+    /// Captures the named-handler cleanups before a loop jump's copied local None test.
+    pub(crate) fn record_copied_loop_none_handler_cleanup(
+        &mut self,
+        jump_item: usize,
+        named_handlers: usize,
+        continued: bool,
+    ) {
+        let load_at = 1 + 4 * named_handlers;
+        let marker_at = load_at + 2;
         let items = self.linear_items();
         let records = items
             .iter()
             .enumerate()
-            .skip(break_item)
+            .skip(jump_item)
             .filter_map(|(index, item)| match item {
                 Item::Instruction(instruction) => Some((index, *instruction)),
                 Item::Label(_) => None,
             })
-            .take(8)
+            .take(marker_at + 1)
             .collect::<Vec<_>>();
-        if records.len() != 8 || records[0].0 != break_item {
+        if records.len() != marker_at + 1 || records[0].0 != jump_item {
             return;
         }
         let authored = records[0].1;
-        let cleanup = &records[1..5];
-        let load = records[5].1;
-        let condition = records[6].1;
-        let marker = records[7].1;
+        let cleanup = &records[1..load_at];
+        let load = records[load_at].1;
+        let condition = records[load_at + 1].1;
+        let marker = records[marker_at].1;
         if authored.opcode != NOP
             || authored.location.line < 0
-            || cleanup[0].1.opcode != POP_EXCEPT
-            || cleanup[1].1.opcode != LOAD_CONST
-            || cleanup[2].1.opcode != STORE_FAST
-            || cleanup[3].1.opcode != DELETE_FAST
-            || cleanup[2].1.operand() != cleanup[3].1.operand()
             || cleanup.iter().any(|(_, instruction)| {
                 instruction.location != authored.location
                     || instruction.exception_policy() != ExceptionPolicy::default()
@@ -16026,7 +16039,8 @@ impl Assembler {
             || marker.location != condition.location
             || marker.value_argument() != Some(0)
             || records.iter().enumerate().any(|(index, (_, instruction))| {
-                (index != 6 && instruction.local_policy.hidden_exception_owner_slots() != 0)
+                (index != load_at + 1
+                    && instruction.local_policy.hidden_exception_owner_slots() != 0)
                     || instruction.pre_fold_extra_instructions() != 0
                     || instruction.no_location_policy.borrow_fallthrough()
                         != BorrowFallthrough::Reachable
@@ -16034,7 +16048,37 @@ impl Assembler {
         {
             return;
         }
-        let labels = items[break_item..records[7].0]
+        if continued {
+            let Some(target) = condition.forward_target() else {
+                return;
+            };
+            let mut targets = items
+                .iter()
+                .enumerate()
+                .filter_map(|(index, item)| (*item == Item::Label(target)).then_some(index));
+            let Some(target_index) = targets.next() else {
+                return;
+            };
+            if targets.next().is_some() || target_index <= records[marker_at].0 {
+                return;
+            }
+            let Some(suffix) = items[target_index + 1..]
+                .iter()
+                .find_map(Item::as_instruction)
+            else {
+                return;
+            };
+            // This recorder runs before the pending continue jump is emitted. A terminal
+            // join has no stable suffix yet and may acquire a fresh backward marker.
+            if matches!(suffix.opcode, NOP | NOT_TAKEN)
+                || is_conditional_jump(suffix.opcode)
+                || is_unconditional_jump(suffix.opcode)
+                || ends_scope(suffix.opcode)
+            {
+                return;
+            }
+        }
+        let labels = items[jump_item..records[marker_at].0]
             .iter()
             .filter_map(|item| match item {
                 Item::Label(label) => Some(*label),
@@ -16061,7 +16105,7 @@ impl Assembler {
         }) {
             return;
         }
-        let Some(start) = items[break_item + 1..records[1].0]
+        let Some(start) = items[jump_item + 1..records[1].0]
             .iter()
             .find_map(|item| match item {
                 Item::Label(label) => Some(*label),
@@ -16070,7 +16114,7 @@ impl Assembler {
         else {
             return;
         };
-        let Some(end) = items[records[4].0 + 1..records[5].0]
+        let Some(end) = items[records[load_at - 1].0 + 1..records[load_at].0]
             .iter()
             .find_map(|item| match item {
                 Item::Label(label) => Some(*label),
@@ -16079,58 +16123,14 @@ impl Assembler {
         else {
             return;
         };
-        self.record_copied_handler_cleanup(start, end, break_item, true);
-    }
-
-    /// Captures a continued local None test with an emitted fallthrough suffix.
-    pub(crate) fn record_copied_continue_none_handler_cleanup(&mut self, continue_item: usize) {
-        let items = self.linear_items();
-        let records = items
-            .iter()
-            .enumerate()
-            .skip(continue_item)
-            .filter_map(|(index, item)| match item {
-                Item::Instruction(instruction) => Some((index, *instruction)),
-                Item::Label(_) => None,
-            })
-            .take(8)
-            .collect::<Vec<_>>();
-        if records.len() != 8 || records[0].0 != continue_item {
-            return;
-        }
-        let condition = records[6].1;
-        if !matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE) {
-            return;
-        }
-        let Some(target) = condition.forward_target() else {
-            return;
-        };
-        let mut targets = items
-            .iter()
-            .enumerate()
-            .filter_map(|(index, item)| (*item == Item::Label(target)).then_some(index));
-        let Some(target_index) = targets.next() else {
-            return;
-        };
-        if targets.next().is_some() || target_index <= records[7].0 {
-            return;
-        }
-        let Some(suffix) = items[target_index + 1..]
-            .iter()
-            .find_map(Item::as_instruction)
-        else {
-            return;
-        };
-        // This recorder runs before the pending continue jump is emitted. A terminal
-        // join has no stable suffix yet and may acquire a fresh backward marker.
-        if matches!(suffix.opcode, NOP | NOT_TAKEN)
-            || is_conditional_jump(suffix.opcode)
-            || is_unconditional_jump(suffix.opcode)
-            || ends_scope(suffix.opcode)
-        {
-            return;
-        }
-        self.record_copied_break_handler_cleanup(continue_item);
+        self.record_copied_handler_cleanup_inner(
+            start,
+            end,
+            jump_item,
+            named_handlers,
+            None,
+            false,
+        );
     }
 
     /// Captures a direct named-handler continue and its first copied call or attribute None test.

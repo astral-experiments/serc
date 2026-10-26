@@ -6952,7 +6952,8 @@ impl<'source> Compiler<'source> {
                     false,
                 );
                 if let Some(origin) = copied_break_handler_origin {
-                    self.assembler.record_copied_break_handler_cleanup(origin);
+                    self.assembler
+                        .record_copied_loop_none_handler_cleanup(origin, 1, false);
                 }
                 let needs_outer_region_boundary = exclusion_start.is_some()
                     && (has_copied_finalizer || !with_unwind_starts.is_empty())
@@ -7223,6 +7224,8 @@ impl<'source> Compiler<'source> {
                     == crate::PythonVersion::Py314
                     && context.iterator_cleanup == IteratorCleanup::Sync
                     && self.control.exceptions.active_try_marker_slots.len() == 1;
+                let continued_handler_count =
+                    self.control.exceptions.active_exception_handlers.len();
                 let continued_handler_origin = (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
                     && self.control.withs.active_with_exits.is_empty()
                     && self.control.exceptions.active_exception_group_handlers == 0
@@ -7233,12 +7236,20 @@ impl<'source> Compiler<'source> {
                     && self.control.finally.preserved_return_value_contexts.is_empty()
                     && self.control.finally.copied_return_finally_preserved_values == 0
                     && self.control.finally.active_pass_finally_locations.is_empty()
-                    && matches!(self.control.exceptions.active_exception_handlers.as_slice(), [handler]
+                    && matches!(self.control.exceptions.active_exception_handlers.as_slice(), [handler, additional @ ..]
                         if handler.name.is_some()
                             && handler.with_depth == 0
                             && handler.loop_depth == self.control.loops.contexts.len()
                             && self.control.exceptions.active_exception_region_exclusions.len()
-                                == handler.exception_region_depth + 1
+                                == handler.exception_region_depth + continued_handler_count
+                            && match additional {
+                                [] => true,
+                                [inner] => nested_handler_finally && inner.name.is_some()
+                                    && inner.loop_depth == handler.loop_depth && inner.with_depth == 0
+                                    && inner.try_body_depth == handler.try_body_depth
+                                    && inner.exception_region_depth == handler.exception_region_depth + 1,
+                                _ => false,
+                            }
                             && self.control.finally.active_loop_finally_contexts.split_last().is_some_and(|(finally, outer)|
                                 finally.handler_depth == 0
                                     && finally.with_depth == 0
@@ -7645,8 +7656,11 @@ impl<'source> Compiler<'source> {
                     self.assembler.record_continued_handler_try_prefix(origin);
                 }
                 if let Some(origin) = continued_handler_origin {
-                    self.assembler
-                        .record_copied_continue_none_handler_cleanup(origin);
+                    self.assembler.record_copied_loop_none_handler_cleanup(
+                        origin,
+                        continued_handler_count,
+                        true,
+                    );
                     if direct_handler_finally {
                         self.assembler
                             .record_copied_continue_handler_cleanup(origin);

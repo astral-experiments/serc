@@ -10491,7 +10491,28 @@ impl LayoutAssembler {
                             && array == original_array_start
                             && end <= instruction_index
                             && tail.early_removals >= end_removed
-                            && (if let Some((prefix, marker)) = continued_attribute_none {
+                            && (if copied_handler_origin.instructions.len() == 8 {
+                                // Two named handlers each erase two POPs. At this
+                                // distance the marker reuses the outer name's LOAD_CONST.
+                                missing == 4
+                                    && end_removed == 1
+                                    && tail.early_removals == 4
+                                    && instruction_index == end + 2
+                                    && matches!(
+                                        indexed_instructions[end].opcode,
+                                        crate::target::opcodes::LOAD_FAST
+                                            | crate::target::opcodes::LOAD_FAST_BORROW
+                                            | crate::target::opcodes::LOAD_DEREF
+                                    )
+                                    && previous.is_some_and(|condition| {
+                                        matches!(
+                                            condition.opcode,
+                                            POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE
+                                        ) && condition.local_policy.hidden_exception_owner_slots()
+                                            == 3
+                                            && condition.location == instruction.location
+                                    })
+                            } else if let Some((prefix, marker)) = continued_attribute_none {
                                 instruction_index - end == prefix.len()
                                     && *instruction == marker
                                     && indexed_instructions[end..instruction_index]
