@@ -2224,6 +2224,30 @@ fn erased_loop_exit_stays_inside_managed_finally() {
 }
 
 #[test]
+fn awaited_exit_before_nested_managers_replays_the_inner_try_pop() {
+    let source = r"async def run(first, second, resource, value, flag):
+    try:
+        with first, second:
+            try:
+                async with resource:
+                    return value
+            except LookupError:
+                pass
+    except OSError:
+        pass
+    finally:
+        if flag is not None:
+            finish()
+";
+    assert_matches_cpython_versions(
+        source,
+        "awaited_nested_manager_return.py",
+        &LEVELS,
+        &[PythonVersion::Py314],
+    );
+}
+
+#[test]
 fn copied_return_through_nested_loops_keeps_none_guard_owner() {
     let source = r#"async def sample(client, response):
     for attempt in range(client.attempts):
