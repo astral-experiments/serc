@@ -11757,6 +11757,31 @@ impl<'source> Compiler<'source> {
                                 self.control.withs.active_with_exits.len(),
                             )
                         });
+                    // A value return unwinds the unnamed handler before its manager.
+                    // The original handler POP is already accounted for at POP_EXCEPT;
+                    // any surrounding ordinary try unwinds after the manager instead.
+                    let ordinary_manager_tries =
+                        self.control.exceptions.active_try_marker_slots.len();
+                    let saved_handler_manager_pop = (self.context.python_version == crate::PythonVersion::Py314
+                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+                        && preserve_tos && !return_is_overridden && context_index == 0
+                        && return_finally_contexts.len() == 1 && handler_count == 1
+                        && finally_context.exception_region_depth == 0 && finally_context.with_depth == 0
+                        && self.control.loops.contexts.is_empty() && next_with == 0 && next_handler == 0
+                        && ordinary_manager_tries <= 1
+                        && self.control.exceptions.active_exception_region_exclusions.len() == 2 + ordinary_manager_tries
+                        && matches!(self.control.withs.active_with_exits.as_slice(), [manager] if !manager.is_async
+                            && manager.exception_region_depth == 1 + ordinary_manager_tries
+                            && matches!(self.control.exceptions.active_exception_handlers.as_slice(), [handler]
+                                if handler.name.is_none() && handler.with_depth == 1 && handler.loop_depth == 0
+                                    && handler.try_body_depth == ordinary_manager_tries
+                                    && handler.exception_region_depth == manager.exception_region_depth))
+                        && with_unwind_starts.iter().map(|unwind| unwind.index).eq([0])
+                        && self.control.exceptions.active_exception_group_handlers == 0
+                        && self.control.finally.active_finally_end_blocks == 0
+                        && self.control.finally.active_normal_finally_bodies == 0
+                        && self.control.finally.active_copied_finally_bodies == 0)
+                        .then(|| (self.assembler.item_count(), ordinary_manager_tries, 1));
                     let copied_manager_none_pop = copied_manager_return_pop
                         .filter(|(_, ordinary_try_pops, managers)| {
                             self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
@@ -12475,7 +12500,7 @@ impl<'source> Compiler<'source> {
                     }
                     if result.is_ok()
                         && let Some((pop_item, ordinary_try_pops, managers)) =
-                            copied_manager_return_pop
+                            copied_manager_return_pop.or(saved_handler_manager_pop)
                     {
                         self.assembler.record_copied_manager_return_compaction(
                             pop_item,
