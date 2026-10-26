@@ -9826,6 +9826,7 @@ impl Compiler<'_> {
                 self.emit_condition_not_taken_preserving_terminal_try_owner(policy)
             };
         }
+        let test_start = self.assembler.item_count();
         let comparison_is_boolean = if let Expr::Compare(comparison) = expression
             && comparison.ops.len() == 1
         {
@@ -9892,6 +9893,13 @@ impl Compiler<'_> {
             },
             ordinary: if comparison_is_boolean {
                 comparison_marker_owner
+            } else if self.context.python_version == PythonVersion::Py314
+                && self.control.finally.active_normal_finally_bodies > 0
+                && self.assembler.truth_test_in_fresh_fallthrough(test_start)
+            {
+                // A short-circuit fallthrough starts its own instruction array.
+                // Only a later compaction can supply an owned monitoring slot.
+                ExceptionPolicy::NoneDynamicConditionStrict
             } else {
                 ExceptionPolicy::normalized_owner(
                     self.control.finally.active_normal_finally_bodies > 0

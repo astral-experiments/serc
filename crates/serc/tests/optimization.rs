@@ -15,6 +15,40 @@ use serc::{
 };
 
 #[test]
+fn conditional_fallthrough_in_a_finally_suite_uses_a_fresh_marker() {
+    for source in [
+        r"def sample(items):
+    try:
+        work()
+    finally:
+        for x in items:
+            try:
+                work()
+            except ValueError as x:
+                v = x.primary or (x.fallback if not x.flag else None)
+",
+        r"async def sample(items):
+    try:
+        await work()
+    finally:
+        try:
+            work()
+        finally:
+            for x in items:
+                if x.skip() or not x.ready() or x != stop:
+                    work()
+",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "finally_fallthrough.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn nested_conversion_handlers_keep_shared_cleanup() {
     let source = r"def sample(items):
     for item in items:
