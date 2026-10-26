@@ -15444,6 +15444,18 @@ impl<'source> Compiler<'source> {
                         !matches!(statement, Stmt::Global(_) | Stmt::Nonlocal(_))
                     });
                     let nested_if_exit = branch_tail.and_then(|statement| match statement {
+                        // The manager cleanup jumps past the join after the assertion is
+                        // erased, leaving only the guard's false edge to donate a location.
+                        Stmt::If(guard)
+                            if self.context.python_version >= crate::PythonVersion::Py314
+                                && guard.elif_else_clauses.is_empty()
+                                && guard.body.last().is_some_and(|part| self.context.is_elided_statement(part))
+                                && matches!(guard.body.iter().rfind(|part| !self.context.is_elided_statement(part)),
+                                    Some(Stmt::With(manager)) if !manager.is_async)
+                                && original_condition_has_unique_jump_target(&guard.test, false) =>
+                        {
+                            Some(NestedIfExitLocation::Located(&guard.test))
+                        }
                         Stmt::If(statement) => nested_if_exit_location(
                             statement,
                             self.control.statements.context.has_following,
