@@ -18919,6 +18919,17 @@ fn copied_return_cleanup_preserves_earlier_loop_exclusions() {
 }
 
 #[test]
+fn try_exit_preserves_loop_else_fallthrough_after_break_threading() {
+    let source = "def scan(items, ready, left, right):\n    try:\n        for item in items:\n            if item:\n                break\n        else:\n            result = left if ready else right\n    except ValueError:\n        recover()\n    finish()\n";
+    assert_matches_cpython_versions(
+        source,
+        "try_loop_else_exit.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn nested_iterator_value_return_preserves_cleanup_exit_locations() {
     let source = "def sample(items, action):\n    for outer in items:\n        for inner in items:\n            try:\n                return []\n            finally:\n                try:\n                    action()\n                except Exception:\n                    action()\n    return []\n";
     for (name, source) in [
