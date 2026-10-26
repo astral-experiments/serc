@@ -6930,7 +6930,8 @@ impl<'source> Compiler<'source> {
                                     None,
                                     (copied_break_pop_blocks > 0)
                                         .then_some((copied_break_item, copied_break_pop_blocks)),
-                                    (copied_handler_is_named == Some(false)).then_some(copied_break_item),
+                                    (copied_handler_is_named == Some(false))
+                                        .then_some(copied_break_item),
                                     defer_finally_end.then_some((
                                         context.finally_end_depth,
                                         copied_finally_exclusion_lengths.as_slice(),
@@ -6950,7 +6951,8 @@ impl<'source> Compiler<'source> {
                     false,
                 );
                 if copied_handler_is_named == Some(true) {
-                    self.assembler.record_copied_break_handler_cleanup(copied_break_item);
+                    self.assembler
+                        .record_copied_break_handler_cleanup(copied_break_item);
                 }
                 let needs_outer_region_boundary = exclusion_start.is_some()
                     && (has_copied_finalizer || !with_unwind_starts.is_empty())
@@ -18709,7 +18711,9 @@ impl<'source> Compiler<'source> {
                         self.control.exceptions.active_exception_region_exclusions[index].len(),
                     ));
                 }
-                if let (Some(origin), Some(start)) = (emitted_handler_pop_item, copied_handler_start) {
+                if let (Some(origin), Some(start)) =
+                    (emitted_handler_pop_item, copied_handler_start)
+                {
                     self.assembler
                         .record_copied_handler_cleanup(start, copy_start, origin, false);
                     // This region-end label certifies the finalizer's separate NULL POP.
