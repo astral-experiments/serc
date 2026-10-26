@@ -38161,10 +38161,28 @@ impl<'source> Compiler<'source> {
             {
                 conditional_exit = Some(NestedIfExitLocation::Located(&tail.test));
             }
-            let copied_loop_exit = statement.finalbody.last().and_then(|tail| {
+            let while_exit = statement.finalbody.last().and_then(|tail| {
                 let Stmt::While(tail) = tail else {
                     return None;
                 };
+                (!preserve_exit_nop
+                    && self.context.python_version >= crate::PythonVersion::Py314
+                    && self.assembler.current_original_block_location().is_none()
+                    && self
+                        .assembler
+                        .current_original_block_pre_fusion_instruction_count()
+                        == 0
+                    && tail.orelse.is_empty()
+                    && condition_has_linear_runtime_leaves(&tail.test)
+                    && original_condition_has_unique_jump_target(&tail.test, false))
+                .then_some(tail)
+            });
+            // The false edge supplies the empty normal exit's line before redundant
+            // jumps are removed. A break can add a second predecessor before copying.
+            let normal_loop_exit = while_exit
+                .filter(|tail| !suite_contains_loop_break(&tail.body))
+                .map(|tail| while_condition_exit_range(&tail.test));
+            let copied_loop_exit = while_exit.and_then(|tail| {
                 // The no-break case has only the condition's false edge at the
                 // original exit. Keep suspension and hidden branch arrays outside
                 // this additional admission.
@@ -38173,9 +38191,7 @@ impl<'source> Compiler<'source> {
                         if matches!(work.value.as_ref(), Expr::Call(_))
                             && !expression_contains_inline_branch(&work.value)
                             && !expression_suspends_current_scope(&work.value));
-                (!preserve_exit_nop
-                    && self.context.python_version >= crate::PythonVersion::Py314
-                    && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+                (self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
                     && self.control.statements.context.followed_by_literal_return
                     && self.control.loops.contexts.is_empty()
                     && self.control.withs.active_with_exits.is_empty()
@@ -38190,14 +38206,6 @@ impl<'source> Compiler<'source> {
                     && self.control.finally.active_normal_finally_bodies == 0
                     && self.control.finally.active_copied_finally_bodies == 0
                     && self.control.finally.active_finally_end_blocks == 0
-                    && self.assembler.current_original_block_location().is_none()
-                    && self
-                        .assembler
-                        .current_original_block_pre_fusion_instruction_count()
-                        == 0
-                    && tail.orelse.is_empty()
-                    && condition_has_linear_runtime_leaves(&tail.test)
-                    && original_condition_has_unique_jump_target(&tail.test, false)
                     && (linear_loop_exit
                         || tail.body.split_last().is_some_and(|(last, leading)| {
                             matches!(last, Stmt::If(branch)
@@ -38209,7 +38217,7 @@ impl<'source> Compiler<'source> {
                         })))
                 .then(|| while_condition_exit_range(&tail.test))
             });
-            if let Some(range) = copied_loop_exit {
+            if let Some(range) = copied_loop_exit.or(normal_loop_exit) {
                 // The condition is the sole remaining edge, either originally or
                 // after small-exit copying removes the break's incoming edge. It
                 // donates this empty original array's line.
@@ -39199,6 +39207,9 @@ impl<'source> Compiler<'source> {
                 // Keep its located jump slot when its direct continuation is copied;
                 // retargeted jumps and the exceptional assertion copy stay unchanged.
                 self.assembler.preserve_direct_inlined_jump_nop(normal_exit);
+            } else if normal_loop_exit.is_some() {
+                self.assembler
+                    .preserve_redundant_jump_nop_after_threading(normal_exit);
             } else if self.context.python_version >= crate::PythonVersion::Py314
                 && !preserve_exit_nop
                 && finalizer_tail_count == 0
