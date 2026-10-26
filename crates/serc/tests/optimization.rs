@@ -9106,6 +9106,25 @@ fn repeated_finalizer_predecessor_keeps_the_manager_pop_unlocated() {
 }
 
 #[test]
+fn repeated_finalizer_guards_keep_the_fallthrough_reraise_unlocated() {
+    let source = r"async def finish(check, item, close):
+    try:
+        work()
+    finally:
+        if check:
+            assert item
+        if item:
+            await close()
+";
+    assert_matches_cpython_versions(
+        source,
+        "finalizer_guards.py",
+        &LEVELS,
+        &[PythonVersion::Py312],
+    );
+}
+
+#[test]
 fn python312_async_iteration_preserves_repeated_conditional_return() {
     let source = r"async def consume(stream, ready):
     async for item in stream:
