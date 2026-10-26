@@ -15109,6 +15109,40 @@ impl<'source> Compiler<'source> {
                         .exceptions
                         .direct_try_body_statements
                         .contains(&statement.range);
+                // The first value jumps over the second value's fallthrough marker.
+                // An erased suite leaves that marker at the last predicate's position.
+                let erased_ternary = match test {
+                    Expr::If(conditional)
+                        if self.context.python_version >= crate::PythonVersion::Py314
+                            && self.unit.flags
+                                & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                                == CO_COROUTINE
+                            && self
+                                .control
+                                .exceptions
+                                .active_exception_region_exclusions
+                                .is_empty()
+                            && self.control.withs.active_with_exits.is_empty()
+                            && !self.control.in_loop()
+                            && branch_index + 2 == branch_count
+                            && body
+                                .iter()
+                                .all(|part| self.context.is_elided_statement(part))
+                            && statement.elif_else_clauses.last().is_some_and(|clause| {
+                                clause.test.is_none()
+                                    && clause
+                                        .body
+                                        .iter()
+                                        .all(|part| self.context.is_elided_statement(part))
+                            })
+                            && [&*conditional.test, &*conditional.body, &*conditional.orelse]
+                                .iter()
+                                .all(|expr| matches!(expr, Expr::Name(_))) =>
+                    {
+                        Some(conditional)
+                    }
+                    _ => None,
+                };
                 let previous_forced_borrowed_loads = exclude_normal_finally_short_circuit
                     .then(|| self.assembler.set_forced_borrowed_loads(true));
                 let previous_terminal_if_generator_exclusion = std::mem::replace(
@@ -15156,7 +15190,13 @@ impl<'source> Compiler<'source> {
                                                             compiler.terminal_try_condition_includes_generator_region(
                                                                 branch_index,
                                                             ),
-                                                            |compiler| compiler.compile_jump_if(test, false, next),
+                                                            |compiler| {
+                                                                if let Some(conditional) = erased_ternary {
+                                                                    compiler.compile_if_expression_jump(conditional, false, next, next, true)
+                                                                } else {
+                                                                    compiler.compile_jump_if(test, false, next)
+                                                                }
+                                                            },
                                                         )
                                                             },
                                                         )
@@ -25282,6 +25322,7 @@ impl<'source> Compiler<'source> {
                                                             true,
                                                             *first,
                                                             *second,
+                                                            false,
                                                         );
                                                     }
                                                     let Expr::BoolOp(boolean) =

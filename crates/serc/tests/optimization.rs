@@ -15,6 +15,26 @@ use serc::{
 };
 
 #[test]
+fn erased_assertions_keep_the_last_ternary_predicate_line() {
+    let source = r"async def sample(first, last, selector, ready):
+    if ready:
+        assert first
+    elif first if selector else last:
+        assert first
+    else:
+        assert last
+    if ready:
+        work()
+";
+    assert_matches_cpython_versions(
+        source,
+        "erased_ternary.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn nested_conversion_handlers_keep_shared_cleanup() {
     let source = r"def sample(items):
     for item in items:
