@@ -32074,7 +32074,20 @@ impl<'source> Compiler<'source> {
                                     && statement.orelse.is_empty()
                                     && matches!(statement.finalbody.as_slice(), [Stmt::Return(returned)]
                                         if matches!(returned.value.as_deref(), Some(Expr::Name(_))))));
-                    if self.control.exceptions.prevent_try_exit_inlining && !return_is_overridden {
+                    // The bare raise follows the manager and its recovery in one
+                    // ordinary finally suite. The recovered path can copy that exit.
+                    let manager_reraise = self.context.python_version
+                        >= crate::PythonVersion::Py314
+                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                            == CO_COROUTINE
+                        && handler.name.is_none()
+                        && statement.handlers.len() == 1
+                        && statement.orelse.is_empty()
+                        && matches!(statement.body.as_slice(), [Stmt::With(manager)] if manager.is_async)
+                        && matches!(statement.finalbody.as_slice(), [Stmt::Raise(raise)] if raise.exc.is_none());
+                    if self.control.exceptions.prevent_try_exit_inlining
+                        && !(return_is_overridden || manager_reraise)
+                    {
                         self.assembler.prevent_jump_inlining(handler_exit);
                     }
                     if handler_has_guarded_finally_cleanup
