@@ -43173,19 +43173,28 @@ fn with_body_has_terminal_manager_suppression(body: &[Stmt]) -> bool {
             _ => false,
         }
     }
-    fn raises(body: &[Stmt]) -> bool {
+    fn terminal_handler(body: &[Stmt]) -> bool {
         match body.last() {
-            Some(Stmt::Raise(_)) => true,
+            Some(Stmt::Raise(_) | Stmt::Return(_)) => true,
+            Some(Stmt::Try(cleanup)) if !cleanup.finalbody.is_empty() => {
+                !cleanup.is_star
+                    && cleanup.handlers.is_empty()
+                    && cleanup.orelse.is_empty()
+                    && matches!(cleanup.body.last(), Some(Stmt::Return(_)))
+                    && !suite_any_statement(&cleanup.finalbody, |statement| {
+                        matches!(statement, Stmt::Break(_) | Stmt::Continue(_))
+                    })
+            }
             Some(Stmt::Try(statement)) => {
                 !statement.is_star
                     && statement.finalbody.is_empty()
                     && statement.orelse.is_empty()
                     && !statement.handlers.is_empty()
-                    && raises(&statement.body)
+                    && terminal_handler(&statement.body)
                     && statement.handlers.iter().all(|handler| {
                         handler
                             .as_except_handler()
-                            .is_some_and(|handler| raises(&handler.body))
+                            .is_some_and(|handler| terminal_handler(&handler.body))
                     })
             }
             _ => false,
@@ -43208,7 +43217,7 @@ fn with_body_has_terminal_manager_suppression(body: &[Stmt]) -> bool {
         && statement.handlers.iter().all(|handler| {
             handler
                 .as_except_handler()
-                .is_some_and(|handler| raises(&handler.body))
+                .is_some_and(|handler| terminal_handler(&handler.body))
         })
         && (matches!(statement.body.last(), Some(Stmt::With(manager))
             if !manager.is_async
