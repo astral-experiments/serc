@@ -31562,12 +31562,19 @@ impl<'source> Compiler<'source> {
                             && (self.control.statements.context.has_following
                                 || self.control.statements.context.inherited_has_following
                                 || self.control.loops.synthesized_loop_tail_predecessor == Some(statement.range)
-                                || self.control.loops.split_loop_tail_prefix_end == Some(statement.range))
+                                || self.control.loops.split_loop_tail_prefix_end == Some(statement.range)
+                                // Exiting a manager or entering a finalizer is also a continuation.
+                                || (self.context.python_version >= crate::PythonVersion::Py314
+                                    && (!self.control.withs.active_with_exits.is_empty()
+                                        || handler_cleanup_has_normal_finally_successor)))
                             && statement.finalbody.is_empty()
                             && tail.elif_else_clauses.is_empty()
                             && matches!(tail.body.last(), Some(Stmt::Return(_) | Stmt::Raise(_) | Stmt::Break(_) | Stmt::Continue(_)))
                             && condition_has_only_runtime_tests(&tail.test)
-                            && !expression_contains_chained_comparison(&tail.test)
+                            // A negated comparison can put its stack cleanup on the raising arm.
+                            && (!expression_contains_chained_comparison(&tail.test)
+                                || (self.context.python_version >= crate::PythonVersion::Py314
+                                    && !condition_has_cleanup_jump_target(&tail.test, false)))
                             && condition_jump_target_count(&tail.test, false) > 1
                 ) || matches!(
                     handler.body.last(),

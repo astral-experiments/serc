@@ -10301,6 +10301,24 @@ fn elided_handler_assertion_preserves_shared_false_cleanup() {
 }
 
 #[test]
+fn guarded_reraise_keeps_shared_manager_cleanup_unlocated() {
+    for condition in [
+        "ready and not low < value < high",
+        "ready and low < value < high",
+    ] {
+        let source = format!(
+            "async def f(manager, ready, value, low, high):\n    async with manager:\n        try:\n            work()\n        except ValueError as error:\n            if {condition}:\n                raise\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "guarded_reraise_cleanup.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn elided_handler_assertion_preserves_conditional_cleanup() {
     for suffix in ["assert value in str(error)", "pass", "after()"] {
         let source = format!(
