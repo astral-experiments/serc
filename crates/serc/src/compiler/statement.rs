@@ -1988,6 +1988,25 @@ impl<'source> Compiler<'source> {
             && following.iter().all(is_elided)
     }
 
+    /// Identifies an erased if/elif chain with one success edge per tested arm.
+    fn erased_elif_has_single_success_edges(&self, branch: &ruff_python_ast::StmtIf) -> bool {
+        let erased_arm = |test: &Expr, body: &[Stmt]| {
+            body.iter()
+                .all(|part| self.context.is_elided_statement(part))
+                && condition_has_linear_runtime_leaves(test)
+                && !expression_suspends_current_scope(test)
+                && condition_jump_target_count(test, true) == 1
+        };
+        !branch.elif_else_clauses.is_empty()
+            && erased_arm(&branch.test, &branch.body)
+            && branch.elif_else_clauses.iter().all(|clause| {
+                clause
+                    .test
+                    .as_ref()
+                    .is_some_and(|test| erased_arm(test, &clause.body))
+            })
+    }
+
     /// Allows linear return copying from an ordinary terminal try body.
     fn supports_linear_protected_terminal_if(&self) -> bool {
         (self.context.python_version == crate::PythonVersion::Py313
@@ -2322,11 +2341,10 @@ impl<'source> Compiler<'source> {
                             || (!conditional.body.is_empty()
                                 && conditional.body.iter().all(|statement| self.context.is_elided_statement(statement))))
                         && !suite_contains_yield(&conditional.body)));
-            let coroutine_if_before_elided = has_elided_tail
+            let unprotected_if_before_elided = has_elided_tail
                 && final_expression_becomes_return
                 && self.context.python_version >= crate::PythonVersion::Py313
                 && self.supports_elided_terminal_if()
-                && self.unit.flags & CO_COROUTINE != 0
                 && self.control.statements.in_terminal_if_branch_suite
                 && self
                     .control
@@ -2339,7 +2357,15 @@ impl<'source> Compiler<'source> {
                     .statements
                     .context
                     .propagates_following_to_suites
-                && self.terminal_if_before_elided(statement, &body[index + 1..]);
+                && ((self.unit.flags & CO_COROUTINE != 0
+                    && self.terminal_if_before_elided(statement, &body[index + 1..]))
+                    || (self.context.python_version >= crate::PythonVersion::Py314
+                        && !is_final
+                        && body[index + 1..]
+                            .iter()
+                            .all(|part| self.context.is_elided_statement(part))
+                        && matches!(statement, Stmt::If(branch)
+                            if self.erased_elif_has_single_success_edges(branch))));
             let linear_protected_if_before_elided = has_elided_tail
                 && final_expression_becomes_return
                 && self.supports_linear_protected_terminal_if()
@@ -2373,7 +2399,7 @@ impl<'source> Compiler<'source> {
                 || terminal_comprehension_before_elided
                 || terminal_nested_before_elided
                 || protected_terminal_if_before_elided
-                || coroutine_if_before_elided
+                || unprotected_if_before_elided
                 || linear_protected_if_before_elided;
             // An assignment with an inlined comprehension becomes terminal when
             // only removed assertions follow it; retain its target's return span.
