@@ -11151,14 +11151,33 @@ impl<'source> Compiler<'source> {
                     // ordinary try POP and the finalizer POP. A value return carries
                     // its result across the same POP pair without iterator cleanup.
                     // Keep both records for the existing None-prefix slot certificate.
-                    let copied_return_unwinds_while_only = self.unit.flags
-                        & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                        == CO_COROUTINE
+                    let managed_while_return = self.context.python_version
+                        == crate::PythonVersion::Py314
+                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                            == 0
+                        && statement.value.is_none()
+                        && finally_context.with_depth == 1
+                        && next_with == 1
+                        && finally_context.exception_region_depth == 0
+                        && with_unwind_starts.is_empty()
+                        && matches!(self.control.withs.active_with_exits.as_slice(), [manager] if !manager.is_async
+                            && manager.exception_region_depth == 0 && manager.loop_depth == 0 && manager.normal_finally_depth == 0)
+                        && matches!(self.control.loops.contexts.as_slice(), [inner] if inner.exception_region_depth == 2)
+                        && matches!(finally_context.body.first(), Some(Stmt::If(guard)) if guard.elif_else_clauses.is_empty()
+                            && match guard.test.as_ref() {
+                                Expr::BoolOp(boolean) if boolean.op == BoolOp::And => boolean.values.first(),
+                                condition => Some(condition),
+                            }.is_some_and(|first| matches!(first, Expr::Compare(compare) if matches!(compare.first_operand(), Expr::Name(_))
+                                && matches!(compare.ops.as_ref(), [CmpOp::Is | CmpOp::IsNot])
+                                && matches!(compare.comparators(), [Expr::NoneLiteral(_)]))));
+                    let copied_return_unwinds_while_only = (managed_while_return
+                        || (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                            == CO_COROUTINE
+                            && self.control.withs.active_with_exits.is_empty()))
                         && !return_is_overridden
                         && context_index == 0
                         && finally_context.loop_depth == 0
                         && next_loop == 1
-                        && self.control.withs.active_with_exits.is_empty()
                         && self.control.finally.active_copied_finally_bodies == 0
                         && self
                             .control
@@ -11167,7 +11186,7 @@ impl<'source> Compiler<'source> {
                             .is_empty()
                         && matches!(self.control.loops.contexts.as_slice(), [loop_context]
                             if loop_context.iterator_cleanup == IteratorCleanup::None
-                                && loop_context.with_depth == 0
+                                && loop_context.with_depth == self.control.withs.active_with_exits.len()
                                 && loop_context.finally_end_depth == 0
                                 && loop_context.exception_region_depth
                                     == self.control.exceptions.active_exception_region_exclusions.len());
@@ -11331,7 +11350,8 @@ impl<'source> Compiler<'source> {
                             == Some(ordinary_try_count + 1)
                         && (self.control.withs.active_with_exits.is_empty()
                             || (copied_return_keeps_outer_async_manager && ordinary_try_count == 1)
-                            || (copied_return_keeps_outer_sync_managers && ordinary_try_count == 1)
+                            || ((copied_return_keeps_outer_sync_managers || managed_while_return)
+                                && ordinary_try_count == 1)
                             || copied_return_unwinds_inner_async_manager)
                         && (self.control.loops.contexts.is_empty()
                             || (copied_return_keeps_outer_loop && ordinary_try_count == 1)
