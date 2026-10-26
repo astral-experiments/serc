@@ -2,8 +2,8 @@
 //!
 //! Count source labels S, true jumps J, and scope exits E before dead-code removal.
 //! K bounds jumps with an unlabeled successor. Usually K = J; explicit suspension
-//! helper backedges, synchronous For backedges, and synchronous With cleanup jumps
-//! already have labeled successors.
+//! helper backedges, iterator backedges, and jumps over cleanup handlers already
+//! have labeled successors.
 //! There are at most U = K + E + 1 original unlabeled blocks and B = S + U blocks.
 //! Empty-block repair and cold placement label at most U original blocks. Cold
 //! placement adds at most C = min(J, floor(B / 2)) bridges: each cold-to-warm
@@ -198,7 +198,9 @@ impl<'ast> Counter<'ast> {
             }
             Stmt::For(statement) => {
                 if statement.is_async {
-                    self.counts.add(6, 3, 0);
+                    // The await helper and the loop backedge both jump over
+                    // labeled handlers. Only SEND has an unlabeled successor.
+                    self.counts.add_with_unlabeled_successors(6, 3, 1, 0);
                 } else {
                     // Only FOR_ITER can create an unlabeled successor. The
                     // original backedge is followed by the cleanup label/END_FOR.
@@ -215,7 +217,10 @@ impl<'ast> Counter<'ast> {
             Stmt::With(statement) => {
                 for item in &statement.items {
                     if statement.is_async {
-                        self.counts.add(15, 9, 2);
+                        // Enter, normal exit and exceptional exit each await
+                        // once. Only their SENDs and the suppression test have
+                        // unlabeled successors.
+                        self.counts.add_with_unlabeled_successors(15, 9, 4, 2);
                     } else {
                         // The normal exit jump is followed by the final label;
                         // the suppression helper's jump by the cleanup label.
@@ -305,7 +310,7 @@ impl<'ast> Counter<'ast> {
             Frame::Loop if stop_at_loop => Some(()),
             Frame::Loop => self.unwind(stop_at_loop),
             Frame::AsyncManager => {
-                self.counts.add(3, 2, 0);
+                self.explicit_suspension();
                 self.unwind(stop_at_loop)
             }
             Frame::Finally(body) => {
@@ -434,11 +439,15 @@ impl<'ast> Counter<'ast> {
         generators.first()?;
         let outer_await = std::mem::take(&mut self.has_await);
         // Count locals cleanup even when native needs no locals preservation.
-        self.counts.add(2, 1, 1);
+        // The normal exit jumps over the labeled locals-restoration handler.
+        self.counts.add_with_unlabeled_successors(2, 1, 0, 1);
         let mut is_async = false;
         for generator in generators {
             let (labels, jumps) = if generator.is_async { (6, 3) } else { (3, 2) };
-            self.counts.add(labels, jumps, 0);
+            // Both loop backedges precede labeled cleanup blocks. Only FOR_ITER
+            // or the async SEND can introduce an unlabeled successor.
+            self.counts
+                .add_with_unlabeled_successors(labels, jumps, 1, 0);
             is_async |= generator.is_async;
             self.expression(&generator.iter)?;
             self.expression(&generator.target)?;
@@ -451,7 +460,7 @@ impl<'ast> Counter<'ast> {
         if is_async || self.has_await {
             // Inlining usually avoids this; bound a possible coroutine caller
             // await as well, propagating it to any enclosing comprehension.
-            self.counts.add(3, 2, 0);
+            self.explicit_suspension();
             self.has_await = true;
         }
         self.has_await |= outer_await;
@@ -760,7 +769,7 @@ mod tests {
             Some(Counts {
                 labels: 38,
                 jumps: 22,
-                unlabeled_jump_successors: 22,
+                unlabeled_jump_successors: 10,
                 exits: 9
             }),
         );
@@ -772,7 +781,7 @@ mod tests {
             Some(Counts {
                 labels: 21,
                 jumps: 12,
-                unlabeled_jump_successors: 11,
+                unlabeled_jump_successors: 6,
                 exits: 5
             }),
         );
@@ -859,7 +868,7 @@ mod tests {
             Some(Counts {
                 labels: 33,
                 jumps: 18,
-                unlabeled_jump_successors: 18,
+                unlabeled_jump_successors: 9,
                 exits: 11,
             }),
         );
@@ -983,7 +992,7 @@ mod tests {
             Some(Counts {
                 labels: 13,
                 jumps: 8,
-                unlabeled_jump_successors: 7,
+                unlabeled_jump_successors: 4,
                 exits: 4
             }),
         );
@@ -996,7 +1005,7 @@ mod tests {
             Some(Counts {
                 labels: 21,
                 jumps: 11,
-                unlabeled_jump_successors: 11,
+                unlabeled_jump_successors: 4,
                 exits: 5
             }),
         );
@@ -1125,8 +1134,7 @@ mod tests {
                 exits: 17,
             }),
         );
-        // Yield-from has the same explicit SEND helper. A possible implicit
-        // manager await always keeps the full charge, as asserted separately.
+        // Yield-from and implicit manager awaits use the same SEND helper.
         assert_eq!(
             counts("def f():\n    yield from items\n"),
             Some(Counts {
@@ -1143,7 +1151,7 @@ mod tests {
             Some(Counts {
                 labels: 23,
                 jumps: 13,
-                unlabeled_jump_successors: 12,
+                unlabeled_jump_successors: 6,
                 exits: 6,
             }),
         );
