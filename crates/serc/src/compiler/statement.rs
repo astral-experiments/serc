@@ -11059,14 +11059,40 @@ impl<'source> Compiler<'source> {
                         && self.assembler.at_original_shared_cleanup_join();
                     self.assembler.set_location(unwind_location);
                     // Surrounding loops stay live until after the copied finally.
+                    // The inner finalizer runs before its enclosing iterator is
+                    // disposed of. Its ordinary try and finally contribute adjacent POPs.
+                    let copied_return_keeps_nested_iterator = self.context.python_version
+                        == crate::PythonVersion::Py314
+                        && statement.value.is_none()
+                        && !preserve_tos
+                        && context_index == 1
+                        && return_finally_contexts.len() == 2
+                        && finally_context.handler_depth == 0
+                        && finally_context.with_depth == 0
+                        && finally_context.try_body_depth == 1
+                        && finally_context.exception_region_depth == 2
+                        && self.control.exceptions.active_try_marker_slots.len() == 2
+                        && self
+                            .control
+                            .finally
+                            .preserved_return_value_contexts
+                            .is_empty()
+                        && matches!(self.control.loops.contexts.as_slice(), [loop_context]
+                            if loop_context.iterator_cleanup == IteratorCleanup::Sync)
+                        && matches!(finally_context.body.first(), Some(Stmt::If(guard))
+                            if guard.elif_else_clauses.is_empty()
+                                && matches!(guard.test.as_ref(), Expr::Compare(test)
+                                    if matches!(test.first_operand(), Expr::Name(_))
+                                        && matches!(test.ops.as_ref(), [CmpOp::Is | CmpOp::IsNot])
+                                        && matches!(test.comparators(), [Expr::NoneLiteral(_)])));
                     // Whiles and retained iterators contribute no unwind records
-                    // between this value return and the ordinary-try/finally POP pair.
+                    // between the return and the ordinary-try/finally POP pair.
                     let copied_return_keeps_outer_loop = self.unit.flags
                         & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                         == CO_COROUTINE
-                        && preserve_tos
+                        && ((preserve_tos && context_index == 0)
+                            || copied_return_keeps_nested_iterator)
                         && !return_is_overridden
-                        && context_index == 0
                         && finally_context.loop_depth > 0
                         && finally_context.loop_depth == self.control.loops.contexts.len()
                         && next_loop == finally_context.loop_depth
@@ -11339,7 +11365,7 @@ impl<'source> Compiler<'source> {
                             self.assembler.mark_last_as_converted_pop_block();
                         }
                     }
-                    if return_finally_contexts.len() == 1
+                    if (return_finally_contexts.len() == 1 || copied_return_keeps_nested_iterator)
                         && handler_count == 0
                         && let Some(ordinary_try_count) = self
                             .control
@@ -12431,6 +12457,7 @@ impl<'source> Compiler<'source> {
                             copied_handler_return_item,
                             first_pop_item,
                             allow_additional_pop,
+                            copied_return_keeps_nested_iterator,
                         );
                         self.assembler.record_copied_return_truth_prefix(
                             copied_handler_return_item,
@@ -19144,7 +19171,7 @@ impl<'source> Compiler<'source> {
                         (copied_break_item, copied_break_first_pop)
                 {
                     self.assembler
-                        .record_copied_return_none_prefix(break_item, first_pop, false);
+                        .record_copied_return_none_prefix(break_item, first_pop, false, false);
                 }
                 if let Some(regions) = unwound_loop_return_regions {
                     self.control

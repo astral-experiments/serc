@@ -12394,6 +12394,7 @@ impl Assembler {
         return_item: usize,
         first_pop_item: usize,
         allow_additional_pop: bool,
+        inner_finally_boundary: bool,
     ) {
         let (pops, additional_pop, load, condition) =
             match self.linear_items().get(first_pop_item..) {
@@ -12412,6 +12413,30 @@ impl Assembler {
                     *load,
                     *condition,
                 ),
+                // A nested finalizer can start its exception range between the last
+                // POP and the guard. The label must stay inside the same basic block.
+                Some(
+                    [
+                        Item::Instruction(first),
+                        Item::Instruction(last),
+                        Item::Label(boundary),
+                        Item::Instruction(load),
+                        Item::Instruction(condition),
+                        ..,
+                    ],
+                ) if inner_finally_boundary
+                    && !self
+                        .exception_owner_provenance
+                        .source_boundaries
+                        .contains(boundary)
+                    && !self
+                        .exception_owner_provenance
+                        .block_boundaries
+                        .contains(boundary)
+                    && !self.preserved_block_boundaries.contains(boundary) =>
+                {
+                    ([*first, *last], None, *load, *condition)
+                }
                 Some(
                     [
                         Item::Instruction(first_pop),
