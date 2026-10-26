@@ -9696,6 +9696,20 @@ impl<'source> Compiler<'source> {
                                 handler.try_body_depth,
                             )
                         };
+                        // Normal exit and suppression from the copied manager both reach this
+                        // handler cleanup. Neither edge supplies a line before the outer unwind.
+                        let shared_manager_return_cleanup = self.context.python_version
+                            >= crate::PythonVersion::Py314
+                            && preserve_tos
+                            && name.is_some()
+                            && with_depth > 0
+                            && next_with == with_depth
+                            && return_finally_contexts.get(next_finally).is_some_and(|finally| {
+                                finally.handler_depth == handler_index + 1
+                                    && matches!(finally.body.last(), Some(Stmt::With(manager))
+                                        if !manager.is_async && manager.items.len() == 1
+                                            && !suite_terminates_before_constant_folding(&manager.body))
+                            });
                         // Managers entered inside this handler must finish while its exception
                         // state is still active. Restore that state only after their exits run.
                         for with_index in (with_depth..next_with).rev() {
@@ -9957,6 +9971,9 @@ impl<'source> Compiler<'source> {
                                     start
                                 });
                             self.emit(SWAP, 2, 0)?;
+                            if shared_manager_return_cleanup {
+                                self.assembler.preserve_last_no_location();
+                            }
                             if let Some(common_cleanup_start) = common_cleanup_start {
                                 // A named-handler return always assigns this swap to the common cleanup.
                                 // A try body entered inside this handler is popped before SWAP,
@@ -10105,6 +10122,9 @@ impl<'source> Compiler<'source> {
                             start
                         });
                         self.emit(POP_EXCEPT, 0, -1)?;
+                        if shared_manager_return_cleanup {
+                            self.assembler.preserve_last_no_location();
+                        }
                         if let Some(start) = named_handler_pop_start {
                             self.assembler.record_named_handler_pop_pair(start);
                         }

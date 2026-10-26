@@ -10208,6 +10208,32 @@ fn returning_handler_preserves_the_inner_manager_suppression_line() {
 }
 
 #[test]
+fn manager_finalizer_keeps_named_handler_cleanup_unlocated() {
+    let source = r"def choose(value):
+    with outer:
+        try:
+            with inner:
+                try:
+                    with resource:
+                        return read()
+                except Error as err:
+                    try:
+                        return value
+                    finally:
+                        with closer:
+                            clean()
+        finally:
+            finish()
+";
+    assert_matches_cpython_versions(
+        source,
+        "manager_handler_cleanup.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn completed_iterator_prefix_preserves_finalizer_manager_exit() {
     for prefix in [
         "        for item in items:\n            begin(item)\n        value = []\n",
