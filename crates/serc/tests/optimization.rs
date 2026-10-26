@@ -9073,6 +9073,30 @@ fn completed_manager_work_preserves_retained_loop_owners() {
 }
 
 #[test]
+fn multiline_return_leaving_a_managed_while_keeps_its_cleanup_line() {
+    for enter in ["with owner", "async with owner"] {
+        let source = format!(
+            "async def run(owner, item):
+    {enter}:
+        while True:
+            try:
+                return (
+                    await item.load()
+                ).value
+            except ValueError:
+                pass
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "managed_while_return.py",
+            &LEVELS,
+            &[PythonVersion::Py312, PythonVersion::Py313],
+        );
+    }
+}
+
+#[test]
 fn managed_try_returns_preserve_their_value_join_and_multiline_locations() {
     let source = r"async def choose(manager, left, right):
     try:
