@@ -4864,12 +4864,17 @@ impl OptimizationPipeline {
         mut constants: Option<&mut dyn ConstantTable>,
     ) -> Result<Vec<Label>, crate::CompileError> {
         let (owner_retargets, region_retargets) = retargets;
-        let graph = &mut self.graph;
-        if graph.is_normalized_jump_free_single_block(&self.preserved_block_boundaries) {
+        if self
+            .graph
+            .is_normalized_jump_free_single_block(&self.preserved_block_boundaries)
+        {
             return Ok(Vec::new());
         }
 
-        graph.normalize_blocks_if_needed(&self.preserved_block_boundaries);
+        self.graph
+            .normalize_blocks_if_needed(&self.preserved_block_boundaries);
+        self.prepare_conditional_discard_try_exits();
+        let graph = &mut self.graph;
         let active_internal_labels = self
             .exception_owner_provenance
             .normal_try_copy_internal_labels
