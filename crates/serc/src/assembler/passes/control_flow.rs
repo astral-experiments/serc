@@ -6240,11 +6240,17 @@ impl OptimizationPipeline {
             }) {
                 continue;
             }
-            let (position, _) = current.last().expect("captured return array is nonempty");
-            self.graph
-                .instruction_mut(*position)
-                .expect("captured original return")
-                .location = donor;
+            // The completed call supplies the location for this entire original
+            // cleanup array, including iterator pops on the far side of a range end.
+            for (position, item) in current {
+                if matches!(item, Item::Instruction(instruction) if instruction.location == SourceLocation::NONE)
+                {
+                    self.graph
+                        .instruction_mut(*position)
+                        .expect("captured cleanup")
+                        .location = donor;
+                }
+            }
         }
         true
     }
