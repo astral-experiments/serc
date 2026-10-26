@@ -2215,7 +2215,7 @@ impl OptimizationPipeline {
         }
         let order = self.graph.order().to_vec();
         if self.python_version == PythonVersion::Py312 {
-            // Tests and ordinary stores retain their native locations. Donate
+            // Tests, NOPs and ordinary stores retain their native locations. Donate
             // those spans before propagation, even with inflated predecessor counts.
             for pair in order.windows(2) {
                 let source = pair[0];
@@ -2223,6 +2223,7 @@ impl OptimizationPipeline {
                 if block_has_fallthrough(self.graph[source].items())
                     && let Some(last) = self.graph[source].last_instruction().copied()
                     && (is_conditional_jump_for(self.python_version, last.opcode)
+                        || last.opcode == NOP
                         || (matches!(last.opcode,
                             STORE_ATTR | STORE_DEREF | STORE_FAST | STORE_GLOBAL | STORE_NAME
                                 | STORE_SLICE | STORE_SUBSCR)
