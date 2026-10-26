@@ -11774,7 +11774,8 @@ impl Assembler {
                 && pop.location == SourceLocation::NONE
                 && pop.fusion_policy.is_converted_pop_block()
                 && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
-                && load.opcode == LOAD_FAST
+                && (load.opcode == LOAD_FAST
+                    || (!method && load.opcode == crate::target::opcodes::LOAD_DEREF))
                 && load.value_argument().is_some()
                 && (!method
                     || call.is_some_and(|record| {
