@@ -24619,16 +24619,11 @@ impl<'source> Compiler<'source> {
             (base_depth + 3 + self.iterator_extra_slots()).cast_unsigned(),
             false,
         );
-        self.assembler
-            .record_legacy_native_setup_target(protected_start, async_cleanup);
-        self.assembler
-            .record_legacy_native_setup_target(yielded, cleanup_throw);
-        self.assembler.record_legacy_protocol_await_setup(
-            yielded,
-            yielded_end,
+        self.assembler.record_legacy_async_iteration(
+            (protected_start, async_cleanup),
+            (yielded, yielded_end),
             cleanup_throw,
-            send,
-            send_end,
+            (send, send_end),
         );
 
         self.assembler.mark(async_cleanup);

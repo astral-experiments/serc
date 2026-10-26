@@ -4743,7 +4743,6 @@ impl Compiler<'_> {
                 .record_exception_setup(protected_start, false);
             if matches!(self.unit.scope, Scope::Function { .. })
                 && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
-                && generators.iter().all(|generator| !generator.is_async)
             {
                 // Native's inlined-comprehension SETUP targets this restore
                 // block, before exception ranges can split the body arrays.
@@ -7163,6 +7162,12 @@ impl Compiler<'_> {
             cleanup_throw,
             (loop_depth + 2 + self.iterator_extra_slots()).cast_unsigned(),
             false,
+        );
+        self.assembler.record_legacy_async_iteration(
+            (protected_start, async_cleanup),
+            (yielded, yielded_end),
+            cleanup_throw,
+            (send, send_end),
         );
         self.assembler.mark(async_cleanup);
         self.set_depth(loop_depth + 1);
