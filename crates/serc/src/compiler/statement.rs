@@ -7958,22 +7958,34 @@ impl<'source> Compiler<'source> {
                         .withs
                         .active_with_exits
                         .last()
-                        .is_some_and(|context| {
-                            context.exception_region_depth
+                        .is_some_and(|manager| {
+                            manager.exception_region_depth
                                 < self
                                     .control
                                     .exceptions
                                     .active_exception_region_exclusions
                                     .len()
+                                && (self
+                                    .control
+                                    .finally
+                                    .active_return_finally_contexts
+                                    .last()
+                                    .is_none_or(|finally| {
+                                        // The inner try pops before the manager, even when a
+                                        // finalizer registered outside the manager will run later.
+                                        self.control.loops.contexts[manager.loop_depth..]
+                                            .iter()
+                                            .all(|context| {
+                                                context.iterator_cleanup == IteratorCleanup::None
+                                            })
+                                            && finally.with_depth
+                                                < self.control.withs.active_with_exits.len()
+                                            && finally.exception_region_depth
+                                                < manager.exception_region_depth
+                                    })
+                                    || self.loop_finalizers_follow_innermost_manager_exit())
                         })
                         && self.control.exceptions.active_exception_handlers.is_empty()
-                        && (self
-                            .control
-                            .finally
-                            .active_return_finally_contexts
-                            .is_empty()
-                            || self.loop_finalizers_follow_innermost_manager_exit()
-                            || retained_inner_try_manager_pop)
                         && self.control.finally.active_finally_end_blocks == 0
                         && self.control.finally.active_normal_finally_bodies == 0
                     {
