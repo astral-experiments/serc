@@ -31814,7 +31814,11 @@ impl<'source> Compiler<'source> {
                         original_cleanup_slots - materialized_cleanup_slots,
                     );
                 }
-                if inlineable_bare_handler_if_with_multiline_join
+                if (handler.name.is_none()
+                    && self.context.python_version >= crate::PythonVersion::Py314
+                    && (handler_ends_with_loop_tail_join
+                        || handler_has_original_conditional_loop_join))
+                    || inlineable_bare_handler_if_with_multiline_join
                     || handler_ends_with_nonterminal_with
                     || inlineable_handler_if_with_suspended_join
                 {

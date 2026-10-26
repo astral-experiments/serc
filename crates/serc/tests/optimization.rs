@@ -9073,6 +9073,21 @@ fn completed_manager_work_preserves_retained_loop_owners() {
 }
 
 #[test]
+fn copied_loop_handler_cleanup_uses_each_conditional_predecessor() {
+    for header in ["for item in items:", "while active:"] {
+        let source = format!(
+            "def run(items, active, resource):\n    with resource:\n        try:\n            {header}\n                try:\n                    pass\n                except ValueError:\n                    if active:\n                        recover()\n        finally:\n            pass\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "loop_handler_locations.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn protected_conditional_store_preserves_erased_else_backedge() {
     let protected = r"def collect(batches, left, right, cleanup, sink):
     try:
