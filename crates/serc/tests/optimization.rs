@@ -9073,6 +9073,25 @@ fn completed_manager_work_preserves_retained_loop_owners() {
 }
 
 #[test]
+fn python312_await_cleanup_uses_the_source_label_width() {
+    for branches in [125, 260] {
+        for stores in [124, 125, 126] {
+            let prefix = "    if active:\n        visit(state)\n".repeat(branches);
+            let suffix = "    result = active\n".repeat(stores);
+            let source = format!(
+                "async def execute(active, visit, state):\n    state.current: int = 0\n{prefix}    await visit(state)\n{suffix}"
+            );
+            assert_matches_cpython_versions(
+                &source,
+                "await_cleanup_width.py",
+                &[OptimizationLevel::Zero],
+                &[PythonVersion::Py312],
+            );
+        }
+    }
+}
+
+#[test]
 fn protected_conditional_store_preserves_erased_else_backedge() {
     let protected = r"def collect(batches, left, right, cleanup, sink):
     try:

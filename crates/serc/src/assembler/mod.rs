@@ -1072,6 +1072,12 @@ impl Assembler {
         }
     }
 
+    /// Certifies the width of original 3.12 codegen labels before any CFG allocation.
+    pub(crate) fn certify_legacy_source_jump_labels(&mut self) {
+        self.exception_owner_provenance
+            .legacy_source_jump_labels_fit = true;
+    }
+
     /// Records a bound on all labels allocated before 3.12 duplicates its exits.
     pub(crate) fn set_legacy_exit_copy_budget(&mut self, budget: u8) {
         self.legacy_native_labels

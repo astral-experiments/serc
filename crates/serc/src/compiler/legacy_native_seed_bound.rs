@@ -27,8 +27,13 @@ pub(super) fn record(assembler: &mut crate::assembler::Assembler, body: &[Stmt])
     if let Some(counts) = function_counts(body) {
         if counts.max_label() < 256 {
             assembler.certify_legacy_uniform_jump_seed();
-        } else if let Ok(max_label) = u8::try_from(counts.max_original_label()) {
-            assembler.set_legacy_exit_copy_budget(u8::MAX - max_label);
+        } else {
+            if let Ok(max_label) = u8::try_from(counts.max_original_label()) {
+                assembler.set_legacy_exit_copy_budget(u8::MAX - max_label);
+            }
+            if counts.labels < 256 {
+                assembler.certify_legacy_source_jump_labels();
+            }
         }
     }
 }
@@ -120,7 +125,7 @@ impl<'ast> Counter<'ast> {
     fn suite(&mut self, statements: &'ast [Stmt]) -> Option<()> {
         // Native source generation visits discarded suites and post-return tails.
         for statement in statements {
-            if self.counts.max_original_label() >= 256 {
+            if self.counts.labels >= 256 {
                 return None;
             }
             self.statement(statement)?;
@@ -343,7 +348,7 @@ impl<'ast> Counter<'ast> {
 
     /// Mirrors native pop/cleanup/recurse/restore, including unreachable copies.
     fn unwind(&mut self, stop_at_loop: bool) -> Option<()> {
-        if self.counts.max_original_label() >= 256 {
+        if self.counts.labels >= 256 {
             return None;
         }
         let Some(frame) = self.frames.pop() else {
