@@ -21289,6 +21289,9 @@ impl<'source> Compiler<'source> {
                     && (!self.has_active_control_flow_region() || protected_try_normal_exit)
                     && condition_jump_target_count(&statement.test, false) == 1
                     && (condition_jump_target_count(&statement.test, true) == 1
+                        || matches!(statement.test.as_ref(), Expr::UnaryOp(unary)
+                            if unary.op == UnaryOp::Not && matches!(unary.operand.as_ref(),
+                                Expr::Compare(comparison) if comparison.ops.len() > 1))
                         || (statement.body.len() == 1
                             && matches!(statement.body.first(), Some(Stmt::Assign(_))))))
             {
