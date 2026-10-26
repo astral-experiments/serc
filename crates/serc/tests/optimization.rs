@@ -15,6 +15,27 @@ use serc::{
 };
 
 #[test]
+fn nested_finalizer_guard_shares_the_manager_exit_line() {
+    let source = r"def apply():
+    with manager:
+        try:
+            prepare()
+        finally:
+            try:
+                release()
+            finally:
+                if failed:
+                    raise ValueError
+";
+    assert_matches_cpython_versions(
+        source,
+        "nested_finalizer_guard.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn nested_conversion_handlers_keep_shared_cleanup() {
     let source = r"def sample(items):
     for item in items:

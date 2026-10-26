@@ -39170,6 +39170,29 @@ impl<'source> Compiler<'source> {
                 self.assembler.defer_jump_removal(normal_exit);
                 self.assembler.mark_borrow_empty_block(normal_exit);
             } else if !preserve_exit_nop
+                && self.context.python_version >= crate::PythonVersion::Py314
+                && self.control.finally.active_normal_finally_bodies == 1
+                && self.control.finally.active_copied_finally_bodies == 0
+                && self.control.finally.active_finally_end_blocks == 0
+                && self.control.loops.contexts.is_empty()
+                && self
+                    .control
+                    .withs
+                    .active_with_exits
+                    .last()
+                    .is_some_and(|manager| !manager.is_async)
+                && !self.control.statements.context.has_following
+                && !self.control.statements.context.inherited_has_following
+                && matches!(conditional_exit, Some(NestedIfExitLocation::Located(_)))
+                && matches!(statement.finalbody.last(), Some(Stmt::If(guard))
+                    if guard.elif_else_clauses.is_empty()
+                        && original_condition_has_unique_jump_target(&guard.test, false)
+                        && suite_has_linear_raise_exit(&guard.body))
+            {
+                // The guard's false edge falls through the enclosing finalizer to
+                // the manager's POP_BLOCK, which already carries the condition line.
+                self.assembler.defer_jump_removal(normal_exit);
+            } else if !preserve_exit_nop
                 && (matches!(conditional_exit, Some(NestedIfExitLocation::Located(_)))
                     || matches!(statement.finalbody.last(), Some(Stmt::If(tail))
                     if early_condition_truthiness(&tail.test).is_none()
