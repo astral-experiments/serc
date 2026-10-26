@@ -4984,7 +4984,8 @@ impl<'source> Compiler<'source> {
             self.record_folded_value(&statement.test)?;
             if !truthiness && statement.elif_else_clauses.is_empty() {
                 // Python 3.13 copies small exits before folding the constant test.
-                if self.context.python_version == crate::PythonVersion::Py313
+                if (self.context.python_version == crate::PythonVersion::Py313
+                    && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) != 0)
                     || self.assembler.at_jump_target()
                     || self.assembler.follows_original_join_store()
                 {
