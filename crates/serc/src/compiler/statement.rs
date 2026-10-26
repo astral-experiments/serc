@@ -11244,6 +11244,55 @@ impl<'source> Compiler<'source> {
                                 && loop_context.finally_end_depth == 0
                                 && loop_context.exception_region_depth
                                     == finally_context.exception_region_depth + 1);
+                    // A value remains on the stack while the finally suite is copied.
+                    // Ordinary try POPs follow any inner iterator and manager cleanup.
+                    let nested_guarded_value_return = self.context.python_version
+                        == crate::PythonVersion::Py314
+                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                            == CO_COROUTINE
+                        && preserve_tos
+                        && !return_is_overridden
+                        && context_index == 0
+                        && finally_context.with_depth == 0
+                        && next_with == 0
+                        && self.control.finally.active_copied_finally_bodies == 0
+                        && self
+                            .control
+                            .finally
+                            .preserved_return_value_contexts
+                            .is_empty()
+                        && self.control.exceptions.active_exception_group_handlers == 0
+                        && match finally_context.body.first() {
+                            Some(Stmt::If(guard)) => is_specialized_none_condition(&guard.test),
+                            Some(Stmt::Assign(assignment)) => matches!(assignment.value.as_ref(),
+                                Expr::If(conditional) if is_specialized_none_condition(&conditional.test)),
+                            _ => false,
+                        };
+                    let return_region_depth = self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .len();
+                    let managers = &self.control.withs.active_with_exits;
+                    let unwinds_inner_managers = nested_guarded_value_return
+                        && managers.first().is_some_and(|manager| manager.is_async)
+                        && managers.iter().all(|manager| {
+                            manager.exception_region_depth == return_region_depth
+                                && manager.normal_finally_depth == 0
+                        })
+                        && with_unwind_starts
+                            .iter()
+                            .map(|unwind| unwind.index)
+                            .eq((0..managers.len()).rev());
+                    let unwinds_nested_loops = nested_guarded_value_return
+                        && next_loop == self.control.loops.contexts.len()
+                        && self.control.loops.contexts.iter().all(|active_loop| {
+                            active_loop.finally_end_depth == 0
+                                && (active_loop.iterator_cleanup == IteratorCleanup::None
+                                    || (unwinds_inner_managers
+                                        && active_loop.exception_region_depth
+                                            == return_region_depth))
+                        });
                     let mut copied_return_none_pop_pair = None;
                     let mut nested_finally_method_pop = None;
                     // Unwind only the ordinary tries entered since the next inner
@@ -11330,10 +11379,12 @@ impl<'source> Compiler<'source> {
                             .checked_sub(finally_context.exception_region_depth)
                             == Some(ordinary_try_count + 1)
                         && (self.control.withs.active_with_exits.is_empty()
+                            || (unwinds_inner_managers && ordinary_try_count >= 2)
                             || (copied_return_keeps_outer_async_manager && ordinary_try_count == 1)
                             || (copied_return_keeps_outer_sync_managers && ordinary_try_count == 1)
                             || copied_return_unwinds_inner_async_manager)
                         && (self.control.loops.contexts.is_empty()
+                            || (unwinds_nested_loops && ordinary_try_count >= 2)
                             || (copied_return_keeps_outer_loop && ordinary_try_count == 1)
                             || (copied_return_unwinds_while_only && ordinary_try_count == 1)
                             || (copied_return_unwinds_value_while_tries
