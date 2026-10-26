@@ -10406,6 +10406,31 @@ fn conditional_attribute_copies_fuse_aliased_local_entries() {
 }
 
 #[test]
+fn discarded_conditions_copy_the_pop_with_its_try_owner() {
+    for discarded in [
+        "read() if ready else fallback()",
+        "await read() if ready else await fallback()",
+    ] {
+        let source = format!(
+            "async def receive(ready, report):
+    try:
+        {discarded}
+    except OSError as error:
+        record(error)
+    if report:
+        finish()
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "conditional_try_discard.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn conditional_call_preserves_erased_else_try_exit() {
     for (index, (call, otherwise)) in [
         ("consume(item if enabled else values)", "assert item"),

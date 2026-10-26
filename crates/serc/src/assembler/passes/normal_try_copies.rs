@@ -12,6 +12,29 @@ use super::super::{
 use super::normal_try_copy_plan::{OriginalNode, OriginalTail, PrefixSlot, plan_normal_try_copies};
 use crate::target::opcodes::{JUMP_BACKWARD, JUMP_FORWARD, NOP, POP_EXCEPT};
 
+/// Exposes the owned discard at the end of a try or handler as a copyable range.
+fn split_discard_owner_regions(
+    regions: &mut Vec<ExceptionRegion>,
+    starts: &FxHashMap<Label, Label>,
+) {
+    if starts.is_empty() {
+        return;
+    }
+    for region in std::mem::take(regions) {
+        if let Some(&start) = starts.get(&region.end)
+            && region.start != start
+        {
+            regions.push(ExceptionRegion {
+                end: start,
+                ..region
+            });
+            regions.push(ExceptionRegion { start, ..region });
+        } else {
+            regions.push(region);
+        }
+    }
+}
+
 /// Checks whether restored owners retain priority when a jump's exclusion is cleared.
 ///
 /// Unknown ranges or priorities are rejected. Existing regions win ties, so a tied
@@ -2864,23 +2887,7 @@ impl OptimizationPipeline {
                     // region fragment, so copying its labels carries that owner
                     // while POP_BLOCK and POP_EXCEPT remain outside the handler.
                     // Keep the original priority and all other owner fields.
-                    if !handler_owner_starts.is_empty() {
-                        let regions = std::mem::take(&mut self.exception_regions);
-                        for region in regions {
-                            if let Some(&start) = handler_owner_starts.get(&region.end)
-                                && region.start != start
-                            {
-                                self.exception_regions.push(ExceptionRegion {
-                                    end: start,
-                                    ..region
-                                });
-                                self.exception_regions
-                                    .push(ExceptionRegion { start, ..region });
-                            } else {
-                                self.exception_regions.push(region);
-                            }
-                        }
-                    }
+                    split_discard_owner_regions(&mut self.exception_regions, &handler_owner_starts);
                     self.exception_owner_provenance
                         .normal_try_copy_internal_labels
                         .extend(internal);
@@ -2899,6 +2906,101 @@ impl OptimizationPipeline {
             &FxHashSet::default(),
             &FxHashMap::default(),
         );
+    }
+
+    /// Rejoins a value discard with its ordinary try exit before exit copying.
+    pub(in crate::assembler) fn prepare_conditional_discard_try_exits(&mut self) {
+        use crate::assembler::ir::BorrowFallthrough;
+        use crate::target::opcodes::POP_TOP;
+
+        let recorded = &self.exception_owner_provenance.normal_try_exits;
+        if self.python_version < crate::PythonVersion::Py314 || recorded.is_empty() {
+            return;
+        }
+        let mut candidates = Vec::new();
+        for pair in self.graph.order().windows(2) {
+            let (
+                [Item::Label(join), Item::Instruction(pop)],
+                [Item::Label(end), Item::Instruction(jump)],
+            ) = (self.graph[pair[0]].items(), self.graph[pair[1]].items())
+            else {
+                continue;
+            };
+            let Some(target) = jump.forward_target() else {
+                continue;
+            };
+            // Borrow analysis can turn this fallthrough into a barrier. It still
+            // contributes one original unlocated jump after POP_TOP and POP_BLOCK.
+            let mut expected = Instruction::new(
+                JUMP_FORWARD,
+                Operand::Forward(target),
+                SourceLocation::NONE,
+                Some(0),
+            );
+            if jump.no_location_policy.borrow_fallthrough() == BorrowFallthrough::Barrier {
+                expected
+                    .no_location_policy
+                    .set_borrow_fallthrough(BorrowFallthrough::Barrier);
+            }
+            if *jump == expected
+                && *pop
+                    == Instruction::new(POP_TOP, Operand::Value(0), SourceLocation::NONE, Some(0))
+                && recorded.contains(&(*end, target))
+                && self.preserved_block_boundaries.contains(join)
+                && self
+                    .exception_owner_provenance
+                    .source_boundaries
+                    .contains(join)
+                && self.original_discard_label_is_intact(*join)
+                && self.original_discard_label_is_intact(*end)
+                && !self.preserved_block_boundaries.contains(end)
+                && !self
+                    .exception_owner_provenance
+                    .block_boundaries
+                    .contains(end)
+                && !self
+                    .exception_owner_provenance
+                    .normal_try_copy_internal_labels
+                    .contains(end)
+                && self.exception_regions.iter().any(|region| {
+                    region.end == *end
+                        && region.depth == 0
+                        && !region.preserve_lasti
+                        && !region.is_scope_fallback
+                })
+            {
+                candidates.push((*join, *end, pair[1]));
+            }
+        }
+        if candidates.is_empty() {
+            return;
+        }
+        // A value arm may jump to the discard. No control-flow edge may enter
+        // between it and the ordinary try exit, which is only a range boundary.
+        let mut incoming = FxHashMap::<Label, bool>::default();
+        for instruction in self.graph.iter_items().filter_map(Item::as_instruction) {
+            if let Operand::Forward(target) | Operand::Backward(target) = instruction.operand() {
+                *incoming.entry(target).or_default() |= instruction.opcode == JUMP_FORWARD
+                    && instruction.depth_after() == Some(1)
+                    && instruction.pre_fold_extra_instructions() == 0;
+            }
+        }
+        let mut starts = FxHashMap::default();
+        for (join, end, exit) in candidates {
+            if incoming.get(&join) != Some(&true) || incoming.contains_key(&end) {
+                continue;
+            }
+            self.graph
+                .instructions_mut(exit)
+                .next()
+                .expect("ordinary try exit")
+                .allow_unconditional_block_inlining();
+            self.exception_owner_provenance
+                .normal_try_copy_internal_labels
+                .push(end);
+            starts.insert(end, join);
+        }
+        split_discard_owner_regions(&mut self.exception_regions, &starts);
     }
 
     /// Checks that a discard-exit label has no borrowing, folding, or omitted-NOP provenance.
