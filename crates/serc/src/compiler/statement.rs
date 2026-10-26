@@ -42017,7 +42017,14 @@ fn expression_contains_chained_comparison(expression: &Expr) -> bool {
             if matches!(expression, Expr::Compare(comparison) if comparison.ops.len() > 1) {
                 self.found = true;
             } else if !self.found {
-                walk_expr(self, expression);
+                // Only the first iterable of a generator is evaluated by the enclosing test.
+                if let Expr::Generator(generator) = expression {
+                    if let Some(first) = generator.generators.first() {
+                        self.visit_expr(&first.iter);
+                    }
+                } else {
+                    walk_expr(self, expression);
+                }
             }
         }
     }
