@@ -1624,7 +1624,19 @@ impl LayoutAssembler {
                 instruction
                     .legacy_initial_jump_width()
                     .expect("all native jumps are certified")
-            } else if short_await_bridge {
+            } else if short_await_bridge
+                || (self
+                    .exception_owner_provenance
+                    .legacy_source_jump_labels_fit
+                    && matches!(
+                        instruction.opcode,
+                        crate::target::opcodes::SEND
+                            | crate::target::opcodes::JUMP_BACKWARD_NO_INTERRUPT
+                    ))
+            {
+                // Python 3.12 emits SEND and JUMP_NO_INTERRUPT only in its
+                // yield-from loop. Their END_SEND and SEND targets are nonempty
+                // source blocks, so empty-block repair cannot replace the operands.
                 0
             } else {
                 extended_arg_count(argument)

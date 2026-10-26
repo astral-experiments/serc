@@ -9092,6 +9092,28 @@ fn python312_await_cleanup_uses_the_source_label_width() {
 }
 
 #[test]
+fn python312_suspension_operands_share_the_source_label_bound() {
+    let prefix = "    if active:\n        visit(state)\n".repeat(125);
+    for (second, padding) in [
+        ("    await visit(active)\n", 117),
+        ("    async with state:\n        await visit(active)\n", 114),
+    ] {
+        for stores in padding..=padding + 1 {
+            let suffix = "    value = active\n".repeat(stores);
+            let source = format!(
+                "async def run(active, state, visit):\n    state.current: int = 0\n{prefix}    await visit(state)\n{second}{suffix}"
+            );
+            assert_matches_cpython_versions(
+                &source,
+                "suspension_label_widths.py",
+                &LEVELS,
+                &[PythonVersion::Py312],
+            );
+        }
+    }
+}
+
+#[test]
 fn protected_conditional_store_preserves_erased_else_backedge() {
     let protected = r"def collect(batches, left, right, cleanup, sink):
     try:
