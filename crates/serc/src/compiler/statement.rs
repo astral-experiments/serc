@@ -43088,6 +43088,18 @@ fn with_body_has_cold_normal_donor(body: &[Stmt], allow_erased_named_handler: bo
     if statement.is_star {
         return false;
     }
+    let has_single_iterator_exit = |loop_: &ruff_python_ast::StmtFor| {
+        !loop_.is_async
+            && loop_.orelse.is_empty()
+            && !suite_contains_loop_break(&loop_.body)
+            && !expression_contains_inline_branch(&loop_.iter)
+            && !expression_suspends_current_scope(&loop_.iter)
+    };
+    if let Some(Stmt::For(loop_)) = statement.finalbody.last() {
+        // The exhausted iterator reaches the manager cleanup after the
+        // exception footer moves out of line.
+        return has_single_iterator_exit(loop_);
+    }
     if statement.finalbody.is_empty() {
         if !statement.orelse.is_empty()
             || !suite_terminates_before_constant_folding(&statement.body)
@@ -43123,11 +43135,7 @@ fn with_body_has_cold_normal_donor(body: &[Stmt], allow_erased_named_handler: bo
         };
         return normal_handlers.next().is_none()
             && handler.name.is_none()
-            && !loop_statement.is_async
-            && loop_statement.orelse.is_empty()
-            && !suite_contains_loop_break(&loop_statement.body)
-            && !expression_contains_inline_branch(&loop_statement.iter)
-            && !expression_suspends_current_scope(&loop_statement.iter);
+            && has_single_iterator_exit(loop_statement);
     }
     let [Stmt::AugAssign(assignment)] = statement.finalbody.as_slice() else {
         return false;

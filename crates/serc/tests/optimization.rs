@@ -10187,6 +10187,28 @@ fn completed_finalizer_prefix_preserves_manager_exit() {
 }
 
 #[test]
+fn finalizer_iterator_supplies_the_manager_exit_line() {
+    let source = r"def close_all(manager, items):
+    with manager:
+        try:
+            read()
+        except Error as error:
+            report(error)
+        else:
+            accepted()
+        finally:
+            for item in items:
+                close(item)
+";
+    assert_matches_cpython_versions(
+        source,
+        "manager_finalizer_iterator.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn completed_iterator_prefix_preserves_finalizer_manager_exit() {
     for prefix in [
         "        for item in items:\n            begin(item)\n        value = []\n",
