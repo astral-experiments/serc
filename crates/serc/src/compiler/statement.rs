@@ -40525,18 +40525,25 @@ impl<'source> Compiler<'source> {
                 )
                 .map(|entry| WithBodyExitNoop::RetainedManagerPopBlock(SourceLocation::NONE, entry))
                 .or_else(|| {
-                    (remaining.is_empty()
-                        && matches!(body_noop, Some(WithBodyExitNoop::ConvertedPopBlock))
-                        && matches!(body.last(), Some(Stmt::For(statement))
-                                if !statement.is_async))
-                    .then(|| {
-                        self.assembler
-                            .original_manager_copied_finally_break_join(protected_end)
-                    })
-                    .flatten()
-                    .map(|(entry, location)| {
-                        WithBodyExitNoop::RetainedManagerPopBlock(location, entry)
-                    })
+                    if !remaining.is_empty()
+                        || !matches!(body_noop, Some(WithBodyExitNoop::ConvertedPopBlock))
+                    {
+                        return None;
+                    }
+                    let has_iterator = match body.last()? {
+                        Stmt::For(statement) if !statement.is_async => true,
+                        Stmt::While(_)
+                            if self.context.python_version >= crate::PythonVersion::Py314 =>
+                        {
+                            false
+                        }
+                        _ => return None,
+                    };
+                    self.assembler
+                        .original_manager_copied_finally_break_join(protected_end, has_iterator)
+                        .map(|(entry, location)| {
+                            WithBodyExitNoop::RetainedManagerPopBlock(location, entry)
+                        })
                 })
                 .or_else(|| {
                     remaining

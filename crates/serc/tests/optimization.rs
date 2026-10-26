@@ -8296,6 +8296,30 @@ fn handler_break_releases_iterator_exception_owner() {
 }
 
 #[test]
+fn while_break_finalizer_donates_the_manager_exit_line() {
+    let source = r"def scan(manager):
+    with manager:
+        while running():
+            try:
+                read()
+            except Error:
+                recover()
+            else:
+                break
+            finally:
+                work()
+        else:
+            raise Error
+";
+    assert_matches_cpython_versions(
+        source,
+        "while_break_finalizer_manager.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn copied_finally_compound_break_threads_both_conditions() {
     let source = r#"async def copied_break(self, key):
     while not self.finished():

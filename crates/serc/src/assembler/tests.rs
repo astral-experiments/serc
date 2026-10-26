@@ -3656,7 +3656,7 @@ fn manager_finally_break_donor_requires_every_target_iterator_pop() {
             }
             assembler.record_exception_owner_block_boundary(entry);
             assert_eq!(
-                assembler.original_manager_copied_finally_break_join(protected_end),
+                assembler.original_manager_copied_finally_break_join(protected_end, true),
                 (mutation == "intact").then_some((entry, location)),
                 "{version:?}, {mutation}"
             );
