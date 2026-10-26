@@ -5605,6 +5605,25 @@ fn erased_nested_else_preserves_coroutine_loop_exits() {
 }
 
 #[test]
+fn erased_handler_assertion_preserves_the_while_exit_position() {
+    let source = r"async def run(context, ready, work):
+    with context:
+        try:
+            work()
+        except ValueError as error:
+            while ready:
+                error = work()
+            assert error
+";
+    assert_matches_cpython_versions(
+        source,
+        "erased_handler_while_position.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn erased_final_else_suffix_preserves_coroutine_loop_exits() {
     let source = r"async def sample(items, selected, prepare, work, verify):
     for item in items:

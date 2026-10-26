@@ -31676,15 +31676,17 @@ impl<'source> Compiler<'source> {
                 {
                     self.assembler
                         .set_location(self.source_location(test.range()));
-                } else if let Some(Stmt::While(tail)) = handler.body.last()
-                    && tail.orelse.is_empty()
+                } else if let Some(Stmt::While(tail)) = handler.body.iter().rev().find(|stmt| {
+                    self.context.python_version < crate::PythonVersion::Py314
+                        || !self.context.is_elided_statement(stmt)
+                }) && tail.orelse.is_empty()
                     && condition_has_only_runtime_tests(&tail.test)
                     && !expression_contains_chained_comparison(&tail.test)
                     && !suite_contains_loop_break(&tail.body)
                     && (self.control.loops.contexts.is_empty()
                         || condition_jump_target_count(&tail.test, false) == 1)
                 {
-                    // Only the condition's false edges reach this loop's normal cleanup.
+                    // Erased suffix statements leave the condition's false edges adjacent to cleanup.
                     // A shared exit stays unlocated; a sole edge supplies its operand span.
                     let location = unique_condition_jump_target(&tail.test, false)
                         .map_or(SourceLocation::NONE, |test| {
