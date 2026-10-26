@@ -17848,6 +17848,25 @@ impl<'source> Compiler<'source> {
                         && !clause.body.is_empty()
                         && clause.body.iter().all(|part| self.context.is_elided_statement(part)))
         };
+        let erased_elif_else = |tail: &ruff_python_ast::StmtIf| {
+            !mode.non_final_branch
+                && self.control.in_loop_tail_without_nested_cleanup()
+                && tail.elif_else_clauses.len() > 1
+                && condition_has_only_runtime_tests(&tail.test)
+                && tail.elif_else_clauses.last().is_some_and(|clause| {
+                    clause.test.is_none()
+                        && !clause.body.is_empty()
+                        && clause
+                            .body
+                            .iter()
+                            .all(|part| self.context.is_elided_statement(part))
+                })
+                && tail
+                    .elif_else_clauses
+                    .iter()
+                    .filter_map(|clause| clause.test.as_ref())
+                    .all(condition_has_only_runtime_tests)
+        };
         if self.context.python_version >= crate::PythonVersion::Py314
             && let Some(end) = body.iter().rposition(|statement| {
                 !matches!(statement, Stmt::Global(_) | Stmt::Nonlocal(_))
@@ -17856,7 +17875,7 @@ impl<'source> Compiler<'source> {
             && body[end + 1..]
                 .iter()
                 .any(|statement| self.context.is_elided_statement(statement))
-            && matches!(&body[end], Stmt::If(statement)
+            && (matches!(&body[end], Stmt::If(statement)
             if (statement.elif_else_clauses.is_empty() || erased_final_else(statement)
                     || self.managed_completed_branch_tail(statement, restart, mode))
                 && condition_has_only_runtime_tests(&statement.test)
@@ -18035,6 +18054,7 @@ impl<'source> Compiler<'source> {
                             || (!statement.body.is_empty()
                                 && original_condition_has_unique_jump_target(&statement.test, true)
                                 && statement.body.iter().all(|statement| self.context.is_elided_statement(statement)))))))
+                || matches!(&body[end], Stmt::If(tail) if erased_elif_else(tail)))
         {
             // Native emits no instructions for the optimized suffix, leaving the
             // conditional as the original loop-tail statement. A direct return or

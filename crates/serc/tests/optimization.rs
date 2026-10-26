@@ -5605,6 +5605,17 @@ fn erased_nested_else_preserves_coroutine_loop_exits() {
 }
 
 #[test]
+fn erased_elif_else_uses_the_last_condition_backedge() {
+    let source = "def run(items, skip, left, right):\n    for item in items:\n        if skip:\n            pass\n        else:\n            if left:\n                pass\n            elif right:\n                pass\n            else:\n                assert item\n            assert left\n";
+    assert_matches_cpython_versions(
+        source,
+        "erased_elif_loop_exit.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn erased_final_else_suffix_preserves_coroutine_loop_exits() {
     let source = r"async def sample(items, selected, prepare, work, verify):
     for item in items:
