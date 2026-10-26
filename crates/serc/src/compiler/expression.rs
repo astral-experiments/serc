@@ -1247,11 +1247,17 @@ impl Compiler<'_> {
                         if index + 1 == matched_cases
                             && (!context.fail_pop.is_empty()
                                 || context.direct_loop_failure.is_some()
-                                || assertion_success_join)
+                                || assertion_success_join
+                                || (self.context.python_version >= PythonVersion::Py314
+                                    && case.guard.is_none()
+                                    && matches!(&case.pattern, Pattern::MatchAs(capture)
+                                        if capture.pattern.is_none() && capture.name.is_some())
+                                    && self.following_name_return_fits_match_copy_budget()))
                         {
                             // CPython duplicates small exits before removing this jump across
-                            // the empty final pattern-failure block. An assertion success
-                            // also keeps its original jump until conditional threading.
+                            // the empty final pattern-failure block, or across the join after
+                            // a final capture when an enclosing branch skips the match.
+                            // An assertion success also waits for conditional threading.
                             self.assembler.defer_jump_removal(success_exit);
                         }
                         let subject_pop_is_optimized_away = !copied_subject
