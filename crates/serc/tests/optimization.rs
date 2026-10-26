@@ -59,6 +59,33 @@ fn erased_nested_assignment_suffix_preserves_join() {
 }
 
 #[test]
+fn erased_value_cases_keep_the_last_pattern_failure_line() {
+    let source = r"def run(tag, active):
+    if active:
+        match tag:
+            case 1:
+                assert active
+            case 2:
+                assert tag
+    else:
+        assert tag
+    if active:
+        match tag:
+            case 3:
+                use(tag)
+            case 4:
+                assert active
+    use(tag)
+";
+    assert_matches_cpython_versions(
+        source,
+        "erased_value_cases.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn erased_async_manager_suffix_preserves_conditional_join() {
     let source = r"async def sample(ordered, items):
     try:

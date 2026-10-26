@@ -666,6 +666,8 @@ pub(super) struct StatementState {
     pub(super) in_match: bool,
     // This exact match ends a case whose success jump skips a later case or default.
     pub(super) match_tail_before_case_exit: Option<TextRange>,
+    // A match whose successful cases jump over a later conditional arm.
+    pub(super) match_tail_before_if_exit: Option<TextRange>,
     // This trailing while shares its empty exit with an enclosing conditional's false edge.
     while_before_conditional_join: Option<TextRange>,
     // The final conditional arm's Pass falls through to a separate original join array.
@@ -15635,6 +15637,14 @@ impl<'source> Compiler<'source> {
                             start
                         });
                         let branch_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, end)?;
+                        if matches!(body.last(), Some(Stmt::Match(matched))
+                            if self.has_erased_final_value_case(matched))
+                        {
+                            // Successful cases bypass this join. The unmatched final
+                            // pattern supplies its line when the join becomes a NOP.
+                            self.assembler
+                                .preserve_redundant_jump_nop_after_threading(branch_exit);
+                        }
                         if let Some(start) = direct_try_body_exit_start {
                             let exclusion_end = self.assembler.label();
                             self.assembler.mark(exclusion_end);
@@ -17056,6 +17066,15 @@ impl<'source> Compiler<'source> {
             .elif_else_clauses
             .last()
             .map_or(statement.body.as_slice(), |clause| clause.body.as_slice());
+        let match_tail_before_if_exit = match body.last() {
+            Some(Stmt::Match(matched))
+                if !std::ptr::eq(body, fallthrough_body)
+                    && self.has_erased_final_value_case(matched) =>
+            {
+                Some(matched.range)
+            }
+            _ => None,
+        };
         let retained_branch_pass = (self.context.python_version >= crate::PythonVersion::Py314
             && body.len() > 1
             && body.last().map(Ranged::range) == fallthrough_body.last().map(Ranged::range))
@@ -17180,7 +17199,17 @@ impl<'source> Compiler<'source> {
                                                     .direct_try_tail_continuation
                                             },
                                             direct_try_tail_continuation,
-                                            |compiler| compiler.compile_suite(body),
+                                            |compiler| {
+                                                compiler.with_control_override(
+                                                    |control| {
+                                                        &mut control
+                                                            .statements
+                                                            .match_tail_before_if_exit
+                                                    },
+                                                    match_tail_before_if_exit,
+                                                    |compiler| compiler.compile_suite(body),
+                                                )
+                                            },
                                         )
                                     },
                                 )

@@ -588,6 +588,21 @@ impl Compiler<'_> {
         )
     }
 
+    pub(super) fn has_erased_final_value_case(
+        &self,
+        statement: &ruff_python_ast::StmtMatch,
+    ) -> bool {
+        self.context.python_version >= PythonVersion::Py314
+            && statement.cases.last().is_some_and(|case| {
+                case.guard.is_none()
+                    && matches!(case.pattern, Pattern::MatchValue(_))
+                    && case
+                        .body
+                        .iter()
+                        .all(|part| self.context.is_elided_statement(part))
+            })
+    }
+
     fn compile_match_with_context(
         &mut self,
         statement: &ruff_python_ast::StmtMatch,
@@ -622,6 +637,8 @@ impl Compiler<'_> {
                 .last()
                 .is_some_and(|case| is_wildcard_pattern(&case.pattern));
         let matched_cases = statement.cases.len() - usize::from(has_default);
+        let erased_final_value_case =
+            self.control.statements.match_tail_before_if_exit == Some(statement.range);
         let mut failure_reaches_end = false;
         let mut specialized_none_seen = false;
         let mut or_default_success_exit = None;
@@ -1280,7 +1297,9 @@ impl Compiler<'_> {
                         // retaining an extra NOP after the subject pop.
                         let erased_subject_fallthrough = self.context.python_version
                             >= PythonVersion::Py314
-                            && (match_has_following || elided_case_body)
+                            && (match_has_following || elided_case_body
+                                || (erased_final_value_case && !self.control.in_loop()
+                                    && case.guard.is_none() && matches!(case.pattern, Pattern::MatchValue(_))))
                             && copied_subject
                             // Folded guards can retain a located NOP before the subject pop.
                             && case
@@ -1318,9 +1337,10 @@ impl Compiler<'_> {
                                     && matches!(case.pattern, Pattern::MatchValue(_)))
                                     || !context.fail_pop.is_empty()))
                         {
-                            if authored_pass_exit
-                                && self.control.statements.match_tail_before_case_exit
-                                    == Some(statement.range)
+                            if (erased_final_value_case
+                                || (authored_pass_exit
+                                    && self.control.statements.match_tail_before_case_exit
+                                        == Some(statement.range)))
                                 && !copied_subject
                                 && !has_default
                                 && index + 1 == matched_cases
@@ -1330,7 +1350,7 @@ impl Compiler<'_> {
                                 && !self.control.falls_through_to_loop_backedge()
                             {
                                 // This final value-pattern failure has a zero-pop join.
-                                // Keep the Pass line on its success jump while allowing it
+                                // Keep the body line on its success jump while allowing it
                                 // to thread through an enclosing case's original exit.
                                 self.assembler.preserve_authored_pass_jump_nop(success_exit);
                             } else if authored_pass_exit
