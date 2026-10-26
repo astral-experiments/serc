@@ -2674,6 +2674,79 @@ impl OptimizationPipeline {
         prefixes
     }
 
+    /// Finds the sole nested recovery whose name cleanup jumps to this tuple return.
+    fn nested_recovery_tuple_donor(
+        &self,
+        normal: BasicBlockId,
+        join: BasicBlockId,
+        tail: BasicBlockId,
+    ) -> Option<SourceLocation> {
+        use crate::target::opcodes::{DELETE_FAST, LOAD_CONST, STORE_FAST};
+
+        let graph = &self.graph;
+        original_local_tuple_return(graph[tail].items())?;
+        let jump_target = |jump: &Instruction| graph.label_block(jump.forward_target()?);
+        let normal_jump = graph[normal].last_instruction()?;
+        if normal_jump.location.line < 0
+            || normal_jump.opcode != JUMP_FORWARD
+            || jump_target(normal_jump) != Some(join)
+        {
+            return None;
+        }
+        let sole_predecessor_except = |target, excluded| {
+            let mut sources = graph.iter().filter_map(|(source, block)| {
+                (Some(source) != excluded
+                    && block.last_instruction().and_then(jump_target) == Some(target))
+                .then_some(source)
+            });
+            let source = sources.next()?;
+            sources.next().is_none().then_some(source)
+        };
+        let cleanup = sole_predecessor_except(join, Some(normal))?;
+        let recovered = sole_predecessor_except(cleanup, None)?;
+        if graph.order().windows(2).any(|pair| {
+            (pair[1] == cleanup || pair[1] == join)
+                && super::super::block_has_fallthrough(graph[pair[0]].items())
+        }) || !self
+            .exception_owner_provenance
+            .normal_try_exits
+            .iter()
+            .any(|&(entry, end)| {
+                graph.label_block(entry) == Some(recovered)
+                    && graph.label_block(end) == Some(cleanup)
+            })
+        {
+            return None;
+        }
+        let items = graph[cleanup].items();
+        let first = items
+            .iter()
+            .position(|item| matches!(item, Item::Instruction(_)))?;
+        let [
+            Item::Instruction(pop),
+            Item::Instruction(none),
+            Item::Instruction(store),
+            Item::Instruction(delete),
+            Item::Instruction(jump),
+        ] = &items[first..]
+        else {
+            return None;
+        };
+        let donor = graph[recovered].last_instruction()?;
+        (pop.opcode == POP_EXCEPT
+            && none.opcode == LOAD_CONST
+            && store.opcode == STORE_FAST
+            && delete.opcode == DELETE_FAST
+            && jump.opcode == JUMP_FORWARD
+            && store.operand() == delete.operand()
+            && [pop, none, store, delete, jump]
+                .iter()
+                .all(|op| op.location == SourceLocation::NONE)
+            && donor.opcode == JUMP_FORWARD
+            && donor.location.line >= 0)
+            .then_some(donor.location)
+    }
+
     /// Keep the join where CPython copies a four-slot return after a shared try exit.
     fn preserve_shared_try_return_joins(&mut self) {
         use crate::target::opcodes::RETURN_VALUE;
@@ -2698,9 +2771,6 @@ impl OptimizationPipeline {
             else {
                 continue;
             };
-            if unlocated_jump(entry) != Some(join) {
-                continue;
-            }
             let Some(tail) = unlocated_jump(join) else {
                 continue;
             };
@@ -2716,6 +2786,13 @@ impl OptimizationPipeline {
                     .sum::<usize>()
                     != 4
             {
+                continue;
+            }
+            if unlocated_jump(entry) != Some(join) {
+                if let Some(donor) = self.nested_recovery_tuple_donor(entry, join, tail) {
+                    let tail_label = graph[tail].first_label().expect("original return target");
+                    joins.push((join, Some((entry, tail_label, donor))));
+                }
                 continue;
             }
             // The two earlier jumps first copy the normal POP_BLOCK/JUMP array. By
@@ -2734,16 +2811,30 @@ impl OptimizationPipeline {
                     })
                 });
             if incoming.nth(1).is_some() {
-                joins.push(join);
+                joins.push((join, None));
             }
         }
-        for join in joins {
-            self.graph
+        for (join, normal_copy) in joins {
+            if let Some((normal, tail, _)) = normal_copy {
+                // The normal try exit copies the original, one-slot bridge first.
+                self.graph
+                    .instructions_mut(normal)
+                    .next_back()
+                    .unwrap()
+                    .set_operand(Operand::Forward(tail));
+            }
+            let jump = self
+                .graph
                 .instructions_mut(join)
                 .next_back()
-                .expect("singleton try join")
-                .jump_policy
-                .prevent_threading_target();
+                .expect("singleton try join");
+            jump.jump_policy.prevent_threading_target();
+            if let Some((_, _, donor)) = normal_copy {
+                // The recovery reaches the bridge after it copies the tuple return.
+                // Its old jump remains as the fifth slot, with the recovery's line.
+                jump.location = donor;
+                jump.jump_policy.retain_nop();
+            }
         }
     }
 
