@@ -932,6 +932,51 @@ fn represented_setup_nops(
         )
 }
 
+/// Restores a represented SETUP to its original assignment-and-raise array.
+fn exit_chain_boundaries(
+    graph: &BlockGraph,
+    order: &[BasicBlockId],
+    positions: &[usize],
+    regions: &[ExceptionRegion],
+    provenance: &ExceptionOwnerProvenance,
+) -> FxHashSet<Label> {
+    let mut boundaries = regions
+        .iter()
+        .flat_map(|region| [region.start, region.end])
+        .collect::<FxHashSet<_>>();
+    for &(start, end) in &provenance.setup_nop_ranges {
+        let Some(setup) = graph.label_block(start) else {
+            continue;
+        };
+        let Some(first) = positions[setup.index()].checked_sub(1) else {
+            continue;
+        };
+        let Some(blocks) = order.get(first..).and_then(|rest| rest.get(..3)) else {
+            continue;
+        };
+        let raise = blocks[2];
+        // The concrete SETUP NOP sits outside the exception range, but it does
+        // not end CPython's four-record assignment and raise array.
+        if graph.label_block(end) == Some(raise)
+            && graph[raise]
+                .last_instruction()
+                .is_some_and(|last| last.value_argument() == Some(1))
+            && blocks
+                .iter()
+                .flat_map(|block| graph[*block].items())
+                .filter_map(Item::as_instruction)
+                .map(|instruction| instruction.opcode)
+                .eq([STORE_FAST, NOP, LOAD_FAST, RAISE_VARARGS])
+            && represented_setup_nops(graph, blocks, provenance)
+                .labels
+                .contains(&start)
+        {
+            boundaries.insert(start);
+        }
+    }
+    boundaries
+}
+
 /// Reconstructs one original exit array across exception-table-only splits.
 fn metadata_split_exit_chain<'a>(
     graph: &BlockGraph,
@@ -1196,10 +1241,8 @@ fn exit_block_analysis(
     // conservative mirror of every copy-producing condition in `duplicate_exit_blocks`; adding a
     // new copy path there requires extending this proof before it is safe to retain the early
     // return.
-    let exception_split_labels = exception_regions
-        .iter()
-        .flat_map(|region| [region.start, region.end])
-        .collect::<FxHashSet<_>>();
+    let exception_split_labels =
+        exit_chain_boundaries(graph, order, &positions, exception_regions, provenance);
     let mut target_analyses = vec![None; vector_len];
     for source in order.iter().copied() {
         let Some(source_last) = graph[source].last_instruction() else {
@@ -5175,11 +5218,13 @@ impl OptimizationPipeline {
             })
             .collect::<FxHashMap<_, _>>();
 
-        let exception_split_labels = self
-            .exception_regions
-            .iter()
-            .flat_map(|region| [region.start, region.end])
-            .collect::<FxHashSet<_>>();
+        let exception_split_labels = exit_chain_boundaries(
+            graph,
+            &order,
+            &positions,
+            &self.exception_regions,
+            &self.exception_owner_provenance,
+        );
         let original_handler_arrays = self
             .exception_owner_provenance
             .borrow_handler_cleanup_arrays
