@@ -1560,6 +1560,20 @@ impl ExceptionOwnerTail {
     }
 
     fn instruction(&mut self, instruction: &Instruction, previous: Option<&Instruction>) {
+        // An authored 'not' emits TO_BOOL before UNARY_NOT. When COMPARE_OP
+        // takes that TO_BOOL slot, NOP compaction has already recorded the
+        // removed comparison on its successor.
+        if instruction.opcode == crate::target::opcodes::UNARY_NOT
+            && previous.is_some_and(|previous| {
+                previous.opcode == COMPARE_OP
+                    && previous
+                        .value_argument()
+                        .is_some_and(|argument| argument & 16 != 0)
+                    && previous.local_policy.hidden_exception_owner_slots() > 0
+            })
+        {
+            self.early_removals = self.early_removals.saturating_sub(1);
+        }
         self.early_removals += usize::from(instruction.local_policy.hidden_exception_owner_slots());
         if matches!(
             instruction.opcode,
