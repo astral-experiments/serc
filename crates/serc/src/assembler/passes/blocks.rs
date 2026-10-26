@@ -8495,14 +8495,33 @@ impl OptimizationPipeline {
                 && first.location.line < 0
                 && !first.no_location_policy.preserves_location()
                 && let Some(location) = jump_sources[target.index()].iter().find_map(|source| {
-                    block_jump_target(graph[*source].items())
-                        .and_then(|label| graph.label_block(label))
-                        .filter(|block| *block == target)
-                        .and_then(|_| {
-                            graph[*source]
-                                .last_instruction()
-                                .map(|instruction| instruction.location)
-                        })
+                    let source = *source;
+                    let jump = graph[source].last_instruction()?;
+                    if jump.jump_target().and_then(|label| graph.label_block(label)) != Some(target) {
+                        return None;
+                    }
+                    // Both arms enter this jump. A line inherited from the arm that
+                    // falls through does not belong to the original shared jump array.
+                    let shared_fallthrough_line = self.python_version >= crate::PythonVersion::Py314
+                        && predecessors[source.index()] == 2
+                        && remaining_predecessors[source.index()] == 2
+                        && jump.opcode == JUMP_FORWARD
+                        && !jump.fusion_policy.is_authored_break()
+                        && graph[source].items().iter().filter_map(Item::as_instruction).nth(1).is_none()
+                        && matches!(jump_sources[source.index()].as_slice(), [origin]
+                            if !drop_blocks[origin.index()] && graph[*origin].last_instruction().is_some_and(|condition|
+                                is_conditional_jump(condition.opcode)
+                                    && condition.jump_target().and_then(|label| graph.label_block(label)) == Some(source)))
+                        && positions[source.index()].checked_sub(1).is_some_and(|position| {
+                            let previous = &graph[order[position]];
+                            block_has_fallthrough(previous.items())
+                                && previous.last_instruction().is_some_and(|tail| tail.location == jump.location)
+                        });
+                    Some(if shared_fallthrough_line {
+                        SourceLocation::NONE
+                    } else {
+                        jump.location
+                    })
                 })
                 && let Some(first) = graph.instructions_mut(target).next()
             {

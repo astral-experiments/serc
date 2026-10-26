@@ -15,6 +15,45 @@ use serc::{
 };
 
 #[test]
+fn shared_conditional_jumps_do_not_locate_outer_pop_blocks() {
+    for source in [
+        r"def scan(items):
+    for item in items:
+        with manager:
+            try:
+                take(item)
+            except ValueError:
+                raise
+            else:
+                if enabled:
+                    accept(item)
+    finish()
+",
+        r"def scan():
+    while active:
+        try:
+            try:
+                take()
+            finally:
+                if enabled:
+                    accept()
+        except ValueError as error:
+            recover(error)
+        else:
+            record()
+    finish()
+",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "shared_conditional_pop.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn nested_conversion_handlers_keep_shared_cleanup() {
     let source = r"def sample(items):
     for item in items:
