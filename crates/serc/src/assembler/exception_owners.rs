@@ -8470,8 +8470,38 @@ impl LayoutAssembler {
                         } else {
                             ExceptionOwner::Absent
                         };
+                        // A retained setup can follow an unprotected prefix in the same
+                        // original array. With no compacted slots, the appended marker
+                        // gets a fresh null owner even after a comprehension restore.
+                        let fresh_array_slot = self.python_version == crate::PythonVersion::Py314
+                            && instruction.opcode == NOT_TAKEN
+                            && owner_history_exact
+                            && !has_owner
+                            && tail.early_removals == 0
+                            && tail.late_removals == 0
+                            && tail.post_compaction_fusions == 0
+                            && previous.is_some_and(|condition| {
+                                condition.no_location_policy.borrow_fallthrough()
+                                    != super::BorrowFallthrough::Barrier
+                            })
+                            && protected_suffix.is_some_and(|(setup, _, _)| {
+                                original_array_start < setup
+                                    && !self.exception_regions.iter().any(|region| {
+                                        !region.is_scope_fallback
+                                            && match (
+                                                label_positions.get(&region.start),
+                                                label_positions.get(&region.end),
+                                            ) {
+                                                (Some(begin), Some(end)) => {
+                                                    *begin < setup && original_array_start < *end
+                                                }
+                                                _ => true,
+                                            }
+                                    })
+                            });
                         let decision = if proven_unprotected_slot
                             || prologue_consumed_all_slots
+                            || fresh_array_slot
                             || instruction.exception_policy().owner()
                                 != NormalizedExceptionOwner::DynamicCondition
                         {
