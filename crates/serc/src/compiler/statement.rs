@@ -5829,15 +5829,15 @@ impl<'source> Compiler<'source> {
             return self.compile_suite_inner(body, false);
         }
         let has_siblings = has_siblings || self.control.statements.terminal_if_branch_has_siblings;
-        // A final else's conditional name assignment, or a tested arm without
-        // siblings, joins at its STORE before the separate implicit return block.
-        // Tested arms with siblings retain their existing exit-copy lowering.
-        // Attribute assignments also keep their original join: their combined tail exceeds
-        // the four-instruction exit-copy limit after the outer jump becomes a NOP.
+        // A conditional name assignment in the last arm falls through its STORE
+        // to the implicit return. Earlier tested arms have a jump over a sibling
+        // and can copy the store and return into both expression branches.
+        // An attribute store also joins because its copied tail exceeds four slots.
+        let joins_at_name_store =
+            is_final_else || !self.control.statements.terminal_if_branch_has_forward_exit;
         let assignment = body.last().and_then(|statement| match statement {
             Stmt::Assign(assignment)
-                if ((is_final_else || !has_siblings)
-                    && matches!(assignment.targets.as_slice(), [Expr::Name(_)]))
+                if (joins_at_name_store && matches!(assignment.targets.as_slice(), [Expr::Name(_)]))
                     || matches!(assignment.targets.as_slice(), [Expr::Attribute(attribute)]
                         if matches!(attribute.value.as_ref(), Expr::Name(_))) =>
             {

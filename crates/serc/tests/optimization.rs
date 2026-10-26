@@ -12469,6 +12469,7 @@ fn terminal_conditional_name_assignments_preserve_join() {
     for (index, source) in [
         "def f(self, x, flag, other, left, right):\n    if flag:\n        value = 1 if x else 2\n    else:\n        use()\n",
         "def f(self, x, flag, other, left, right):\n    if flag:\n        use()\n    elif other:\n        value = left if x else right\n    else:\n        done()\n",
+        "def target(first, second, flag, left, right):\n    if first:\n        use()\n    elif second:\n        result = left if flag else right\n",
         "def target(enabled, choose, left, right):\n    if enabled:\n        result = left if choose else right\n    else:\n        fallback()\n",
         "def target(outer, inner, choose, left, right):\n    if outer:\n        fallback()\n    else:\n        if inner:\n            result = left if choose else right\n        else:\n            finish()\n",
     ]
