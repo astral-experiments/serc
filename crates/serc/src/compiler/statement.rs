@@ -6635,13 +6635,9 @@ impl<'source> Compiler<'source> {
                     == IteratorCleanup::Sync
                     && self.continued_finally_pop_blocks(context, true, false) == 2)
                     .then_some(copied_break_item);
-                // Direct named handlers in ordinary functions and coroutines have
-                // the same two omitted POP_BLOCKs and four cleanup records.
-                let copied_break_handler_origin = (matches!(
-                        self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR),
-                        0 | CO_COROUTINE
-                    )
-                    && matches!(context.iterator_cleanup, IteratorCleanup::None | IteratorCleanup::Sync)
+                // Both handler forms unwind before the copied finalizer. A named
+                // handler also clears its bound exception after POP_EXCEPT.
+                let copied_handler_is_named = (matches!(context.iterator_cleanup, IteratorCleanup::None | IteratorCleanup::Sync)
                     && self.control.withs.active_with_exits.is_empty()
                     && self.control.exceptions.active_try_marker_slots.is_empty()
                     && self.control.exceptions.active_exception_group_handlers == 0
@@ -6654,7 +6650,9 @@ impl<'source> Compiler<'source> {
                     && self.control.finally.copied_return_finally_preserved_values == 0
                     && self.control.finally.active_pass_finally_locations.is_empty()
                     && matches!(self.control.exceptions.active_exception_handlers.as_slice(), [handler]
-                        if handler.name.is_some()
+                        if ((handler.name.is_some()
+                            && matches!(self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR), 0 | CO_COROUTINE))
+                            || (handler.name.is_none() && self.context.python_version == crate::PythonVersion::Py314))
                             && handler.with_depth == 0
                             && handler.loop_depth == self.control.loops.contexts.len()
                             && self.control.exceptions.active_exception_region_exclusions.len()
@@ -6665,7 +6663,7 @@ impl<'source> Compiler<'source> {
                                     && finally.loop_depth == handler.loop_depth
                                     && finally.exception_region_depth + 1 == handler.exception_region_depth
                                     && finally.exception_region_depth == context.exception_region_depth)))
-                    .then_some(copied_break_item);
+                    .then(|| self.control.exceptions.active_exception_handlers[0].name.is_some());
                 let is_first_emitted_body_instruction =
                     self.assembler.instruction_count() == context.body_start;
                 let break_continues_line = self
@@ -6932,7 +6930,8 @@ impl<'source> Compiler<'source> {
                                     None,
                                     (copied_break_pop_blocks > 0)
                                         .then_some((copied_break_item, copied_break_pop_blocks)),
-                                    None,
+                                    (copied_handler_is_named == Some(false))
+                                        .then_some(copied_break_item),
                                     defer_finally_end.then_some((
                                         context.finally_end_depth,
                                         copied_finally_exclusion_lengths.as_slice(),
@@ -6951,8 +6950,9 @@ impl<'source> Compiler<'source> {
                     self.control.withs.active_with_exits.len(),
                     false,
                 );
-                if let Some(origin) = copied_break_handler_origin {
-                    self.assembler.record_copied_break_handler_cleanup(origin);
+                if copied_handler_is_named == Some(true) {
+                    self.assembler
+                        .record_copied_break_handler_cleanup(copied_break_item);
                 }
                 let needs_outer_region_boundary = exclusion_start.is_some()
                     && (has_copied_finalizer || !with_unwind_starts.is_empty())
@@ -18561,7 +18561,7 @@ impl<'source> Compiler<'source> {
         with_depth: usize,
         continue_target: Option<Label>,
         copied_break_item: Option<(usize, usize)>,
-        copied_continue_item: Option<usize>,
+        emitted_handler_pop_item: Option<usize>,
         deferred_finally_end: Option<(usize, &[usize])>,
     ) -> Result<LoopControlUnwind, CompileError> {
         use super::legacy_native_labels::{FinallyCopy, WithAwait};
@@ -18639,7 +18639,7 @@ impl<'source> Compiler<'source> {
                     &mut region_unwind_starts,
                     finally_exclusion_lengths,
                 )?;
-                let copied_handler_start = if copied_continue_item.is_some() {
+                let copied_handler_start = if emitted_handler_pop_item.is_some() {
                     // No manager or preserved-value unwind precedes this exact handler.
                     // Its original POP_BLOCK precedes POP_EXCEPT in the same array.
                     self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
@@ -18711,7 +18711,9 @@ impl<'source> Compiler<'source> {
                         self.control.exceptions.active_exception_region_exclusions[index].len(),
                     ));
                 }
-                if let (Some(origin), Some(start)) = (copied_continue_item, copied_handler_start) {
+                if let (Some(origin), Some(start)) =
+                    (emitted_handler_pop_item, copied_handler_start)
+                {
                     self.assembler
                         .record_copied_handler_cleanup(start, copy_start, origin, false);
                     // This region-end label certifies the finalizer's separate NULL POP.
@@ -18724,7 +18726,7 @@ impl<'source> Compiler<'source> {
                     CO_GENERATOR | CO_ASYNC_GENERATOR
                 ) && continue_target.is_none()
                     && copied_break_item.is_none()
-                    && copied_continue_item.is_none()
+                    && emitted_handler_pop_item.is_none()
                     && finally_contexts.len() == 1
                     && context.with_depth == with_depth
                     && next_with == context.with_depth
@@ -18836,7 +18838,7 @@ impl<'source> Compiler<'source> {
                 let retained_try_break_exit = (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                     && continue_target.is_none()
                     && copied_break_item.is_none()
-                    && copied_continue_item.is_none()
+                    && emitted_handler_pop_item.is_none()
                     && finally_contexts.len() == 1
                     && index == 0
                     && loop_depth == 1
