@@ -11757,6 +11757,50 @@ impl<'source> Compiler<'source> {
                                 self.control.withs.active_with_exits.len(),
                             )
                         });
+                    // The two ordinary tries straddle the synchronous managers. The
+                    // inner one's POP follows the awaited exit, before either manager.
+                    let awaited_exit_before_managers = (self.context.python_version
+                        == crate::PythonVersion::Py314
+                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                            == CO_COROUTINE
+                        && preserve_tos
+                        && !return_is_overridden
+                        && context_index == 0
+                        && return_finally_contexts.len() == 1
+                        && handler_count == 0
+                        && finally_context.exception_region_depth == 0
+                        && finally_context.with_depth == 0
+                        && self.control.loops.contexts.is_empty()
+                        && next_with == 0
+                        && self.control.exceptions.active_try_marker_slots.len() == 2
+                        && self
+                            .control
+                            .exceptions
+                            .active_exception_region_exclusions
+                            .len()
+                            == 3
+                        && with_unwind_starts
+                            .iter()
+                            .map(|unwind| unwind.index)
+                            .eq([2, 1, 0])
+                        && self.control.exceptions.active_exception_group_handlers == 0
+                        && self.control.finally.active_finally_end_blocks == 0
+                        && self.control.finally.active_normal_finally_bodies == 0
+                        && self.control.finally.active_copied_finally_bodies == 0)
+                        .then(|| match self.control.withs.active_with_exits.as_slice() {
+                            [outer, inner, awaited]
+                                if !outer.is_async
+                                    && !inner.is_async
+                                    && awaited.is_async
+                                    && outer.exception_region_depth == 2
+                                    && inner.exception_region_depth == 2
+                                    && awaited.exception_region_depth == 3 =>
+                            {
+                                Some((self.assembler.item_count(), awaited.location))
+                            }
+                            _ => None,
+                        })
+                        .flatten();
                     let copied_manager_none_pop = copied_manager_return_pop
                         .filter(|(_, ordinary_try_pops, managers)| {
                             self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
@@ -12484,6 +12528,12 @@ impl<'source> Compiler<'source> {
                             None,
                             false,
                         );
+                    }
+                    if result.is_ok()
+                        && let Some((pop_item, location)) = awaited_exit_before_managers
+                    {
+                        self.assembler
+                            .record_awaited_manager_return_compaction(pop_item, location);
                     }
                     if result.is_ok()
                         && let Some(pop_item) = copied_manager_none_pop

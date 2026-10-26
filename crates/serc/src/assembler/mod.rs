@@ -13152,6 +13152,48 @@ impl Assembler {
             });
     }
 
+    /// Captures the try POP between an async exit and two synchronous manager exits.
+    pub(crate) fn record_awaited_manager_return_compaction(
+        &mut self,
+        pop_item: usize,
+        location: SourceLocation,
+    ) {
+        let before = &self.linear_items()[..pop_item];
+        let mut preceding = before
+            .iter()
+            .enumerate()
+            .rev()
+            .filter_map(|(offset, item)| Some((offset, *item.as_instruction()?)))
+            .skip(14); // Each synchronous manager retains seven cleanup instructions.
+        let (Some((_, pop)), Some((end, send))) = (preceding.next(), preceding.next()) else {
+            return;
+        };
+        let Some(Item::Label(entry)) = end.checked_sub(1).and_then(|index| before.get(index))
+        else {
+            return;
+        };
+        if send.opcode != END_SEND
+            || pop.opcode != POP_TOP
+            || send.location != location
+            || pop.location != location
+        {
+            return;
+        }
+        let prefix = (*entry, [send, pop]);
+        let count = self
+            .exception_owner_provenance
+            .copied_manager_return_compactions
+            .len();
+        self.record_copied_manager_return_compaction(pop_item, 1, 2, None, false);
+        if let Some(origin) = self
+            .exception_owner_provenance
+            .copied_manager_return_compactions
+            .get_mut(count)
+        {
+            origin.awaited_exit = Some(prefix);
+        }
+    }
+
     /// Captures the actual manager unwind and first None test of its copied finally.
     pub(crate) fn record_copied_manager_return_compaction(
         &mut self,
@@ -13284,6 +13326,7 @@ impl Assembler {
                     retained_outer_handler,
                     cleanup,
                     earlier_cleanup,
+                    awaited_exit: None,
                     named_handler_cleanup,
                     constant_return_prefix: None,
                     to_bool: None,
@@ -13435,6 +13478,7 @@ impl Assembler {
                     ordinary_try_pops: outer_try_pops,
                     cleanup: cleanup.to_vec(),
                     earlier_cleanup: None,
+                    awaited_exit: None,
                     named_handler_cleanup: None,
                     constant_return_prefix: Some(exception_owners::ConstantManagerReturnPrefix {
                         authored_nop: authored,
@@ -13621,6 +13665,7 @@ impl Assembler {
                 ordinary_try_pops: usize::from(!retained_inner_try),
                 cleanup: cleanup.to_vec(),
                 earlier_cleanup: None,
+                awaited_exit: None,
                 named_handler_cleanup: None,
                 constant_return_prefix: Some(exception_owners::ConstantManagerReturnPrefix {
                     authored_nop: authored,

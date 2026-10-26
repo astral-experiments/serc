@@ -931,6 +931,11 @@ impl ExceptionOwnerProvenance {
                     visit(instruction);
                 }
             }
+            if let Some((_, records)) = &mut origin.awaited_exit {
+                for record in records {
+                    visit(record);
+                }
+            }
             if let Some(prefix) = origin.named_handler_cleanup.as_mut() {
                 for instruction in prefix.iter_mut() {
                     visit(instruction);
@@ -1210,6 +1215,8 @@ pub(super) struct CopiedManagerReturnCompaction {
     pub(super) retained_outer_handler: Option<Label>,
     pub(super) cleanup: Vec<Instruction>,
     pub(super) earlier_cleanup: Option<[Instruction; 7]>,
+    /// The completion of an inner async exit before two synchronous manager cleanups.
+    pub(super) awaited_exit: Option<(Label, [Instruction; 2])>,
     /// `SWAP`, `POP_EXCEPT`, and name clearing after two omitted named-handler POPs.
     pub(super) named_handler_cleanup: Option<[Instruction; 5]>,
     pub(super) constant_return_prefix: Option<ConstantManagerReturnPrefix>,
@@ -12710,6 +12717,18 @@ impl LayoutAssembler {
                 {
                     return None;
                 }
+                if let Some((entry, records)) = &origin.awaited_exit
+                    && !(positions.get(entry) == Some(&array_start)
+                        && origin.earlier_cleanup.as_ref().is_some_and(|early| {
+                            array_start + records.len() + early.len() == start
+                        })
+                        && instructions[array_start..array_start + records.len()]
+                            .iter()
+                            .zip(records)
+                            .all(|(actual, original)| **actual == *original))
+                {
+                    return None;
+                }
                 let mut expected_load = origin.load;
                 expected_load
                     .local_policy
@@ -12926,6 +12945,8 @@ impl LayoutAssembler {
                 .checked_add(prefix_tail.early_removals)?
                 // A preceding captured manager contributes its own omitted POP.
                 .checked_add(usize::from(origin.earlier_cleanup.is_some()))?
+                // The try inside the managers is unwound just after the async exit.
+                .checked_add(usize::from(origin.awaited_exit.is_some()))?
                 // Named-handler cleanup omits one POP before SWAP and another
                 // before POP_EXCEPT. Both precede the captured manager records.
                 .checked_add(2 * usize::from(origin.named_handler_cleanup.is_some()))?
@@ -13927,6 +13948,7 @@ mod tests {
                         retained_outer_handler: None,
                         cleanup: cleanup.to_vec(),
                         earlier_cleanup: None,
+                        awaited_exit: None,
                         named_handler_cleanup: None,
                         constant_return_prefix: None,
                         to_bool: None,
