@@ -17856,7 +17856,11 @@ impl<'source> Compiler<'source> {
             && body[end + 1..]
                 .iter()
                 .any(|statement| self.context.is_elided_statement(statement))
-            && matches!(&body[end], Stmt::If(statement)
+            && (matches!(&body[end], Stmt::While(statement)
+                if statement.orelse.is_empty()
+                    && condition_has_only_runtime_tests(&statement.test)
+                    && !suite_contains_loop_break(&statement.body))
+                || matches!(&body[end], Stmt::If(statement)
             if (statement.elif_else_clauses.is_empty() || erased_final_else(statement)
                     || self.managed_completed_branch_tail(statement, restart, mode))
                 && condition_has_only_runtime_tests(&statement.test)
@@ -18034,11 +18038,10 @@ impl<'source> Compiler<'source> {
                                         })))
                             || (!statement.body.is_empty()
                                 && original_condition_has_unique_jump_target(&statement.test, true)
-                                && statement.body.iter().all(|statement| self.context.is_elided_statement(statement)))))))
+                                && statement.body.iter().all(|statement| self.context.is_elided_statement(statement))))))))
         {
-            // Native emits no instructions for the optimized suffix, leaving the
-            // conditional as the original loop-tail statement. A direct return or
-            // raise leaves only its false edge to supply the backedge's location.
+            // The optimized suffix emits no instructions, so the preceding
+            // statement still owns the original loop backedge.
             let tail = self.compile_loop_tail_suite_inner(
                 &body[..=end],
                 restart,
