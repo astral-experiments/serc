@@ -9264,6 +9264,7 @@ impl Compiler<'_> {
         jump_on: bool,
         body_target: Label,
         else_target: Label,
+        retain_else_line: bool,
     ) -> Result<(), CompileError> {
         let otherwise = self.assembler.label();
         let end = self.assembler.label();
@@ -9323,6 +9324,12 @@ impl Compiler<'_> {
                 else_target,
                 self.source_location(conditional.orelse.range()),
             );
+        }
+        if retain_else_line {
+            self.assembler
+                .set_location(self.source_location(conditional.orelse.range()));
+            self.emit(NOP, 0, 0)?;
+            self.assembler.preserve_last_nop();
         }
         self.assembler.preserve_block_boundary_if_new(end);
         self.assembler.mark(end);
@@ -9604,7 +9611,7 @@ impl Compiler<'_> {
             return Ok(());
         }
         if let Expr::If(conditional) = expression {
-            return self.compile_if_expression_jump(conditional, jump_on, label, label);
+            return self.compile_if_expression_jump(conditional, jump_on, label, label, false);
         }
         if let Expr::Compare(comparison) = expression
             && comparison.ops.len() > 1
