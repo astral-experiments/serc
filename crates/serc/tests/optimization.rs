@@ -5158,6 +5158,17 @@ fn copied_iterator_break_joins_guarded_handler_exits() {
 }
 
 #[test]
+fn manager_break_threads_the_guarded_finalizer_jump() {
+    let source = "def run(running, stop, cleanup, manager):\n    while running:\n        try:\n            with manager:\n                if stop:\n                    break\n        finally:\n            if cleanup:\n                try:\n                    work()\n                finally:\n                    finish()\n    observe()\n";
+    assert_matches_cpython_versions(
+        source,
+        "guarded_finalizer_break.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn recovery_finalizer_preserves_local_return_borrow_boundary() {
     let source = r"def sample(items, work, recover, cleanup, valid):
     for item in items:

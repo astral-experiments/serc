@@ -7092,10 +7092,15 @@ impl<'source> Compiler<'source> {
                             .at_original_shared_copied_finally_break_join();
                     let break_jump =
                         self.emit_jump_forward_instruction(JUMP_FORWARD, context.break_label)?;
-                    // The authored break NOP precedes unwinding. A legacy finalizer's
-                    // new join starts after that marker and can be threaded directly.
-                    if self.context.python_version >= crate::PythonVersion::Py314
-                        || has_no_emitted_cleanup
+                    // A manager unwind followed by a shared copied-finally join
+                    // puts the break in its own block. Incoming finalizer jumps
+                    // thread through it with their own source positions.
+                    let managed_finally_join = original_shared_break_join
+                        && has_copied_finalizer
+                        && !with_unwind_starts.is_empty();
+                    if (self.context.python_version >= crate::PythonVersion::Py314
+                        || has_no_emitted_cleanup)
+                        && !managed_finally_join
                     {
                         self.assembler.prevent_jump_threading_target(break_jump);
                     }
