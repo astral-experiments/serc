@@ -2060,13 +2060,16 @@ impl OptimizationPipeline {
                     && (wrapper.is_none()
                         || has_only_scope_owner()
                         || forward_join_keeps_owners()))
+                    || (instruction.opcode == RERAISE
+                        && instruction.operand() == Operand::Value(0))
                     || (instruction.opcode == RETURN_CONST
                         && original_scope_exit
                         && (wrapper.is_none() || has_only_scope_owner())))
                 && instruction.location == SourceLocation::NONE
             {
                 let mut expected = *instruction;
-                let counts = if matches!(instruction.opcode, JUMP_FORWARD | RETURN_CONST) {
+                let counts = if matches!(instruction.opcode, JUMP_FORWARD | RERAISE | RETURN_CONST)
+                {
                     if instruction.opcode == JUMP_FORWARD
                         && let Operand::Forward(target) = instruction.operand()
                         && label_group(target) == Some(index + 1)
