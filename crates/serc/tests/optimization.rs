@@ -15,6 +15,32 @@ use serc::{
 };
 
 #[test]
+fn iterators_keep_an_unlocated_join_after_a_named_finalizer_handler() {
+    let source = r"def sample(items, value):
+    try:
+        with manager():
+            for outer in items:
+                for inner in outer:
+                    try:
+                        for part in inner:
+                            return value
+                    finally:
+                        try:
+                            clean()
+                        except ValueError as exc:
+                            recover(exc)
+    finally:
+        done()
+";
+    assert_matches_cpython_versions(
+        source,
+        "managed_iterator_recovery.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn nested_conversion_handlers_keep_shared_cleanup() {
     let source = r"def sample(items):
     for item in items:

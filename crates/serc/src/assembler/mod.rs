@@ -11496,6 +11496,18 @@ impl Assembler {
             .preserve_location();
     }
 
+    /// Keeps the line of each artificial iterator discard unresolved at a shared join.
+    pub(crate) fn preserve_iterator_cleanup_positions(&mut self, start: usize) {
+        for item in &mut self.linear_items_mut()[start..] {
+            if let Item::Instruction(instruction) = item
+                && matches!(instruction.opcode, crate::target::opcodes::SWAP | POP_TOP)
+                && instruction.location == SourceLocation::NONE
+            {
+                instruction.no_location_policy.preserve_location();
+            }
+        }
+    }
+
     /// Records a nested join until its original match-case successor is emitted.
     pub(crate) fn record_nested_if_unlocated_join(&mut self, emitted: EmittedJump) {
         let index = usize::try_from(emitted.instruction().item_index)
