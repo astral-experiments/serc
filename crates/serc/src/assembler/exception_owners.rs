@@ -7528,13 +7528,16 @@ impl LayoutAssembler {
                             // Compaction certifies a run only when every removed
                             // record was a POP_BLOCK on this linear fallthrough.
                             let hidden = nop.local_policy.hidden_exception_owner_slots();
-                            let pop_slots = if provenance.removed_pop_block_widths.iter().any(
-                                |(label, &width)| {
-                                    width == hidden
-                                        && usize::from(width) <= tail.early_removals
-                                        && label_positions.get(label) == Some(&setup_index)
-                                },
-                            ) {
+                            let pop_slots = if usize::from(hidden) <= tail.early_removals
+                                && provenance.removed_pop_block_boundaries.iter().any(|label| {
+                                    label_positions.get(label) == Some(&setup_index)
+                                        && provenance
+                                            .removed_pop_block_widths
+                                            .get(label)
+                                            .copied()
+                                            .unwrap_or(1)
+                                            == hidden
+                                }) {
                                 usize::from(hidden)
                             } else {
                                 0
