@@ -10442,6 +10442,78 @@ impl LayoutAssembler {
                                 ExceptionOwnerDecision::override_with_region(None),
                             );
                         }
+                        // Unwinding an unnamed handler compacts the authored return NOP
+                        // and its unowned handler POP into POP_EXCEPT. The later guard
+                        // appends at a different one of these records for each folded NULL.
+                        if instruction.exception_policy() == super::ExceptionPolicy::NonePresent
+                            && owner_history_exact
+                            && pop_slot_epoch_known
+                            && let Some((array, start, end, end_removed, 0, None, None, origin)) =
+                                copied_handler_prefix
+                            && array == original_array_start
+                            && start > array
+                            && end == start + 1
+                            && instruction_index == end + 2
+                            && origin.instructions[0].opcode == crate::target::opcodes::POP_EXCEPT
+                            && origin.removed_prefix_slots == 2
+                            && origin.return_nop.exception_policy()
+                                == super::ExceptionPolicy::NoneUnchanged
+                            && !origin.return_nop.fusion_policy.is_converted_pop_block()
+                            && let Some((pop_end, pop_tail, width @ (1 | 2))) = ended_pop_slot
+                            && pop_end == end
+                            && pop_tail.early_removals == end_removed
+                            && tail.insertions == 0
+                            && tail.late_removals == 0
+                            && tail.post_compaction_fusions == 0
+                            && tail.early_removals == end_removed + usize::from(width) + 3
+                            && matches!(
+                                indexed_instructions[end].opcode,
+                                crate::target::opcodes::LOAD_FAST
+                                    | crate::target::opcodes::LOAD_FAST_BORROW
+                            )
+                            && indexed_instructions[end]
+                                .local_policy
+                                .hidden_exception_owner_slots()
+                                == width
+                            && previous.is_some_and(|guard| {
+                                matches!(guard.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+                                    && guard.local_policy.hidden_exception_owner_slots() == 3
+                                    && guard.location == instruction.location
+                            })
+                            && let prefix = &indexed_instructions[array..start]
+                            && prefix.iter().all(|record| {
+                                record.local_policy.hidden_exception_owner_slots() == 0
+                                    && record.pre_fold_extra_instructions() == 0
+                            })
+                            && prefix
+                                .iter()
+                                .filter(|record| {
+                                    record.opcode == LOAD_GLOBAL
+                                        && record.value_argument().is_some_and(|arg| arg & 1 != 0)
+                                })
+                                .count()
+                                + 2
+                                == end_removed
+                        {
+                            let donor = match end_removed - 2 {
+                                0 | 2 => Some(None),
+                                1 => self
+                                    .uniform_exception_owner(start, end, &label_positions)
+                                    .map(Some),
+                                _ => self
+                                    .uniform_exception_owner(array, start, &label_positions)
+                                    .map(Some),
+                            };
+                            if let Some(region) = donor
+                                && region
+                                    .is_none_or(|r| !self.exception_regions[r].is_scope_fallback)
+                            {
+                                owners.insert(
+                                    instruction_index,
+                                    ExceptionOwnerDecision::override_with_region(region),
+                                );
+                            }
+                        }
                         // A complete captured unwind supplies its own original array proof;
                         // it does not revive the generic POP epoch after manager range aliases.
                         if instruction.exception_policy() == super::ExceptionPolicy::NonePresent
