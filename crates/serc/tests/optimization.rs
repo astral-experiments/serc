@@ -11225,6 +11225,27 @@ fn populated_nested_elif_preserves_outer_join() {
 }
 
 #[test]
+fn optimized_generator_fallback_keeps_its_line_before_a_keyword_call_and_raise() {
+    let source = r"def collect(items, flag):
+    try:
+        work()
+    except Error:
+        record(code=(
+            tuple(entry.name for entry in items)
+            if flag
+            else ()
+        ))
+        raise
+";
+    assert_matches_cpython_versions(
+        source,
+        "generator_keyword_reraise.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn discarded_generator_calls_rejoin_loop_backedges() {
     for source in [
         "def sample(items):\n    while items:\n        any(value for value in items)\n",

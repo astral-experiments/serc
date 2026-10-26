@@ -6517,13 +6517,30 @@ impl OptimizationPipeline {
                             || (!membership.contains(&source_position)
                                 && !membership.contains(&target_position))
                     });
+            // A keyword call followed by a bare raise is another short exit. On an
+            // original empty join the fallthrough can supply the optimized call's line.
+            let inline_keyword_reraise = inline_small_exit
+                && target_pre_fusion_size == 4
+                && graph[source]
+                    .last_instruction()
+                    .is_some_and(|jump| jump.jump_policy.is_original_empty_join())
+                && graph[target]
+                    .last_instruction()
+                    .is_some_and(|raise| raise.value_argument() == Some(0))
+                && graph[target]
+                    .items()
+                    .iter()
+                    .filter_map(Item::as_instruction)
+                    .map(|instruction| instruction.opcode)
+                    .eq([LOAD_CONST, CALL_KW, POP_TOP, RAISE_VARARGS]);
             // Keep an isolated unlocated join's replaced-jump NOP until its
             // remaining fallthrough predecessor supplies a location. Earlier jump
             // threading may already have removed its other incoming edges.
             // Exception bookkeeping can split a block without creating an original
             // CFG boundary, so only retain markers on recorded original blocks.
             let preserve_unlocated_join_nop = (inline_unprotected_return
-                || inline_unprotected_keyword_raise)
+                || inline_unprotected_keyword_raise
+                || inline_keyword_reraise)
                 && target_chain_end == target_position
                 && source_location.line < 0
                 && graph[source].items().iter().any(|item| {
@@ -6549,7 +6566,8 @@ impl OptimizationPipeline {
                         let target_owned = membership.contains(&target_position);
                         // The scope fallback does not split this original empty join.
                         // Its replaced jump keeps the same owner as the copied return.
-                        if self.exception_regions[index].is_scope_fallback {
+                        if inline_keyword_reraise || self.exception_regions[index].is_scope_fallback
+                        {
                             source_owned == target_owned
                         } else {
                             !source_owned && !target_owned
