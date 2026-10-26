@@ -9088,6 +9088,34 @@ fn completed_manager_work_preserves_retained_loop_owners() {
 }
 
 #[test]
+fn erased_conditional_fallthroughs_preserve_redundant_jump_predecessors() {
+    for scope in ["with manager:", "async with manager:", "try:"] {
+        let cleanup = if scope == "try:" {
+            "    finally:\n        finish()\n"
+        } else {
+            ""
+        };
+        let source = format!(
+            "async def run(first, second, item, manager):
+    {scope}
+        if first:
+            assert item
+        if second:
+            assert item
+        else:
+            assert first
+{cleanup}"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "redundant_conditional_jump.py",
+            &LEVELS,
+            &[PythonVersion::Py312],
+        );
+    }
+}
+
+#[test]
 fn repeated_finalizer_predecessor_keeps_the_manager_pop_unlocated() {
     let source = r"def run(manager, ready):
     with manager:
