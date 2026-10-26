@@ -17401,6 +17401,21 @@ assert events == ['caught'], events
 }
 
 #[test]
+fn nested_else_assertion_exit_inherits_its_success_operand() {
+    for condition in ["left and right", "left is None and right > 3"] {
+        let source = format!(
+            "def run(first, second, left, right):\n    if first:\n        pass\n    elif second:\n        if left:\n            observe(left)\n        elif right:\n            pass\n        else:\n            assert {condition}\n    else:\n        assert first\n    finish()\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "nested_assertion_exit.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn nested_pass_exit_successors_match_cpython() {
     for successor in ["out = 1", "del item", "if flag:\n            assert flag"] {
         let source = format!(

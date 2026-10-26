@@ -17491,14 +17491,16 @@ impl<'source> Compiler<'source> {
                 && let Some((clause, earlier)) = statement.elif_else_clauses.split_last()
                 && clause.test.is_none()
                 && (earlier.is_empty()
-                    || (suite_terminates_before_constant_folding(&statement.body)
-                        && earlier.iter().all(|clause| {
-                            clause
-                                .test
-                                .as_ref()
-                                .is_some_and(condition_has_only_runtime_tests)
-                                && suite_terminates_before_constant_folding(&clause.body)
-                        })))
+                    || (earlier.iter().all(|clause| {
+                        clause
+                            .test
+                            .as_ref()
+                            .is_some_and(condition_has_only_runtime_tests)
+                    }) && (suite_assert_success_fallthrough_range(&clause.body).is_some()
+                        || (suite_terminates_before_constant_folding(&statement.body)
+                            && earlier.iter().all(|clause| {
+                                suite_terminates_before_constant_folding(&clause.body)
+                            })))))
             {
                 final_else_body = &clause.body;
                 descended_else = true;
