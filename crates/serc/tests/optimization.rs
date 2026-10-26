@@ -9073,6 +9073,24 @@ fn completed_manager_work_preserves_retained_loop_owners() {
 }
 
 #[test]
+fn copied_finalizer_test_can_reuse_the_unowned_setup_slot() {
+    for calls in 0..=2 {
+        for handler in ["finally:", "except KeyError:"] {
+            let prefix = "        consume(value)\n".repeat(calls);
+            let source = format!(
+                "async def process(flag, value):\n    try:\n        await fetch()\n{prefix}        return value\n    except ValueError as error:\n        pass\n    finally:\n        try:\n            if flag:\n                pass\n        {handler}\n            pass\n"
+            );
+            assert_matches_cpython_versions(
+                &source,
+                "nested_finalizer_setup.py",
+                &LEVELS,
+                &[PythonVersion::Py314],
+            );
+        }
+    }
+}
+
+#[test]
 fn protected_conditional_store_preserves_erased_else_backedge() {
     let protected = r"def collect(batches, left, right, cleanup, sink):
     try:
