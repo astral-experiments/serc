@@ -40551,10 +40551,15 @@ impl<'source> Compiler<'source> {
             _ => body_noop,
         };
         let body_noop = body_noop.or_else(|| {
+            let tail = body.last()?;
+            let Stmt::If(branch) = tail else {
+                return None;
+            };
             if self.context.python_version < crate::PythonVersion::Py314
                 || !remaining.is_empty()
-                || !matches!(body.last(), Some(Stmt::If(branch))
-                    if branch.elif_else_clauses.last().is_some_and(|clause| clause.test.is_none()))
+                || branch.elif_else_clauses.last().is_none_or(|clause| clause.test.is_some())
+                // A suspension can resume in another block before reaching the jump.
+                || suite_contains_suspending_expression(std::slice::from_ref(tail))
             {
                 return None;
             }
