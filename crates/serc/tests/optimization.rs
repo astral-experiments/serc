@@ -1759,6 +1759,9 @@ fn nested_finalizer_call_keeps_original_reraise_copy_width() {
     for argument in [
         "left if flag else right",
         "{0: left if flag else right}",
+        "{**(left if flag else right)}",
+        "[*(left if flag else right)]",
+        "{*(left if flag else right)}",
         "[left if flag else right], flag",
     ] {
         let source = format!(
