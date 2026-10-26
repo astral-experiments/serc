@@ -13391,6 +13391,18 @@ fn while_else_keeps_finally_borrowing_after_elided_assertions() {
 }
 
 #[test]
+fn multiline_conditional_assertion_copies_chained_failures() {
+    let source = "def check(a, b, c, reverse, message):
+    assert (
+        (a < b < c)
+        if reverse
+        else (c < b < a)
+    ), message
+";
+    assert_matches_cpython(source, "conditional_chained_assertion.py", &LEVELS);
+}
+
+#[test]
 fn terminal_chained_comparisons_preserve_empty_branch_exits() {
     for (index, body) in [
         "assert value",

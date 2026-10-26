@@ -9277,13 +9277,34 @@ impl Compiler<'_> {
                 otherwise,
             );
         }
+        // Each chained arm has its own false cleanup before the shared assertion exit.
+        let chained_assertion = self.context.python_version >= PythonVersion::Py314
+            && self.control.conditions.retained_multiline_assert_ifexp_exit
+                == Some(conditional.range)
+            && [conditional.body.as_ref(), conditional.orelse.as_ref()]
+                .into_iter()
+                .all(|arm| matches!(arm, Expr::Compare(comparison) if comparison.ops.len() > 1));
+        let compile_arm = |compiler: &mut Self, arm: &Expr, target| {
+            if chained_assertion {
+                compiler.with_control_override(
+                    |control| &mut control.conditions.retained_chained_comparison_exit,
+                    Some(arm.range()),
+                    |compiler| compiler.compile_if_expression_arm_jump(arm, jump_on, target),
+                )
+            } else {
+                compiler.compile_if_expression_arm_jump(arm, jump_on, target)
+            }
+        };
         self.compile_jump_if(&conditional.test, false, otherwise)?;
         self.assembler.record_short_circuit_owner_continuation();
-        self.compile_if_expression_arm_jump(&conditional.body, jump_on, body_target)?;
+        compile_arm(self, &conditional.body, body_target)?;
         self.assembler.set_location(SourceLocation::NONE);
         let body_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, end)?;
         if self.control.conditions.retained_multiline_assert_ifexp_exit == Some(conditional.range) {
             self.assembler.preserve_inlined_jump_nop(body_exit);
+            if chained_assertion {
+                self.assembler.allow_last_unconditional_block_inlining();
+            }
         } else {
             // CPython copies the original unlocated join before small branch tails.
             self.assembler.preserve_direct_inlined_jump_nop(body_exit);
@@ -9304,16 +9325,10 @@ impl Compiler<'_> {
                         .terminal_try_condition_exception_exclusion_depth
                 },
                 None,
-                |compiler| {
-                    compiler.compile_if_expression_arm_jump(
-                        &conditional.orelse,
-                        jump_on,
-                        else_target,
-                    )
-                },
+                |compiler| compile_arm(compiler, &conditional.orelse, else_target),
             )?;
         } else {
-            self.compile_if_expression_arm_jump(&conditional.orelse, jump_on, else_target)?;
+            compile_arm(self, &conditional.orelse, else_target)?;
         }
         if body_target == else_target
             && jump_constant_truthiness(&conditional.orelse) == Some(jump_on)

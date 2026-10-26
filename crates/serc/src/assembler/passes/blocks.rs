@@ -11,10 +11,11 @@ use crate::assembler::block_graph::{BasicBlockId, BlockGraph, ItemPosition};
 use crate::assembler::exception_owners::ExceptionOwnerProvenance;
 use crate::target::opcodes::{
     BUILD_TUPLE, CALL, CALL_KW, DELETE_FAST, END_ASYNC_FOR, END_SEND, FOR_ITER, LOAD_ATTR,
-    LOAD_CONST, LOAD_DEREF, LOAD_FAST, LOAD_GLOBAL, LOAD_SMALL_INT, NOP, NOT_TAKEN, POP_EXCEPT,
-    POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE, POP_JUMP_IF_TRUE, POP_TOP,
-    RAISE_VARARGS, RERAISE, RETURN_VALUE, STORE_ATTR, STORE_FAST, SWAP,
+    LOAD_COMMON_CONSTANT, LOAD_CONST, LOAD_DEREF, LOAD_FAST, LOAD_GLOBAL, LOAD_SMALL_INT, NOP,
+    NOT_TAKEN, POP_EXCEPT, POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE,
+    POP_JUMP_IF_TRUE, POP_TOP, RAISE_VARARGS, RERAISE, RETURN_VALUE, STORE_ATTR, STORE_FAST, SWAP,
 };
+use crate::target::operands::CommonConstant;
 use crate::target::{is_conditional_jump, is_unconditional_jump};
 
 #[cfg(test)]
@@ -6277,6 +6278,36 @@ impl OptimizationPipeline {
                         Item::Instruction(_) | Item::Label(_) => None,
                     })
                     .unwrap_or(SourceLocation::NONE)
+            };
+            let source_location = if source_location == SourceLocation::NONE
+                && inline_small_exit
+                && target_pre_fusion_size == 4
+                && target_terminal_opcode == Some(RAISE_VARARGS)
+                && graph[target]
+                    .items()
+                    .iter()
+                    .find_map(Item::as_instruction)
+                    .is_some_and(|load| {
+                        load.opcode == LOAD_COMMON_CONSTANT
+                            && load.value_argument()
+                                == Some(CommonConstant::ASSERTIONERROR.argument())
+                    })
+                && remaining_predecessors[source.index()] == 1
+                && graph[source].last_instruction().is_some_and(|jump| {
+                    jump.jump_policy.always_retains_nop()
+                        && jump.only_allows_unconditional_inlining()
+                })
+                && let Some(previous) = source_position.checked_sub(1).map(|index| order[index])
+                && block_has_fallthrough(graph[previous].items())
+                && let Some(pop) = graph[previous]
+                    .last_instruction()
+                    .filter(|op| op.opcode == POP_TOP)
+            {
+                // The comparison's other false edge copied the empty join. Its
+                // surviving fallthrough supplies the line of the replaced jump.
+                pop.location
+            } else {
+                source_location
             };
             // Earlier unconditional predecessors have copied the exit. A remaining
             // guard supplies the original empty match join's retained jump span.
