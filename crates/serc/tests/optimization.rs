@@ -5605,6 +5605,32 @@ fn erased_nested_else_preserves_coroutine_loop_exits() {
 }
 
 #[test]
+fn nested_match_case_guard_keeps_each_exit_position() {
+    let source = r"async def run(outer, inner, first, second, visit):
+    try:
+        match outer:
+            case 0:
+                match inner:
+                    case 1:
+                        if first or second:
+                            visit()
+                    case 2:
+                        visit()
+            case 3:
+                visit()
+    except ValueError:
+        visit()
+    visit()
+";
+    assert_matches_cpython_versions(
+        source,
+        "nested_match_case_guard.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn erased_final_else_suffix_preserves_coroutine_loop_exits() {
     let source = r"async def sample(items, selected, prepare, work, verify):
     for item in items:
