@@ -3211,7 +3211,8 @@ impl<'source> Compiler<'source> {
                     Some(Stmt::Return(statement))
                         if matches!(
                             statement.value.as_deref(),
-                            Some(value @ Expr::Tuple(tuple)) if self.context.fold_constant(value).is_some()
+                            Some(value @ Expr::Tuple(tuple)) if !tuple.elts.is_empty()
+                                && self.context.fold_constant(value).is_some()
                                 && !(tuple.elts.len() == 2
                                     && tuple.elts.iter().all(is_literal_constant))
                         )

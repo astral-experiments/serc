@@ -1426,6 +1426,12 @@ fn conditional_deletion_keeps_cleanup_reachable() {
 }
 
 #[test]
+fn iterator_break_copies_empty_tuple_return() {
+    let source = "def lookup(items):\n    for item in items:\n        if item:\n            break\n    return ()\n";
+    assert_matches_cpython(source, "break_empty_tuple.py", &LEVELS);
+}
+
+#[test]
 fn async_iterator_recovery_keeps_cleanup_cold() {
     let source = "async def sample(owner, stream, payload, kind, close):\n    try:\n        async for event in stream:\n            if not isinstance(payload, dict):\n                continue\n            if kind in {'finished', 'failed', 'incomplete'}:\n                break\n    except Exception as error:\n        result = {'type': type(error).__name__, 'message': str(error), 'identifier': getattr(error, 'identifier', None)}\n    finally:\n        if callable(close):\n            maybe = close()\n            if maybe is not None:\n                await maybe\n";
     for source in [
