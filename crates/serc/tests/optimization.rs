@@ -15409,6 +15409,39 @@ fn protected_elided_assertion_preserves_terminal_control_flow() {
 }
 
 #[test]
+fn manager_exits_keep_the_normal_try_jumps_break_line() {
+    let source = r"def consume(manager):
+    with manager:
+        try:
+            while True:
+                try:
+                    read()
+                    break
+                except LookupError:
+                    continue
+        except OSError:
+            raise
+
+def finish(manager):
+    try:
+        with manager:
+            try:
+                while True:
+                    break
+            except ValueError as error:
+                raise
+    finally:
+        close()
+";
+    assert_matches_cpython_versions(
+        source,
+        "manager_break_exit.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn folded_protected_branch_before_elided_assertion_keeps_exit_location() {
     let versions = VERSIONS.map(|(version, _, _)| version);
     for (index, source) in [

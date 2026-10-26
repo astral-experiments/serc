@@ -4173,10 +4173,9 @@ impl Assembler {
 
     /// Keeps a manager's original `POP_BLOCK` unlocated after a folded loop exit.
     ///
-    /// Before constant folding, an ordinary try's unlocated two-slot exit is copied
-    /// onto its break predecessor. The folded conditional still enters the original
-    /// exit, so the following manager cleanup has no sole location donor. Certify that
-    /// original graph while its labels and emitted instruction slots are still intact.
+    /// Both a break and the loop's original false edge can reach the normal try exit
+    /// before folding. The jump surviving at the break's line keeps its handler.
+    /// The following manager POP has no sole location donor.
     pub(crate) fn preserve_with_pop_after_folded_try_bridge(&mut self, instruction_offset: usize) {
         let items = self.linear_items();
         let mut instructions = Vec::new();
@@ -4271,6 +4270,10 @@ impl Assembler {
         let mut conditional_break_policy = ir::JumpPolicy::default();
         conditional_break_policy.prevent_threading_target();
         conditional_break_policy.retain_nop_for_direct_target();
+        let mut first_break_policy = conditional_break_policy;
+        first_break_policy.retain_nop();
+        let mut uncopied_bridge_policy = ir::JumpPolicy::default();
+        uncopied_bridge_policy.prevent_small_exit_inlining();
         let mut certified = false;
         for &(entry, target) in &self.exception_owner_provenance.normal_try_exits {
             let Some(&bridge_index) = entries.get(&entry) else {
@@ -4304,14 +4307,14 @@ impl Assembler {
                 || bridge.operand() != Operand::Forward(target)
                 || bridge.pre_fold_extra_instructions() != 0
                 || bridge.local_policy.hidden_exception_owner_slots() != 0
-                || !ordinary_jump_policy(&bridge)
+                || !(ordinary_jump_policy(&bridge) || bridge.jump_policy == uncopied_bridge_policy)
                 || bridge.no_location_policy.preserves_location()
                 || !(is_unconditional_jump(previous.opcode) || ends_scope(previous.opcode))
             {
                 continue;
             }
             let mut has_break = false;
-            let mut all_predecessors_copyable = true;
+            let mut only_breaks = true;
             for (index, (_, instruction)) in instructions.iter().enumerate() {
                 let (Operand::Forward(label) | Operand::Backward(label)) = instruction.operand()
                 else {
@@ -4320,26 +4323,28 @@ impl Assembler {
                 if entries.get(&label) != Some(&bridge_index) {
                     continue;
                 }
-                // A next-instruction edge can disappear before the original copy round.
-                // Admit only the ordinary forward break edges whose complete bridge is copied.
+                // An adjacent break may keep its own line and an extra original
+                // instruction slot. It still reaches the same normal try exit.
+                let adjacent = index + 1 == bridge_index;
                 if !is_unconditional_jump(instruction.opcode)
                     || instruction.forward_target().is_none()
                     || !instruction.fusion_policy.is_authored_break()
                     // Ordinary conditional breaks preserve their source jump's NOP and
                     // reject incoming threading. Neither flag prevents copying their target.
                     || !(ordinary_jump_policy(instruction)
-                        || instruction.jump_policy == conditional_break_policy)
+                        || instruction.jump_policy == conditional_break_policy
+                        || (adjacent && instruction.jump_policy == first_break_policy))
                     || instruction.location.line < 0
-                    || instruction.pre_fold_extra_instructions() != 0
+                    || instruction.pre_fold_extra_instructions() > u8::from(adjacent)
                     || instruction.local_policy.hidden_exception_owner_slots() != 0
-                    || index + 1 >= bridge_index
+                    || index >= bridge_index
                 {
-                    all_predecessors_copyable = false;
+                    only_breaks = false;
                     break;
                 }
                 has_break = true;
             }
-            if has_break && all_predecessors_copyable {
+            if has_break && only_breaks {
                 certified = true;
                 break;
             }
