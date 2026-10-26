@@ -15,6 +15,26 @@ use serc::{
 };
 
 #[test]
+fn outer_finalizer_keeps_the_managed_return_value_join() {
+    let source = r"async def finish(manager, ready):
+    try:
+        async with manager:
+            try:
+                return ready and check()
+            except ValueError:
+                pass
+    finally:
+        close()
+";
+    assert_matches_cpython_versions(
+        source,
+        "managed_value_join.py",
+        &LEVELS,
+        &[PythonVersion::Py312],
+    );
+}
+
+#[test]
 fn nested_conversion_handlers_keep_shared_cleanup() {
     let source = r"def sample(items):
     for item in items:

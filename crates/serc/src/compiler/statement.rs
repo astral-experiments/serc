@@ -8065,25 +8065,27 @@ impl<'source> Compiler<'source> {
                         self.assembler.set_location(location);
                         self.emit(NOP, 0, 0)?;
                     }
+                    let finally = &self.control.finally;
                     if self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
                         && !return_is_overridden
                         && self.control.exceptions.active_exception_handlers.is_empty()
                         && self.control.exceptions.active_exception_group_handlers == 0
-                        && self
-                            .control
-                            .finally
-                            .active_return_finally_contexts
-                            .is_empty()
-                        && self
-                            .control
-                            .finally
-                            .active_pass_finally_locations
-                            .is_empty()
-                        && self.control.finally.active_finally_try_bodies == 0
-                        && self.control.finally.active_finally_end_blocks == 0
-                        && self.control.finally.active_normal_finally_bodies == 0
-                        && self.control.finally.active_copied_finally_bodies == 0
                         && let Some(context) = self.control.withs.active_with_exits.last()
+                        && ((finally.active_return_finally_contexts.is_empty()
+                            && finally.active_pass_finally_locations.is_empty()
+                            && finally.active_finally_try_bodies == 0)
+                            // A computed value can join inside an ordinary try even
+                            // when a finalizer outside the manager is still pending.
+                            || (self.context.python_version == crate::PythonVersion::Py312
+                                && finally.active_finally_try_bodies
+                                    == finally.active_return_finally_contexts.len()
+                                && finally.active_return_finally_contexts.last()
+                                    .is_some_and(|finally| finally.with_depth < self.control.withs.active_with_exits.len()
+                                        && finally.exception_region_depth < context.exception_region_depth)
+                                && self.assembler.at_jump_target()))
+                        && finally.active_finally_end_blocks == 0
+                        && finally.active_normal_finally_bodies == 0
+                        && finally.active_copied_finally_bodies == 0
                         && context.exception_region_depth
                             < self
                                 .control
