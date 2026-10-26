@@ -1755,6 +1755,29 @@ fn asserted_async_iterator_break_keeps_cleanup_cold() {
 }
 
 #[test]
+fn nested_recovery_handlers_copy_outer_constant_return_cleanup() {
+    let source = r"async def close(manager, ready):
+    if ready:
+        try:
+            async with manager:
+                work()
+        except LookupError:
+            if ready:
+                try:
+                    recover()
+                except ValueError as error:
+                    record(error)
+        return
+";
+    assert_matches_cpython_versions(
+        source,
+        "handler_constant_return.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn nested_reraise_cleanup_keeps_awaited_store_reachable() {
     let source = "async def sample():\n    try:\n        if native:\n            await session.close()\n        else:\n            await session.detach()\n    except CancelledError as error:\n        raise\n    except OwnershipError as error:\n        recovered = error\n    finally:\n        try:\n            if not native:\n                if session.reusable:\n                    await pool.release(lease)\n                else:\n                    retired = await replace(pool, name=lease.name, expected=lease.backend, lease=lease)\n                    if retired and isinstance(pool, Pool):\n                        disposition = 'retired'\n        except BaseException as failure:\n            raise\n";
     assert_matches_cpython(source, "nested_reraise_cleanup.py", &LEVELS);
