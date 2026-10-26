@@ -16715,11 +16715,31 @@ impl<'source> Compiler<'source> {
                             .active_exception_region_exclusions
                             .is_empty()
                         && self.control.finally.is_inactive_for_return_unwind()
-                        && matches!(effective_nested_else_body.last(),Some(Stmt::If(tail))
-                            if original_condition_has_unique_jump_target(&tail.test, false)
-                                && (erased_else || (effective_nested_else_body.len() < body.len()
+                        && effective_nested_else_body.last().is_some_and(|last| {
+                            let Stmt::If(tail) = last else {
+                                return false;
+                            };
+                            if !original_condition_has_unique_jump_target(&tail.test, false) {
+                                return false;
+                            }
+                            let direct_donor = match tail.elif_else_clauses.as_slice() {
+                                [] => tail
+                                    .body
+                                    .iter()
+                                    .rfind(|part| !self.context.is_elided_statement(part))
+                                    .is_some_and(|part| !matches!(part, Stmt::If(_))),
+                                [clause] => {
+                                    clause.test.is_none()
+                                        && is_elided_suite(&tail.body)
+                                        && is_elided_suite(&clause.body)
+                                }
+                                _ => false,
+                            };
+                            (erased_else && direct_donor)
+                                || (effective_nested_else_body.len() < body.len()
                                     && tail.elif_else_clauses.is_empty()
-                                    && suite_terminates_before_constant_folding(&tail.body))));
+                                    && suite_terminates_before_constant_folding(&tail.body))
+                        });
                     if coroutine_guard_donor
                         || erased_join_has_donor
                         || optimized_empty_both

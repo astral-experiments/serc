@@ -31,6 +31,22 @@ fn coroutine_nested_guard_donates_its_line_after_assertion_removal() {
         &LEVELS,
         &[PythonVersion::Py314, PythonVersion::Py315],
     );
+    let source = r"async def sample(first, second):
+    if first:
+        assert check()
+        if second:
+            assert check()
+        assert check()
+    else:
+        assert check()
+    finish()
+";
+    assert_matches_cpython_versions(
+        source,
+        "erased_inner_guard.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
 }
 
 #[test]
