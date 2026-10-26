@@ -9073,6 +9073,21 @@ fn completed_manager_work_preserves_retained_loop_owners() {
 }
 
 #[test]
+fn protected_conditional_reaches_each_coroutine_return_after_assertion_removal() {
+    let source = "async def select(left, right, ready):\n    try:\n        if left and right:\n            ...\n        assert ready\n    except ValueError:\n        pass\n";
+    assert_matches_cpython_versions(
+        source,
+        "protected_coroutine_test.py",
+        &LEVELS,
+        &[
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ],
+    );
+}
+
+#[test]
 fn protected_conditional_store_preserves_erased_else_backedge() {
     let protected = r"def collect(batches, left, right, cleanup, sink):
     try:

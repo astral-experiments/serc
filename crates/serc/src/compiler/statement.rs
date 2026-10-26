@@ -1859,9 +1859,9 @@ impl<'source> Compiler<'source> {
     }
 
     fn supports_protected_terminal_if(&self) -> bool {
-        self.context.python_version >= crate::PythonVersion::Py314
+        self.context.python_version >= crate::PythonVersion::Py313
             && matches!(self.unit.scope, Scope::Function { .. })
-            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
             && self.control.loops.contexts.is_empty()
             && self.control.withs.active_with_region_exclusions.is_empty()
             && self
