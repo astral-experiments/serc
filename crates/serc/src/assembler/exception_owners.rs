@@ -3386,6 +3386,23 @@ impl ExceptionOwnerProvenance {
                         return false;
                     }
                 }
+                crate::target::opcodes::STORE_SUBSCR if comprehension_restore_count > 0 => {
+                    // Assigning the restored collection to a local container's
+                    // constant key consumes three values without compacting the instruction array.
+                    let [.., owner, key] = &instructions[..index] else {
+                        return false;
+                    };
+                    if index <= comprehension_restore_count + 2
+                        || owner.opcode != LOAD_FAST
+                        || key.opcode != LOAD_CONST
+                        || instruction.depth_after().is_none()
+                        || key.depth_after().and_then(|depth| depth.checked_sub(3))
+                            != instruction.depth_after()
+                    {
+                        return false;
+                    }
+                    expanded_collection = true;
+                }
                 TO_BOOL => {
                     // The one conversion is emitted for a nonconstant terminal
                     // condition. Pseudo short-circuit COPY lowering is excluded.
@@ -3395,7 +3412,13 @@ impl ExceptionOwnerProvenance {
                             .is_none_or(|previous| {
                                 !matches!(
                                     previous.opcode,
-                                    LOAD_FAST | LOAD_DEREF | LOAD_NAME | LOAD_ATTR | CALL
+                                    LOAD_FAST
+                                        | LOAD_DEREF
+                                        | LOAD_NAME
+                                        | LOAD_ATTR
+                                        | CALL
+                                        | CALL_KW
+                                        | BINARY_OP
                                 )
                             })
                     {

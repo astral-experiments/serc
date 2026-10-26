@@ -10167,6 +10167,37 @@ fn elided_assertion_preserves_conditional_manager_store_location() {
 }
 
 #[test]
+fn comprehension_results_keep_guard_slots_after_calls_and_subscripts() {
+    for source in [
+        r"def sample(values, receiver):
+    with scope():
+        result = consume([item for item in values])
+        try:
+            assert receiver.check(ready=True)
+            finish()
+        finally:
+            done()
+",
+        r"def sample(values, data):
+    with scope():
+        data['values'] = [item for item in values]
+        try:
+            if not data['status']:
+                finish()
+        finally:
+            done()
+",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "comprehension_continuation_guards.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn comprehension_assignment_prefix_preserves_finalizer_manager_exit() {
     for suffix in ["assert valid(values)", "pass", "check(values)"] {
         let source = format!(
