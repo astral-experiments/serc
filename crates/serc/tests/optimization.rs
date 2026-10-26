@@ -8296,6 +8296,41 @@ fn handler_break_releases_iterator_exception_owner() {
 }
 
 #[test]
+fn breaks_keep_their_line_before_a_shared_return() {
+    for source in [
+        r"def choose(flag, value):
+    if flag:
+        while ready():
+            use(value)
+            break
+    else:
+        finish()
+    return value
+",
+        r"async def choose(result):
+    if active:
+        while running:
+            if stop:
+                break
+            step()
+    else:
+        try:
+            await idle()
+        except Error:
+            idle()
+    return result
+",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "break_before_shared_return.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn copied_finally_compound_break_threads_both_conditions() {
     let source = r#"async def copied_break(self, key):
     while not self.finished():
