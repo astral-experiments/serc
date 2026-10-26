@@ -1414,6 +1414,12 @@ fn recovery_loop_comprehension_keeps_continuation_cold() {
 }
 
 #[test]
+fn iterator_break_copies_local_return_through_deletion() {
+    let source = "def sample(items, result, temporary):\n    try:\n        for item in items:\n            if item:\n                break\n        return result\n    finally:\n        del temporary\n";
+    assert_matches_cpython(source, "break_finally_delete.py", &LEVELS);
+}
+
+#[test]
 fn conditional_deletion_keeps_cleanup_reachable() {
     for scope in ["def", "async def"] {
         for target in ["pending[item]", "owner.slot", "started"] {
