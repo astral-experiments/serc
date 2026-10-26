@@ -1115,6 +1115,29 @@ pub(super) struct CopiedReturnNonePrefix {
     pub(super) condition: Instruction,
 }
 
+impl CopiedReturnNonePrefix {
+    /// Matches the live POP, load and conditional after same-line return NOPs were compacted.
+    fn matches_retained_guard(
+        &self,
+        pop: &Instruction,
+        load: &Instruction,
+        condition: &Instruction,
+    ) -> bool {
+        let mut expected_pop = self.pops[1];
+        expected_pop
+            .local_policy
+            .add_hidden_exception_owner_slots(if self.additional_pop.is_some() { 3 } else { 2 });
+        let mut expected_load = self.load;
+        if load.opcode == crate::target::opcodes::LOAD_FAST_BORROW {
+            expected_load.opcode = load.opcode;
+        }
+        self.return_nop.is_some()
+            && *pop == expected_pop
+            && *load == expected_load
+            && *condition == self.condition
+    }
+}
+
 /// Exact emitted iterator/manager cleanup before a copied local None finalizer.
 #[derive(Debug)]
 pub(super) struct CopiedCleanupReturnNonePrefix {
@@ -7753,32 +7776,15 @@ impl LayoutAssembler {
                                     .copied_return_none_prefixes
                                     .iter()
                                     .filter(|origin| {
-                                        let removed = if origin.additional_pop.is_some() {
-                                            3
-                                        } else {
-                                            2
-                                        };
-                                        let mut expected_pop = origin.pops[1];
-                                        expected_pop
-                                            .local_policy
-                                            .add_hidden_exception_owner_slots(removed);
-                                        let Some(load) =
-                                            indexed_instructions.get(instruction_index + 1)
-                                        else {
-                                            return false;
-                                        };
-                                        let mut expected_load = origin.load;
-                                        if load.opcode == crate::target::opcodes::LOAD_FAST_BORROW {
-                                            expected_load.opcode = load.opcode;
-                                        }
-                                        origin.return_nop.is_some()
-                                            && expected_pop == *instruction
-                                            && expected_load == **load
-                                            && indexed_instructions
-                                                .get(instruction_index + 2)
-                                                .is_some_and(|condition| {
-                                                    **condition == origin.condition
-                                                })
+                                        indexed_instructions
+                                            .get(instruction_index + 1..instruction_index + 3)
+                                            .is_some_and(|suffix| {
+                                                origin.matches_retained_guard(
+                                                    instruction,
+                                                    suffix[0],
+                                                    suffix[1],
+                                                )
+                                            })
                                             && jump_targets.iter().all(|target| {
                                                 label_positions.get(target).is_none_or(|position| {
                                                     *position <= instruction_index
@@ -7857,7 +7863,12 @@ impl LayoutAssembler {
                             // CPython removes the preceding authored return NOP during
                             // optimize_cfg, before insert_superinstructions compacts the
                             // live array. Its one hidden slot does not survive that fusion.
-                            && instruction.local_policy.hidden_exception_owner_slots() <= 1
+                            && (instruction.local_policy.hidden_exception_owner_slots() <= 1
+                                || indexed_instructions.get(instruction_index + 1..instruction_index + 3).is_some_and(|suffix| {
+                                    self.exception_owner_provenance.copied_return_none_prefixes.iter().any(|origin| {
+                                        origin.matches_retained_guard(instruction, suffix[0], suffix[1])
+                                    })
+                                }))
                             && instruction.pre_fold_extra_instructions() == 0
                             && instruction.no_location_policy.borrow_fallthrough()
                                 != super::BorrowFallthrough::Barrier
@@ -9236,7 +9247,13 @@ impl LayoutAssembler {
                         // The checked live prefix is a conservative lower bound for its
                         // pre-fusion width; never infer owners before that checked span.
                         let prefix_width = end - start;
-                        if removed > suffix_width && removed <= suffix_width + prefix_width {
+                        if removed == suffix_width {
+                            // The selected cell is the surviving POP_BLOCK itself.
+                            owners.insert(
+                                instruction_index,
+                                ExceptionOwnerDecision::override_with_region(None),
+                            );
+                        } else if removed > suffix_width && removed <= suffix_width + prefix_width {
                             owners.insert(
                                 instruction_index,
                                 ExceptionOwnerDecision::override_with_region(Some(region)),
