@@ -38713,9 +38713,15 @@ impl<'source> Compiler<'source> {
                 )?
             };
             if self.context.python_version >= crate::PythonVersion::Py314
-                && self.control.withs.active_with_exits.last().is_some_and(|manager| {
-                    !manager.is_async && manager.terminal_statement_range == Some(statement.range)
-                })
+                && self
+                    .control
+                    .withs
+                    .active_with_exits
+                    .last()
+                    .is_some_and(|manager| {
+                        !manager.is_async
+                            && manager.terminal_statement_range == Some(statement.range)
+                    })
                 && matches!(statement.finalbody.last(), Some(Stmt::If(guard))
                     if condition_has_only_runtime_tests(&guard.test) && !suite_terminates(&guard.body)
                         && matches!(guard.elif_else_clauses.as_slice(), [otherwise]
@@ -38723,8 +38729,10 @@ impl<'source> Compiler<'source> {
             {
                 // The earlier arm jumps past the finalizer's normal exit, leaving the else
                 // suite to locate its jump before the manager cleanup.
-                self.assembler.preserve_redundant_jump_nop_after_threading(normal_exit);
-                self.assembler.mark_retained_nop_borrow_fallthrough_if_unblocked(normal_exit);
+                self.assembler
+                    .preserve_redundant_jump_nop_after_threading(normal_exit);
+                self.assembler
+                    .mark_retained_nop_borrow_fallthrough_if_unblocked(normal_exit);
             }
             if let (Some(depth), Some(start)) = (pass_exit_exception_depth, pass_exit_start) {
                 let end = self.assembler.label();
