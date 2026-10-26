@@ -9073,6 +9073,22 @@ fn completed_manager_work_preserves_retained_loop_owners() {
 }
 
 #[test]
+fn finalizer_none_marker_keeps_the_protected_result_after_local_fusion() {
+    for pairs in 2..=5 {
+        let source = format!(
+            "def run(manager, state, left, right):\n    with manager:\n        assert manager\n        try:\n{}            finish()\n        finally:\n            if state is not None:\n                close()\n",
+            "            record(left, right)\n".repeat(pairs),
+        );
+        assert_matches_cpython_versions(
+            &source,
+            &format!("finalizer_local_fusion_{pairs}.py"),
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn protected_conditional_store_preserves_erased_else_backedge() {
     let protected = r"def collect(batches, left, right, cleanup, sink):
     try:

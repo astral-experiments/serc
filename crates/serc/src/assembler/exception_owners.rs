@@ -1549,6 +1549,16 @@ struct ExceptionOwnerTail {
     post_compaction_fusions: usize,
 }
 
+fn is_local_fusion(instruction: &Instruction) -> bool {
+    matches!(
+        instruction.opcode,
+        LOAD_FAST_BORROW_LOAD_FAST_BORROW
+            | LOAD_FAST_LOAD_FAST
+            | STORE_FAST_LOAD_FAST
+            | STORE_FAST_STORE_FAST
+    )
+}
+
 impl ExceptionOwnerTail {
     fn has_owner_after_insertions(self, conditional_insertions: usize) -> bool {
         // COPY and TO_BOOL are inserted before SETUP instructions become removable NOPs.
@@ -1561,13 +1571,7 @@ impl ExceptionOwnerTail {
 
     fn instruction(&mut self, instruction: &Instruction, previous: Option<&Instruction>) {
         self.early_removals += usize::from(instruction.local_policy.hidden_exception_owner_slots());
-        if matches!(
-            instruction.opcode,
-            LOAD_FAST_BORROW_LOAD_FAST_BORROW
-                | LOAD_FAST_LOAD_FAST
-                | STORE_FAST_LOAD_FAST
-                | STORE_FAST_STORE_FAST
-        ) {
+        if is_local_fusion(instruction) {
             self.post_compaction_fusions += 1;
             self.early_removals += 1;
         }
@@ -9688,6 +9692,74 @@ impl LayoutAssembler {
                             == 1
                     {
                         pending_normal_none_owner = Some((instruction_index + 1, None));
+                    }
+                    // Local superinstructions compact the already optimized array once more.
+                    // Count back from the marker through an unfused protected suffix.
+                    // Those live records keep their owners from before local fusion.
+                    if matches!(instruction.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+                        && owner_history_exact
+                        && pop_slot_epoch_known
+                        && tail.post_compaction_fusions >= 3
+                        && tail.insertions == 0
+                        && tail.late_removals == 0
+                        && instruction_index >= original_array_start + 3
+                        && let Some(donor) =
+                            (instruction_index + 1).checked_sub(tail.post_compaction_fusions)
+                        && donor >= original_array_start
+                    {
+                        let discard_index = instruction_index - 2;
+                        let load = *indexed_instructions[instruction_index - 1];
+                        let discard = *indexed_instructions[discard_index];
+                        if discard.opcode == POP_TOP
+                            && matches!(
+                                indexed_instructions[discard_index - 1].opcode,
+                                crate::target::opcodes::CALL | crate::target::opcodes::RESUME
+                            )
+                            && indexed_instructions[donor..=discard_index]
+                                .iter()
+                                .all(|record| {
+                                    record.value_argument().is_some()
+                                        && record.opcode != NOP
+                                        && !is_local_fusion(record)
+                                        && record.exception_policy()
+                                            == super::ExceptionPolicy::NoneUnchanged
+                                        && record.pre_fold_extra_instructions() == 0
+                                        && record.local_policy.hidden_exception_owner_slots() == 0
+                                        && record.no_location_policy.borrow_fallthrough()
+                                            != super::BorrowFallthrough::Barrier
+                                })
+                            && (donor..=instruction_index).all(|index| !owners.contains_key(index))
+                            && !jump_targets.iter().any(|label| {
+                                label_positions.get(label).is_some_and(|index| {
+                                    donor < *index && *index <= instruction_index + 1
+                                })
+                            })
+                            && self
+                                .exception_owner_provenance
+                                .normal_finally_none_prefixes
+                                .iter()
+                                .any(|(_, original_load, condition)| {
+                                    let mut expected = *original_load;
+                                    expected.local_policy.add_hidden_exception_owner_slots(1);
+                                    if load.opcode == crate::target::opcodes::LOAD_FAST_BORROW {
+                                        expected.opcode = load.opcode;
+                                    }
+                                    *condition == *instruction && load == expected
+                                })
+                            && indexed_instructions[original_array_start..donor]
+                                .iter()
+                                .filter(|record| is_local_fusion(record))
+                                .count()
+                                == tail.post_compaction_fusions
+                            && let Some(region) = self.uniform_exception_owner(
+                                donor,
+                                discard_index + 1,
+                                &label_positions,
+                            )
+                            && !self.exception_regions[region].is_scope_fallback
+                        {
+                            pending_normal_none_owner = Some((instruction_index + 1, Some(region)));
+                        }
                     }
                     // A normal-finally local None test removes exactly three comparison
                     // records. With a retained POP its marker reuses IS_OP; with one
