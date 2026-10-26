@@ -40,6 +40,27 @@ fn nested_conversion_handlers_keep_shared_cleanup() {
 }
 
 #[test]
+fn negated_comparison_keeps_the_nonfinal_loop_branch() {
+    let source = r"def run(items, value, enabled):
+    for item in items:
+        if enabled:
+            if not low < value < high:
+                break
+        elif fallback:
+            pass
+    else:
+        done()
+    return value
+";
+    assert_matches_cpython_versions(
+        source,
+        "negated_comparison_loop_branch.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn erased_nested_assignment_suffix_preserves_join() {
     let source = r"def sample(flag, condition):
     with acquire() as manager:
