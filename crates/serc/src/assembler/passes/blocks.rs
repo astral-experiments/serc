@@ -6185,6 +6185,8 @@ impl OptimizationPipeline {
             if exit_without_unique_predecessor[target.index()]
                 && !self.exception_regions.is_empty()
                 && !split_iterator_return
+                // Early no-location inlining runs before the cold blocks move.
+                && !inline_no_location_block
                 && target_pre_fusion_size > 4
                 && !target_blocks.iter().any(|block| {
                     graph[*block].items().iter().any(|item| {
