@@ -19279,6 +19279,16 @@ impl<'source> Compiler<'source> {
                 finally_exclusion_lengths,
                 region_unwind_starts,
             )?;
+            if self.context.python_version == crate::PythonVersion::Py312
+                && matches!(origin, super::legacy_native_labels::WithAwait::Break(_))
+                && handler.name.is_none()
+                && self.control.finally.active_loop_finally_contexts.is_empty()
+            {
+                // The unnamed handler's POP_BLOCK still occupies an exit-copy
+                // slot before POP_EXCEPT, even when both share the break line.
+                self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
+                self.assembler.mark_last_as_converted_pop_block();
+            }
             let start = self.assembler.label();
             self.assembler.mark(start);
             handler_unwind_starts.push(start);

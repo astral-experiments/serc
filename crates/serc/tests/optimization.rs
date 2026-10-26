@@ -15,6 +15,26 @@ use serc::{
 };
 
 #[test]
+fn handler_break_cleanup_counts_toward_the_legacy_exit_copy_limit() {
+    let source = r"def process(items, result):
+    for item in items:
+        try:
+            work(item)
+        except ValueError:
+            with output() as stream:
+                stream.write(item)
+            break
+    return result
+";
+    assert_matches_cpython_versions(
+        source,
+        "handler_break_copy.py",
+        &LEVELS,
+        &[PythonVersion::Py312],
+    );
+}
+
+#[test]
 fn nested_conversion_handlers_keep_shared_cleanup() {
     let source = r"def sample(items):
     for item in items:
