@@ -2251,6 +2251,27 @@ fn iterator_returns_unwind_inner_try_before_copied_none_guard() {
 }
 
 #[test]
+fn protected_iterator_returns_keep_the_comparison_join() {
+    for comparison in ["low <= row.value <= high", "row.value < high"] {
+        let source = format!(
+            "def within(rows, low, high):
+    for row in rows:
+        try:
+            return {comparison}
+        except AttributeError:
+            pass
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "iterator_comparison.py",
+            &LEVELS,
+            &[PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn iterator_returns_unwind_the_iterator_before_the_outer_try() {
     for header in ["for item in items:", "async for item in items:"] {
         let source = format!(

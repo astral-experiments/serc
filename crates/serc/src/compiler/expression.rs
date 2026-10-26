@@ -8878,6 +8878,11 @@ impl Compiler<'_> {
         self.emit(SWAP, 2, 0)?;
         self.emit(POP_TOP, 0, -1)?;
         self.assembler.mark(end);
+        if self.context.python_version == PythonVersion::Py315 {
+            // The success jump enters an original block after the failed comparison
+            // discards its saved operand. A return can unwind a handler at this join.
+            self.assembler.record_exception_owner_block_boundary(end);
+        }
         self.set_depth(base_depth + 1);
         Ok(())
     }
