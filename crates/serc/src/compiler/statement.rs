@@ -40467,18 +40467,26 @@ impl<'source> Compiler<'source> {
                 })
                 .or_else(|| {
                     let context = self.control.loops.contexts.last()?;
+                    let regions = self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .len();
+                    let shares_loop_cleanup = match context.iterator_cleanup {
+                        // A while break has no iterator to unwind. Any enclosing
+                        // protected ranges must still be active at the break target.
+                        IteratorCleanup::None => context.exception_region_depth == regions,
+                        IteratorCleanup::Sync => {
+                            regions == 0 && self.control.finally.active_finally_try_bodies == 0
+                        }
+                        IteratorCleanup::Async => false,
+                    };
                     if !remaining.is_empty()
                         || self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) != 0
-                        || context.iterator_cleanup != IteratorCleanup::Sync
+                        || !shares_loop_cleanup
                         || context.has_orelse
                         || context.break_policy != LoopBreakPolicy::Jump
                         || !self.control.exceptions.active_exception_handlers.is_empty()
-                        || !self
-                            .control
-                            .exceptions
-                            .active_exception_region_exclusions
-                            .is_empty()
-                        || self.control.finally.active_finally_try_bodies != 0
                         || self.control.finally.active_normal_finally_bodies != 0
                         || self.control.finally.active_copied_finally_bodies != 0
                         || self.control.finally.active_finally_end_blocks != 0
