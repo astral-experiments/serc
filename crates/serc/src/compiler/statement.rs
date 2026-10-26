@@ -9558,7 +9558,7 @@ impl<'source> Compiler<'source> {
                                 && iterator.exception_region_depth == handler.exception_region_depth
                     );
                 // Capture omitted POP cells only for this complete saved-value unwind.
-                // Its one async manager remains active until after the copied finalizer.
+                // The enclosing async managers unwind after the copied finalizer.
                 let captures_async_manager_handler_return = preserve_tos
                     && !return_is_overridden
                     && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
@@ -9581,22 +9581,23 @@ impl<'source> Compiler<'source> {
                             self.control.withs.active_with_exits.as_slice(),
                             self.control.loops.contexts.as_slice(),
                         ),
-                        ([handler], [finally], [manager], [])
-                            if handler.name.is_some()
-                                && handler.with_depth == 1
+                        ([handler], [finally], managers, [])
+                            if (1..=2).contains(&managers.len())
+                                && handler.name.is_some()
+                                && handler.with_depth == managers.len()
                                 && handler.loop_depth == 0
                                 && handler.try_body_depth == 0
                                 && handler.exception_region_depth == finally.exception_region_depth + 1
                                 && self.control.exceptions.active_exception_region_exclusions.len()
                                     == handler.exception_region_depth + 1
                                 && finally.handler_depth == 0
-                                && finally.with_depth == 1
+                                && finally.with_depth == managers.len()
                                 && finally.loop_depth == 0
                                 && finally.try_body_depth == 0
-                                && manager.is_async
-                                && manager.loop_depth == 0
-                                && manager.normal_finally_depth == 0
-                                && manager.exception_region_depth == finally.exception_region_depth
+                                && managers.iter().all(|manager|
+                                    manager.is_async && manager.loop_depth == 0
+                                        && manager.normal_finally_depth == 0
+                                        && manager.exception_region_depth == finally.exception_region_depth)
                     );
                 // An ordinary try inside the named handler unwinds immediately
                 // before the handler's two omitted POPs and the name-clear sequence.
