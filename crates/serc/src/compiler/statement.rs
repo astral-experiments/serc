@@ -10825,6 +10825,17 @@ impl<'source> Compiler<'source> {
                     };
                     let iterator_cleanup_start = self.assembler.label();
                     self.assembler.mark(iterator_cleanup_start);
+                    // The normal finalizer and a recovering named handler both reach
+                    // this join. Neither path can donate the outer iterator pops' line.
+                    let shared_recovery_join = preserve_tos && remaining_with > 0
+                        && self.assembler.location() == SourceLocation::NONE
+                        && self.assembler.at_original_unconditional_join()
+                        && return_finally_contexts.get(context_index+1).is_some_and(|inner|
+                            matches!(inner.body.last(), Some(Stmt::Try(cleanup))
+                                if !cleanup.is_star && cleanup.orelse.is_empty() && cleanup.finalbody.is_empty()
+                                    && cleanup.handlers.iter().any(|handler| handler.as_except_handler().is_some_and(|handler|
+                                        handler.name.is_some() && !suite_terminates_before_constant_folding(&handler.body)))));
+                    let unwind_start = self.assembler.item_count();
                     self.emit_return_loop_iterator_cleanup(
                         finally_context.loop_depth,
                         next_loop,
@@ -10848,6 +10859,10 @@ impl<'source> Compiler<'source> {
                             None
                         },
                     )?;
+                    if shared_recovery_join {
+                        self.assembler
+                            .preserve_iterator_cleanup_positions(unwind_start);
+                    }
                     if preserve_shared_iterator_location {
                         // The proven range contains one sync iterator and no saved value:
                         // emit_return_loop_iterator_cleanup emitted exactly this POP_TOP.
