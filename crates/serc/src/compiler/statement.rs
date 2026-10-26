@@ -6743,13 +6743,11 @@ impl<'source> Compiler<'source> {
                             && handler.exception_region_depth == context.exception_region_depth + 1
                             && self.control.exceptions.active_exception_region_exclusions.len()
                                 == handler.exception_region_depth + 1);
-                let copied_finally_iterator_join = context.iterator_cleanup
+                let guarded_finally_iterator_join = context.iterator_cleanup
                     == IteratorCleanup::Sync
                     && !context.prevent_break_exit_inlining
                     && context.break_policy == LoopBreakPolicy::Jump
                     && self.control.withs.active_with_exits.is_empty()
-                    && (self.control.exceptions.active_exception_handlers.is_empty()
-                        || copied_finally_iterator_handler)
                     && self.control.finally.active_finally_try_bodies == 1
                     && self.control.finally.active_finally_end_blocks == 0
                     && self.control.finally.active_normal_finally_bodies == 0
@@ -6759,8 +6757,12 @@ impl<'source> Compiler<'source> {
                             && finally.with_depth == context.with_depth
                             && finally.handler_depth == 0
                             && finally.exception_region_depth == context.exception_region_depth
-                            && matches!(finally.body, [Stmt::If(guard)]
+                            && matches!(finally.body.last(), Some(Stmt::If(guard))
                                 if guard.elif_else_clauses.is_empty()));
+                let copied_finally_iterator_join = guarded_finally_iterator_join
+                    && (self.control.exceptions.active_exception_handlers.is_empty()
+                        || copied_finally_iterator_handler)
+                    && matches!(self.control.finally.active_loop_finally_contexts.as_slice(), [finally] if finally.body.len() == 1);
                 // This finalizer's normal and handler exits share the original iterator
                 // discard. The join is checked again after every unwind has been emitted.
                 let copied_finally_try_iterator_join = self.unit.flags
@@ -6985,11 +6987,18 @@ impl<'source> Compiler<'source> {
                     // reaches the loop's artificial iterator discard.
                     self.assembler.set_location(location);
                 }
-                let copied_finally_try_iterator_entry = (copied_finally_try_iterator_join
-                    && self.assembler.at_original_shared_finally_iterator_join(
-                        finally_unwind_start,
-                        copied_finally_iterator_handler,
-                    ))
+                // A copied trailing guard can give multiple edges the same unlocated
+                // iterator discard. Capture its entry before appending the break.
+                let shared_guard_join = guarded_finally_iterator_join
+                    && self.context.python_version >= crate::PythonVersion::Py314
+                    && self.control.exceptions.active_exception_group_handlers == 0
+                    && self.assembler.at_original_shared_cleanup_join();
+                let copied_finally_try_iterator_entry = (shared_guard_join
+                    || (copied_finally_try_iterator_join
+                        && self.assembler.at_original_shared_finally_iterator_join(
+                            finally_unwind_start,
+                            copied_finally_iterator_handler,
+                        )))
                 .then(|| self.assembler.item_count());
                 self.emit_iterator_cleanup(context.iterator_cleanup, false)?;
                 if copied_finalizer_location.is_some() {
