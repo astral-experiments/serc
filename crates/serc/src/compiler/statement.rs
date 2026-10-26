@@ -6137,6 +6137,14 @@ impl<'source> Compiler<'source> {
         &self,
         assignment: &ruff_python_ast::StmtAssign,
     ) -> bool {
+        // Chained comparisons have a separate POP_TOP failure block. Keep its
+        // jump to the shared arm until Python 3.12 performs its second exit-copy pass.
+        if self.context.python_version == crate::PythonVersion::Py312
+            && matches!(assignment.value.as_ref(), Expr::If(expression)
+                if final_chained_comparison(&expression.test).is_some())
+        {
+            return false;
+        }
         // CPython only copies terminal exit blocks with at most four pre-fusion instructions.
         // Compound targets therefore need the ordinary joined lowering so the assembler can
         // apply that threshold. Keep the direct forms specialized to preserve nested-conditional
@@ -6153,12 +6161,6 @@ impl<'source> Compiler<'source> {
                 // Keep an optimized tuple call's original join until the assembler
                 // copies the attribute-store exit and accounts for its jump slot.
                 matches!(attribute.value.as_ref(), Expr::Name(_))
-                    // The chained-test cleanup must reach the original shared else
-                    // assignment before 3.12's second small-exit copy pass.
-                    && !(self.context.python_version == crate::PythonVersion::Py312
-                        && matches!(assignment.value.as_ref(), Expr::If(expression)
-                            if matches!(expression.test.as_ref(), Expr::Compare(compare)
-                                if compare.ops.len() > 1)))
                     && !matches!(assignment.value.as_ref(), Expr::If(expression)
                         if matches!(expression.body.as_ref(), Expr::Call(call)
                             if optimized_generator_callable(call) == Some("tuple")))

@@ -9073,6 +9073,21 @@ fn completed_manager_work_preserves_retained_loop_owners() {
 }
 
 #[test]
+fn python312_terminal_stores_share_chained_condition_failures() {
+    for target in ["result", "item.code"] {
+        let source = format!(
+            "def update(item, ready, low, value, high):\n    {target} = value if ready and low < value <= high else 1\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "chained_store.py",
+            &LEVELS,
+            &[PythonVersion::Py312],
+        );
+    }
+}
+
+#[test]
 fn protected_conditional_store_preserves_erased_else_backedge() {
     let protected = r"def collect(batches, left, right, cleanup, sink):
     try:
