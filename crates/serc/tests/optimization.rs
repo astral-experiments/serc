@@ -15,6 +15,33 @@ use serc::{
 };
 
 #[test]
+fn named_handler_while_exit_preserves_the_finalizer_line() {
+    for condition in ["ready()", "ready() and not stopped() and not done()"] {
+        let source = format!(
+            "async def retry(active):
+    try:
+        while active:
+            try:
+                break
+            except Error as err:
+                while {condition}:
+                    await wait()
+            finally:
+                await clean()
+    finally:
+        finish()
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "named_handler_while_exit.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn nested_conversion_handlers_keep_shared_cleanup() {
     let source = r"def sample(items):
     for item in items:
