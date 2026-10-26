@@ -9091,6 +9091,22 @@ fn copied_finalizer_test_can_reuse_unowned_unwind_slots() {
 }
 
 #[test]
+fn finalizer_truth_test_can_reuse_one_removed_pop_block() {
+    for calls in 3..=5 {
+        let prefix = "        step()\n".repeat(calls);
+        let source = format!(
+            "def run(value, flag):\n    try:\n{prefix}        return value\n    finally:\n        try:\n            if flag:\n                finish()\n        finally:\n            close()\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "finalizer_truth_test.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn protected_conditional_store_preserves_erased_else_backedge() {
     let protected = r"def collect(batches, left, right, cleanup, sink):
     try:
