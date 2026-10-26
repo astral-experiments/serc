@@ -7448,6 +7448,9 @@ impl Compiler<'_> {
                 self.compile_collection(&tuple.elts, CollectionKind::List)?;
                 if self.context.python_version == PythonVersion::Py315 {
                     self.emit_unary_intrinsic(UnaryIntrinsic::LIST_TO_TUPLE)?;
+                } else {
+                    // Python 3.14 removes the conversion before GET_ITER but retains its array slot.
+                    self.assembler.add_last_hidden_exception_owner_slots(1);
                 }
                 Ok(())
             }
