@@ -13167,7 +13167,7 @@ impl Assembler {
         let Some(before) = items.get(..pop_item) else {
             return;
         };
-        if !(1..=2).contains(&manager_count) {
+        if manager_count == 0 {
             return;
         }
         let mut records = before
@@ -13198,7 +13198,11 @@ impl Assembler {
         {
             return;
         }
-        let cleanup = records[records.len() - 7..].to_vec();
+        let (cleanup, earlier_cleanups) = records
+            .as_chunks::<7>()
+            .0
+            .split_last()
+            .expect("at least one cleanup");
         let named_handler_cleanup = if named_handler {
             if manager_count != 1 || ordinary_try_pops != 1 || retained_outer_handler.is_none() {
                 return;
@@ -13250,11 +13254,6 @@ impl Assembler {
         } else {
             None
         };
-        let earlier_cleanup = (manager_count == 2).then(|| {
-            records[..7]
-                .try_into()
-                .expect("seven earlier cleanup records")
-        });
         let mut suffix = items[pop_item..].iter().filter_map(|item| match item {
             Item::Instruction(instruction) => Some(*instruction),
             Item::Label(_) => None,
@@ -13300,8 +13299,8 @@ impl Assembler {
                     inner_try_pop,
                     ordinary_try_pops,
                     retained_outer_handler,
-                    cleanup,
-                    earlier_cleanup,
+                    cleanup: cleanup.to_vec(),
+                    earlier_cleanups: earlier_cleanups.to_vec(),
                     named_handler_cleanup,
                     constant_return_prefix: None,
                     to_bool,
@@ -13453,7 +13452,7 @@ impl Assembler {
                     retained_outer_handler: None,
                     ordinary_try_pops: outer_try_pops,
                     cleanup: cleanup.to_vec(),
-                    earlier_cleanup: None,
+                    earlier_cleanups: Vec::new(),
                     named_handler_cleanup: None,
                     constant_return_prefix: Some(exception_owners::ConstantManagerReturnPrefix {
                         authored_nop: authored,
@@ -13640,7 +13639,7 @@ impl Assembler {
                 retained_outer_handler: None,
                 ordinary_try_pops: usize::from(!retained_inner_try),
                 cleanup: cleanup.to_vec(),
-                earlier_cleanup: None,
+                earlier_cleanups: Vec::new(),
                 named_handler_cleanup: None,
                 constant_return_prefix: Some(exception_owners::ConstantManagerReturnPrefix {
                     authored_nop: authored,

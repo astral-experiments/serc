@@ -1906,6 +1906,24 @@ fn erased_loop_break_keeps_async_manager_finally_boundary() {
 }
 
 #[test]
+fn saved_return_through_three_managers_keeps_the_outer_cleanup_owner() {
+    let source = r"def sample(flag, value):
+    try:
+        with first():
+            with second():
+                with third():
+                    if flag:
+                        work()
+                    else:
+                        return value
+    finally:
+        if flag is not None:
+            finish()
+";
+    assert_matches_cpython(source, "three_manager_return.py", &LEVELS);
+}
+
+#[test]
 fn saved_return_tracks_try_pops_on_each_side_of_a_manager() {
     let source = r"async def sample(job, flag):
     try:
