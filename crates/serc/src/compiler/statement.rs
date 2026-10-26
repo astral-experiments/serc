@@ -16767,13 +16767,10 @@ impl<'source> Compiler<'source> {
                         // an else suite would supply its own preceding line instead.
                         // A while loop also has an empty condition-failure block. Its
                         // inlined branch jump has no preceding line event to replace it.
-                        if matches!(body.last(), Some(Stmt::For(loop_statement))
-                            if !loop_statement.is_async && suite_contains_loop_break(&loop_statement.body))
-                        {
-                            // The break target is an original empty array even when
-                            // its exit is copied through another branch join. Keep
-                            // that identity so the iterator's preceding line cannot
-                            // erase the copied jump's separate NOP slot.
+                        if matches!(body.last(), Some(Stmt::For(_))) {
+                            // The break target or async exhaustion continuation starts
+                            // an empty array. Its copied jump retains a separate NOP
+                            // even when the preceding iterator has the same line.
                             self.assembler
                                 .preserve_empty_join_inlined_jump_nop(branch_exit);
                         } else {
