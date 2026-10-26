@@ -9073,6 +9073,36 @@ fn completed_manager_work_preserves_retained_loop_owners() {
 }
 
 #[test]
+fn managed_try_returns_preserve_their_value_join_and_multiline_locations() {
+    let source = r"async def choose(manager, left, right):
+    try:
+        async with manager:
+            try:
+                return left and right
+            except ValueError:
+                pass
+    finally:
+        close()
+
+async def read(manager, ready):
+    async with manager:
+        while ready:
+            try:
+                return (
+                    await fetch()
+                ).value
+            except ValueError:
+                retry()
+";
+    assert_matches_cpython_versions(
+        source,
+        "managed_return.py",
+        &LEVELS,
+        &[PythonVersion::Py313],
+    );
+}
+
+#[test]
 fn protected_conditional_store_preserves_erased_else_backedge() {
     let protected = r"def collect(batches, left, right, cleanup, sink):
     try:

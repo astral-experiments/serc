@@ -8057,21 +8057,20 @@ impl<'source> Compiler<'source> {
                         && !return_is_overridden
                         && self.control.exceptions.active_exception_handlers.is_empty()
                         && self.control.exceptions.active_exception_group_handlers == 0
-                        && self
-                            .control
-                            .finally
-                            .active_return_finally_contexts
-                            .is_empty()
-                        && self
-                            .control
-                            .finally
-                            .active_pass_finally_locations
-                            .is_empty()
-                        && self.control.finally.active_finally_try_bodies == 0
+                        && let Some(context) = self.control.withs.active_with_exits.last()
+                        && self.control.finally.active_finally_try_bodies
+                            == self.control.finally.active_return_finally_contexts.len()
+                        // A surrounding finalizer runs after the manager. The
+                        // ordinary try inside it still unwinds at the return line.
+                        && (self.control.finally.active_return_finally_contexts.is_empty()
+                            || (self.context.python_version == crate::PythonVersion::Py313
+                                && self.control.finally.active_return_finally_contexts.iter().all(|finally|
+                                    finally.with_depth < self.control.withs.active_with_exits.len()
+                                        && finally.exception_region_depth < context.exception_region_depth)))
+                        && self.control.finally.active_pass_finally_locations.is_empty()
                         && self.control.finally.active_finally_end_blocks == 0
                         && self.control.finally.active_normal_finally_bodies == 0
                         && self.control.finally.active_copied_finally_bodies == 0
-                        && let Some(context) = self.control.withs.active_with_exits.last()
                         && context.exception_region_depth
                             < self
                                 .control
@@ -8081,7 +8080,9 @@ impl<'source> Compiler<'source> {
                         && (context.loop_depth == self.control.loops.contexts.len()
                             // A while entered inside the same protected manager emits no
                             // iterator unwind record before this original value join.
-                            || (self.assembler.at_jump_target()
+                            || ((self.assembler.at_jump_target()
+                                || (self.context.python_version == crate::PythonVersion::Py313
+                                    && location.line != location.end_line))
                                 && self.control.loops.contexts[context.loop_depth..]
                                     .iter()
                                     .all(|loop_context| {
