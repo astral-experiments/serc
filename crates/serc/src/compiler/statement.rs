@@ -2241,8 +2241,9 @@ impl<'source> Compiler<'source> {
                     .iter()
                     .all(|statement| self.context.is_elided_statement(statement));
             // Removing trailing assertions makes this conditional the function's
-            // terminal statement. Keep its comprehension assignment's return span.
-            let terminal_comprehension_before_elided = has_elided_tail
+            // terminal statement. Keep exit copies from comprehension assignments
+            // and the cleanup and success edges of an erased chained comparison.
+            let terminal_expression_if_before_elided = has_elided_tail
                 && !is_final
                 && final_expression_becomes_return
                 && self.supports_elided_terminal_if()
@@ -2263,7 +2264,13 @@ impl<'source> Compiler<'source> {
                     .iter()
                     .all(|statement| self.context.is_elided_statement(statement))
                 && matches!(statement, Stmt::If(conditional)
-                if (((plain_function_suite
+                if (condition_has_only_runtime_tests(&conditional.test)
+                    && final_chained_comparison_jump(&conditional.test).is_some()
+                    && !expression_suspends_current_scope(&conditional.test)
+                    && conditional.body.iter().all(|part| self.context.is_elided_statement(part))
+                    && conditional.elif_else_clauses.iter().all(|clause| clause.test.is_none()
+                        && clause.body.iter().all(|part| self.context.is_elided_statement(part))))
+                    || (((plain_function_suite
                     || (self.unit.flags & CO_COROUTINE != 0
                         && self.coroutine_branches_have_linear_return_donors(conditional)))
                     && std::iter::once(conditional.body.as_slice())
@@ -2370,7 +2377,7 @@ impl<'source> Compiler<'source> {
                     .contains(&statement.range())
                 && self.protected_terminal_if_before_elided(statement, &body[index + 1..]);
             let terminal_if_before_elided = terminal_before_elided_assertions
-                || terminal_comprehension_before_elided
+                || terminal_expression_if_before_elided
                 || terminal_nested_before_elided
                 || protected_terminal_if_before_elided
                 || coroutine_if_before_elided

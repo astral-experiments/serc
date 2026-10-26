@@ -13421,6 +13421,17 @@ fn terminal_chained_comparisons_preserve_empty_branch_exits() {
         }
     }
     assert_matches_cpython(
+        "def sample(enabled, value):
+    if enabled and 0 < value < 3:
+        assert value
+    else:
+        assert enabled
+    assert value
+",
+        "elided_comparison_return.py",
+        &LEVELS,
+    );
+    assert_matches_cpython(
         "def f(low, value, high, other):
     if low < value < high:
         global state
