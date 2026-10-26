@@ -9073,6 +9073,37 @@ fn completed_manager_work_preserves_retained_loop_owners() {
 }
 
 #[test]
+fn collections_before_a_protected_condition_preserve_the_marker_slot() {
+    for expression in [
+        "worker.accept(extra={**(left if item.ready else right)})",
+        "[1, 2, 3, item.key, *(left if item.ready else right)]",
+        "[1, 2, 3, item, *(left if item.ready else right)]",
+        "[1, 2, 3, 4, *(left if item.ready else right)]",
+    ] {
+        let source = format!(
+            "def run(worker, owner, flag, left, right):
+    with owner as item:
+        try:
+            work()
+        finally:
+            if flag:
+                pass
+            try:
+                {expression}
+            except ValueError:
+                pass
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "collections_before_condition.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn local_truth_test_after_handler_starts_with_an_unowned_marker() {
     let source = r"def read(rows, flag):
     with resource() as reader:
