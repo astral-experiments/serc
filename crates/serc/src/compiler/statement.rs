@@ -13065,6 +13065,25 @@ impl<'source> Compiler<'source> {
                     // the resumed unwind artificial so each incoming branch can supply its
                     // location when the shared return block is duplicated.
                     self.assembler.set_location(SourceLocation::NONE);
+                    if self.context.python_version == crate::PythonVersion::Py313
+                        && context_index == 0
+                        && finally_context.try_body_depth > 0
+                        && next_with == finally_context.with_depth
+                        && let Some(manager) =
+                            self.control.withs.active_with_exits[..next_with].last()
+                        && manager.exception_region_depth < finally_context.exception_region_depth
+                        && self.assembler.at_jump_target()
+                    {
+                        // The copied finalizer ended at a join. The enclosing try's
+                        // POP_BLOCK starts that new array before manager cleanup.
+                        self.emit_with_exception_policy(
+                            NOP,
+                            0,
+                            0,
+                            ExceptionPolicy::EXCLUDE_ALWAYS,
+                        )?;
+                        self.assembler.mark_last_as_converted_pop_block();
+                    }
                     next_loop = finally_context.loop_depth;
                 }
                 if !return_finally_contexts.is_empty() {
