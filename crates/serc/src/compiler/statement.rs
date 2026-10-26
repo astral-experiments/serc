@@ -12136,6 +12136,17 @@ impl<'source> Compiler<'source> {
                         .exceptions
                         .active_exception_region_exclusions
                         .len();
+                    let named_setup_return = preserve_tos
+                        && next_handler == 0
+                        && self.control.loops.contexts.is_empty()
+                        && with_unwind_starts.is_empty()
+                        && matches!(self.control.exceptions.active_exception_handlers.as_slice(), [handler]
+                            if handler.name.is_some()
+                                && handler.with_depth == next_with
+                                && handler.loop_depth == 0
+                                && handler.finally_end_depth == 0
+                                && handler.try_body_depth == ordinary_pops
+                                && handler.exception_region_depth == ordinary_pops + 1);
                     let nested_setup_return = self.context.python_version
                         == crate::PythonVersion::Py314
                         && matches!(finally_context.body.first(), Some(Stmt::Try(inner))
@@ -12147,7 +12158,7 @@ impl<'source> Compiler<'source> {
                         && finally_context.exception_region_depth == 0
                         && finally_context.try_body_depth == 0
                         && finally_context.handler_depth == 0
-                        && handler_count == 0
+                        && (handler_count == 0 || named_setup_return)
                         && self.control.exceptions.active_exception_group_handlers == 0
                         && self.control.finally.active_finally_end_blocks == 0
                         && self.control.finally.active_normal_finally_bodies == 0
@@ -12157,7 +12168,7 @@ impl<'source> Compiler<'source> {
                             .finally
                             .preserved_return_value_contexts
                             .is_empty()
-                        && setup_region_depth == ordinary_pops + 1
+                        && setup_region_depth == ordinary_pops + 1 + handler_count
                         && ordinary_pops <= 1
                         && next_with == finally_context.with_depth
                         && with_unwind_starts.len() <= 1
@@ -12397,6 +12408,7 @@ impl<'source> Compiler<'source> {
                             setup_pop_item,
                             ordinary_pops,
                             with_unwind_starts.len(),
+                            named_setup_return,
                         );
                     }
                     if result.is_ok()
