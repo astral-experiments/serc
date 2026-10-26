@@ -2491,6 +2491,23 @@ impl<'source> Compiler<'source> {
                         continue;
                     }
                     Stmt::While(statement)
+                        if self.context.python_version >= crate::PythonVersion::Py314
+                            && !statement.orelse.is_empty()
+                            && matches!(statement.body.first(),Some(Stmt::Try(protected))
+                                if !protected.is_star && protected.finalbody.is_empty()
+                                  && protected.handlers.iter().any(|handler| handler.as_except_handler().is_some_and(|handler|
+                                    matches!(handler.body.as_slice(),[Stmt::Break(_)])))) =>
+                    {
+                        // Both the loop's else and the handler's break can reach
+                        // this return. Leave each copy to inherit its predecessor.
+                        self.compile_while(statement)?;
+                        self.assembler.set_location(SourceLocation::NONE);
+                        self.assembler.record_current_original_scope_exit();
+                        self.emit_implicit_return()?;
+                        self.control.statements.emitted_fallthrough_return = true;
+                        continue;
+                    }
+                    Stmt::While(statement)
                         if statement.orelse.is_empty()
                             && suite_contains_loop_break(&statement.body)
                             && (self.context.python_version >= crate::PythonVersion::Py314

@@ -15,6 +15,26 @@ use serc::{
 };
 
 #[test]
+fn terminal_while_else_keeps_its_handler_break_position() {
+    let source = r"def sample(active):
+    if active:
+        while ready():
+            try:
+                work()
+            except LookupError:
+                break
+        else:
+            finish()
+";
+    assert_matches_cpython_versions(
+        source,
+        "handler_break.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn nested_conversion_handlers_keep_shared_cleanup() {
     let source = r"def sample(items):
     for item in items:
