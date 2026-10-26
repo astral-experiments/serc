@@ -6682,8 +6682,8 @@ impl LayoutAssembler {
             self.retained_setup_nops_with_instructions(&label_positions, &indexed_instructions);
         // An original entry prefix with no SETUP, region, or policy owner can
         // supply only NULL records, including its certified early-folded slots.
-        let null_original_entry_prefix =
-            |start: usize, setup_label: Label, owners: &DynamicExceptionOwners| {
+        let null_original_prefix =
+            |array: usize, start: usize, setup_label: Label, owners: &DynamicExceptionOwners| {
                 start
                     .checked_sub(1)
                     .is_some_and(|index| retained_setup_nops.contains(&index))
@@ -6695,34 +6695,33 @@ impl LayoutAssembler {
                             *label == setup_label
                                 || label_positions
                                     .get(label)
-                                    .is_some_and(|position| *position > start)
+                                    .is_some_and(|position| *position < array || *position > start)
                         })
                     && self.exception_regions.iter().all(|region| {
                         match (
                             label_positions.get(&region.start),
                             label_positions.get(&region.end),
                         ) {
-                            (Some(begin), Some(end)) => *begin >= start || *end == 0,
+                            (Some(begin), Some(end)) => *begin >= start || *end <= array,
                             _ => false,
                         }
                     })
-                    && indexed_instructions[..start]
-                        .iter()
-                        .enumerate()
-                        .all(|(index, previous)| {
+                    && indexed_instructions[array..start].iter().enumerate().all(
+                        |(index, previous)| {
                             matches!(
                                 previous.exception_policy(),
                                 super::ExceptionPolicy::NoneUnchanged
                                     | super::ExceptionPolicy::AlwaysUnchanged
-                            ) && !owners.contains_key(index)
+                            ) && !owners.contains_key(array + index)
                                 && previous.no_location_policy.borrow_fallthrough()
                                     != super::BorrowFallthrough::Barrier
                                 && (previous.opcode != NOP
-                                    || (retained_setup_nops.contains(&index)
+                                    || (retained_setup_nops.contains(&(array + index))
                                         && previous.local_policy.hidden_exception_owner_slots()
                                             == 0
                                         && previous.pre_fold_extra_instructions() == 0))
-                        })
+                        },
+                    )
             };
         let retained_setup_null_markers =
             self.retained_setup_null_markers(&label_positions, &jump_targets, &retained_setup_nops);
@@ -8252,6 +8251,52 @@ impl LayoutAssembler {
                         previous = Some(instruction);
                         continue;
                     }
+                    // Fusion leaves a newer tail than peephole compaction. Prefix
+                    // insertion consumes that tail before the marker is appended.
+                    let fused_retained_setup_cell = instruction.opcode == NOT_TAKEN
+                        && matches!(
+                            instruction.exception_policy().owner(),
+                            NormalizedExceptionOwner::DynamicCondition
+                                | NormalizedExceptionOwner::Present
+                        )
+                        && owner_history_exact
+                        && pop_slot_epoch_known
+                        && tail.late_removals == 0
+                        && protected_suffix.is_some_and(|(start, setup_tail, _)| {
+                            tail.insertions == setup_tail.insertions
+                                && (tail.insertions == 0 || original_array_start == 0)
+                                && tail.post_compaction_fusions > 0
+                                && tail.post_compaction_fusions
+                                    == setup_tail.post_compaction_fusions
+                                && tail
+                                    .post_compaction_fusions
+                                    .checked_sub(tail.insertions)
+                                    .and_then(|slots| slots.checked_sub(instruction_index - start))
+                                    == Some(1)
+                                && start.checked_sub(1).is_some_and(|index| {
+                                    original_array_start <= index
+                                        && retained_setup_nops.contains(&index)
+                                        && indexed_instructions.get(index).is_some_and(|nop| {
+                                            nop.opcode == NOP
+                                                && nop.exception_policy().exclusion()
+                                                    == super::ExceptionExclusion::Always
+                                                && nop.local_policy.hidden_exception_owner_slots()
+                                                    == 0
+                                                && nop.pre_fold_extra_instructions() == 0
+                                        })
+                                })
+                        });
+                    if fused_retained_setup_cell
+                        && instruction.exception_policy() == super::ExceptionPolicy::NonePresent
+                        && owners
+                            .get(instruction_index)
+                            .is_none_or(|owner| !owner.is_definitive())
+                    {
+                        owners.insert(
+                            instruction_index,
+                            ExceptionOwnerDecision::override_with_region(None),
+                        );
+                    }
                     if matches!(
                         instruction.exception_policy().owner(),
                         NormalizedExceptionOwner::Dynamic
@@ -8322,7 +8367,7 @@ impl LayoutAssembler {
                                 && tail.insertions == setup_tail.insertions
                                 && tail.post_compaction_fusions <= tail.insertions
                                 && insertions <= instruction_index - start
-                                && null_original_entry_prefix(start, setup_label, &owners);
+                                && null_original_prefix(0, start, setup_label, &owners);
                             proven_unprotected_slot = owner_history_exact
                                 && (tail.post_compaction_fusions == 0
                                     || prologue_consumed_fusion_prefix)
@@ -8365,47 +8410,15 @@ impl LayoutAssembler {
                                             });
                                     first_unprotected_setup || unprotected_array_prefix
                                 });
-                            // Fusion leaves its newer stale tail after early compaction.
-                            // If no later fusion changes this retained SETUP's coordinates,
-                            // one slot before its protected suffix is the original NULL NOP.
-                            // Entry prologue insertion consumes this newer tail first; earlier
-                            // peephole removals cannot change the fusion-stage coordinates.
-                            let fused_retained_setup_cell = instruction.opcode == NOT_TAKEN
-                                && instruction.exception_policy().owner()
-                                    == NormalizedExceptionOwner::DynamicCondition
-                                && owner_history_exact
-                                && pop_slot_epoch_known
-                                && tail.insertions == setup_tail.insertions
-                                && (tail.insertions == 0 || original_array_start == 0)
-                                && tail.post_compaction_fusions > 0
-                                && tail.post_compaction_fusions
-                                    == setup_tail.post_compaction_fusions
-                                && tail
-                                    .post_compaction_fusions
-                                    .checked_sub(tail.insertions)
-                                    .and_then(|slots| slots.checked_sub(instruction_index - start))
-                                    == Some(1)
-                                && start.checked_sub(1).is_some_and(|index| {
-                                    original_array_start <= index
-                                        && retained_setup_nops.contains(&index)
-                                        && indexed_instructions.get(index).is_some_and(|nop| {
-                                            nop.opcode == NOP
-                                                && nop.exception_policy().exclusion()
-                                                    == super::ExceptionExclusion::Always
-                                                && nop.local_policy.hidden_exception_owner_slots()
-                                                    == 0
-                                                && nop.pre_fold_extra_instructions() == 0
-                                        })
-                                });
                             // More prefix fusions can place the append before SETUP,
                             // inside the same original entry's entirely NULL prefix.
                             // No suffix rewrite may change the fusion-stage coordinates.
                             let fused_unprotected_prefix = instruction.opcode == NOT_TAKEN
                                 && instruction.exception_policy().owner()
                                     == NormalizedExceptionOwner::DynamicCondition
-                                && original_array_start == 0
                                 && owner_history_exact
                                 && pop_slot_epoch_known
+                                && (tail.insertions == 0 || original_array_start == 0)
                                 && tail.insertions == setup_tail.insertions
                                 && tail.post_compaction_fusions
                                     == setup_tail.post_compaction_fusions
@@ -8413,8 +8426,14 @@ impl LayoutAssembler {
                                     .post_compaction_fusions
                                     .checked_sub(tail.insertions)
                                     .and_then(|slots| slots.checked_sub(instruction_index - start))
-                                    .is_some_and(|before_suffix| before_suffix > 1)
-                                && null_original_entry_prefix(start, setup_label, &owners);
+                                    .is_some_and(|before| {
+                                        before > 1 && ((original_array_start == 0 && null_original_prefix(0, start, setup_label, &owners)) ||
+                                            start.checked_sub(before).is_some_and(|source| {
+                                                original_array_start <= source
+                                                    && !indexed_instructions[source..start].iter().any(|op| matches!(op.opcode, LOAD_FAST_LOAD_FAST | LOAD_FAST_BORROW_LOAD_FAST_BORROW | STORE_FAST_STORE_FAST | STORE_FAST_LOAD_FAST))
+                                                    && null_original_prefix(source, start, setup_label, &owners)
+                                            }))
+                                    });
                             has_owner &= !(fused_retained_setup_cell || fused_unprotected_prefix);
                             proven_unprotected_slot |=
                                 fused_retained_setup_cell || fused_unprotected_prefix;
@@ -8580,7 +8599,7 @@ impl LayoutAssembler {
                                     .is_some_and(|remaining| {
                                         remaining > protected_before_compaction
                                     })
-                                && null_original_entry_prefix(start, setup_label, &owners);
+                                && null_original_prefix(0, start, setup_label, &owners);
                             if prologue_consumed_all_slots
                                 || prologue_reuses_null_setup
                                 || prologue_reuses_null_prefix
