@@ -17188,6 +17188,26 @@ fn terminal_matches_before_erased_assertions_keep_case_returns() {
 }
 
 #[test]
+fn match_subject_pop_keeps_the_return_line_before_finally() {
+    let source = r"def choose(value):
+    try:
+        match value:
+            case 1:
+                return False
+            case 2:
+                pass
+    finally:
+        clean()
+";
+    assert_matches_cpython_versions(
+        source,
+        "match_subject_pop_before_finally.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn nonlinear_wildcard_match_tails_preserve_false_edge_returns() {
     for prefix in ["def", "async def"] {
         for (case, tail) in [

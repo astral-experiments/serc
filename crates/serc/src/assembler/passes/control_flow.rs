@@ -6729,7 +6729,10 @@ impl OptimizationPipeline {
                         // and unlocated removal rules below still apply normally.
                         && !original_fallthrough_pops.contains(&position)
                         && previous.is_some_and(|previous: &Instruction| {
-                            previous.location.line == instruction.location.line
+                            // NEXT_LOCATION is resolved after NOP removal, so the
+                            // subject pop cannot supply the return's line here.
+                            !previous.fusion_policy.location_from_next()
+                                && previous.location.line == instruction.location.line
                                 && !(ends_scope(previous.opcode)
                                     || is_unconditional_jump(previous.opcode))
                         }))
