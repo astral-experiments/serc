@@ -8278,7 +8278,7 @@ impl Compiler<'_> {
             self.assembler.mark(end);
             Ok(())
         } else {
-            self.compile_bool_expression_at(expression, continuation, false)
+            self.compile_bool_expression_at(expression, continuation, false, &[])
         }
     }
 
@@ -8287,16 +8287,21 @@ impl Compiler<'_> {
         expression: &ruff_python_ast::ExprBoolOp,
         continuation: Option<(BoolOp, SourceLocation)>,
         nested_leading_group: bool,
+        threaded_lines: &[SourceLocation],
     ) -> Result<(), CompileError> {
         // Threading a value-preserving boolean jump into an enclosing test gives it that
         // test's location. The last operand flows directly to the enclosing test, so pass
         // this continuation through trailing groups even when their operators differ.
-        let location = continuation
-            .filter(|(operator, _)| *operator == expression.op)
-            .map_or_else(
-                || self.source_location(expression.range),
-                |(_, location)| location,
-            );
+        let original_location = self.source_location(expression.range);
+        let matching = continuation.filter(|(operator, _)| *operator == expression.op);
+        let location = matching.map_or(original_location, |(_, location)| location);
+        let mut jump_lines = SmallVec::<[SourceLocation; 2]>::new();
+        if matching.is_some() {
+            jump_lines.extend_from_slice(threaded_lines);
+            if jump_lines.last().unwrap_or(&location).line != original_location.line {
+                jump_lines.push(original_location);
+            }
+        }
         let mut effective = Vec::with_capacity(expression.values.len());
         let mut short_circuited = false;
         let mut folded_prefix = false;
@@ -8366,6 +8371,7 @@ impl Compiler<'_> {
                     inner,
                     Some((expression.op, location)),
                     inner.op == expression.op,
+                    &jump_lines,
                 )?;
             } else {
                 self.compile_expression_with_boolean_continuation(
@@ -8373,17 +8379,26 @@ impl Compiler<'_> {
                     Some((expression.op, location)),
                 )?;
             }
-            let original_location = self.source_location(expression.range);
-            if original_location.line != location.line
-                && self
+            for source in jump_lines.iter().rev() {
+                if self
                     .assembler
                     .current_block_last_instruction_location()
-                    .is_none_or(|previous| previous.line != original_location.line)
-            {
-                // Threading into the outer test converts the inner jump to a NOP.
-                // Retain its line event when neither neighboring instruction owns it.
-                self.assembler.set_location(original_location);
-                self.emit(NOP, 0, 0)?;
+                    .is_none_or(|previous| previous.line != source.line)
+                {
+                    // Each jump CPython threads becomes a NOP. Only the original
+                    // conditional occupied an existing exception-owner slot.
+                    self.assembler.set_location(*source);
+                    if *source == original_location {
+                        self.emit(NOP, 0, 0)?;
+                    } else {
+                        self.emit_with_exception_policy(
+                            NOP,
+                            0,
+                            0,
+                            ExceptionPolicy::EXCLUDE_ALWAYS,
+                        )?;
+                    }
+                }
             }
             self.assembler.set_location(location);
             let resumes_after_yield = self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) != 0
@@ -8754,7 +8769,7 @@ impl Compiler<'_> {
             && (inner.op == expression.op
                 || folded_bool_operand(last, self.context.python_version).is_none())
         {
-            self.compile_bool_expression_at(inner, continuation, false)?;
+            self.compile_bool_expression_at(inner, continuation, false, threaded_lines)?;
         } else {
             self.compile_expression_with_boolean_continuation(last, continuation)?;
         }
