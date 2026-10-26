@@ -16178,6 +16178,42 @@ fn nested_function_finally_retains_terminating_handler_boundary() {
 }
 
 #[test]
+fn conditional_finalizer_preserves_jump_before_manager_exit() {
+    let normal = r"def run(manager, flag):
+    with manager:
+        try:
+            prepare()
+        finally:
+            if flag:
+                pass
+            else:
+                finish()
+";
+    let copied = r"async def run(manager, resource, active, flag):
+    with manager:
+        while active:
+            try:
+                async with resource:
+                    break
+            finally:
+                if flag:
+                    finish()
+";
+    assert_matches_cpython_versions(
+        normal,
+        "normal_finalizer_manager_exit.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+    assert_matches_cpython_versions(
+        copied,
+        "copied_finalizer_manager_exit.py",
+        &LEVELS,
+        &[PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn sole_handler_retains_nested_finally_entry_marker() {
     for (header, suspension) in [("def", ""), ("async def", "await ")] {
         for recovery in ["pass", "recover(resource)"] {
