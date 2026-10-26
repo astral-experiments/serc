@@ -11931,6 +11931,23 @@ fn elided_else_preserves_the_original_legacy_scope_footer() {
 }
 
 #[test]
+fn erased_finally_assertion_preserves_both_guard_returns() {
+    let source = "def close(ready):\n    try:\n        prepare()\n    finally:\n        if ready:\n            pass\n        assert ready\n";
+    for source in [source.to_owned(), format!("async {source}")] {
+        assert_matches_cpython_versions(
+            &source,
+            "finally_guard_returns.py",
+            &LEVELS,
+            &[
+                PythonVersion::Py313,
+                PythonVersion::Py314,
+                PythonVersion::Py315,
+            ],
+        );
+    }
+}
+
+#[test]
 fn terminal_finally_and_loop_preserves_returns_before_removed_assertions() {
     for (index, source) in [
         "def f(a, b):\n    try:\n        action()\n    finally:\n        while a and b:\n            action()\n    assert a\n",
