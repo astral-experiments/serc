@@ -3492,7 +3492,7 @@ impl OptimizationPipeline {
         // Normal and exceptional cleanup exits can thread past that join before
         // lines are propagated. Their shared target gives the manager POP no
         // unique donor, even when the guard retains a located NOP.
-        let recorded_guard_join = |source: BasicBlockId, jump: &Instruction| {
+        let recorded_cleanup_join = |source: BasicBlockId, jump: &Instruction| {
             if jump.location.line < 0
                 || !jump.jump_policy.is_original_empty_join()
                 || !jump.jump_policy.preserves_nop_after_threading()
@@ -3507,6 +3507,37 @@ impl OptimizationPipeline {
             let Some(depth) = jump.depth_after() else {
                 return false;
             };
+            if let [fallthrough, branch] = predecessors.as_slice()
+                && positions[fallthrough] + 1 == positions[&source]
+                && super::super::block_has_fallthrough(graph[*fallthrough].items())
+                && let Some(last) = graph[*fallthrough].last_instruction()
+                && last.location == jump.location
+                && last.depth_after() == Some(depth)
+                && !crate::target::is_conditional_jump(last.opcode)
+                && let Some(edge) = graph[*branch].last_instruction()
+                && edge.opcode == JUMP_FORWARD
+                && edge.jump_policy.inline_small_exit()
+                && !edge.fusion_policy.is_authored_break()
+                && edge.pre_fold_extra_instructions() == 0
+                && edge.local_policy.hidden_exception_owner_slots() == 0
+                && edge.location.line >= 0
+                && edge.location.line != last.location.line
+                && edge.depth_after() == Some(depth)
+                && let Some(entry) = edge.forward_target()
+                && graph.label_block(entry) == Some(source)
+                && self
+                    .exception_owner_provenance
+                    .source_boundaries
+                    .contains(&entry)
+                && self
+                    .exception_owner_provenance
+                    .block_boundaries
+                    .contains(&entry)
+            {
+                // The two completed arms enter the same empty join. Both can
+                // bypass its jump before the manager POP receives a location.
+                return true;
+            }
             let mut guard_entry = None;
             let mut cleanup_entry = None;
             for &predecessor in predecessors {
@@ -3594,7 +3625,7 @@ impl OptimizationPipeline {
                     jump.opcode == JUMP_FORWARD
                         && instructions.next().is_none()
                         && positions[&source] < positions[&block]
-                        && (jump.location.line < 0 || recorded_guard_join(source, jump))
+                        && (jump.location.line < 0 || recorded_cleanup_join(source, jump))
                 });
                 let count = if jump_only {
                     expanded_incoming[&source]
