@@ -15443,10 +15443,15 @@ impl<'source> Compiler<'source> {
                     let branch_tail = body.iter().rev().find(|statement| {
                         !matches!(statement, Stmt::Global(_) | Stmt::Nonlocal(_))
                     });
+                    // A return or reraise after a copied finally suite is a live
+                    // continuation of its nested branches, even at the suite's end.
+                    let finalizer_exit = self.context.python_version >= crate::PythonVersion::Py314
+                        && (self.control.finally.copied_return_finally_preserved_values > 0
+                            || self.control.finally.active_finally_end_blocks > 0);
                     let nested_if_exit = branch_tail.and_then(|statement| match statement {
                         Stmt::If(statement) => nested_if_exit_location(
                             statement,
-                            self.control.statements.context.has_following,
+                            self.control.statements.context.has_following || finalizer_exit,
                         )
                         .or_else(|| self.elided_else_exit_location(statement)),
                         // The loop's else can leave its own shared partial-if join.

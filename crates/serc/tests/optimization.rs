@@ -9363,6 +9363,29 @@ fn populated_elif_chains_preserve_conditional_loop_join() {
 }
 
 #[test]
+fn nested_finally_joins_keep_distinct_return_and_reraise_locations() {
+    let source = r"def sample(value, enabled, ready, retry):
+    try:
+        return value
+    finally:
+        if enabled:
+            if ready:
+                commit()
+            else:
+                if retry:
+                    restart()
+        else:
+            close()
+";
+    assert_matches_cpython_versions(
+        source,
+        "nested_finally_exit.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn protected_nested_joins_keep_their_finally_owner() {
     let source = r"async def collect(items, enabled):
     try:
