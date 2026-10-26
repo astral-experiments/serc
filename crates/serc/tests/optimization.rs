@@ -9073,7 +9073,7 @@ fn completed_manager_work_preserves_retained_loop_owners() {
 }
 
 #[test]
-fn python313_manager_unwinds_the_try_after_a_copied_finalizer_join() {
+fn legacy_manager_unwinds_the_try_after_a_copied_finalizer_join() {
     for value in ["value", "None"] {
         let source = format!(
             "def finish(manager, value):\n    with manager:\n        try:\n            try:\n                return {value}\n            finally:\n                try:\n                    process()\n                finally:\n                    close()\n        except ValueError:\n            recover()\n"
@@ -9082,7 +9082,7 @@ fn python313_manager_unwinds_the_try_after_a_copied_finalizer_join() {
             &source,
             "copied_finalizer_join.py",
             &LEVELS,
-            &[PythonVersion::Py313],
+            &[PythonVersion::Py312, PythonVersion::Py313],
         );
     }
 }

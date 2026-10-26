@@ -13065,7 +13065,7 @@ impl<'source> Compiler<'source> {
                     // the resumed unwind artificial so each incoming branch can supply its
                     // location when the shared return block is duplicated.
                     self.assembler.set_location(SourceLocation::NONE);
-                    if self.context.python_version == crate::PythonVersion::Py313
+                    if self.context.python_version <= crate::PythonVersion::Py313
                         && context_index == 0
                         && finally_context.try_body_depth > 0
                         && next_with == finally_context.with_depth
