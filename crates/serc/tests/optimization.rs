@@ -8774,6 +8774,31 @@ fn copied_guarded_recovery_preserves_outer_cleanup_borrow_boundary() {
 }
 
 #[test]
+fn saved_handler_values_replay_the_final_manager_cleanup() {
+    let source = r"async def run(value, flag):
+    try:
+        with acquire():
+            try:
+                work()
+            except KeyError:
+                return factory(value, tag=1)
+    except ValueError:
+        pass
+    finally:
+        if flag is not None:
+            finish()
+";
+    for returned in ["value", "factory(value, tag=1)"] {
+        assert_matches_cpython_versions(
+            &source.replace("factory(value, tag=1)", returned),
+            "saved_handler_manager_cleanup.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn handler_return_copies_terminal_manager_cleanup() {
     for (prefix, work, cleanup) in [
         ("", "resource.record(item)", "resource.finished()"),
