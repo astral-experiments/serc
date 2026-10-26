@@ -1078,7 +1078,7 @@ impl Assembler {
             .legacy_source_jump_labels_fit = true;
     }
 
-    /// Captures the authored jump to a comprehension's nonempty FOR_ITER header.
+    /// Captures the authored jump to a comprehension's nonempty `FOR_ITER` header.
     pub(crate) fn record_legacy_comprehension_backedge(&mut self, entry: Label) {
         if self
             .exception_owner_provenance
