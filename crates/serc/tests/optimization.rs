@@ -19068,4 +19068,10 @@ fn nested_conditional_arms_donate_implicit_return_locations() {
         assert third
 ";
     assert_matches_cpython(source, "nested_implicit_returns.py", &LEVELS);
+    assert_matches_cpython_versions(
+        "async def pick(outer, inner):\n    if outer:\n        pass\n    else:\n        if inner:\n            value = inner\n        else:\n            value = await outer\n        assert value\n",
+        "nested_assignment_returns.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
 }
