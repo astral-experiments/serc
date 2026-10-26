@@ -37909,8 +37909,14 @@ impl<'source> Compiler<'source> {
             self.assembler
                 .exclude_normalized_exception_owner_at(normal_finally_pop_block);
         }
+        // An assertion's failure block is physically adjacent to the success
+        // label. Its RAISE location cannot supply either cleanup footer.
+        let runtime_assertion_exit = self.context.python_version >= crate::PythonVersion::Py313
+            && statement.finalbody.last().is_some_and(|tail|
+                matches!(tail, Stmt::Assert(assertion) if assertion_has_only_runtime_tests(&assertion.test))
+                && !self.context.is_elided_statement(tail));
         if terminal && !finalbody_emitted_fallthrough && !suite_terminates(&statement.finalbody) {
-            if (self.context.python_version == crate::PythonVersion::Py312
+            if runtime_assertion_exit || (self.context.python_version == crate::PythonVersion::Py312
                 && statement.finalbody.last().is_some_and(|statement| {
                     matches!(statement, Stmt::Assign(_))
                         || matches!(statement, Stmt::AnnAssign(assignment) if assignment.value.is_some())
@@ -38237,6 +38243,9 @@ impl<'source> Compiler<'source> {
                 // The normal cleanup exit inherits its unique assertion-success operand,
                 // independently of the failure RAISE's full test location.
                 self.assembler.set_location(self.source_location(range));
+            } else if runtime_assertion_exit {
+                // Multiple successful edges reach the same normal jump.
+                self.assembler.set_location(SourceLocation::NONE);
             } else if (self.control.loops.uncopied_loop_tail_statement == Some(statement.range)
                 || self.control.loops.terminal_while_tail_statement == Some(statement.range))
                 && self.assembler.current_original_block_location().is_none()
@@ -39518,7 +39527,7 @@ impl<'source> Compiler<'source> {
                                 !matches!(statement, Stmt::Global(_) | Stmt::Nonlocal(_))
                                     && !compiler.context.is_elided_statement(statement)
                             });
-                        if (compiler.context.python_version == crate::PythonVersion::Py312
+                        if runtime_assertion_exit || (compiler.context.python_version == crate::PythonVersion::Py312
                             && effective_tail.is_some_and(|statement| {
                                 matches!(statement, Stmt::Assign(_))
                                     || matches!(statement, Stmt::AnnAssign(assignment) if assignment.value.is_some())

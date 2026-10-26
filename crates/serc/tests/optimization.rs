@@ -2164,6 +2164,31 @@ fn named_handler_none_while_break_copies_cleanup() {
 }
 
 #[test]
+fn finally_assertion_exits_inherit_the_successful_operand() {
+    for test in [
+        "first and not second",
+        "first or second",
+        "first if second else third",
+    ] {
+        for following in ["", "    finish()\n"] {
+            let source = format!(
+                "def close(first, second, third):\n    try:\n        work()\n    finally:\n        assert {test}\n{following}"
+            );
+            assert_matches_cpython_versions(
+                &source,
+                "finally_assertion_exit.py",
+                &LEVELS,
+                &[
+                    PythonVersion::Py313,
+                    PythonVersion::Py314,
+                    PythonVersion::Py315,
+                ],
+            );
+        }
+    }
+}
+
+#[test]
 fn retry_breaks_copy_named_handler_interrupt_checks() {
     let source = r"def probe(values, token, item):
     records = []
