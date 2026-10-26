@@ -3489,9 +3489,9 @@ impl OptimizationPipeline {
             }
         }
         // A guard's originally empty join can carry its false-edge line early.
-        // Its cleanup predecessor still threads past that join before line
-        // propagation. Preserve the original two donor paths to a manager POP;
-        // the retained guard NOP must not turn them into one cleanup-line donor.
+        // Normal and exceptional cleanup exits can thread past that join before
+        // lines are propagated. Their shared target gives the manager POP no
+        // unique donor, even when the guard retains a located NOP.
         let recorded_guard_join = |source: BasicBlockId, jump: &Instruction| {
             if jump.location.line < 0
                 || !jump.jump_policy.is_original_empty_join()
@@ -3504,48 +3504,78 @@ impl OptimizationPipeline {
             let Some(predecessors) = incoming.get(&source) else {
                 return false;
             };
-            let [first, second] = predecessors.as_slice() else {
+            let Some(depth) = jump.depth_after() else {
                 return false;
             };
-            let (Some(first), Some(second)) = (
-                graph[*first].last_instruction(),
-                graph[*second].last_instruction(),
-            ) else {
-                return false;
-            };
-            let (guard, cleanup) = if first.opcode == POP_JUMP_IF_NONE {
-                (first, second)
-            } else {
-                (second, first)
-            };
-            guard.opcode == POP_JUMP_IF_NONE
-                && guard.location == jump.location
-                && guard.local_policy.hidden_exception_owner_slots() == 3
-                && self
-                    .exception_owner_provenance
-                    .source_none_conditions
+            let mut guard_entry = None;
+            let mut cleanup_entry = None;
+            for &predecessor in predecessors {
+                let mut instructions = graph[predecessor]
+                    .items()
                     .iter()
-                    .filter(|origin| origin.instruction == *guard)
-                    .count()
-                    == 1
-                && cleanup.opcode == JUMP_FORWARD
-                && cleanup.location.line >= 0
-                && cleanup.local_policy.hidden_exception_owner_slots() == 0
-                && guard.operand() != cleanup.operand()
-                && guard.depth_after().is_some()
-                && guard.depth_after() == cleanup.depth_after()
-                && guard.depth_after() == jump.depth_after()
-                && [guard, cleanup].iter().all(|instruction| {
-                    instruction.pre_fold_extra_instructions() == 0
-                        && instruction.exception_policy() == ExceptionPolicy::default()
-                        && !instruction.no_location_policy.preserves_location()
-                        && !instruction.fusion_policy.is_authored_break()
-                        && instruction.jump_policy.inline_small_exit()
-                        && matches!(instruction.operand(), Operand::Forward(label)
-                            if graph.label_block(label) == Some(source)
-                                && self.exception_owner_provenance.source_boundaries.contains(&label)
-                                && self.exception_owner_provenance.block_boundaries.contains(&label))
-                })
+                    .rev()
+                    .filter_map(Item::as_instruction);
+                let Some(edge) = instructions.next() else {
+                    return false;
+                };
+                let Some(entry) = edge.forward_target() else {
+                    return false;
+                };
+                if edge.pre_fold_extra_instructions() != 0
+                    || edge.exception_policy() != ExceptionPolicy::default()
+                    || edge.no_location_policy.preserves_location()
+                    || edge.fusion_policy.is_authored_break()
+                    || !edge.jump_policy.inline_small_exit()
+                    || edge.depth_after() != Some(depth)
+                    || graph.label_block(entry) != Some(source)
+                    || !self
+                        .exception_owner_provenance
+                        .source_boundaries
+                        .contains(&entry)
+                    || !self
+                        .exception_owner_provenance
+                        .block_boundaries
+                        .contains(&entry)
+                {
+                    return false;
+                }
+                if edge.opcode == JUMP_FORWARD {
+                    if edge.location.line < 0
+                        || edge.local_policy.hidden_exception_owner_slots() != 0
+                        || cleanup_entry.is_some_and(|prior| prior != entry)
+                    {
+                        return false;
+                    }
+                    cleanup_entry = Some(entry);
+                } else {
+                    let original_guard = match edge.opcode {
+                        POP_JUMP_IF_NONE => {
+                            predecessors.len() == 2
+                                && edge.local_policy.hidden_exception_owner_slots() == 3
+                                && self
+                                    .exception_owner_provenance
+                                    .source_none_conditions
+                                    .iter()
+                                    .filter(|origin| origin.instruction == *edge)
+                                    .count()
+                                    == 1
+                        }
+                        POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE => {
+                            predecessors.len() >= 3
+                                && edge.local_policy.hidden_exception_owner_slots() == 0
+                                && instructions.next().is_some_and(|test| {
+                                    test.opcode == TO_BOOL && test.location == edge.location
+                                })
+                        }
+                        _ => false,
+                    };
+                    if !original_guard || guard_entry.is_some() || edge.location != jump.location {
+                        return false;
+                    }
+                    guard_entry = Some(entry);
+                }
+            }
+            guard_entry.is_some() && cleanup_entry.is_some() && guard_entry != cleanup_entry
         };
         // A shared unlocated jump-only array cannot acquire a line, so it also
         // cannot donate one to its successor. This remains true if conditional
