@@ -2251,6 +2251,33 @@ fn iterator_returns_unwind_inner_try_before_copied_none_guard() {
 }
 
 #[test]
+fn iterator_returns_unwind_the_iterator_before_the_outer_try() {
+    for header in ["for item in items:", "async for item in items:"] {
+        let source = format!(
+            "async def sample(items, value, enabled):
+    try:
+        while enabled:
+            {header}
+                await work()
+                return
+    except ValueError:
+        pass
+    finally:
+        if value is not None:
+            clean(value)
+        done()
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "outer_try_iterator_return.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn copied_return_through_nested_loops_keeps_none_guard_owner() {
     let source = r#"async def sample(client, response):
     for attempt in range(client.attempts):

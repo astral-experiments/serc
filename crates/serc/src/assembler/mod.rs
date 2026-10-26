@@ -12240,7 +12240,7 @@ impl Assembler {
         pop_item: usize,
         manager: bool,
         handler: bool,
-        iterator_try: bool,
+        iterator_try_pop_slot: Option<usize>,
     ) {
         use crate::target::opcodes::{CALL, DELETE_FAST, STORE_FAST};
 
@@ -12382,7 +12382,7 @@ impl Assembler {
                 cleanup,
                 manager,
                 handler,
-                iterator_try,
+                iterator_try_pop_slot,
                 pop: *pop,
                 load: *load,
                 condition: *condition,
