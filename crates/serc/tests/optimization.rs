@@ -1755,6 +1755,33 @@ fn asserted_async_iterator_break_keeps_cleanup_cold() {
 }
 
 #[test]
+fn nested_finalizer_call_keeps_original_reraise_copy_width() {
+    for argument in [
+        "left if flag else right",
+        "{0: left if flag else right}",
+        "[left if flag else right], flag",
+    ] {
+        let source = format!(
+            "def finish(flag, left, right):
+    try:
+        pass
+    finally:
+        try:
+            work()
+        finally:
+            send({argument})
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "finalizer_call_width.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn nested_reraise_cleanup_keeps_awaited_store_reachable() {
     let source = "async def sample():\n    try:\n        if native:\n            await session.close()\n        else:\n            await session.detach()\n    except CancelledError as error:\n        raise\n    except OwnershipError as error:\n        recovered = error\n    finally:\n        try:\n            if not native:\n                if session.reusable:\n                    await pool.release(lease)\n                else:\n                    retired = await replace(pool, name=lease.name, expected=lease.backend, lease=lease)\n                    if retired and isinstance(pool, Pool):\n                        disposition = 'retired'\n        except BaseException as failure:\n            raise\n";
     assert_matches_cpython(source, "nested_reraise_cleanup.py", &LEVELS);
