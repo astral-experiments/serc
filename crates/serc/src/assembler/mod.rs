@@ -12037,9 +12037,22 @@ impl Assembler {
                 Item::Instruction(instruction) => Some((index, *instruction)),
                 Item::Label(_) => None,
             })
-            .take(3)
+            .take(4)
             .collect::<Vec<_>>();
-        let [(.., pop_except), (.., handler_pop), (swap_item, swap)] = preceding.as_slice() else {
+        let (unwind, final_pops) = match preceding.as_slice() {
+            [(_, extra), tail @ ..]
+                if extra.opcode == NOP
+                    && extra.fusion_policy.is_converted_pop_block()
+                    && extra.value_argument() == Some(0)
+                    && extra.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
+                    && extra.local_policy.hidden_exception_owner_slots() == 0
+                    && extra.pre_fold_extra_instructions() == 0 =>
+            {
+                (tail, 2)
+            }
+            tail => (tail, 1),
+        };
+        let [(_, pop_except), (_, handler_pop), (swap_item, swap), ..] = unwind else {
             return;
         };
         let following = items[final_pop_item..]
@@ -12089,7 +12102,7 @@ impl Assembler {
         };
         self.exception_owner_provenance
             .copied_handler_return_none_prefixes
-            .push((entry, records));
+            .push((entry, records, final_pops));
     }
 
     /// Captures a saved named-handler return whose enclosing async manager unwinds later.

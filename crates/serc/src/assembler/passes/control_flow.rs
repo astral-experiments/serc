@@ -4632,7 +4632,7 @@ impl OptimizationPipeline {
                         origin.condition = *instruction;
                     }
                 }
-                for (_, records) in &mut *handler_none_prefixes {
+                for (_, records, _) in &mut *handler_none_prefixes {
                     if records[5] == original_condition {
                         records[5] = *instruction;
                     }
