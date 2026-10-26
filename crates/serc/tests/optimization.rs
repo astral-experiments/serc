@@ -10406,6 +10406,25 @@ fn conditional_attribute_copies_fuse_aliased_local_entries() {
 }
 
 #[test]
+fn final_elif_after_recovery_keeps_each_false_backedge() {
+    let source = "def sample(items, selected, first, second):
+    for item in items:
+        try:
+            try:
+                prepare()
+            except TypeError:
+                recover()
+            if selected:
+                consume(item)
+            elif first and second:
+                finish()
+        except ValueError:
+            continue
+";
+    assert_matches_cpython(source, "protected_elif_backedges.py", &LEVELS);
+}
+
+#[test]
 fn conditional_call_preserves_erased_else_try_exit() {
     for (index, (call, otherwise)) in [
         ("consume(item if enabled else values)", "assert item"),

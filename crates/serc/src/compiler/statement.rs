@@ -22448,8 +22448,7 @@ impl<'source> Compiler<'source> {
                     ));
             // A completed try in the prefix cannot locate a separate empty false
             // join reached only by this condition's original runtime edges.
-            let independent_original_fallthrough = statement.elif_else_clauses.is_empty()
-                && condition_has_only_runtime_tests(&statement.test)
+            let independent_original_fallthrough = condition_has_only_runtime_tests(fallthrough_test)
                 && self.control.exceptions.normal_try_loop_tail_owner
                     == Some((
                         restart,
