@@ -7679,15 +7679,44 @@ impl<'source> Compiler<'source> {
                         .is_some_and(|finally| {
                             finally.exception_region_depth > context.exception_region_depth
                         });
+                // The surrounding ordinary try ends between the copied guard and
+                // the continue. Each incoming edge receives its own backedge
+                // after that POP_BLOCK, with the guard itself still protected.
+                let sync_continue_test = if let [finally] =
+                    self.control.finally.active_loop_finally_contexts.as_slice()
+                    && let [Stmt::If(tail)] = finally.body
+                    && context.iterator_cleanup == IteratorCleanup::Sync
+                    && finally.loop_depth == self.control.loops.contexts.len()
+                    && finally.with_depth == context.with_depth
+                    && context.exception_region_depth.checked_add(1)
+                        == Some(finally.exception_region_depth)
+                    && finally.try_body_depth
+                        == self.control.exceptions.active_try_marker_slots.len()
+                    && self.control.exceptions.active_exception_handlers.is_empty()
+                    && self.control.withs.active_with_exits.len() == context.with_depth
+                    && self.control.finally.active_finally_end_blocks == context.finally_end_depth
+                    && tail.elif_else_clauses.is_empty()
+                    && original_condition_has_unique_jump_target(&tail.test, false)
+                    && condition_has_only_runtime_tests(&tail.test)
+                    && !expression_suspends_current_scope(&tail.test)
+                    && (matches!(tail.body.as_slice(), [Stmt::Pass(_)])
+                        || suite_has_linear_borrow_fallthrough(&tail.body))
+                {
+                    Some(self.source_location(tail.test.range()))
+                } else {
+                    None
+                };
                 let copies_finally_continue_exit = !legacy_pending_finally_try
-                    && copied_finally_continue_test.is_some_and(|test| {
-                        self.assembler.allow_copied_finally_continue_exit(
-                            continue_jump,
-                            context.continue_label,
-                            test,
-                            finally_unwind_start,
-                        )
-                    });
+                    && copied_finally_continue_test
+                        .or(sync_continue_test)
+                        .is_some_and(|test| {
+                            self.assembler.allow_copied_finally_continue_exit(
+                                continue_jump,
+                                context.continue_label,
+                                test,
+                                finally_unwind_start,
+                            )
+                        });
                 if !copies_finally_continue_exit
                     && !legacy_pending_finally_try
                     && self

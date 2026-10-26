@@ -11241,7 +11241,7 @@ impl Assembler {
         }
     }
 
-    /// Lets a copied await finalizer's false edge receive a private, unlocated exit copy.
+    /// Lets a copied finalizer's false edge receive a private, unlocated exit copy.
     pub(crate) fn allow_copied_finally_continue_exit(
         &mut self,
         emitted: EmittedJump,

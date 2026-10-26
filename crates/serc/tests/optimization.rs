@@ -5451,6 +5451,21 @@ fn erased_branches_preserve_nested_finalizer_loop_exits() {
 }
 
 #[test]
+fn copied_finalizer_guard_preserves_each_continue_backedge() {
+    for cleanup in ["pass", "release(item)"] {
+        let source = format!(
+            "def sample(items, flag):\n    for item in items:\n        try:\n            try:\n                if flag:\n                    continue\n                use(item)\n            finally:\n                if item >= 0:\n                    {cleanup}\n        except ValueError:\n            pass\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "guarded_copied_finalizer_continue.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn erased_prefix_preserves_conditional_continue_exit() {
     let source = r#"async def sample(items, selected, verify):
     for item in items:
