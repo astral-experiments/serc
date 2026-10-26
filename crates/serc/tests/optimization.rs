@@ -12999,6 +12999,45 @@ fn erased_assertion_preserves_try_break_exit_donor() {
 }
 
 #[test]
+fn try_else_break_donates_its_copied_exit_location() {
+    let backedge = r"def run(outer, inner, manager):
+    while outer:
+        while inner:
+            try:
+                prepare()
+            except ValueError:
+                recover()
+            else:
+                with manager:
+                    finish()
+                break
+";
+    let implicit_return = r"def run(active):
+    try:
+        while active:
+            try:
+                prepare()
+            except ValueError:
+                recover()
+            else:
+                finish()
+                break
+        else:
+            raise LookupError
+    except RuntimeError:
+        pass
+";
+    for source in [backedge, implicit_return] {
+        assert_matches_cpython_versions(
+            source,
+            "try_else_break_exit.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn nested_try_else_break_preserves_borrowed_tail() {
     for (index, (nested, conditional, else_assignment, work_before_break)) in [
         (true, true, true, false),

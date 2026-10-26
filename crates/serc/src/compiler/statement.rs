@@ -27366,6 +27366,15 @@ impl<'source> Compiler<'source> {
                     .map(|statement| self.source_location(statement.range()))
             })
             .flatten();
+        if self.context.python_version >= crate::PythonVersion::Py314
+            && statement.finalbody.is_empty()
+            && let [.., Stmt::With(_), Stmt::Break(tail)] = statement.orelse.as_slice()
+        {
+            // A manager followed by a break normally retains its marker through threading.
+            // Here the separate try-else exit can copy the break's line onto a backedge.
+            self.assembler
+                .limit_break_nop_to_direct_target(self.source_location(tail.range));
+        }
         let normal_exit_ends_in_nop = self.assembler.last_instruction_is_nop();
         if direct_continue {
         } else if terminal {
@@ -27451,6 +27460,15 @@ impl<'source> Compiler<'source> {
                 && let Some(range) = suite_assert_success_fallthrough_range(normal_exit_suite)
             {
                 self.assembler.set_location(self.source_location(range));
+            } else if self.context.python_version >= crate::PythonVersion::Py314
+                && let Some(Stmt::While(while_loop)) = normal_exit_suite.last()
+                && suite_terminates(&while_loop.orelse)
+                && matches!(while_loop.body.last(), Some(Stmt::Try(inner))
+                    if inner.finalbody.is_empty() && matches!(inner.orelse.last(), Some(Stmt::Break(_))))
+            {
+                // Exhaustion exits in the while-else suite. Only breaks reach the implicit
+                // return, so each copy inherits its own edge's location.
+                self.assembler.set_location(SourceLocation::NONE);
             } else if self.terminal_for_break_exit_inherits_predecessor(normal_exit_suite) {
                 // The try's terminal footer is shared by loop exhaustion and break
                 // edges, including loops in its else suite. Copies inherit each

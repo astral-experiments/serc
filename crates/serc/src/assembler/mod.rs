@@ -8847,6 +8847,16 @@ impl Assembler {
             .retain_nop();
     }
 
+    /// A break that threads out of a try-else arm can donate its line to the copied exit.
+    pub(crate) fn limit_break_nop_to_direct_target(&mut self, location: SourceLocation) {
+        if let Some(jump) = self.last_instruction_mut()
+            && jump.fusion_policy.is_authored_break()
+            && jump.location == location
+        {
+            jump.jump_policy.limit_nop_retention_to_direct_target();
+        }
+    }
+
     /// Certifies an original case-success edge without introducing a block boundary.
     pub(crate) fn record_original_match_success(
         &mut self,

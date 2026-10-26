@@ -737,6 +737,13 @@ impl JumpPolicy {
         self.0 |= Self::ORIGINAL_SHARED_EMPTY_JOIN;
     }
 
+    /// Retains the authored marker only while its jump still targets the original exit.
+    pub(super) fn limit_nop_retention_to_direct_target(&mut self) {
+        if self.always_retains_nop() {
+            self.0 = (self.0 & !Self::RETAINED_NOP_MASK) | Self::RETAINED_NOP_DIRECT_TARGET;
+        }
+    }
+
     fn clear_direct_target_retention(&mut self) {
         if matches!(self.retained_nop(), RetainedJumpNop::DirectTarget)
             && self.0 & Self::RETAIN_NOP_AFTER_RETARGETING == 0
