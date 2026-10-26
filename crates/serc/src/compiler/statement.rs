@@ -24051,7 +24051,7 @@ impl<'source> Compiler<'source> {
     }
 
     /// Finds an erased Boolean join that must precede the iterator's unlocated backedge.
-    /// Linear prefixes and enclosing one-arm conditions preserve that same join.
+    /// Earlier statements complete before the join, including nested loops and conditionals.
     fn optimized_iterator_if_join(
         &self,
         statement: &ruff_python_ast::StmtFor,
@@ -24071,7 +24071,7 @@ impl<'source> Compiler<'source> {
         }
         let mut body = statement.body.as_slice();
         loop {
-            let (Stmt::If(branch), prefix) = body.split_last()? else {
+            let Stmt::If(branch) = body.last()? else {
                 return None;
             };
             let guarded_else_join = statement.orelse.is_empty()
@@ -24084,26 +24084,6 @@ impl<'source> Compiler<'source> {
                         && outer.finally_end_depth
                             == self.control.finally.active_finally_end_blocks)
                 && self.erased_disjunction_with_guarded_else(branch);
-            if !prefix.iter().all(|statement| {
-                self.context.is_elided_statement(statement)
-                    || suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement))
-                    // Both value edges finish at the local store before this tail join.
-                    || (guarded_else_join
-                        && matches!(statement, Stmt::Assign(assignment)
-                            if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
-                                && matches!(assignment.value.as_ref(), Expr::BoolOp(_))
-                                && expression_has_completed_boolean_value(&assignment.value)))
-                    // A conditional continue targets the iterator head separately;
-                    // its false edge leaves this tail's original empty join intact.
-                    || matches!(statement, Stmt::If(guard)
-                        if guard.elif_else_clauses.is_empty()
-                            && matches!(guard.body.as_slice(), [Stmt::Continue(_)])
-                            && condition_has_only_runtime_tests(&guard.test)
-                            && condition_has_linear_runtime_leaves(&guard.test)
-                            && !expression_suspends_current_scope(&guard.test))
-            }) {
-                return None;
-            }
             if self.optimized_conditional_join(branch) || guarded_else_join {
                 return Some(branch.range);
             }

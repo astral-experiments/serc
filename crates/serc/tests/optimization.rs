@@ -9178,6 +9178,17 @@ fn protected_completed_inner_for_preserves_erased_else_backedge() {
 }
 
 #[test]
+fn erased_iterator_guard_keeps_its_join_after_a_conditional_prefix() {
+    let source = "def collect(values, flag, first, last):\n    for value in values:\n        if flag:\n            consume(value)\n        if first or not last:\n            assert value\n";
+    assert_matches_cpython_versions(
+        source,
+        "erased_iterator_guard.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn erased_nested_arms_keep_the_enclosing_iterator_exit() {
     let source = r"def process(items, flags, kinds, width):
     with manager() as owner, manager(), manager(), manager(), manager(), manager():
