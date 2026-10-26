@@ -10108,9 +10108,7 @@ impl<'source> Compiler<'source> {
                         // its original position without adding another exception range.
                         let copied_unnamed_try_pop = (self.context.python_version
                             == crate::PythonVersion::Py314
-                            && self.unit.flags
-                                & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                                == CO_COROUTINE
+                            && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
                             && enclosing_try_owns_pop_except
                             && protected_pop_except.is_none()
                             && !preserve_tos
