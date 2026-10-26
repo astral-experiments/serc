@@ -19090,7 +19090,7 @@ fn python312_value_patterns_preserve_loop_jump_widths() {
     for pattern in ["Kind.READY", "Kind.READY | Kind.SET", "Kind.READY if guard"] {
         let mut source = String::from("def choose(item, items, guard):\n");
         source.push_str(&"    result = 0\n".repeat(135));
-        source.push_str(&format!("    match item:\n        case {pattern}:\n            done()\n        case _:\n            pass\n    for item in items:\n"));
+        writeln!(source, "    match item:\n        case {pattern}:\n            done()\n        case _:\n            pass\n    for item in items:").unwrap();
         source.push_str(&"        result = 1\n".repeat(124));
         source.push_str("        if guard:\n            finish(item)\n    return result\n");
         assert_matches_cpython_versions(
