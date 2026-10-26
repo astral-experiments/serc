@@ -96,6 +96,22 @@ fn erased_named_handler_suffix_preserves_cleanup_copies() {
 }
 
 #[test]
+fn protected_collection_guard_uses_fused_local_tail() {
+    for count in 1..=4 {
+        let prefix = "    prepare(first, second)\n".repeat(count);
+        let source = format!(
+            "def collect(first, second, items):\n{prefix}    try:\n        return tuple(convert(item) for item in items)\n    finally:\n        close()\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "collection_guard_tail.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn conditional_try_body_preserves_else_return_join() {
     let source = r"def sample(flag):
     try:

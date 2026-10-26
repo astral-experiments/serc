@@ -8270,21 +8270,52 @@ impl LayoutAssembler {
                         if let Some((start, setup_tail, setup_label)) = protected_suffix
                             && tail.late_removals == 0
                         {
+                            // A builtin identity check is already present at the fusion
+                            // pass. Its appended marker can reuse one of these five cells.
+                            let fused_builtin_guard = instruction.opcode == NOT_TAKEN
+                                && instruction.exception_policy().owner()
+                                    == NormalizedExceptionOwner::DynamicConditionStrict
+                                && owner_history_exact
+                                && pop_slot_epoch_known
+                                && tail.insertions == 0
+                                && (1..=5).contains(&tail.post_compaction_fusions)
+                                && tail.post_compaction_fusions
+                                    == setup_tail.post_compaction_fusions
+                                && start
+                                    .checked_sub(1)
+                                    .is_some_and(|i| retained_setup_nops.contains(&i))
+                                && indexed_instructions[start..instruction_index].iter().all(
+                                    |record| {
+                                        record.location == instruction.location
+                                            && record.local_policy.hidden_exception_owner_slots()
+                                                == 0
+                                            && record.pre_fold_extra_instructions() == 0
+                                    },
+                                )
+                                && matches!(&indexed_instructions[start..instruction_index], [load, copy, common, is_op, jump]
+                                    if load.opcode == LOAD_GLOBAL && load.value_argument().is_some_and(|arg| arg & 1 == 0)
+                                        && copy.opcode == crate::target::opcodes::COPY && copy.value_argument() == Some(1)
+                                        && common.opcode == crate::target::opcodes::LOAD_COMMON_CONSTANT
+                                        && is_op.opcode == crate::target::opcodes::IS_OP && is_op.value_argument() == Some(0)
+                                        && jump.opcode == crate::target::opcodes::POP_JUMP_IF_FALSE);
+                            has_owner |= fused_builtin_guard;
                             // Local fusion leaves a newer tail than peephole compaction.
                             // Boolean COPY/TO_BOOL expansion consumes that tail first; use
                             // its geometry while a fusion slot remains for this marker.
-                            let (removed, setup_removed) = if instruction.exception_policy().owner()
-                                == NormalizedExceptionOwner::Dynamic
-                                && owner_history_exact
-                                && tail.post_compaction_fusions > tail.insertions + insertions
-                            {
-                                (
-                                    tail.post_compaction_fusions,
-                                    setup_tail.post_compaction_fusions,
-                                )
-                            } else {
-                                (tail.early_removals, setup_tail.early_removals)
-                            };
+                            let (removed, setup_removed) =
+                                if (instruction.exception_policy().owner()
+                                    == NormalizedExceptionOwner::Dynamic
+                                    || fused_builtin_guard)
+                                    && owner_history_exact
+                                    && tail.post_compaction_fusions > tail.insertions + insertions
+                                {
+                                    (
+                                        tail.post_compaction_fusions,
+                                        setup_tail.post_compaction_fusions,
+                                    )
+                                } else {
+                                    (tail.early_removals, setup_tail.early_removals)
+                                };
                             let protected_original_instructions =
                                 (instruction_index - start + removed - setup_removed)
                                     .saturating_sub(
