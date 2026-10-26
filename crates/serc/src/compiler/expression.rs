@@ -622,6 +622,10 @@ impl Compiler<'_> {
                 .last()
                 .is_some_and(|case| is_wildcard_pattern(&case.pattern));
         let matched_cases = statement.cases.len() - usize::from(has_default);
+        let guarded_try_tail = !has_default
+            && matched_cases > 1
+            && self.control.exceptions.active_try_body_tail == Some(statement.range)
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE;
         let mut failure_reaches_end = false;
         let mut specialized_none_seen = false;
         let mut or_default_success_exit = None;
@@ -952,6 +956,9 @@ impl Compiler<'_> {
                         end,
                         loop_tail,
                         index + 1 == matched_cases && !context.fail_pop.is_empty(),
+                        guarded_try_tail
+                            && case.guard.is_some()
+                            && matches!(case.pattern, Pattern::MatchValue(_)),
                     )?;
                     true
                 } else {
@@ -1057,7 +1064,20 @@ impl Compiler<'_> {
                         }
                     }
                 }
-                if !emitted_case_exit && !suite_terminates(&case.body) && !emitted_fallthrough {
+                // The last successful deletion falls directly onto the try's normal
+                // exit. A synthetic case-end jump would jump to the next instruction.
+                let final_guarded_deletion = index + 1 == matched_cases
+                    && guarded_try_tail
+                    && self.context.python_version >= PythonVersion::Py314
+                    && case.guard.is_some()
+                    && matches!(case.pattern, Pattern::MatchValue(_))
+                    && matches!(case.body.last(),Some(Stmt::Delete(deletion)) if deletion.targets.iter().all(|target| matches!(target, Expr::Name(_))))
+                    && context.fail_pop.len() <= 1;
+                if !emitted_case_exit
+                    && !suite_terminates(&case.body)
+                    && !emitted_fallthrough
+                    && !final_guarded_deletion
+                {
                     // The final nested pattern's failure reaches this outer case exit;
                     // successful inner cases have already copied or bypassed that exit.
                     let nested_pattern_failure = matches!(case.body.last(), Some(Stmt::Match(nested))
@@ -1572,6 +1592,7 @@ impl Compiler<'_> {
         match_end: Label,
         loop_tail: bool,
         final_case: bool,
+        guarded_try_tail: bool,
     ) -> Result<(), CompileError> {
         let base_depth = self.control.stack.depth;
         let false_exit = self.assembler.label();
@@ -1592,7 +1613,7 @@ impl Compiler<'_> {
             && !suite_terminates(&nested.body)
         {
             self.compile_suite(leading)?;
-            self.compile_match_case_tail_if(nested, match_end, true, final_case)?;
+            self.compile_match_case_tail_if(nested, match_end, true, final_case, false)?;
         } else {
             if loop_tail {
                 self.compile_suite(&statement.body)?;
@@ -1652,14 +1673,15 @@ impl Compiler<'_> {
                     })
                 });
             let original_unlocated_head = self.assembler.at_jump_target();
-            // A nested match at its enclosing case exit can copy that unlocated
-            // exit onto each condition before the false edges donate their lines.
+            // A protected case can copy its unlocated exit onto each condition
+            // before the false edges donate their lines.
             let protected_case_exit = !final_case
-                && self
-                    .control
-                    .statements
-                    .match_tail_before_case_exit
-                    .is_some()
+                && (guarded_try_tail
+                    || self
+                        .control
+                        .statements
+                        .match_tail_before_case_exit
+                        .is_some())
                 && self.context.python_version >= PythonVersion::Py314
                 && !self
                     .control
