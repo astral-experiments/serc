@@ -28448,14 +28448,28 @@ impl<'source> Compiler<'source> {
                                 && self.context.fold_constant(&assignment.value).is_some()
                                 && self.assembler.current_original_block_location()
                                     == Some(self.source_location(assignment.targets[0].range()))));
-            // A final class failure falls through to its own original try exit.
-            // Successful cases thread past it to the manager cleanup. The failure
-            // POP_TOP's location cannot absorb this separate protected jump slot.
-            let retained_manager_match_failure = !statement.is_star
+            // Only the final arm falls through with its POP_TOP in the original
+            // match array. Its following try-exit jump has a separate line slot.
+            let coroutine_match_pop = !statement.is_star
                 && statement.orelse.is_empty()
                 && statement.finalbody.is_empty()
                 && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                     == CO_COROUTINE
+                && self.assembler.at_original_match_join()
+                && self
+                    .assembler
+                    .instruction_opcode_at(self.assembler.instruction_count().saturating_sub(1))
+                    == Some(POP_TOP);
+            let retained_match_fallthrough = coroutine_match_pop
+                && self.context.python_version >= crate::PythonVersion::Py314
+                && matches!(statement.body.last(), Some(Stmt::Match(matched))
+                    if matched.cases.last().is_some_and(|case| case.guard.is_none()
+                        && ((matches!(case.pattern, Pattern::MatchClass(_))
+                            && matched.cases.iter().all(|case| suite_terminates_before_constant_folding(&case.body)))
+                            || (is_wildcard_pattern(&case.pattern)
+                                && matches!(case.body.last(), Some(Stmt::Expr(_)))))));
+            // Successful cases thread past the final class failure to the manager cleanup.
+            let retained_manager_match_failure = coroutine_match_pop
                 && self.control.loops.contexts.is_empty()
                 && self.control.exceptions.active_exception_handlers.is_empty()
                 && self.control.exceptions.active_exception_group_handlers == 0
@@ -28469,33 +28483,26 @@ impl<'source> Compiler<'source> {
                         && manager.exception_region_depth
                             == self.control.exceptions.active_exception_region_exclusions.len())
                 && matches!(statement.handlers.as_slice(), [handler]
-                    if handler.as_except_handler().is_some_and(|handler| {
-                        handler.type_.is_some()
-                            && handler.name.is_some()
-                            && matches!(handler.body.last(), Some(Stmt::Raise(raise))
-                                if raise.exc.is_none() && raise.cause.is_none())
-                    }))
-                && self.assembler.at_original_match_join()
-                // A live match end becomes a CFG boundary only after emission.
-                // Its producer certificate uses the final failure POP_TOP, not
-                // a block scan that still reaches through the match-end label.
-                && self.assembler.instruction_opcode_at(
-                    self.assembler.instruction_count().saturating_sub(1),
-                ) == Some(POP_TOP)
+                if handler.as_except_handler().is_some_and(|handler| {
+                    handler.type_.is_some()
+                        && handler.name.is_some()
+                        && matches!(handler.body.last(), Some(Stmt::Raise(raise))
+                            if raise.exc.is_none() && raise.cause.is_none())
+                }))
                 && matches!(statement.body.as_slice(), [Stmt::Match(matched)]
-                    if match_has_multiple_normal_case_exits(matched)
-                        && matched.cases.last().is_some_and(|case| {
-                            matches!(&case.pattern, Pattern::MatchClass(pattern)
-                                if pattern.arguments.patterns.is_empty()
-                                    && pattern.arguments.keywords.is_empty()
-                                    && self.assembler.last_instruction_location()
-                                        == Some(self.source_location(pattern.range)))
-                                && matches!(case.body.as_slice(), [Stmt::Expr(expression)]
-                                    if matches!(expression.value.as_ref(), Expr::Await(awaited)
-                                        if matches!(awaited.value.as_ref(), Expr::Call(_))
-                                            && !expression_contains_inline_branch(&awaited.value)
-                                            && !expression_suspends_current_scope(&awaited.value)))
-                        }));
+                if match_has_multiple_normal_case_exits(matched)
+                    && matched.cases.last().is_some_and(|case| {
+                        matches!(&case.pattern, Pattern::MatchClass(pattern)
+                            if pattern.arguments.patterns.is_empty()
+                                && pattern.arguments.keywords.is_empty()
+                                && self.assembler.last_instruction_location()
+                                    == Some(self.source_location(pattern.range)))
+                            && matches!(case.body.as_slice(), [Stmt::Expr(expression)]
+                                if matches!(expression.value.as_ref(), Expr::Await(awaited)
+                                    if matches!(awaited.value.as_ref(), Expr::Call(_))
+                                        && !expression_contains_inline_branch(&awaited.value)
+                                        && !expression_suspends_current_scope(&awaited.value)))
+                    }));
             if (self.assembler.python_version() == crate::PythonVersion::Py312
                 && (matches!(normal_exit_suite.last(), Some(Stmt::Assign(_)))
                     || matches!(normal_exit_suite.last(), Some(Stmt::AnnAssign(assignment))
@@ -29572,7 +29579,7 @@ impl<'source> Compiler<'source> {
                         .prevent_borrow_jump_threading_target(normal_exit);
                 }
             }
-            if retained_manager_match_failure {
+            if retained_manager_match_failure || retained_match_fallthrough {
                 self.assembler
                     .preserve_redundant_jump_nop_after_threading(normal_exit);
             }
