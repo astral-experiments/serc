@@ -9073,6 +9073,21 @@ fn completed_manager_work_preserves_retained_loop_owners() {
 }
 
 #[test]
+fn manager_pop_has_no_line_after_multiple_conditional_cleanup_exits() {
+    for guard in ["flag", "not flag", "enabled()"] {
+        let source = format!(
+            "def run(resource, nested, flag):\n    with resource:\n        try:\n            pass\n        finally:\n            try:\n                pass\n            finally:\n                if {guard}:\n                    with nested:\n                        pass\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "nested_manager_pop.py",
+            &LEVELS,
+            &[PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn protected_conditional_store_preserves_erased_else_backedge() {
     let protected = r"def collect(batches, left, right, cleanup, sink):
     try:
