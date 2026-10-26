@@ -15909,6 +15909,27 @@ fn optimized_empty_manager_bodies_match_cpython() {
 }
 
 #[test]
+fn literal_tuple_arithmetic_keeps_its_original_exception_slots() {
+    let source = r"def sample(value, v0, v1, v2):
+    def cap():
+        return v0, v1, v2
+    data = (1, 2) * 2 + (3,) * 2 + (4,) * 2
+    prepare(value)
+    try:
+        if value == 0:
+            work()
+    finally:
+        clean()
+";
+    assert_matches_cpython_versions(
+        source,
+        "tuple_arithmetic_guard.py",
+        &LEVELS,
+        &[PythonVersion::Py314],
+    );
+}
+
+#[test]
 fn modern_manager_finally_jump_and_copied_exit_keep_owners() {
     const JUMP_SOURCE: &str = "def f(manager, work):\n    try:\n        raise ValueError()\n    except ValueError:\n        with manager:\n            try:\n                work()\n            finally:\n                pass\n";
     const DIRECT_SOURCE: &str = "def f(manager, work):\n    with manager:\n        try:\n            work()\n        finally:\n            pass\n";
