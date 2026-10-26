@@ -2224,6 +2224,29 @@ fn erased_loop_exit_stays_inside_managed_finally() {
 }
 
 #[test]
+fn named_handler_return_keeps_the_nested_finalizer_setup_unowned() {
+    let source = r"def sample(items, flag, value):
+    with lock():
+        try:
+            try:
+                work()
+            except KeyError as error:
+                for item in items:
+                    work(item)
+                return value
+        except ValueError:
+            recover()
+        finally:
+            try:
+                if flag:
+                    finish()
+            finally:
+                cleanup()
+";
+    assert_matches_cpython(source, "named_handler_setup.py", &LEVELS);
+}
+
+#[test]
 fn nested_finalizers_reuse_unowned_setup_slots_after_manager_returns() {
     let samples = [
         r"def sample(value, enabled):

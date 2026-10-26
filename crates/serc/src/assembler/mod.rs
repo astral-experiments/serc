@@ -12240,18 +12240,31 @@ impl Assembler {
         pop: usize,
         ordinary: usize,
         managers: usize,
+        named_handler: bool,
     ) {
-        use crate::target::opcodes::{CALL, LOAD_FAST, TO_BOOL};
+        use crate::target::opcodes::{CALL, DELETE_FAST, LOAD_FAST, STORE_FAST, TO_BOOL};
         let items = self.linear_items();
         let cleanup: Vec<_> = items[start..pop]
             .iter()
             .filter_map(Item::as_instruction)
             .collect();
-        let missing_pops = ordinary + managers;
+        // A saved value crosses the named-handler POP before SWAP and the
+        // name-cleanup POP before POP_EXCEPT. Both precede the final ordinary try.
+        let missing_pops = ordinary + managers + 2 * usize::from(named_handler);
         if missing_pops == 0
             || cleanup
                 .iter()
                 .any(|record| record.fusion_policy.is_converted_pop_block())
+        {
+            return;
+        }
+        if named_handler
+            && !matches!(cleanup.as_slice(), [.., swap, pop, value, store, clear]
+                if swap.opcode == SWAP && swap.value_argument() == Some(2)
+                    && pop.opcode == POP_EXCEPT && value.opcode == LOAD_CONST
+                    && store.opcode == STORE_FAST && clear.opcode == DELETE_FAST
+                    && store.operand() == clear.operand()
+                    && [pop, value, store, clear].iter().all(|r| r.location == swap.location))
         {
             return;
         }
