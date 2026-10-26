@@ -28012,6 +28012,12 @@ impl<'source> Compiler<'source> {
                 // the break exits the loop and cannot donate its location.
                 self.assembler
                     .set_location(self.source_location(donor.range()));
+            } else if self.context.python_version >= crate::PythonVersion::Py314
+                && !statement.is_star
+                && matches!(normal_exit_suite.last(), Some(Stmt::If(_) | Stmt::While(_)))
+                && let Some(donor) = self.assembler.try_exit_condition_donor()
+            {
+                self.assembler.set_location(donor);
             } else if let Some(location) = self.elided_raise_try_exit_location(statement) {
                 // The raising arm cannot reach this exit. Removed assertions leave
                 // the condition's false edge as the original jump's sole donor.

@@ -11865,6 +11865,43 @@ fn erased_return_guard_preserves_authored_else_jump() {
 }
 
 #[test]
+fn conditional_edges_locate_the_normal_try_exit_after_copying() {
+    let source = r"def select(group, allowed, enabled):
+    try:
+        if group:
+            visit()
+        else:
+            prepare()
+            if allowed:
+                consume()
+            elif enabled:
+                raise ValueError
+    except LookupError:
+        recover()
+    finish()
+
+def scan(items, ready, open_):
+    for item in items:
+        try:
+            read(item)
+        except OSError:
+            recover()
+        else:
+            if ready:
+                visit(item)
+            elif open_:
+                break
+        report(item)
+";
+    assert_matches_cpython_versions(
+        source,
+        "conditional_try_exit.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn erased_assertions_preserve_raising_try_guard_exit_locations() {
     for scope in ["def", "async def"] {
         for condition in ["flag", "not flag", "flag or other"] {

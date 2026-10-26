@@ -3154,6 +3154,51 @@ impl Assembler {
             .then_some(edge.location)
     }
 
+    /// Finds the condition that still enters an unlocated normal try exit after copying.
+    pub(crate) fn try_exit_condition_donor(&self) -> Option<SourceLocation> {
+        let items = self.linear_items();
+        let labels = trailing_labels(items).collect::<Vec<_>>();
+        let Item::Instruction(previous) = items.get(items.len().checked_sub(labels.len() + 1)?)?
+        else {
+            return None;
+        };
+        if labels.is_empty()
+            || !(ends_scope(previous.opcode) || is_unconditional_jump(previous.opcode))
+            || self.join_labels_have_authored_location(&labels)
+            || labels.iter().any(|label| {
+                self.folded_away_condition_targets.contains(label)
+                    || self.folded_away_loop_else_targets.contains(label)
+            })
+        {
+            return None;
+        }
+        let mut donor = None;
+        for item in items {
+            let Item::Instruction(edge) = item else {
+                continue;
+            };
+            if !edge
+                .jump_target()
+                .is_some_and(|target| labels.contains(&target))
+            {
+                continue;
+            }
+            if !matches!(edge.operand(), Operand::Forward(_)) {
+                return None;
+            }
+            // The original try exit is an unlocated block ending in a jump. CPython
+            // copies it onto unconditional predecessors before it propagates lines.
+            if is_unconditional_jump(edge.opcode) {
+                continue;
+            }
+            if !is_conditional_jump(edge.opcode) || edge.location.line < 0 || donor.is_some() {
+                return None;
+            }
+            donor = Some(edge.location);
+        }
+        donor
+    }
+
     /// Returns the sole physical donor at an empty original source join.
     ///
     /// Folded edges, range-only labels, handler entries, and authored NOPs cannot
