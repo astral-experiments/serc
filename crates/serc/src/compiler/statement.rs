@@ -30673,11 +30673,17 @@ impl<'source> Compiler<'source> {
                 && self.control.finally.active_normal_finally_bodies == 0
                 && self.control.finally.active_finally_end_blocks == 0
                 && self.control.finally.active_copied_finally_bodies == 0
-                && matches!(handler.body.last(), Some(Stmt::If(tail))
+                && (matches!(handler.body.last(), Some(Stmt::If(tail))
                     if tail.elif_else_clauses.is_empty()
                         && condition_has_only_runtime_tests(&tail.test)
                         && if_has_multiple_normal_exit_targets(tail)
                         && matches!(tail.body.as_slice(), [Stmt::Break(_) | Stmt::Assign(_)]))
+                    || (self.context.python_version >= crate::PythonVersion::Py314
+                        && matches!(handler.body.last(), Some(Stmt::While(tail))
+                            if tail.orelse.is_empty()
+                                && !suite_contains_loop_break(&tail.body)
+                                && condition_has_linear_runtime_leaves(&tail.test)
+                                && condition_jump_target_count(&tail.test, false) > 1)))
                 && self.assembler.at_original_shared_cleanup_join();
             // A final guard and its nested for-end alias the original handler cleanup.
             // The authored break copies that unlocated array before line propagation,
