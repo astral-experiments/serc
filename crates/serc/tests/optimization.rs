@@ -8121,6 +8121,21 @@ fn nested_handler_returns_preserve_outer_finalizer_owners() {
 }
 
 #[test]
+fn loop_assertion_keeps_a_multiline_comparison_failure() {
+    for message in ["detail", "explain(detail)"] {
+        let source = format!(
+            "def check(values, low, high, detail):\n    for value in values:\n        assert value is None or not (\n            low < value < high\n        ), {message}\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "loop_assertion_comparison.py",
+            &[OptimizationLevel::Zero],
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn nested_erased_assertion_tails_keep_original_loop_backedges() {
     for (index, source) in [
         r"from __future__ import annotations

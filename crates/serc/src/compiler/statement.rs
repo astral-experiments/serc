@@ -20066,12 +20066,27 @@ impl<'source> Compiler<'source> {
         }
 
         let failure = self.assembler.label();
-        self.compile_loop_tail_condition(
-            &statement.test,
-            false,
-            failure,
-            restart,
-            non_final_branch,
+        // Copying a short failure block onto the comparison preserves its jump as a NOP
+        // when the AssertionError load starts on a different line.
+        let retained_comparison = final_chained_comparison_jump(&statement.test)
+            .filter(|range| {
+                self.context.python_version >= crate::PythonVersion::Py314
+                    && self.source_location(*range).line
+                        != self.source_location(statement.range).line
+            })
+            .or(self.control.conditions.retained_chained_comparison_exit);
+        self.with_control_override(
+            |control| &mut control.conditions.retained_chained_comparison_exit,
+            retained_comparison,
+            |compiler| {
+                compiler.compile_loop_tail_condition(
+                    &statement.test,
+                    false,
+                    failure,
+                    restart,
+                    non_final_branch,
+                )
+            },
         )?;
 
         self.assembler.mark(failure);
