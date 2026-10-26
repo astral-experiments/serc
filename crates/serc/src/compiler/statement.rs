@@ -1751,8 +1751,9 @@ impl<'source> Compiler<'source> {
         let emitted = &body[..=end];
         // An exhausted iterator restores the outer conditional's stack. Its
         // fallthrough and the condition's false edge each donate a return.
-        if matches!(emitted, [Stmt::For(iterator)]
-            if !iterator.is_async
+        if matches!(emitted.split_last(), Some((Stmt::For(iterator), prefix))
+            if prefix.iter().all(is_elided)
+                && !iterator.is_async
                 && iterator.orelse.is_empty()
                 && Self::is_linear_scope_exit_iterator(iterator)
                 && self.suite_has_completed_erased_iterator_work(&iterator.body))
@@ -1780,6 +1781,13 @@ impl<'source> Compiler<'source> {
 
     /// Checks the completed iterable shape used by shared scope exits.
     fn is_linear_scope_exit_iterator(iterator: &ruff_python_ast::StmtFor) -> bool {
+        let completed_choice = |element: &Expr| {
+            matches!(element, Expr::If(choice)
+            if !expression_contains_inline_branch(&choice.test)
+                && !expression_suspends_current_scope(&choice.test)
+                && is_small_literal_tuple_element(&choice.body)
+                && is_small_literal_tuple_element(&choice.orelse))
+        };
         let linear_iterator_element = |element: &Expr| {
             is_small_literal_tuple_element(element)
                 || matches!(element, Expr::Name(_))
@@ -1787,6 +1795,7 @@ impl<'source> Compiler<'source> {
                 if tuple.elts.len() <= 30
                     && tuple.elts.iter().all(|part| {
                         is_small_literal_tuple_element(part)
+                            || completed_choice(part)
                             || matches!(part, Expr::Name(_))
                             || matches!(part, Expr::Attribute(attribute)
                                 if matches!(attribute.value.as_ref(), Expr::Name(_)))
@@ -1809,7 +1818,9 @@ impl<'source> Compiler<'source> {
                     && !expression_yields_in_current_scope(&iterator.iter))
                 || matches!(iterator.iter.as_ref(), Expr::Call(call)
                     if matches!(call.func.as_ref(), Expr::Name(_) | Expr::Attribute(_))))
-            && !expression_contains_inline_branch(&iterator.iter)
+            // A conditional inside a validated tuple element completes before GET_ITER.
+            && (matches!(iterator.iter.as_ref(), Expr::Tuple(_))
+                || !expression_contains_inline_branch(&iterator.iter))
             && !expression_suspends_current_scope(&iterator.iter)
     }
 
