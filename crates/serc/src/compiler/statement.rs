@@ -2369,12 +2369,21 @@ impl<'source> Compiler<'source> {
                     .direct_try_body_statements
                     .contains(&statement.range())
                 && self.protected_terminal_if_before_elided(statement, &body[index + 1..]);
+            let finally_if_before_elided = has_elided_tail
+                && !is_final
+                && self.context.python_version >= crate::PythonVersion::Py314
+                && self.control.finally.active_normal_finally_bodies == 1
+                && matches!(statement, Stmt::If(_))
+                && body[index + 1..]
+                    .iter()
+                    .all(|part| self.context.is_elided_statement(part));
             let terminal_if_before_elided = terminal_before_elided_assertions
                 || terminal_comprehension_before_elided
                 || terminal_nested_before_elided
                 || protected_terminal_if_before_elided
                 || coroutine_if_before_elided
-                || linear_protected_if_before_elided;
+                || linear_protected_if_before_elided
+                || finally_if_before_elided;
             // An assignment with an inlined comprehension becomes terminal when
             // only removed assertions follow it; retain its target's return span.
             let terminal_assignment_before_elided = has_elided_tail
