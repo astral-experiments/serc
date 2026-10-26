@@ -9073,6 +9073,21 @@ fn completed_manager_work_preserves_retained_loop_owners() {
 }
 
 #[test]
+fn conditional_arms_copy_a_raise_with_the_same_handler() {
+    for handler in ["except ValueError:", "except ValueError as error:", "finally:"] {
+        let source = format!(
+            "def classify(low, value, high):\n    try:\n        work()\n    {handler}\n        outcome = LEFT if low < value <= high else RIGHT\n        raise\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "conditional_reraise.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn protected_conditional_store_preserves_erased_else_backedge() {
     let protected = r"def collect(batches, left, right, cleanup, sink):
     try:
