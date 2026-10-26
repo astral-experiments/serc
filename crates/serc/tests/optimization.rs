@@ -5698,6 +5698,32 @@ fn while_break_keeps_fallthrough_else_exception_owner() {
 }
 
 #[test]
+fn while_else_store_locates_the_normal_try_exit() {
+    for value in ["item", "item if flag else other"] {
+        let source = format!(
+            r"def sample(result, item, other, flag):
+    try:
+        while running():
+            if flag:
+                break
+        else:
+            result = {value}
+    except LookupError:
+        recover()
+    finish()
+    return result
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "while_else_store_exit.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn while_else_nonfinal_condition_preserves_forward_exit() {
     for coroutine in [false, true] {
         for loop_else in [false, true] {
