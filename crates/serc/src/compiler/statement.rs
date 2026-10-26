@@ -37391,8 +37391,22 @@ impl<'source> Compiler<'source> {
                 .or(handler_else_pop_location)
                 .unwrap_or(SourceLocation::NONE),
         );
-        // CPython converts POP_BLOCK to a NOP without assigning it an exception owner,
-        // including the implicit outer handler of generators and coroutines.
+        // Removing the assertion makes the break jump and the normal POP_BLOCK
+        // share a slot. The surviving NOP keeps the authored break's try owner.
+        let break_pop_owns_protected_try = self.context.python_version
+            >= crate::PythonVersion::Py314
+            && statement.handlers.is_empty()
+            && statement.orelse.is_empty()
+            && statement
+                .body
+                .last()
+                .is_some_and(|part| self.context.is_elided_statement(part))
+            && matches!(statement.body.iter().rfind(|part| !self.context.is_elided_statement(part)),
+                Some(Stmt::While(tail)) if early_condition_truthiness(&tail.test) == Some(true)
+                    && tail.orelse.is_empty()
+                    && matches!(tail.body.last(), Some(Stmt::If(guard)) if guard.elif_else_clauses.is_empty()
+                        && matches!(guard.body.as_slice(), [Stmt::Break(_)])))
+            && matches!(statement.finalbody.first(), Some(Stmt::Try(_)));
         let normal_finally_pop_block = if let Some(origin) = async_for_end_pop {
             // The located exhaustion marker already represents this one original POP_BLOCK.
             // Keep its range labels and location; emitting another NOP invents a removed slot.
@@ -37401,7 +37415,21 @@ impl<'source> Compiler<'source> {
             origin.instruction_index
         } else {
             let index = self.assembler.instruction_count();
-            self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
+            if break_pop_owns_protected_try {
+                self.emit(NOP, 0, 0)?;
+                let end = self.assembler.label();
+                self.assembler.mark(end);
+                self.assembler.add_exception_region(
+                    protected_end,
+                    end,
+                    finally_handler,
+                    base_depth.cast_unsigned(),
+                    false,
+                );
+            } else {
+                // A normal converted POP_BLOCK has no exception owner.
+                self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
+            }
             index
         };
         if folded_pass_finally_exit {
