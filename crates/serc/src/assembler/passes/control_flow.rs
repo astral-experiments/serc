@@ -3493,9 +3493,10 @@ impl OptimizationPipeline {
         // lines are propagated. Their shared target gives the manager POP no
         // unique donor, even when the guard retains a located NOP.
         let recorded_cleanup_join = |source: BasicBlockId, jump: &Instruction| {
+            let original_join = jump.jump_policy.is_original_empty_join()
+                && jump.jump_policy.preserves_nop_after_threading();
             if jump.location.line < 0
-                || !jump.jump_policy.is_original_empty_join()
-                || !jump.jump_policy.preserves_nop_after_threading()
+                || (!original_join && !jump.jump_policy.retains_nop_for(jump.operand()))
                 || jump.pre_fold_extra_instructions() != 0
                 || jump.local_policy.hidden_exception_owner_slots() != 0
             {
@@ -3507,7 +3508,8 @@ impl OptimizationPipeline {
             let Some(depth) = jump.depth_after() else {
                 return false;
             };
-            if let [fallthrough, branch] = predecessors.as_slice()
+            if original_join
+                && let [fallthrough, branch] = predecessors.as_slice()
                 && positions[fallthrough] + 1 == positions[&source]
                 && super::super::block_has_fallthrough(graph[*fallthrough].items())
                 && let Some(last) = graph[*fallthrough].last_instruction()
@@ -3540,6 +3542,7 @@ impl OptimizationPipeline {
             }
             let mut guard_entry = None;
             let mut cleanup_entry = None;
+            let mut manager_location = None;
             for &predecessor in predecessors {
                 let mut instructions = graph[predecessor]
                     .items()
@@ -3571,25 +3574,71 @@ impl OptimizationPipeline {
                     return false;
                 }
                 if edge.opcode == JUMP_FORWARD {
-                    if edge.location.line < 0
-                        || edge.local_policy.hidden_exception_owner_slots() != 0
+                    if edge.local_policy.hidden_exception_owner_slots() != 0
                         || cleanup_entry.is_some_and(|prior| prior != entry)
                     {
                         return false;
                     }
+                    if !original_join {
+                        // Both the normal and suppression exits of the same manager
+                        // pop the result before reaching a retained try exit.
+                        if predecessors.len() != 3
+                            || !self
+                                .exception_owner_provenance
+                                .with_context_locations
+                                .contains(&edge.location)
+                            || manager_location
+                                .replace(edge.location)
+                                .is_some_and(|prior| prior != edge.location)
+                            || !instructions.next().is_some_and(|pop| {
+                                pop.opcode == POP_TOP && pop.location == edge.location
+                            })
+                        {
+                            return false;
+                        }
+                    } else if edge.location.line < 0 {
+                        // A named handler's exit also threads this join after
+                        // restoring its exception state and clearing the binding.
+                        let (Some(delete), Some(store), Some(load), Some(pop)) = (
+                            instructions.next(),
+                            instructions.next(),
+                            instructions.next(),
+                            instructions.next(),
+                        ) else {
+                            return false;
+                        };
+                        if delete.opcode != DELETE_FAST
+                            || store.opcode != STORE_FAST
+                            || store.operand() != delete.operand()
+                            || load.opcode != LOAD_CONST
+                            || pop.opcode != POP_EXCEPT
+                            || [delete, store, load, pop]
+                                .iter()
+                                .any(|instruction| instruction.location != SourceLocation::NONE)
+                        {
+                            return false;
+                        }
+                    }
                     cleanup_entry = Some(entry);
                 } else {
                     let original_guard = match edge.opcode {
-                        POP_JUMP_IF_NONE => {
-                            predecessors.len() == 2
-                                && edge.local_policy.hidden_exception_owner_slots() == 3
-                                && self
-                                    .exception_owner_provenance
-                                    .source_none_conditions
-                                    .iter()
-                                    .filter(|origin| origin.instruction == *edge)
-                                    .count()
-                                    == 1
+                        POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE => {
+                            edge.local_policy.hidden_exception_owner_slots() == 3
+                                && (match predecessors.len() {
+                                    2 => {
+                                        self.exception_owner_provenance
+                                            .source_none_conditions
+                                            .iter()
+                                            .filter(|origin| origin.instruction == *edge)
+                                            .count()
+                                            == 1
+                                    }
+                                    3 => instructions.next().is_some_and(|value| {
+                                        value.location.line == edge.location.line
+                                            && value.depth_after() == depth.checked_add(1)
+                                    }),
+                                    _ => false,
+                                })
                         }
                         POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE => {
                             predecessors.len() >= 3
