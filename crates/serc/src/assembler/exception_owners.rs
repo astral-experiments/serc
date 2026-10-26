@@ -5693,7 +5693,7 @@ impl LayoutAssembler {
         positions: &OwnerLabelPositions,
         jump_targets: &FxHashSet<Label>,
     ) -> Option<ExceptionOwnerDecision> {
-        if !(4..=5).contains(&tail.early_removals)
+        if !(4..=8).contains(&tail.early_removals)
             || tail.insertions != 0
             || tail.late_removals != 0
             || tail.post_compaction_fusions != 0
@@ -5780,8 +5780,11 @@ impl LayoutAssembler {
                     if offset == origin.unwind_offset + 6 {
                         expected.local_policy.add_hidden_exception_owner_slots(1);
                     }
-                    if expected.opcode == crate::target::opcodes::LOAD_FAST
-                        && actual.opcode == crate::target::opcodes::LOAD_FAST_BORROW
+                    if (expected.opcode == crate::target::opcodes::LOAD_FAST
+                        && actual.opcode == crate::target::opcodes::LOAD_FAST_BORROW)
+                        || (offset < origin.unwind_offset
+                            && expected.opcode == crate::target::opcodes::LOAD_FAST_CHECK
+                            && actual.opcode == crate::target::opcodes::LOAD_FAST)
                     {
                         expected.opcode = actual.opcode;
                     }
@@ -5801,15 +5804,17 @@ impl LayoutAssembler {
         {
             return None;
         }
-        // The two omitted handler POPs normally put the finalizer POP at the
-        // append slot. One additional inner-try POP or early fold moves DELETE_FAST
-        // into this slot instead, before the finalizer's exception-range boundary.
-        let extra = prefix_tail.early_removals + usize::from(origin.inner_try_pop);
-        match extra {
-            0 => Some(ExceptionOwnerDecision::override_with_region(None)),
-            1 => {
-                let delete = marker.checked_sub(3)?;
-                let owner = self.uniform_exception_owner(delete, delete + 1, positions)?;
+        // Each earlier fold or omitted inner try POP moves the append slot
+        // back from the finalizer POP through the four name-clearing records
+        // to the unowned handler POP immediately before POP_EXCEPT.
+        let shift = prefix_tail.early_removals + usize::from(origin.inner_try_pop);
+        match shift {
+            0 | 5 if shift == 0 || origin.inner_try_pop => {
+                Some(ExceptionOwnerDecision::override_with_region(None))
+            }
+            1..=4 if shift == 1 || origin.inner_try_pop => {
+                let slot = marker.checked_sub(2 + shift)?;
+                let owner = self.uniform_exception_owner(slot, slot + 1, positions)?;
                 let region = self.exception_regions[owner];
                 (!region.is_scope_fallback && !region.preserve_lasti)
                     .then_some(ExceptionOwnerDecision::override_with_region(Some(owner)))
@@ -10448,9 +10453,11 @@ impl LayoutAssembler {
                         if instruction.exception_policy() == super::ExceptionPolicy::NonePresent
                             && owner_history_exact
                             && pop_slot_epoch_known
-                            && owners
+                            // Four prefix folds select the omitted handler POP and supersede
+                            // an owner inferred from surviving name-clear records.
+                            && (tail.early_removals == 8 || owners
                                 .get(instruction_index)
-                                .is_none_or(|decision| !decision.is_definitive())
+                                .is_none_or(|decision| !decision.is_definitive()))
                             && let Some(decision) = self.saved_named_handler_none_owner(
                                 instruction_index,
                                 original_array_start,
