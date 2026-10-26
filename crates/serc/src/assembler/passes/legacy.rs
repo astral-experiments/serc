@@ -258,8 +258,10 @@ impl OptimizationPipeline {
                     });
                     if surviving_blocks.contains(&block)
                         && let Some(instruction) = instructions.next()
-                        && instructions.next().is_none()
                         && *instruction == expected
+                        && (instructions.next().is_none()
+                            || (expected.opcode == NOP
+                                && expected.fusion_policy.is_converted_pop_block()))
                         && predecessors.get(&block) == Some(&before)
                     {
                         predecessors.insert(block, native);
@@ -1983,12 +1985,15 @@ impl OptimizationPipeline {
                 && instruction.location == SourceLocation::NONE
                 && self.graph[block].items().iter().any(|item| {
                     matches!(item, Item::Label(label)
-                    if self.exception_owner_provenance.original_manager_pop_blocks.contains(label))
+                    if self.exception_owner_provenance.original_manager_pop_blocks.contains(label)
+                        || self.exception_regions.iter().any(|region| {
+                            !region.is_scope_fallback && !region.preserve_lasti && region.end == *label
+                        }))
                 })
             {
-                // A shared manager POP cannot inherit a line from the cleanup
-                // array visited twice. Its physical fragment is checked again
-                // after cold placement, before restoring the native count.
+                // A shared cleanup POP cannot inherit a line from the array
+                // visited twice. Recheck the physical block after cold placement
+                // before restoring its native count.
                 let (ordinary, native) = predecessor_counts[index];
                 tails.push((block, *instruction, ordinary, native));
                 continue;

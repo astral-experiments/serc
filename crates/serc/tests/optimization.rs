@@ -9132,6 +9132,26 @@ fn completed_manager_work_preserves_retained_loop_owners() {
 }
 
 #[test]
+fn repeated_try_predecessor_keeps_the_finalizer_pop_unlocated() {
+    let source = r"def unpack(ready, pair):
+    try:
+        if ready:
+            assert pair
+        first, last = pair
+    except ValueError:
+        raise
+    finally:
+        finish()
+";
+    assert_matches_cpython_versions(
+        source,
+        "repeated_try_pop.py",
+        &LEVELS,
+        &[PythonVersion::Py312],
+    );
+}
+
+#[test]
 fn repeated_finalizer_predecessor_keeps_the_manager_pop_unlocated() {
     let source = r"def run(manager, ready):
     with manager:
