@@ -1685,8 +1685,6 @@ pub(crate) struct Assembler {
     pub(super) original_fallthrough_location: Option<(EmittedInstruction, SourceLocation)>,
     /// Source-authored match end awaiting its first emitted instruction.
     pub(super) original_match_join: Option<Label>,
-    /// Synchronous for-else end labels and their producer stack depth.
-    pub(super) original_sync_for_else_ends: FxHashMap<Label, u32>,
     /// Keeps this large state in place as the assembler changes optimization phases.
     pub(super) exception_owner_provenance: LazyExceptionOwnerProvenance,
     /// Authored Pass records do not require the full owner state during emission.
@@ -1956,7 +1954,6 @@ impl Default for Assembler {
             exception_regions: Vec::new(),
             original_fallthrough_location: None,
             original_match_join: None,
-            original_sync_for_else_ends: FxHashMap::default(),
             exception_owner_provenance: LazyExceptionOwnerProvenance::default(),
             original_pass_nops: Vec::new(),
             preserved_block_boundaries: FxHashSet::default(),
