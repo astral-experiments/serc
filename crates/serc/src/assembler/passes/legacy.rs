@@ -264,7 +264,9 @@ impl OptimizationPipeline {
                 }
             }
         }
+        let blocks_before_exit_copies = self.graph.len();
         self.resolve_legacy_locations(predecessors, &original_arrays);
+        let exit_copies = self.graph.len() - blocks_before_exit_copies;
         if self.python_version == PythonVersion::Py312 {
             self.guarantee_legacy_exit_line_numbers(first_line_number);
         }
@@ -286,7 +288,14 @@ impl OptimizationPipeline {
             self.remove_legacy_nops(&original_arrays, true);
         }
         self.normalize_legacy_jump_directions();
-        self.normalize_backward_conditionals()?;
+        let reversed = self.normalize_backward_conditionals()?;
+        // Exit duplication retargets the block pointer but keeps the original operand.
+        // Only a new backedge from conditional normalization reads the copied label.
+        self.legacy_uniform_jump_seed |= self
+            .legacy_native_labels
+            .as_ref()
+            .and_then(|native| native.exit_copy_budget)
+            .is_some_and(|budget| !reversed || exit_copies <= usize::from(budget));
         if !self
             .legacy_native_labels
             .as_ref()

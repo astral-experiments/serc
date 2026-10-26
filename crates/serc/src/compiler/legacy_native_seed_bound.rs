@@ -10,6 +10,8 @@
 //! adjacency needs a distinct incoming warm jump because its cold predecessor
 //! cannot make the successor warm. Exit duplication adds at most J + C labels.
 //! Normalization adds unlabeled bridges only, so S + U + J + C bounds every label.
+//! When only S + U fits, defer the decision until exit copies and normalized
+//! backedges are known. Copying an exit leaves the incoming jump operand intact.
 //!
 //! This certificate controls initial `EXTENDED_ARG` widths, not final jump distances.
 //! Unsupported syntax declines the complete code object. Finally copies follow
@@ -19,8 +21,19 @@ use ruff_python_ast::{
     Comprehension, Expr, FStringPartRef, InterpolatedStringElement, Parameters, Stmt, UnaryOp,
 };
 
-/// Proves that native source generation and every CFG allocation stay below 256.
-pub(super) fn certifies(body: &[Stmt]) -> bool {
+/// Records which native jump operands fit in a single byte before offset resolution.
+pub(super) fn record(assembler: &mut crate::assembler::Assembler, body: &[Stmt]) {
+    if let Some(counts) = function_counts(body) {
+        if counts.max_label() < 256 {
+            assembler.certify_legacy_uniform_jump_seed();
+        } else if let Ok(max_label) = u8::try_from(counts.max_original_label()) {
+            assembler.set_legacy_exit_copy_budget(u8::MAX - max_label);
+        }
+    }
+}
+
+#[cfg(test)]
+fn certifies(body: &[Stmt]) -> bool {
     function_counts(body).is_some_and(|counts| counts.max_label() < 256)
 }
 
@@ -54,12 +67,16 @@ impl Counts {
         debug_assert!(self.unlabeled_jump_successors <= self.jumps);
     }
 
-    fn max_label(self) -> u32 {
+    fn max_original_label(self) -> u32 {
         let unlabeled = self
             .unlabeled_jump_successors
             .saturating_add(self.exits)
             .saturating_add(1);
-        let blocks = self.labels.saturating_add(unlabeled);
+        self.labels.saturating_add(unlabeled)
+    }
+
+    fn max_label(self) -> u32 {
+        let blocks = self.max_original_label();
         let cold_bridges = self.jumps.min(blocks / 2);
         blocks
             .saturating_add(self.jumps)
@@ -102,7 +119,7 @@ impl<'ast> Counter<'ast> {
     fn suite(&mut self, statements: &'ast [Stmt]) -> Option<()> {
         // Native source generation visits discarded suites and post-return tails.
         for statement in statements {
-            if self.counts.max_label() >= 256 {
+            if self.counts.max_original_label() >= 256 {
                 return None;
             }
             self.statement(statement)?;
@@ -278,7 +295,7 @@ impl<'ast> Counter<'ast> {
 
     /// Mirrors native pop/cleanup/recurse/restore, including unreachable copies.
     fn unwind(&mut self, stop_at_loop: bool) -> Option<()> {
-        if self.counts.max_label() >= 256 {
+        if self.counts.max_original_label() >= 256 {
             return None;
         }
         let Some(frame) = self.frames.pop() else {
@@ -1088,7 +1105,9 @@ mod tests {
             panic!()
         };
         assert!(!certifies(&function.body));
-        assert_eq!(counts(&format!("{source}    await discarded()\n")), None);
+        let counts = counts(&format!("{source}    await discarded()\n")).unwrap();
+        assert_eq!(counts.max_original_label(), 136);
+        assert!(counts.max_label() >= 256);
     }
 
     #[test]

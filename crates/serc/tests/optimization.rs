@@ -19066,3 +19066,23 @@ fn nested_conditional_arms_donate_implicit_return_locations() {
 ";
     assert_matches_cpython(source, "nested_implicit_returns.py", &LEVELS);
 }
+
+#[test]
+fn python312_seeds_loop_backedges_before_resolving_offsets() {
+    for padding in [123, 124, 125] {
+        let mut source = String::from(
+            "def f(items, flag):\n    try:\n        prepare()\n    except:\n        recover()\n",
+        );
+        source.push_str(&"    if flag:\n        observe()\n".repeat(56));
+        source.push_str(&"    padding = 0\n".repeat(120));
+        source.push_str("    for item in items:\n");
+        source.push_str(&"        padding = 1\n".repeat(padding));
+        source.push_str("        if flag:\n            finish(item)\n");
+        assert_matches_cpython_versions(
+            &source,
+            "loop_backedge_width.py",
+            &LEVELS,
+            &[PythonVersion::Py312],
+        );
+    }
+}

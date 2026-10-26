@@ -42,6 +42,7 @@ pub(super) struct LegacyNativeLabels {
     bindings: FxHashMap<Label, u32>,
     blocks: FxHashMap<BasicBlockId, u32>,
     original_arrays: FxHashMap<BasicBlockId, usize>,
+    pub(super) exit_copy_budget: Option<u8>,
     certified: bool,
     invalidated: bool,
 }

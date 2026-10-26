@@ -1072,6 +1072,13 @@ impl Assembler {
         }
     }
 
+    /// Records a bound on all labels allocated before 3.12 duplicates its exits.
+    pub(crate) fn set_legacy_exit_copy_budget(&mut self, budget: u8) {
+        self.legacy_native_labels
+            .get_or_insert_with(Default::default)
+            .exit_copy_budget = Some(budget);
+    }
+
     /// Binds a physical entry to its canonical native 3.12 codegen label.
     pub(crate) fn bind_legacy_native_label(&mut self, physical: Label, native: u32) {
         debug_assert_eq!(self.python_version, crate::PythonVersion::Py312);
