@@ -11319,6 +11319,49 @@ impl<'source> Compiler<'source> {
                                         if matches!(test.first_operand(), Expr::Name(_))
                                             && matches!(test.ops.as_ref(), [CmpOp::Is | CmpOp::IsNot])
                                             && matches!(test.comparators(), [Expr::NoneLiteral(_)]))));
+                    // An ordinary try lies inside each finalizer. The while
+                    // between them has no iterator disposal to separate its POP.
+                    let captures_assignment_finally_pops = self.context.python_version
+                        == crate::PythonVersion::Py314
+                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                            == CO_COROUTINE
+                        && !preserve_tos
+                        && !return_is_overridden
+                        && statement.value.is_none()
+                        && handler_count == 0
+                        && self.control.withs.active_with_exits.is_empty()
+                        && self.control.exceptions.active_exception_group_handlers == 0
+                        && self.control.exceptions.active_try_marker_slots.len() == 2
+                        && self
+                            .control
+                            .exceptions
+                            .active_exception_region_exclusions
+                            .len()
+                            == 4
+                        && self.control.finally.active_finally_end_blocks == 0
+                        && self.control.finally.active_normal_finally_bodies == 0
+                        && self.control.finally.active_copied_finally_bodies == 0
+                        && self
+                            .control
+                            .finally
+                            .preserved_return_value_contexts
+                            .is_empty()
+                        && matches!(self.control.loops.contexts.as_slice(), [loop_context]
+                            if loop_context.iterator_cleanup == IteratorCleanup::None
+                                && loop_context.with_depth == 0 && loop_context.finally_end_depth == 0
+                                && loop_context.exception_region_depth == 2)
+                        && matches!(return_finally_contexts.as_slice(), [outer, inner]
+                        if outer.handler_depth == 0 && inner.handler_depth == 0
+                            && outer.loop_depth == 0 && inner.loop_depth == 1
+                            && outer.with_depth == 0 && inner.with_depth == 0
+                            && outer.try_body_depth == 0 && inner.try_body_depth == 1
+                            && outer.exception_region_depth == 0 && inner.exception_region_depth == 2
+                            && matches!(inner.body, [Stmt::Assign(assign)]
+                                if matches!(assign.targets.as_slice(), [Expr::Name(_)]) && matches!(assign.value.as_ref(),Expr::NoneLiteral(_)))
+                            && matches!(outer.body.first(), Some(Stmt::If(guard)) if {
+                                let first = match guard.test.as_ref() {Expr::BoolOp(b) if b.op == BoolOp::Or => b.values.first(), e => Some(e)};
+                                matches!(first, Some(Expr::Compare(test)) if matches!(test.first_operand(),Expr::Attribute(attr) if matches!(attr.value.as_ref(),Expr::Name(_))) && matches!(test.ops.as_ref(),[CmpOp::Is | CmpOp::IsNot]) && matches!(test.comparators(),[Expr::NoneLiteral(_)]))
+                            }));
                     if restores_nested_finalizer_try_pops {
                         let before = return_finally_contexts.get(context_index + 1).map_or(
                             self.control.exceptions.active_try_marker_slots.len(),
@@ -12421,6 +12464,10 @@ impl<'source> Compiler<'source> {
                         && let Some(start) = nested_finally_method_pop
                     {
                         self.assembler.record_copied_method_cleanup_pop_span(start);
+                    }
+                    if result.is_ok() && captures_assignment_finally_pops && context_index == 0 {
+                        self.assembler
+                            .record_copied_assignment_finally_guard(copied_handler_return_item);
                     }
                     if result.is_ok() && restores_nested_finalizer_try_pops && context_index == 0 {
                         self.assembler

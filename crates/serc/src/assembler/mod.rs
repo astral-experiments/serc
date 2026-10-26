@@ -15102,6 +15102,72 @@ impl Assembler {
             .push(origin);
     }
 
+    /// Captures the two finalizer POPs around a copied assignment and outer attribute guard.
+    pub(crate) fn record_copied_assignment_finally_guard(&mut self, return_item: usize) {
+        let records = self.linear_items()[return_item..]
+            .iter()
+            .filter_map(Item::as_instruction)
+            .copied()
+            .take(9)
+            .collect::<smallvec::SmallVec<[_; 16]>>();
+        let [
+            authored,
+            inner_finally,
+            value,
+            store,
+            outer_finally,
+            load,
+            attr,
+            condition,
+            marker,
+        ] = records.as_slice()
+        else {
+            return;
+        };
+        if authored.opcode != NOP
+            || authored.location.line < 0
+            || authored.fusion_policy.is_converted_pop_block()
+            || authored.exception_policy() != ExceptionPolicy::default()
+            || [inner_finally, outer_finally].iter().any(|pop| {
+                pop.opcode != NOP
+                    || pop.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
+                    || !pop.fusion_policy.is_converted_pop_block()
+            })
+            || inner_finally.location != authored.location
+            || outer_finally.location != SourceLocation::NONE
+            || value.opcode != LOAD_CONST
+            || store.opcode != STORE_FAST
+            || !matches!(load.opcode, LOAD_FAST | crate::target::opcodes::LOAD_DEREF)
+            || attr.opcode != LOAD_ATTR
+            || !attr.value_argument().is_some_and(|arg| arg & 1 == 0)
+            || !matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+            || condition.forward_target().is_none()
+            || marker.opcode != NOT_TAKEN
+            || marker.location != condition.location
+            || records.iter().enumerate().any(|(index, record)| {
+                record.pre_fold_extra_instructions() != 0
+                    || record.local_policy.hidden_exception_owner_slots()
+                        != if index == 7 { 3 } else { 0 }
+                    || record.no_location_policy.borrow_fallthrough()
+                        != BorrowFallthrough::Reachable
+            })
+        {
+            return;
+        }
+        // The authored return compacts into the inner finally POP. The outer
+        // finally POP moves into the receiver. The ordinary tries' two omitted
+        // POPs are counted separately when locating the original append slot.
+        let mut retained = *inner_finally;
+        retained.local_policy.add_hidden_exception_owner_slots(1);
+        let mut receiver = *load;
+        receiver.local_policy.add_hidden_exception_owner_slots(1);
+        self.exception_owner_provenance
+            .copied_assignment_finally_guards
+            .push([
+                retained, *value, *store, receiver, *attr, *condition, *marker,
+            ]);
+    }
+
     /// Captures the two source POPs and intact method cleanup copied by a return.
     pub(crate) fn record_copied_method_cleanup_pop_span(&mut self, start: usize) {
         let items = self.linear_items();
