@@ -574,7 +574,7 @@ fn copied_raise_completes_local_store(source: &[Item], copied: &[Item]) -> bool 
 
 /// Certifies a local raise without copied return/finally unwind records.
 ///
-/// A constant cause adds one load before the raise. One converted `POP_BLOCK`
+/// A local or constant cause adds one load before the raise. One converted `POP_BLOCK`
 /// may precede either form. Authored or folded NOPs do not prove its size.
 fn block_is_local_raise(items: &[Item], original_nop_targets: &FxHashSet<Label>) -> bool {
     if !original_nop_targets.is_empty()
@@ -613,7 +613,7 @@ fn block_is_local_raise(items: &[Item], original_nop_targets: &FxHashSet<Label>)
     let Some(next) = instructions.next() else {
         return false;
     };
-    let (raise, arguments) = if next.opcode == LOAD_CONST && visible(next) {
+    let (raise, arguments) = if matches!(next.opcode, LOAD_CONST | LOAD_FAST) && visible(next) {
         let Some(raise) = instructions.next() else {
             return false;
         };
