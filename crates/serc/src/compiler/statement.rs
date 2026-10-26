@@ -12035,8 +12035,22 @@ impl<'source> Compiler<'source> {
                                     self.assembler.item_count(),
                                     false,
                                     !handlers.is_empty(),
-                                    !self.control.exceptions.active_try_marker_slots.is_empty(),
+                                    (!self.control.exceptions.active_try_marker_slots.is_empty()).then_some(1),
                                 ))
+                            }
+                            ([], loops, [])
+                                if self.context.python_version == crate::PythonVersion::Py314
+                                    && next_loop == loops.len()
+                                    && loops.iter().filter(|context|
+                                        context.iterator_cleanup != IteratorCleanup::None).count() == 1
+                                    && loops.iter().all(|context|
+                                        context.with_depth == 0
+                                            && context.finally_end_depth == 0
+                                            && context.exception_region_depth == 2)
+                                    && self.control.exceptions.active_try_marker_slots.len() == 1
+                                    && self.control.exceptions.active_exception_region_exclusions.len() == 2 =>
+                            {
+                                Some((self.assembler.item_count(), false, false, Some(2)))
                             }
                             ([manager], [], handlers)
                                 if next_loop == 0
@@ -12056,7 +12070,7 @@ impl<'source> Compiler<'source> {
                                                     && handler.try_body_depth == 0
                                                     && handler.exception_region_depth == 1))) =>
                             {
-                                Some((self.assembler.item_count(), true, !handlers.is_empty(), false))
+                                Some((self.assembler.item_count(), true, !handlers.is_empty(), None))
                             }
                             _ => None,
                         }).flatten();
@@ -12358,7 +12372,7 @@ impl<'source> Compiler<'source> {
                             .record_saved_named_handler_none_prefix(start, pop_item);
                     }
                     if result.is_ok()
-                        && let Some((pop_item, manager, handler, iterator_try)) =
+                        && let Some((pop_item, manager, handler, iterator_try_pop_slot)) =
                             copied_cleanup_none_pop
                     {
                         self.assembler.record_copied_cleanup_return_none_prefix(
@@ -12366,7 +12380,7 @@ impl<'source> Compiler<'source> {
                             pop_item,
                             manager,
                             handler,
-                            iterator_try,
+                            iterator_try_pop_slot,
                         );
                     }
                     if result.is_ok() && copied_bare_handler_none {

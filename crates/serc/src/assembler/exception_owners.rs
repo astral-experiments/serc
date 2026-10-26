@@ -1122,8 +1122,8 @@ pub(super) struct CopiedCleanupReturnNonePrefix {
     pub(super) cleanup: Vec<Instruction>,
     pub(super) manager: bool,
     pub(super) handler: bool,
-    // An inner try adds a POP before the iterator is discarded on return.
-    pub(super) iterator_try: bool,
+    // A try unwinds before or after the iterator, according to their nesting.
+    pub(super) iterator_try_pop_slot: Option<usize>,
     pub(super) pop: Instruction,
     pub(super) load: Instruction,
     pub(super) condition: Instruction,
@@ -5915,8 +5915,9 @@ impl LayoutAssembler {
         // handler contributes two POPs before POP_EXCEPT/name clearing; an ordinary
         // try contributes one POP before the finalizer. None of those cells is owned.
         let source = match (origin.manager, origin.handler, slot) {
-            (false, false, 1 | 3) if origin.iterator_try => None,
-            (false, false, 2) if origin.iterator_try => Some(start),
+            (false, false, 3) if origin.iterator_try_pop_slot.is_some() => None,
+            (false, false, 1 | 2) if origin.iterator_try_pop_slot == Some(slot) => None,
+            (false, false, 1 | 2) if origin.iterator_try_pop_slot.is_some() => Some(start),
             (false, false, 1) => Some(start),
             (false, false, 2) | (false, true, 1 | 4) => None,
             (false, true, 2..=3) => Some(start + slot - 2),
