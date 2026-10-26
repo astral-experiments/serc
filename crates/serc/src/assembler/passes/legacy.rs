@@ -2052,6 +2052,17 @@ impl OptimizationPipeline {
                     start <= end && (start..end).contains(&source) == (start..end).contains(&target)
                 })
             };
+            // A conditional can also be the protected jump's sole ordinary
+            // predecessor. Every visit to the conditional charges that fallthrough.
+            let sole_conditional_fallthrough = || {
+                predecessor_counts[index].0 == 1
+                    && index
+                        .checked_sub(1)
+                        .and_then(|previous| group_instructions(previous).next_back())
+                        .is_some_and(|last| {
+                            is_conditional_jump_for(self.python_version, last.opcode)
+                        })
+            };
             if instructions.next().is_none()
                 && (matches!(
                     instruction.opcode,
@@ -2059,7 +2070,8 @@ impl OptimizationPipeline {
                 ) || (instruction.opcode == JUMP_FORWARD
                     && (wrapper.is_none()
                         || has_only_scope_owner()
-                        || forward_join_keeps_owners()))
+                        || forward_join_keeps_owners()
+                        || sole_conditional_fallthrough()))
                     || (instruction.opcode == RERAISE
                         && instruction.operand() == Operand::Value(0))
                     || (instruction.opcode == RETURN_CONST
