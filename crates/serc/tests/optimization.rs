@@ -96,6 +96,29 @@ fn erased_named_handler_suffix_preserves_cleanup_copies() {
 }
 
 #[test]
+fn protected_jump_preserves_repeated_conditional_fallthrough() {
+    let source = r"async def handle(first, second, active):
+    try:
+        if first:
+            work()
+        elif second:
+            assert second
+        if active:
+            assert active
+        else:
+            done()
+    finally:
+        finish()
+";
+    assert_matches_cpython_versions(
+        source,
+        "protected_fallthrough.py",
+        &LEVELS,
+        &[PythonVersion::Py312],
+    );
+}
+
+#[test]
 fn repeated_loop_guards_keep_the_fallthrough_backedge_unlocated() {
     let source = r"def finish(items, ready):
     try:
