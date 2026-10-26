@@ -9073,6 +9073,32 @@ fn completed_manager_work_preserves_retained_loop_owners() {
 }
 
 #[test]
+fn constant_return_keeps_the_try_pop_before_a_managed_finally_guard() {
+    for prefix in ["", "async "] {
+        let source = format!(
+            r"{prefix}def use(manager, ready, first, last):
+    {prefix}with manager:
+        try:
+            if ready:
+                log('begin', 'work', tags=('x',))
+                return
+        except RuntimeError:
+            raise
+        finally:
+            if first is not None and last is not None:
+                release()
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "managed_return_guard.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn protected_conditional_store_preserves_erased_else_backedge() {
     let protected = r"def collect(batches, left, right, cleanup, sink):
     try:
