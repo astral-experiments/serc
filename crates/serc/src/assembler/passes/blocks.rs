@@ -3239,6 +3239,20 @@ impl OptimizationPipeline {
                     continue;
                 };
                 let Some((_, previous)) = instructions.next() else {
+                    if jump.opcode == JUMP_FORWARD
+                        && jump.jump_policy.retained_nop()
+                            != super::super::ir::RetainedJumpNop::None
+                        && jump
+                            .forward_target()
+                            .is_some_and(|target| graph.label_block(target) == Some(next))
+                    {
+                        // This empty arm jumps to its physical successor. CPython removes
+                        // that jump before cold relocation inserts an ownerless bridge.
+                        graph
+                            .instruction_mut(ItemPosition::new(current, offset))
+                            .expect("retained cold exit")
+                            .exclude_from_exception_table(ExceptionExclusion::Always);
+                    }
                     continue;
                 };
                 if jump.opcode == JUMP_FORWARD
