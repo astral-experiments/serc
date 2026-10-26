@@ -13391,6 +13391,29 @@ fn while_else_keeps_finally_borrowing_after_elided_assertions() {
 }
 
 #[test]
+fn conditional_comparison_arms_keep_a_copied_return_line() {
+    for result in ["None", "finish(value)"] {
+        let source = format!(
+            r"def check(flag, small, large, value):
+    if expired() or not (
+        0 < small <= 5
+        if flag
+        else 0 < large <= 10
+    ):
+        return {result}
+    finish()
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "conditional_comparison_return.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn terminal_chained_comparisons_preserve_empty_branch_exits() {
     for (index, body) in [
         "assert value",
