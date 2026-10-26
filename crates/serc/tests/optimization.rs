@@ -1440,6 +1440,12 @@ fn async_iterator_recovery_keeps_cleanup_cold() {
 }
 
 #[test]
+fn conditional_assignment_copies_protected_raise() {
+    let source = "def sample(ready, fallback):\n    error = make_error() if ready else fallback\n    try:\n        raise error\n    except Problem as caught:\n        report(caught)\n";
+    assert_matches_cpython(source, "assigned_protected_raise.py", &LEVELS);
+}
+
+#[test]
 fn guarded_manager_cleanup_retains_raise_recovery() {
     for work in ["resource.run()", "result = resource.run()"] {
         for exit in ["raise", "return"] {
