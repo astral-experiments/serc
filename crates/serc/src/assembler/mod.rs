@@ -14401,16 +14401,13 @@ impl Assembler {
         .then_some((entry, last.location))
     }
 
-    /// Certifies a sole located branch jump into a manager's original normal cleanup.
-    ///
-    /// The final continue has already emitted its separate manager exit and backedge.
-    /// Its physical adjacency therefore contributes no fallthrough to this empty join.
-    pub(crate) fn original_manager_has_unique_branch_donor(
+    /// Finds the sole located jump into an empty manager join after a terminal arm.
+    pub(crate) fn original_manager_branch_donor(
         &self,
         protected_end: Label,
-        location: SourceLocation,
+        terminals: &[Opcode],
         removed_slots: u8,
-    ) -> bool {
+    ) -> Option<(Label, SourceLocation)> {
         let items = self.linear_items();
         let aliases = trailing_labels(items).collect::<Vec<_>>();
         if !aliases.contains(&protected_end)
@@ -14420,26 +14417,24 @@ impl Assembler {
                     || self.folded_away_loop_else_targets.contains(label)
             })
         {
-            return false;
+            return None;
         }
         let Some(Item::Instruction(previous)) =
             items.get(items.len().saturating_sub(aliases.len() + 1))
         else {
-            return false;
+            return None;
         };
-        if previous.opcode != JUMP_BACKWARD {
-            return false;
+        if !terminals.contains(&previous.opcode) {
+            return None;
         }
         let provenance = &self.exception_owner_provenance;
         let mut entries = aliases
             .iter()
             .copied()
             .filter(|label| provenance.block_boundaries.contains(label));
-        let Some(entry) = entries.next() else {
-            return false;
-        };
+        let entry = entries.next()?;
         if entries.next().is_some() || !provenance.source_boundaries.contains(&entry) {
-            return false;
+            return None;
         }
         let mut incoming = items.iter().filter_map(|item| match item {
             Item::Instruction(instruction)
@@ -14447,14 +14442,11 @@ impl Assembler {
                     if aliases.contains(&label)) => Some(instruction),
             _ => None,
         });
-        let Some(jump) = incoming.next() else {
-            return false;
-        };
-        incoming.next().is_none()
+        let jump = incoming.next()?;
+        (incoming.next().is_none()
             && jump.opcode == JUMP_FORWARD
             && jump.operand() == Operand::Forward(entry)
-            && jump.location == location
-            && location.line >= 0
+            && jump.location.line >= 0
             && jump.pre_fold_extra_instructions() == removed_slots
             && jump.local_policy.hidden_exception_owner_slots() == 0
             && jump.exception_policy() == ExceptionPolicy::default()
@@ -14463,7 +14455,8 @@ impl Assembler {
             && !jump.fusion_policy.is_converted_pop_block()
             && jump.jump_policy.retained_nop() == ir::RetainedJumpNop::DirectTarget
             && !jump.jump_policy.borrow_empty_block()
-            && jump.depth_after().is_some()
+            && jump.depth_after().is_some())
+        .then_some((entry, jump.location))
     }
 
     /// Certifies the sole original donor of a manager join beside a separate break exit.
