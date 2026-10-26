@@ -9073,6 +9073,29 @@ fn completed_manager_work_preserves_retained_loop_owners() {
 }
 
 #[test]
+fn chained_comparison_copies_protected_return_arms() {
+    for (prefix, selected, fallback) in [
+        ("", "1", "2"),
+        ("", "ENABLED", "DISABLED"),
+        (
+            "        if low is None:\n            return None\n",
+            "value",
+            "None",
+        ),
+    ] {
+        let source = format!(
+            "def choose(low, value, high):\n    try:\n{prefix}        return {selected} if low < value <= high else {fallback}\n    except LookupError:\n        recover()\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "chained_conditional_returns.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn protected_conditional_store_preserves_erased_else_backedge() {
     let protected = r"def collect(batches, left, right, cleanup, sink):
     try:

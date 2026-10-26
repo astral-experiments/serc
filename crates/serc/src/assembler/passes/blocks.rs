@@ -5439,14 +5439,15 @@ impl OptimizationPipeline {
                 let discard = *order.get(source_position.checked_sub(1)?)?;
                 let alternative = *order.get(source_position + 1)?;
                 let condition = *order.get(source_position.checked_sub(3)?)?;
-                let [
-                    Item::Label(_),
-                    Item::Instruction(not_taken),
-                    Item::Instruction(success),
-                ] = graph[predecessor].items()
+                // A fallthrough marker need not have an explicit entry label.
+                let (entry_labels, [Item::Instruction(not_taken), Item::Instruction(success)]) =
+                    graph[predecessor].items().split_last_chunk::<2>()?
                 else {
                     return None;
                 };
+                if !matches!(entry_labels, [] | [Item::Label(_)]) {
+                    return None;
+                }
                 let [
                     Item::Label(_),
                     Item::Instruction(pop),
@@ -5484,9 +5485,7 @@ impl OptimizationPipeline {
                     && !region.preserve_lasti
                     && self
                         .exception_owner_provenance
-                        .ordinary_try_setups
-                        .get(&region.start)
-                        == Some(&region.target)
+                        .is_original_ordinary_try_region(region)
                     && region.end == *end
                     && positions[return_block.index()] == source_position + 2
                     && *return_label == return_entry
@@ -5505,7 +5504,10 @@ impl OptimizationPipeline {
                     && jump.no_location_policy.copies_split_return_exit()
                     && !jump.jump_policy.retains_nop_for(jump.operand())
                     && !has_jump_eval_check(jump)
-                    && load.opcode == LOAD_FAST
+                    && matches!(
+                        load.opcode,
+                        LOAD_FAST | LOAD_CONST | LOAD_SMALL_INT | LOAD_GLOBAL
+                    )
                     && load.depth_after() == Some(1)
                     && load.location.line >= 0
                     && load.value_argument().is_some()
