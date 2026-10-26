@@ -5324,6 +5324,122 @@ impl Assembler {
                 && provenance.block_boundaries.contains(label))
         })?;
         let prefix = &items[begin..];
+        // The outer normal POP starts at an incoming jump. The nested try's
+        // SETUP retains its line, but its final POP compacts into the method
+        // receiver. The appended marker then reuses the conditional jump.
+        if truth && self.python_version == crate::PythonVersion::Py314 && prefix.len() >= 18 {
+            let records = prefix
+                .iter()
+                .filter_map(Item::as_instruction)
+                .take(19)
+                .collect::<smallvec::SmallVec<[_; 32]>>();
+            if let [
+                outer,
+                outer_load,
+                outer_method,
+                outer_call,
+                outer_pop,
+                setup,
+                inner_load,
+                inner_method,
+                value,
+                names,
+                inner_call,
+                inner_pop,
+                final_pop,
+                load,
+                method,
+                call,
+                boolean,
+                condition,
+            ] = records.as_slice()
+                && [outer, final_pop].into_iter().all(|pop| {
+                    pop.opcode == NOP
+                        && pop.location == SourceLocation::NONE
+                        && pop.fusion_policy.is_converted_pop_block()
+                        && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
+                })
+                && setup.opcode == NOP
+                && setup.location.line >= 0
+                && !setup.fusion_policy.is_converted_pop_block()
+                && matches!(outer_load.opcode, LOAD_FAST | LOAD_DEREF)
+                && [inner_load, load]
+                    .into_iter()
+                    .all(|record| record.opcode == LOAD_FAST)
+                && [outer_method, inner_method, method]
+                    .into_iter()
+                    .all(|record| {
+                        record.opcode == LOAD_ATTR
+                            && record.value_argument().is_some_and(|arg| arg & 1 != 0)
+                    })
+                && [outer_call, call]
+                    .into_iter()
+                    .all(|record| record.opcode == CALL && record.value_argument() == Some(0))
+                && [outer_pop, inner_pop]
+                    .into_iter()
+                    .all(|record| record.opcode == POP_TOP)
+                && matches!(
+                    value.opcode,
+                    LOAD_CONST | crate::target::opcodes::LOAD_SMALL_INT
+                )
+                && names.opcode == LOAD_CONST
+                && inner_call.opcode == crate::target::opcodes::CALL_KW
+                && inner_call.value_argument() == Some(1)
+                && boolean.opcode == TO_BOOL
+                && boolean.location == condition.location
+                && call.location == condition.location
+                && records.iter().all(|record| {
+                    record.local_policy.hidden_exception_owner_slots() == 0
+                        && record.pre_fold_extra_instructions() == 0
+                        && record.no_location_policy.borrow_fallthrough()
+                            == BorrowFallthrough::Reachable
+                })
+            {
+                let outer_index = prefix
+                    .iter()
+                    .position(|item| item.as_instruction() == Some(*outer))?;
+                let setup_index = prefix
+                    .iter()
+                    .position(|item| item.as_instruction() == Some(*setup))?;
+                // Both the try-line NOP and its following SETUP belong to this
+                // array. Only the leading labels may receive a jump from outside.
+                let [
+                    Item::Label(start),
+                    _,
+                    Item::Label(end),
+                    Item::Label(setup_label),
+                    ..,
+                ] = prefix.get(setup_index.checked_sub(1)?..)?
+                else {
+                    return None;
+                };
+                if !provenance.setup_nop_ranges.contains(&(*start, *end))
+                    || !provenance
+                        .setups
+                        .iter()
+                        .any(|(label, _)| label == setup_label)
+                    || !items[..begin]
+                        .iter()
+                        .filter_map(Item::as_instruction)
+                        .any(|jump| {
+                            jump.forward_target().is_some_and(|target| {
+                                prefix[..outer_index].contains(&Item::Label(target))
+                            })
+                        })
+                    || items[..begin]
+                        .iter()
+                        .filter_map(Item::as_instruction)
+                        .any(|jump| {
+                            jump.jump_target().is_some_and(|target| {
+                                prefix[outer_index..].contains(&Item::Label(target))
+                            })
+                        })
+                {
+                    return None;
+                }
+                return Some(true);
+            }
+        }
         let mut leading_labels = FxHashSet::default();
         let mut labels = FxHashSet::default();
         let mut instructions = Vec::new();
