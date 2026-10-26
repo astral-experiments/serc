@@ -4983,9 +4983,11 @@ impl<'source> Compiler<'source> {
         {
             self.record_folded_value(&statement.test)?;
             if !truthiness && statement.elif_else_clauses.is_empty() {
-                if self.assembler.at_jump_target() || self.assembler.follows_original_join_store() {
+                if self.assembler.at_jump_target()
+                    || self.assembler.follows_original_join_store_or_call()
+                {
                     // An incoming edge still targets the original condition block, possibly
-                    // after its single assignment store. Keep the folded NOP and footer entry
+                    // after its store or discarded call. Keep the folded NOP and footer entry
                     // so this array cannot become a small return before condition folding.
                     self.compile_if(statement)?;
                     self.emit_deferred_implicit_return()?;

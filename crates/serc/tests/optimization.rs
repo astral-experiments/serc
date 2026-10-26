@@ -15359,6 +15359,29 @@ for prefix, line, argument, expected in cases:
 }
 
 #[test]
+fn folded_tail_conditions_keep_the_call_argument_join() {
+    for call in [
+        "publish(first if ready else second)",
+        "sink.publish(prefix, first if ready else second)",
+        "publish(first if ready else second, suffix)",
+    ] {
+        let source = format!(
+            "def send(ready, first, second):
+    {call}
+    if False:
+        pass
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "folded_tail_call.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn folded_protected_nested_terminal_joins_match_cpython() {
     for (index, source) in [
         "def f(a, b):\n try:\n  if True:\n   if b:\n    work()\n  else:\n   other()\n  assert a\n except ValueError:\n  work()\n",
