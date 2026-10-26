@@ -11032,13 +11032,18 @@ impl<'source> Compiler<'source> {
                     let shared_copied_cleanup_join = unwind_location == SourceLocation::NONE
                         && self.assembler.at_original_shared_cleanup_join();
                     self.assembler.set_location(unwind_location);
+                    // A constant return has an authored NOP before the ordinary
+                    // try and finally POPs. Python 3.14 can reuse either NULL POP
+                    // when it appends a monitoring marker to the copied guard.
+                    let constant_return_slots =
+                        !preserve_tos && self.context.python_version == crate::PythonVersion::Py314;
                     // Surrounding loops stay live until after the copied finally.
                     // Whiles and retained iterators contribute no unwind records
                     // between this value return and the ordinary-try/finally POP pair.
                     let copied_return_keeps_outer_loop = self.unit.flags
                         & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                         == CO_COROUTINE
-                        && preserve_tos
+                        && (preserve_tos || constant_return_slots)
                         && !return_is_overridden
                         && context_index == 0
                         && finally_context.loop_depth > 0
@@ -11061,7 +11066,7 @@ impl<'source> Compiler<'source> {
                     let copied_return_keeps_outer_async_manager = self.unit.flags
                         & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                         == CO_COROUTINE
-                        && preserve_tos
+                        && (preserve_tos || constant_return_slots)
                         && !return_is_overridden
                         && context_index == 0
                         && return_finally_contexts.len() == 1
@@ -11083,8 +11088,9 @@ impl<'source> Compiler<'source> {
                     let copied_return_keeps_outer_sync_managers = self.unit.flags
                         & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                         == 0
-                        && preserve_tos
-                        && matches!(statement.value.as_deref(), Some(Expr::Call(_)))
+                        && ((preserve_tos
+                            && matches!(statement.value.as_deref(), Some(Expr::Call(_))))
+                            || constant_return_slots)
                         && !return_is_overridden
                         && context_index == 0
                         && return_finally_contexts.len() == 1
@@ -11117,7 +11123,7 @@ impl<'source> Compiler<'source> {
                                 Expr::Compare(comparison) => matches!(comparison.first_operand(), Expr::Name(_))
                                     && matches!(comparison.ops.as_ref(), [CmpOp::Is | CmpOp::IsNot])
                                     && matches!(comparison.comparators(), [Expr::NoneLiteral(_)]),
-                                Expr::BoolOp(boolean) => boolean.op == BoolOp::Or
+                                Expr::BoolOp(boolean) => (boolean.op == BoolOp::Or || constant_return_slots)
                                     && matches!(boolean.values.first(), Some(Expr::Compare(comparison))
                                         if matches!(comparison.first_operand(), Expr::Name(_))
                                             && matches!(comparison.ops.as_ref(), [CmpOp::Is | CmpOp::IsNot])
