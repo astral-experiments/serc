@@ -4353,6 +4353,44 @@ fn literal_finalizer_returns_preserve_completed_cleanup_locations() {
 }
 
 #[test]
+fn managed_handler_returns_replay_the_outer_cleanup_owner() {
+    let generator = r"def run(manager, active, flag):
+    try:
+        while active:
+            with manager:
+                try:
+                    work()
+                except LookupError:
+                    return
+    finally:
+        if flag is not None:
+            finish()
+        yield flag
+";
+    let coroutine = r"async def run(manager, flag):
+    try:
+        with manager:
+            try:
+                work()
+            except LookupError:
+                return
+    except KeyError:
+        pass
+    finally:
+        if flag is not None:
+            finish()
+";
+    for source in [generator, coroutine] {
+        assert_matches_cpython_versions(
+            source,
+            "managed_handler_return_cleanup.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn inner_handler_returns_restore_exception_state_before_outer_managers() {
     let source = r"def sample(manager, work, finish, value):
     with manager():
