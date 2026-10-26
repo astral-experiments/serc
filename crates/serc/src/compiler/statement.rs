@@ -27726,18 +27726,33 @@ impl<'source> Compiler<'source> {
             // Line resolution precedes constant folding. A shared original false
             // anchor cannot inherit the final break's location through the empty exit.
             let shared_loop_condition_exit = statement.orelse.is_empty()
-                && matches!(statement.body.last(), Some(Stmt::While(loop_statement))
-                if loop_statement.orelse.is_empty()
-                    && !is_break_only_loop(loop_statement)
-                    && ((condition_jump_target_count(&loop_statement.test, false) == 1
-                        && !original_condition_has_unique_jump_target(
-                            &loop_statement.test,
-                            false,
-                        ))
-                        || (condition_jump_target_count(&loop_statement.test, false) > 1
-                            && condition_has_only_runtime_tests(&loop_statement.test)
-                            && !expression_contains_chained_comparison(&loop_statement.test)
-                            && !suite_contains_loop_break(&loop_statement.body))));
+                && match statement.body.last() {
+                    Some(Stmt::While(loop_statement)) => {
+                        loop_statement.orelse.is_empty()
+                            && !is_break_only_loop(loop_statement)
+                            && ((condition_jump_target_count(&loop_statement.test, false) == 1
+                                && !original_condition_has_unique_jump_target(
+                                    &loop_statement.test,
+                                    false,
+                                ))
+                                || (condition_jump_target_count(&loop_statement.test, false) > 1
+                                    && condition_has_only_runtime_tests(&loop_statement.test)
+                                    && !expression_contains_chained_comparison(
+                                        &loop_statement.test,
+                                    )))
+                    }
+                    // Break, the guard's false edge, and its completed body share
+                    // the try exit after the asynchronous iterator is exhausted.
+                    Some(Stmt::For(loop_statement)) => {
+                        loop_statement.is_async
+                            && suite_contains_loop_break(&loop_statement.body)
+                            && matches!(loop_statement.orelse.last(), Some(Stmt::If(branch))
+                                if branch.elif_else_clauses.is_empty()
+                                    && condition_has_only_runtime_tests(&branch.test)
+                                    && !suite_terminates(&branch.body))
+                    }
+                    _ => false,
+                };
             // Removed assertions cannot replace a runtime while's unique false-edge
             // location. Other loop shapes retain their separate exit policies.
             let loop_exit_tail = normal_exit_suite
