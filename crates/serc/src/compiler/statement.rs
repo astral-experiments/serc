@@ -10105,23 +10105,6 @@ impl<'source> Compiler<'source> {
                             start
                         });
                         self.emit(POP_EXCEPT, 0, -1)?;
-                        if self.context.python_version == crate::PythonVersion::Py313
-                            && preserve_tos
-                            && handler_count == 1
-                            && name.is_none()
-                            && try_body_depth > 0
-                            && next_finally == 0
-                            && next_loop == 0
-                            && next_with == 0
-                        {
-                            // CPython counts each enclosing try's POP_BLOCK after
-                            // POP_EXCEPT before deciding whether to copy this exit.
-                            let boundary = self.assembler.label();
-                            self.assembler.mark(boundary);
-                            for _ in 0..try_body_depth {
-                                self.assembler.add_legacy_pop_block_copy_slot(boundary);
-                            }
-                        }
                         if let Some(start) = named_handler_pop_start {
                             self.assembler.record_named_handler_pop_pair(start);
                         }
@@ -13409,7 +13392,7 @@ impl<'source> Compiler<'source> {
                     // Regions surrounding the handlers and managers remain active throughout
                     // their cleanup; only the final return leaves those enclosing regions.
                     let outer_try_pop_count = if self.context.python_version
-                        == crate::PythonVersion::Py312
+                        <= crate::PythonVersion::Py313
                         && preserve_tos
                         && handler_count == 1
                         && self.control.loops.contexts.is_empty()
@@ -13435,7 +13418,7 @@ impl<'source> Compiler<'source> {
                     }
                     // The handler's SWAP/POP_BLOCK/POP_EXCEPT is followed by each
                     // remaining outer try's POP_BLOCK in the same original array.
-                    // 3.12 counts these records in both four-slot exit-copy sweeps.
+                    // Both legacy versions count these slots before inlining the exit.
                     for _ in 0..outer_try_pop_count {
                         self.emit_with_exception_policy(
                             NOP,
