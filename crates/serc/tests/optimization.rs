@@ -9073,6 +9073,28 @@ fn completed_manager_work_preserves_retained_loop_owners() {
 }
 
 #[test]
+fn terminal_values_before_erased_assertions_keep_branch_returns() {
+    for (scope, work) in [
+        ("def", "consume(value or fallback)"),
+        ("async def", "await record(value)"),
+        (
+            "async def",
+            "item = build(value or fallback)\n            assert item\n            last = item.name",
+        ),
+    ] {
+        let source = format!(
+            "{scope} check(enabled, active, value):\n    if enabled:\n        pass\n    else:\n        if active:\n            {work}\n        assert active\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "conditional_value_returns.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn protected_conditional_store_preserves_erased_else_backedge() {
     let protected = r"def collect(batches, left, right, cleanup, sink):
     try:
