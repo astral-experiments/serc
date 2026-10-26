@@ -6964,6 +6964,21 @@ fn named_elif_cleanup_retains_recovery_and_conditional_suffix() {
 }
 
 #[test]
+fn copied_keyword_raise_keeps_the_collection_call_line() {
+    for last in ["flag", "None"] {
+        let source = format!(
+            "def sample(items, flag):\n    raise Error(\n        selected=tuple(item.value for item in items) if flag else None,\n        last={last},\n    )\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "collection_call_before_keyword_raise.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn conditional_finalizer_preserves_tuple_return_copy_order() {
     let source = r"async def sample(work, flag, left, right):
     try:
