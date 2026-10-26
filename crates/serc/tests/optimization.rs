@@ -6964,6 +6964,21 @@ fn named_elif_cleanup_retains_recovery_and_conditional_suffix() {
 }
 
 #[test]
+fn protected_keyword_return_keeps_the_collection_call_line() {
+    for first in ["", "first=work(),\n            "] {
+        let source = format!(
+            "def sample(items, flag):\n    try:\n        return pack(\n            {first}selected=tuple(item for item in items) if flag else None,\n        )\n    except ValueError:\n        pass\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "protected_collection_call_before_return.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn copied_keyword_raise_keeps_the_collection_call_line() {
     for last in ["flag", "None"] {
         let source = format!(
