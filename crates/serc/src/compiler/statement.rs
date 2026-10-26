@@ -37404,7 +37404,18 @@ impl<'source> Compiler<'source> {
             self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
             index
         };
-        if folded_pass_finally_exit {
+        // Before constant folding, the infinite loop still has a false edge into
+        // this join. Both arms reach POP_BLOCK when 3.13 assigns source lines.
+        let folded_conditional_exit = self.context.python_version == crate::PythonVersion::Py313
+            && statement.handlers.is_empty()
+            && statement.orelse.is_empty()
+            && matches!(statement.body.last(), Some(Stmt::If(branch))
+                if condition_has_only_runtime_tests(&branch.test)
+                    && matches!(branch.elif_else_clauses.as_slice(), [otherwise]
+                        if otherwise.test.is_none()
+                            && if_suites(branch).all(|suite| !suite_terminates_before_constant_folding(suite))
+                            && if_suites(branch).any(suite_terminates)));
+        if folded_pass_finally_exit || folded_conditional_exit {
             self.assembler.preserve_last_no_location();
         }
         if (statement.handlers.is_empty()
