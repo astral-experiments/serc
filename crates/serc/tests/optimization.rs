@@ -5605,6 +5605,33 @@ fn erased_nested_else_preserves_coroutine_loop_exits() {
 }
 
 #[test]
+fn a_named_handler_return_inherits_its_inner_cleanup_position() {
+    let source = r"def recover(value, state):
+    try:
+        try:
+            read()
+        except ValueError as error:
+            try:
+                return value
+            finally:
+                del state.pending
+    except LookupError:
+        pass
+";
+    for source in [
+        source.to_owned(),
+        source.replace("del state.pending", "state.close()"),
+    ] {
+        assert_matches_cpython_versions(
+            &source,
+            "handler_cleanup_return.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn erased_final_else_suffix_preserves_coroutine_loop_exits() {
     let source = r"async def sample(items, selected, prepare, work, verify):
     for item in items:
