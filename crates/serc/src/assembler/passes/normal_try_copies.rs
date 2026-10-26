@@ -2747,6 +2747,127 @@ impl OptimizationPipeline {
         }
     }
 
+    /// Preserves both original return copies where recovery arms leave a nested condition.
+    fn preserve_nested_recovery_returns(&mut self) {
+        use crate::target::opcodes::POP_TOP;
+        if self.python_version < crate::PythonVersion::Py314
+            || self.exception_regions.is_empty()
+            || !self.graph.features().has_forward_conditional()
+        {
+            return;
+        }
+        let graph = &self.graph;
+        let original_join = |block: BasicBlockId| {
+            let (Item::Instruction(jump), labels) = graph[block].items().split_last()? else {
+                return None;
+            };
+            (jump.opcode == JUMP_FORWARD
+                && jump.jump_policy.is_original_empty_join()
+                && jump.jump_policy.inline_small_exit()
+                && !jump.jump_policy.defers_redundant_removal()
+                && jump.pre_fold_extra_instructions() == 0
+                && jump.depth_after() == Some(0)
+                && labels.iter().all(|item| matches!(item, Item::Label(_))))
+            .then_some(jump)
+        };
+        let jump_target = |jump: &Instruction| graph.label_block(jump.forward_target()?);
+        let copies = graph
+            .iter()
+            .filter_map(|(cleanup, block)| {
+                let [labels @ .., Item::Instruction(pop), Item::Instruction(edge)] = block.items()
+                else {
+                    return None;
+                };
+                if pop.opcode != POP_EXCEPT
+                    || edge.opcode != JUMP_FORWARD
+                    || edge.depth_after() != Some(0)
+                    || !labels.iter().all(|item| matches!(item, Item::Label(_)))
+                {
+                    return None;
+                }
+                let first = jump_target(edge)?;
+                let inner = original_join(first)?;
+                let second = jump_target(inner)?;
+                let outer = original_join(second)?;
+                let tail = jump_target(outer)?;
+                if !matches!(
+                    original_computed_return(graph[tail].items()),
+                    Some(OriginalTail::ComputedReturn { width: 4 })
+                ) {
+                    return None;
+                }
+                let mut inputs = graph.iter().filter_map(|(id, block)| {
+                    let jump = block.last_instruction()?;
+                    (jump_target(jump) == Some(first)).then_some((id, jump))
+                });
+                let (_, guard) = inputs.next()?;
+                let (normal, success) = inputs.next()?;
+                let (handler, _) = inputs.next()?;
+                if inputs.next().is_some()
+                    || handler != cleanup
+                    || !super::super::is_conditional_jump(guard.opcode)
+                    || guard.location != inner.location
+                    || success.opcode != JUMP_FORWARD
+                    || [edge, success].iter().any(|jump| {
+                        jump.pre_fold_extra_instructions() != 0
+                            || !jump.jump_policy.inline_small_exit()
+                            || jump.jump_policy.is_interruptible()
+                    })
+                    || graph.iter().any(|(id, block)| {
+                        id != first
+                            && block
+                                .last_instruction()
+                                .and_then(Instruction::jump_target)
+                                .and_then(|label| graph.label_block(label))
+                                == Some(second)
+                    })
+                    || !graph.order().windows(2).any(|pair| {
+                        pair[1] == second
+                            && graph[pair[0]].last_instruction().is_some_and(|op| {
+                                op.opcode == POP_TOP && op.location == outer.location
+                            })
+                    })
+                {
+                    return None;
+                }
+                Some((
+                    normal,
+                    cleanup,
+                    first,
+                    second,
+                    inner.operand(),
+                    outer.operand(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        for (normal, cleanup, first, second, outer_target, returned) in copies {
+            // The warm exit and POP_EXCEPT first copy the inner join's jump. The
+            // guard still reaches that join, where the return gets a separate copy.
+            for source in [normal, cleanup] {
+                self.graph
+                    .instructions_mut(source)
+                    .next_back()
+                    .expect("recovery exit")
+                    .retarget(outer_target);
+            }
+            self.graph
+                .instructions_mut(first)
+                .next_back()
+                .expect("inner join")
+                .set_operand(returned);
+            // The outer join already received the return from its fallthrough.
+            // After that pass the old jump is a fifth slot, and its copies stop.
+            let jump = self
+                .graph
+                .instructions_mut(second)
+                .next_back()
+                .expect("outer join");
+            jump.jump_policy.prevent_threading_target();
+            jump.location = SourceLocation::NONE;
+            jump.no_location_policy.preserve_location();
+        }
+    }
+
     /// Restores original cleanup arrays for a closed ordinary-try/short-return graph.
     ///
     /// These records precede location propagation and NOP compaction in CPython. Keeping
@@ -2755,12 +2876,15 @@ impl OptimizationPipeline {
     pub(in crate::assembler) fn prepare_normal_try_copy_plan(&mut self) {
         // Prefix restoration and every selected cleanup require a forward jump and
         // a recorded normal exit or discard owner that can certify a cleanup crossing.
-        if !self.graph.features().has_forward_jump()
-            || (self.exception_owner_provenance.normal_try_exits.is_empty()
-                && self
-                    .exception_owner_provenance
-                    .normal_try_jump_owners
-                    .is_empty())
+        if !self.graph.features().has_forward_jump() {
+            return;
+        }
+        self.preserve_nested_recovery_returns();
+        if self.exception_owner_provenance.normal_try_exits.is_empty()
+            && self
+                .exception_owner_provenance
+                .normal_try_jump_owners
+                .is_empty()
         {
             return;
         }
