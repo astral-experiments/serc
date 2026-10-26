@@ -1440,6 +1440,12 @@ fn async_iterator_recovery_keeps_cleanup_cold() {
 }
 
 #[test]
+fn manager_exit_copies_local_raise_with_constant_cause() {
+    let source = "def sample(manager):\n    try:\n        work()\n    except Problem as caught:\n        error = translate(caught)\n        with manager:\n            log(error)\n        raise error from None\n    finally:\n        finish()\n";
+    assert_matches_cpython(source, "manager_raise_cause.py", &LEVELS);
+}
+
+#[test]
 fn guarded_manager_cleanup_retains_raise_recovery() {
     for work in ["resource.run()", "result = resource.run()"] {
         for exit in ["raise", "return"] {

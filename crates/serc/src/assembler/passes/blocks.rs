@@ -574,8 +574,8 @@ fn copied_raise_completes_local_store(source: &[Item], copied: &[Item]) -> bool 
 
 /// Certifies a local raise without copied return/finally unwind records.
 ///
-/// One original converted `POP_BLOCK` may precede the two-record raise. Authored
-/// or folded-away NOPs do not certify that original array's size.
+/// A constant cause adds one load before the raise. One converted `POP_BLOCK`
+/// may precede either form. Authored or folded NOPs do not prove its size.
 fn block_is_local_raise(items: &[Item], original_nop_targets: &FxHashSet<Label>) -> bool {
     if !original_nop_targets.is_empty()
         && items
@@ -603,15 +603,27 @@ fn block_is_local_raise(items: &[Item], original_nop_targets: &FxHashSet<Label>)
         };
         first = local;
     }
-    first.opcode == LOAD_FAST
-        && first.pre_fold_extra_instructions() == 0
-        && first.local_policy.hidden_exception_owner_slots() == 0
-        && instructions.next().is_some_and(|raise| {
-            raise.opcode == RAISE_VARARGS
-                && raise.value_argument() == Some(1)
-                && raise.pre_fold_extra_instructions() == 0
-                && raise.local_policy.hidden_exception_owner_slots() == 0
-        })
+    let visible = |instruction: &Instruction| {
+        instruction.pre_fold_extra_instructions() == 0
+            && instruction.local_policy.hidden_exception_owner_slots() == 0
+    };
+    if first.opcode != LOAD_FAST || !visible(first) {
+        return false;
+    }
+    let Some(next) = instructions.next() else {
+        return false;
+    };
+    let (raise, arguments) = if next.opcode == LOAD_CONST && visible(next) {
+        let Some(raise) = instructions.next() else {
+            return false;
+        };
+        (raise, 2)
+    } else {
+        (next, 1)
+    };
+    raise.opcode == RAISE_VARARGS
+        && raise.value_argument() == Some(arguments)
+        && visible(raise)
         && instructions.next().is_none()
 }
 
