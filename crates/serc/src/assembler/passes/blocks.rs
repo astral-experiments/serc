@@ -10,10 +10,10 @@ use super::super::{
 use crate::assembler::block_graph::{BasicBlockId, BlockGraph, ItemPosition};
 use crate::assembler::exception_owners::ExceptionOwnerProvenance;
 use crate::target::opcodes::{
-    BUILD_TUPLE, CALL, CALL_KW, DELETE_FAST, END_ASYNC_FOR, END_SEND, FOR_ITER, LOAD_ATTR,
-    LOAD_CONST, LOAD_DEREF, LOAD_FAST, LOAD_GLOBAL, LOAD_SMALL_INT, NOP, NOT_TAKEN, POP_EXCEPT,
-    POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE, POP_JUMP_IF_TRUE, POP_TOP,
-    RAISE_VARARGS, RERAISE, RETURN_VALUE, STORE_ATTR, STORE_FAST, SWAP,
+    BUILD_LIST, BUILD_MAP, BUILD_SET, BUILD_TUPLE, CALL, CALL_KW, DELETE_FAST, END_ASYNC_FOR,
+    END_SEND, FOR_ITER, LOAD_ATTR, LOAD_CONST, LOAD_DEREF, LOAD_FAST, LOAD_GLOBAL, LOAD_SMALL_INT,
+    NOP, NOT_TAKEN, POP_EXCEPT, POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE,
+    POP_JUMP_IF_TRUE, POP_TOP, RAISE_VARARGS, RERAISE, RETURN_VALUE, STORE_ATTR, STORE_FAST, SWAP,
 };
 use crate::target::{is_conditional_jump, is_unconditional_jump};
 
@@ -179,8 +179,8 @@ fn original_tuple_return_join(
     .then_some((*entry, *end, split_return))
 }
 
-/// Recognizes a located attribute assignment with exactly four original copy slots.
-fn is_four_slot_attribute_store_jump(items: &[Item]) -> bool {
+/// Recognizes a located store or call suffix with four original slots before a reraise.
+fn is_four_slot_reraise_predecessor(items: &[Item]) -> bool {
     let Some(first) = items
         .iter()
         .position(|item| matches!(item, Item::Instruction(_)))
@@ -189,12 +189,12 @@ fn is_four_slot_attribute_store_jump(items: &[Item]) -> bool {
     };
     matches!(
         &items[first..],
-        [Item::Instruction(value), Item::Instruction(object), Item::Instruction(store), Item::Instruction(jump)]
-            if matches!(value.opcode, LOAD_CONST | LOAD_SMALL_INT)
-                && object.opcode == LOAD_FAST
-                && store.opcode == STORE_ATTR
+        [Item::Instruction(first), Item::Instruction(second), Item::Instruction(third), Item::Instruction(jump)]
+            if matches!((first.opcode, second.opcode, third.opcode),
+                (LOAD_CONST | LOAD_SMALL_INT, LOAD_FAST, STORE_ATTR)
+                | (BUILD_LIST | BUILD_MAP | BUILD_SET | BUILD_TUPLE, CALL, POP_TOP))
                 && jump.opcode == JUMP_FORWARD
-                && [value, object, store, jump].iter().all(|instruction| {
+                && [first, second, third, jump].iter().all(|instruction| {
                     instruction.location.line >= 0
                         && instruction.pre_fold_extra_instructions() == 0
                         && instruction.local_policy.hidden_exception_owner_slots() == 0
@@ -7161,7 +7161,7 @@ impl OptimizationPipeline {
                 }
                 copied.insert(position, Item::Instruction(marker));
             }
-            let inline_reraising_attribute_store = matches!(
+            let inline_reraising_four_slot_source = matches!(
                 self.python_version,
                 crate::PythonVersion::Py314 | crate::PythonVersion::Py315
             ) && inline_small_exit
@@ -7171,7 +7171,7 @@ impl OptimizationPipeline {
                 && graph[target].last_instruction().is_some_and(|instruction| {
                     instruction.location.line < 0 && instruction.value_argument() == Some(0)
                 })
-                && is_four_slot_attribute_store_jump(graph[source].items());
+                && is_four_slot_reraise_predecessor(graph[source].items());
             let inline_reraising_iterator_break = self.python_version
                 == crate::PythonVersion::Py315
                 && inline_small_exit
@@ -7192,14 +7192,14 @@ impl OptimizationPipeline {
             if (inline_unprotected_return
                 || inline_unprotected_raise
                 || inline_reraising_iterator_break
-                || inline_reraising_attribute_store)
+                || inline_reraising_four_slot_source)
                 && !planned_copy
                 && let Some(instruction) = copied.iter_mut().find_map(Item::as_instruction_mut)
             {
                 // CPython retains the replaced jump and any jumps bypassed by our earlier
                 // threading as NOPs until after the repeated small-exit copy pass. A 3.15
-                // iterator break's marker and two POPs, or a located three-operation
-                // attribute store, then make its copied RERAISE five original slots,
+                // iterator break's marker and two POPs, or a three-operation store or
+                // call suffix, then make its copied RERAISE five original slots,
                 // preventing another small-exit copy.
                 let jump_extra = graph[source]
                     .last_instruction()
