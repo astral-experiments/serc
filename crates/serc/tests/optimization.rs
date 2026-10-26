@@ -1440,6 +1440,12 @@ fn async_iterator_recovery_keeps_cleanup_cold() {
 }
 
 #[test]
+fn nested_recovery_shares_the_outer_call_return() {
+    let source = "def sample(start, active, ready, allowed, last):\n    if start:\n        pass\n    elif active:\n        if ready:\n            if allowed:\n                try:\n                    work()\n                except ValueError:\n                    recover()\n                else:\n                    record()\n        else:\n            skip()\n    elif last:\n        pass\n    return finish()\n";
+    assert_matches_cpython(source, "nested_recovery_call_return.py", &LEVELS);
+}
+
+#[test]
 fn guarded_manager_cleanup_retains_raise_recovery() {
     for work in ["resource.run()", "result = resource.run()"] {
         for exit in ["raise", "return"] {
