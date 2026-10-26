@@ -11938,7 +11938,11 @@ fn erased_finally_assertion_preserves_both_guard_returns() {
             &source,
             "finally_guard_returns.py",
             &LEVELS,
-            &[PythonVersion::Py314, PythonVersion::Py315],
+            &[
+                PythonVersion::Py313,
+                PythonVersion::Py314,
+                PythonVersion::Py315,
+            ],
         );
     }
 }

@@ -2369,9 +2369,11 @@ impl<'source> Compiler<'source> {
                     .direct_try_body_statements
                     .contains(&statement.range())
                 && self.protected_terminal_if_before_elided(statement, &body[index + 1..]);
+            // The normal cleanup falls through to the scope return once its
+            // trailing assertions disappear. Each arm retains its own donor.
             let finally_if_before_elided = has_elided_tail
                 && !is_final
-                && self.context.python_version >= crate::PythonVersion::Py314
+                && self.context.python_version >= crate::PythonVersion::Py313
                 && self.control.finally.active_normal_finally_bodies == 1
                 && matches!(statement, Stmt::If(_))
                 && body[index + 1..]
