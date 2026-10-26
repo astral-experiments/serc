@@ -9073,6 +9073,25 @@ fn completed_manager_work_preserves_retained_loop_owners() {
 }
 
 #[test]
+fn conditional_finalizer_jump_before_manager_exit_has_no_location() {
+    for loop_header in [
+        "while ready",
+        "for item in items",
+        "async for item in items",
+    ] {
+        let source = format!(
+            "async def run(items, resource, nested, value):\n    {loop_header}:\n        async with resource:\n            try:\n                with nested:\n                    return value\n            finally:\n                if flag:\n                    observe()\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "finalizer_manager_exit.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn protected_conditional_store_preserves_erased_else_backedge() {
     let protected = r"def collect(batches, left, right, cleanup, sink):
     try:
