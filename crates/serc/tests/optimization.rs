@@ -2224,6 +2224,30 @@ fn erased_loop_exit_stays_inside_managed_finally() {
 }
 
 #[test]
+fn retained_manager_returns_unwind_tries_before_attribute_none_guards() {
+    let source = r"def sample(state, value):
+    with acquire():
+        try:
+            with scope():
+                pass
+            return maker.build(value, read(value), read(value))
+        except ValueError:
+            raise
+        finally:
+            if state.flag is not None:
+                clean()
+";
+    for source in [source.to_owned(), source.replace("is not None", "is None")] {
+        assert_matches_cpython_versions(
+            &source,
+            "retained_manager_attribute_guard.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn copied_return_through_nested_loops_keeps_none_guard_owner() {
     let source = r#"async def sample(client, response):
     for attempt in range(client.attempts):

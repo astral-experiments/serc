@@ -11114,7 +11114,10 @@ impl<'source> Compiler<'source> {
                         && matches!(finally_context.body.first(), Some(Stmt::If(guard))
                         if guard.elif_else_clauses.is_empty()
                             && match guard.test.as_ref() {
-                                Expr::Compare(comparison) => matches!(comparison.first_operand(), Expr::Name(_))
+                                Expr::Compare(comparison) => (matches!(comparison.first_operand(), Expr::Name(_))
+                                    || (self.context.python_version == crate::PythonVersion::Py314
+                                        && matches!(comparison.first_operand(), Expr::Attribute(attribute)
+                                            if matches!(attribute.value.as_ref(), Expr::Name(_)))))
                                     && matches!(comparison.ops.as_ref(), [CmpOp::Is | CmpOp::IsNot])
                                     && matches!(comparison.comparators(), [Expr::NoneLiteral(_)]),
                                 Expr::BoolOp(boolean) => boolean.op == BoolOp::Or
