@@ -9073,6 +9073,37 @@ fn completed_manager_work_preserves_retained_loop_owners() {
 }
 
 #[test]
+fn local_truth_test_after_handler_starts_with_an_unowned_marker() {
+    let source = r"def read(rows, flag):
+    with resource() as reader:
+        try:
+            while flag:
+                for entry, value in rows:
+                    yield entry
+        finally:
+            try:
+                visit()
+            except ValueError as error:
+                raise RuntimeError from error
+            if reader.ready():
+                pass
+";
+    for test in [
+        "reader.ready()",
+        "reader.ready(1)",
+        "reader.ready",
+        "reader",
+    ] {
+        assert_matches_cpython_versions(
+            &source.replace("reader.ready()", test),
+            "reader_method_test.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn protected_conditional_store_preserves_erased_else_backedge() {
     let protected = r"def collect(batches, left, right, cleanup, sink):
     try:
