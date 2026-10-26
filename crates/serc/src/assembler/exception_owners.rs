@@ -926,10 +926,8 @@ impl ExceptionOwnerProvenance {
             for instruction in &mut origin.cleanup {
                 visit(instruction);
             }
-            if let Some(prefix) = origin.earlier_cleanup.as_mut() {
-                for instruction in prefix.iter_mut() {
-                    visit(instruction);
-                }
+            for instruction in origin.earlier_cleanups.iter_mut().flatten() {
+                visit(instruction);
             }
             if let Some(prefix) = origin.named_handler_cleanup.as_mut() {
                 for instruction in prefix.iter_mut() {
@@ -1210,7 +1208,7 @@ pub(super) struct CopiedManagerReturnCompaction {
     /// A still-live manager can be replaced only by a captured original cleanup cell.
     pub(super) retained_outer_handler: Option<Label>,
     pub(super) cleanup: Vec<Instruction>,
-    pub(super) earlier_cleanup: Option<[Instruction; 7]>,
+    pub(super) earlier_cleanups: Vec<[Instruction; 7]>,
     /// `SWAP`, `POP_EXCEPT`, and name clearing after two omitted named-handler POPs.
     pub(super) named_handler_cleanup: Option<[Instruction; 5]>,
     pub(super) constant_return_prefix: Option<ConstantManagerReturnPrefix>,
@@ -12727,31 +12725,32 @@ impl LayoutAssembler {
                         .iter()
                         .zip(&origin.cleanup)
                         .all(|(actual, expected)| **actual == *expected)
-                    || !origin.earlier_cleanup.is_none_or(|cleanup| {
-                        start.checked_sub(cleanup.len()).is_some_and(|earlier| {
-                            array_start <= earlier
-                                && instructions[earlier..start]
-                                    .iter()
-                                    .zip(cleanup)
-                                    .all(|(actual, expected)| **actual == expected)
-                                && !jump_targets
-                                    .iter()
-                                    .chain(&self.exception_owner_provenance.source_boundaries)
-                                    .chain(&self.exception_owner_provenance.block_boundaries)
-                                    .any(|label| {
-                                        positions.get(label).is_some_and(|position| {
-                                            earlier < *position && *position <= start
+                    || (!origin.earlier_cleanups.is_empty()
+                        && !start
+                            .checked_sub(7 * origin.earlier_cleanups.len())
+                            .is_some_and(|earlier| {
+                                array_start <= earlier
+                                    && instructions[earlier..start]
+                                        .iter()
+                                        .zip(origin.earlier_cleanups.iter().flatten())
+                                        .all(|(actual, expected)| **actual == *expected)
+                                    && !jump_targets
+                                        .iter()
+                                        .chain(&self.exception_owner_provenance.source_boundaries)
+                                        .chain(&self.exception_owner_provenance.block_boundaries)
+                                        .any(|label| {
+                                            positions.get(label).is_some_and(|position| {
+                                                earlier < *position && *position <= start
+                                            })
                                         })
-                                    })
-                        })
-                    })
+                            }))
                 {
                     return None;
                 }
                 if let Some(prefix) = origin.named_handler_cleanup {
                     if tail.post_compaction_fusions != 0
                         || origin.constant_return_prefix.is_some()
-                        || origin.earlier_cleanup.is_some()
+                        || !origin.earlier_cleanups.is_empty()
                         || !instructions[prefix_start..start]
                             .iter()
                             .zip(prefix)
@@ -12938,8 +12937,8 @@ impl LayoutAssembler {
             // These original POP records are NULL before compaction removes them.
             let original_start = start
                 .checked_add(prefix_tail.early_removals)?
-                // A preceding captured manager contributes its own omitted POP.
-                .checked_add(usize::from(origin.earlier_cleanup.is_some()))?
+                // Each preceding manager contributes its own omitted POP.
+                .checked_add(origin.earlier_cleanups.len())?
                 // Named-handler cleanup omits one POP before SWAP and another
                 // before POP_EXCEPT. Both precede the captured manager records.
                 .checked_add(2 * usize::from(origin.named_handler_cleanup.is_some()))?
@@ -13943,7 +13942,7 @@ mod tests {
                         ordinary_try_pops: 1,
                         retained_outer_handler: None,
                         cleanup: cleanup.to_vec(),
-                        earlier_cleanup: None,
+                        earlier_cleanups: Vec::new(),
                         named_handler_cleanup: None,
                         constant_return_prefix: None,
                         to_bool: None,

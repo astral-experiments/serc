@@ -11714,7 +11714,12 @@ impl<'source> Compiler<'source> {
                             }
                             _ => false,
                         }
-                        && (1..=2).contains(&self.control.withs.active_with_exits.len())
+                        && (matches!(self.control.withs.active_with_exits.len(), 1 | 2)
+                            || (self.control.withs.active_with_exits.len() > 2
+                                && self.control.loops.contexts.is_empty()
+                                && return_finally_contexts.len() == 1
+                                && self.control.exceptions.active_try_marker_slots.is_empty()
+                                && self.control.withs.active_with_exits.iter().all(|manager| manager.exception_region_depth == 1)))
                         && self
                             .control
                             .withs
