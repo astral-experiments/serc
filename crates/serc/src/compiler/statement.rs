@@ -22160,16 +22160,13 @@ impl<'source> Compiler<'source> {
                     && (!non_final_branch || managed_coroutine_branch)
                     && !try_body_normal_exit
                     && matches!(self.unit.scope, Scope::Function { .. })
-                    && ((self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
-                        && !self.has_active_control_flow_region()
-                        && self.control.withs.active_with_exits.is_empty())
-                        || managed_coroutine_branch
-                        || finalized_erased_coroutine_branch)
+                    && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+                    // The erased arm returns to the innermost iterator without unwinding.
+                    && self.control.in_loop_tail_without_nested_cleanup()
                     && !self.control.statements.in_match
                     && !self.control.in_exception_handler()
                     && (self.control.finally.is_inactive_for_return_unwind()
                         || finalized_erased_coroutine_branch)
-                    && self.control.loops.contexts.len() == 1
                     && self.control.loops.contexts.last().is_some_and(|context| {
                         context.iterator_cleanup == IteratorCleanup::Sync
                             && !context.has_orelse
