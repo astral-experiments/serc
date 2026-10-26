@@ -17401,6 +17401,21 @@ assert events == ['caught'], events
 }
 
 #[test]
+fn loop_breaks_preserve_shared_try_exit_positions() {
+    for source in [
+        "async def run(items, left, right, flag, value):\n    if right:\n        pass\n    elif flag:\n        try:\n            try:\n                async for value in items:\n                    if flag:\n                        break\n                else:\n                    if flag:\n                        value = left\n            except ValueError:\n                pass\n        finally:\n            pass\n    else:\n        raise ValueError\n    observe(value)\n",
+        "async def run(items, left, right, flag, value):\n    if right:\n        pass\n    elif flag:\n        try:\n            while left and right:\n                if flag:\n                    break\n        except ValueError:\n            pass\n    else:\n        raise ValueError\n    observe(value)\n",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "shared_loop_try_exit.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn nested_pass_exit_successors_match_cpython() {
     for successor in ["out = 1", "del item", "if flag:\n            assert flag"] {
         let source = format!(
