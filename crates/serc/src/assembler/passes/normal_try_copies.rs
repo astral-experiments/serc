@@ -1837,16 +1837,28 @@ impl OptimizationPipeline {
                     end.as_u32(),
                     block,
                     owners.clone(),
+                    (jump.location.line < 0 && empty_setup_donor && !shared_reraise)
+                        .then(|| (start, target, instructions[start_offset - 1].location)),
                 ));
             }
         }
-        selected.sort_by_key(|(offset, start, end, _, _)| (*offset, *start, *end));
-        for (_, _, _, block, owners) in selected {
-            self.graph
+        selected.sort_by_key(|(offset, start, end, _, _, _)| (*offset, *start, *end));
+        for (_, _, _, block, owners, setup_exit) in selected {
+            let jump = self
+                .graph
                 .instructions_mut(block)
                 .next_back()
-                .expect("original normal jump")
-                .set_exception_policy(super::super::ExceptionPolicy::default());
+                .expect("original normal jump");
+            jump.set_exception_policy(super::super::ExceptionPolicy::default());
+            if let Some((entry, target, location)) = setup_exit {
+                // A retained NOP on the setup line represents the ownerless setup.
+                // A surviving jump or a copied exit still has the surrounding owner.
+                let mut expected = *jump;
+                expected.location = location;
+                self.exception_owner_provenance
+                    .ownerless_compound_try_nops
+                    .push((entry, target, expected));
+            }
             self.exception_regions.extend(owners);
         }
     }

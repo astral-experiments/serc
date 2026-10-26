@@ -15,6 +15,29 @@ use serc::{
 };
 
 #[test]
+fn removed_try_body_preserves_an_ownerless_setup_line() {
+    let source = r"async def sample(enabled, ready, value):
+    try:
+        if enabled:
+            if ready:
+                try:
+                    assert value
+                except LookupError as exc:
+                    pass
+            result = consume(enabled, ready, value)
+            finish(result)
+    except ValueError:
+        recover()
+";
+    assert_matches_cpython_versions(
+        source,
+        "removed_try_body.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn nested_conversion_handlers_keep_shared_cleanup() {
     let source = r"def sample(items):
     for item in items:
