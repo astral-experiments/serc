@@ -1762,6 +1762,24 @@ impl<'source> Compiler<'source> {
             }
     }
 
+    /// Checks that each reachable path through a nested conditional can fall through.
+    fn suite_has_conditional_return_fallthrough(&self, body: &[Stmt]) -> bool {
+        body.iter().all(|part| {
+            if let Stmt::If(branch) = part {
+                condition_has_linear_runtime_leaves(&branch.test)
+                    && !expression_suspends_current_scope(&branch.test)
+                    && self.suite_has_conditional_return_fallthrough(&branch.body)
+                    && (branch.elif_else_clauses.is_empty()
+                        || matches!(branch.elif_else_clauses.as_slice(), [clause] if clause.test.is_none()
+                            && self.suite_has_conditional_return_fallthrough(&clause.body)))
+            } else {
+                self.context.is_elided_statement(part)
+                    || matches!(part, Stmt::Pass(_))
+                    || self.has_terminal_value_fallthrough(std::slice::from_ref(part))
+            }
+        })
+    }
+
     /// Certifies a terminal branch with erased assertions or a linear conditional prefix.
     fn linear_terminal_branch_before_elided(&self, body: &[Stmt]) -> bool {
         let is_elided = |statement: &Stmt| self.context.is_elided_statement(statement);
@@ -2336,9 +2354,10 @@ impl<'source> Compiler<'source> {
                             || (self.context.python_version >= crate::PythonVersion::Py314
                                 && self.has_terminal_value_fallthrough(&conditional.body))
                             || matches!(conditional.body.as_slice(), [Stmt::Pass(_)])
-                            // The nested pass keeps its original NOP until after
-                            // exit copying. Both conditions need separate returns
-                            // before the removed assertion's empty join disappears.
+                            // Copy each reachable exit before the erased assertions lose their join.
+                            || (self.context.python_version >= crate::PythonVersion::Py314
+                                && conditional.body.iter().any(|part| matches!(part, Stmt::If(_)))
+                                && self.suite_has_conditional_return_fallthrough(&conditional.body))
                             || matches!(conditional.body.as_slice(), [Stmt::If(nested)]
                                 if nested.elif_else_clauses.is_empty()
                                     && condition_has_linear_runtime_leaves(&nested.test)
