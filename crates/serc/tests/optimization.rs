@@ -15,6 +15,25 @@ use serc::{
 };
 
 #[test]
+fn coroutine_nested_guard_donates_its_line_after_assertion_removal() {
+    let source = r"async def sample(first, second, leaf):
+    if first:
+        if second:
+            raise ValueError
+        assert check()
+    else:
+        handle()
+    return leaf
+";
+    assert_matches_cpython_versions(
+        source,
+        "erased_guard.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn nested_conversion_handlers_keep_shared_cleanup() {
     let source = r"def sample(items):
     for item in items:

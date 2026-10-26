@@ -16700,7 +16700,28 @@ impl<'source> Compiler<'source> {
                             && condition_has_only_runtime_tests(test))
                             || (nested_else_has_donor
                                 && (erased_else || effective_nested_else_body.len() < body.len())));
-                    if erased_join_has_donor
+                    // An erased alternative leaves the nested condition's false edge
+                    // as the line donor. With a live else, a terminating inner arm
+                    // can supply that edge across a trailing erased assertion.
+                    let coroutine_guard_donor = self.context.python_version
+                        >= crate::PythonVersion::Py314
+                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                            == CO_COROUTINE
+                        && !self.control.in_loop()
+                        && !self.control.in_exception_handler()
+                        && self
+                            .control
+                            .exceptions
+                            .active_exception_region_exclusions
+                            .is_empty()
+                        && self.control.finally.is_inactive_for_return_unwind()
+                        && matches!(effective_nested_else_body.last(),Some(Stmt::If(tail))
+                            if original_condition_has_unique_jump_target(&tail.test, false)
+                                && (erased_else || (effective_nested_else_body.len() < body.len()
+                                    && tail.elif_else_clauses.is_empty()
+                                    && suite_terminates_before_constant_folding(&tail.body))));
+                    if coroutine_guard_donor
+                        || erased_join_has_donor
                         || optimized_empty_both
                         || optimized_nested_else
                         || raising_else_join.is_some()
