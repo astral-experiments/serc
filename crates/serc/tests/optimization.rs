@@ -18559,6 +18559,17 @@ fn boolean_call_prefix_keeps_terminal_finalizer_join() {
 }
 
 #[test]
+fn folded_generator_guard_preserves_conditional_argument_join() {
+    let source = "def select(flag, left, right):\n    emit(left if flag else right)\n    if False:\n        yield left\n";
+    assert_matches_cpython_versions(
+        source,
+        "folded_generator_guard.py",
+        &LEVELS,
+        &[PythonVersion::Py313],
+    );
+}
+
+#[test]
 fn erased_assertions_preserve_populated_iterator_branch_joins() {
     let source = r"def collect(groups):
     result = 0
