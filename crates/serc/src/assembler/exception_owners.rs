@@ -12377,7 +12377,7 @@ impl LayoutAssembler {
         exact && seen_send && seen_bridge == origin.bridge.is_some()
     }
 
-    /// Recovers the owned record immediately before an authenticated POP/SETUP pair.
+    /// Recovers the original owner of a source record before a retained SETUP.
     fn retained_setup_predecessor_owner(
         &self,
         marker: usize,
@@ -12390,31 +12390,18 @@ impl LayoutAssembler {
         jump_targets: &FxHashSet<Label>,
         owners: &DynamicExceptionOwners,
     ) -> Option<usize> {
-        use crate::target::opcodes::{LOAD_DEREF, LOAD_FAST, LOAD_FAST_BORROW};
+        use crate::target::opcodes::{
+            BUILD_LIST, CALL, LOAD_DEREF, LOAD_FAST, LOAD_FAST_BORROW, STORE_FAST, UNPACK_SEQUENCE,
+        };
 
         let nop_index = setup_start.checked_sub(1)?;
-        let donor_index = nop_index.checked_sub(1)?;
-        // The sole transferred POP precedes the retained SETUP. Neither it nor
-        // the three folded None-comparison records can donate this old slot.
-        if array_start > donor_index
-            || setup_start.checked_add(2) != Some(marker)
-            || donor_index.checked_add(setup_removed.checked_sub(1)?) != Some(marker)
-        {
+        let [nop, load, condition] = instructions.get(nop_index..marker)? else {
             return None;
-        }
-        let donor = *instructions.get(donor_index)?;
-        let nop = *instructions.get(nop_index)?;
-        let load = *instructions.get(setup_start)?;
-        let condition = *instructions.get(marker.checked_sub(1)?)?;
-        if !matches!(donor.opcode, LOAD_FAST | LOAD_FAST_BORROW | POP_TOP)
-            || donor.exception_policy() != super::ExceptionPolicy::NoneUnchanged
-            || owners.contains_key(donor_index)
-            || donor.local_policy.hidden_exception_owner_slots() != 0
-            || nop.opcode != NOP
+        };
+        if nop.opcode != NOP
             || nop.value_argument() != Some(0)
             || nop.fusion_policy.is_converted_pop_block()
             || nop.exception_policy() != super::ExceptionPolicy::EXCLUDE_ALWAYS
-            || nop.local_policy.hidden_exception_owner_slots() != 1
             || !matches!(load.opcode, LOAD_FAST | LOAD_FAST_BORROW | LOAD_DEREF)
             || load.exception_policy() != super::ExceptionPolicy::NoneUnchanged
             || load.local_policy.hidden_exception_owner_slots() != 0
@@ -12422,13 +12409,64 @@ impl LayoutAssembler {
             || condition.forward_target().is_none()
             || condition.exception_policy() != super::ExceptionPolicy::NoneUnchanged
             || condition.local_policy.hidden_exception_owner_slots() != 3
-            || [donor, nop, load, condition].iter().any(|instruction| {
-                instruction.pre_fold_extra_instructions() != 0
-                    || instruction.only_allows_unconditional_inlining()
-                    || instruction.no_location_policy.borrow_fallthrough()
-                        == super::BorrowFallthrough::Barrier
-                    || instruction.location.line < 0
-            })
+        {
+            return None;
+        }
+        let intact = |r: &Instruction| {
+            r.pre_fold_extra_instructions() == 0
+                && !r.only_allows_unconditional_inlining()
+                && r.no_location_policy.borrow_fallthrough() != super::BorrowFallthrough::Barrier
+                && r.location.line >= 0
+        };
+        if ![nop, load, condition].iter().all(|r| intact(r)) {
+            return None;
+        }
+        if nop.local_policy.hidden_exception_owner_slots() == 0 {
+            // Walk the old slots backward from SETUP. A fused global call still
+            // includes PUSH_NULL, and a finalizer may begin after an erased POP.
+            let mut end = nop_index.checked_add(setup_removed)?;
+            for index in (array_start..nop_index).rev() {
+                let r = instructions[index];
+                let hidden = usize::from(r.local_policy.hidden_exception_owner_slots());
+                if !intact(r)
+                    || r.exception_policy() != super::ExceptionPolicy::NoneUnchanged
+                    || !matches!(
+                        r.opcode,
+                        STORE_FAST | BUILD_LIST | LOAD_GLOBAL | CALL | UNPACK_SEQUENCE
+                    )
+                    || (hidden != 0 && !(hidden == 1 && r.opcode == BUILD_LIST))
+                {
+                    return None;
+                }
+                end = end.checked_sub(r.pre_fusion_width() + hidden)?;
+                if end <= marker {
+                    return (r.opcode == STORE_FAST
+                        && hidden == 0
+                        && end == marker
+                        && !owners.contains_key(index)
+                        && !jump_targets.iter().any(|label| {
+                            positions
+                                .get(label)
+                                .is_some_and(|p| index < *p && *p <= marker)
+                        }))
+                    .then(|| self.uniform_exception_owner(index, index + 1, positions))
+                    .flatten();
+                }
+            }
+            return None;
+        }
+        let donor_index = nop_index.checked_sub(1)?;
+        let donor = *instructions.get(donor_index)?;
+        // The sole transferred POP precedes the retained SETUP. Neither it nor
+        // the three folded None-comparison records can donate this old slot.
+        if array_start > donor_index
+            || nop.local_policy.hidden_exception_owner_slots() != 1
+            || donor_index.checked_add(setup_removed.checked_sub(1)?) != Some(marker)
+            || !matches!(donor.opcode, LOAD_FAST | LOAD_FAST_BORROW | POP_TOP)
+            || donor.exception_policy() != super::ExceptionPolicy::NoneUnchanged
+            || owners.contains_key(donor_index)
+            || donor.local_policy.hidden_exception_owner_slots() != 0
+            || !intact(donor)
         {
             return None;
         }

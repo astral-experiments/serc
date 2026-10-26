@@ -1906,6 +1906,25 @@ fn erased_loop_break_keeps_async_manager_finally_boundary() {
 }
 
 #[test]
+fn stored_finalizer_value_keeps_retained_setup_marker_owner() {
+    let params = (0..16)
+        .map(|n| format!("p{n}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let guard = "        try:\n            if guard is not None:\n                guard.close()\n        finally:\n            finish()\n";
+    let copied = format!(
+        "async def sample({params}, guard, flag, left, right):\n    try:\n        if flag:\n            work(left)\n            work(left)\n            return pack(left, right)\n    finally:\n        current = state.current()\n{guard}"
+    );
+    let calls = "        work(left)\n".repeat(10);
+    let normal = format!(
+        "def sample({params}, guard, flag, left, right):\n    try:\n{calls}        saved = pack(left, right)\n    finally:\n        errors = []\n        current, previous = begin()\n{guard}"
+    );
+    for source in [copied, normal] {
+        assert_matches_cpython(&source, "stored_finalizer_owner.py", &LEVELS);
+    }
+}
+
+#[test]
 fn tuple_unpack_prefix_keeps_retained_setup_marker_owner() {
     let source = r#"async def sample(healthy):
     group = attach({**originals, **({"peer": peer} if healthy else {})})
