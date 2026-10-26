@@ -18934,6 +18934,7 @@ impl<'source> Compiler<'source> {
                                     captured_none_prefix
                                         && self
                                             .copied_finally_starts_local_none_cleanup(context.body),
+                                    suite_has_linear_borrow_fallthrough,
                                 ))
                             || (self.unit.flags
                                 & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
@@ -18946,7 +18947,11 @@ impl<'source> Compiler<'source> {
                                         )
                                     },
                                 )
-                                && copied_finally_has_guarded_pass_cleanup(context.body)))
+                                && copied_finally_has_guarded_linear_cleanup(
+                                    context.body,
+                                    false,
+                                    sync_cleanup_falls_through,
+                                )))
                         && matches!(context.body.last(), Some(Stmt::If(tail))
                             if tail.elif_else_clauses.is_empty()
                                 && (!suite_contains_loop_break(&tail.body)
@@ -48772,17 +48777,42 @@ fn copied_finally_has_guarded_pass_cleanup(body: &[Stmt]) -> bool {
         && matches!(handler.body.as_slice(), [Stmt::Pass(_)])
 }
 
+/// A conditional argument rejoins at its call before this synchronous cleanup exits.
+fn sync_cleanup_falls_through(body: &[Stmt]) -> bool {
+    if matches!(body, [Stmt::Pass(_)]) || suite_has_linear_borrow_fallthrough(body) {
+        return true;
+    }
+    let [Stmt::Expr(expression)] = body else {
+        return false;
+    };
+    let Expr::Call(call) = expression.value.as_ref() else {
+        return false;
+    };
+    !expression_contains_inline_branch(&call.func)
+        && call.arguments.args.iter().all(|argument| {
+            !matches!(argument, Expr::Starred(_))
+                && expression_has_completed_conditional_value(argument)
+        })
+        && call.arguments.keywords.iter().all(|keyword| {
+            keyword.arg.is_some() && expression_has_completed_conditional_value(&keyword.value)
+        })
+}
+
 /// A terminal runtime guard can bypass a closed, linear cleanup and reach the loop.
 ///
 /// The guarded try keeps ordinary lowering: its body, recovery and finalizer have
 /// no branch or abrupt exit. This certificate does not change the original POP
 /// accounting used before the copy or admit cleanup still pending after the copy.
-fn copied_finally_has_guarded_linear_cleanup(body: &[Stmt], captured_none_prefix: bool) -> bool {
+fn copied_finally_has_guarded_linear_cleanup(
+    body: &[Stmt],
+    captured_none_prefix: bool,
+    falls_through: impl Fn(&[Stmt]) -> bool,
+) -> bool {
     fn linear_or_empty(body: &[Stmt]) -> bool {
         body.is_empty() || suite_has_linear_borrow_fallthrough(body)
     }
 
-    fn guarded_cleanup(statement: &ruff_python_ast::StmtIf) -> bool {
+    let guarded_cleanup = |statement: &ruff_python_ast::StmtIf| {
         let Some((Stmt::Try(cleanup), leading)) = statement.body.split_last() else {
             return false;
         };
@@ -48793,17 +48823,17 @@ fn copied_finally_has_guarded_linear_cleanup(body: &[Stmt], captured_none_prefix
             && !cleanup.is_star
             && cleanup.orelse.is_empty()
             && (cleanup.handlers.is_empty() != cleanup.finalbody.is_empty())
-            && suite_has_linear_borrow_fallthrough(&cleanup.body)
-            && linear_or_empty(&cleanup.finalbody)
+            && falls_through(&cleanup.body)
+            && (cleanup.finalbody.is_empty() || falls_through(&cleanup.finalbody))
             && cleanup.handlers.iter().all(|handler| {
                 handler.as_except_handler().is_some_and(|handler| {
                     handler.type_.as_deref().is_some_and(|test| {
                         !expression_contains_inline_branch(test)
                             && !expression_suspends_current_scope(test)
-                    }) && suite_has_linear_borrow_fallthrough(&handler.body)
+                    }) && falls_through(&handler.body)
                 })
             })
-    }
+    };
 
     let Some((Stmt::If(tail), leading)) = body.split_last() else {
         return false;
@@ -48888,7 +48918,12 @@ fn copied_finally_has_closed_none_continue(
                         && matches!(raise.exc.as_deref(), Some(Expr::Name(_))))
         }
         (CO_ASYNC_GENERATOR, IteratorCleanup::None) => {
-            leading.is_empty() && copied_finally_has_guarded_linear_cleanup(body, false)
+            leading.is_empty()
+                && copied_finally_has_guarded_linear_cleanup(
+                    body,
+                    false,
+                    suite_has_linear_borrow_fallthrough,
+                )
         }
         _ => false,
     }

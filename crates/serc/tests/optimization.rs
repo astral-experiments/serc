@@ -9073,6 +9073,45 @@ fn completed_manager_work_preserves_retained_loop_owners() {
 }
 
 #[test]
+fn handler_continue_shortcuts_a_closed_conditional_cleanup() {
+    let source = r"def process(items, enabled):
+    for item in items:
+        try:
+            read(item)
+        except ValueError as error:
+            continue
+        finally:
+            if enabled:
+                try:
+                    step(item)
+                except TypeError:
+                    recover()
+";
+    for (i, source) in [
+        source.to_owned(),
+        source.replace("except TypeError:", "finally:"),
+        source.replace(
+            "step(item)",
+            "store.stream.write(item if item is not None else fallback())",
+        ),
+        source
+            .replace("step(item)", "pass")
+            .replace("recover()", "pass"),
+        source.replace("continue", "recover()"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython_versions(
+            &source,
+            &format!("closed_cleanup_{i}.py"),
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn protected_conditional_store_preserves_erased_else_backedge() {
     let protected = r"def collect(batches, left, right, cleanup, sink):
     try:
