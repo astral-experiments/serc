@@ -8081,7 +8081,7 @@ impl<'source> Compiler<'source> {
                             // A while entered inside the same protected manager emits no
                             // iterator unwind record before this original value join.
                             || ((self.assembler.at_jump_target()
-                                || (self.context.python_version == crate::PythonVersion::Py313
+                                || (self.context.python_version <= crate::PythonVersion::Py313
                                     && location.line != location.end_line))
                                 && self.control.loops.contexts[context.loop_depth..]
                                     .iter()
