@@ -10167,6 +10167,41 @@ fn elided_assertion_preserves_conditional_manager_store_location() {
 }
 
 #[test]
+fn fused_local_prefixes_leave_unowned_slots_at_try_entry() {
+    for source in [
+        r"def sample(x, mode, a, b, c, d, e, f):
+    def capture():
+        return mode
+    packet = consume(a, b, c, d, e, f)
+    result = consume(a, b, c, d, e, f)
+    try:
+        if x == mode:
+            process()
+    finally:
+        clean()
+",
+        r"def sample(x, mode, a, b, c, d, e, f):
+    if x:
+        prepare()
+    packet = consume(a, b, c, d, e, f)
+    result = consume(a, b, c, d, e, f)
+    try:
+        if x:
+            process()
+    finally:
+        clean()
+",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "fused_locals_before_try.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn comprehension_assignment_prefix_preserves_finalizer_manager_exit() {
     for suffix in ["assert valid(values)", "pass", "check(values)"] {
         let source = format!(
