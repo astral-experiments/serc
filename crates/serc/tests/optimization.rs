@@ -15,6 +15,29 @@ use serc::{
 };
 
 #[test]
+fn while_exit_keeps_its_line_before_finally() {
+    let source = r"def run(active):
+    try:
+        while active:
+            work()
+    except Error as err:
+        try:
+            work()
+        except Error:
+            recover()
+    finally:
+        pass
+    return active
+";
+    assert_matches_cpython_versions(
+        source,
+        "while_exit_before_finally.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn nested_conversion_handlers_keep_shared_cleanup() {
     let source = r"def sample(items):
     for item in items:

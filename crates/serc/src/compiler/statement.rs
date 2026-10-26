@@ -28998,7 +28998,24 @@ impl<'source> Compiler<'source> {
                         && handler.name.is_some()
                         && async_recovery_has_populated_handler_suffix(&handler.body)
                 }));
+            let runtime_while_has_sole_exit = loop_exit_location.is_some()
+                && matches!(loop_exit_tail, Some(Stmt::While(loop_statement))
+                    if loop_statement.orelse.is_empty()
+                        && !suite_contains_loop_break(&loop_statement.body)
+                        && early_condition_truthiness(&loop_statement.test).is_none()
+                        && condition_has_only_runtime_tests(&loop_statement.test)
+                        && condition_jump_target_count(&loop_statement.test, false) == 1
+                        && original_condition_has_unique_jump_target(&loop_statement.test, false));
+            // The loop's unique false edge keeps the normal try jump's line when
+            // cold handlers move away from a nonempty finally continuation.
+            let retained_while_finally_exit = self.context.python_version
+                >= crate::PythonVersion::Py314
+                && !statement.is_star
+                && !statement.finalbody.is_empty()
+                && handler_contains_nested_handler_cold_join
+                && runtime_while_has_sole_exit;
             if (normal_exit_starts_in_empty_block
+                && !retained_while_finally_exit
                 && borrow_exit_has_source_successor
                 && !nonempty_finally_normal_source
                 && !populated_guarded_handler_suffix
@@ -29423,17 +29440,10 @@ impl<'source> Compiler<'source> {
                                 && raise.exc.is_none()
                                 && raise.cause.is_none())
                 }));
-            let retained_runtime_while_exit = loop_exit_location.is_some()
+            let retained_runtime_while_exit = runtime_while_has_sole_exit
                 && !normal_exit_absorbed_by_manager_pop
                 && !statement.is_star
-                && statement.finalbody.is_empty()
-                && matches!(loop_exit_tail, Some(Stmt::While(loop_statement))
-                    if loop_statement.orelse.is_empty()
-                        && !suite_contains_loop_break(&loop_statement.body)
-                        && early_condition_truthiness(&loop_statement.test).is_none()
-                        && condition_has_only_runtime_tests(&loop_statement.test)
-                        && condition_jump_target_count(&loop_statement.test, false) == 1
-                        && original_condition_has_unique_jump_target(&loop_statement.test, false));
+                && statement.finalbody.is_empty();
             if direct_exit_location.is_some_and(|location| location.chained_comparison_cleanup)
                 || chained_assertion_exit_location.is_some()
                 || retained_runtime_while_exit
