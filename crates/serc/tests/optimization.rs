@@ -9073,6 +9073,34 @@ fn completed_manager_work_preserves_retained_loop_owners() {
 }
 
 #[test]
+fn final_elif_comprehension_returns_keep_the_store_location() {
+    let source = r"def collect(items, active, fallback, key):
+    if active or fallback:
+        pass
+    elif key:
+        assert active
+        if key in {1, 2}:
+            result = [item for item in items if item]
+            assert active
+    assert active
+
+def collect_direct(items, active, fallback):
+    if active:
+        pass
+    elif fallback:
+        result = [item for item in items]
+        assert active
+    assert active
+";
+    assert_matches_cpython_versions(
+        source,
+        "final_elif_comprehension.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn protected_conditional_store_preserves_erased_else_backedge() {
     let protected = r"def collect(batches, left, right, cleanup, sink):
     try:
