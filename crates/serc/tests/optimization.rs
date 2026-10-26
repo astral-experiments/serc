@@ -7024,6 +7024,30 @@ fn conditional_finalizer_preserves_tuple_return_copy_order() {
 }
 
 #[test]
+fn guarded_finalizer_handlers_keep_four_slot_call_returns() {
+    let source = r"def run(enabled, retry):
+    try:
+        consume()
+    finally:
+        if enabled:
+            try:
+                flush()
+            except OSError:
+                if retry:
+                    record()
+                else:
+                    raise
+    return complete()
+";
+    assert_matches_cpython_versions(
+        source,
+        "guarded_handler_call_return.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn guarded_finalizer_handlers_share_tuple_return_copies() {
     let source = r"def sample(first, second, condition, callback):
     try:

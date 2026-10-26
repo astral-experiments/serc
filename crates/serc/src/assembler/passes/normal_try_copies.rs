@@ -3600,8 +3600,8 @@ impl OptimizationPipeline {
                 let Some(target) = graph.label_block(label) else {
                     continue;
                 };
-                let Some(tail @ OriginalTail::LocalTupleReturn { .. }) =
-                    original_return_tail(label)
+                let Some(tail) =
+                    original_return_tail(label).filter(OriginalTail::is_four_slot_value_return)
                 else {
                     continue;
                 };
@@ -3951,7 +3951,7 @@ impl OptimizationPipeline {
             && (exits.is_empty()
                 || !returns
                     .values()
-                    .any(|tail| matches!(tail, OriginalTail::LocalTupleReturn { .. })))
+                    .any(OriginalTail::is_four_slot_value_return))
         {
             return;
         }
@@ -3967,7 +3967,7 @@ impl OptimizationPipeline {
             .collect::<FxHashSet<_>>();
         // A private normal exit is part of its preceding runtime array. It can
         // still enter original unlocated joins whose copy rounds determine the
-        // size of a later tuple exit, without becoming a standalone POP_BLOCK target.
+        // size of a later four-slot return, without becoming a standalone POP_BLOCK target.
         let private_join_schedule = entry_returns.is_empty();
         if private_join_schedule {
             let mut private_joins = Vec::new();
@@ -4043,10 +4043,10 @@ impl OptimizationPipeline {
                         break;
                     }
                     current = target;
-                    if matches!(
-                        returns.get(&current),
-                        Some(OriginalTail::LocalTupleReturn { .. })
-                    ) {
+                    if returns
+                        .get(&current)
+                        .is_some_and(OriginalTail::is_four_slot_value_return)
+                    {
                         entry_returns.insert(current);
                         break;
                     }
@@ -4089,15 +4089,13 @@ impl OptimizationPipeline {
             .any(|block| !original_jump_targets.contains(block))
         {
             // A private normal exit belongs to its preceding runtime array. For
-            // an intact constant or local tuple tail, keep its jump as an ordinary
+            // an intact constant or four-slot value return, keep its jump as an ordinary
             // scheduled source; no predecessor can copy its omitted POP_BLOCK or
             // depend on its width. Only independently entered cleanup targets
             // receive restored arrays.
             if !entry_returns.iter().all(|block| {
-                matches!(
-                    returns[block],
-                    OriginalTail::ConstantReturn { .. } | OriginalTail::LocalTupleReturn { .. }
-                )
+                matches!(returns[block], OriginalTail::ConstantReturn { .. })
+                    || returns[block].is_four_slot_value_return()
             })
                 || selected
                     .iter()
@@ -4225,7 +4223,7 @@ impl OptimizationPipeline {
         }
         // Widths of private range fragments need not reconstruct the preceding
         // runtime array: no jump can enter them. Every actual copy target remains
-        // a certified singleton join or the intact four-slot tuple return.
+        // a certified singleton join or an intact four-slot value return.
         if private_join_schedule
             && sources.iter().any(|block| {
                 !selected_joins.contains(block) && original_jump_targets.contains(block)
