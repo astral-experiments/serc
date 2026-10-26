@@ -3579,6 +3579,18 @@ impl Assembler {
         self.original_shared_handler_join(&[], false)
     }
 
+    /// Checks that a handler cleanup cannot fall through into a shared original jump.
+    pub(crate) fn at_shared_join_after_handler_cleanup(&self) -> bool {
+        let items = self.linear_items();
+        let end = items.len() - trailing_labels(items).count();
+        matches!(&items[..end], [.., Item::Instruction(copy), Item::Instruction(pop), Item::Instruction(reraise)]
+            if copy.opcode == COPY && copy.value_argument() == Some(3)
+                && pop.opcode == POP_EXCEPT && pop.value_argument() == Some(0)
+                && reraise.opcode == RERAISE && reraise.value_argument() == Some(1)
+                && [copy, pop, reraise].iter().all(|instruction| instruction.location == SourceLocation::NONE))
+            && self.at_original_shared_handler_join()
+    }
+
     /// Certifies a guarded finalizer join with one recorded same-line None comparison.
     pub(crate) fn at_original_guarded_finally_handler_join(&self) -> bool {
         self.original_shared_handler_join(&[POP_JUMP_IF_NONE], false)
