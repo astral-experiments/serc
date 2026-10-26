@@ -5605,6 +5605,26 @@ fn erased_nested_else_preserves_coroutine_loop_exits() {
 }
 
 #[test]
+fn erased_loop_prefix_keeps_the_enclosing_condition_return() {
+    let source = r"def run(enabled, ready, pick, use):
+    if enabled:
+        use(0)
+    else:
+        if ready:
+            assert enabled
+            for key, value in ((1, 2), (3, 4 if pick() else 5)):
+                use(key, value)
+        assert enabled
+";
+    assert_matches_cpython_versions(
+        source,
+        "erased_loop_prefix.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn erased_final_else_suffix_preserves_coroutine_loop_exits() {
     let source = r"async def sample(items, selected, prepare, work, verify):
     for item in items:
