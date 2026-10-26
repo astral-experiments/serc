@@ -38710,6 +38710,13 @@ impl<'source> Compiler<'source> {
                     exception_policy,
                 )?
             };
+            // The located jump can become a NOP, but its original empty block still
+            // ends fallthrough for the 3.14 borrowed-load pass.
+            if guarded_nested_cleanup && self.context.python_version == crate::PythonVersion::Py314
+            {
+                self.assembler
+                    .mark_borrow_fallthrough_barrier(normal_exit.instruction());
+            }
             if let (Some(depth), Some(start)) = (pass_exit_exception_depth, pass_exit_start) {
                 let end = self.assembler.label();
                 self.assembler.mark(end);
