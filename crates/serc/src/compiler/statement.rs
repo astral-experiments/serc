@@ -23940,6 +23940,11 @@ impl<'source> Compiler<'source> {
             && condition_jump_target_count(&statement.test, false) == 1
             // The break and false edge share the original protected-region exit.
             // Its completed cleanup determines the POP_BLOCK location after copying.
+            // A return copy runs this loop before its separate manager unwind.
+            // Exhaustion reaches that cleanup directly, without a manager POP_BLOCK here.
+            && !(self.context.python_version >= crate::PythonVersion::Py314
+                && self.control.finally.copied_return_finally_loop_depth.is_some()
+                && !self.control.withs.active_with_exits.is_empty())
             && !self.assembler.has_authored_forward_break_to(end)
         {
             let exclusion_start = self.assembler.label();
@@ -32985,10 +32990,18 @@ impl<'source> Compiler<'source> {
             module_can_suspend && super::expression::expression_suspends_current_scope(expression)
         };
 
-        let preserve_exit_nop =
-            std::mem::take(&mut self.control.finally.preserve_next_finally_exit_nop);
         let capture_manager_pop =
             std::mem::take(&mut self.control.finally.capture_next_finally_manager_pop);
+        // A folded-true loop exits through its breaks. The manager's original POP_BLOCK
+        // has no source location of its own after the normal finalizer jump is removed.
+        let preserve_exit_nop =
+            std::mem::take(&mut self.control.finally.preserve_next_finally_exit_nop)
+                && !(capture_manager_pop
+                    && self.context.python_version >= crate::PythonVersion::Py314
+                    && matches!(statement.finalbody.last(), Some(Stmt::While(tail))
+                        if tail.orelse.is_empty()
+                            && early_condition_truthiness(&tail.test) == Some(true)
+                            && suite_contains_loop_break(&tail.body)));
         let mut captured_manager_pop = None;
         let drop_expression_if_exit_nop = preserve_exit_nop
             && statement.handlers.is_empty()
