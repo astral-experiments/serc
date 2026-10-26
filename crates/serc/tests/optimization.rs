@@ -5605,6 +5605,28 @@ fn erased_nested_else_preserves_coroutine_loop_exits() {
 }
 
 #[test]
+fn a_protected_break_keeps_its_owner_before_an_erased_assertion() {
+    let source = r"def drain(ready, value):
+    try:
+        while True:
+            if ready():
+                break
+        assert value
+    finally:
+        try:
+            close()
+        finally:
+            record()
+";
+    assert_matches_cpython_versions(
+        source,
+        "protected_break_owner.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn erased_final_else_suffix_preserves_coroutine_loop_exits() {
     let source = r"async def sample(items, selected, prepare, work, verify):
     for item in items:
