@@ -7302,6 +7302,21 @@ fn retired_managed_handlers_keep_outer_try_ownership_for_finalizer_copies() {
 }
 
 #[test]
+fn nested_finalizer_keeps_the_next_return_unwind_marker() {
+    for (definition, expression) in [("def", "finish()"), ("async def", "await finish()")] {
+        let source = format!(
+            "{definition} choose(flag, value):\n    try:\n        try:\n            if flag:\n                return value\n        finally:\n            try:\n                prepare()\n            finally:\n                {expression}\n    finally:\n        if ready():\n            record()\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "nested_finalizer_unwind.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn nested_tries_own_copied_finalizer_handler_cleanup() {
     let source = r"async def sample(items, flag):
     try:

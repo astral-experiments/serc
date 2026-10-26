@@ -12134,6 +12134,13 @@ impl<'source> Compiler<'source> {
                     self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
                     if !starts_jump_target
                         || shared_copied_cleanup_join
+                        // Normal completion of a nested try/finally jumps to this outer
+                        // POP_BLOCK. Retain its slot so that edge can supply the cleanup line.
+                        || (self.context.python_version >= crate::PythonVersion::Py314
+                            && return_finally_contexts.get(context_index + 1).is_some_and(|inner| {
+                                matches!(inner.body.last(), Some(Stmt::Try(cleanup))
+                                    if !cleanup.finalbody.is_empty())
+                            }))
                         || copied_guard_exit_location.is_some()
                         || matches!(finally_context.body, [Stmt::Pass(_)])
                         // A preceding copied finalizer can finish at a conditional join.
