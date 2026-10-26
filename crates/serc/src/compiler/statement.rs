@@ -30639,7 +30639,12 @@ impl<'source> Compiler<'source> {
                                 && !terminal
                                 && loop_tail.is_none()
                                 && self.control.finally.active_copied_finally_bodies == 0))
-                            && handler_cleanup_has_runtime_jump_exit(tail)
+                            && (handler_cleanup_has_runtime_jump_exit(tail)
+                                // A failed comparison drops its saved operand and jumps
+                                // to this same cleanup, including within a Boolean guard.
+                                || (tail.elif_else_clauses.is_empty()
+                                    && condition_has_only_runtime_tests(&tail.test)
+                                    && condition_has_cleanup_jump_target(&tail.test, false)))
                             && handler_cleanup_has_stable_fallthrough_location(tail)
                             && (!cleanup_has_small_return_successor
                                 || !handler_cleanup_has_nested_branch_exit(tail)

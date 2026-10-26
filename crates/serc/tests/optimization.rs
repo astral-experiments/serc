@@ -82,6 +82,28 @@ fn erased_async_manager_suffix_preserves_conditional_join() {
 }
 
 #[test]
+fn chained_comparison_failures_copy_named_handler_cleanup() {
+    for guard in ["low <= code <= high", "ready and low <= code <= high", "ready"] {
+        let source = format!(
+            "def read(code, low, high, ready, result):
+    try:
+        fetch()
+    except LookupError as error:
+        if {guard}:
+            record(error)
+    return result
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "named_handler_comparison.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn erased_named_handler_suffix_preserves_cleanup_copies() {
     let source = r"def sample():
     try:
