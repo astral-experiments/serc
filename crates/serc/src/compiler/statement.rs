@@ -2241,8 +2241,8 @@ impl<'source> Compiler<'source> {
                     .iter()
                     .all(|statement| self.context.is_elided_statement(statement));
             // Removing trailing assertions makes this conditional the function's
-            // terminal statement. Keep its comprehension assignment's return span.
-            let terminal_comprehension_before_elided = has_elided_tail
+            // terminal statement. Preserve the source location of its last store.
+            let terminal_store_before_elided = has_elided_tail
                 && !is_final
                 && final_expression_becomes_return
                 && self.supports_elided_terminal_if()
@@ -2274,7 +2274,15 @@ impl<'source> Compiler<'source> {
                     // Nested joins and empty sibling arms can share return donors;
                     // coroutine copying requires an independent donor in every arm.
                     || (conditional.elif_else_clauses.is_empty()
-                        && self.terminal_comprehension_assignment(&conditional.body).is_some()))
+                        && self.terminal_comprehension_assignment(&conditional.body).is_some())
+                    // Static swaps reorder the stores, but the copied return keeps
+                    // the location of the rightmost source target.
+                    || std::iter::once(conditional.body.as_slice())
+                        .chain(conditional.elif_else_clauses.iter().map(|clause| clause.body.as_slice()))
+                        .any(|branch| matches!(branch.last(), Some(Stmt::Assign(assignment))
+                            if matches!(assignment.targets.as_slice(), [Expr::Tuple(tuple)]
+                                if tuple.elts.iter().all(|target| matches!(target, Expr::Name(_))))
+                                && matches!(assignment.value.as_ref(), Expr::Tuple(_)))))
                     && condition_has_linear_runtime_leaves(&conditional.test)
                     && !expression_suspends_current_scope(&conditional.test)
                     && conditional.elif_else_clauses.iter().all(|clause| {
@@ -2370,7 +2378,7 @@ impl<'source> Compiler<'source> {
                     .contains(&statement.range())
                 && self.protected_terminal_if_before_elided(statement, &body[index + 1..]);
             let terminal_if_before_elided = terminal_before_elided_assertions
-                || terminal_comprehension_before_elided
+                || terminal_store_before_elided
                 || terminal_nested_before_elided
                 || protected_terminal_if_before_elided
                 || coroutine_if_before_elided
