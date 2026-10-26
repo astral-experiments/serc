@@ -7966,21 +7966,21 @@ impl Compiler<'_> {
         // CPython emits the conditional-expression join without a location. Its later
         // propagation pass inherits the body location only when the join remains in the same
         // basic block; short-circuit bodies can leave it deliberately unlocated.
-        // A nested conditional leaves its own join immediately before this one, so propagate
-        // that conditional's actual fallthrough leaf rather than its whole source range.
+        // A nested conditional leaves its join immediately before this jump. An attribute
+        // load or formatted value at the end of its fallthrough can carry a narrower span.
         let preserve_nested_no_location = if let Expr::If(nested) = expression.body.as_ref() {
-            let fallthrough = conditional_expression_fallthrough(nested);
-            let location = if self.context.python_version <= PythonVersion::Py313 {
-                // Native legacy joins stay unlocated through early exit copying;
-                // inheriting the else leaf now would thread away the donor owner.
+            let shared = conditional_expression_has_shared_fallthrough(nested);
+            let location = if self.context.python_version <= PythonVersion::Py313 || shared {
+                // Legacy joins stay unlocated through early exit copying. A shared
+                // short-circuit join has no unique instruction to donate its span.
                 SourceLocation::NONE
             } else {
-                fallthrough.map_or(SourceLocation::NONE, |fallthrough| {
-                    self.source_location(fallthrough.range())
-                })
+                self.assembler
+                    .last_instruction_location()
+                    .unwrap_or(SourceLocation::NONE)
             };
             self.assembler.set_location(location);
-            fallthrough.is_none()
+            shared
         } else {
             self.assembler.set_location(SourceLocation::NONE);
             false
@@ -10447,11 +10447,10 @@ pub(super) fn early_condition_truthiness(expression: &Expr) -> Option<bool> {
     }
 }
 
-// Returns the leaf that reaches a nested conditional expression's join by fallthrough.
-// A short-circuit leaf has multiple predecessors, so CPython keeps the join source-less.
-fn conditional_expression_fallthrough(expression: &ExprIf) -> Option<&Expr> {
+/// A short-circuit fallthrough gives a conditional's join multiple predecessors.
+fn conditional_expression_has_shared_fallthrough(expression: &ExprIf) -> bool {
     if crate::stack_growth_required() {
-        return crate::grow_stack(|| conditional_expression_fallthrough(expression));
+        return crate::grow_stack(|| conditional_expression_has_shared_fallthrough(expression));
     }
     let branch = if early_condition_truthiness(&expression.test) == Some(true) {
         expression.body.as_ref()
@@ -10459,9 +10458,9 @@ fn conditional_expression_fallthrough(expression: &ExprIf) -> Option<&Expr> {
         expression.orelse.as_ref()
     };
     match branch {
-        Expr::If(nested) => conditional_expression_fallthrough(nested),
-        Expr::BoolOp(_) => None,
-        _ => Some(branch),
+        Expr::If(nested) => conditional_expression_has_shared_fallthrough(nested),
+        Expr::BoolOp(_) => true,
+        _ => false,
     }
 }
 

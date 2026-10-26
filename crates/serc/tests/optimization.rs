@@ -19041,6 +19041,26 @@ def copied_handler_return(owner, condition):
 }
 
 #[test]
+fn nested_conditional_jump_uses_its_last_instruction_position() {
+    let source = r#"def choose(outer, inner, factory, value):
+    attr = (
+        (value if inner else factory(
+            value
+        ).result)
+        if outer else value
+    )
+    formatted = (value if inner else f"{value:.2f}") if outer else value
+    return attr, formatted
+"#;
+    assert_matches_cpython_versions(
+        source,
+        "conditional_leaf_positions.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn nested_conditional_arms_donate_implicit_return_locations() {
     let source = r"def sample(first, second, third, items):
     if first:
