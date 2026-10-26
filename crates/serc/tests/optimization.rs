@@ -2224,6 +2224,33 @@ fn erased_loop_exit_stays_inside_managed_finally() {
 }
 
 #[test]
+fn guarded_returns_leave_the_final_unwound_try_cell_unowned() {
+    for returned in ["return", "return 1"] {
+        let source = format!(
+            "async def sample(value, enabled):
+    try:
+        try:
+            if enabled:
+                {returned}
+        except ValueError:
+            pass
+    except TypeError:
+        pass
+    finally:
+        if value is not None:
+            clean()
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "guarded_try_return.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn copied_return_through_nested_loops_keeps_none_guard_owner() {
     let source = r#"async def sample(client, response):
     for attempt in range(client.attempts):
