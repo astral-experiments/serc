@@ -37911,12 +37911,13 @@ impl<'source> Compiler<'source> {
         }
         // An assertion's failure block is physically adjacent to the success
         // label. Its RAISE location cannot supply either cleanup footer.
-        let runtime_assertion_exit = statement.finalbody.last().is_some_and(|tail|
+        let runtime_assertion_exit = statement.finalbody.last().is_some_and(|tail| {
             matches!(tail, Stmt::Assert(assertion)
                 if assertion_has_only_runtime_tests(&assertion.test)
                     && (self.context.python_version >= crate::PythonVersion::Py313
                         || !original_condition_has_unique_jump_target(&assertion.test, true)))
-            && !self.context.is_elided_statement(tail));
+                && !self.context.is_elided_statement(tail)
+        });
         if terminal && !finalbody_emitted_fallthrough && !suite_terminates(&statement.finalbody) {
             if runtime_assertion_exit || (self.context.python_version == crate::PythonVersion::Py312
                 && statement.finalbody.last().is_some_and(|statement| {
