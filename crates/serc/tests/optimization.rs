@@ -9073,6 +9073,24 @@ fn completed_manager_work_preserves_retained_loop_owners() {
 }
 
 #[test]
+fn erased_unnamed_handler_locates_the_manager_exit() {
+    let source = r"def process(resource, value):
+    with resource:
+        try:
+            return value
+        except ValueError:
+            assert check(value)
+    finish()
+";
+    assert_matches_cpython_versions(
+        source,
+        "erased_handler.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn protected_conditional_store_preserves_erased_else_backedge() {
     let protected = r"def collect(batches, left, right, cleanup, sink):
     try:
