@@ -12703,6 +12703,30 @@ fn nested_linear_branch_preserves_returns_before_removed_assertions() {
 }
 
 #[test]
+fn erased_elif_arms_keep_their_own_return_positions() {
+    for definition in ["def", "async def"] {
+        let source = format!(
+            "{definition} choose(ready, first, second, last):
+    if ready:
+        if first and second:
+            assert first
+        elif second:
+            assert second
+        elif last:
+            assert last
+        assert ready
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "erased_elif_returns.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn nested_branch_returns_survive_removed_inner_assertions() {
     for (index, source) in [
         "def f(a, b):\n    if a:\n        if b:\n            pass\n            assert b\n        assert a\n",
