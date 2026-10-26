@@ -13,7 +13,7 @@ use crate::target::opcodes::{
     BUILD_TUPLE, CALL, CALL_KW, DELETE_FAST, END_ASYNC_FOR, END_SEND, FOR_ITER, LOAD_ATTR,
     LOAD_CONST, LOAD_DEREF, LOAD_FAST, LOAD_GLOBAL, LOAD_SMALL_INT, NOP, NOT_TAKEN, POP_EXCEPT,
     POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE, POP_JUMP_IF_TRUE, POP_TOP,
-    RAISE_VARARGS, RERAISE, RETURN_VALUE, STORE_ATTR, STORE_FAST, SWAP,
+    RAISE_VARARGS, RERAISE, RETURN_VALUE, STORE_ATTR, STORE_FAST, STORE_SUBSCR, SWAP,
 };
 use crate::target::{is_conditional_jump, is_unconditional_jump};
 
@@ -179,8 +179,8 @@ fn original_tuple_return_join(
     .then_some((*entry, *end, split_return))
 }
 
-/// Recognizes a located attribute assignment with exactly four original copy slots.
-fn is_four_slot_attribute_store_jump(items: &[Item]) -> bool {
+/// Recognizes a located assignment with exactly four original copy slots.
+fn is_four_slot_store_jump(items: &[Item]) -> bool {
     let Some(first) = items
         .iter()
         .position(|item| matches!(item, Item::Instruction(_)))
@@ -189,12 +189,14 @@ fn is_four_slot_attribute_store_jump(items: &[Item]) -> bool {
     };
     matches!(
         &items[first..],
-        [Item::Instruction(value), Item::Instruction(object), Item::Instruction(store), Item::Instruction(jump)]
-            if matches!(value.opcode, LOAD_CONST | LOAD_SMALL_INT)
-                && object.opcode == LOAD_FAST
-                && store.opcode == STORE_ATTR
+        [Item::Instruction(first), Item::Instruction(second), Item::Instruction(store), Item::Instruction(jump)]
+            if matches!(
+                (first.opcode, second.opcode, store.opcode),
+                (LOAD_CONST | LOAD_SMALL_INT, LOAD_FAST, STORE_ATTR)
+                    | (LOAD_FAST, LOAD_CONST | LOAD_SMALL_INT, STORE_SUBSCR)
+            )
                 && jump.opcode == JUMP_FORWARD
-                && [value, object, store, jump].iter().all(|instruction| {
+                && [first, second, store, jump].iter().all(|instruction| {
                     instruction.location.line >= 0
                         && instruction.pre_fold_extra_instructions() == 0
                         && instruction.local_policy.hidden_exception_owner_slots() == 0
@@ -7161,7 +7163,7 @@ impl OptimizationPipeline {
                 }
                 copied.insert(position, Item::Instruction(marker));
             }
-            let inline_reraising_attribute_store = matches!(
+            let inline_reraising_store = matches!(
                 self.python_version,
                 crate::PythonVersion::Py314 | crate::PythonVersion::Py315
             ) && inline_small_exit
@@ -7171,7 +7173,7 @@ impl OptimizationPipeline {
                 && graph[target].last_instruction().is_some_and(|instruction| {
                     instruction.location.line < 0 && instruction.value_argument() == Some(0)
                 })
-                && is_four_slot_attribute_store_jump(graph[source].items());
+                && is_four_slot_store_jump(graph[source].items());
             let inline_reraising_iterator_break = self.python_version
                 == crate::PythonVersion::Py315
                 && inline_small_exit
@@ -7192,7 +7194,7 @@ impl OptimizationPipeline {
             if (inline_unprotected_return
                 || inline_unprotected_raise
                 || inline_reraising_iterator_break
-                || inline_reraising_attribute_store)
+                || inline_reraising_store)
                 && !planned_copy
                 && let Some(instruction) = copied.iter_mut().find_map(Item::as_instruction_mut)
             {
