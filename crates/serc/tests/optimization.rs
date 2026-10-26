@@ -10286,6 +10286,21 @@ fn elided_conditional_preserves_jump_before_nested_finalizers() {
 }
 
 #[test]
+fn guarded_handler_loop_keeps_shared_cleanup_unlocated() {
+    for last in ["raise", "return item"] {
+        let source = format!(
+            "def handle(item, items, ready, retry):\n    try:\n        read(item)\n    except OSError:\n        if ready:\n            for value in items:\n                scan(value)\n            if retry:\n                {last}\n    scan(item)\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "guarded_handler_loop.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn elided_handler_assertion_preserves_shared_false_cleanup() {
     for (condition, suffix) in [
         ("config.recover and not stopped", "assert False"),

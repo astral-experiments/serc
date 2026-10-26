@@ -31272,7 +31272,14 @@ impl<'source> Compiler<'source> {
             // a loop backedge is different: each copied backedge keeps its predecessor span.
             // Elided assertions add no instruction between the conditional join
             // and its artificial cleanup, so they cannot supply its location.
-            let handler_ends_with_unlocated_if_cleanup = matches!(
+            // Independent live branches can reach the same original cleanup even
+            // when a loop or nested guard precedes the last fallthrough.
+            let shared_guarded_handler = self.context.python_version >= crate::PythonVersion::Py314
+                && handler.name.is_none()
+                && matches!(handler.body.last(), Some(Stmt::If(tail))
+                    if tail.elif_else_clauses.is_empty() && condition_has_only_runtime_tests(&tail.test))
+                && self.assembler.at_original_shared_cleanup_join();
+            let handler_ends_with_unlocated_if_cleanup = shared_guarded_handler || matches!(
                 handler.body.iter().rev().find(|statement| {
                     !self.context.is_elided_statement(statement)
                 }),
