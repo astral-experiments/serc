@@ -19068,6 +19068,24 @@ fn nested_conditional_arms_donate_implicit_return_locations() {
 }
 
 #[test]
+fn python312_async_comprehension_cleanup_preserves_jump_widths() {
+    for padding in [123, 124, 125] {
+        let mut source = String::from("async def run(items, stream, flag):\n");
+        source.push_str(&"    found = [key async for key in stream if ready(key)]\n".repeat(14));
+        source.push_str(&"    padding = 0\n".repeat(120));
+        source.push_str("    for item in items:\n");
+        source.push_str(&"        padding = 1\n".repeat(padding));
+        source.push_str("        if flag:\n            finish(item)\n");
+        assert_matches_cpython_versions(
+            &source,
+            "async_comprehension_jump_width.py",
+            &LEVELS,
+            &[PythonVersion::Py312],
+        );
+    }
+}
+
+#[test]
 fn python312_seeds_loop_backedges_before_resolving_offsets() {
     for padding in [123, 124, 125] {
         let mut source = String::from(
