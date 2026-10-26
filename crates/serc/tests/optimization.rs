@@ -9106,6 +9106,26 @@ fn repeated_finalizer_predecessor_keeps_the_manager_pop_unlocated() {
 }
 
 #[test]
+fn python312_async_iteration_preserves_repeated_conditional_return() {
+    let source = r"async def consume(stream, ready):
+    async for item in stream:
+        pass
+    if ready:
+        assert valid()
+    if ready:
+        work()
+    else:
+        assert valid()
+";
+    assert_matches_cpython_versions(
+        source,
+        "async_iteration.py",
+        &LEVELS,
+        &[PythonVersion::Py312],
+    );
+}
+
+#[test]
 fn protected_conditional_store_preserves_erased_else_backedge() {
     let protected = r"def collect(batches, left, right, cleanup, sink):
     try:
