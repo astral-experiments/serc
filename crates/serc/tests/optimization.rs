@@ -2168,22 +2168,14 @@ fn finally_assertion_exits_inherit_the_successful_operand() {
     for test in [
         "first and not second",
         "first or second",
+        "first is None or not second",
         "first if second else third",
     ] {
         for following in ["", "    finish()\n"] {
             let source = format!(
                 "def close(first, second, third):\n    try:\n        work()\n    finally:\n        assert {test}\n{following}"
             );
-            assert_matches_cpython_versions(
-                &source,
-                "finally_assertion_exit.py",
-                &LEVELS,
-                &[
-                    PythonVersion::Py313,
-                    PythonVersion::Py314,
-                    PythonVersion::Py315,
-                ],
-            );
+            assert_matches_cpython(&source, "finally_assertion_exit.py", &LEVELS);
         }
     }
 }
