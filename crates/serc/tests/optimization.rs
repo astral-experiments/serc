@@ -11240,6 +11240,29 @@ fn discarded_generator_calls_rejoin_loop_backedges() {
 }
 
 #[test]
+fn generator_call_guard_after_local_fusion_keeps_its_handler() {
+    for builtin in ["tuple", "any", "all"] {
+        let source = format!(
+            "def read(receiver, item):
+    item = parse(item, receiver.kind)
+    {{'one', 'two', 'three', 'four'}}
+    verify(verify(default, limit), 'invalid')
+    try:
+        collected = {builtin}(project for entry in records)
+    except ValueError:
+        pass
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "generator_guard_after_fusion.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn generator_call_stores_preserve_populated_nested_join() {
     let source = r"def choose(result, items):
     if result is None:

@@ -10199,6 +10199,49 @@ impl LayoutAssembler {
                             ExceptionOwnerDecision::override_with_region(Some(region)),
                         );
                     }
+                    // The builtin guard is an original conditional at the start of a
+                    // protected suite. One local fusion leaves that conditional in the
+                    // first unused cell after the earlier compaction.
+                    if instruction.opcode == NOT_TAKEN
+                        && instruction.exception_policy()
+                            == super::ExceptionPolicy::NoneDynamicConditionStrict
+                        && owner_history_exact
+                        && tail.post_compaction_fusions == 1
+                        && tail.insertions == 0
+                        && tail.late_removals == 0
+                        && instruction_index >= original_array_start + 6
+                        && let [setup, callable, copy, common, compare, jump] =
+                            &indexed_instructions[instruction_index - 6..instruction_index]
+                        && setup.opcode == NOP
+                        && callable.opcode == LOAD_GLOBAL
+                        && copy.opcode == crate::target::opcodes::COPY
+                        && copy.value_argument() == Some(1)
+                        && common.opcode == crate::target::opcodes::LOAD_COMMON_CONSTANT
+                        && compare.opcode == crate::target::opcodes::IS_OP
+                        && compare.value_argument() == Some(0)
+                        && jump.opcode == crate::target::opcodes::POP_JUMP_IF_FALSE
+                        && jump.forward_target().is_some()
+                        && [*callable, *copy, *common, *compare, *jump]
+                            .iter()
+                            .all(|record| record.location == instruction.location)
+                        && self
+                            .exception_owner_provenance
+                            .setups
+                            .iter()
+                            .any(|(label, _)| {
+                                label_positions.get(label) == Some(&(instruction_index - 5))
+                            })
+                        && let Some(region) = self.uniform_exception_owner(
+                            instruction_index - 5,
+                            instruction_index,
+                            &label_positions,
+                        )
+                    {
+                        owners.insert(
+                            instruction_index,
+                            ExceptionOwnerDecision::override_with_region(Some(region)),
+                        );
+                    }
                     // The threading pass appends a fresh NULL-owned conditional after
                     // turning its old record into a NOP. CPython removes early NOPs before
                     // local fusion. Exactly one fusion leaves the last live record (this
