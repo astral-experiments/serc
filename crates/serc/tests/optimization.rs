@@ -1043,6 +1043,29 @@ fn awaited_else_break_keeps_normal_cleanup_reachable() {
 }
 
 #[test]
+fn nested_finally_method_guard_keeps_its_condition_owner() {
+    let source = r"def run(manager, item, signal):
+    with manager:
+        try:
+            if not item.ready():
+                raise ValueError
+        finally:
+            signal.release()
+            try:
+                item.wait(limit=3)
+            finally:
+                if not item.done():
+                    record()
+";
+    assert_matches_cpython_versions(
+        source,
+        "nested_method_guard.py",
+        &LEVELS,
+        &[PythonVersion::Py314],
+    );
+}
+
+#[test]
 fn guarded_break_preserves_normal_cleanup_ownership() {
     let source = "def sample(owner, values):\n    try:\n        while owner.ready():\n            try:\n                value = owner.next()\n                if (value or {}).get('ready', 0) > 0:\n                    owner.record(value)\n                    break\n            except Error as error:\n                owner.problem(error)\n            finally:\n                if not owner.done():\n                    owner.cancel()\n            owner.pause()\n        else:\n            raise Error()\n        owner.finish()\n    finally:\n        owner.close()\n";
     for source in [
