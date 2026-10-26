@@ -10187,6 +10187,27 @@ fn completed_finalizer_prefix_preserves_manager_exit() {
 }
 
 #[test]
+fn returning_handler_preserves_the_inner_manager_suppression_line() {
+    let source = r"def run(manager, inner, result):
+    with manager:
+        try:
+            with inner:
+                return result
+        except Error as error:
+            try:
+                return result
+            finally:
+                pass
+";
+    assert_matches_cpython_versions(
+        source,
+        "returning_handler_manager_suppression.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn completed_iterator_prefix_preserves_finalizer_manager_exit() {
     for prefix in [
         "        for item in items:\n            begin(item)\n        value = []\n",
