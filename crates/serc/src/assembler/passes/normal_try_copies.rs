@@ -2674,7 +2674,7 @@ impl OptimizationPipeline {
         prefixes
     }
 
-    /// Keep the join where CPython copies a four-slot return after a shared try exit.
+    /// Keeps original jumps until their shared try exit can copy its return.
     fn preserve_shared_try_return_joins(&mut self) {
         use crate::target::opcodes::RETURN_VALUE;
 
@@ -2690,6 +2690,7 @@ impl OptimizationPipeline {
             }
             graph.label_block(jump.forward_target()?)
         };
+        let mut local_return_cleanups = FxHashSet::default();
         let mut joins = Vec::new();
         for &(entry_label, join_label) in &self.exception_owner_provenance.normal_try_exits {
             let Some((entry, join)) = graph
@@ -2698,6 +2699,16 @@ impl OptimizationPipeline {
             else {
                 continue;
             };
+            let mut cleanup = graph[entry].items().iter().filter_map(Item::as_instruction);
+            if original_local_return(graph[join].items())
+                && matches!((cleanup.next(), cleanup.next()), (Some(jump), None)
+                    if jump.opcode == JUMP_FORWARD
+                        && jump.forward_target() == Some(join_label)
+                        && jump.pre_fusion_width() == 1
+                        && jump.local_policy.hidden_exception_owner_slots() == 0)
+            {
+                local_return_cleanups.insert(entry);
+            }
             if unlocated_jump(entry) != Some(join) {
                 continue;
             }
@@ -2735,6 +2746,32 @@ impl OptimizationPipeline {
                 });
             if incoming.nth(1).is_some() {
                 joins.push(join);
+            }
+        }
+        // The original POP_BLOCK, skip jump and two-slot local return fit in one
+        // four-slot copy. Keep an adjacent authored break until it can copy them;
+        // the loop condition continues to target the original cleanup.
+        if !local_return_cleanups.is_empty() {
+            for pos in 1..self.graph.order().len() {
+                let entry = self.graph.block_at(pos);
+                let source = self.graph.block_at(pos - 1);
+                if local_return_cleanups.contains(&entry)
+                    && self.graph[source].last_instruction().is_some_and(|jump| {
+                        jump.opcode == JUMP_FORWARD
+                            && jump.fusion_policy.is_authored_break()
+                            && jump
+                                .forward_target()
+                                .and_then(|label| self.graph.label_block(label))
+                                == Some(entry)
+                    })
+                {
+                    self.graph
+                        .instructions_mut(source)
+                        .next_back()
+                        .expect("adjacent authored break")
+                        .jump_policy
+                        .defer_removal();
+                }
             }
         }
         for join in joins {
