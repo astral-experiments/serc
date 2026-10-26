@@ -15,6 +15,29 @@ use serc::{
 };
 
 #[test]
+fn threaded_boolean_value_keeps_intermediate_jump_lines() {
+    let expression = r"(a
+        or (b and (
+            (c
+             and (not d or e))
+            or f
+        ))
+        or g)";
+    for body in [
+        format!("return {expression}"),
+        format!("return any({expression} for d in items)"),
+    ] {
+        let source = format!("def sample(a, b, c, d, e, f, g, items):\n    {body}\n");
+        assert_matches_cpython_versions(
+            &source,
+            "threaded_boolean_lines.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn nested_conversion_handlers_keep_shared_cleanup() {
     let source = r"def sample(items):
     for item in items:
