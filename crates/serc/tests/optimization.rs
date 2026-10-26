@@ -9097,6 +9097,37 @@ fn manager_pop_has_no_line_after_two_finally_arms() {
 }
 
 #[test]
+fn guarded_try_exits_leave_the_enclosing_manager_pop_unlocated() {
+    for (guard, handler) in [
+        ("resource.poll() is None", "recover()"),
+        ("resource", "with nested:\n                            pass"),
+    ] {
+        let source = format!(
+            r"def sample(manager, resource, nested):
+    with manager:
+        try:
+            work()
+        finally:
+            try:
+                finish()
+            finally:
+                if {guard}:
+                    try:
+                        close()
+                    except LookupError as error:
+                        {handler}
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "guarded_try_manager_pop.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn manager_pop_has_no_line_after_multiple_conditional_cleanup_exits() {
     for guard in ["flag", "not flag", "enabled()"] {
         let source = format!(
