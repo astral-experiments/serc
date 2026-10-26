@@ -1837,6 +1837,25 @@ fn erased_terminal_async_manager_join_keeps_marker() {
 }
 
 #[test]
+fn constant_return_unwinds_the_inner_try_before_a_manager() {
+    for manager in ["with", "async with"] {
+        let source = format!(
+            "async def read(owner, ready):\n    try:\n        {manager} owner:\n            try:\n                if ready:\n                    return 1\n            except ValueError:\n                recover()\n    finally:\n        close()\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "managed_constant_return.py",
+            &LEVELS,
+            &[
+                PythonVersion::Py313,
+                PythonVersion::Py314,
+                PythonVersion::Py315,
+            ],
+        );
+    }
+}
+
+#[test]
 fn erased_finalizer_keeps_managed_return_copy() {
     let source = "async def sample(owner):\n    try:\n        with prepare_scope(owner, search=False):\n            return await prepare(owner, Context())\n    finally:\n        assert enabled()\n";
     assert_matches_cpython(source, "erased_managed_return.py", &LEVELS);
