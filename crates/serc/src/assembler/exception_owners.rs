@@ -7507,6 +7507,31 @@ impl LayoutAssembler {
                             value_jump_setup_history_known &= known_setup;
                         }
                         tail.late_removals += usize::from(!retained);
+                        // A copied finalizer may retain its SETUP after hidden unwind
+                        // records. The original SETUP cell is still unowned after
+                        // those records and earlier peephole deletions compact.
+                        if retained
+                            && owner_history_exact
+                            && tail.insertions == 0
+                            && tail.late_removals == 0
+                            && tail.post_compaction_fusions == 0
+                            && previous.is_some_and(|nop| {
+                                nop.local_policy.hidden_exception_owner_slots() > 0
+                            })
+                            && original_array_start + 1 < instruction_index
+                            && provenance.setup_nop_ranges.iter().any(|(start, end)| {
+                                label_positions.get(start) == Some(&(instruction_index - 1))
+                                    && label_positions.get(end) == Some(&instruction_index)
+                            })
+                        {
+                            let setup_index = instruction_index - 1;
+                            transferred_setup_null_slot = Some((
+                                original_array_start,
+                                setup_index,
+                                setup_index + tail.early_removals,
+                                tail.early_removals,
+                            ));
+                        }
                         // A certified async SEND continuation has the same late-SETUP
                         // suffix. Its captured entry, cleanup, and incoming edges must all
                         // remain unchanged before this array can donate the marker's owner.
