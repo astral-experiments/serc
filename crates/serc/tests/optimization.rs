@@ -5735,6 +5735,36 @@ fn while_else_nonfinal_condition_preserves_forward_exit() {
 }
 
 #[test]
+fn managed_finalizer_loops_compact_exit_markers() {
+    let copied = r"def run(manager, active, value):
+    with manager:
+        try:
+            return value
+        finally:
+            while active:
+                consume()
+";
+    let folded = r"def run(manager, other, flag):
+    with manager, other:
+        try:
+            prepare()
+        finally:
+            while True:
+                if flag:
+                    break
+                check()
+";
+    for source in [copied, folded] {
+        assert_matches_cpython_versions(
+            source,
+            "managed_finalizer_loop.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn managed_while_else_preserves_nested_branch_exits() {
     let source = r"def sample(left, right, flag):
     with acquire() as worker, acquire() as other:
