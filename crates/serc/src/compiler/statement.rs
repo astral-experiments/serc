@@ -2274,7 +2274,10 @@ impl<'source> Compiler<'source> {
                     // Nested joins and empty sibling arms can share return donors;
                     // coroutine copying requires an independent donor in every arm.
                     || (conditional.elif_else_clauses.is_empty()
-                        && self.terminal_comprehension_assignment(&conditional.body).is_some()))
+                        && self.terminal_comprehension_assignment(&conditional.body).is_some())
+                    // The last else falls through directly from its result store.
+                    || conditional.elif_else_clauses.last().is_some_and(|clause|
+                        clause.test.is_none() && self.terminal_comprehension_assignment(&clause.body).is_some()))
                     && condition_has_linear_runtime_leaves(&conditional.test)
                     && !expression_suspends_current_scope(&conditional.test)
                     && conditional.elif_else_clauses.iter().all(|clause| {
@@ -5524,8 +5527,7 @@ impl<'source> Compiler<'source> {
             .rfind(|statement| !self.context.is_elided_statement(statement))
             .filter(|statement| matches!(statement, Stmt::Assign(assignment)
                 if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
-                    && matches!(assignment.value.as_ref(), Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_))
-                    && !expression_suspends_current_scope(&assignment.value)))
+                    && matches!(assignment.value.as_ref(), Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_))))
     }
 
     /// Recovers the original return donor hidden by removed branch-tail assertions.

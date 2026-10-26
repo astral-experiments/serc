@@ -16850,6 +16850,17 @@ fn elided_assertions_after_comprehension_branches_keep_store_return_locations() 
             }
         }
     }
+    for iterable in ["for item in values", "async for item in values"] {
+        let source = format!(
+            "async def choose(flag, values):\n    if flag:\n        pass\n    else:\n        result = [item {iterable}]\n        assert result\n    assert flag\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "comprehension_else_return.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
 }
 
 #[test]
