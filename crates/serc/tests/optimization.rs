@@ -2224,6 +2224,50 @@ fn erased_loop_exit_stays_inside_managed_finally() {
 }
 
 #[test]
+fn nested_finalizers_reuse_unowned_setup_slots_after_manager_returns() {
+    let samples = [
+        r"def sample(value, enabled):
+    try:
+        with acquire():
+            if enabled:
+                return
+    except ValueError:
+        pass
+    finally:
+        try:
+            if value is None:
+                clean()
+        finally:
+            done()
+",
+        r"async def sample(value, enabled, items):
+    yield value
+    try:
+        with acquire():
+            async for item in items:
+                if enabled:
+                    return
+    except ValueError:
+        pass
+    finally:
+        try:
+            if value is None:
+                clean()
+        finally:
+            done()
+",
+    ];
+    for source in samples {
+        assert_matches_cpython_versions(
+            source,
+            "manager_return_nested_finally.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn copied_return_through_nested_loops_keeps_none_guard_owner() {
     let source = r#"async def sample(client, response):
     for attempt in range(client.attempts):
