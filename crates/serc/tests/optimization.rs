@@ -12080,6 +12080,47 @@ fn erased_else_preserves_final_elif_try_exit_locations() {
 }
 
 #[test]
+fn nested_recovery_guard_keeps_the_normal_try_exit_line() {
+    let source = r"async def guarded_body(flag, value):
+    try:
+        if flag:
+            try:
+                use(value)
+            finally:
+                try:
+                    finish()
+                except LookupError:
+                    recover()
+    except ValueError:
+        value = fallback()
+    use(value)
+
+async def guarded_else(flag, value):
+    try:
+        work()
+    except ValueError as error:
+        try:
+            recover()
+        except LookupError:
+            raise
+    else:
+        if flag:
+            try:
+                work()
+            except LookupError:
+                recover()
+    use(value)
+    finish()
+";
+    assert_matches_cpython_versions(
+        source,
+        "guarded_try_exit.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn erased_try_else_keeps_condition_location_on_retained_exit() {
     for (case, source) in [
         "def f(obj, flag):\n    try:\n        if flag:\n            obj.action()\n        else:\n            assert flag\n    except ValueError:\n        return False\n    if flag:\n        assert obj\n    return True\n",

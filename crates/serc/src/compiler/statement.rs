@@ -28520,6 +28520,28 @@ impl<'source> Compiler<'source> {
                 // front-end omitted body or else NOP already donates its location above.
                 self.assembler.set_location(SourceLocation::NONE);
             }
+            let guarded_recovery_exit = match normal_exit_suite.last() {
+                Some(Stmt::If(guard))
+                    if self.context.python_version >= crate::PythonVersion::Py314
+                        && !statement.is_star
+                        && guard.elif_else_clauses.is_empty()
+                        && matches!(guard.body.last(), Some(Stmt::Try(_)))
+                        && original_condition_has_unique_jump_target(&guard.test, false) =>
+                {
+                    let location = self.source_location(condition_fallthrough_range(&guard.test));
+                    // The nested cleanup jumps past this exit. The original
+                    // conditional edge stays here and supplies its line.
+                    ((!statement.orelse.is_empty() && direct_exit_location.is_some())
+                        || self
+                            .assembler
+                            .original_guarded_exit_has_empty_cleanup(location))
+                    .then_some(location)
+                }
+                _ => None,
+            };
+            if let Some(location) = guarded_recovery_exit {
+                self.assembler.set_location(location);
+            }
             let normal_exit = if (match_body_pop_block
                 || compound_match_pop_block
                 || self.assembler.python_version() == crate::PythonVersion::Py312)
@@ -29453,6 +29475,12 @@ impl<'source> Compiler<'source> {
                 // Delay the break's exit until threading, then allow an adjacent
                 // finally POP_BLOCK with the same line to absorb its redundant NOP.
                 self.assembler.defer_jump_removal(normal_exit);
+            }
+            if guarded_recovery_exit.is_some() {
+                self.assembler
+                    .preserve_redundant_jump_nop_after_threading(normal_exit);
+                self.assembler
+                    .mark_retained_nop_borrow_fallthrough_if_unblocked(normal_exit);
             }
             if chained_assertion_exit_location.is_some() || retained_runtime_while_exit {
                 // A unique runtime loop exit keeps its condition's line through return
