@@ -8513,12 +8513,18 @@ fn unnamed_handler_constant_return_preserves_copied_guard_owner() {
     ] {
         let source = source.replace("MIDDLE_SUITE", suite);
         for result in ["value", "one()", "one(two())", "one(two(three()))"] {
-            assert_matches_cpython_versions(
-                &source.replace("value=result", &format!("value={result}")),
-                "unnamed_handler_guard.py",
-                &LEVELS,
-                &[PythonVersion::Py314],
-            );
+            let source = source.replace("value=result", &format!("value={result}"));
+            for source in [
+                &source,
+                &source.replace("async def", "def").replace("await ", ""),
+            ] {
+                assert_matches_cpython_versions(
+                    source,
+                    "unnamed_handler_guard.py",
+                    &LEVELS,
+                    &[PythonVersion::Py314],
+                );
+            }
         }
     }
 }
