@@ -11688,23 +11688,25 @@ impl<'source> Compiler<'source> {
                         && preserve_tos
                         && !return_is_overridden
                         && context_index == 0
-                        && return_finally_contexts.len() == 1
                         && handler_count == 0
                         && finally_context.exception_region_depth == 0
-                        && matches!(
-                            (
-                                self.control
-                                    .exceptions
-                                    .active_exception_region_exclusions
-                                    .len(),
-                                self.control
-                                    .exceptions
-                                    .active_try_marker_slots
-                                    .len()
-                                    .checked_sub(finally_context.try_body_depth),
-                            ),
-                            (1, Some(0)) | (2, Some(1))
-                        )
+                        && match (
+                            return_finally_contexts.as_slice(),
+                            self.control.exceptions.active_exception_region_exclusions.len(),
+                            self.control.exceptions.active_try_marker_slots.len().checked_sub(finally_context.try_body_depth),
+                        ) {
+                            ([_], 1, Some(0)) | ([_], 2, Some(1)) => true,
+                            // The inner finally has already run. Its own POP is in
+                            // the prefix before the manager rather than after it.
+                            ([_, inner], 2, Some(0)) => {
+                                self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+                                    && inner.with_depth == 1 && inner.try_body_depth == 0
+                                    && inner.exception_region_depth == 1
+                                    && self.control.withs.active_with_exits.len() == 1
+                                    && self.control.loops.contexts.is_empty()
+                            }
+                            _ => false,
+                        }
                         && (1..=2).contains(&self.control.withs.active_with_exits.len())
                         && self
                             .control
@@ -11749,11 +11751,7 @@ impl<'source> Compiler<'source> {
                         .then(|| {
                             (
                                 self.assembler.item_count(),
-                                self.control
-                                    .exceptions
-                                    .active_exception_region_exclusions
-                                    .len()
-                                    - 1,
+                                self.control.exceptions.active_try_marker_slots.len() - finally_context.try_body_depth,
                                 self.control.withs.active_with_exits.len(),
                             )
                         });
