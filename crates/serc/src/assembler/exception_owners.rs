@@ -6860,7 +6860,7 @@ impl LayoutAssembler {
         let mut source_owned_prefix = None;
         let mut pending_retained_prefix = None;
         let mut transferred_pop_setup: Option<(Label, usize)> = None;
-        let mut transferred_setup_null_slot = None;
+        let mut transferred_setup_null_slots = None;
         let mut retained_pop_prefix = None;
         let mut early_return_nop_slot = None;
         let mut early_return_iterator_slot = None;
@@ -7143,7 +7143,7 @@ impl LayoutAssembler {
                     if has_instruction && is_boundary {
                         retained_pop_prefix = None;
                         original_array_start = instruction_index;
-                        transferred_setup_null_slot = None;
+                        transferred_setup_null_slots = None;
                         captured_null_slots.clear();
                         captured_handler_owner_slots.clear();
                         captured_method_owner_slots.clear();
@@ -7515,9 +7515,8 @@ impl LayoutAssembler {
                             && tail.insertions == 0
                             && tail.late_removals == 0
                             && tail.post_compaction_fusions == 0
-                            && previous.is_some_and(|nop| {
-                                nop.local_policy.hidden_exception_owner_slots() > 0
-                            })
+                            && let Some(nop) = previous
+                            && nop.local_policy.hidden_exception_owner_slots() > 0
                             && original_array_start + 1 < instruction_index
                             && provenance.setup_nop_ranges.iter().any(|(start, end)| {
                                 label_positions.get(start) == Some(&(instruction_index - 1))
@@ -7525,10 +7524,26 @@ impl LayoutAssembler {
                             })
                         {
                             let setup_index = instruction_index - 1;
-                            transferred_setup_null_slot = Some((
+                            let setup_slot = setup_index + tail.early_removals;
+                            // Compaction certifies a run only when every removed
+                            // record was a POP_BLOCK on this linear fallthrough.
+                            let hidden = nop.local_policy.hidden_exception_owner_slots();
+                            let pop_slots = if provenance.removed_pop_block_widths.iter().any(
+                                |(label, &width)| {
+                                    width == hidden
+                                        && usize::from(width) <= tail.early_removals
+                                        && label_positions.get(label) == Some(&setup_index)
+                                },
+                            ) {
+                                usize::from(hidden)
+                            } else {
+                                0
+                            };
+                            transferred_setup_null_slots = Some((
                                 original_array_start,
                                 setup_index,
-                                setup_index + tail.early_removals,
+                                setup_slot - pop_slots,
+                                setup_slot,
                                 tail.early_removals,
                             ));
                         }
@@ -7680,9 +7695,10 @@ impl LayoutAssembler {
                                 .checked_add(tail.early_removals)
                                 .and_then(|index| index.checked_add(1))
                             {
-                                transferred_setup_null_slot = Some((
+                                transferred_setup_null_slots = Some((
                                     original_array_start,
                                     instruction_index,
+                                    slot,
                                     slot,
                                     tail.early_removals + 1,
                                 ));
@@ -10285,9 +10301,9 @@ impl LayoutAssembler {
                             ExceptionOwnerDecision::override_with_region(None),
                         );
                     }
-                    // The retained SETUP's original cell is NULL, even if its compacted
-                    // live record is surrounded by protected instructions. An appended
-                    // marker may reuse it only when no subsequent edit shifts that cell.
+                    // A retained SETUP and any certified POP_BLOCKs immediately
+                    // before it leave unowned slots. An appended marker can reuse
+                    // one only if no later edit shifts the original array.
                     if instruction.opcode == NOT_TAKEN
                         && instruction.exception_policy().exclusion()
                             == super::ExceptionExclusion::None
@@ -10295,9 +10311,10 @@ impl LayoutAssembler {
                         && tail.insertions == 0
                         && tail.late_removals == 0
                         && tail.post_compaction_fusions == 0
-                        && let Some((array, setup, slot, removals)) = transferred_setup_null_slot
+                        && let Some((array, setup, first, last, removals)) =
+                            transferred_setup_null_slots
                         && array == original_array_start
-                        && slot == instruction_index
+                        && (first..=last).contains(&instruction_index)
                         && removals == tail.early_removals
                         && instruction_index > setup
                         && indexed_instructions
@@ -11495,7 +11512,7 @@ impl LayoutAssembler {
                     {
                         retained_pop_prefix = None;
                         original_array_start = instruction_index;
-                        transferred_setup_null_slot = None;
+                        transferred_setup_null_slots = None;
                         captured_null_slots.clear();
                         captured_handler_owner_slots.clear();
                         captured_method_owner_slots.clear();
