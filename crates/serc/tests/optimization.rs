@@ -15909,6 +15909,26 @@ fn optimized_empty_manager_bodies_match_cpython() {
 }
 
 #[test]
+fn nested_manager_setups_leave_unowned_slots_for_truth_jumps() {
+    let source = r"def sample(value):
+    def closure():
+        return value
+    with first(), second(), third(), fourth():
+        try:
+            if value:
+                report()
+        finally:
+            close()
+";
+    assert_matches_cpython_versions(
+        source,
+        "manager_setup_truth_slot.py",
+        &LEVELS,
+        &[PythonVersion::Py314],
+    );
+}
+
+#[test]
 fn modern_manager_finally_jump_and_copied_exit_keep_owners() {
     const JUMP_SOURCE: &str = "def f(manager, work):\n    try:\n        raise ValueError()\n    except ValueError:\n        with manager:\n            try:\n                work()\n            finally:\n                pass\n";
     const DIRECT_SOURCE: &str = "def f(manager, work):\n    with manager:\n        try:\n            work()\n        finally:\n            pass\n";

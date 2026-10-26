@@ -11368,8 +11368,17 @@ impl LayoutAssembler {
                                 || late_setup_positions.last() == Some(&instruction_index))
                             && instruction.exception_policy().exclusion()
                                 == super::ExceptionExclusion::None
-                            && instruction.exception_policy().owner()
+                            && (instruction.exception_policy().owner()
                                 == NormalizedExceptionOwner::Present
+                                || (instruction.exception_policy().owner()
+                                    == NormalizedExceptionOwner::DynamicCondition
+                                    && instruction_index.checked_sub(1).is_some_and(|index| {
+                                        matches!(
+                                            indexed_instructions[index].opcode,
+                                            crate::target::opcodes::POP_JUMP_IF_TRUE
+                                                | crate::target::opcodes::POP_JUMP_IF_FALSE
+                                        )
+                                    })))
                             && owners
                                 .get(instruction_index)
                                 .is_none_or(|decision| !decision.is_definitive())
@@ -12994,14 +13003,21 @@ impl LayoutAssembler {
         let Some(source) = marker.checked_sub(removed_positions.len()) else {
             return false;
         };
+        // A specialized None test folded three original cells. A truth jump
+        // keeps its own record. Both precede the final SETUP compaction.
+        let condition_slots = match condition.opcode {
+            POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE => 3,
+            crate::target::opcodes::POP_JUMP_IF_TRUE
+            | crate::target::opcodes::POP_JUMP_IF_FALSE => 0,
+            _ => return false,
+        };
         let provenance = &self.exception_owner_provenance;
         if removed_positions.is_empty()
             || removed_positions
                 .last()
                 .is_none_or(|position| *position > marker)
-            || !matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
             || condition.forward_target().is_none()
-            || condition.local_policy.hidden_exception_owner_slots() != 3
+            || condition.local_policy.hidden_exception_owner_slots() != condition_slots
             || condition.pre_fold_extra_instructions() != 0
             || condition.exception_policy() != super::ExceptionPolicy::NoneUnchanged
             || append.opcode != NOT_TAKEN
