@@ -9126,6 +9126,24 @@ fn python312_async_iteration_preserves_repeated_conditional_return() {
 }
 
 #[test]
+fn python312_inline_async_comprehension_preserves_conditional_returns() {
+    for expression in [
+        "[item async for item in stream]",
+        "{item async for item in stream}",
+    ] {
+        let source = format!(
+            "async def collect(resource, stream, ready):\n    with resource:\n        result = {expression}\n    if ready:\n        assert valid()\n    if ready:\n        return result\n    else:\n        assert valid()\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "async_comprehension.py",
+            &LEVELS,
+            &[PythonVersion::Py312],
+        );
+    }
+}
+
+#[test]
 fn protected_conditional_store_preserves_erased_else_backedge() {
     let protected = r"def collect(batches, left, right, cleanup, sink):
     try:

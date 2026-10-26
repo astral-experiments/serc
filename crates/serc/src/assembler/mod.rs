@@ -16657,6 +16657,25 @@ impl Assembler {
         }
     }
 
+    /// Registers both original Python 3.12 SETUP edges in an async iteration header.
+    pub(crate) fn record_legacy_async_iteration(
+        &mut self,
+        (entry, exhaustion): (Label, Label),
+        (yielded, yielded_end): (Label, Label),
+        cleanup_throw: Label,
+        (send, send_end): (Label, Label),
+    ) {
+        self.record_legacy_native_setup_target(entry, exhaustion);
+        self.record_legacy_native_setup_target(yielded, cleanup_throw);
+        self.record_legacy_protocol_await_setup(
+            yielded,
+            yielded_end,
+            cleanup_throw,
+            send,
+            send_end,
+        );
+    }
+
     /// Records protocol-await labels without treating the await as ordinary source work.
     pub(crate) fn record_legacy_protocol_await_setup(
         &mut self,
