@@ -2224,6 +2224,31 @@ fn erased_loop_exit_stays_inside_managed_finally() {
 }
 
 #[test]
+fn generator_finalizers_reuse_the_unwound_try_slot_for_attribute_checks() {
+    for (guard, repeat) in [("state.flag", 2), ("state.flag()", 3)] {
+        let preparation = "        prepare()\n".repeat(repeat);
+        let source = format!(
+            "async def sample(state):
+    try:
+        async with gate():
+            pass
+{preparation}        yield build(state)
+    finally:
+        if {guard} is None:
+            finish()
+        done()
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "generator_finally_attribute.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn copied_return_through_nested_loops_keeps_none_guard_owner() {
     let source = r#"async def sample(client, response):
     for attempt in range(client.attempts):
