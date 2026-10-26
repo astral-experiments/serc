@@ -174,7 +174,9 @@ impl<'ast> Counter<'ast> {
             Stmt::If(statement) => {
                 let clauses = &statement.elif_else_clauses;
                 let has_else = u32::from(!clauses.is_empty());
-                self.counts.add(1 + has_else, has_else, 0);
+                // The jump over an else suite is immediately followed by its label.
+                self.counts
+                    .add_with_unlabeled_successors(1 + has_else, has_else, 0, 0);
                 self.condition(&statement.test)?;
                 self.suite(&statement.body)?;
                 // Ruff flattens elif; native recursively emits another If with
@@ -182,7 +184,8 @@ impl<'ast> Counter<'ast> {
                 for (index, clause) in clauses.iter().enumerate() {
                     if let Some(test) = &clause.test {
                         let has_else = u32::from(index + 1 < clauses.len());
-                        self.counts.add(1 + has_else, has_else, 0);
+                        self.counts
+                            .add_with_unlabeled_successors(1 + has_else, has_else, 0, 0);
                         self.condition(test)?;
                     }
                     self.suite(&clause.body)?;
@@ -449,7 +452,7 @@ impl<'ast> Counter<'ast> {
                 }
             }
             Expr::If(conditional) => {
-                self.counts.add(2, 1, 0);
+                self.counts.add_with_unlabeled_successors(2, 1, 0, 0);
                 self.condition(&conditional.test)?;
                 self.condition(&conditional.body)?;
                 self.condition(&conditional.orelse)?;
@@ -545,7 +548,7 @@ impl<'ast> Counter<'ast> {
             }
             Expr::Yield(yielded) => self.optional(yielded.value.as_deref())?,
             Expr::If(conditional) => {
-                self.counts.add(2, 1, 0);
+                self.counts.add_with_unlabeled_successors(2, 1, 0, 0);
                 self.condition(&conditional.test)?;
                 self.expression(&conditional.body)?;
                 self.expression(&conditional.orelse)?;
@@ -728,13 +731,13 @@ mod tests {
             Counts {
                 labels: 95,
                 jumps: 51,
-                unlabeled_jump_successors: 22,
+                unlabeled_jump_successors: 19,
                 exits: 29,
             },
         );
-        assert_eq!(budget.max_label(), 249);
+        assert_eq!(budget.max_label(), 246);
         // Source generation still visits unreachable exits, and 256 is excluded.
-        for (extra_exits, expected) in [(6, true), (7, false)] {
+        for (extra_exits, expected) in [(9, true), (10, false)] {
             let source = format!("{source}{}", "    raise Error\n".repeat(extra_exits));
             let parsed = parse_module(&source).unwrap();
             let Stmt::FunctionDef(function) = &parsed.suite()[0] else {
@@ -785,7 +788,7 @@ mod tests {
             Some(Counts {
                 labels: 6,
                 jumps: 4,
-                unlabeled_jump_successors: 4,
+                unlabeled_jump_successors: 2,
                 exits: 4
             }),
         );
