@@ -2867,6 +2867,18 @@ impl OptimizationPipeline {
                     native.invalidate();
                 }
             }
+            // Normalization reads the target block's own label. An original
+            // comprehension header begins with FOR_ITER and cannot be an exit copy.
+            if self
+                .exception_owner_provenance
+                .legacy_comprehension_backedges
+                .iter()
+                .any(|(_, original)| original.jump_target() == Some(target))
+            {
+                self.exception_owner_provenance
+                    .legacy_comprehension_backedges
+                    .push((fresh_entry, backedge));
+            }
             items.push(Item::Instruction(backedge));
             self.preserved_block_boundaries.insert(fresh_entry);
             self.graph.insert_block(position + 1, items);
