@@ -2392,6 +2392,24 @@ fn nested_handler_raise_keeps_empty_outer_exit() {
 }
 
 #[test]
+fn a_deferred_generator_comparison_keeps_the_outer_loop_branches() {
+    let source = r"def run(values, ok):
+    for value in values:
+        if skip:
+            pass
+        elif ok and enabled and not any(low < n < high for n in values):
+            work(value)
+    return ok
+";
+    assert_matches_cpython_versions(
+        source,
+        "deferred_comparison_loop_branches.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn loop_raise_comparison_chain_reaches_cleanup() {
     for scope in ["def", "async def"] {
         for condition in [
