@@ -22959,6 +22959,15 @@ impl<'source> Compiler<'source> {
             } else {
                 compiler.compile_suite(&statement.body)?;
             }
+            if compiler.context.python_version == crate::PythonVersion::Py313
+                && statement.orelse.is_empty()
+            {
+                // The repeated test after a terminal break becomes an empty original
+                // array. Keep it between the break and a later cold bridge.
+                compiler
+                    .assembler
+                    .record_while_break_before_repeated_test(anchor, end);
+            }
             compiler.set_depth(base_depth);
             compiler.compile_jump_if(&statement.test, true, body)
         })?;
