@@ -9073,6 +9073,30 @@ fn completed_manager_work_preserves_retained_loop_owners() {
 }
 
 #[test]
+fn manager_pop_has_no_line_after_two_finally_arms() {
+    let source = r"def sample(manager, table, key, value):
+    with manager:
+        try:
+            work()
+        finally:
+            try:
+                finish()
+            finally:
+                if value is None:
+                    table.pop(key)
+                else:
+                    table[key] = value
+    return table
+";
+    assert_matches_cpython_versions(
+        source,
+        "manager_pop_after_two_arms.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn manager_pop_has_no_line_after_multiple_conditional_cleanup_exits() {
     for guard in ["flag", "not flag", "enabled()"] {
         let source = format!(
