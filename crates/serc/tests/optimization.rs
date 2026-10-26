@@ -17287,6 +17287,27 @@ fn completed_managers_preserve_coroutine_match_returns() {
 }
 
 #[test]
+fn final_match_capture_copies_following_return() {
+    let source = r"def choose(subject, enabled, result):
+    if enabled:
+        match subject:
+            case None:
+                pass
+            case remaining:
+                remember(subject)
+    return result
+";
+    for fallback in ["remaining", "_"] {
+        assert_matches_cpython_versions(
+            &source.replace("case remaining:", &format!("case {fallback}:")),
+            "capture_return.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn nested_match_arms_preserve_tuple_return_copy_budget() {
     for otherwise in ["assert False", "pass", "result = [7]; tag = 'seven'"] {
         for returned in ["result, tag", "result", "result, tag, kind"] {
