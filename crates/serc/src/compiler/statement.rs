@@ -16693,7 +16693,7 @@ impl<'source> Compiler<'source> {
                                     || original_condition_has_unique_jump_target(&inner.test, false)
                                     || matches!(inner.test.as_ref(), Expr::Compare(chain) if chain.ops.len() > 1))));
                     let erased_join_has_donor = self.context.python_version
-                        == crate::PythonVersion::Py314
+                        >= crate::PythonVersion::Py314
                         && original_condition_has_unique_jump_target(test, true)
                         && ((erased_else && is_elided_suite(body)
                             // A folded guard emits no branch into the erased suite.

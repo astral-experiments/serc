@@ -11992,6 +11992,12 @@ fn terminating_if_before_erased_assertions_preserves_the_legacy_footer() {
 
 #[test]
 fn erased_assertion_gaps_preserve_conditional_join_nops() {
+    assert_matches_cpython_versions(
+        "async def f(outer, inner):\n    if outer:\n        if inner:\n            assert inner\n        else:\n            assert outer\n    else:\n        assert outer\n    work()\n",
+        "nested_erased_join.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
     for gap in [
         "",
         "        assert flag\n",
