@@ -1577,12 +1577,37 @@ impl LayoutAssembler {
             });
         }
 
+        // Cold relocation reads the original END_SEND label when the captured
+        // suspension and its bridge survive. Its width is independent of any
+        // labels allocated later for empty or duplicated blocks.
+        let mut short_await_bridges = rustc_hash::FxHashMap::default();
+        if !native_jump_widths
+            && !uniform_jump_widths
+            && self
+                .exception_owner_provenance
+                .legacy_source_jump_labels_fit
+        {
+            short_await_bridges.extend(
+                self.exception_owner_provenance
+                    .ordinary_await_ends
+                    .iter()
+                    .filter_map(|origin| origin.bridge),
+            );
+        }
+        let mut expected_bridge = None;
         let mut extended_args = Vec::with_capacity(instruction_count);
         let mut resolved_arguments = Vec::with_capacity(instruction_count);
         for item in &self.items {
-            let Item::Instruction(instruction) = item else {
-                continue;
+            let instruction = match item {
+                Item::Instruction(instruction) => instruction,
+                Item::Label(label) => {
+                    if let Some(bridge) = short_await_bridges.get(label) {
+                        expected_bridge = Some(bridge);
+                    }
+                    continue;
+                }
             };
+            let short_await_bridge = expected_bridge.take() == Some(instruction);
             let argument = match self.encoded_operand(instruction)? {
                 Operand::Value(argument) => argument,
                 Operand::Forward(label) | Operand::Backward(label) => initial_jump_arguments
@@ -1599,6 +1624,8 @@ impl LayoutAssembler {
                 instruction
                     .legacy_initial_jump_width()
                     .expect("all native jumps are certified")
+            } else if short_await_bridge {
+                0
             } else {
                 extended_arg_count(argument)
             };

@@ -259,6 +259,8 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) named_handler_cleanup_targets: FxHashSet<Label>,
     // Original ordinary-await suspension regions, resolved alongside their live regions.
     pub(super) ordinary_await_cleanups: Vec<super::ExceptionRegion>,
+    // Every original 3.12 codegen label fits in one operand byte.
+    pub(super) legacy_source_jump_labels_fit: bool,
     // Authored SEND, completion entry, and END_SEND before any cleanup or copying.
     pub(super) ordinary_await_ends: Vec<OrdinaryAwaitEnd>,
     // Empty runtime-while anchor, shared exit, and exact terminal authored break.
