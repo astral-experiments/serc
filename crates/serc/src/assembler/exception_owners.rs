@@ -324,7 +324,7 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) copied_return_membership_prefixes: Vec<CopiedReturnMembershipPrefix>,
     pub(super) copied_return_call_prefixes: Vec<CopiedReturnCallPrefix>,
     pub(super) copied_return_attribute_truth_prefixes: Vec<CopiedReturnAttributeTruthPrefix>,
-    pub(super) copied_handler_return_none_prefixes: Vec<(Label, [Instruction; 6])>,
+    pub(super) copied_handler_return_none_prefixes: Vec<(Label, [Instruction; 6], u16)>,
     pub(super) saved_named_handler_none_prefixes: Vec<SavedNamedHandlerNonePrefix>,
     pub(super) copied_manager_return_none_prefixes: Vec<CopiedManagerReturnNonePrefix>,
     pub(super) retained_manager_return_none_prefixes: Vec<RetainedManagerReturnNonePrefix>,
@@ -9572,7 +9572,7 @@ impl LayoutAssembler {
                     {
                         let pop_index = instruction_index - 2;
                         let swap_index = pop_index - 1;
-                        for (entry, [swap, _, pop_except, _, load, condition]) in &self
+                        for (entry, [swap, _, pop_except, _, load, condition], final_pops) in &self
                             .exception_owner_provenance
                             .copied_handler_return_none_prefixes
                         {
@@ -9594,7 +9594,7 @@ impl LayoutAssembler {
                             let mut expected_load = *load;
                             expected_load
                                 .local_policy
-                                .add_hidden_exception_owner_slots(1);
+                                .add_hidden_exception_owner_slots(*final_pops);
                             if indexed_instructions[instruction_index - 1].opcode
                                 == crate::target::opcodes::LOAD_FAST_BORROW
                             {
@@ -9607,11 +9607,11 @@ impl LayoutAssembler {
                             {
                                 continue;
                             }
-                            // The final POP and three comparison cells follow POP_EXCEPT;
-                            // all earlier removals shift its original cell to the right.
+                            // Later scope POPs and the three comparison cells follow
+                            // POP_EXCEPT. Earlier folds shift its original slot.
                             if tail
                                 .early_removals
-                                .checked_sub(4)
+                                .checked_sub(3 + usize::from(*final_pops))
                                 .and_then(|removed| pop_index.checked_add(removed))
                                 == Some(instruction_index + 1)
                                 && let Some(region) = self.uniform_exception_owner(

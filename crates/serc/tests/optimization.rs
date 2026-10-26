@@ -6455,6 +6455,35 @@ fn iterator_handler_returns_preserve_conditional_finalizer_entry() {
 }
 
 #[test]
+fn saved_handler_value_keeps_owner_across_enclosing_try() {
+    let source = r"def sample(value, guard):
+    try:
+        try:
+            try:
+                work()
+            except ValueError:
+                note(value)
+                return result(item=value)
+        except OSError:
+            pass
+    finally:
+        if guard is None:
+            guard.close()
+";
+    for source in [
+        source.to_owned(),
+        source.replace("def sample", "async def sample"),
+    ] {
+        assert_matches_cpython_versions(
+            &source,
+            "saved_handler_try_pop.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn boolean_returns_preserve_enclosing_named_handler_owners() {
     let source = r"def sample(items, flag):
     for value in items:

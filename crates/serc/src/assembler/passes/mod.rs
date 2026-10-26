@@ -911,7 +911,7 @@ impl OptimizationPipeline {
                     records[3] = *after;
                 }
             }
-            for (_, records) in &mut self
+            for (_, records, _) in &mut self
                 .exception_owner_provenance
                 .copied_handler_return_none_prefixes
             {
