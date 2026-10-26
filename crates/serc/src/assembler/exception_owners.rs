@@ -5682,8 +5682,8 @@ impl LayoutAssembler {
         (!owner.is_scope_fallback && !owner.preserve_lasti).then_some(region)
     }
 
-    /// Replays the exact finalizer NULL cell after a saved named-handler return.
-    fn saved_named_handler_none_is_null(
+    /// Finds the original marker cell after a saved named-handler return.
+    fn saved_named_handler_none_owner(
         &self,
         marker: usize,
         array: usize,
@@ -5691,13 +5691,13 @@ impl LayoutAssembler {
         instructions: &[&Instruction],
         positions: &OwnerLabelPositions,
         jump_targets: &FxHashSet<Label>,
-    ) -> bool {
-        if tail.early_removals != 4
+    ) -> Option<ExceptionOwnerDecision> {
+        if !(4..=8).contains(&tail.early_removals)
             || tail.insertions != 0
             || tail.late_removals != 0
             || tail.post_compaction_fusions != 0
         {
-            return false;
+            return None;
         }
         let provenance = &self.exception_owner_provenance;
         let mut matching = provenance
@@ -5707,9 +5707,7 @@ impl LayoutAssembler {
                 origin.items.last() == Some(&Item::Instruction(*instructions[marker]))
                     && positions.get(&origin.entry) == Some(&array)
             });
-        let Some(origin) = matching.next() else {
-            return false;
-        };
+        let origin = matching.next()?;
         if matching.next().is_some()
             || !provenance.source_boundaries.contains(&origin.entry)
             || !provenance.block_boundaries.contains(&origin.entry)
@@ -5742,8 +5740,9 @@ impl LayoutAssembler {
                     .is_some_and(|position| array < *position && *position <= marker)
             })
         {
-            return false;
+            return None;
         }
+        let mut folded_nulls = 0;
         let mut original = 0;
         let mut live = array;
         let mut labels = FxHashSet::default();
@@ -5762,7 +5761,7 @@ impl LayoutAssembler {
                             .count()
                             != 1
                     {
-                        return false;
+                        return None;
                     }
                 }
                 Item::Instruction(mut expected) => {
@@ -5772,27 +5771,47 @@ impl LayoutAssembler {
                         // Only the captured finalizer POP is erased from this live prefix.
                         continue;
                     }
-                    let Some(actual) = instructions.get(live) else {
-                        return false;
-                    };
+                    let actual = instructions.get(live)?;
+                    if offset < origin.unwind_offset
+                        && expected.opcode == crate::target::opcodes::LOAD_GLOBAL
+                        && expected.value_argument().is_some_and(|arg| arg & 1 != 0)
+                    {
+                        folded_nulls += 1;
+                    }
                     if offset == origin.unwind_offset + 6 {
                         expected.local_policy.add_hidden_exception_owner_slots(1);
                     }
-                    if expected.opcode == crate::target::opcodes::LOAD_FAST
-                        && actual.opcode == crate::target::opcodes::LOAD_FAST_BORROW
+                    if (expected.opcode == crate::target::opcodes::LOAD_FAST
+                        && actual.opcode == crate::target::opcodes::LOAD_FAST_BORROW)
+                        || (offset < origin.unwind_offset
+                            && expected.opcode == crate::target::opcodes::LOAD_FAST_CHECK
+                            && actual.opcode == crate::target::opcodes::LOAD_FAST)
                     {
                         expected.opcode = actual.opcode;
                     }
                     if **actual != expected {
-                        return false;
+                        return None;
                     }
                     live += 1;
                 }
             }
         }
-        // The omitted handler POPs precede SWAP and POP_EXCEPT. They put the
-        // finalizer POP at original SWAP+7, exactly the appended marker's cell.
-        original == origin.unwind_offset + 9 && live == marker + 1
+        if original != origin.unwind_offset + 9
+            || live != marker + 1
+            || tail.early_removals != 4 + folded_nulls
+        {
+            return None;
+        }
+        // The omitted handler POPs put the marker on the unowned finalizer POP.
+        // Each folded global-call NULL shifts it back through the four live
+        // instructions that clear the exception and its local binding.
+        let region = if folded_nulls == 0 {
+            None
+        } else {
+            let slot = array + origin.unwind_offset + 5 - folded_nulls;
+            Some(self.uniform_exception_owner(slot, slot + 1, positions)?)
+        };
+        Some(ExceptionOwnerDecision::override_with_region(region))
     }
 
     /// Replays only fully captured constant-return cleanup and its original NULL cells.
@@ -10421,14 +10440,14 @@ impl LayoutAssembler {
                             );
                         }
                         // This saved-value cleanup certifies two omitted handler POPs and
-                        // the exact later finalizer NULL cell without changing generic history.
+                        // the original marker cell at the end of the unwind.
                         if instruction.exception_policy() == super::ExceptionPolicy::NonePresent
                             && owner_history_exact
                             && pop_slot_epoch_known
                             && owners
                                 .get(instruction_index)
                                 .is_none_or(|decision| !decision.is_definitive())
-                            && self.saved_named_handler_none_is_null(
+                            && let Some(owner) = self.saved_named_handler_none_owner(
                                 instruction_index,
                                 original_array_start,
                                 tail,
@@ -10437,10 +10456,7 @@ impl LayoutAssembler {
                                 &jump_targets,
                             )
                         {
-                            owners.insert(
-                                instruction_index,
-                                ExceptionOwnerDecision::override_with_region(None),
-                            );
+                            owners.insert(instruction_index, owner);
                         }
                         // A complete captured unwind supplies its own original array proof;
                         // it does not revive the generic POP epoch after manager range aliases.

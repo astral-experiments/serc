@@ -7753,6 +7753,39 @@ fn guarded_recovery_preserves_populated_normal_cleanup_entries() {
 }
 
 #[test]
+fn folded_calls_preserve_named_handler_cleanup_slots() {
+    for arguments in [
+        "error",
+        "convert(error)",
+        "convert(error), convert(item)",
+        "convert(error), convert(item), convert(flag)",
+        "convert(error), convert(item), convert(flag), convert(manager)",
+    ] {
+        let source = format!(
+            "async def handle(manager, item, flag, reporter):
+    async with manager:
+        try:
+            return await process(item)
+        except ValueError as error:
+            if skip(error):
+                return item, flag
+            reporter.note({arguments})
+            return item
+        finally:
+            if flag is not None:
+                reporter.done()
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "named_handler_cleanup_slots.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn named_handler_returns_preserve_outer_finalizer_owners() {
     let source = r"def named_nested(choice, item, owner, operation, cleanup, recover):
     value = None
