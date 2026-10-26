@@ -59,6 +59,24 @@ fn erased_nested_assignment_suffix_preserves_join() {
 }
 
 #[test]
+fn a_relocated_async_loop_exit_has_no_exception_handler() {
+    let source = r"async def run(items, flag):
+    if flag:
+        async for value in items:
+            use(value)
+    else:
+        assert flag
+    use(flag)
+";
+    assert_matches_cpython_versions(
+        source,
+        "async_loop_exit_handler.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn erased_async_manager_suffix_preserves_conditional_join() {
     let source = r"async def sample(ordered, items):
     try:
