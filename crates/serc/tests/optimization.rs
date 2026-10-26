@@ -8493,6 +8493,37 @@ fn composed_mapping_capture_cleanups_apply_static_swaps() {
 }
 
 #[test]
+fn unnamed_handler_constant_return_preserves_copied_guard_owner() {
+    let source = r"async def sample(value, guard):
+    try:
+        try:
+            try:
+                work()
+            except OSError:
+                use(value=result)
+                return False
+        MIDDLE_SUITE
+    finally:
+        if guard is None:
+            await finish(value)
+";
+    for suite in [
+        "except ValueError:\n            pass",
+        "finally:\n            if guard is None:\n                await finish(value)",
+    ] {
+        let source = source.replace("MIDDLE_SUITE", suite);
+        for result in ["value", "one()", "one(two())", "one(two(three()))"] {
+            assert_matches_cpython_versions(
+                &source.replace("value=result", &format!("value={result}")),
+                "unnamed_handler_guard.py",
+                &LEVELS,
+                &[PythonVersion::Py314],
+            );
+        }
+    }
+}
+
+#[test]
 fn unnamed_handler_match_cleanup_preserves_success_edges() {
     let source = r"async def handler_match(owner, kinds, operation, sink, choice):
     result = None

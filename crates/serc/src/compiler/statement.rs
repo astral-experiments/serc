@@ -10104,7 +10104,41 @@ impl<'source> Compiler<'source> {
                             }
                             start
                         });
+                        // The enclosing ordinary try already protects POP_EXCEPT. Record
+                        // its original position without adding another exception range.
+                        let copied_unnamed_try_pop = (self.context.python_version
+                            == crate::PythonVersion::Py314
+                            && self.unit.flags
+                                & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                                == CO_COROUTINE
+                            && enclosing_try_owns_pop_except
+                            && protected_pop_except.is_none()
+                            && !preserve_tos
+                            && !return_is_overridden
+                            && name.is_none()
+                            && return_finally_contexts.len() == 1
+                            && return_finally_contexts[0].exception_region_depth == 0
+                            && with_depth == 0
+                            && loop_depth == 0
+                            && try_body_depth == 1
+                            && self.control.exceptions.active_try_marker_slots.len() == 1)
+                            .then(|| {
+                                let start = self.assembler.label();
+                                self.assembler.mark(start);
+                                self.assembler.record_exception_owner_continuation(start);
+                                start
+                            });
                         self.emit(POP_EXCEPT, 0, -1)?;
+                        if let Some(start) = copied_unnamed_try_pop {
+                            let end = self.assembler.label();
+                            self.assembler.mark(end);
+                            self.assembler.record_copied_handler_cleanup(
+                                start,
+                                end,
+                                copied_handler_return_item,
+                                false,
+                            );
+                        }
                         if let Some(start) = named_handler_pop_start {
                             self.assembler.record_named_handler_pop_pair(start);
                         }
@@ -10204,7 +10238,12 @@ impl<'source> Compiler<'source> {
                                 if !preserve_tos
                                     && handler_count == 1
                                     && (next_finally == 1
-                                        || (tracks_try_between_finally_unwinds && next_finally == 2))
+                                        || (tracks_try_between_finally_unwinds && next_finally == 2)
+                                        || (self.context.python_version == crate::PythonVersion::Py314
+                                            && next_finally == 2 && return_finally_contexts.len() == 2
+                                            && name.is_none() && with_depth == 0 && loop_depth == 0
+                                            && try_body_depth == 0 && region_depth == 2
+                                            && return_finally_contexts[0].exception_region_depth == 0))
                                     && next_with == with_depth
                                     // Matching saved depths and the exact emitted prefix
                                     // exclude iterator cleanup before the captured handler POP.
