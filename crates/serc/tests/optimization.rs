@@ -215,6 +215,23 @@ fn guarded_finally_arms_keep_their_manager_exit_location() {
 }
 
 #[test]
+fn restored_comprehension_cell_keeps_the_assignment_exit_position() {
+    let source = r"def run(items, ready, seq):
+    for item in items:
+        if ready:
+            out = [(row for _ in seq) for row in items]
+        assert ready
+    return ready
+";
+    assert_matches_cpython_versions(
+        source,
+        "comprehension_cell_loop_exit.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn completed_coroutine_prefixes_keep_comprehension_return_locations() {
     for iterator in ["for", "async for"] {
         for suffix in ["", "        finish(values)\n"] {
