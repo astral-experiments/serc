@@ -9073,6 +9073,35 @@ fn completed_manager_work_preserves_retained_loop_owners() {
 }
 
 #[test]
+fn nested_else_uses_its_terminating_guard_or_loop_exit_location() {
+    let source = r"def run(first, second, third, active, value):
+    if first:
+        if second:
+            pass
+        elif third:
+            raise ValueError
+        else:
+            if active:
+                raise RuntimeError
+    elif active:
+        pass
+    return value
+";
+    for tail in [
+        "if active:\n                raise RuntimeError",
+        "while active:\n                visit()",
+        "if active:\n                visit()",
+    ] {
+        assert_matches_cpython_versions(
+            &source.replace("if active:\n                raise RuntimeError", tail),
+            "nested_branch_location.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn protected_conditional_store_preserves_erased_else_backedge() {
     let protected = r"def collect(batches, left, right, cleanup, sink):
     try:
