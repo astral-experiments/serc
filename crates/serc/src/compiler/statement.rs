@@ -39210,6 +39210,8 @@ impl<'source> Compiler<'source> {
             } else if normal_loop_exit.is_some() {
                 self.assembler
                     .preserve_redundant_jump_nop_after_threading(normal_exit);
+                self.assembler
+                    .mark_retained_nop_borrow_fallthrough_if_unblocked(normal_exit);
             } else if self.context.python_version >= crate::PythonVersion::Py314
                 && !preserve_exit_nop
                 && finalizer_tail_count == 0
