@@ -9095,6 +9095,27 @@ fn terminal_values_before_erased_assertions_keep_branch_returns() {
 }
 
 #[test]
+fn terminal_branch_loop_copies_false_returns_before_erased_assertions() {
+    for body in ["pass", "visit(left)"] {
+        for suffix in [
+            "assert right",
+            "assert right\n        assert left",
+            "visit(right)",
+        ] {
+            let source = format!(
+                "def run(flag, left, right, stop):\n    if flag:\n        while not left and right < stop:\n            {body}\n        {suffix}\n"
+            );
+            assert_matches_cpython_versions(
+                &source,
+                "terminal_branch_loop.py",
+                &LEVELS,
+                &[PythonVersion::Py314, PythonVersion::Py315],
+            );
+        }
+    }
+}
+
+#[test]
 fn protected_conditional_store_preserves_erased_else_backedge() {
     let protected = r"def collect(batches, left, right, cleanup, sink):
     try:

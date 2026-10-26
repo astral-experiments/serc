@@ -2496,7 +2496,25 @@ impl<'source> Compiler<'source> {
                 && body[index + 1..]
                     .iter()
                     .all(|statement| self.context.is_elided_statement(statement));
+            // Each false edge of a terminal conjunction gets its own return
+            // when the enclosing conditional supplies the function's other exit.
+            let terminal_branch_while = has_elided_tail
+                && self.context.python_version >= crate::PythonVersion::Py314
+                && self.control.statements.in_terminal_if_branch_suite
+                && self.supports_elided_terminal_if()
+                && !self.has_active_control_flow_region()
+                && matches!(statement, Stmt::While(loop_statement)
+                    if loop_statement.orelse.is_empty()
+                        && matches!(loop_statement.test.as_ref(), Expr::BoolOp(boolean) if boolean.op == BoolOp::And)
+                        && condition_has_linear_runtime_leaves(&loop_statement.test)
+                        && !expression_suspends_current_scope(&loop_statement.test)
+                        && (suite_has_linear_borrow_fallthrough(&loop_statement.body)
+                            || matches!(loop_statement.body.as_slice(), [Stmt::Pass(_)])))
+                && body[index + 1..]
+                    .iter()
+                    .all(|part| self.context.is_elided_statement(part));
             if (is_final
+                || terminal_branch_while
                 || terminal_if_before_elided
                 || terminal_assignment_before_elided
                 || terminal_match_before_elided
