@@ -9279,7 +9279,9 @@ impl Compiler<'_> {
         }
         self.compile_jump_if(&conditional.test, false, otherwise)?;
         self.assembler.record_short_circuit_owner_continuation();
-        self.compile_if_expression_arm_jump(&conditional.body, jump_on, body_target)?;
+        let retain_arms =
+            self.control.conditions.retained_chained_comparison_exit == Some(conditional.range);
+        self.compile_if_expression_arm_jump(&conditional.body, jump_on, body_target, retain_arms)?;
         self.assembler.set_location(SourceLocation::NONE);
         let body_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, end)?;
         if self.control.conditions.retained_multiline_assert_ifexp_exit == Some(conditional.range) {
@@ -9309,11 +9311,17 @@ impl Compiler<'_> {
                         &conditional.orelse,
                         jump_on,
                         else_target,
+                        retain_arms,
                     )
                 },
             )?;
         } else {
-            self.compile_if_expression_arm_jump(&conditional.orelse, jump_on, else_target)?;
+            self.compile_if_expression_arm_jump(
+                &conditional.orelse,
+                jump_on,
+                else_target,
+                retain_arms,
+            )?;
         }
         if body_target == else_target
             && jump_constant_truthiness(&conditional.orelse) == Some(jump_on)
@@ -9335,6 +9343,7 @@ impl Compiler<'_> {
         expression: &Expr,
         jump_on: bool,
         label: Label,
+        retain_comparison_exit: bool,
     ) -> Result<(), CompileError> {
         if self.context.python_version <= PythonVersion::Py313
             && self.return_value_is_constant(expression)
@@ -9356,6 +9365,14 @@ impl Compiler<'_> {
                 -1,
             )?;
             self.emit(NOT_TAKEN, 0, 0)
+        } else if retain_comparison_exit
+            && matches!(expression, Expr::Compare(comparison) if comparison.ops.len() > 1)
+        {
+            self.with_control_override(
+                |control| &mut control.conditions.retained_conditional_comparison_arm,
+                Some(expression.range()),
+                |compiler| compiler.compile_jump_if(expression, jump_on, label),
+            )
         } else {
             self.compile_jump_if(expression, jump_on, label)
         }
@@ -9383,7 +9400,7 @@ impl Compiler<'_> {
             // Keep the original constant and conditional until CFG optimization.
             // An early unconditional jump would expose its target to exit copying
             // and let incoming edges skip the constant's retained line marker.
-            return self.compile_if_expression_arm_jump(expression, jump_on, label);
+            return self.compile_if_expression_arm_jump(expression, jump_on, label, false);
         }
         if let Expr::UnaryOp(unary) = expression
             && unary.op == UnaryOp::Not
@@ -9674,7 +9691,15 @@ impl Compiler<'_> {
                 end,
             );
             let comparison_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, end)?;
-            if self.control.conditions.retained_chained_comparison_exit == Some(comparison.range) {
+            let retained = self.control.conditions.retained_chained_comparison_exit;
+            let conditional_arm = self.control.conditions.retained_conditional_comparison_arm
+                == Some(comparison.range);
+            if conditional_arm && jump_on {
+                // A true-jumping arm falls through its own join before the return
+                // is copied. Thread the join while retaining the comparison line.
+                self.assembler
+                    .preserve_authored_pass_jump_nop(comparison_exit);
+            } else if retained == Some(comparison.range) || conditional_arm {
                 // CPython retains this final comparison fallthrough jump as a NOP when its
                 // neighboring terminal exit is copied through the optimized CFG.
                 self.assembler.preserve_inlined_jump_nop(comparison_exit);

@@ -573,6 +573,8 @@ pub(super) struct ConditionState {
     pub(super) include_scoped_none_condition_owner: bool,
     // The final chained comparison whose fallthrough jump survives small-exit inlining as a NOP.
     pub(super) retained_chained_comparison_exit: Option<TextRange>,
+    // The selected arm of a runtime conditional can thread its own empty join.
+    pub(super) retained_conditional_comparison_arm: Option<TextRange>,
     // Declaration-only terminal arms retain their comparison cleanup until exit copying.
     pub(super) empty_terminal_comparison_arms: Vec<TextRange>,
     // A direct conditional-expression assertion outside an iterator loop that begins below the
@@ -14943,7 +14945,10 @@ impl<'source> Compiler<'source> {
                 let retained_chained_comparison_exit =
                     (matches!(body, [Stmt::Return(_) | Stmt::Raise(_)]) || terminal_break_return)
                         .then(|| {
-                            final_chained_comparison_jump(test).or_else(|| {
+                            final_chained_comparison_target(test, self.context.python_version >= crate::PythonVersion::Py314
+                                && matches!(body, [Stmt::Return(ret)] if ret.value.as_deref().is_none_or(|value| {
+                                    matches!(value, Expr::Name(_)) || self.return_value_is_constant(value)
+                                }))).or_else(|| {
                                 (self.control.statements.context.has_following
                                     && matches!(test, Expr::Compare(comparison)
                                         if comparison.ops.len() > 1
@@ -25042,8 +25047,7 @@ impl<'source> Compiler<'source> {
             module_can_suspend && super::expression::expression_suspends_current_scope(expression)
         };
         let condition_truthiness = early_condition_truthiness(&statement.test);
-        let retained_chained_comparison_exit =
-            final_chained_comparison(&statement.test).map(|comparison| comparison.range);
+        let retained_chained_comparison_exit = final_chained_comparison_jump(&statement.test);
         let empty_folded_failure_block =
             condition_truthiness == Some(false) && self.assembler.at_empty_borrow_block();
         // Legacy constant conditions must survive the early small-exit copy pass.
@@ -42027,34 +42031,47 @@ fn expression_contains_chained_comparison(expression: &Expr) -> bool {
     detector.found
 }
 
-// Returns the final chained comparison that `compile_jump_if` lowers for this condition.
-// Its fallthrough jump can become a located NOP when a small terminal exit is copied.
-fn final_chained_comparison(expression: &Expr) -> Option<&ruff_python_ast::ExprCompare> {
+// Returns the source range whose fallthrough jump can become a NOP when a
+// small exit is copied. Both arms of a runtime conditional can share that exit.
+fn final_chained_comparison_target(
+    expression: &Expr,
+    include_conditional_arms: bool,
+) -> Option<TextRange> {
     if let Expr::UnaryOp(unary) = expression
         && unary.op == UnaryOp::Not
     {
-        return final_chained_comparison(&unary.operand);
+        return final_chained_comparison_target(&unary.operand, include_conditional_arms);
     }
-    if let Expr::If(conditional) = expression
-        && let Some(truthiness) = early_condition_truthiness(&conditional.test)
-    {
-        return final_chained_comparison(if truthiness {
-            &conditional.body
-        } else {
-            &conditional.orelse
-        });
+    if let Expr::If(conditional) = expression {
+        if let Some(truthiness) = early_condition_truthiness(&conditional.test) {
+            return final_chained_comparison_target(
+                if truthiness {
+                    &conditional.body
+                } else {
+                    &conditional.orelse
+                },
+                include_conditional_arms,
+            );
+        }
+        return (include_conditional_arms
+            && [&conditional.body, &conditional.orelse].into_iter().any(
+                |arm| matches!(arm.as_ref(), Expr::Compare(comparison) if comparison.ops.len() > 1),
+            ))
+        .then_some(conditional.range);
     }
     if let Expr::BoolOp(boolean) = expression {
-        return boolean.values.last().and_then(final_chained_comparison);
+        return boolean.values.last().and_then(|expression| {
+            final_chained_comparison_target(expression, include_conditional_arms)
+        });
     }
     match expression {
-        Expr::Compare(comparison) if comparison.ops.len() > 1 => Some(comparison),
+        Expr::Compare(comparison) if comparison.ops.len() > 1 => Some(comparison.range),
         _ => None,
     }
 }
 
 pub(super) fn final_chained_comparison_jump(expression: &Expr) -> Option<TextRange> {
-    final_chained_comparison(expression).map(|comparison| comparison.range)
+    final_chained_comparison_target(expression, false)
 }
 
 pub(super) fn suite_terminates(body: &[Stmt]) -> bool {
