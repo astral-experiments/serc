@@ -2224,6 +2224,33 @@ fn erased_loop_exit_stays_inside_managed_finally() {
 }
 
 #[test]
+fn iterator_returns_unwind_inner_try_before_copied_none_guard() {
+    for call in ["work(item if enabled else value)", "await work(item)"] {
+        let source = format!(
+            "async def sample(value, items, enabled):
+    try:
+        for item in items:
+            try:
+                {call}
+                return 1
+            except ValueError as error:
+                pass
+    finally:
+        if value is not None:
+            clean()
+        finish()
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "iterator_try_return.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn copied_return_through_nested_loops_keeps_none_guard_owner() {
     let source = r#"async def sample(client, response):
     for attempt in range(client.attempts):
