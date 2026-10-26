@@ -9073,6 +9073,28 @@ fn completed_manager_work_preserves_retained_loop_owners() {
 }
 
 #[test]
+fn managed_while_break_preserves_the_other_arm_location() {
+    let source = r"def update(resource, active, ready, value):
+    try:
+        while active:
+            with resource:
+                if ready:
+                    saved = value
+                else:
+                    break
+            observe()
+    finally:
+        done()
+";
+    assert_matches_cpython_versions(
+        source,
+        "managed_while.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn protected_conditional_store_preserves_erased_else_backedge() {
     let protected = r"def collect(batches, left, right, cleanup, sink):
     try:
