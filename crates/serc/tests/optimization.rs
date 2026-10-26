@@ -912,6 +912,25 @@ fn conditional_awaited_finalizers_preserve_outer_cleanup_borrowing() {
 }
 
 #[test]
+fn manager_exits_share_a_protected_constant_return() {
+    let source = "def sample(enabled, selected, later, manager):
+    try:
+        if enabled:
+            if selected:
+                with manager:
+                    work()
+            else:
+                fallback()
+        elif later:
+            other()
+        return 1
+    except ValueError:
+        recover()
+";
+    assert_matches_cpython(source, "manager_branch_return.py", &LEVELS);
+}
+
+#[test]
 fn conditional_manager_callback_store_keeps_cleanup_exit_owned() {
     let source = "async def sample(owner, client, task, cancel, failed, detach):\n    try:\n        replacement = owner.create()\n    finally:\n        if cancel:\n            with owner.expect(Cancelled):\n                await owner.wait(task)\n        elif failed and not detach:\n            with owner.expect(Failed):\n                await owner.wait(task)\n        else:\n            await owner.wait(task)\n        client.close = lambda: None\n    assert owner.active.session is replacement\n";
     for source in [

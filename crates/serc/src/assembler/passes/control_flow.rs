@@ -3446,6 +3446,96 @@ impl OptimizationPipeline {
         changed
     }
 
+    /// Keeps the shared branch exit that receives both paths out of a manager.
+    pub(in crate::assembler) fn preserve_manager_branch_return_joins(&mut self) {
+        use crate::target::opcodes::LOAD_SMALL_INT;
+
+        if self.python_version < crate::PythonVersion::Py314
+            || self
+                .exception_owner_provenance
+                .with_context_locations
+                .is_empty()
+        {
+            return;
+        }
+        let graph = &self.graph;
+        let records = |id: BasicBlockId| {
+            let items = graph[id].items();
+            &items[items
+                .iter()
+                .take_while(|item| matches!(item, Item::Label(_)))
+                .count()..]
+        };
+        let region_ends: FxHashSet<_> = self
+            .exception_regions
+            .iter()
+            .filter_map(|region| graph.label_block(region.end))
+            .collect();
+        let mut returns = FxHashSet::default();
+        for pair in graph.order().windows(2) {
+            if region_ends.contains(&pair[1])
+                && let [Item::Instruction(nop)] = records(pair[0])
+                && let [Item::Instruction(load), Item::Instruction(ret)] = records(pair[1])
+                && nop.opcode == NOP
+                && nop.location.line >= 0
+                && matches!(
+                    load.opcode,
+                    LOAD_CONST | LOAD_COMMON_CONSTANT | LOAD_SMALL_INT
+                )
+                && ret.opcode == RETURN_VALUE
+                && nop.location == load.location
+                && load.location == ret.location
+            {
+                // The source NOP, POP_BLOCK, constant and return fill four original slots.
+                returns.insert(pair[0]);
+            }
+        }
+        if returns.is_empty() {
+            return;
+        }
+        let single_jump = |id| match records(id) {
+            [Item::Instruction(jump)] if jump.opcode == JUMP_FORWARD => Some(jump),
+            _ => None,
+        };
+        let target = |jump: &Instruction| graph.label_block(jump.forward_target()?);
+        let mut joins = Vec::new();
+        for (id, _) in graph.iter() {
+            let [
+                Item::Instruction(pop),
+                Item::Instruction(a),
+                Item::Instruction(b),
+                Item::Instruction(c),
+                Item::Instruction(exit),
+            ] = records(id)
+            else {
+                continue;
+            };
+            if pop.opcode == POP_EXCEPT
+                && [a, b, c].iter().all(|i| i.opcode == POP_TOP)
+                && exit.opcode == JUMP_FORWARD
+                && let Some(manager) = target(exit).and_then(single_jump)
+                && manager.location == SourceLocation::NONE
+                && let Some(join) = target(manager)
+                && single_jump(join)
+                    .and_then(target)
+                    .is_some_and(|id| returns.contains(&id))
+            {
+                joins.push(join);
+            }
+        }
+        for join in joins {
+            // This original jump copies the return first. The old jump occupies a
+            // fifth slot, so neither manager exit can copy the resulting block.
+            let jump = self
+                .graph
+                .instructions_mut(join)
+                .next_back()
+                .expect("branch exit");
+            jump.jump_policy.prevent_threading_target();
+            jump.location = SourceLocation::NONE;
+        }
+    }
+
     /// Keeps a manager POP unlocated when its original upstream donor is not unique.
     /// Jump-only arrays propagate this absence even when conditional entries prevent copying.
     pub(in crate::assembler) fn preserve_shared_original_manager_pop_locations(&mut self) {

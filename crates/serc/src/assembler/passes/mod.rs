@@ -612,6 +612,7 @@ impl OptimizationPipeline {
         }
         let local_nop_donors = self.capture_local_nop_donors();
         let reversed_store_exits = self.capture_reversed_store_exits();
+        self.preserve_manager_branch_return_joins();
         self.preserve_shared_original_manager_pop_locations();
         self.record_shared_unlocated_jump_entries();
         let mut original_owners = FusionOwnerCertificates::capture_original_owners(&self);
