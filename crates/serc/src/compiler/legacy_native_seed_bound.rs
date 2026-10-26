@@ -15,10 +15,11 @@
 //!
 //! This certificate controls initial `EXTENDED_ARG` widths, not final jump distances.
 //! Unsupported syntax declines the complete code object. Finally copies follow
-//! native frame unwinding; pattern failure stacks remain unsupported.
+//! native frame unwinding. Patterns that capture or unpack values remain unsupported.
 
 use ruff_python_ast::{
-    Comprehension, Expr, FStringPartRef, InterpolatedStringElement, Parameters, Stmt, UnaryOp,
+    Comprehension, Expr, FStringPartRef, InterpolatedStringElement, Parameters, Pattern, Stmt,
+    UnaryOp,
 };
 
 /// Records which native jump operands fit in a single byte before offset resolution.
@@ -259,6 +260,45 @@ impl<'ast> Counter<'ast> {
                     // FINALLY_END only pops stack values on unwind, so it adds
                     // no projected frame or label/jump/exit budget.
                     self.suite(&statement.finalbody)?;
+                }
+            }
+            Stmt::Match(statement) => {
+                self.expression(&statement.subject)?;
+                self.counts.add(1, 0, 0); // Common match end.
+                for case in &statement.cases {
+                    match &case.pattern {
+                        Pattern::MatchValue(value) => {
+                            self.expression(&value.value)?;
+                            // The comparison jumps to the failure label. The
+                            // successful suite jumps over that labeled failure.
+                            self.counts.add_with_unlabeled_successors(1, 2, 1, 0);
+                        }
+                        Pattern::MatchOr(pattern) => {
+                            // Each value alternative has one failure label. Its
+                            // success jump and the final failure jump lead over
+                            // labeled successors; only the comparisons can split.
+                            for alternative in &pattern.patterns {
+                                let Pattern::MatchValue(value) = alternative else {
+                                    return None;
+                                };
+                                self.expression(&value.value)?;
+                                self.counts.add_with_unlabeled_successors(1, 2, 1, 0);
+                            }
+                            // OR success, enclosing case failure, and their jumps.
+                            self.counts.add_with_unlabeled_successors(2, 2, 0, 0);
+                        }
+                        Pattern::MatchAs(wildcard)
+                            if wildcard.pattern.is_none() && wildcard.name.is_none() =>
+                        {
+                            // Also covers a sole wildcard, which can emit a case-end jump.
+                            self.counts.add(1, 1, 0);
+                        }
+                        _ => return None,
+                    }
+                    if let Some(guard) = &case.guard {
+                        self.condition(guard)?;
+                    }
+                    self.suite(&case.body)?;
                 }
             }
             Stmt::FunctionDef(definition) => {
@@ -1038,7 +1078,7 @@ mod tests {
     #[test]
     fn unsupported_allocation_routes_decline_the_whole_function() {
         for source in [
-            "def f(value):\n    match value:\n        case _: pass\n",
+            "def f(value):\n    match value:\n        case [first, second]: pass\n",
             "def f():\n    def generic[T]():\n        pass\n",
             "def f():\n    type Alias = int\n",
         ] {
