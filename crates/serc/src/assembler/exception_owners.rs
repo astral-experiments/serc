@@ -312,7 +312,7 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) original_normal_finally_arrays: Vec<OriginalNormalFinallyArray>,
     pub(super) normal_finally_none_prefixes: Vec<(Instruction, Instruction, Instruction)>,
     pub(super) copied_finally_none_prefixes: Vec<(Instruction, Instruction, Instruction)>,
-    pub(super) normal_finally_method_none_prefixes: Vec<[Instruction; 5]>,
+    pub(super) normal_finally_attribute_none_prefixes: Vec<SmallVec<[Instruction; 5]>>,
     pub(super) normal_finally_truth_prefixes: Vec<[Instruction; 4]>,
     pub(super) copied_return_none_prefixes: Vec<CopiedReturnNonePrefix>,
     pub(super) copied_break_none_nops: Vec<(Vec<Label>, [Instruction; 4])>,
@@ -593,9 +593,9 @@ impl ExceptionOwnerProvenance {
             .chain(&self.copied_finally_none_prefixes)
             .map(|origin| &origin.2)
             .chain(
-                self.normal_finally_method_none_prefixes
+                self.normal_finally_attribute_none_prefixes
                     .iter()
-                    .map(|prefix| &prefix[4]),
+                    .filter_map(|prefix| prefix.last()),
             )
             .chain(
                 self.normal_finally_truth_prefixes
@@ -802,7 +802,7 @@ impl ExceptionOwnerProvenance {
             visit(&mut record.1);
             visit(&mut record.2);
         }
-        for prefix in &mut self.normal_finally_method_none_prefixes {
+        for prefix in &mut self.normal_finally_attribute_none_prefixes {
             for instruction in prefix.iter_mut() {
                 visit(instruction);
             }
@@ -4333,8 +4333,8 @@ impl LayoutAssembler {
         result
     }
 
-    /// Matches a captured normal-finally method test after only POP removal and borrowing.
-    fn normal_finally_method_none_prefix(
+    /// Matches a normal-finally attribute test after POP removal and local borrowing.
+    fn normal_finally_attribute_none_prefix(
         &self,
         condition_index: usize,
         array_start: usize,
@@ -4342,7 +4342,13 @@ impl LayoutAssembler {
         positions: &OwnerLabelPositions,
         jump_targets: &FxHashSet<Label>,
     ) -> Option<(usize, u16)> {
-        let load_index = condition_index.checked_sub(3)?;
+        let access = instructions.get(condition_index.checked_sub(1)?)?;
+        let width = match access.opcode {
+            crate::target::opcodes::CALL => 3,
+            crate::target::opcodes::LOAD_ATTR => 2,
+            _ => return None,
+        };
+        let load_index = condition_index.checked_sub(width)?;
         let load = *instructions[load_index];
         let removed_pop = load.local_policy.hidden_exception_owner_slots();
         if removed_pop > 1 {
@@ -4350,7 +4356,7 @@ impl LayoutAssembler {
         }
         let mut matches = self
             .exception_owner_provenance
-            .normal_finally_method_none_prefixes
+            .normal_finally_attribute_none_prefixes
             .iter()
             .filter(|origin| {
                 let mut expected_load = origin[1];
@@ -4361,9 +4367,10 @@ impl LayoutAssembler {
                     expected_load.opcode = load.opcode;
                 }
                 load == expected_load
-                    && instructions[load_index + 1] == &origin[2]
-                    && instructions[load_index + 2] == &origin[3]
-                    && instructions[condition_index] == &origin[4]
+                    && instructions[load_index + 1..=condition_index]
+                        .iter()
+                        .copied()
+                        .eq(&origin[2..])
             });
         let origin = matches.next()?;
         if matches.next().is_some() {
@@ -7409,16 +7416,18 @@ impl LayoutAssembler {
                                     })
                                     .count()
                                     == 1)
-                                || (indexed_instructions
-                                    .get(instruction_index + 4)
-                                    .is_some_and(|marker| marker.opcode == NOT_TAKEN)
-                                    && self.normal_finally_method_none_prefix(
-                                        instruction_index + 3,
-                                        original_array_start,
-                                        &indexed_instructions,
-                                        &label_positions,
-                                        &jump_targets,
-                                    ) == Some((instruction_index, 1))));
+                                || [2, 3].into_iter().any(|width| {
+                                    indexed_instructions
+                                        .get(instruction_index + width + 1)
+                                        .is_some_and(|marker| marker.opcode == NOT_TAKEN)
+                                        && self.normal_finally_attribute_none_prefix(
+                                            instruction_index + width,
+                                            original_array_start,
+                                            &indexed_instructions,
+                                            &label_positions,
+                                            &jump_targets,
+                                        ) == Some((instruction_index, 1))
+                                }));
                         // Labels that alias the certified POP_BLOCK end add no records.
                         // A later unknown label or a real jump join ends the proof.
                         if ended_owned_suffix != Some(instruction_index)
@@ -8993,14 +9002,14 @@ impl LayoutAssembler {
                             owners.insert(instruction_index, decision);
                         }
                     }
-                    let method_none_prefix =
+                    let attribute_none_prefix =
                         if matches!(instruction.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
                             && owner_history_exact
                             && tail.insertions == 0
                             && tail.late_removals == 0
                             && tail.post_compaction_fusions == 0
                         {
-                            self.normal_finally_method_none_prefix(
+                            self.normal_finally_attribute_none_prefix(
                                 instruction_index,
                                 original_array_start,
                                 &indexed_instructions,
@@ -9010,10 +9019,9 @@ impl LayoutAssembler {
                         } else {
                             None
                         };
-                    // The marker after a method call is two records later than a local
-                    // None marker. Keep the preceding try's exact POP boundary until its
-                    // old slot is resolved; the marker's range labels may end that epoch.
-                    let original_method_none_marker = method_none_prefix
+                    // An attribute test moves the marker past LOAD_ATTR and any call.
+                    // Keep the preceding try's POP boundary until its old slot is resolved.
+                    let original_attribute_none_marker = attribute_none_prefix
                         .filter(|(load_index, removed_pop)| {
                             *removed_pop == 1
                                 && retained_epoch_known
@@ -9125,7 +9133,7 @@ impl LayoutAssembler {
                     if let Some((marker_index, marker)) = (instruction.opcode == NOT_TAKEN)
                         .then_some((instruction_index, *instruction))
                         .or(original_none_marker)
-                        .or(original_method_none_marker)
+                        .or(original_attribute_none_marker)
                         .or(original_truth_marker)
                         && marker.exception_policy().exclusion() == super::ExceptionExclusion::None
                         && matches!(
@@ -9995,7 +10003,27 @@ impl LayoutAssembler {
                             }
                         }
                     }
-                    if let Some((load_index, removed_pop)) = method_none_prefix
+                    // An appended marker reuses the finalizer POP when preceding
+                    // removals exactly cover the surviving attribute-test instructions.
+                    if let Some((load_index, 1)) = attribute_none_prefix
+                        && pop_slot_epoch_known
+                        && let Some((start, end, start_tail, end_tail)) = ended_owned_prefix
+                        && start == original_array_start
+                        && end == load_index
+                        && start_tail.early_removals == 0
+                        && end_tail.early_removals == instruction_index + 1 - load_index
+                        && tail.early_removals == end_tail.early_removals + 4
+                        && indexed_instructions
+                            .get(instruction_index + 1)
+                            .is_some_and(|marker| {
+                                marker.opcode == NOT_TAKEN
+                                    && marker.exception_policy()
+                                        == super::ExceptionPolicy::NonePresent
+                            })
+                    {
+                        pending_normal_none_owner = Some((instruction_index + 1, None));
+                    }
+                    if let Some((load_index, removed_pop)) = attribute_none_prefix
                         && tail.early_removals == 3 + usize::from(removed_pop)
                         && (load_index..=instruction_index).all(|index| !owners.contains_key(index))
                         && let Some(region) = self.uniform_exception_owner(
@@ -10006,7 +10034,7 @@ impl LayoutAssembler {
                         && !self.exception_regions[region].is_scope_fallback
                     {
                         // With only this POP and comparison removed, normalization appends
-                        // into a method-test cell. Earlier compaction uses the protected
+                        // into an attribute-test cell. Earlier compaction uses the protected
                         // prefix path above instead of borrowing this suffix's owner.
                         pending_normal_none_owner = Some((instruction_index + 1, Some(region)));
                     }

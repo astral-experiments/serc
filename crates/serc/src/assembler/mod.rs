@@ -11737,7 +11737,7 @@ impl Assembler {
         }
     }
 
-    /// Records a direct local None test following a normal finalizer's `POP_BLOCK`.
+    /// Records a local or attribute test following a normal finalizer's `POP_BLOCK`.
     pub(crate) fn record_normal_finally_none_prefix(&mut self, ordinal: usize) {
         let mut instructions = self
             .linear_items()
@@ -11754,48 +11754,60 @@ impl Assembler {
         ) else {
             return;
         };
-        // A zero-argument method test retains two more records than a local test.
-        // Capture them before either the normal POP or its range labels disappear.
+        // Attribute tests retain a receiver and attribute load, plus the call
+        // instruction when the attribute is a zero-argument method.
         if condition.opcode == crate::target::opcodes::LOAD_ATTR {
-            if let (Some(call), Some(comparison)) = (instructions.next(), instructions.next()) {
-                let prefix = [pop, load, condition, call, comparison];
-                if pop.opcode == NOP
-                    && pop.value_argument() == Some(0)
-                    && pop.location == SourceLocation::NONE
-                    && pop.fusion_policy.is_converted_pop_block()
-                    && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
-                    && load.opcode == LOAD_FAST
-                    && load.value_argument().is_some()
-                    && matches!(condition.operand(), Operand::Value(argument) if argument & 1 != 0)
-                    && call.opcode == crate::target::opcodes::CALL
-                    && call.value_argument() == Some(0)
-                    && matches!(comparison.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
-                    && comparison.forward_target().is_some()
-                    && comparison.location.line >= 0
-                    && prefix[1..].iter().all(|record| {
-                        record.location.line == comparison.location.line
-                            && record.location.end_line == comparison.location.end_line
-                            && record.location.column == comparison.location.column
-                            && record.location.end_column <= comparison.location.end_column
-                            && record.exception_policy() == ExceptionPolicy::default()
-                    })
-                    && prefix.iter().enumerate().all(|(index, record)| {
-                        record.pre_fold_extra_instructions() == 0
-                            && record.local_policy.hidden_exception_owner_slots()
-                                == if index == 4 { 3 } else { 0 }
-                            && record.no_location_policy.borrow_fallthrough()
-                                == BorrowFallthrough::Reachable
-                    })
-                    && pop.depth_after().is_some()
-                    && load.depth_after() == pop.depth_after().map(|depth| depth + 1)
-                    && condition.depth_after() == pop.depth_after().map(|depth| depth + 2)
-                    && call.depth_after() == load.depth_after()
-                    && comparison.depth_after() == pop.depth_after()
-                {
-                    self.exception_owner_provenance
-                        .normal_finally_method_none_prefixes
-                        .push(prefix);
-                }
+            let Some(argument) = condition.value_argument() else {
+                return;
+            };
+            let method = argument & 1 != 0;
+            let call = if method { instructions.next() } else { None };
+            let Some(comparison) = instructions.next() else {
+                return;
+            };
+            let mut prefix: smallvec::SmallVec<[Instruction; 5]> =
+                smallvec::smallvec![pop, load, condition];
+            prefix.extend(call);
+            prefix.push(comparison);
+            if pop.opcode == NOP
+                && pop.value_argument() == Some(0)
+                && pop.location == SourceLocation::NONE
+                && pop.fusion_policy.is_converted_pop_block()
+                && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
+                && load.opcode == LOAD_FAST
+                && load.value_argument().is_some()
+                && (!method
+                    || call.is_some_and(|record| {
+                        record.opcode == crate::target::opcodes::CALL
+                            && record.value_argument() == Some(0)
+                            && record.depth_after() == load.depth_after()
+                    }))
+                && matches!(comparison.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+                && comparison.forward_target().is_some()
+                && comparison.location.line >= 0
+                && prefix[1..].iter().all(|record| {
+                    record.location.line == comparison.location.line
+                        && record.location.end_line == comparison.location.end_line
+                        && record.location.column == comparison.location.column
+                        && record.location.end_column <= comparison.location.end_column
+                        && record.exception_policy() == ExceptionPolicy::default()
+                })
+                && prefix.iter().enumerate().all(|(index, record)| {
+                    record.pre_fold_extra_instructions() == 0
+                        && record.local_policy.hidden_exception_owner_slots()
+                            == if index + 1 == prefix.len() { 3 } else { 0 }
+                        && record.no_location_policy.borrow_fallthrough()
+                            == BorrowFallthrough::Reachable
+                })
+                && pop.depth_after().is_some()
+                && load.depth_after() == pop.depth_after().map(|depth| depth + 1)
+                && condition.depth_after()
+                    == load.depth_after().map(|depth| depth + u32::from(method))
+                && comparison.depth_after() == pop.depth_after()
+            {
+                self.exception_owner_provenance
+                    .normal_finally_attribute_none_prefixes
+                    .push(prefix);
             }
             return;
         }
