@@ -2087,7 +2087,8 @@ impl OptimizationPipeline {
             }
             self.graph.label_block(last.jump_target()?)
         };
-        for &[first, second, exit] in self.graph.order().array_windows() {
+        let order = self.graph.order();
+        for (index, &[first, second, exit]) in order.array_windows().enumerate() {
             if conditional_target(first) != Some(second)
                 || conditional_target(second).is_none_or(|target| target == exit)
             {
@@ -2141,7 +2142,16 @@ impl OptimizationPipeline {
             // The first conditional queues its target and fallthrough before
             // either is marked visited. Each pop of the second conditional
             // charges its fallthrough; the jump therefore has two predecessors.
-            tails.push((exit, *jump, 1, 2));
+            let mut expected = *jump;
+            if let Some(target) = jump
+                .forward_target()
+                .and_then(|label| self.graph.label_block(label))
+                && order.get(index + 3) == Some(&target)
+            {
+                // Removing a jump to the following block preserves its location and predecessors.
+                legacy_nop(&mut expected);
+            }
+            tails.push((exit, expected, 1, 2));
         }
     }
 
