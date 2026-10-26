@@ -9073,6 +9073,27 @@ fn completed_manager_work_preserves_retained_loop_owners() {
 }
 
 #[test]
+fn copied_iterator_exhaustion_keeps_the_outer_try_pop() {
+    let source = r"def finish(manager, items, value):
+    with manager:
+        try:
+            try:
+                return value
+            finally:
+                for item in items:
+                    pass
+        except ValueError:
+            recover()
+";
+    assert_matches_cpython_versions(
+        source,
+        "iterator_finalizer.py",
+        &LEVELS,
+        &[PythonVersion::Py312],
+    );
+}
+
+#[test]
 fn legacy_manager_unwinds_the_try_after_a_copied_finalizer_join() {
     for value in ["value", "None"] {
         let source = format!(

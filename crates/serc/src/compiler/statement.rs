@@ -13072,10 +13072,16 @@ impl<'source> Compiler<'source> {
                         && let Some(manager) =
                             self.control.withs.active_with_exits[..next_with].last()
                         && manager.exception_region_depth < finally_context.exception_region_depth
-                        && self.assembler.at_jump_target()
+                        && (self.assembler.at_jump_target()
+                            || (self.context.python_version == crate::PythonVersion::Py312
+                                && self
+                                    .assembler
+                                    .current_original_block_pre_fusion_instruction_count()
+                                    == 0))
                     {
-                        // The copied finalizer ended at a join. The enclosing try's
-                        // POP_BLOCK starts that new array before manager cleanup.
+                        // The enclosing try's POP_BLOCK starts this array before
+                        // manager cleanup. A 3.12 loop exhaustion can start an
+                        // empty array without an explicit jump to its end label.
                         self.emit_with_exception_policy(
                             NOP,
                             0,
