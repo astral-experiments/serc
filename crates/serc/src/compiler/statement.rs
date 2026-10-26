@@ -2275,9 +2275,14 @@ impl<'source> Compiler<'source> {
                     // coroutine copying requires an independent donor in every arm.
                     || (conditional.elif_else_clauses.is_empty()
                         && self.terminal_comprehension_assignment(&conditional.body).is_some())
-                    // The last else falls through directly from its result store.
+                    // The last clause falls through directly from its result store.
                     || conditional.elif_else_clauses.last().is_some_and(|clause|
-                        clause.test.is_none() && self.terminal_comprehension_assignment(&clause.body).is_some()))
+                        self.terminal_comprehension_assignment(&clause.body).is_some()
+                            || matches!(clause.body.iter().rfind(|part| !self.context.is_elided_statement(part)), Some(Stmt::If(nested))
+                                if nested.elif_else_clauses.is_empty()
+                                    && condition_has_linear_runtime_leaves(&nested.test)
+                                    && !expression_suspends_current_scope(&nested.test)
+                                    && self.terminal_comprehension_assignment(&nested.body).is_some())))
                     && condition_has_linear_runtime_leaves(&conditional.test)
                     && !expression_suspends_current_scope(&conditional.test)
                     && conditional.elif_else_clauses.iter().all(|clause| {
