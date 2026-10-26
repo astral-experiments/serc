@@ -19160,6 +19160,23 @@ fn python312_labeled_handler_successors_preserve_loop_jump_widths() {
 }
 
 #[test]
+fn python312_runtime_guards_preserve_loop_jump_widths() {
+    for padding in [119, 120, 121] {
+        let mut source = String::from("def run(items, ready, state):\n    state.value: int = 0\n");
+        source.push_str(&"    if ready:\n        observe(ready)\n".repeat(125));
+        source.push_str("    for item in items:\n");
+        source.push_str(&"        value = ready\n".repeat(padding));
+        source.push_str("        observe(item)\n    return ready\n");
+        assert_matches_cpython_versions(
+            &source,
+            "runtime_guard_width.py",
+            &LEVELS,
+            &[PythonVersion::Py312],
+        );
+    }
+}
+
+#[test]
 fn python312_labeled_conditional_successors_preserve_loop_jump_widths() {
     let mut source = String::from(
         "async def choose(items, flag):\n    try:\n        prepare()\n    except:\n        recover()\n",

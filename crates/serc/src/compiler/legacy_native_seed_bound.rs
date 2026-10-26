@@ -24,7 +24,8 @@ use ruff_python_ast::{
 
 /// Records which native jump operands fit in a single byte before offset resolution.
 pub(super) fn record(assembler: &mut crate::assembler::Assembler, body: &[Stmt]) {
-    if let Some(counts) = function_counts(body) {
+    if let Some(counter) = count_function(body) {
+        let counts = counter.counts;
         if counts.max_label() < 256 {
             assembler.certify_legacy_uniform_jump_seed();
         } else {
@@ -33,6 +34,9 @@ pub(super) fn record(assembler: &mut crate::assembler::Assembler, body: &[Stmt])
             }
             if counts.labels < 256 {
                 assembler.certify_legacy_source_jump_labels();
+                if counts.labels.saturating_add(counter.foldable_tests) < 256 {
+                    assembler.certify_legacy_original_jump_operands();
+                }
             }
         }
     }
@@ -102,19 +106,25 @@ enum Frame<'ast> {
 #[derive(Default)]
 struct Counter<'ast> {
     counts: Counts,
+    foldable_tests: u32,
     frames: Vec<Frame<'ast>>,
     has_await: bool,
     in_annotation: bool,
 }
 
+#[cfg(test)]
 fn function_counts(body: &[Stmt]) -> Option<Counts> {
+    count_function(body).map(|counter| counter.counts)
+}
+
+fn count_function(body: &[Stmt]) -> Option<Counter<'_>> {
     let mut counter = Counter::default();
     // Function start, optional StopIteration handler, its RETURN/RERAISE, and
     // the implicit footer. This also overcounts modules: their prologue adds no
     // labels or jumps, and their footer adds only one scope exit.
     counter.counts.add(2, 0, 3);
     counter.suite(body)?;
-    Some(counter.counts)
+    Some(counter)
 }
 
 fn count(length: usize) -> u32 {
@@ -446,6 +456,22 @@ impl<'ast> Counter<'ast> {
         Some(())
     }
 
+    /// Bounds labels assigned when empty-block repair skips a folded truth test.
+    ///
+    /// An initially empty block is followed by another source label. An originally
+    /// unlabeled successor can need a label only after its reachable predecessor
+    /// loses its terminating jump. Before empty-block repair, only a truth jump
+    /// following a constant can disappear; returns and unconditional jumps survive.
+    fn count_foldable_test(&mut self, expression: &Expr) {
+        if !matches!(
+            expression,
+            Expr::Attribute(_) | Expr::Await(_) | Expr::Call(_) | Expr::Compare(_) | Expr::Named(_)
+        ) && !matches!(expression, Expr::Name(name) if name.id.as_str() != "__debug__")
+        {
+            self.foldable_tests = self.foldable_tests.saturating_add(1);
+        }
+    }
+
     fn condition(&mut self, expression: &Expr) -> Option<()> {
         if crate::stack_growth_required() {
             return crate::grow_stack(|| self.condition(expression));
@@ -475,6 +501,7 @@ impl<'ast> Counter<'ast> {
             }
             _ => {
                 self.expression(expression)?;
+                self.count_foldable_test(expression);
                 self.counts.add(0, 1, 0);
             }
         }
@@ -564,6 +591,9 @@ impl<'ast> Counter<'ast> {
             Expr::BoolOp(boolean) => {
                 self.counts
                     .add(1, count(boolean.values.len()).saturating_sub(1), 0);
+                for value in &boolean.values[..boolean.values.len().saturating_sub(1)] {
+                    self.count_foldable_test(value);
+                }
                 for value in &boolean.values {
                     self.expression(value)?;
                 }
@@ -664,6 +694,15 @@ mod tests {
     use super::{Counts, certifies, function_counts};
     use ruff_python_ast::Stmt;
     use ruff_python_parser::parse_module;
+
+    #[test]
+    fn potential_constant_jumps_bound_empty_target_repairs() {
+        let parsed = parse_module(
+            "if flag: pass\nif (value := flag): pass\nif __debug__: pass\nif True: pass\nvalue = False and flag\n",
+        ).unwrap();
+        let counter = super::count_function(parsed.suite()).unwrap();
+        assert_eq!(counter.foldable_tests, 3);
+    }
 
     fn counts(source: &str) -> Option<Counts> {
         let parsed = parse_module(source).unwrap();

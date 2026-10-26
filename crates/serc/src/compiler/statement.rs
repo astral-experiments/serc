@@ -24150,6 +24150,7 @@ impl<'source> Compiler<'source> {
         self.compile_store_target(&statement.target)?;
         self.consume_unreferenced_native_for_body(statement.range);
         self.bind_native_source_label(NativeRole::ForStart(statement.range), start);
+        self.assembler.record_legacy_for_header(start);
         self.bind_native_source_label(NativeRole::ForCleanup(statement.range), cleanup);
         self.bind_native_source_label(NativeRole::ForEnd(statement.range), end);
         self.assembler.record_for_target_owner_prefix(body);
