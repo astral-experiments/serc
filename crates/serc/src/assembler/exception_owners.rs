@@ -1239,7 +1239,7 @@ pub(super) struct CopiedReturnGuard {
     pub(super) operands: Vec<Instruction>,
     pub(super) condition: Instruction,
     pub(super) marker: Instruction,
-    pub(super) ordinary_pops: usize,
+    pub(super) omitted_pops: usize,
 }
 
 /// An original saved-value return array with two omitted named-handler POP cells.
@@ -13076,11 +13076,11 @@ impl LayoutAssembler {
         }
         suffix.instruction(instructions[condition], None);
         // The compacted load occupies the final POP's position. Restore only the
-        // preceding cells, including ordinary tries omitted after handler cleanup.
+        // preceding cells, including omitted handler and ordinary-try POPs.
         tail.early_removals
             .checked_sub(suffix.early_removals)
             .and_then(|earlier| load.checked_add(earlier))
-            .and_then(|slot| slot.checked_add(origin.ordinary_pops))
+            .and_then(|slot| slot.checked_add(origin.omitted_pops))
             == Some(marker)
     }
 

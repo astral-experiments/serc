@@ -11821,6 +11821,30 @@ impl<'source> Compiler<'source> {
                         .iter()
                         .filter(|context| context.iterator_cleanup != IteratorCleanup::None);
                     let iterator = iterators.next();
+                    let nested_named_handler = preserve_tos
+                        && !emitted_named_handler_pops
+                        && ordinary_pops == 0
+                        && self.control.withs.active_with_exits.is_empty()
+                        && self.control.loops.contexts.is_empty()
+                        && matches!(self.control.exceptions.active_exception_handlers.as_slice(), [outer, inner]
+                            if outer.name.is_some() && inner.name.is_none()
+                                && outer.exception_region_depth == 1 && inner.exception_region_depth == 2
+                                && [outer, inner].iter().all(|handler| handler.with_depth == 0
+                                    && handler.loop_depth == 0 && handler.try_body_depth == 0 && handler.finally_end_depth == 0));
+                    let direct_cleanup = handler_count <= 1
+                        && (handler_count == 1 || iterator.is_some())
+                        && self
+                            .control
+                            .exceptions
+                            .active_exception_handlers
+                            .iter()
+                            .all(|handler| {
+                                (handler.name.is_none() || emitted_named_handler_pops)
+                                    && handler.with_depth == finally_context.with_depth
+                                    && handler.loop_depth == self.control.loops.contexts.len()
+                                    && handler.try_body_depth == ordinary_pops
+                                    && handler.exception_region_depth == handler.try_body_depth + 1
+                            });
                     let return_guard_pops = (self.context.python_version
                         == crate::PythonVersion::Py314
                         && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
@@ -11847,27 +11871,20 @@ impl<'source> Compiler<'source> {
                             .active_exception_region_exclusions
                             .len()
                             == 1 + handler_count + ordinary_pops
-                        && handler_count <= 1
-                        && self
-                            .control
-                            .exceptions
-                            .active_exception_handlers
-                            .iter()
-                            .all(|handler| {
-                                (handler.name.is_none() || emitted_named_handler_pops)
-                                    && handler.with_depth == finally_context.with_depth
-                                    && handler.loop_depth == self.control.loops.contexts.len()
-                                    && handler.try_body_depth == ordinary_pops
-                                    && handler.exception_region_depth == handler.try_body_depth + 1
-                            })
+                        && (direct_cleanup || nested_named_handler)
                         && iterators.next().is_none()
                         && iterator.is_none_or(|context| {
                             context.iterator_cleanup == IteratorCleanup::Sync
                                 && context.with_depth == finally_context.with_depth
                                 && context.exception_region_depth == ordinary_pops + 1
-                        })
-                        && (handler_count == 1 || iterator.is_some()))
-                    .then(|| (self.assembler.item_count(), ordinary_pops));
+                        }))
+                    .then(|| {
+                        (
+                            self.assembler.item_count(),
+                            ordinary_pops,
+                            nested_named_handler,
+                        )
+                    });
                     let copied_handler_none_pop = (preserve_tos
                         && !return_is_overridden
                         && context_index == 0
@@ -12393,10 +12410,13 @@ impl<'source> Compiler<'source> {
                         },
                     );
                     if result.is_ok()
-                        && let Some((pop, ordinary_pops)) = return_guard_pops
+                        && let Some((pop, ordinary_pops, nested_named_handler)) = return_guard_pops
                     {
-                        self.assembler
-                            .record_copied_return_guard(pop, ordinary_pops);
+                        self.assembler.record_copied_return_guard(
+                            pop,
+                            ordinary_pops,
+                            nested_named_handler,
+                        );
                     }
                     if result.is_ok() && preserve_tos {
                         self.assembler

@@ -2238,6 +2238,19 @@ fn handler_and_iterator_returns_reuse_the_final_cleanup_pop() {
                 clean()
             done()
 ",
+        r"async def sample(value, flag):
+    try:
+        start()
+    except KeyError as error:
+        try:
+            restart()
+        except ValueError:
+            return value
+    finally:
+        if flag:
+            finish()
+        done()
+",
         r"async def sample(items, value):
     try:
         try:

@@ -13153,17 +13153,50 @@ impl Assembler {
     }
 
     /// Records the final POP and the first local test of the copied finally suite.
-    pub(crate) fn record_copied_return_guard(&mut self, pop_item: usize, ordinary_pops: usize) {
+    pub(crate) fn record_copied_return_guard(
+        &mut self,
+        pop_item: usize,
+        ordinary_pops: usize,
+        nested_named_handler: bool,
+    ) {
         let items = self.linear_items();
-        let Some(cleanup) = items[..pop_item].iter().rev().find_map(|item| match item {
-            Item::Instruction(i) => Some(*i),
-            Item::Label(_) => None,
-        }) else {
+        let mut preceding = items[..pop_item]
+            .iter()
+            .rev()
+            .filter_map(Item::as_instruction);
+        let Some(&cleanup) = preceding.next() else {
             return;
         };
-        if !matches!(cleanup.opcode, POP_EXCEPT | POP_TOP) {
+        let omitted_pops = if nested_named_handler {
+            // The outer named handler omits a POP before its SWAP and POP_EXCEPT.
+            // The inner handler's POP_EXCEPT starts the uninterrupted unwind tail.
+            let [
+                Some(store),
+                Some(none),
+                Some(outer_pop),
+                Some(swap),
+                Some(inner_pop),
+            ] = std::array::from_fn(|_| preceding.next())
+            else {
+                return;
+            };
+            if cleanup.opcode != DELETE_FAST
+                || store.opcode != STORE_FAST
+                || store.operand() != cleanup.operand()
+                || none.opcode != LOAD_CONST
+                || outer_pop.opcode != POP_EXCEPT
+                || swap.opcode != SWAP
+                || swap.value_argument() != Some(2)
+                || inner_pop.opcode != POP_EXCEPT
+            {
+                return;
+            }
+            2
+        } else if matches!(cleanup.opcode, POP_EXCEPT | POP_TOP) {
+            ordinary_pops
+        } else {
             return;
-        }
+        };
         let mut records = items[pop_item..].iter().filter_map(|item| match item {
             Item::Instruction(i) => Some(*i),
             Item::Label(_) => None,
@@ -13209,7 +13242,7 @@ impl Assembler {
                 operands: guard,
                 condition,
                 marker,
-                ordinary_pops,
+                omitted_pops,
             },
         );
     }
