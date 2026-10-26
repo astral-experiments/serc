@@ -1607,8 +1607,24 @@ impl Compiler<'_> {
                 let original_unlocated_head = self.assembler.at_jump_target();
                 let success_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, match_end)?;
                 self.assembler.mark_jump_as_interruptible(success_exit);
-                self.assembler
-                    .inherit_nested_if_match_exit_locations(success_exit, original_unlocated_head);
+                // A nested guard can leave several incoming edges at the case
+                // exit. Each copy of this unlocated jump gets its own edge's span.
+                if original_unlocated_head
+                    && self.context.python_version >= PythonVersion::Py314
+                    && matches!(statement.body.last(), Some(Stmt::If(nested))
+                        if (nested.elif_else_clauses.is_empty()
+                                && suite_terminates(&nested.body)
+                                && condition_jump_target_count(&nested.test, false) > 1)
+                            || nested.elif_else_clauses.last().is_some_and(|clause| clause.test.is_some()))
+                {
+                    self.assembler
+                        .prepare_no_location_block_for_inlining(success_exit);
+                } else {
+                    self.assembler.inherit_nested_if_match_exit_locations(
+                        success_exit,
+                        original_unlocated_head,
+                    );
+                }
             }
         }
 

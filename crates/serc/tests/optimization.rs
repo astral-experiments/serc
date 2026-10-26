@@ -15,6 +15,25 @@ use serc::{
 };
 
 #[test]
+fn nested_case_guards_keep_each_loop_exit() {
+    for tail in [
+        "if first(item) and second(item):\n    return item",
+        "if first(item):\n    use(item)\nelif second(item):\n    other(item)",
+    ] {
+        let tail = tail.replace('\n', "\n                    ");
+        let source = format!(
+            "def sample(items, flag):\n    for item in items:\n        match item:\n            case First():\n                if flag:\n                    {tail}\n            case Second():\n                pass\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "nested_case_guard_loop_exits.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn nested_conversion_handlers_keep_shared_cleanup() {
     let source = r"def sample(items):
     for item in items:
