@@ -12934,6 +12934,20 @@ impl<'source> Compiler<'source> {
                             }
                         }
                     }
+                    // Popping the named handler and its enclosing try leaves the copied
+                    // finalizer's last location on the saved-value return.
+                    if self.context.python_version >= crate::PythonVersion::Py314
+                        && preserve_tos
+                        && return_finally_contexts.len() == 1
+                        && self.control.withs.active_with_exits.is_empty()
+                        && self.control.loops.contexts.is_empty()
+                        && matches!(self.control.exceptions.active_exception_handlers.as_slice(),
+                            [handler] if handler.name.is_some() && handler.try_body_depth > 0
+                                && finally_context.handler_depth == 1)
+                        && suite_has_nonsuspending_linear_fallthrough(finally_context.body)
+                    {
+                        copied_finally_return_location = self.assembler.last_instruction_location();
+                    }
                     if tracks_outer_try_handler_finally_unwinds
                         && self.context.python_version >= crate::PythonVersion::Py314
                         && self.control.loops.contexts[..finally_context.loop_depth]
