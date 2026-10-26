@@ -13307,7 +13307,7 @@ impl Assembler {
         use crate::target::opcodes::{CALL, DELETE_FAST, LOAD_CONST, STORE_FAST};
 
         if outer_try_pops > 1
-            || ((named_handler || unnamed_handler_managers != 0) && outer_try_pops != 0)
+            || (named_handler && outer_try_pops != 0)
             || (named_handler && missing_null_pops != 2)
             || (!named_handler && missing_null_pops > 1)
             || (unnamed_handler_managers != 0

@@ -11639,42 +11639,45 @@ impl<'source> Compiler<'source> {
                         });
                     // An unnamed handler restores its exception state before one or
                     // two enclosing sync managers and the sole outer finally unwind.
-                    let copied_unnamed_handler_manager_pop = (matches!(self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR), 0 | CO_COROUTINE)
+                    let manager_outer_tries = self.control.exceptions.active_try_marker_slots.len();
+                    let replay_resumable_manager =
+                        self.context.python_version == crate::PythonVersion::Py314;
+                    let copied_unnamed_handler_manager_pop = ((replay_resumable_manager || matches!(self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR), 0 | CO_COROUTINE))
                         && !preserve_tos
                         && !return_is_overridden
                         && context_index == 0
                         && return_finally_contexts.len() == 1
                         && handler_count == 1
                         && next_handler == 0
-                        && next_loop == 0
+                        && next_loop == self.control.loops.contexts.len()
                         && next_with == 0
                         && finally_context.handler_depth == 0
                         && finally_context.with_depth == 0
                         && finally_context.loop_depth == 0
                         && finally_context.try_body_depth == 0
                         && finally_context.exception_region_depth == 0
-                        && self.control.exceptions.active_try_marker_slots.is_empty()
-                        && self.control.exceptions.active_exception_region_exclusions.len() == 2
+                        && (manager_outer_tries == 0 || (replay_resumable_manager && manager_outer_tries == 1 && copied_try_manager_pop.is_none()))
+                        && self.control.exceptions.active_exception_region_exclusions.len() == 2 + manager_outer_tries
                         && matches!(
                             self.control.exceptions.active_exception_handlers.as_slice(),
                             [handler]
                                 if handler.name.is_none()
                                     && handler.with_depth == self.control.withs.active_with_exits.len()
-                                    && handler.loop_depth == 0
+                                    && handler.loop_depth == self.control.loops.contexts.len()
                                     && handler.finally_end_depth == 0
-                                    && handler.try_body_depth == 0
-                                    && handler.exception_region_depth == 1
+                                    && handler.try_body_depth == manager_outer_tries
+                                    && handler.exception_region_depth == 1 + manager_outer_tries
                         )
                         && (1..=2).contains(&self.control.withs.active_with_exits.len())
                         && self.control.withs.active_with_exits.iter().all(|manager| {
                             !manager.is_async
-                                && manager.loop_depth == 0
+                                && manager.loop_depth == self.control.loops.contexts.len()
                                 && manager.normal_finally_depth == 0
-                                && manager.exception_region_depth == 1
+                                && manager.exception_region_depth == 1 + manager_outer_tries
                         })
                         && with_unwind_starts.iter().map(|unwind| unwind.index)
                             .eq((0..self.control.withs.active_with_exits.len()).rev())
-                        && self.control.loops.contexts.is_empty()
+                        && (self.control.loops.contexts.is_empty() || (replay_resumable_manager && self.control.loops.contexts.iter().all(|context| context.iterator_cleanup == IteratorCleanup::None)))
                         && self.control.finally.active_finally_try_bodies == 1
                         && self.control.finally.active_finally_end_blocks == 0
                         && self.control.finally.active_normal_finally_bodies == 0
@@ -12470,7 +12473,7 @@ impl<'source> Compiler<'source> {
                                 false,
                                 managers - 1,
                                 managers,
-                                0,
+                                manager_outer_tries,
                             );
                     }
                     if result.is_ok()
