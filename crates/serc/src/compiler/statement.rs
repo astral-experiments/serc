@@ -30630,8 +30630,16 @@ impl<'source> Compiler<'source> {
                 // An elif or a nested runtime conditional gives an earlier normal
                 // arm an original success jump into the shared name cleanup.
                 || (handler.name.is_some()
-                    && self.control.finally.active_normal_finally_bodies == 0
-                    && self.control.finally.active_finally_end_blocks == 0
+                    && ((self.control.finally.active_normal_finally_bodies == 0
+                        && self.control.finally.active_finally_end_blocks == 0)
+                        // A finalizer's following statement keeps the last elif's
+                        // false edge and fallthrough at the shared cleanup.
+                        || (self.context.python_version >= crate::PythonVersion::Py314
+                            && self.control.loops.contexts.is_empty()
+                            && (self.control.statements.context.has_following
+                                || self.control.statements.context.inherited_has_following)
+                            && matches!(handler.body.last(), Some(Stmt::If(tail))
+                                if tail.elif_else_clauses.last().is_some_and(|clause| clause.test.is_some()))))
                     && suite_has_normal_fallthrough(&handler.body)
                     && matches!(handler.body.last(), Some(Stmt::If(tail))
                         if (tail.elif_else_clauses.last().is_some_and(|clause| clause.test.is_some())
