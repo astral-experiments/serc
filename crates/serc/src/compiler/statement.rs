@@ -8053,25 +8053,25 @@ impl<'source> Compiler<'source> {
                         self.assembler.set_location(location);
                         self.emit(NOP, 0, 0)?;
                     }
+                    let finally = &self.control.finally;
+                    let modern_unwind = self.context.python_version >= crate::PythonVersion::Py314;
                     if self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
                         && !return_is_overridden
                         && self.control.exceptions.active_exception_handlers.is_empty()
                         && self.control.exceptions.active_exception_group_handlers == 0
-                        && self
-                            .control
-                            .finally
-                            .active_return_finally_contexts
-                            .is_empty()
-                        && self
-                            .control
-                            .finally
-                            .active_pass_finally_locations
-                            .is_empty()
-                        && self.control.finally.active_finally_try_bodies == 0
-                        && self.control.finally.active_finally_end_blocks == 0
-                        && self.control.finally.active_normal_finally_bodies == 0
-                        && self.control.finally.active_copied_finally_bodies == 0
+                        && finally.active_pass_finally_locations.is_empty()
+                        && finally.active_finally_end_blocks == 0
+                        && finally.active_normal_finally_bodies == 0
+                        && finally.active_copied_finally_bodies == 0
                         && let Some(context) = self.control.withs.active_with_exits.last()
+                        // Each pending finalizer lies outside this manager, so it runs
+                        // after the ordinary try has popped and the manager has exited.
+                        && finally.active_finally_try_bodies == finally.active_return_finally_contexts.len()
+                        && finally.active_return_finally_contexts.iter().all(|pending| {
+                            modern_unwind
+                                && pending.with_depth < self.control.withs.active_with_exits.len()
+                                && pending.exception_region_depth < context.exception_region_depth
+                        })
                         && context.exception_region_depth
                             < self
                                 .control
@@ -8079,9 +8079,9 @@ impl<'source> Compiler<'source> {
                                 .active_exception_region_exclusions
                                 .len()
                         && (context.loop_depth == self.control.loops.contexts.len()
-                            // A while entered inside the same protected manager emits no
-                            // iterator unwind record before this original value join.
-                            || (self.assembler.at_jump_target()
+                            // An inner while adds no iterator cleanup before the manager.
+                            // The computed value can end in a join or in a linear block.
+                            || ((modern_unwind || self.assembler.at_jump_target())
                                 && self.control.loops.contexts[context.loop_depth..]
                                     .iter()
                                     .all(|loop_context| {

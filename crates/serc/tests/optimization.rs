@@ -4353,6 +4353,36 @@ fn literal_finalizer_returns_preserve_completed_cleanup_locations() {
 }
 
 #[test]
+fn protected_manager_returns_keep_the_ordinary_try_pop() {
+    let source = r"async def within_loop(manager, value):
+    async with manager:
+        while True:
+            try:
+                return (
+                    await value()
+                ).attr
+            except LookupError:
+                recover()
+
+async def within_finally(manager, value):
+    try:
+        async with manager:
+            try:
+                return value and value.attr is True
+            except LookupError:
+                return False
+    finally:
+        finish()
+";
+    assert_matches_cpython_versions(
+        source,
+        "protected_manager_return.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn inner_handler_returns_restore_exception_state_before_outer_managers() {
     let source = r"def sample(manager, work, finish, value):
     with manager():
