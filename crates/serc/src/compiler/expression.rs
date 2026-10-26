@@ -1322,16 +1322,20 @@ impl Compiler<'_> {
                                 && self.control.statements.match_tail_before_case_exit
                                     == Some(statement.range)
                                 && !copied_subject
-                                && !has_default
+                                && (!has_default
+                                    || statement
+                                        .cases
+                                        .last()
+                                        .is_some_and(|case| suite_terminates(&case.body)))
                                 && index + 1 == matched_cases
                                 && case.guard.is_none()
                                 && matches!(case.pattern, Pattern::MatchValue(_))
                                 && context.fail_pop.len() == 1
                                 && !self.control.falls_through_to_loop_backedge()
                             {
-                                // This final value-pattern failure has a zero-pop join.
-                                // Keep the Pass line on its success jump while allowing it
-                                // to thread through an enclosing case's original exit.
+                                // A missing or terminal default leaves this Pass as the only
+                                // success falling through to the enclosing case exit. Thread
+                                // its jump while retaining the authored line.
                                 self.assembler.preserve_authored_pass_jump_nop(success_exit);
                             } else if authored_pass_exit
                                 && !copied_subject
