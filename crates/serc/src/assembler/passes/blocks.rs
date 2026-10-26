@@ -6068,10 +6068,10 @@ impl OptimizationPipeline {
                             || (!membership.contains(&source_position)
                                 && !membership.contains(&target_position))
                     });
-            // RAISE_VARARGS also exits the scope. Append unprotected copies now so
-            // another small-exit round can see the expanded predecessor, just as
-            // CPython's basicblock_inline_small_or_no_lineno_blocks does.
-            let inline_unprotected_raise = inline_small_exit
+            // RAISE_VARARGS stays under its original handlers until it executes.
+            // Revisit the copied block when source and target share those handlers
+            // and no exception boundary splits the target's original array.
+            let inline_raise = inline_small_exit
                 && target_terminal_opcode == Some(RAISE_VARARGS)
                 && region_memberships
                     .iter()
@@ -6080,6 +6080,11 @@ impl OptimizationPipeline {
                         self.exception_regions[index].is_scope_fallback
                             || (!membership.contains(&source_position)
                                 && !membership.contains(&target_position))
+                            || (target_chain_end == target_position
+                                && !exception_boundary_blocks[source.index()]
+                                && !exception_boundary_blocks[target.index()]
+                                && membership.contains(&source_position)
+                                && membership.contains(&target_position))
                     });
             let inline_no_location_block =
                 !source_has_fallthrough && target_is_no_location_no_fallthrough;
@@ -7190,7 +7195,7 @@ impl OptimizationPipeline {
                     })
                     .eq([NOP, POP_TOP, POP_TOP, JUMP_FORWARD]);
             if (inline_unprotected_return
-                || inline_unprotected_raise
+                || inline_raise
                 || inline_reraising_iterator_break
                 || inline_reraising_attribute_store)
                 && !planned_copy
@@ -7956,7 +7961,7 @@ impl OptimizationPipeline {
                 graph.append_to_block(source, copied);
             } else if inline_no_location_block
                 || inline_unprotected_return
-                || inline_unprotected_raise
+                || inline_raise
                 || inline_stored_reraise
                 || inline_protected_return
                 || (inline_small_exit && target_terminal_opcode == Some(RERAISE))
