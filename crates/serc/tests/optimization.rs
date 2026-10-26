@@ -2165,22 +2165,27 @@ fn named_handler_none_while_break_copies_cleanup() {
 
 #[test]
 fn finally_assertion_keeps_the_line_of_its_successful_exit() {
-    let source = r"def sample(items, value):
+    for prefix in [
+        "",
+        "        for item in items:\n            if item:\n                pass\n",
+    ] {
+        let source = format!(
+            r"def sample(items, value):
     try:
         work()
     finally:
-        for item in items:
-            if item:
-                pass
-        assert value
-    finish()
-";
-    assert_matches_cpython_versions(
-        source,
-        "finally_assertion_success.py",
-        &LEVELS,
-        &[PythonVersion::Py314, PythonVersion::Py315],
-    );
+{prefix}        assert value
+    finish(value.attr)
+    assert value
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "finally_assertion_success.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
 }
 
 #[test]

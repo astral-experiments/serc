@@ -38778,9 +38778,12 @@ impl<'source> Compiler<'source> {
                 && suite_assert_success_fallthrough_range(&statement.finalbody).is_some()
             {
                 // The sole success edge locates this original jump before the
-                // exceptional blocks move. Its late removal preserves that line.
+                // exceptional blocks move. Its late removal preserves the line
+                // and fallthrough to the continuation's borrowed loads.
                 self.assembler
                     .preserve_redundant_jump_nop_after_threading(normal_exit);
+                self.assembler
+                    .mark_retained_nop_borrow_fallthrough_if_unblocked(normal_exit);
             }
             if discarded_if_exit
                 && self.assembler.last_instruction_location() == Some(SourceLocation::NONE)
