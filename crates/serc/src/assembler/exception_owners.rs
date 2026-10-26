@@ -3237,6 +3237,15 @@ impl ExceptionOwnerProvenance {
                                 Operand::Value(1..=2) => {
                                     !matches!(next.opcode, GET_ITER | CONTAINS_OP)
                                 }
+                                Operand::Value(3..) => {
+                                    // A runtime value at the top of the stack prevents
+                                    // the constant-sequence fold, even for a long list.
+                                    setup_count > 0
+                                        && !matches!(next.opcode, GET_ITER | CONTAINS_OP)
+                                        && instructions[..index].last().is_some_and(|last| {
+                                            matches!(last.opcode, LOAD_FAST | LOAD_DEREF | LOAD_ATTR | CALL)
+                                        })
+                                }
                                 _ => false,
                             }
                         });
@@ -3250,11 +3259,15 @@ impl ExceptionOwnerProvenance {
                     }
                 }
                 BUILD_MAP | DICT_UPDATE => {
-                    // Neither operation folds or swaps with a restore. The certified
-                    // comprehension continuation supplies a runtime value to this array.
-                    if comprehension_restore_count == 0
-                        || index <= comprehension_restore_count
-                        || !matches!(instruction.operand(), Operand::Value(1..))
+                    // An empty map retains its single record after SETUP. A
+                    // comprehension restore also certifies nonempty map operations.
+                    let empty_map = setup_count > 0
+                        && instruction.opcode == BUILD_MAP
+                        && instruction.value_argument() == Some(0);
+                    if !empty_map
+                        && (comprehension_restore_count == 0
+                            || index <= comprehension_restore_count
+                            || !matches!(instruction.operand(), Operand::Value(1..)))
                     {
                         return false;
                     }
