@@ -17287,6 +17287,26 @@ fn completed_managers_preserve_coroutine_match_returns() {
 }
 
 #[test]
+fn protected_tuple_returns_copy_onto_conditional_call_arms() {
+    for element in ["transform(node.key)", "transform(node)", "default_value"] {
+        let source = format!(
+            "async def project(node, enabled):
+    try:
+        return (0, {element} if enabled else None) if node else (None, None)
+    except KeyError:
+        pass
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "tuple_call_return.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn nested_match_arms_preserve_tuple_return_copy_budget() {
     for otherwise in ["assert False", "pass", "result = [7]; tag = 'seven'"] {
         for returned in ["result, tag", "result", "result, tag, kind"] {

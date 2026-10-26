@@ -95,6 +95,7 @@ fn original_tuple_return_join(
 ) -> Option<(Label, Label, bool)> {
     let [
         Item::Label(_),
+        prefix @ ..,
         Item::Instruction(value),
         Item::Instruction(branch),
     ] = predecessor
@@ -124,19 +125,54 @@ fn original_tuple_return_join(
         return None;
     };
     let arity = tuple.value_argument()?;
+    let simple_load = |op: &Instruction| {
+        op.value_argument().is_some_and(|argument| {
+            matches!(op.opcode, LOAD_FAST | LOAD_CONST | LOAD_SMALL_INT)
+                || (op.opcode == LOAD_GLOBAL && argument & 1 == 0)
+        })
+    };
+    let original_value = match prefix {
+        [] => simple_load(value),
+        // A global call with one value argument leaves the completed element at
+        // the same depth as a direct load. Its prefix stays in the predecessor.
+        [
+            Item::Instruction(callee),
+            Item::Instruction(receiver),
+            attributes @ ..,
+        ] => {
+            callee.opcode == LOAD_GLOBAL
+                && callee.value_argument().is_some_and(|arg| arg & 1 == 1)
+                && callee.depth_after() == Some(arity.checked_add(1)?)
+                && simple_load(receiver)
+                && receiver.depth_after() == Some(arity.checked_add(2)?)
+                && attributes.iter().all(|item| {
+                    matches!(item, Item::Instruction(op)
+                    if op.opcode == LOAD_ATTR && op.value_argument().is_some_and(|arg| arg & 1 == 0)
+                        && op.depth_after() == receiver.depth_after())
+                })
+                && value.opcode == CALL
+                && value.value_argument() == Some(1)
+                && prefix.iter().all(|item| {
+                    matches!(item, Item::Instruction(op)
+                    if op.location.line == tuple.location.line)
+                })
+        }
+        _ => false,
+    };
     let split_return = jump.no_location_policy.copies_split_return_exit();
     let alternate_slots = alternate.pre_fold_extra_instructions();
     (tuple.opcode == BUILD_TUPLE
         && arity > 0
         && tuple.depth_after() == Some(1)
         && tuple.location.line >= 0
+        && original_value
+        && simple_load(other)
         && [value, other].iter().all(|instruction| {
-            matches!(instruction.opcode, LOAD_FAST | LOAD_CONST | LOAD_SMALL_INT)
-                && instruction.value_argument().is_some()
+            instruction.value_argument().is_some()
                 && instruction.depth_after() == Some(arity)
                 && instruction.location.line == tuple.location.line
         })
-        && matches!(alternate.opcode, LOAD_FAST | LOAD_CONST | LOAD_SMALL_INT)
+        && simple_load(alternate)
         && alternate.value_argument().is_some()
         && alternate.depth_after() == Some(1)
         && alternate.location.line == tuple.location.line
@@ -158,8 +194,10 @@ fn original_tuple_return_join(
         && ret.value_argument() == Some(0)
         && ret.depth_after() == Some(0)
         && ret.location.line == tuple.location.line
-        && [value, branch, other, tuple, jump, ret]
+        && prefix
             .iter()
+            .filter_map(Item::as_instruction)
+            .chain([value, branch, other, tuple, jump, ret])
             .all(|instruction| {
                 instruction.pre_fold_extra_instructions() == 0
                     && instruction.local_policy.hidden_exception_owner_slots() == 0
