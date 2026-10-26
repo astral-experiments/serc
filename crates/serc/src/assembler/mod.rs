@@ -2600,6 +2600,14 @@ impl Assembler {
         .is_some()
     }
 
+    /// Checks that a nested cleanup's unlocated jump bypasses the guard's original exit.
+    pub(crate) fn original_guarded_exit_has_empty_cleanup(&self, location: SourceLocation) -> bool {
+        let items = self.linear_items();
+        self.original_guarded_finally_exit_origin(items, Some(location), true, None)
+            .and_then(|(_, index)| items[index].as_instruction())
+            .is_some_and(|jump| jump.location == SourceLocation::NONE)
+    }
+
     /// Certifies a source None guard, including its retained multiline literal NOP.
     pub(crate) fn original_guarded_finally_exit_has_none_donor(
         &self,
