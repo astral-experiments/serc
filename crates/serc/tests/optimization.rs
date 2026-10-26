@@ -9073,6 +9073,34 @@ fn completed_manager_work_preserves_retained_loop_owners() {
 }
 
 #[test]
+fn erased_assertion_after_while_keeps_outer_loop_backedge() {
+    let source = r"def poll(items, active, step):
+    for item in items:
+        if item:
+            while active():
+                step()
+            assert item
+";
+    for (i, source) in [
+        source.to_owned(),
+        source
+            .replace("def poll", "async def poll")
+            .replace("for item", "async for item"),
+        source.replace("assert item", "step()"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        assert_matches_cpython_versions(
+            source,
+            &format!("nested_while_backedge_{i}.py"),
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn protected_conditional_store_preserves_erased_else_backedge() {
     let protected = r"def collect(batches, left, right, cleanup, sink):
     try:
