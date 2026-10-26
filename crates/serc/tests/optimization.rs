@@ -9073,6 +9073,29 @@ fn completed_manager_work_preserves_retained_loop_owners() {
 }
 
 #[test]
+fn guarded_inner_finalizer_preserves_the_empty_outer_join() {
+    let source = r"def process(manager, enabled):
+    with manager:
+        try:
+            start()
+        finally:
+            prepare()
+            if enabled is not None:
+                try:
+                    pass
+                finally:
+                    close()
+    finish()
+";
+    assert_matches_cpython_versions(
+        source,
+        "guarded_cleanup.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn protected_conditional_store_preserves_erased_else_backedge() {
     let protected = r"def collect(batches, left, right, cleanup, sink):
     try:
