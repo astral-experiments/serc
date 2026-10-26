@@ -13392,7 +13392,7 @@ impl<'source> Compiler<'source> {
                     // Regions surrounding the handlers and managers remain active throughout
                     // their cleanup; only the final return leaves those enclosing regions.
                     let outer_try_pop_count = if self.context.python_version
-                        == crate::PythonVersion::Py312
+                        <= crate::PythonVersion::Py313
                         && preserve_tos
                         && handler_count == 1
                         && self.control.loops.contexts.is_empty()
@@ -13418,7 +13418,7 @@ impl<'source> Compiler<'source> {
                     }
                     // The handler's SWAP/POP_BLOCK/POP_EXCEPT is followed by each
                     // remaining outer try's POP_BLOCK in the same original array.
-                    // 3.12 counts these records in both four-slot exit-copy sweeps.
+                    // Both legacy versions count these slots before inlining the exit.
                     for _ in 0..outer_try_pop_count {
                         self.emit_with_exception_policy(
                             NOP,
