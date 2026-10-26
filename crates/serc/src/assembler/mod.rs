@@ -1078,6 +1078,20 @@ impl Assembler {
             .legacy_source_jump_labels_fit = true;
     }
 
+    /// Captures the authored jump to a comprehension's nonempty FOR_ITER header.
+    pub(crate) fn record_legacy_comprehension_backedge(&mut self, entry: Label) {
+        if self
+            .exception_owner_provenance
+            .legacy_source_jump_labels_fit
+        {
+            let jump = *self.required_last_instruction_mut("recording a comprehension backedge");
+            debug_assert_eq!(jump.opcode, JUMP_BACKWARD);
+            self.exception_owner_provenance
+                .legacy_comprehension_backedges
+                .push((entry, jump));
+        }
+    }
+
     /// Records a bound on all labels allocated before 3.12 duplicates its exits.
     pub(crate) fn set_legacy_exit_copy_budget(&mut self, budget: u8) {
         self.legacy_native_labels

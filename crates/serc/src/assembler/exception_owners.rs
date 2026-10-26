@@ -261,6 +261,8 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) ordinary_await_cleanups: Vec<super::ExceptionRegion>,
     // Every original 3.12 codegen label fits in one operand byte.
     pub(super) legacy_source_jump_labels_fit: bool,
+    // Authored and normalized backedges to a nonempty 3.12 comprehension header.
+    pub(super) legacy_comprehension_backedges: Vec<(Label, Instruction)>,
     // Authored SEND, completion entry, and END_SEND before any cleanup or copying.
     pub(super) ordinary_await_ends: Vec<OrdinaryAwaitEnd>,
     // Empty runtime-while anchor, shared exit, and exact terminal authored break.
@@ -686,6 +688,9 @@ impl ExceptionOwnerProvenance {
         &mut self,
         mut visit: impl FnMut(&mut Instruction),
     ) {
+        for (_, jump) in &mut self.legacy_comprehension_backedges {
+            visit(jump);
+        }
         for origin in &mut self.ordinary_await_ends {
             visit(&mut origin.send);
             visit(&mut origin.end_send);

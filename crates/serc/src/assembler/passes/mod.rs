@@ -1577,37 +1577,42 @@ impl LayoutAssembler {
             });
         }
 
-        // Cold relocation reads the original END_SEND label when the captured
-        // suspension and its bridge survive. Its width is independent of any
-        // labels allocated later for empty or duplicated blocks.
-        let mut short_await_bridges = rustc_hash::FxHashMap::default();
+        // These surviving jumps read original END_SEND or comprehension header
+        // labels. Later labels for empty or duplicated blocks do not size them.
+        let mut short_source_jumps = rustc_hash::FxHashMap::default();
         if !native_jump_widths
             && !uniform_jump_widths
             && self
                 .exception_owner_provenance
                 .legacy_source_jump_labels_fit
         {
-            short_await_bridges.extend(
+            short_source_jumps.extend(
                 self.exception_owner_provenance
                     .ordinary_await_ends
                     .iter()
                     .filter_map(|origin| origin.bridge),
             );
+            short_source_jumps.extend(
+                self.exception_owner_provenance
+                    .legacy_comprehension_backedges
+                    .iter()
+                    .copied(),
+            );
         }
-        let mut expected_bridge = None;
+        let mut expected_jump = None;
         let mut extended_args = Vec::with_capacity(instruction_count);
         let mut resolved_arguments = Vec::with_capacity(instruction_count);
         for item in &self.items {
             let instruction = match item {
                 Item::Instruction(instruction) => instruction,
                 Item::Label(label) => {
-                    if let Some(bridge) = short_await_bridges.get(label) {
-                        expected_bridge = Some(bridge);
+                    if let Some(jump) = short_source_jumps.get(label) {
+                        expected_jump = Some(jump);
                     }
                     continue;
                 }
             };
-            let short_await_bridge = expected_bridge.take() == Some(instruction);
+            let short_source_jump = expected_jump.take() == Some(instruction);
             let argument = match self.encoded_operand(instruction)? {
                 Operand::Value(argument) => argument,
                 Operand::Forward(label) | Operand::Backward(label) => initial_jump_arguments
@@ -1624,7 +1629,7 @@ impl LayoutAssembler {
                 instruction
                     .legacy_initial_jump_width()
                     .expect("all native jumps are certified")
-            } else if short_await_bridge
+            } else if short_source_jump
                 || (self
                     .exception_owner_provenance
                     .legacy_source_jump_labels_fit
@@ -1776,6 +1781,50 @@ mod uniform_jump_seed_tests {
             removed_max_depth: None,
             next_label: 1,
             has_next_location: false,
+        }
+    }
+
+    #[test]
+    fn partial_comprehension_seed_requires_its_original_backedge() {
+        let version = PythonVersion::Py312;
+        for (bounded, surviving) in [(true, true), (true, false), (false, true)] {
+            let mut layout = boundary_layout(version, false, None, false);
+            let entry = Label::from_u32(1);
+            layout.next_label = 2;
+            let Some(Item::Instruction(jump)) = layout.items.pop() else {
+                unreachable!()
+            };
+            let mut captured = jump;
+            if !surviving {
+                captured.retarget(Operand::Backward(entry));
+            }
+            layout
+                .items
+                .extend([Item::Label(entry), Item::Instruction(jump)]);
+            layout
+                .exception_owner_provenance
+                .legacy_source_jump_labels_fit = bounded;
+            layout
+                .exception_owner_provenance
+                .legacy_comprehension_backedges
+                .push((entry, captured));
+            let code = layout.finish(1).unwrap().bytecode;
+            let suffix = if bounded && surviving {
+                [
+                    NOP.code_for(version),
+                    0,
+                    JUMP_BACKWARD.code_for(version),
+                    255,
+                ]
+            } else {
+                [
+                    EXTENDED_ARG.code_for(version),
+                    1,
+                    JUMP_BACKWARD.code_for(version),
+                    0,
+                ]
+            };
+            assert!(code.ends_with(&suffix));
         }
     }
 

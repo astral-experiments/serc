@@ -6895,6 +6895,10 @@ impl Compiler<'_> {
             self.assembler.mark(filter_cleanup);
         }
         self.emit_jump_backward(JUMP_BACKWARD, start, 0)?;
+        if self.context.python_version == PythonVersion::Py312 {
+            self.assembler
+                .record_legacy_comprehension_backedge(filter_cleanup);
+        }
         self.assembler.mark(cleanup);
         self.set_depth(loop_depth + 1);
         self.assembler
