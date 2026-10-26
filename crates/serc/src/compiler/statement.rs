@@ -4508,6 +4508,22 @@ impl<'source> Compiler<'source> {
         statement: &ruff_python_ast::StmtIf,
         preserve_protected_folded_nop: bool,
     ) -> Result<(), CompileError> {
+        // 3.12 counts predecessors before copying unlocated exits. Emit the original
+        // conditional and its shared footer so each copy can inherit its incoming
+        // edge's location, even when an erased branch queued that edge twice.
+        if self.context.python_version == crate::PythonVersion::Py312
+            && self.supports_elided_terminal_if()
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+        {
+            self.compile_if(statement)?;
+            self.assembler.record_current_original_scope_exit();
+            self.assembler.set_location(SourceLocation::NONE);
+            return self.emit_deferred_implicit_return();
+        }
         // Removed assertions are represented as empty declarations.
         let empty_comparison_arms: Vec<_> =
             std::iter::once((statement.test.as_ref(), statement.body.as_slice()))
