@@ -122,9 +122,9 @@ pub(super) fn original_local_tuple_return(items: &[Item]) -> Option<[bool; 4]> {
     .then_some([true; 4])
 }
 
-/// Recognizes the four original slots of an explicit local subscript return.
+/// Recognizes the four original slots of a subscript return indexed by a local.
 fn original_local_subscript_return(items: &[Item]) -> Option<OriginalTail> {
-    use crate::target::opcodes::{BINARY_OP, LOAD_FAST, RETURN_VALUE};
+    use crate::target::opcodes::{BINARY_OP, LOAD_DEREF, LOAD_FAST, RETURN_VALUE};
     use crate::target::operands::BinaryOperation;
 
     let head = items
@@ -140,7 +140,7 @@ fn original_local_subscript_return(items: &[Item]) -> Option<OriginalTail> {
     else {
         return None;
     };
-    (value.opcode == LOAD_FAST
+    (matches!(value.opcode, LOAD_FAST | LOAD_DEREF)
         && value.value_argument().is_some()
         && index.opcode == LOAD_FAST
         && index.value_argument().is_some()
