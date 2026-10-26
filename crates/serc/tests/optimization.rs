@@ -9073,6 +9073,27 @@ fn completed_manager_work_preserves_retained_loop_owners() {
 }
 
 #[test]
+fn unbroken_finally_while_locates_its_normal_exit() {
+    let source = r"def flush(items, active, value):
+    try:
+        start()
+    finally:
+        for item in items:
+            if ready(item):
+                consume(item)
+        while active:
+            tick()
+    result = value
+";
+    assert_matches_cpython_versions(
+        source,
+        "finally_while.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn protected_conditional_store_preserves_erased_else_backedge() {
     let protected = r"def collect(batches, left, right, cleanup, sink):
     try:
