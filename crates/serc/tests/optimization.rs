@@ -12784,6 +12784,25 @@ fn copied_sequence_folds_preserve_locations_and_constant_order() {
 }
 
 #[test]
+fn folded_tuple_iteration_keeps_the_try_line_outside_its_handler() {
+    let elements = (0..31)
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    for (open, close) in [("(", ")"), ("[", "]")] {
+        let source = format!(
+            "def run(use):\n    try:\n        for item in {open}{elements}{close}:\n            use(item)\n    finally:\n        use(None)\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "protected_sequence_fold.py",
+            &LEVELS,
+            &[PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn sequence_folds_after_dynamic_tuple_iteration_preserve_boundaries() {
     let values = std::iter::repeat_n("value", 31)
         .collect::<Vec<_>>()

@@ -2,7 +2,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::super::block_graph::ItemPosition;
 use super::super::{
-    ConstantTable, Item, Label, Operand, OptimizationPipeline, SourceLocation,
+    ConstantTable, ExceptionPolicy, Item, Label, Operand, OptimizationPipeline, SourceLocation,
     block_has_fallthrough, block_jump_target,
 };
 use crate::code_object::Constant;
@@ -150,7 +150,14 @@ impl OptimizationPipeline {
                             Item::Instruction(instruction)
                                 if instruction.opcode == NOP && instruction.location.line < 0 => {}
                             Item::Instruction(instruction) => {
-                                if instruction.opcode == NOP {
+                                // The tuple intrinsic keeps the display's own span.
+                                // Moving an excluded donor onto its cleared prefix
+                                // would move that line inside the protected region.
+                                if instruction.opcode == NOP
+                                    && !(intrinsic
+                                        && instruction.exception_policy()
+                                            == ExceptionPolicy::EXCLUDE_ALWAYS)
+                                {
                                     nop_location = Some(instruction.location);
                                 }
                                 break 'find_donor;
