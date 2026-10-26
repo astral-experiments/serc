@@ -9099,6 +9099,27 @@ fn constant_return_keeps_the_try_pop_before_a_managed_finally_guard() {
 }
 
 #[test]
+fn synchronous_iterator_return_keeps_enclosing_try_pop_before_finally() {
+    let source = r"async def drain(stream, state):
+    try:
+        for item in stream:
+            if stop(item):
+                return 1
+    except ValueError:
+        recover()
+    finally:
+        if state is not None:
+            close()
+";
+    assert_matches_cpython_versions(
+        source,
+        "iterator_finally.py",
+        &LEVELS,
+        &[PythonVersion::Py314],
+    );
+}
+
+#[test]
 fn protected_conditional_store_preserves_erased_else_backedge() {
     let protected = r"def collect(batches, left, right, cleanup, sink):
     try:

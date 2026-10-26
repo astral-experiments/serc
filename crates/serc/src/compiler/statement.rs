@@ -11177,11 +11177,11 @@ impl<'source> Compiler<'source> {
                                 && loop_context.finally_end_depth == 0
                                 && loop_context.exception_region_depth
                                     == self.control.exceptions.active_exception_region_exclusions.len());
-                    // A coroutine's inner async iterator has already emitted its
+                    // A coroutine's inner iterator has already emitted its
                     // POP_TOP (and SWAP for a value return). The surrounding ordinary
                     // try still contributes a NULL POP before the copied finalizer.
                     // An outer while contributes no iterator cell to that prefix.
-                    let copied_return_unwinds_inner_async_iterator = self.unit.flags
+                    let copied_return_unwinds_inner_iterator = self.unit.flags
                         & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                         == CO_COROUTINE
                         && !return_is_overridden
@@ -11208,8 +11208,10 @@ impl<'source> Compiler<'source> {
                                         == finally_context.exception_region_depth
                             })
                         && self.control.loops.contexts.last().is_some_and(|iterator| {
-                            iterator.iterator_cleanup == IteratorCleanup::Async
-                                && iterator.with_depth == 0
+                            matches!(
+                                iterator.iterator_cleanup,
+                                IteratorCleanup::Sync | IteratorCleanup::Async
+                            ) && iterator.with_depth == 0
                                 && iterator.finally_end_depth == 0
                                 && iterator.exception_region_depth
                                     == self
@@ -11344,8 +11346,7 @@ impl<'source> Compiler<'source> {
                             || (copied_return_unwinds_while_only && ordinary_try_count == 1)
                             || (copied_return_unwinds_value_while_tries
                                 && (1..=2).contains(&ordinary_try_count))
-                            || (copied_return_unwinds_inner_async_iterator
-                                && ordinary_try_count == 1)
+                            || (copied_return_unwinds_inner_iterator && ordinary_try_count == 1)
                             || (self.unit.flags & CO_ASYNC_GENERATOR != 0
                                 && !preserve_tos
                                 && !return_is_overridden
@@ -11375,7 +11376,7 @@ impl<'source> Compiler<'source> {
                     {
                         // Ordinary tries nested inside this finally unwind first. Each
                         // POP_BLOCK remains a distinct NULL record after NOP compaction.
-                        // An async iterator entered inside this ordinary try has already
+                        // An iterator entered inside this ordinary try has already
                         // emitted its POP_TOP above. The try still contributes its own
                         // original NULL POP before the finally POP. Bare and value returns
                         // through the certified coroutine iterator retain the adjacent pair;
@@ -11395,7 +11396,7 @@ impl<'source> Compiler<'source> {
                             && (self.control.loops.contexts.is_empty()
                                 || copied_return_keeps_outer_loop
                                 || copied_return_unwinds_while_only
-                                || (copied_return_unwinds_inner_async_iterator
+                                || (copied_return_unwinds_inner_iterator
                                     && (preserve_tos || statement.value.is_none())))
                         {
                             copied_return_none_pop_pair =
