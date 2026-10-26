@@ -1870,6 +1870,34 @@ impl Assembler {
         false
     }
 
+    /// Checks the original short-circuit edge and the unchanged truth test following it.
+    pub(crate) fn truth_test_in_fresh_fallthrough(&self, start: usize) -> bool {
+        let (before, test) = self.linear_items().split_at(start);
+        let [Item::Instruction(load), _, ..] = test else {
+            return false;
+        };
+        if load.opcode != LOAD_FAST || !test[1..].iter().all(|item| matches!(item,
+            Item::Instruction(ins) if matches!(ins.opcode, LOAD_ATTR | TO_BOOL | POP_JUMP_IF_TRUE | POP_JUMP_IF_FALSE)
+                || (ins.opcode == crate::target::opcodes::CALL && ins.value_argument() == Some(0))))
+            || !test.iter().all(|item| matches!(item, Item::Instruction(ins) if ins.pre_fold_extra_instructions() == 0 &&
+                ins.local_policy.hidden_exception_owner_slots() == 0))
+        { return false }
+        let provenance = &self.exception_owner_provenance;
+        match before {
+            [prefix @ .., Item::Instruction(pop)] if pop.opcode == POP_TOP => provenance
+                .original_value_jump_prefixes
+                .last()
+                .is_some_and(|(_, origin)| prefix.ends_with(origin)),
+            [.., Item::Instruction(condition), Item::Instruction(marker)]
+                if marker.opcode == NOT_TAKEN =>
+            {
+                matches!(provenance.original_primitive_condition_boundaries.as_slice(),
+                    [.., prior, current] if prior == condition && test.last() == Some(&Item::Instruction(*current)))
+            }
+            _ => false,
+        }
+    }
+
     /// Returns the preceding instruction's location within the current fallthrough block.
     pub(crate) fn current_block_last_instruction_location(&self) -> Option<SourceLocation> {
         self.linear_items()[self.current_block_start()..]
