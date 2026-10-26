@@ -12407,6 +12407,12 @@ fn elided_terminal_boolean_preserves_shared_return_order() {
         let source = format!("def f(a, b, c, d):\n    if {test}:\n        assert a\n");
         assert_matches_cpython(&source, "elided_terminal_boolean.py", &LEVELS);
     }
+    assert_matches_cpython_versions(
+        "async def f(first, second):\n    if first or check(second):\n        assert ready()\n",
+        "elided_coroutine_boolean.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
     for (body, suffix) in [
         ("pass", ""),
         ("consume(a)", ""),
