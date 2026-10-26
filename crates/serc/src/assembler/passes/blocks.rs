@@ -6164,24 +6164,50 @@ impl OptimizationPipeline {
                 && !exception_handler_blocks[target.index()];
             // A two-cell iterator return split at an outer POP_BLOCK is cleanup,
             // not a large footer whose copy order follows cold-block relocation.
-            let split_iterator_return = self.python_version == crate::PythonVersion::Py315
+            let split_iterator_cleanup = self.python_version == crate::PythonVersion::Py315
                 && target_chain_end > target_position
-                && target_has_no_location
-                && target_blocks
+                && target_has_no_location;
+            // A constant return pops both iterator slots before leaving the outer
+            // region. The following load and return still belong to the same array.
+            let slot = |instruction: &Instruction| {
+                (
+                    instruction.opcode,
+                    instruction.depth_after(),
+                    instruction.pre_fusion_width(),
+                )
+            };
+            let split_constant_return = split_iterator_cleanup
+                && target_blocks.len() == 2
+                && is_unlocated_value_cleanup_prefix(graph[target].items(), self.python_version)
+                && graph[target]
+                    .items()
                     .iter()
-                    .flat_map(|block| graph[*block].items())
-                    .filter_map(|item| match item {
-                        Item::Instruction(instruction) => {
-                            Some((instruction.opcode, instruction.operand()))
-                        }
-                        Item::Label(_) => None,
-                    })
-                    .eq([
-                        (SWAP, Operand::Value(3)),
-                        (POP_TOP, Operand::Value(0)),
-                        (POP_TOP, Operand::Value(0)),
-                        (RETURN_VALUE, Operand::Value(0)),
-                    ]);
+                    .filter_map(Item::as_instruction)
+                    .map(slot)
+                    .eq([(POP_TOP, Some(1), 1), (POP_TOP, Some(0), 1)])
+                && graph[target_exit]
+                    .items()
+                    .iter()
+                    .filter_map(Item::as_instruction)
+                    .map(slot)
+                    .eq([(LOAD_CONST, Some(1), 1), (RETURN_VALUE, Some(0), 1)]);
+            let split_iterator_return = split_constant_return
+                || (split_iterator_cleanup
+                    && target_blocks
+                        .iter()
+                        .flat_map(|block| graph[*block].items())
+                        .filter_map(|item| match item {
+                            Item::Instruction(instruction) => {
+                                Some((instruction.opcode, instruction.operand()))
+                            }
+                            Item::Label(_) => None,
+                        })
+                        .eq([
+                            (SWAP, Operand::Value(3)),
+                            (POP_TOP, Operand::Value(0)),
+                            (POP_TOP, Operand::Value(0)),
+                            (RETURN_VALUE, Operand::Value(0)),
+                        ]));
             if exit_without_unique_predecessor[target.index()]
                 && !self.exception_regions.is_empty()
                 && !split_iterator_return
@@ -8098,16 +8124,19 @@ impl OptimizationPipeline {
                 {
                     self.original_jump_head_targets.remove(&copied_label);
                 }
-                // Exception-region labels can split one original cleanup array. Insert its
-                // copies after the whole array so the original still reaches its own jump.
-                if target != target_exit
-                    && (target_has_unlocated_jump_eval_check || split_iterator_return)
-                {
-                    copied_split_eval_starts.insert(target_exit, target_position);
-                }
+                // Keep copies after the complete array and its exception-range splits.
                 target_copies.entry(target_exit).or_default().push(copied);
             } else {
                 inline_copies.entry(source).or_default().push(copied);
+            }
+            if target != target_exit
+                && (split_constant_return
+                    || (source_has_fallthrough
+                        && (target_has_unlocated_jump_eval_check || split_iterator_return)))
+            {
+                // Unconditional copies can leave the guard as the original constant
+                // return's sole donor. Carry its location through the POP_BLOCK split.
+                copied_split_eval_starts.insert(target_exit, target_position);
             }
             remaining_predecessors[target.index()] -= 1;
             if remaining_predecessors[target.index()] == 0 {

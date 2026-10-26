@@ -1414,6 +1414,12 @@ fn recovery_loop_comprehension_keeps_continuation_cold() {
 }
 
 #[test]
+fn iterator_constant_return_inherits_the_finalizer_branch() {
+    let source = "def sample(items, ready, active):\n    try:\n        for item in items:\n            if item:\n                try:\n                    if ready:\n                        return True\n                finally:\n                    if active:\n                        try:\n                            record()\n                        except ValueError:\n                            pass\n    except LookupError:\n        pass\n";
+    assert_matches_cpython(source, "iterator_constant_finalizer.py", &LEVELS);
+}
+
+#[test]
 fn conditional_deletion_keeps_cleanup_reachable() {
     for scope in ["def", "async def"] {
         for target in ["pending[item]", "owner.slot", "started"] {
