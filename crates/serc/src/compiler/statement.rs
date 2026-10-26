@@ -2432,9 +2432,9 @@ impl<'source> Compiler<'source> {
                         Some(super::optimization::OptimizedLocation::Elided)
                     )
                 });
-            // Erased assertions leave the try's original footer as its successor.
-            // Terminal lowering merges the empty setup or copies that return onto
-            // each fallthrough of an empty conditional at the end of the else.
+            // An erased suffix leaves the scope footer immediately after the try.
+            // A conditional or loop in the normal finally copy reaches that footer
+            // with the same exits as it would at the physical end of the suite.
             let terminal_try_before_elided = has_elided_tail
                 && self.context.python_version >= crate::PythonVersion::Py314
                 && !is_final
@@ -2442,43 +2442,16 @@ impl<'source> Compiler<'source> {
                     || direct_function_suite && self.unit.flags & CO_COROUTINE != 0)
                 && !self.control.in_exception_handler()
                 && self.control.finally.is_inactive_for_return_unwind()
-                && matches!(statement, Stmt::Try(statement)
-                if !statement.is_star
-                    && statement.finalbody.is_empty()
-                    && ((statement.orelse.is_empty()
-                        && statement.body.iter().all(|statement| self.context.is_elided_statement(statement)))
-                        || self.erased_try_else_return_end(&statement.orelse).is_some()))
-                && body[index + 1..]
-                    .iter()
-                    .all(|statement| self.context.is_elided_statement(statement));
-            // Each false edge of a terminal finally loop supplies its own return
-            // location. Linear cleanup before the loop and erased assertions after
-            // the try body or the try itself do not share those exits.
-            let terminal_finally_while_before_elided = has_elided_tail
-                && self.context.python_version >= crate::PythonVersion::Py314
-                && !is_final
-                && plain_function_suite
-                && !self.has_active_control_flow_region()
-                && self.control.withs.active_with_exits.is_empty()
-                && !self.control.in_exception_handler()
-                && self.control.finally.is_inactive_for_return_unwind()
-                && matches!(statement, Stmt::Try(statement)
-                if !statement.is_star
-                    && statement.handlers.is_empty()
-                    && statement.orelse.is_empty()
-                    && statement.body.iter()
-                        .rposition(|statement| !self.context.is_elided_statement(statement))
-                        .is_some_and(|last| suite_has_linear_borrow_fallthrough(&statement.body[..=last]))
-                    && statement.finalbody.split_last().is_some_and(|(tail, prefix)| {
-                        (prefix.is_empty() || suite_has_linear_borrow_fallthrough(prefix))
-                            && matches!(tail, Stmt::While(loop_statement)
-                        if loop_statement.orelse.is_empty()
-                            && matches!(loop_statement.test.as_ref(), Expr::BoolOp(boolean)
-                                if boolean.op == BoolOp::And && boolean.values.len() > 1)
-                            && condition_has_linear_runtime_leaves(&loop_statement.test)
-                            && !expression_suspends_current_scope(&loop_statement.test)
-                            && suite_has_linear_borrow_fallthrough(&loop_statement.body))
-                    }))
+                && matches!(statement, Stmt::Try(statement) if !statement.is_star
+                && if statement.finalbody.is_empty() {
+                    (statement.orelse.is_empty()
+                        && statement.body.iter().all(|part| self.context.is_elided_statement(part)))
+                        || self.erased_try_else_return_end(&statement.orelse).is_some()
+                } else {
+                    statement.handlers.is_empty() && statement.orelse.is_empty()
+                        && matches!(statement.finalbody.iter().rfind(|part| !self.context.is_elided_statement(part)),
+                            Some(Stmt::If(_) | Stmt::While(_)))
+                })
                 && body[index + 1..]
                     .iter()
                     .all(|statement| self.context.is_elided_statement(statement));
@@ -2486,8 +2459,7 @@ impl<'source> Compiler<'source> {
                 || terminal_if_before_elided
                 || terminal_assignment_before_elided
                 || terminal_match_before_elided
-                || terminal_try_before_elided
-                || terminal_finally_while_before_elided)
+                || terminal_try_before_elided)
                 && final_expression_becomes_return
             {
                 match statement {
