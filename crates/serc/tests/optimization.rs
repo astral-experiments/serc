@@ -6641,6 +6641,32 @@ COMPANION    finally:
 }
 
 #[test]
+fn raising_finalizer_guard_shares_the_following_cleanup_line() {
+    for kind in ["def", "async def"] {
+        for condition in ["error", "error is not None"] {
+            let source = format!(
+                "{kind} run(error):
+    try:
+        try:
+            work()
+        finally:
+            if {condition}:
+                raise error
+    finally:
+        finish()
+"
+            );
+            assert_matches_cpython_versions(
+                &source,
+                "raising_finalizer_guard.py",
+                &LEVELS,
+                &[PythonVersion::Py314, PythonVersion::Py315],
+            );
+        }
+    }
+}
+
+#[test]
 fn conditional_handler_return_preserves_normal_finally_borrows() {
     let source = r"def sample(item):
     try:

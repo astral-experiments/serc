@@ -5586,30 +5586,33 @@ impl OptimizationPipeline {
                             let Item::Instruction(pop) = graph.item(next) else {
                                 return false;
                             };
-                            pop.opcode == NOP
-                                && pop.fusion_policy.is_converted_pop_block()
-                                && matches!(
-                                    pop.exception_policy(),
-                                    super::super::ExceptionPolicy::AlwaysUnchanged
-                                        | super::super::ExceptionPolicy::AlwaysAbsent
-                                )
-                                && pop.location == instruction.location
-                                && self
-                                    .exception_owner_provenance
-                                    .normal_try_exits
-                                    .iter()
-                                    .chain(
-                                        &self.exception_owner_provenance.compound_try_owner_exits,
-                                    )
-                                    .chain(&self.exception_owner_provenance.guarded_try_else_exits)
-                                    .any(|(entry, end)| {
-                                        *end == target
-                                            && graph[block].items()[..offset]
-                                                .iter()
-                                                .rev()
-                                                .take_while(|item| matches!(item, Item::Label(_)))
-                                                .any(|item| *item == Item::Label(*entry))
+                            if pop.opcode != NOP
+                                || !pop.fusion_policy.is_converted_pop_block()
+                                || !matches!(pop.exception_policy(), ExceptionPolicy::AlwaysUnchanged | ExceptionPolicy::AlwaysAbsent)
+                                || pop.location != instruction.location
+                            {
+                                return false;
+                            }
+                            let entry_labels = &graph[block].items()[..offset];
+                            self.exception_owner_provenance.normal_try_exits.iter()
+                                .chain(&self.exception_owner_provenance.compound_try_owner_exits)
+                                .chain(&self.exception_owner_provenance.guarded_try_else_exits)
+                                .any(|(entry, end)| {
+                                    *end == target && entry_labels.iter().rev()
+                                        .take_while(|item| matches!(item, Item::Label(_)))
+                                        .any(|item| *item == Item::Label(*entry))
+                                })
+                                // A raising guard leaves a jump on its other arm. Its
+                                // line is already carried by the following POP_BLOCK.
+                                || order[..block_index].last_chunk::<3>().is_some_and(|[test, marker, raised]| {
+                                    graph[*test].last_instruction().is_some_and(|condition| {
+                                        condition.location == instruction.location
+                                            && condition.forward_target().is_some_and(|entry| entry_labels == [Item::Label(entry)])
                                     })
+                                        && graph[*marker].items().iter().filter_map(Item::as_instruction)
+                                            .map(|op| op.opcode).eq([NOT_TAKEN])
+                                        && graph[*raised].last_instruction().is_some_and(|last| last.opcode == RAISE_VARARGS)
+                                })
                         });
                     // CPython resets the preceding line at the original cleanup array.
                     // Its captured fallthrough donor belongs to the preceding array, so the
