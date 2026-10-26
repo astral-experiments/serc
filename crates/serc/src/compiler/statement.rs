@@ -38777,6 +38777,12 @@ impl<'source> Compiler<'source> {
                 && (self.control.loops.contexts.is_empty()
                     || self.control.statements.context.has_following
                     || self.control.statements.context.inherited_has_following
+                    // The manager's exit call still separates this shared join from a
+                    // direct loop backedge, even at the end of its enclosing loop.
+                    || (self.context.python_version >= crate::PythonVersion::Py314
+                        && self.control.withs.active_with_exits.last().is_some_and(|manager| {
+                            manager.loop_depth == self.control.loops.contexts.len()
+                        }))
                     || self.control.loops.synthesized_loop_tail_predecessor
                         == Some(statement.range))
             {
