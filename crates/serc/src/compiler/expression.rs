@@ -3310,6 +3310,13 @@ impl Compiler<'_> {
         let yielded_end = self.assembler.label();
         let cleanup = self.assembler.label();
         if let Some([send_role, fail_role, exit_role]) = native_roles {
+            use super::legacy_native_labels::NativeRole;
+            if let NativeRole::AwaitExit(range) | NativeRole::WithAwaitExit(range, _) = exit_role
+                && self.context.python_version == PythonVersion::Py312
+                && range.end() <= self.legacy_short_label_prefix
+            {
+                self.assembler.record_legacy_short_await_labels(send, end);
+            }
             self.bind_native_source_label(send_role, send);
             self.bind_native_source_label(fail_role, cleanup);
             self.bind_native_source_label(exit_role, end);

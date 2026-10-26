@@ -14,28 +14,34 @@
 //! backedges are known. Copying an exit leaves the incoming jump operand intact.
 //!
 //! This certificate controls initial `EXTENDED_ARG` widths, not final jump distances.
-//! Unsupported syntax declines the complete code object. Finally copies follow
-//! native frame unwinding. Patterns that capture or unpack values remain unsupported.
+//! A later unsupported statement ends the whole-object proof. Earlier complete
+//! statements still bound the nonempty targets of their suspension loops. Finally
+//! copies follow native frame unwinding.
 
 use ruff_python_ast::{
-    Comprehension, Expr, FStringPartRef, InterpolatedStringElement, Parameters, Pattern, Stmt,
-    UnaryOp,
+    BoolOp, Comprehension, Expr, FStringPartRef, InterpolatedStringElement, Parameters, Pattern,
+    Stmt, UnaryOp,
 };
+use ruff_text_size::{Ranged, TextSize};
 
-/// Records which native jump operands fit in a single byte before offset resolution.
-pub(super) fn record(assembler: &mut crate::assembler::Assembler, body: &[Stmt]) {
-    if let Some(counts) = function_counts(body) {
+/// Certifies one-byte labels and returns the bounded source prefix when the whole unit exceeds it.
+pub(super) fn record(assembler: &mut crate::assembler::Assembler, body: &[Stmt]) -> TextSize {
+    let (counts, prefix) = function_budget(body);
+    if let Some(counts) = counts {
         if counts.max_label() < 256 {
             assembler.certify_legacy_uniform_jump_seed();
+            return TextSize::default();
         } else {
             if let Ok(max_label) = u8::try_from(counts.max_original_label()) {
                 assembler.set_legacy_exit_copy_budget(u8::MAX - max_label);
             }
             if counts.labels < 256 {
                 assembler.certify_legacy_source_jump_labels();
+                return TextSize::default();
             }
         }
     }
+    prefix
 }
 
 #[cfg(test)]
@@ -107,14 +113,29 @@ struct Counter<'ast> {
     in_annotation: bool,
 }
 
+#[cfg(test)]
 fn function_counts(body: &[Stmt]) -> Option<Counts> {
+    function_budget(body).0
+}
+
+/// Retains complete statements whose source labels fit even if a later statement
+/// exceeds the bound. A statement includes any copies emitted by unwinding its body.
+fn function_budget(body: &[Stmt]) -> (Option<Counts>, TextSize) {
     let mut counter = Counter::default();
     // Function start, optional StopIteration handler, its RETURN/RERAISE, and
     // the implicit footer. This also overcounts modules: their prologue adds no
     // labels or jumps, and their footer adds only one scope exit.
     counter.counts.add(2, 0, 3);
-    counter.suite(body)?;
-    Some(counter.counts)
+    let mut prefix = TextSize::default();
+    for statement in body {
+        if counter.counts.labels >= 256 || counter.statement(statement).is_none() {
+            return (None, prefix);
+        }
+        if counter.counts.labels < 256 {
+            prefix = statement.range().end();
+        }
+    }
+    (Some(counter.counts), prefix)
 }
 
 fn count(length: usize) -> u32 {
@@ -173,7 +194,7 @@ impl<'ast> Counter<'ast> {
             }
             Stmt::Assert(statement) => {
                 self.counts.add(1, 0, 1);
-                self.condition(&statement.test)?;
+                self.condition(&statement.test, true)?;
                 self.optional(statement.msg.as_deref())?;
             }
             Stmt::If(statement) => {
@@ -182,7 +203,7 @@ impl<'ast> Counter<'ast> {
                 // The jump over an else suite is immediately followed by its label.
                 self.counts
                     .add_with_unlabeled_successors(1 + has_else, has_else, 0, 0);
-                self.condition(&statement.test)?;
+                self.condition(&statement.test, false)?;
                 self.suite(&statement.body)?;
                 // Ruff flattens elif; native recursively emits another If with
                 // its own end and optional else label for every tested clause.
@@ -191,7 +212,7 @@ impl<'ast> Counter<'ast> {
                         let has_else = u32::from(index + 1 < clauses.len());
                         self.counts
                             .add_with_unlabeled_successors(1 + has_else, has_else, 0, 0);
-                        self.condition(test)?;
+                        self.condition(test, false)?;
                     }
                     self.suite(&clause.body)?;
                 }
@@ -199,9 +220,9 @@ impl<'ast> Counter<'ast> {
             Stmt::While(statement) => {
                 self.counts.add(4, 0, 0);
                 self.frames.push(Frame::Loop);
-                self.condition(&statement.test)?;
+                self.condition(&statement.test, false)?;
                 self.suite(&statement.body)?;
-                self.condition(&statement.test)?;
+                self.condition(&statement.test, true)?;
                 self.frames.pop();
                 self.suite(&statement.orelse)?;
             }
@@ -304,7 +325,7 @@ impl<'ast> Counter<'ast> {
                         _ => return None,
                     }
                     if let Some(guard) = &case.guard {
-                        self.condition(guard)?;
+                        self.condition(guard, false)?;
                     }
                     self.suite(&case.body)?;
                 }
@@ -446,24 +467,28 @@ impl<'ast> Counter<'ast> {
         Some(())
     }
 
-    fn condition(&mut self, expression: &Expr) -> Option<()> {
+    fn condition(&mut self, expression: &Expr, jump_on: bool) -> Option<()> {
         if crate::stack_growth_required() {
-            return crate::grow_stack(|| self.condition(expression));
+            return crate::grow_stack(|| self.condition(expression, jump_on));
         }
         match expression {
-            Expr::UnaryOp(unary) if unary.op == UnaryOp::Not => self.condition(&unary.operand)?,
+            Expr::UnaryOp(unary) if unary.op == UnaryOp::Not => {
+                self.condition(&unary.operand, !jump_on)?
+            }
             Expr::BoolOp(boolean) => {
-                // At most one private short-circuit label in either polarity.
-                self.counts.add(1, 0, 0);
-                for value in &boolean.values {
-                    self.condition(value)?;
+                let short = boolean.op == BoolOp::Or;
+                self.counts.add(u32::from(short != jump_on), 0, 0);
+                let (last, leading) = boolean.values.split_last()?;
+                for value in leading {
+                    self.condition(value, short)?;
                 }
+                self.condition(last, jump_on)?;
             }
             Expr::If(conditional) => {
                 self.counts.add_with_unlabeled_successors(2, 1, 0, 0);
-                self.condition(&conditional.test)?;
-                self.condition(&conditional.body)?;
-                self.condition(&conditional.orelse)?;
+                self.condition(&conditional.test, false)?;
+                self.condition(&conditional.body, jump_on)?;
+                self.condition(&conditional.orelse, jump_on)?;
             }
             Expr::Compare(comparison) if comparison.ops.len() > 1 => {
                 self.counts
@@ -503,7 +528,7 @@ impl<'ast> Counter<'ast> {
             self.expression(&generator.iter)?;
             self.expression(&generator.target)?;
             for condition in &generator.ifs {
-                self.condition(condition)?;
+                self.condition(condition, false)?;
             }
         }
         self.optional(key)?;
@@ -557,7 +582,7 @@ impl<'ast> Counter<'ast> {
             Expr::Yield(yielded) => self.optional(yielded.value.as_deref())?,
             Expr::If(conditional) => {
                 self.counts.add_with_unlabeled_successors(2, 1, 0, 0);
-                self.condition(&conditional.test)?;
+                self.condition(&conditional.test, false)?;
                 self.expression(&conditional.body)?;
                 self.expression(&conditional.orelse)?;
             }

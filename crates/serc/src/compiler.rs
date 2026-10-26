@@ -76,6 +76,8 @@ pub(crate) struct Compiler<'source> {
     control: ControlFlowState<'source>,
     assembler: Assembler,
     native_label_plan: Option<Box<legacy_native_labels::NativeLabelPlan>>,
+    // Source statements whose Python 3.12 suspension labels fit in one byte.
+    legacy_short_label_prefix: TextSize,
 }
 
 #[derive(Clone, Copy, Debug)]

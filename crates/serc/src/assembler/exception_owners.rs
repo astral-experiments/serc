@@ -261,6 +261,8 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) ordinary_await_cleanups: Vec<super::ExceptionRegion>,
     // Every original 3.12 codegen label fits in one operand byte.
     pub(super) legacy_source_jump_labels_fit: bool,
+    // Nonempty suspension targets allocated in a source prefix with one-byte labels.
+    pub(super) legacy_short_await_labels: FxHashSet<Label>,
     // Authored and normalized backedges to a nonempty 3.12 comprehension header.
     pub(super) legacy_comprehension_backedges: Vec<(Label, Instruction)>,
     // Authored SEND, completion entry, and END_SEND before any cleanup or copying.
