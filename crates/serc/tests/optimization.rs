@@ -40,6 +40,23 @@ fn nested_conversion_handlers_keep_shared_cleanup() {
 }
 
 #[test]
+fn chained_assertions_copy_the_loop_exit_for_each_success() {
+    let source = r"def run(items, low, high, ready):
+    for value in items:
+        if ready:
+            assert not (low < value < high and enabled(value))
+        else:
+            assert ready
+";
+    assert_matches_cpython_versions(
+        source,
+        "chained_assertion_backedge.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn erased_nested_assignment_suffix_preserves_join() {
     let source = r"def sample(flag, condition):
     with acquire() as manager:

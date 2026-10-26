@@ -20023,7 +20023,9 @@ impl<'source> Compiler<'source> {
         let copy_success_backedge = non_final_branch
             && condition_jump_target_count(&statement.test, true) > 1
             && (success_conditional
-                || (success_disjunction && condition_has_linear_runtime_leaves(&statement.test)));
+                || (success_disjunction
+                    && (condition_has_linear_runtime_leaves(&statement.test)
+                        || expression_contains_chained_comparison(&statement.test))));
         let original_try_exit = statement.msg.is_none()
             && self.preserves_original_try_loop_tail_exit(&statement.test, restart, false, false);
         if (non_final_branch || original_try_exit)
