@@ -17374,6 +17374,39 @@ impl Assembler {
                 origin.constant.set_operand(Operand::Value(*remapped));
                 true
             });
+        provenance
+            .copied_manager_return_compactions
+            .retain_mut(|origin| {
+                origin
+                    .cleanup
+                    .iter_mut()
+                    .chain(origin.earlier_cleanup.iter_mut().flatten())
+                    .chain(origin.named_handler_cleanup.iter_mut().flatten())
+                    .chain(
+                        origin
+                            .constant_return_prefix
+                            .iter_mut()
+                            .flat_map(|prefix| &mut prefix.instructions),
+                    )
+                    .filter(|record| record.opcode == LOAD_CONST)
+                    .all(|record| {
+                        let Some(index) = record.value_argument() else {
+                            return false;
+                        };
+                        let index = if index == u32::MAX {
+                            deferred_none
+                        } else {
+                            Some(index)
+                        };
+                        let Some(remapped) =
+                            index.and_then(|index| *index_map.get(index as usize)?)
+                        else {
+                            return false;
+                        };
+                        record.set_operand(Operand::Value(remapped));
+                        true
+                    })
+            });
         provenance.copied_return_pop_prefixes.retain_mut(|origin| {
             let load = &mut origin.records[2];
             if load.opcode != LOAD_CONST {
