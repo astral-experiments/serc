@@ -1179,6 +1179,28 @@ fn guarded_recovery_preserves_loop_cleanup_entry() {
 }
 
 #[test]
+fn protected_while_break_copies_following_local_return() {
+    let source = r"async def collect(ready, limit, done, count):
+    try:
+        while ready() and count < limit:
+            count += 1
+            if done(count):
+                break
+    except ValueError:
+        pass
+    return count
+";
+    for condition in ["ready() and count < limit", "ready()"] {
+        assert_matches_cpython_versions(
+            &source.replace("ready() and count < limit", condition),
+            "protected_while_return.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn runtime_while_break_reaches_finalizer_iteration() {
     for manager in ["", "with acquire():", "with acquire(), acquire():"] {
         for nested in [false, true] {
