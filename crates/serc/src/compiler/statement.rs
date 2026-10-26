@@ -11027,10 +11027,23 @@ impl<'source> Compiler<'source> {
                     // POP_BLOCK becomes an unowned NOP before line-number cleanup. A return
                     // expression with multiple exits can leave this marker at their join.
                     let starts_jump_target = self.assembler.at_jump_target();
-                    // A copied finalizer's conditional and continuing body share this
-                    // original POP_BLOCK. Neither predecessor can donate its location.
+                    // A conditional cleanup or the normal and suppressed exits of a
+                    // copied manager share this POP_BLOCK. Neither edge donates a line.
                     let shared_copied_cleanup_join = unwind_location == SourceLocation::NONE
-                        && self.assembler.at_original_shared_cleanup_join();
+                        && (self.assembler.at_original_shared_cleanup_join()
+                            || (self.context.python_version >= crate::PythonVersion::Py314
+                                && starts_jump_target
+                                && return_finally_contexts.get(context_index + 1).is_some_and(|inner| {
+                                    inner.with_depth == finally_context.with_depth
+                                        && inner.loop_depth == finally_context.loop_depth
+                                        && inner.handler_depth == finally_context.handler_depth
+                                        && inner.try_body_depth == finally_context.try_body_depth
+                                        && inner.exception_region_depth == finally_context.exception_region_depth + 1
+                                        && matches!(inner.body.last(), Some(Stmt::With(manager))
+                                            if !manager.is_async
+                                                && matches!(with_body_normal_exit(&manager.body),
+                                                    WithBodyNormalExit::Other | WithBodyNormalExit::While(_)))
+                                })));
                     self.assembler.set_location(unwind_location);
                     // Surrounding loops stay live until after the copied finally.
                     // Whiles and retained iterators contribute no unwind records
