@@ -12784,6 +12784,35 @@ fn copied_sequence_folds_preserve_locations_and_constant_order() {
 }
 
 #[test]
+fn iterated_tuple_conversion_preserves_later_branch_owners() {
+    let large = format!("({})", ["first"; 31].join(", "));
+    for iterable in [
+        "(*left, *right)",
+        "(first, *left, last)",
+        &large,
+        "[first, last]",
+    ] {
+        let source = format!(
+            "def collect(sink, left, right, first, last):
+    try:
+        sink.extend(item for item in {iterable})
+        if any(item for item in left):
+            report()
+    except ValueError:
+        return first
+    return last
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "iterated_tuple_slots.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn sequence_folds_after_dynamic_tuple_iteration_preserve_boundaries() {
     let values = std::iter::repeat_n("value", 31)
         .collect::<Vec<_>>()
