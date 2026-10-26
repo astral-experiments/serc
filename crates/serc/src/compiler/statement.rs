@@ -17486,24 +17486,37 @@ impl<'source> Compiler<'source> {
             // to the enclosing branch exit. Folded branches keep their emitted donor.
             let mut final_else_body = body;
             let mut descended_else = false;
+            let mut assertion_fallthrough = true;
             while let Some(Stmt::If(statement)) = final_else_body.last()
                 && condition_has_only_runtime_tests(&statement.test)
                 && let Some((clause, earlier)) = statement.elif_else_clauses.split_last()
                 && clause.test.is_none()
-                && (earlier.is_empty()
-                    || (suite_terminates_before_constant_folding(&statement.body)
-                        && earlier.iter().all(|clause| {
-                            clause
-                                .test
-                                .as_ref()
-                                .is_some_and(condition_has_only_runtime_tests)
-                                && suite_terminates_before_constant_folding(&clause.body)
-                        })))
+                && earlier.iter().all(|clause| {
+                    clause
+                        .test
+                        .as_ref()
+                        .is_some_and(condition_has_only_runtime_tests)
+                })
             {
+                let earlier_arms_terminate = earlier.is_empty()
+                    || (suite_terminates_before_constant_folding(&statement.body)
+                        && earlier
+                            .iter()
+                            .all(|clause| suite_terminates_before_constant_folding(&clause.body)));
+                if !earlier_arms_terminate
+                    && self.context.python_version < crate::PythonVersion::Py314
+                {
+                    break;
+                }
+                // Earlier arms jump across this else. The last loop or terminating
+                // guard can still donate its unique false edge to the outer jump.
+                assertion_fallthrough &= earlier_arms_terminate;
                 final_else_body = &clause.body;
                 descended_else = true;
             }
-            if let Some(range) = suite_assert_success_fallthrough_range(final_else_body) {
+            if assertion_fallthrough
+                && let Some(range) = suite_assert_success_fallthrough_range(final_else_body)
+            {
                 self.assembler.set_location(self.source_location(range));
             } else if let Some(range) = loop_false_fallthrough_range(final_else_body) {
                 self.assembler.set_location(self.source_location(range));
