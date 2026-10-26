@@ -15,6 +15,27 @@ use serc::{
 };
 
 #[test]
+fn erased_finalizer_copies_returns_to_the_try_else_branches() {
+    let source = r"def sample(ready):
+    try:
+        work()
+    except LookupError:
+        raise
+    else:
+        if ready:
+            finish()
+    finally:
+        assert ready
+";
+    assert_matches_cpython_versions(
+        source,
+        "erased_finalizer.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn nested_conversion_handlers_keep_shared_cleanup() {
     let source = r"def sample(items):
     for item in items:

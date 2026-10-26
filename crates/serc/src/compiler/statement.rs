@@ -27318,7 +27318,34 @@ impl<'source> Compiler<'source> {
                                 .or_else(|| compiler.erased_try_else_return_end(&statement.orelse))
                         {
                             let ((), emitted) = compiler.with_fallthrough_tracking(|compiler| {
-                                compiler.compile_suite_inner(&statement.orelse[..end], true)
+                                // A terminal try with a finalizer reaches this path only
+                                // when the finalizer has been erased. Each return is
+                                // copied from after that protected suite.
+                                let depth = if !statement.finalbody.is_empty() {
+                                    Some(
+                                        compiler
+                                            .control
+                                            .exceptions
+                                            .active_exception_region_exclusions
+                                            .len(),
+                                    )
+                                } else {
+                                    compiler
+                                        .control
+                                        .exceptions
+                                        .implicit_return_exception_exclusion_depth
+                                };
+                                compiler.with_control_override(
+                                    |control| {
+                                        &mut control
+                                            .exceptions
+                                            .implicit_return_exception_exclusion_depth
+                                    },
+                                    depth,
+                                    |compiler| {
+                                        compiler.compile_suite_inner(&statement.orelse[..end], true)
+                                    },
+                                )
                             })?;
                             normal_return_emitted = emitted;
                             if end < statement.orelse.len() {
@@ -37204,6 +37231,10 @@ impl<'source> Compiler<'source> {
                                     emit_statement_nop: compiler.context.python_version
                                         == crate::PythonVersion::Py312
                                         && !statement.is_star,
+                                    terminal: terminal
+                                        && compiler.context.python_version >= crate::PythonVersion::Py314
+                                        && statement.finalbody.iter().all(|part| compiler.context.is_elided_statement(part))
+                                        && matches!(statement.orelse.last(), Some(Stmt::If(tail)) if tail.elif_else_clauses.is_empty()),
                                     retained_else_break_exit:
                                         terminal_else_break_bypasses_empty_exit,
                                     ..TryCompileOptions::NESTED_HANDLER
