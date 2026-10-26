@@ -324,6 +324,7 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) copied_return_membership_prefixes: Vec<CopiedReturnMembershipPrefix>,
     pub(super) copied_return_call_prefixes: Vec<CopiedReturnCallPrefix>,
     pub(super) copied_return_attribute_truth_prefixes: Vec<CopiedReturnAttributeTruthPrefix>,
+    pub(super) copied_return_guards: Vec<CopiedReturnGuard>,
     pub(super) copied_handler_return_none_prefixes: Vec<(Label, [Instruction; 6])>,
     pub(super) saved_named_handler_none_prefixes: Vec<SavedNamedHandlerNonePrefix>,
     pub(super) copied_manager_return_none_prefixes: Vec<CopiedManagerReturnNonePrefix>,
@@ -1229,6 +1230,16 @@ pub(super) struct ConstantManagerReturnPrefix {
     pub(super) handler_pop: Option<Instruction>,
     pub(super) instructions: Vec<Instruction>,
     pub(super) missing_null_pops: usize,
+}
+
+/// The final POP of a handler or iterator return and the copied finally's first test.
+#[derive(Debug)]
+pub(super) struct CopiedReturnGuard {
+    pub(super) cleanup: Instruction,
+    pub(super) operands: Vec<Instruction>,
+    pub(super) condition: Instruction,
+    pub(super) marker: Instruction,
+    pub(super) ordinary_pops: usize,
 }
 
 /// An original saved-value return array with two omitted named-handler POP cells.
@@ -10260,6 +10271,26 @@ impl LayoutAssembler {
                             ExceptionOwnerDecision::override_with_region(None),
                         );
                     }
+                    if instruction.opcode == NOT_TAKEN
+                        && owner_history_exact
+                        && pop_slot_epoch_known
+                        && tail.late_removals == 0
+                        && tail.insertions == 0
+                        && tail.post_compaction_fusions == 0
+                        && self.copied_return_guard_uses_final_pop(
+                            instruction_index,
+                            original_array_start,
+                            tail,
+                            &indexed_instructions,
+                            &label_positions,
+                            &jump_targets,
+                        )
+                    {
+                        owners.insert(
+                            instruction_index,
+                            ExceptionOwnerDecision::override_with_region(None),
+                        );
+                    }
                     // The retained SETUP's original cell is NULL, even if its compacted
                     // live record is surrounded by protected instructions. An appended
                     // marker may reuse it only when no subsequent edit shifts that cell.
@@ -12971,6 +13002,86 @@ impl LayoutAssembler {
         (!owner.is_scope_fallback && !owner.preserve_lasti && current_owner_matches).then_some(
             ExceptionOwnerDecision::override_with_region(owns_cleanup_record.then_some(region)),
         )
+    }
+
+    /// Projects an appended guard through the original return cleanup and its final POP.
+    fn copied_return_guard_uses_final_pop(
+        &self,
+        marker: usize,
+        array: usize,
+        tail: ExceptionOwnerTail,
+        instructions: &[&Instruction],
+        positions: &OwnerLabelPositions,
+        targets: &FxHashSet<Label>,
+    ) -> bool {
+        let Some(condition) = marker.checked_sub(1) else {
+            return false;
+        };
+        let mut origins = self
+            .exception_owner_provenance
+            .copied_return_guards
+            .iter()
+            .filter(|origin| {
+                origin.marker == *instructions[marker]
+                    && origin.condition == *instructions[condition]
+            });
+        let Some(origin) = origins.next() else {
+            return false;
+        };
+        let Some(load) = condition.checked_sub(origin.operands.len()) else {
+            return false;
+        };
+        let Some(previous) = load.checked_sub(1) else {
+            return false;
+        };
+        if origins.next().is_some()
+            || previous < array
+            || targets
+                .iter()
+                .chain(&self.exception_owner_provenance.source_boundaries)
+                .chain(&self.exception_owner_provenance.block_boundaries)
+                .any(|label| {
+                    positions
+                        .get(label)
+                        .is_some_and(|&pos| previous < pos && pos <= marker)
+                })
+        {
+            return false;
+        }
+        // Earlier return and handler POPs can compact into the last cleanup record.
+        let mut cleanup = origin.cleanup;
+        cleanup.local_policy.add_hidden_exception_owner_slots(
+            instructions[previous]
+                .local_policy
+                .hidden_exception_owner_slots(),
+        );
+        if cleanup != *instructions[previous] {
+            return false;
+        }
+        let mut suffix = ExceptionOwnerTail::default();
+        for (offset, mut expected) in origin.operands.iter().copied().enumerate() {
+            let actual = instructions[load + offset];
+            if offset == 0 {
+                expected.local_policy.add_hidden_exception_owner_slots(1);
+                if expected.opcode == crate::target::opcodes::LOAD_FAST
+                    && actual.opcode == crate::target::opcodes::LOAD_FAST_BORROW
+                {
+                    expected.opcode = actual.opcode;
+                }
+            }
+            if expected != *actual {
+                return false;
+            }
+            suffix.instruction(actual, None);
+        }
+        suffix.instruction(instructions[condition], None);
+        // The compacted load occupies the final POP's position. Restore only the
+        // preceding cells, including ordinary tries omitted after handler cleanup.
+        tail.early_removals
+            .checked_sub(suffix.early_removals)
+            .and_then(|earlier| load.checked_add(earlier))
+            .and_then(|slot| slot.checked_add(origin.ordinary_pops))
+            == Some(marker)
     }
 
     /// Locates a NULL SETUP record in an entry array's last compacted tail.

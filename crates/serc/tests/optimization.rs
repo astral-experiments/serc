@@ -2224,6 +2224,47 @@ fn erased_loop_exit_stays_inside_managed_finally() {
 }
 
 #[test]
+fn handler_and_iterator_returns_reuse_the_final_cleanup_pop() {
+    for source in [
+        r"async def sample(value, flag):
+    with scope():
+        try:
+            run()
+        except ValueError:
+            log(value)
+            return value
+        finally:
+            if flag is None:
+                clean()
+            done()
+",
+        r"async def sample(items, value):
+    try:
+        try:
+            try:
+                for item in items:
+                    if item:
+                        return
+            except RuntimeError:
+                recover()
+        except RuntimeError:
+            recover()
+    finally:
+        if value:
+            release()
+        close()
+",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "copied_return_cleanup_guard.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn copied_return_through_nested_loops_keeps_none_guard_owner() {
     let source = r#"async def sample(client, response):
     for attempt in range(client.attempts):
