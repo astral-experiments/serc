@@ -11127,6 +11127,55 @@ impl Assembler {
         self.copied_finally_iterator_break_origins.push(origin);
     }
 
+    /// Records a copied truth test at the completion of an awaited manager exit.
+    pub(crate) fn record_awaited_break_truth_guard(
+        &mut self,
+        unwind_start: usize,
+        manager: SourceLocation,
+        handler: Label,
+    ) {
+        let records = self.linear_items()[unwind_start..]
+            .windows(8)
+            .find_map(|items| {
+                let [
+                    Item::Label(entry),
+                    Item::Instruction(end),
+                    Item::Instruction(pop),
+                    Item::Label(_),
+                    Item::Instruction(load),
+                    Item::Instruction(truth),
+                    Item::Instruction(jump),
+                    Item::Instruction(marker),
+                ] = items
+                else {
+                    return None;
+                };
+                (end.opcode == END_SEND
+                    && end.location == manager
+                    && pop.opcode == POP_TOP
+                    && pop.location == manager
+                    && matches!(load.opcode, LOAD_FAST | LOAD_GLOBAL)
+                    && truth.opcode == TO_BOOL
+                    && matches!(jump.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE)
+                    && marker.opcode == NOT_TAKEN
+                    && [truth, jump, marker]
+                        .iter()
+                        .all(|instruction| instruction.location == load.location)
+                    && [end, pop, load, truth, jump, marker]
+                        .iter()
+                        .all(|instruction| {
+                            instruction.pre_fold_extra_instructions() == 0
+                                && instruction.local_policy.hidden_exception_owner_slots() == 0
+                        }))
+                .then_some((*entry, handler, *load, *jump))
+            });
+        if let Some(records) = records {
+            self.exception_owner_provenance
+                .awaited_break_truth_guards
+                .push(records);
+        }
+    }
+
     /// Certifies a conditional join that starts at the jump after copied finalizer cleanup.
     pub(crate) fn record_copied_finally_break_head(
         &mut self,

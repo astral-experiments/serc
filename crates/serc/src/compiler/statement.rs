@@ -7152,21 +7152,43 @@ impl<'source> Compiler<'source> {
                     }
                     if self.context.python_version >= crate::PythonVersion::Py314
                         && context.with_depth > 0
-                        && self.control.withs.active_with_exits.get(context.with_depth)
+                        && self
+                            .control
+                            .withs
+                            .active_with_exits
+                            .get(context.with_depth)
                             .is_some_and(|manager| manager.is_async)
-                        && self.control.finally.active_loop_finally_contexts.last().is_some_and(|finally| {
-                            finally.loop_depth == self.control.loops.contexts.len()
-                                && finally.with_depth == context.with_depth
-                                && matches!(finally.body.last(), Some(Stmt::If(guard))
+                        && let Some(finally) =
+                            self.control.finally.active_loop_finally_contexts.last()
+                        && finally.loop_depth == self.control.loops.contexts.len()
+                        && finally.with_depth == context.with_depth
+                        && matches!(finally.body.last(), Some(Stmt::If(guard))
                                     if guard.elif_else_clauses.is_empty()
                                         && original_condition_has_unique_jump_target(&guard.test, false)
                                         && condition_has_only_runtime_tests(&guard.test)
                                         && suite_has_linear_borrow_fallthrough(&guard.body))
-                        })
                     {
                         // The copied arm falls through to the break jump after unwinding the
                         // inner manager. Its unlocated jump inherits that arm's line.
                         self.assembler.preserve_inlined_jump_nop(break_jump);
+                        if self.context.python_version == crate::PythonVersion::Py314
+                            && let [outer, inner] =
+                                &self.control.withs.active_with_exits[context.with_depth - 1..]
+                            && !outer.is_async
+                            && let Some(pops @ 1..=3) = inner
+                                .exception_region_depth
+                                .checked_sub(finally.exception_region_depth)
+                            && finally.handler_depth
+                                == self.control.exceptions.active_exception_handlers.len()
+                            && finally.try_body_depth + pops - 1
+                                == self.control.exceptions.active_try_marker_slots.len()
+                        {
+                            self.assembler.record_awaited_break_truth_guard(
+                                finally_unwind_start,
+                                inner.location,
+                                outer.handler,
+                            );
+                        }
                     }
                     if has_copied_finalizer
                         && defer_finally_end
