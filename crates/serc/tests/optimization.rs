@@ -2096,6 +2096,21 @@ fn erased_coroutine_join_preserves_predating_async_managers() {
 }
 
 #[test]
+fn folded_loop_arm_keeps_the_finally_join_unlocated() {
+    for condition in ["True", "ready"] {
+        let source = format!(
+            "def run(ready):\n    try:\n        if ready:\n            while {condition}:\n                work()\n        else:\n            finish()\n    finally:\n        cleanup()\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "folded_loop_finally_join.py",
+            &LEVELS,
+            &[PythonVersion::Py313],
+        );
+    }
+}
+
+#[test]
 fn folded_while_breaks_copy_unnamed_handler_cleanup() {
     let source = r"def sample(values, limit):
     try:
