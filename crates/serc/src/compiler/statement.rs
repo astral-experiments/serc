@@ -6989,16 +6989,16 @@ impl<'source> Compiler<'source> {
                 }
                 // A copied trailing guard can give multiple edges the same unlocated
                 // iterator discard. Capture its entry before appending the break.
-                let shared_guard_join = guarded_finally_iterator_join
+                let shared_guard_entry = (guarded_finally_iterator_join
                     && self.context.python_version >= crate::PythonVersion::Py314
                     && self.control.exceptions.active_exception_group_handlers == 0
-                    && self.assembler.at_original_shared_cleanup_join();
-                let copied_finally_try_iterator_entry = (shared_guard_join
-                    || (copied_finally_try_iterator_join
-                        && self.assembler.at_original_shared_finally_iterator_join(
-                            finally_unwind_start,
-                            copied_finally_iterator_handler,
-                        )))
+                    && self.assembler.at_original_shared_cleanup_join())
+                .then(|| self.assembler.item_count());
+                let copied_finally_try_iterator_entry = (copied_finally_try_iterator_join
+                    && self.assembler.at_original_shared_finally_iterator_join(
+                        finally_unwind_start,
+                        copied_finally_iterator_handler,
+                    ))
                 .then(|| self.assembler.item_count());
                 self.emit_iterator_cleanup(context.iterator_cleanup, false)?;
                 if copied_finalizer_location.is_some() {
@@ -7127,19 +7127,32 @@ impl<'source> Compiler<'source> {
                             finally_unwind_start,
                             entry,
                         );
-                    } else if copied_finally_iterator_join {
-                        self.assembler.prepare_copied_finally_iterator_break(
-                            break_jump,
-                            context.break_label,
-                            finally_unwind_start,
-                            copied_finally_iterator_handler,
-                            copied_conjunction_break_origin,
-                            (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                                == 0
-                                && self.control.loops.contexts.len() == 1
-                                && context.exception_region_depth == 0)
-                                .then_some(copied_break_item),
-                        );
+                    } else if copied_finally_iterator_join || shared_guard_entry.is_some() {
+                        if copied_finally_iterator_join {
+                            self.assembler.prepare_copied_finally_iterator_break(
+                                break_jump,
+                                context.break_label,
+                                finally_unwind_start,
+                                copied_finally_iterator_handler,
+                                copied_conjunction_break_origin,
+                                (self.unit.flags
+                                    & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                                    == 0
+                                    && self.control.loops.contexts.len() == 1
+                                    && context.exception_region_depth == 0)
+                                    .then_some(copied_break_item),
+                            );
+                        }
+                        // A specialized cleanup can also certify its handler's marker.
+                        // The generic check only accepts an untouched authored break.
+                        if let Some(entry) = shared_guard_entry {
+                            self.assembler.prepare_shared_finally_iterator_break(
+                                break_jump,
+                                context.break_label,
+                                finally_unwind_start,
+                                entry,
+                            );
+                        }
                     } else if context.prevent_break_exit_inlining {
                         self.assembler.prevent_jump_inlining(break_jump);
                     } else if context.break_policy.preserves_jump_exit() {
