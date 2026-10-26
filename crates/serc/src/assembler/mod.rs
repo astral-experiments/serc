@@ -4678,9 +4678,9 @@ impl Assembler {
             || swap.operand() != Operand::Value(u32::try_from(restores.len() + 1).ok()?)
             || store.opcode != STORE_FAST
             || store.local_policy.may_store_null()
-            || restores.iter().any(|restore| {
-                restore.opcode != STORE_FAST || !restore.local_policy.may_store_null()
-            })
+            // The recorded normal restore also covers a saved comprehension cell,
+            // whose STORE_FAST uses a storage slot outside the ordinary fast locals.
+            || restores.iter().any(|restore| restore.opcode != STORE_FAST)
             || !restores.iter().chain([store]).all(|instruction| {
                 matches!(instruction.operand(), Operand::Value(local) if locals.insert(local))
             })
