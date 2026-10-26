@@ -40630,7 +40630,7 @@ impl<'source> Compiler<'source> {
         // The assembler still applies its original-array budget to either exit.
         let inline_erased_finalizer_exit = self.context.python_version
             >= crate::PythonVersion::Py314
-            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+            && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
             && self.control.finally.active_finally_try_bodies == 1
             && self.control.finally.active_normal_finally_bodies == 0
             && self.control.finally.active_copied_finally_bodies == 0

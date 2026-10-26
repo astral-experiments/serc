@@ -1837,6 +1837,21 @@ fn erased_terminal_async_manager_join_keeps_marker() {
 }
 
 #[test]
+fn erased_finalizer_copies_synchronous_manager_exits() {
+    for body in ["inspect(value)", "return value"] {
+        let source = format!(
+            "def sample(manager, ready):\n    try:\n        with manager as value:\n            {body}\n    finally:\n        assert ready\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "erased_manager_exit.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn erased_finalizer_keeps_managed_return_copy() {
     let source = "async def sample(owner):\n    try:\n        with prepare_scope(owner, search=False):\n            return await prepare(owner, Context())\n    finally:\n        assert enabled()\n";
     assert_matches_cpython(source, "erased_managed_return.py", &LEVELS);
