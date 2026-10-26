@@ -10074,6 +10074,38 @@ fn erased_suffix_preserves_with_pop_block() {
 }
 
 #[test]
+fn terminating_nested_try_leaves_one_manager_exit() {
+    let handler = r"def run(manager, value):
+    with manager:
+        try:
+            consume(value)
+        except ValueError:
+            try:
+                return value
+            except TypeError:
+                raise
+";
+    let branch = r"def run(manager, value):
+    with manager:
+        if value:
+            result = value
+        else:
+            try:
+                return value
+            except TypeError:
+                raise
+";
+    for source in [handler, branch] {
+        assert_matches_cpython_versions(
+            source,
+            "nested_try_manager_exit.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn erased_coroutine_handler_assertions_preserve_manager_pop_block() {
     for work in ["worker()", "await worker()"] {
         for exit in ["raise Failure('expected')", "return 42"] {

@@ -40514,14 +40514,7 @@ impl<'source> Compiler<'source> {
                 .assembler
                 .original_manager_cleanup_join(
                     protected_end,
-                    remaining.is_empty()
-                        && with_body_has_cold_normal_donor(
-                            body,
-                            self.context.python_version >= crate::PythonVersion::Py314
-                                && self.unit.flags
-                                    & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                                    == CO_COROUTINE,
-                        ),
+                    remaining.is_empty() && with_body_has_cold_normal_donor(self, body),
                 )
                 .map(|entry| WithBodyExitNoop::RetainedManagerPopBlock(SourceLocation::NONE, entry))
                 .or_else(|| {
@@ -42804,9 +42797,13 @@ fn with_body_conditional_exit_location(
     if otherwise.test.is_some() {
         return None;
     }
+    let nested_try_exit = |arm: &[Stmt]| {
+        compiler.context.python_version >= crate::PythonVersion::Py314
+            && with_body_ends_in_terminal_try(arm)
+    };
     let (terminal, fallthrough, fallthrough_truthiness) = match (
-        suite_terminates(&statement.body),
-        suite_terminates(&otherwise.body),
+        suite_terminates(&statement.body) || nested_try_exit(&statement.body),
+        suite_terminates(&otherwise.body) || nested_try_exit(&otherwise.body),
     ) {
         (true, false) => (&statement.body, &otherwise.body, false),
         (false, true) => (&otherwise.body, &statement.body, true),
@@ -42820,6 +42817,7 @@ fn with_body_conditional_exit_location(
             return None;
         }
         match terminal.last() {
+            Some(Stmt::Try(_)) if nested_try_exit(terminal) => {}
             Some(Stmt::Continue(_)) => {}
             Some(Stmt::Break(_)) if allow_break => {}
             Some(Stmt::If(nested))
@@ -43078,7 +43076,7 @@ fn with_chained_manager_exit_location(
 // These source exits reach a distinct manager POP after the cold COPY/POP_EXCEPT/
 // RERAISE footer. The assembler still certifies that exact original footer and its
 // sole source/block join; the existing graph pass resolves live predecessor counts.
-fn with_body_has_cold_normal_donor(body: &[Stmt], allow_erased_named_handler: bool) -> bool {
+fn with_body_has_cold_normal_donor(compiler: &Compiler<'_>, body: &[Stmt]) -> bool {
     if with_body_has_terminal_manager_suppression(body) {
         return true;
     }
@@ -43089,6 +43087,21 @@ fn with_body_has_cold_normal_donor(body: &[Stmt], allow_erased_named_handler: bo
         return false;
     }
     if statement.finalbody.is_empty() {
+        if compiler.context.python_version >= crate::PythonVersion::Py314
+            && statement.orelse.is_empty()
+            && (suite_has_linear_borrow_fallthrough(&statement.body)
+                || matches!(statement.body.as_slice(), [Stmt::Pass(_)]))
+            && try_normal_exit_predecessors(statement) > 1
+            && statement.handlers.iter().all(|handler| {
+                handler.as_except_handler().is_some_and(|handler| {
+                    suite_terminates(&handler.body) || with_body_ends_in_terminal_try(&handler.body)
+                })
+            })
+        {
+            // A nested try can terminate a handler on every path. Only the protected
+            // body's normal exit can then supply the manager's POP_BLOCK location.
+            return true;
+        }
         if !statement.orelse.is_empty()
             || !suite_terminates_before_constant_folding(&statement.body)
             || !statement
@@ -43106,7 +43119,9 @@ fn with_body_has_cold_normal_donor(body: &[Stmt], allow_erased_named_handler: bo
         let Some(handler) = normal_handlers.next() else {
             return false;
         };
-        if allow_erased_named_handler
+        if compiler.context.python_version >= crate::PythonVersion::Py314
+            && compiler.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                == CO_COROUTINE
             && handler.name.is_some()
             && !handler.body.is_empty()
             && handler
