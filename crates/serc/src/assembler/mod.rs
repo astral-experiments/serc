@@ -14597,15 +14597,15 @@ impl Assembler {
         Some(entry)
     }
 
-    /// Locates a manager exit reached only by a break's copied-finally store.
+    /// Locates a manager exit reached only by a break's copied finalizer.
     ///
-    /// The source has one break and a terminating loop else. Its original cleanup
-    /// array ends with `STORE_FAST`, the target's unlocated iterator pops, and the
-    /// authored break. Resolve this donor before exit copying, which precedes the
-    /// within-block location propagation that would locate the pops and jump.
+    /// Only the break reaches the manager after the loop else terminates. Its
+    /// copied finalizer ends in a store or expression pop followed by the
+    /// unlocated jump. A `for` also unwinds its iterator before jumping.
     pub(crate) fn original_manager_copied_finally_break_join(
         &self,
         protected_end: Label,
+        has_iterator: bool,
     ) -> Option<(Label, SourceLocation)> {
         let items = self.linear_items();
         let aliases = trailing_labels(items).collect::<Vec<_>>();
@@ -14626,12 +14626,17 @@ impl Assembler {
             return None;
         }
         let provenance = &self.exception_owner_provenance;
-        let mut entries = aliases
-            .iter()
-            .copied()
-            .filter(|label| provenance.block_boundaries.contains(label));
+        let mut entries = aliases.iter().copied().filter(|label| {
+            if has_iterator {
+                provenance.block_boundaries.contains(label)
+            } else {
+                *label != protected_end
+            }
+        });
         let entry = entries.next()?;
-        if entries.next().is_some() || !provenance.source_boundaries.contains(&entry) {
+        if entries.next().is_some()
+            || (has_iterator && !provenance.source_boundaries.contains(&entry))
+        {
             return None;
         }
         let mut incoming = items.iter().enumerate().filter_map(|(index, item)| match item {
@@ -14644,17 +14649,16 @@ impl Assembler {
         if incoming.next().is_some() {
             return None;
         }
-        let iterator_slots = match self.python_version {
-            crate::PythonVersion::Py312
-            | crate::PythonVersion::Py313
-            | crate::PythonVersion::Py314 => 1,
-            crate::PythonVersion::Py315 => 2,
+        let iterator_slots = match (has_iterator, self.python_version) {
+            (false, _) => 0,
+            (true, crate::PythonVersion::Py315) => 2,
+            (true, _) => 1,
         };
         let tail = items.get(index.checked_sub(iterator_slots + 1)?..=index)?;
-        let [Item::Instruction(store), pops @ .., Item::Instruction(jump)] = tail else {
+        let [Item::Instruction(donor), pops @ .., Item::Instruction(jump)] = tail else {
             return None;
         };
-        let mut depth = store.depth_after()?;
+        let mut depth = donor.depth_after()?;
         for item in pops {
             let Item::Instruction(pop) = item else {
                 return None;
@@ -14668,9 +14672,9 @@ impl Assembler {
                 return None;
             }
         }
-        (store.opcode == STORE_FAST
-            && store.value_argument().is_some()
-            && store.location.line >= 0
+        ((donor.opcode == STORE_FAST || (!has_iterator && donor.opcode == POP_TOP))
+            && donor.value_argument().is_some()
+            && donor.location.line >= 0
             && jump.opcode == JUMP_FORWARD
             && jump.operand() == Operand::Forward(entry)
             && jump.location == SourceLocation::NONE
@@ -14688,7 +14692,7 @@ impl Assembler {
                     && !instruction.jump_policy.borrow_empty_block()
                     && instruction.depth_after().is_some()
             }))
-        .then_some((entry, store.location))
+        .then_some((entry, donor.location))
     }
 
     /// Records a manager's original `POP_BLOCK` at the head of its cleanup array.
