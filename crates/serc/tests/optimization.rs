@@ -13204,6 +13204,7 @@ fn elided_assertions_preserve_linear_assignment_return_boundary() {
 #[test]
 fn elided_assertions_preserve_conditional_assignment_return_boundary() {
     for (case, source) in [
+        "async def f(flag, choose, left, right):\n    if flag:\n        value = left if choose else right\n        assert value\n    else:\n        assert choose\n",
         "def f(flag, value):\n    if value is not None:\n        result = 1 if flag else 2\n        assert result\n",
         "def f(flag, value):\n    if value is None:\n        consume()\n    else:\n        result = 1 if flag else 2\n        assert result\n        assert flag\n",
         "def f(obj, flag, value):\n    if value is not None:\n        obj.result = 1 if flag else 2\n        assert obj.result\n    else:\n        obj.result = None\n",

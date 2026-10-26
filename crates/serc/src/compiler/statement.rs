@@ -4508,10 +4508,10 @@ impl<'source> Compiler<'source> {
         statement: &ruff_python_ast::StmtIf,
         preserve_protected_folded_nop: bool,
     ) -> Result<(), CompileError> {
-        // 3.12 counts predecessors before copying unlocated exits. Emit the original
-        // conditional and its shared footer so each copy can inherit its incoming
-        // edge's location, even when an erased branch queued that edge twice.
-        if self.context.python_version == crate::PythonVersion::Py312
+        // The legacy optimizer copies small exits and resolves the locations of
+        // shared returns. Keep the conditional's original join through both passes,
+        // including when an erased branch queues the same edge twice in 3.12.
+        if self.context.python_version <= crate::PythonVersion::Py313
             && self.supports_elided_terminal_if()
             && self
                 .control
