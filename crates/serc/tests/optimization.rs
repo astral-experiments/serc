@@ -9095,6 +9095,37 @@ fn terminal_values_before_erased_assertions_keep_branch_returns() {
 }
 
 #[test]
+fn nested_conditional_exits_survive_erased_branch_assertions() {
+    for (first_arm, second_arm, suffix) in [
+        ("pass", "assert item", "assert item"),
+        ("visit(item)", "record(item)", "assert item"),
+        ("visit(item)", "record(item)", "visit(item)"),
+    ] {
+        let source = format!(
+            "def run(enabled, flag, first, second, item):
+    if flag:
+        if enabled:
+            if first:
+                if second:
+                    {first_arm}
+                else:
+                    {second_arm}
+                {suffix}
+            else:
+                assert flag
+        assert item
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "nested_branch_assertions.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn protected_conditional_store_preserves_erased_else_backedge() {
     let protected = r"def collect(batches, left, right, cleanup, sink):
     try:
