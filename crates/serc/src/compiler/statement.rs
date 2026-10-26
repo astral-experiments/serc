@@ -25510,6 +25510,21 @@ impl<'source> Compiler<'source> {
                         .as_except_handler()
                         .is_some_and(|handler| matches!(handler.body.as_slice(), [Stmt::Try(_)]))
                 }));
+        // A generic loop-tail try jumps to the backedge after its else and handlers.
+        // The guard test and its body can reach the original cleanup independently.
+        let guarded_loop_try = self.context.python_version >= crate::PythonVersion::Py314
+            && !terminal
+            && loop_tail.is_none()
+            && !statement.orelse.is_empty()
+            && statement.finalbody.is_empty()
+            && self.control.in_loop()
+            && self.control.loops.uncopied_loop_tail_statement == Some(statement.range);
+        let shared_guard = |body: &[Stmt]| {
+            matches!(body.last(), Some(Stmt::If(guard))
+            if guard.elif_else_clauses.is_empty()
+                && condition_has_only_runtime_tests(&guard.test)
+                && if_has_multiple_normal_exit_targets(guard))
+        };
         // Only this ordinary source route preserves the native shared joins.
         // Unsupported lowering leaves its planned roles unconsumed, cancelling
         // the complete certificate without guessing transformed label aliases.
@@ -27697,7 +27712,10 @@ impl<'source> Compiler<'source> {
                         && condition_jump_target_count(&branch.test, false) > 1
                         && suite_terminates_before_constant_folding(&branch.body))
                 && self.assembler.at_original_jump_only_conditional_join();
-            let shared_conditional_exit = shared_assertion_exit
+            let shared_conditional_exit = (guarded_loop_try
+                && shared_guard(&statement.orelse)
+                && self.assembler.at_original_shared_cleanup_join())
+                || shared_assertion_exit
                 || folded_false_try_exit
                 || terminal_else_orphan_exit
                 || forwarded_conditional_exit.is_none()
@@ -30880,7 +30898,8 @@ impl<'source> Compiler<'source> {
                         && matches!(tail.body.as_slice(), [Stmt::Raise(raised)]
                             if raised.exc.is_none() && raised.cause.is_none()))
                 && self.assembler.at_original_jump_only_conditional_join();
-            let handler_ends_with_inlineable_cleanup = handler_ends_with_preordered_cleanup
+            let handler_ends_with_inlineable_cleanup = (guarded_loop_try && shared_guard(&handler.body) && self.assembler.at_original_shared_cleanup_join())
+                || handler_ends_with_preordered_cleanup
                 || handler_has_elided_for_break_cleanup
                 || handler_has_finalizer_false_join
                 || handler_has_guarded_finally_cleanup
