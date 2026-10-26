@@ -11696,6 +11696,13 @@ impl<'source> Compiler<'source> {
                             self.control.exceptions.active_try_marker_slots.len().checked_sub(finally_context.try_body_depth),
                         ) {
                             ([_], 1, Some(0)) | ([_], 2, Some(1)) => true,
+                            // An ordinary try on each side of the manager places
+                            // one omitted POP before its cleanup and one after it.
+                            ([_], 3, Some(2)) => {
+                                self.control.loops.contexts.is_empty()
+                                    && matches!(self.control.withs.active_with_exits.as_slice(), [manager]
+                                        if manager.exception_region_depth == 2)
+                            }
                             // The inner finally has already run. Its own POP is in
                             // the prefix before the manager rather than after it.
                             ([_, inner], 2, Some(0)) => {
@@ -11749,14 +11756,18 @@ impl<'source> Compiler<'source> {
                         && self.control.finally.active_normal_finally_bodies == 0
                         && self.control.finally.active_copied_finally_bodies == 0)
                         .then(|| {
+                            let ordinary_pops = self.control.exceptions.active_try_marker_slots.len() - finally_context.try_body_depth;
+                            let inner_pop = ordinary_pops > 0 && return_finally_contexts.len() == 1
+                                && matches!(self.control.withs.active_with_exits.as_slice(), [manager]
+                                    if manager.exception_region_depth < self.control.exceptions.active_exception_region_exclusions.len());
                             (
                                 self.assembler.item_count(),
-                                self.control.exceptions.active_try_marker_slots.len() - finally_context.try_body_depth,
+                                (inner_pop, ordinary_pops - usize::from(inner_pop)),
                                 self.control.withs.active_with_exits.len(),
                             )
                         });
                     let copied_manager_none_pop = copied_manager_return_pop
-                        .filter(|(_, ordinary_try_pops, managers)| {
+                        .filter(|(_, (_, ordinary_try_pops), managers)| {
                             self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                                 == CO_COROUTINE
                                 && *managers == 1
@@ -12472,15 +12483,10 @@ impl<'source> Compiler<'source> {
                             );
                     }
                     if result.is_ok()
-                        && let Some((pop_item, ordinary_try_pops, managers)) =
-                            copied_manager_return_pop
+                        && let Some((pop_item, try_pops, managers)) = copied_manager_return_pop
                     {
                         self.assembler.record_copied_manager_return_compaction(
-                            pop_item,
-                            ordinary_try_pops,
-                            managers,
-                            None,
-                            false,
+                            pop_item, try_pops, managers, None, false,
                         );
                     }
                     if result.is_ok()
@@ -12500,7 +12506,7 @@ impl<'source> Compiler<'source> {
                         if preserve_tos {
                             self.assembler.record_copied_manager_return_compaction(
                                 pop_item,
-                                ordinary_try_pops,
+                                (false, ordinary_try_pops),
                                 1,
                                 Some(outer_handler),
                                 false,
@@ -12519,7 +12525,7 @@ impl<'source> Compiler<'source> {
                     {
                         self.assembler.record_copied_manager_return_compaction(
                             pop_item,
-                            1,
+                            (false, 1),
                             1,
                             Some(outer_handler),
                             true,

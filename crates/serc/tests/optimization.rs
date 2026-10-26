@@ -1906,6 +1906,43 @@ fn erased_loop_break_keeps_async_manager_finally_boundary() {
 }
 
 #[test]
+fn saved_return_tracks_try_pops_on_each_side_of_a_manager() {
+    let source = r"async def sample(job, flag):
+    try:
+        with manager():
+            try:
+                return await job
+            except LookupError:
+                recover()
+    except ValueError:
+        recover()
+    finally:
+        if flag:
+            finish()
+";
+    assert_matches_cpython(source, "saved_manager_return.py", &LEVELS);
+
+    let source = r"async def sample(job, value, flag):
+    def read():
+        return flag
+    try:
+        with manager():
+            try:
+                if value:
+                    record()
+                else:
+                    use(job)
+                    return value
+            except LookupError:
+                recover()
+    finally:
+        if flag is not None:
+            finish()
+";
+    assert_matches_cpython(source, "saved_manager_cell.py", &LEVELS);
+}
+
+#[test]
 fn tuple_unpack_prefix_keeps_retained_setup_marker_owner() {
     let source = r#"async def sample(healthy):
     group = attach({**originals, **({"peer": peer} if healthy else {})})
