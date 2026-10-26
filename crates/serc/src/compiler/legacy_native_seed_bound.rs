@@ -251,7 +251,7 @@ impl<'ast> Counter<'ast> {
                 } else {
                     // Native reserves body/end/exit/cleanup and emits one normal
                     // jump plus two reraises around its normal/exceptional copies.
-                    self.counts.add(4, 1, 2);
+                    self.counts.add_with_unlabeled_successors(4, 1, 0, 2);
                     self.frames.push(Frame::Finally(&statement.finalbody));
                     if statement.handlers.is_empty() {
                         self.suite(&statement.body)?;
@@ -372,7 +372,7 @@ impl<'ast> Counter<'ast> {
         if statement.is_star {
             self.counts.add(7, 4, 2);
         } else {
-            self.counts.add(4, 1, 2);
+            self.counts.add_with_unlabeled_successors(4, 1, 0, 2);
         }
         self.suite(&statement.body)?;
         if !statement.is_star {
@@ -384,9 +384,12 @@ impl<'ast> Counter<'ast> {
                 self.counts.add(5, 4, 0);
                 self.frames.push(Frame::ExceptStarBarrier);
             } else {
-                self.counts.add(
+                // Both normal exits jump over the following labeled handler or cleanup.
+                // Only a typed handler's test has an unlabeled successor.
+                self.counts.add_with_unlabeled_successors(
                     if handler.name.is_some() { 3 } else { 2 },
                     1 + u32::from(handler.type_.is_some()),
+                    u32::from(handler.type_.is_some()),
                     u32::from(handler.name.is_some()),
                 );
             }
@@ -756,7 +759,7 @@ mod tests {
             Some(Counts {
                 labels: 24,
                 jumps: 10,
-                unlabeled_jump_successors: 4,
+                unlabeled_jump_successors: 3,
                 exits: 12,
             }),
         );
@@ -839,7 +842,7 @@ mod tests {
             Some(Counts {
                 labels: 11,
                 jumps: 4,
-                unlabeled_jump_successors: 4,
+                unlabeled_jump_successors: 1,
                 exits: 6
             }),
         );
@@ -861,7 +864,7 @@ mod tests {
             Some(Counts {
                 labels: 6,
                 jumps: 1,
-                unlabeled_jump_successors: 1,
+                unlabeled_jump_successors: 0,
                 exits: 5,
             }),
         );
@@ -872,7 +875,7 @@ mod tests {
             Some(Counts {
                 labels: 9,
                 jumps: 4,
-                unlabeled_jump_successors: 4,
+                unlabeled_jump_successors: 3,
                 exits: 6,
             }),
         );
@@ -881,7 +884,7 @@ mod tests {
             Some(Counts {
                 labels: 6,
                 jumps: 1,
-                unlabeled_jump_successors: 1,
+                unlabeled_jump_successors: 0,
                 exits: 7,
             }),
         );
@@ -898,7 +901,7 @@ mod tests {
             Some(Counts {
                 labels: 19,
                 jumps: 11,
-                unlabeled_jump_successors: 11,
+                unlabeled_jump_successors: 9,
                 exits: 17,
             }),
         );
@@ -911,7 +914,7 @@ mod tests {
             Some(Counts {
                 labels: 33,
                 jumps: 18,
-                unlabeled_jump_successors: 9,
+                unlabeled_jump_successors: 8,
                 exits: 11,
             }),
         );
@@ -926,7 +929,7 @@ mod tests {
             Some(Counts {
                 labels: 13,
                 jumps: 10,
-                unlabeled_jump_successors: 9,
+                unlabeled_jump_successors: 8,
                 exits: 5,
             }),
         );
@@ -937,7 +940,7 @@ mod tests {
             Some(Counts {
                 labels: 12,
                 jumps: 6,
-                unlabeled_jump_successors: 5,
+                unlabeled_jump_successors: 4,
                 exits: 5,
             }),
         );
@@ -952,7 +955,7 @@ mod tests {
             Some(Counts {
                 labels: 17,
                 jumps: 9,
-                unlabeled_jump_successors: 9,
+                unlabeled_jump_successors: 6,
                 exits: 9,
             }),
         );
@@ -963,7 +966,7 @@ mod tests {
             Some(Counts {
                 labels: 25,
                 jumps: 15,
-                unlabeled_jump_successors: 14,
+                unlabeled_jump_successors: 13,
                 exits: 8,
             }),
         );
@@ -986,12 +989,12 @@ mod tests {
             Some(Counts {
                 labels: 9,
                 jumps: 4,
-                unlabeled_jump_successors: 4,
+                unlabeled_jump_successors: 3,
                 exits: 9,
             }),
         );
         let source = format!(
-            "def f(flag):\n    try:\n        pass\n    finally:\n{}",
+            "def f(flag):\n    try:\n        pass\n    finally:\n{}    raise Error\n",
             "        if flag:\n            pass\n".repeat(30),
         );
         let budget = counts(&source).unwrap();
@@ -1000,8 +1003,8 @@ mod tests {
             Counts {
                 labels: 66,
                 jumps: 61,
-                unlabeled_jump_successors: 61,
-                exits: 5,
+                unlabeled_jump_successors: 60,
+                exits: 6,
             },
         );
         assert_eq!(budget.max_label(), 255);
@@ -1173,7 +1176,7 @@ mod tests {
             Some(Counts {
                 labels: 61,
                 jumps: 32,
-                unlabeled_jump_successors: 17,
+                unlabeled_jump_successors: 15,
                 exits: 17,
             }),
         );

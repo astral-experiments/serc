@@ -19103,6 +19103,22 @@ fn python312_value_patterns_preserve_loop_jump_widths() {
 }
 
 #[test]
+fn python312_labeled_handler_successors_preserve_loop_jump_widths() {
+    let mut source = String::from("def check(active, items):\n");
+    source.push_str(&"    padding = 0\n".repeat(136));
+    source.push_str(&"    try:\n        work()\n    except:\n        recover()\n".repeat(25));
+    source.push_str("    for item in items:\n");
+    source.push_str(&"        padding = 1\n".repeat(124));
+    source.push_str("        if active:\n            finish(item)\n");
+    assert_matches_cpython_versions(
+        &source,
+        "handler_successor_jump_width.py",
+        &LEVELS,
+        &[PythonVersion::Py312],
+    );
+}
+
+#[test]
 fn python312_labeled_conditional_successors_preserve_loop_jump_widths() {
     let mut source = String::from(
         "async def choose(items, flag):\n    try:\n        prepare()\n    except:\n        recover()\n",
