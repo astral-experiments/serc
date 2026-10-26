@@ -40626,11 +40626,11 @@ impl<'source> Compiler<'source> {
             }
         }
 
-        // One erased finalizer leaves only its POP_BLOCK before the short return.
-        // The assembler still applies its original-array budget to either exit.
+        // A resumable function keeps just the erased finalizer's POP_BLOCK
+        // before the short return. Both manager exits can copy that return.
         let inline_erased_finalizer_exit = self.context.python_version
             >= crate::PythonVersion::Py314
-            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) != 0
             && self.control.finally.active_finally_try_bodies == 1
             && self.control.finally.active_normal_finally_bodies == 0
             && self.control.finally.active_copied_finally_bodies == 0
