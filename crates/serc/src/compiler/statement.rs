@@ -2612,6 +2612,9 @@ impl<'source> Compiler<'source> {
                             .set_location(self.source_location(statement.range));
                         self.compile_try_inner(statement, TryCompileOptions::STANDARD)?;
                         self.assembler.set_location(SourceLocation::NONE);
+                        if self.context.python_version == crate::PythonVersion::Py312 {
+                            self.assembler.record_current_original_scope_exit();
+                        }
                         self.emit_deferred_implicit_return()?;
                         self.assembler.set_location(previous);
                         self.control.statements.emitted_fallthrough_return = true;

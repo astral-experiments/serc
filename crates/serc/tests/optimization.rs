@@ -11976,6 +11976,21 @@ fn terminal_finally_loop_after_linear_cleanup_preserves_returns() {
 }
 
 #[test]
+fn repeated_guards_keep_the_original_legacy_scope_exit() {
+    for source in [
+        "def run(first, last):\n    if first:\n        assert first\n    if last:\n        consume()\n    assert last\n",
+        "def run(first, last):\n    try:\n        if first:\n            assert first\n    finally:\n        if last:\n            consume()\n",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "legacy_scope_exit.py",
+            &LEVELS,
+            &[PythonVersion::Py312],
+        );
+    }
+}
+
+#[test]
 fn terminating_if_before_erased_assertions_preserves_the_legacy_footer() {
     for body in [
         "return None",
