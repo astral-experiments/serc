@@ -11,11 +11,12 @@ use super::super::{
 };
 use crate::target::opcodes::{
     CALL, CALL_FUNCTION_EX, CALL_INTRINSIC_1, CLEANUP_THROW, COMPARE_OP, CONTAINS_OP, COPY,
-    COPY_FREE_VARS, END_SEND, IS_OP, JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD,
-    LOAD_CLOSURE, LOAD_CONST, LOAD_FAST, LOAD_FAST_LOAD_FAST, LOAD_GLOBAL, MAKE_CELL, NOP, POP_TOP,
-    PUSH_NULL, RERAISE, RESUME, RETURN_CONST, RETURN_GENERATOR, RETURN_VALUE, SEND, STORE_ATTR,
-    STORE_DEREF, STORE_FAST, STORE_FAST_LOAD_FAST, STORE_FAST_STORE_FAST, STORE_GLOBAL, STORE_NAME,
-    STORE_SLICE, STORE_SUBSCR, TO_BOOL, UNARY_NOT, YIELD_VALUE,
+    COPY_FREE_VARS, END_ASYNC_FOR, END_SEND, GET_ANEXT, IS_OP, JUMP_BACKWARD,
+    JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD, LOAD_CLOSURE, LOAD_CONST, LOAD_FAST,
+    LOAD_FAST_LOAD_FAST, LOAD_GLOBAL, MAKE_CELL, NOP, POP_TOP, PUSH_NULL, RERAISE, RESUME,
+    RETURN_CONST, RETURN_GENERATOR, RETURN_VALUE, SEND, STORE_ATTR, STORE_DEREF, STORE_FAST,
+    STORE_FAST_LOAD_FAST, STORE_FAST_STORE_FAST, STORE_GLOBAL, STORE_NAME, STORE_SLICE,
+    STORE_SUBSCR, TO_BOOL, UNARY_NOT, YIELD_VALUE,
 };
 use crate::target::operands::ResumeLocation;
 use crate::target::{is_conditional_jump_for, is_unconditional_jump};
@@ -1765,7 +1766,18 @@ impl OptimizationPipeline {
             let target = label_group(targets[&entry])?;
             // The handler's cleanup SETUP is its first instruction. A body
             // SETUP instead precedes its entry label in the preceding array.
-            let owner = if Some(entry) == wrapper || handler_groups.contains(&position) {
+            // The exhaustion SETUP starts the async iteration header. Its
+            // backedge enters the same array again on every iteration.
+            let async_iteration = group_instructions(position)
+                .next()
+                .is_some_and(|i| i.opcode == GET_ANEXT)
+                && group_instructions(target)
+                    .next()
+                    .is_some_and(|i| i.opcode == END_ASYNC_FOR);
+            let owner = if Some(entry) == wrapper
+                || handler_groups.contains(&position)
+                || async_iteration
+            {
                 position
             } else if self
                 .exception_owner_provenance
