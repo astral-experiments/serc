@@ -319,7 +319,7 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) copied_bare_handler_none_prefixes: Vec<(Label, Label, [Instruction; 10])>,
     pub(super) copied_iterator_attribute_none_prefixes: Vec<[Instruction; 4]>,
     pub(super) copied_cleanup_return_none_prefixes: Vec<CopiedCleanupReturnNonePrefix>,
-    pub(super) copied_return_setups: Vec<CopiedReturnSetup>,
+    pub(super) copied_finalizer_setups: Vec<CopiedFinalizerSetup>,
     pub(super) copied_return_pop_prefixes: Vec<CopiedReturnPopPrefix>,
     pub(super) copied_return_truth_prefixes: Vec<CopiedReturnTruthPrefix>,
     pub(super) copied_return_membership_prefixes: Vec<CopiedReturnMembershipPrefix>,
@@ -609,7 +609,7 @@ impl ExceptionOwnerProvenance {
                     .map(|origin| &origin.condition),
             )
             .chain(
-                self.copied_return_setups
+                self.copied_finalizer_setups
                     .iter()
                     .filter_map(|origin| origin.records.last()),
             )
@@ -846,7 +846,7 @@ impl ExceptionOwnerProvenance {
                 visit(instruction);
             }
         }
-        for origin in &mut self.copied_return_setups {
+        for origin in &mut self.copied_finalizer_setups {
             for record in &mut origin.records {
                 visit(record);
             }
@@ -1126,9 +1126,9 @@ pub(super) struct CopiedReturnNonePrefix {
     pub(super) condition: Instruction,
 }
 
-/// The retained SETUP and its primitive condition after a return unwinds a finally.
+/// The retained SETUP and first guard of a copied finalizer.
 #[derive(Debug)]
-pub(super) struct CopiedReturnSetup {
+pub(super) struct CopiedFinalizerSetup {
     pub(super) records: SmallVec<[Instruction; 4]>,
     pub(super) missing_pops: usize,
     pub(super) adjacent_pops: usize,
@@ -5814,8 +5814,8 @@ impl LayoutAssembler {
         original == origin.unwind_offset + 9 && live == marker + 1
     }
 
-    /// Locates the retained SETUP and preceding unowned POPs in the original return block.
-    fn copied_return_setup_is_null(
+    /// Locates the retained SETUP and preceding unowned POPs in the original exit block.
+    fn copied_finalizer_setup_is_null(
         &self,
         marker: usize,
         array: usize,
@@ -5829,7 +5829,7 @@ impl LayoutAssembler {
         };
         let mut origins = self
             .exception_owner_provenance
-            .copied_return_setups
+            .copied_finalizer_setups
             .iter()
             .filter(|origin| origin.records.last() == instructions.get(condition_index).copied());
         let Some(origin) = origins.next() else {
@@ -5860,9 +5860,6 @@ impl LayoutAssembler {
                 .enumerate()
                 .any(|(i, (record, actual))| {
                     let mut expected = *record;
-                    if i == 0 {
-                        expected.local_policy.add_hidden_exception_owner_slots(1);
-                    }
                     if i == 1 && actual.opcode == crate::target::opcodes::LOAD_FAST_BORROW {
                         expected.opcode = actual.opcode;
                     }
@@ -5871,10 +5868,11 @@ impl LayoutAssembler {
         {
             return false;
         }
-        let condition = *instructions[condition_index];
-        let Some(before) = tail.early_removals.checked_sub(usize::from(
-            condition.local_policy.hidden_exception_owner_slots(),
-        )) else {
+        let mut guard_tail = ExceptionOwnerTail::default();
+        for instruction in &origin.records[1..] {
+            guard_tail.instruction(instruction, None);
+        }
+        let Some(before) = tail.early_removals.checked_sub(guard_tail.early_removals) else {
             return false;
         };
         let original_setup = setup + before + origin.missing_pops;
@@ -10537,7 +10535,7 @@ impl LayoutAssembler {
                             && owners
                                 .get(instruction_index)
                                 .is_none_or(|decision| !decision.is_definitive())
-                            && self.copied_return_setup_is_null(
+                            && self.copied_finalizer_setup_is_null(
                                 instruction_index,
                                 original_array_start,
                                 tail,

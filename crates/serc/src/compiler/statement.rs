@@ -7213,6 +7213,52 @@ impl<'source> Compiler<'source> {
                 let context = self.control.loops.contexts.last().copied().ok_or_else(|| {
                     CompileError::invalid_syntax("'continue' not properly in loop", statement.range)
                 })?;
+                let nested_handler_setup = match (
+                    self.control.exceptions.active_exception_handlers.as_slice(),
+                    self.control.finally.active_loop_finally_contexts.as_slice(),
+                ) {
+                    ([outer, inner], [finally])
+                        if self.context.python_version == crate::PythonVersion::Py314
+                            && self.unit.flags
+                                & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                                == 0
+                            && context.iterator_cleanup == IteratorCleanup::Sync
+                            && context.exception_region_depth == 0
+                            && self.control.withs.active_with_exits.is_empty()
+                            && self.control.exceptions.active_try_marker_slots.is_empty()
+                            && self.control.exceptions.active_exception_group_handlers == 0
+                            && self
+                                .control
+                                .exceptions
+                                .active_exception_region_exclusions
+                                .len()
+                                == 3
+                            && self.control.finally.active_finally_try_bodies == 1
+                            && self.control.finally.active_finally_end_blocks == 0
+                            && self.control.finally.active_normal_finally_bodies == 0
+                            && self.control.finally.active_copied_finally_bodies == 0
+                            && finally.handler_depth == 0
+                            && finally.exception_region_depth == 0
+                            && finally.loop_depth == self.control.loops.contexts.len()
+                            && outer.exception_region_depth == 1
+                            && inner.exception_region_depth == 2
+                            && [outer, inner].iter().all(|handler| {
+                                handler.with_depth == 0
+                                    && handler.try_body_depth == 0
+                                    && handler.finally_end_depth == 0
+                                    && handler.loop_depth == finally.loop_depth
+                            })
+                            && matches!(finally.body.first(), Some(Stmt::Try(nested)) if !nested.is_star
+                            && nested.handlers.is_empty() && !nested.finalbody.is_empty()
+                            && matches!(nested.body.first(), Some(Stmt::If(_)))) =>
+                    {
+                        Some((
+                            self.assembler.item_count(),
+                            [inner.name.is_some(), outer.name.is_some()],
+                        ))
+                    }
+                    _ => None,
+                };
                 // This direct named handler contributes two original POP_BLOCKs before
                 // its four name-cleanup records. No other unwind may add hidden records.
                 let continued_handler_origin = (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
@@ -7631,6 +7677,9 @@ impl<'source> Compiler<'source> {
                     self.control.withs.active_with_exits.len(),
                     false,
                 );
+                if let Some((item, names)) = nested_handler_setup {
+                    self.assembler.record_copied_continue_setup(item, names);
+                }
                 if let Some(origin) = continued_handler_try_origin {
                     self.assembler.record_continued_handler_try_prefix(origin);
                 }
