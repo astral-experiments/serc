@@ -6995,26 +6995,24 @@ impl<'source> Compiler<'source> {
                 if copied_finalizer_location.is_some() {
                     self.assembler.set_location(iterator_location);
                 }
-                if context.break_policy.returns() {
-                    if self.context.python_version == crate::PythonVersion::Py313
-                        && self.assembler.instruction_count() == marker_end
-                        && self.control.exceptions.active_exception_handlers.is_empty()
-                        && let Some(boundary) = exclusion_start
+                if self.context.python_version == crate::PythonVersion::Py313
+                    && self.assembler.instruction_count() == marker_end
+                    && self.control.exceptions.active_exception_handlers.is_empty()
+                    && let Some(boundary) = exclusion_start
+                {
+                    // Ordinary try pops still count when early exit copying
+                    // replaces a break jump with a return or reraise.
+                    for _ in context.exception_region_depth
+                        ..self
+                            .control
+                            .exceptions
+                            .active_exception_region_exclusions
+                            .len()
                     {
-                        // This break unwinds only ordinary try blocks: no manager,
-                        // handler, or finalizer emitted cleanup after its marker.
-                        // Their POP_BLOCKs are still NOP slots during native early
-                        // exit copying, before the already-copied return pair.
-                        for _ in context.exception_region_depth
-                            ..self
-                                .control
-                                .exceptions
-                                .active_exception_region_exclusions
-                                .len()
-                        {
-                            self.assembler.add_legacy_pop_block_copy_slot(boundary);
-                        }
+                        self.assembler.add_legacy_pop_block_copy_slot(boundary);
                     }
+                }
+                if context.break_policy.returns() {
                     if self.unit.flags & CO_GENERATOR != 0 {
                         // This copied implicit return leaves the terminal try just as an
                         // ordinary fallthrough does; its preceding handler cleanup does not.

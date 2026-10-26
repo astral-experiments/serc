@@ -9073,6 +9073,27 @@ fn completed_manager_work_preserves_retained_loop_owners() {
 }
 
 #[test]
+fn copied_break_exits_count_the_protected_try_cleanup() {
+    let source = r"def select(left, right, ready):
+    try:
+        prepare()
+    finally:
+        while ready:
+            try:
+                result = left if ready else right
+                break
+            except ValueError:
+                recover()
+";
+    assert_matches_cpython_versions(
+        source,
+        "protected_break.py",
+        &LEVELS,
+        &[PythonVersion::Py313],
+    );
+}
+
+#[test]
 fn protected_conditional_store_preserves_erased_else_backedge() {
     let protected = r"def collect(batches, left, right, cleanup, sink):
     try:
