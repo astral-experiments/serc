@@ -24345,10 +24345,6 @@ impl<'source> Compiler<'source> {
                 // An emitted break targets a separate original array after END_FOR
                 // and POP_ITER. Its cleanup conditions cannot borrow earlier slots.
                 self.assembler.record_exception_owner_block_boundary(end);
-                if !statement.orelse.is_empty() {
-                    self.assembler
-                        .record_sync_for_else_end(end, base_depth.cast_unsigned());
-                }
             }
             self.assembler.mark(end);
         }
@@ -38704,59 +38700,13 @@ impl<'source> Compiler<'source> {
                 }
             }
             if self.context.python_version >= crate::PythonVersion::Py314
-                && !preserve_exit_nop
-                && matches!(self.unit.scope, Scope::Function { .. })
-                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
-                && !statement.is_star
-                && statement.handlers.is_empty()
-                && statement.orelse.is_empty()
-                && self.control.withs.active_with_exits.is_empty()
-                && self.control.withs.active_with_region_exclusions.is_empty()
-                && self.control.exceptions.active_exception_handlers.is_empty()
-                && self.control.exceptions.active_exception_group_handlers == 0
-                && self
-                    .control
-                    .exceptions
-                    .active_exception_region_exclusions
-                    .is_empty()
-                && self.control.finally.active_finally_try_bodies == 0
-                && self.control.finally.active_normal_finally_bodies == 0
-                && self.control.finally.active_copied_finally_bodies == 0
-                && self.control.finally.active_finally_end_blocks == 0
-                && self.control.finally.active_overriding_finally_returns == 0
-                && let [Stmt::For(tail)] = statement.finalbody.as_slice()
-                && !tail.is_async
-                && !expression_contains_inline_branch(&tail.iter)
-                && !expression_suspends_current_scope(&tail.iter)
-                && !expression_contains_inline_branch(&tail.target)
-                && !expression_suspends_current_scope(&tail.target)
-                && let Some(Stmt::Expr(discard)) = tail.orelse.last()
-                && let Expr::Call(call) = discard.value.as_ref()
-                && !expression_contains_inline_branch(&discard.value)
-                && !expression_suspends_current_scope(&discard.value)
+                && matches!(statement.finalbody.last(), Some(Stmt::For(tail))
+                    if !tail.is_async && suite_contains_loop_break(&tail.body))
             {
-                let authored_break = match tail.body.as_slice() {
-                    [Stmt::Break(authored)] => Some(authored),
-                    [Stmt::If(branch)]
-                        if branch.elif_else_clauses.is_empty()
-                            && early_condition_truthiness(&branch.test) != Some(false)
-                            && !expression_contains_inline_branch(&branch.test)
-                            && !expression_suspends_current_scope(&branch.test) =>
-                    {
-                        match branch.body.as_slice() {
-                            [Stmt::Break(authored)] => Some(authored),
-                            _ => None,
-                        }
-                    }
-                    _ => None,
-                };
-                if let Some(authored_break) = authored_break {
-                    self.assembler.preserve_sync_for_else_finally_exit(
-                        normal_exit,
-                        self.source_location(authored_break.range),
-                        self.call_opcode_location(call),
-                    );
-                }
+                // Breaks can thread past the normal-finally jump. Its fallthrough
+                // still owns the exhausted iterator or else suite's source line.
+                self.assembler
+                    .preserve_redundant_jump_nop_after_threading(normal_exit);
             }
             if copied_loop_exit.is_some() {
                 self.assembler.preserve_direct_inlined_jump_nop(normal_exit);

@@ -18934,6 +18934,30 @@ fn nested_iterator_value_return_preserves_cleanup_exit_locations() {
 }
 
 #[test]
+fn iterator_exhaustion_preserves_the_normal_finally_exit() {
+    let source = "def process(values):\n    try:\n        prepare()\n    finally:\n        for value in values:\n            if value:\n                break\n    finish()\n";
+    let with_else = source.replace(
+        "    finish()",
+        "        else:\n            exhausted()\n    finish()",
+    );
+    for source in [
+        source.to_owned(),
+        with_else.replace(
+            "                break",
+            "                consume(value)\n                break",
+        ),
+        with_else,
+    ] {
+        assert_matches_cpython_versions(
+            &source,
+            "iterator_finally_exit.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn managed_finalizer_loops_preserve_empty_borrow_exit() {
     for manager in ["", "with acquire():", "with acquire(), acquire():"] {
         for prefix in ["def", "async def"] {
