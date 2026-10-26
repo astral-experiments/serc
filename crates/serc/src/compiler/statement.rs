@@ -31490,6 +31490,17 @@ impl<'source> Compiler<'source> {
                 // These shared normal exits have no unique source donor. Keep the
                 // artificial named cleanup unlocated so its jump cannot give the
                 // following finally POP_BLOCK the last terminating arm's line.
+                // Each short-circuit false edge reaches the same handler cleanup.
+                // A loop backedge cannot donate the final body's line to that join.
+                let handler_has_shared_while_cleanup = handler.name.is_some()
+                    && handler_cleanup_has_normal_finally_successor
+                    && self.context.python_version >= crate::PythonVersion::Py314
+                    && matches!(handler.body.last(), Some(Stmt::While(tail))
+                        if tail.orelse.is_empty()
+                            && !suite_contains_loop_break(&tail.body)
+                            && condition_has_only_runtime_tests(&tail.test)
+                            && condition_jump_target_count(&tail.test, false) > 1)
+                    && self.assembler.at_original_jump_only_conditional_join();
                 let handler_has_shared_normal_finally_cleanup = handler.name.is_some()
                     && !terminal
                     && loop_tail.is_none()
@@ -31624,6 +31635,7 @@ impl<'source> Compiler<'source> {
                 if (self.context.python_version <= crate::PythonVersion::Py313
                     && self.assembler.at_jump_target())
                     || handler_cleanup_from_original_join
+                    || handler_has_shared_while_cleanup
                     || handler_has_shared_normal_finally_cleanup
                     || handler_ends_with_unlocated_bare_raise_branch_cleanup
                     || handler_has_shared_terminating_false_cleanup
@@ -31824,6 +31836,7 @@ impl<'source> Compiler<'source> {
                         .make_last_no_location_copy_inherit_shared_predecessor();
                 }
                 if handler_ends_with_preserved_unlocated_cleanup
+                    || handler_has_shared_while_cleanup
                     || handler_has_shared_normal_finally_cleanup
                     || handler_ends_with_unlocated_bare_raise_branch_cleanup
                     || (handler_ends_with_unlocated_if_cleanup
