@@ -15,6 +15,22 @@ use serc::{
 };
 
 #[test]
+fn nested_iterator_return_carries_the_cleanup_call_line() {
+    let source = r"def search(groups):
+    for group in groups:
+        try:
+            for item in group:
+                try:
+                    return item
+                finally:
+                    close()
+        except ValueError:
+            pass
+";
+    assert_matches_cpython(source, "iterator_cleanup_line.py", &LEVELS);
+}
+
+#[test]
 fn nested_conversion_handlers_keep_shared_cleanup() {
     let source = r"def sample(items):
     for item in items:
