@@ -12133,6 +12133,11 @@ impl<'source> Compiler<'source> {
                     let copied_finally_pop_instruction = self.assembler.instruction_count();
                     self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
                     if !starts_jump_target
+                        // The ordinary try and its finally each contribute a POP_BLOCK
+                        // at a shared value-return tail. Both survive early exit copying.
+                        || (self.context.python_version == crate::PythonVersion::Py312
+                            && preserve_tos
+                            && copied_return_none_pop_pair.is_some())
                         || shared_copied_cleanup_join
                         || copied_guard_exit_location.is_some()
                         || matches!(finally_context.body, [Stmt::Pass(_)])

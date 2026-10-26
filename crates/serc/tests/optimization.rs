@@ -7161,6 +7161,30 @@ fn managed_handler_finalizer_jump_keeps_enclosing_owner() {
 }
 
 #[test]
+fn protected_value_return_keeps_both_cleanup_slots_before_copying() {
+    for value in ["first if ready else second", "first and second"] {
+        for cleanup in ["saved = 1", "saved = first", "del first, second"] {
+            let source = format!(
+                "def run(ready, first, second):
+    try:
+        return {value}
+    except ValueError:
+        pass
+    finally:
+        {cleanup}
+"
+            );
+            assert_matches_cpython_versions(
+                &source,
+                "protected_value_return.py",
+                &LEVELS,
+                &[PythonVersion::Py312],
+            );
+        }
+    }
+}
+
+#[test]
 fn conditional_manager_finally_copies_iterator_cleanup() {
     let source = r"async def sample(items, first, second, manager, work, cleanup, finish):
     for item in items:
