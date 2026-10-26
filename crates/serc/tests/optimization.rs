@@ -9088,6 +9088,24 @@ fn completed_manager_work_preserves_retained_loop_owners() {
 }
 
 #[test]
+fn repeated_finalizer_predecessor_keeps_the_manager_pop_unlocated() {
+    let source = r"def run(manager, ready):
+    with manager:
+        try:
+            if ready:
+                assert valid()
+        finally:
+            close()
+";
+    assert_matches_cpython_versions(
+        source,
+        "repeated_manager_pop.py",
+        &LEVELS,
+        &[PythonVersion::Py312],
+    );
+}
+
+#[test]
 fn protected_conditional_store_preserves_erased_else_backedge() {
     let protected = r"def collect(batches, left, right, cleanup, sink):
     try:
