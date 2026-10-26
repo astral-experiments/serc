@@ -1966,6 +1966,21 @@ impl OptimizationPipeline {
             let Some((block, instruction)) = instructions.next() else {
                 continue;
             };
+            if instruction.opcode == NOP
+                && instruction.fusion_policy.is_converted_pop_block()
+                && instruction.location == SourceLocation::NONE
+                && self.graph[block].items().iter().any(|item| {
+                    matches!(item, Item::Label(label)
+                    if self.exception_owner_provenance.original_manager_pop_blocks.contains(label))
+                })
+            {
+                // A shared manager POP cannot inherit a line from the cleanup
+                // array visited twice. Its physical fragment is checked again
+                // after cold placement, before restoring the native count.
+                let (ordinary, native) = predecessor_counts[index];
+                tails.push((block, *instruction, ordinary, native));
+                continue;
+            }
             // Completed SETUP regions do not own a later original scope footer.
             // Its repeated count still prevents the final call's line donation.
             let original_scope_exit = fragments.iter().any(|block| {
