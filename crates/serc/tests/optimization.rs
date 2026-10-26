@@ -16178,6 +16178,31 @@ fn nested_function_finally_retains_terminating_handler_boundary() {
 }
 
 #[test]
+fn deferred_handler_return_replays_the_inner_finalizer_owner() {
+    let source = r"async def run(value, flag):
+    try:
+        try:
+            start()
+        except RuntimeError:
+            return
+        finally:
+            consume(value)
+    finally:
+        if flag is not None:
+            finish()
+        done()
+";
+    for returned in ["return", "return 1"] {
+        assert_matches_cpython_versions(
+            &source.replace("return", returned),
+            "deferred_handler_return.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn sole_handler_retains_nested_finally_entry_marker() {
     for (header, suspension) in [("def", ""), ("async def", "await ")] {
         for recovery in ["pass", "recover(resource)"] {

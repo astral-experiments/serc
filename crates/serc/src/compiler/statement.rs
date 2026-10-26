@@ -11681,6 +11681,34 @@ impl<'source> Compiler<'source> {
                         && self.control.finally.active_copied_finally_bodies == 0
                         && self.control.finally.preserved_return_value_contexts.is_empty())
                         .then(|| (self.assembler.item_count(), self.control.withs.active_with_exits.len()));
+                    // A deferred return from this unnamed handler unwinds its two POPs
+                    // before copying both finalizers. The outer None test can reuse the
+                    // last protected instruction of the already-compiled inner suite.
+                    let nested_handler_exit = self.context.python_version
+                        == crate::PythonVersion::Py314
+                        && !preserve_tos
+                        && !return_is_overridden
+                        && context_index == 0
+                        && return_finally_contexts.len() == 2
+                        && finally_context.handler_depth == 0
+                        && finally_context.exception_region_depth == 0
+                        && self.control.exceptions.active_try_marker_slots.is_empty()
+                        && self.control.withs.active_with_exits.is_empty()
+                        && self
+                            .control
+                            .loops
+                            .contexts
+                            .iter()
+                            .all(|context| context.iterator_cleanup == IteratorCleanup::None)
+                        && matches!(self.control.exceptions.active_exception_handlers.as_slice(), [handler]
+                            if handler.name.is_none() && handler.with_depth == 0 && handler.try_body_depth == 0
+                                && handler.exception_region_depth == 2)
+                        && self
+                            .control
+                            .exceptions
+                            .active_exception_region_exclusions
+                            .len()
+                            == 3;
                     let copied_manager_return_pop = (matches!(
                             self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR),
                             0 | CO_COROUTINE
@@ -12333,7 +12361,7 @@ impl<'source> Compiler<'source> {
                             }
                         },
                     );
-                    if result.is_ok() && preserve_tos {
+                    if result.is_ok() && (preserve_tos || nested_handler_exit) {
                         self.assembler
                             .record_copied_finally_none_prefix(copied_finally_pop_instruction);
                     }
