@@ -70,7 +70,12 @@ fn erased_value_cases_keep_the_last_pattern_failure_line() {
     else:
         assert tag
     if active:
-        use(tag)
+        match tag:
+            case 3:
+                use(tag)
+            case 4:
+                assert active
+    use(tag)
 ";
     assert_matches_cpython_versions(
         source,

@@ -637,7 +637,8 @@ impl Compiler<'_> {
                 .last()
                 .is_some_and(|case| is_wildcard_pattern(&case.pattern));
         let matched_cases = statement.cases.len() - usize::from(has_default);
-        let erased_final_value_case = self.has_erased_final_value_case(statement);
+        let erased_final_value_case =
+            self.control.statements.match_tail_before_if_exit == Some(statement.range);
         let mut failure_reaches_end = false;
         let mut specialized_none_seen = false;
         let mut or_default_success_exit = None;
