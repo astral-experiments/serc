@@ -6494,18 +6494,18 @@ impl OptimizationPipeline {
             }
             // A short keyword-call raise is also a scope exit in CPython's
             // original array. Keep the same empty-join provenance and location
-            // guards as returns; admit only its three unchanged records here.
+            // guards as returns, including an optional final keyword value load.
             let inline_unprotected_keyword_raise = inline_small_exit
                 && target_chain_end == target_position
-                && target_pre_fusion_size == 3
-                && graph[target]
-                    .items()
-                    .iter()
-                    .filter_map(|item| match item {
-                        Item::Instruction(instruction) => Some(instruction.opcode),
-                        Item::Label(_) => None,
-                    })
-                    .eq([LOAD_CONST, CALL_KW, RAISE_VARARGS])
+                && matches!(target_pre_fusion_size, 3 | 4)
+                && {
+                    let mut opcodes = graph[target].items().iter().filter_map(|item| {
+                        item.as_instruction().map(|instruction| instruction.opcode)
+                    });
+                    (target_pre_fusion_size == 3
+                        || matches!(opcodes.next(), Some(LOAD_FAST | LOAD_DEREF | LOAD_CONST)))
+                        && opcodes.eq([LOAD_CONST, CALL_KW, RAISE_VARARGS])
+                }
                 && graph[target]
                     .last_instruction()
                     .is_some_and(|instruction| instruction.value_argument() == Some(1))
