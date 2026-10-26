@@ -9073,6 +9073,25 @@ fn completed_manager_work_preserves_retained_loop_owners() {
 }
 
 #[test]
+fn nested_handler_return_counts_outer_try_pops_before_copying() {
+    let source = r"def select(left, right, flag):
+    try:
+        try:
+            fetch()
+        except ValueError:
+            return left if flag else right
+    except LookupError:
+        recover()
+";
+    assert_matches_cpython_versions(
+        source,
+        "handler_return.py",
+        &LEVELS,
+        &[PythonVersion::Py313],
+    );
+}
+
+#[test]
 fn protected_conditional_store_preserves_erased_else_backedge() {
     let protected = r"def collect(batches, left, right, cleanup, sink):
     try:

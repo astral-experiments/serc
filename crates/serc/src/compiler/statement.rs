@@ -10105,6 +10105,23 @@ impl<'source> Compiler<'source> {
                             start
                         });
                         self.emit(POP_EXCEPT, 0, -1)?;
+                        if self.context.python_version == crate::PythonVersion::Py313
+                            && preserve_tos
+                            && handler_count == 1
+                            && name.is_none()
+                            && try_body_depth > 0
+                            && next_finally == 0
+                            && next_loop == 0
+                            && next_with == 0
+                        {
+                            // CPython counts each enclosing try's POP_BLOCK after
+                            // POP_EXCEPT before deciding whether to copy this exit.
+                            let boundary = self.assembler.label();
+                            self.assembler.mark(boundary);
+                            for _ in 0..try_body_depth {
+                                self.assembler.add_legacy_pop_block_copy_slot(boundary);
+                            }
+                        }
                         if let Some(start) = named_handler_pop_start {
                             self.assembler.record_named_handler_pop_pair(start);
                         }
