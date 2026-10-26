@@ -15,6 +15,21 @@ use serc::{
 };
 
 #[test]
+fn protected_match_fallthrough_retains_its_exit_location() {
+    for (pattern, body) in [("Last()", "return item"), ("_", "consume(item)")] {
+        let source = format!(
+            "async def scan(item):\n    try:\n        match item:\n            case First():\n                return item\n            case Middle():\n                return item\n            case {pattern}:\n                {body}\n    except ValueError:\n        pass\n    finish()\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "protected_match_exit.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn nested_conversion_handlers_keep_shared_cleanup() {
     let source = r"def sample(items):
     for item in items:
