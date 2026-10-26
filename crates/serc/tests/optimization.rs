@@ -9073,6 +9073,25 @@ fn completed_manager_work_preserves_retained_loop_owners() {
 }
 
 #[test]
+fn coroutine_conditional_comprehension_returns_use_the_assignment_target() {
+    for expression in [
+        "[x for x in items]",
+        "{x for x in items}",
+        "{x: x for x in items}",
+    ] {
+        let source = format!(
+            "async def gather(items, enabled, fallback):\n    result = {expression} if enabled else fallback\n    assert enabled\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "conditional_comprehension.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn protected_conditional_store_preserves_erased_else_backedge() {
     let protected = r"def collect(batches, left, right, cleanup, sink):
     try:

@@ -2381,8 +2381,8 @@ impl<'source> Compiler<'source> {
                 && self.context.python_version >= crate::PythonVersion::Py314
                 && !is_final
                 && final_expression_becomes_return
-                && plain_function_suite
-                && !self.has_active_control_flow_region()
+                && (plain_function_suite
+                    || direct_function_suite && self.unit.flags & CO_COROUTINE != 0)
                 && !self.control.in_exception_handler()
                 && self.control.finally.is_inactive_for_return_unwind()
                 && matches!(statement, Stmt::Assign(assignment)
