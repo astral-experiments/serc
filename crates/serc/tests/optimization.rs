@@ -17401,6 +17401,17 @@ assert events == ['caught'], events
 }
 
 #[test]
+fn erased_assertion_exposes_shared_else_exit() {
+    let source = "def run(left, right, outer, value):\n    if outer:\n        if left:\n            pass\n        else:\n            if right:\n                value = left\n            assert left\n    else:\n        pass\n    observe(value)\n";
+    assert_matches_cpython_versions(
+        source,
+        "elided_nested_else_exit.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn nested_pass_exit_successors_match_cpython() {
     for successor in ["out = 1", "del item", "if flag:\n            assert flag"] {
         let source = format!(

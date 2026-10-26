@@ -17289,6 +17289,27 @@ impl<'source> Compiler<'source> {
             return None;
         }
         let (final_clause, earlier) = statement.elif_else_clauses.split_last()?;
+        // Erasing the suffix can expose a partial if whose true and false edges
+        // share the outer jump. Neither supplies a unique source position.
+        if final_clause.test.is_none()
+            && final_clause
+                .body
+                .last()
+                .is_some_and(|tail| self.context.is_elided_statement(tail))
+            && let Some(Stmt::If(guard)) = final_clause
+                .body
+                .iter()
+                .rev()
+                .find(|tail| !self.context.is_elided_statement(tail))
+            && guard.elif_else_clauses.is_empty()
+            && condition_has_only_runtime_tests(&guard.test)
+            && matches!(
+                nested_if_exit_location(guard, false),
+                Some(NestedIfExitLocation::Unlocated)
+            )
+        {
+            return Some(NestedIfExitLocation::Unlocated);
+        }
         if final_clause.test.is_some()
             || final_clause.body.is_empty()
             || !final_clause
