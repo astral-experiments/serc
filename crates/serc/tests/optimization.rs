@@ -15909,6 +15909,28 @@ fn optimized_empty_manager_bodies_match_cpython() {
 }
 
 #[test]
+fn compacted_constants_keep_manager_cleanup_slots() {
+    let source = r"async def sample(value):
+    if ('left', 'right'):
+        pass
+    try:
+        with scope():
+            await suspend()
+            return query(value)
+    finally:
+        if value is None:
+            release()
+        finish()
+";
+    assert_matches_cpython_versions(
+        source,
+        "manager_cleanup_constants.py",
+        &LEVELS,
+        &[PythonVersion::Py314],
+    );
+}
+
+#[test]
 fn modern_manager_finally_jump_and_copied_exit_keep_owners() {
     const JUMP_SOURCE: &str = "def f(manager, work):\n    try:\n        raise ValueError()\n    except ValueError:\n        with manager:\n            try:\n                work()\n            finally:\n                pass\n";
     const DIRECT_SOURCE: &str = "def f(manager, work):\n    with manager:\n        try:\n            work()\n        finally:\n            pass\n";
