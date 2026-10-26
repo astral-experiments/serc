@@ -9073,8 +9073,8 @@ fn completed_manager_work_preserves_retained_loop_owners() {
 }
 
 #[test]
-fn copied_finalizer_test_can_reuse_the_unowned_setup_slot() {
-    for calls in 0..=2 {
+fn copied_finalizer_test_can_reuse_unowned_unwind_slots() {
+    for calls in 0..=4 {
         for handler in ["finally:", "except KeyError:"] {
             let prefix = "        consume(value)\n".repeat(calls);
             let source = format!(
