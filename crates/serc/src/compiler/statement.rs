@@ -38770,6 +38770,21 @@ impl<'source> Compiler<'source> {
             if copied_loop_exit.is_some() {
                 self.assembler.preserve_direct_inlined_jump_nop(normal_exit);
             }
+            if self.context.python_version >= crate::PythonVersion::Py314
+                && runtime_assertion_exit
+                && !preserve_exit_nop
+                && !self.control.in_synchronous_with()
+                && self.control.finally.active_finally_try_bodies == 0
+                && suite_assert_success_fallthrough_range(&statement.finalbody).is_some()
+            {
+                // The sole success edge locates this original jump before the
+                // exceptional blocks move. Its late removal preserves the line
+                // and fallthrough to the continuation's borrowed loads.
+                self.assembler
+                    .preserve_redundant_jump_nop_after_threading(normal_exit);
+                self.assembler
+                    .mark_retained_nop_borrow_fallthrough_if_unblocked(normal_exit);
+            }
             if discarded_if_exit
                 && self.assembler.last_instruction_location() == Some(SourceLocation::NONE)
             {
