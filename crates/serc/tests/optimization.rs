@@ -2224,6 +2224,49 @@ fn erased_loop_exit_stays_inside_managed_finally() {
 }
 
 #[test]
+fn copied_coroutine_finalizers_unwind_nested_tries_after_cleanup() {
+    let samples = [
+        r"async def sample(value, enabled):
+    try:
+        while enabled:
+            try:
+                await prepare()
+                return value
+            except ValueError as error:
+                pass
+    except TypeError:
+        pass
+    finally:
+        key = value if value is not None else enabled
+        finish()
+",
+        r"async def sample(value, items):
+    try:
+        try:
+            async with acquire():
+                async with acquire():
+                    return value
+        except ValueError:
+            pass
+    except TypeError:
+        pass
+    finally:
+        if value is not None:
+            clean()
+        done()
+",
+    ];
+    for source in samples {
+        assert_matches_cpython_versions(
+            source,
+            "nested_coroutine_cleanup.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn copied_return_through_nested_loops_keeps_none_guard_owner() {
     let source = r#"async def sample(client, response):
     for attempt in range(client.attempts):
