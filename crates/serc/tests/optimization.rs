@@ -96,6 +96,16 @@ fn erased_named_handler_suffix_preserves_cleanup_copies() {
 }
 
 #[test]
+fn async_iterator_exhaustion_keeps_copied_branch_exit() {
+    for first in ["pass", "visit(item)", "if item: break"] {
+        let source = format!(
+            "async def collect(choose, left, right, result):\n    try:\n        if choose:\n            async for item in left:\n                {first}\n        else:\n            async for item in right:\n                visit(item)\n    except ValueError as error:\n        report(error)\n    return result\n"
+        );
+        assert_matches_cpython(&source, "async_iterator_exhaustion_join.py", &LEVELS);
+    }
+}
+
+#[test]
 fn conditional_try_body_preserves_else_return_join() {
     let source = r"def sample(flag):
     try:
