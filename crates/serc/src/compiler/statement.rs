@@ -4519,9 +4519,23 @@ impl<'source> Compiler<'source> {
                 .is_empty()
             && (self.context.python_version <= crate::PythonVersion::Py313
                 || if_suites(statement).any(|arm| {
-                    arm.last().is_some_and(|part| self.context.is_elided_statement(part))
-                        && matches!(arm.iter().rfind(|part| !self.context.is_elided_statement(part)),
-                            Some(Stmt::If(nested)) if nested.elif_else_clauses.last().is_some_and(|clause| clause.test.is_none()))
+                    if !arm.last().is_some_and(|part| self.context.is_elided_statement(part)) {
+                        return false;
+                    }
+                    let Some(Stmt::If(nested)) =
+                        arm.iter().rfind(|part| !self.context.is_elided_statement(part))
+                    else {
+                        return false;
+                    };
+                    // A final guard in the else suite still has a false edge of its own.
+                    nested.elif_else_clauses.last().is_some_and(|clause| {
+                        clause.test.is_none()
+                            && !matches!(
+                                clause.body.iter().rfind(|part| !self.context.is_elided_statement(part)),
+                                Some(Stmt::If(tail)) if tail.elif_else_clauses.is_empty()
+                                    && !suite_terminates(&tail.body)
+                            )
+                    })
                 }))
         {
             self.compile_if(statement)?;
@@ -44668,6 +44682,21 @@ fn nested_terminal_assignment_branches(statement: &ruff_python_ast::StmtIf) -> b
     let test = |test: &Expr| {
         condition_has_linear_runtime_leaves(test) && !expression_suspends_current_scope(test)
     };
+    // The nested guard at the end of the else arm has two independent
+    // return donors once the following assertion disappears.
+    if test(&statement.test)
+        && assignment(&statement.body)
+        && matches!(statement.elif_else_clauses.as_slice(), [clause]
+            if clause.test.is_none()
+                && matches!(clause.body.split_last(), Some((Stmt::If(tail), prefix))
+                    if prefix.iter().all(|part| assignment(std::slice::from_ref(part)))
+                        && tail.elif_else_clauses.is_empty()
+                        && test(&tail.test)
+                        && suite_has_linear_borrow_fallthrough(&tail.body)
+                        && !suite_contains_yield(&tail.body)))
+    {
+        return true;
+    }
     let Some((Stmt::If(nested), prefix)) = statement.body.split_last() else {
         return false;
     };

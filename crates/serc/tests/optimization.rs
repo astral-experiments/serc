@@ -5605,6 +5605,28 @@ fn erased_nested_else_preserves_coroutine_loop_exits() {
 }
 
 #[test]
+fn erased_assertion_keeps_both_exits_from_a_nested_else_guard() {
+    let source = r"def run(enabled, ready, flag, visit):
+    if enabled:
+        if ready:
+            value = 1
+        else:
+            value = 2
+            if flag:
+                visit(value)
+        assert value
+    else:
+        visit(0)
+";
+    assert_matches_cpython_versions(
+        source,
+        "nested_else_guard.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn erased_final_else_suffix_preserves_coroutine_loop_exits() {
     let source = r"async def sample(items, selected, prepare, work, verify):
     for item in items:
