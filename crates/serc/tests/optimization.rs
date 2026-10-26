@@ -1891,6 +1891,21 @@ fn erased_conditional_join_inside_async_manager_loop_keeps_marker() {
 }
 
 #[test]
+fn nested_finalizer_arms_keep_their_own_implicit_return_locations() {
+    let source = "def run(ready, value):\n    try:\n        work()\n    finally:\n        try:\n            release()\n        finally:\n            if ready:\n                observe(value)\n            else:\n                skip(value)\n            assert value\n";
+    assert_matches_cpython_versions(
+        source,
+        "nested_finally_branch_exits.py",
+        &LEVELS,
+        &[
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ],
+    );
+}
+
+#[test]
 fn erased_loop_break_keeps_async_manager_finally_boundary() {
     for setup in ["", "                event = await next_event(channel)\n"] {
         for condition in [

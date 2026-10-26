@@ -2374,7 +2374,7 @@ impl<'source> Compiler<'source> {
             let finally_if_before_elided = has_elided_tail
                 && !is_final
                 && self.context.python_version >= crate::PythonVersion::Py313
-                && self.control.finally.active_normal_finally_bodies == 1
+                && self.control.finally.active_normal_finally_bodies > 0
                 && matches!(statement, Stmt::If(_))
                 && body[index + 1..]
                     .iter()
