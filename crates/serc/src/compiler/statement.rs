@@ -21221,7 +21221,7 @@ impl<'source> Compiler<'source> {
                     context.with_depth > 0 || context.exception_region_depth > 0
                 })
                 && matches!(statement.test.as_ref(), Expr::BoolOp(_));
-            if ((copied_loop_branch_exit && self.unit.flags & CO_COROUTINE == 0)
+            if (copied_loop_branch_exit
                 || (self.unit.flags & CO_COROUTINE != 0
                     && !non_final_branch
                     && self.control.in_loop_tail_without_nested_cleanup())
@@ -21275,9 +21275,13 @@ impl<'source> Compiler<'source> {
                 self.set_depth(base_depth);
                 self.assembler.set_location(SourceLocation::NONE);
                 let backedge = self.emit_loop_tail_backedge(restart, false)?;
-                self.assembler.mark_as_artificial_eval_break(backedge);
-                if self.unit.flags & CO_COROUTINE != 0 || protected_erased_iterator_exit {
-                    self.assembler.record_last_original_loop_backedge();
+                // An earlier coroutine arm originally jumps forward to the iterator
+                // backedge. Copy its exits before normalizing backward conditionals.
+                if !non_final_branch || self.unit.flags & CO_COROUTINE == 0 {
+                    self.assembler.mark_as_artificial_eval_break(backedge);
+                    if self.unit.flags & CO_COROUTINE != 0 || protected_erased_iterator_exit {
+                        self.assembler.record_last_original_loop_backedge();
+                    }
                 }
                 return Ok(LoopBackedge::Emitted);
             }

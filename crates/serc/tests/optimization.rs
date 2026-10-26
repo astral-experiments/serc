@@ -9814,6 +9814,19 @@ fn async_iterator_preserves_erased_branch_backedges() {
 }
 
 #[test]
+fn erased_coroutine_loop_guard_orders_its_backedges() {
+    let source = "async def sample(items, enabled, left, right):
+    for item in items:
+        if enabled:
+            if left or not right:
+                assert item
+        else:
+            use(item)
+";
+    assert_matches_cpython(source, "erased_coroutine_loop_guard.py", &LEVELS);
+}
+
+#[test]
 fn async_iterator_chained_condition_preserves_erased_else_backedge() {
     for iterator in ["for", "async for"] {
         for condition in [
