@@ -2213,7 +2213,12 @@ impl OptimizationPipeline {
                     // The producer's authored break NOP is the sole omitted slot.
                     || source.pre_fold_extra_instructions() != 1
                     || offset + 1 != source_items.len()
-                    || !source_items[..offset].iter().all(|item| matches!(item, Item::Label(_)))
+                    // A completed expression before the break occupies the same
+                    // source block but does not supply the break's line.
+                    || !(source_items[..offset].iter().all(|item| matches!(item, Item::Label(_)))
+                        || matches!(source_items[..offset].last(), Some(Item::Instruction(pop))
+                            if pop.opcode == POP_TOP && pop.depth_after() == Some(0)
+                                && pop.location.line >= 0 && pop.location.line != source.location.line))
                 {
                     return None;
                 }
@@ -2300,9 +2305,9 @@ impl OptimizationPipeline {
                 let join_index = label_offsets[&entry];
                 let return_index = label_offsets[&target];
                 // A coroutine's single StopIteration owner is split around await
-                // and cleanup arrays. A constant exit can cross those intervals
+                // and cleanup arrays. A constant or local exit can cross those intervals
                 // only when every original slot still has that exact same owner.
-                let shared_constant_fallback = constant_return
+                let shared_return_fallback = (constant_return || local_return)
                     && self.exception_regions.iter().zip(&region_ranges)
                         .find(|(_, range)| range.contains(&source_index))
                         .is_some_and(|(owner, _)| {
@@ -2324,7 +2329,7 @@ impl OptimizationPipeline {
                                     })
                         });
                 if !(source_index < join_index && join_index < return_index)
-                    || (!shared_constant_fallback && self.exception_regions.iter().zip(&region_ranges).any(|(region, range)| {
+                    || (!shared_return_fallback && self.exception_regions.iter().zip(&region_ranges).any(|(region, range)| {
                         let mut covered = [source_index, join_index].into_iter()
                             .chain(return_index..return_index + return_items.len());
                         let any_covered = covered.clone().any(|index| range.contains(&index));
