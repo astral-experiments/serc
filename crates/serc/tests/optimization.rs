@@ -18603,6 +18603,22 @@ fn erased_assertions_preserve_populated_iterator_branch_joins() {
 }
 
 #[test]
+fn erased_disjunction_copies_each_incoming_iterator_backedge() {
+    let sources = [
+        "async def scan(items, left, right):\n    for item in items:\n        if left or right:\n            assert item\n        else:\n            consume(item)\n",
+        "def scan(items, left, right, owner):\n    with owner:\n        for item in items:\n            if left or right:\n                assert item\n            else:\n                consume(item)\n",
+    ];
+    for source in sources {
+        assert_matches_cpython_versions(
+            source,
+            "erased_iterator_disjunction.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn erased_disjunction_preserves_nested_iterator_branch_joins() {
     let branch = r"if probe.accepts((1, 2)) or value == 0 or flag:
     assert all(element != 7 for element in group)
