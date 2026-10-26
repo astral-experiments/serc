@@ -37996,6 +37996,21 @@ impl<'source> Compiler<'source> {
             {
                 conditional_exit = Some(NestedIfExitLocation::Located(&branch.test));
             }
+            // Normal completion of the inner finalizer bypasses the empty
+            // outer join. Its remaining predecessor supplies the guard location.
+            let guarded_nested_cleanup = self.context.python_version >= crate::PythonVersion::Py314
+                && !statement.is_star
+                && self.assembler.current_original_block_location().is_none()
+                && self
+                    .assembler
+                    .current_original_block_pre_fusion_instruction_count()
+                    == 0
+                && matches!(conditional_exit, Some(NestedIfExitLocation::Unlocated))
+                && matches!(statement.finalbody.last(), Some(Stmt::If(guard))
+                    if guard.elif_else_clauses.is_empty() && condition_has_only_runtime_tests(&guard.test)
+                        && original_condition_has_unique_jump_target(&guard.test, false)
+                        && matches!(guard.body.last(), Some(Stmt::Try(cleanup))
+                            if !cleanup.finalbody.is_empty()));
             // Both cleanup copies retain the guard's original false-edge donor.
             let nested_coroutine_manager_guard = self.context.python_version
                 >= crate::PythonVersion::Py314
@@ -38156,7 +38171,8 @@ impl<'source> Compiler<'source> {
                                 _ => false,
                             }
                     })))
-                || nested_coroutine_manager_guard;
+                || nested_coroutine_manager_guard
+                || guarded_nested_cleanup;
             if located_nested_finally_guard && let Some(Stmt::If(tail)) = statement.finalbody.last()
             {
                 conditional_exit = Some(NestedIfExitLocation::Located(&tail.test));
