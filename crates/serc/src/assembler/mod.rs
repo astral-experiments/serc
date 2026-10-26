@@ -2046,25 +2046,42 @@ impl Assembler {
             })
     }
 
-    /// Whether one intact local or closure store follows an original expression join.
-    pub(crate) fn follows_original_join_store(&self) -> bool {
+    /// Whether a store or discarded positional call consumes an original expression join.
+    pub(crate) fn follows_original_join_store_or_call(&self) -> bool {
         let items = self.linear_items();
-        let Some((Item::Instruction(store), before)) = items.split_last() else {
+        let Some((Item::Instruction(last), prefix)) = items.split_last() else {
             return false;
         };
-        if !matches!(store.opcode, STORE_FAST | STORE_DEREF)
-            || store.value_argument().is_none()
-            || store.depth_after() != Some(0)
-            || store.location.line < 0
-            || store.local_policy != LocalPolicy::default()
-            || store.no_location_policy != ir::NoLocationPolicy::default()
-            || store.fusion_policy != ir::FusionPolicy::default()
-            || store.jump_policy != ir::JumpPolicy::default()
-            || store.pre_fold_extra_instructions() != 0
-            || store.exception_policy() != ExceptionPolicy::default()
+        if last.value_argument().is_none()
+            || last.depth_after() != Some(0)
+            || last.location.line < 0
+            || last.local_policy != LocalPolicy::default()
+            || last.no_location_policy != ir::NoLocationPolicy::default()
+            || last.fusion_policy != ir::FusionPolicy::default()
+            || last.jump_policy != ir::JumpPolicy::default()
+            || last.pre_fold_extra_instructions() != 0
+            || last.exception_policy() != ExceptionPolicy::default()
         {
             return false;
         }
+        let (before, entry_depth) = if matches!(last.opcode, STORE_FAST | STORE_DEREF) {
+            (prefix, 1)
+        } else if self.python_version >= crate::PythonVersion::Py314
+            && last.opcode == POP_TOP
+            && last.value_argument() == Some(0)
+            && let Some((Item::Instruction(call), before)) = prefix.split_last()
+            && call.opcode == crate::target::opcodes::CALL
+            && call.location == last.location
+            && *call == Instruction::new(call.opcode, call.operand(), call.location, Some(1))
+            && let Some(depth) = call
+                .value_argument()
+                .and_then(|arguments| arguments.checked_add(2))
+        {
+            // CALL consumes the argument slots plus the callable and self/NULL pair.
+            (before, depth)
+        } else {
+            return false;
+        };
         let labels = trailing_labels(before).collect::<Vec<_>>();
         let head = before.len() - labels.len();
         if self.join_labels_have_authored_location(&labels)
@@ -2128,7 +2145,7 @@ impl Assembler {
                     JUMP_FORWARD,
                     Operand::Forward(target),
                     jump.location,
-                    Some(1),
+                    Some(entry_depth),
                 )
             {
                 return false;
