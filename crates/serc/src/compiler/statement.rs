@@ -31467,7 +31467,7 @@ impl<'source> Compiler<'source> {
                             if tail.elif_else_clauses.is_empty()
                                 && (matches!(tail.body.last(), Some(Stmt::Raise(_)))
                                     || (handler.name.is_some()
-                                        && matches!(tail.body.last(), Some(Stmt::Return(_)))))
+                                        && matches!(tail.body.last(), Some(Stmt::Return(_) | Stmt::Break(_) | Stmt::Continue(_)))))
                                 && condition_has_linear_runtime_leaves(&tail.test)
                                 && condition_jump_target_count(&tail.test, false) > 1
                     );

@@ -10286,6 +10286,25 @@ fn elided_conditional_preserves_jump_before_nested_finalizers() {
 }
 
 #[test]
+fn guarded_loop_exit_preserves_named_handler_cleanup_location() {
+    for (guard, exit) in [
+        ("ready and enabled", "break"),
+        ("ready and enabled", "continue"),
+        ("ready or enabled", "break"),
+    ] {
+        let source = format!(
+            "def visit(items, ready, enabled):\n    for item in items:\n        try:\n            prepare(item)\n        except OSError:\n            pass\n        else:\n            try:\n                process(item)\n            except ValueError as error:\n                if {guard}:\n                    {exit}\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "guarded_loop_handler.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn elided_handler_assertion_preserves_shared_false_cleanup() {
     for (condition, suffix) in [
         ("config.recover and not stopped", "assert False"),
