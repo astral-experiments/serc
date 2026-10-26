@@ -11681,6 +11681,15 @@ impl<'source> Compiler<'source> {
                         && self.control.finally.active_copied_finally_bodies == 0
                         && self.control.finally.preserved_return_value_contexts.is_empty())
                         .then(|| (self.assembler.item_count(), self.control.withs.active_with_exits.len()));
+                    // An inner await finishes in a separate instruction array. The
+                    // outer synchronous exits follow END_SEND in the current array.
+                    let outer_sync_managers = self
+                        .control
+                        .withs
+                        .active_with_exits
+                        .iter()
+                        .take_while(|manager| !manager.is_async)
+                        .count();
                     let copied_manager_return_pop = (matches!(
                             self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR),
                             0 | CO_COROUTINE
@@ -11705,13 +11714,7 @@ impl<'source> Compiler<'source> {
                             ),
                             (1, Some(0)) | (2, Some(1))
                         )
-                        && (1..=2).contains(&self.control.withs.active_with_exits.len())
-                        && self
-                            .control
-                            .withs
-                            .active_with_exits
-                            .iter()
-                            .all(|manager| !manager.is_async)
+                        && (1..=2).contains(&outer_sync_managers)
                         && next_with == 0
                         && with_unwind_starts
                             .iter()
@@ -11754,7 +11757,7 @@ impl<'source> Compiler<'source> {
                                     .active_exception_region_exclusions
                                     .len()
                                     - 1,
-                                self.control.withs.active_with_exits.len(),
+                                outer_sync_managers,
                             )
                         });
                     let copied_manager_none_pop = copied_manager_return_pop

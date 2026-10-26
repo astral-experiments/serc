@@ -9073,6 +9073,30 @@ fn completed_manager_work_preserves_retained_loop_owners() {
 }
 
 #[test]
+fn awaited_manager_return_keeps_the_outer_cleanup_marker_slot() {
+    let source = r"def make_reader(enabled):
+    async def read(outer, inner, value, ready):
+        try:
+            with outer:
+                async with inner:
+                    return value
+        except ValueError:
+            pass
+        finally:
+            if GUARD is not None:
+                close()
+";
+    for guard in ["ready", "enabled", "flag"] {
+        assert_matches_cpython_versions(
+            &source.replace("GUARD", guard),
+            "awaited_manager_return.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn protected_conditional_store_preserves_erased_else_backedge() {
     let protected = r"def collect(batches, left, right, cleanup, sink):
     try:

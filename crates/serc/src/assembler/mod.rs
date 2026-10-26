@@ -13161,7 +13161,7 @@ impl Assembler {
         retained_outer_handler: Option<Label>,
         named_handler: bool,
     ) {
-        use crate::target::opcodes::{CALL, DELETE_FAST, LOAD_CONST, STORE_FAST, SWAP};
+        use crate::target::opcodes::{CALL, DELETE_FAST, LOAD_CONST, LOAD_DEREF, STORE_FAST, SWAP};
 
         let items = self.linear_items();
         let Some(before) = items.get(..pop_item) else {
@@ -13269,7 +13269,7 @@ impl Assembler {
             && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
             && pop.local_policy.hidden_exception_owner_slots() == 0
             && pop.pre_fold_extra_instructions() == 0
-            && load.opcode == LOAD_FAST
+            && matches!(load.opcode, LOAD_FAST | LOAD_GLOBAL | LOAD_DEREF)
             && load.local_policy.hidden_exception_owner_slots() == 0
             && load.pre_fold_extra_instructions() == 0
             && matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
