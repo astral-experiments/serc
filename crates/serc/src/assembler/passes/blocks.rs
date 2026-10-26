@@ -10,11 +10,12 @@ use super::super::{
 use crate::assembler::block_graph::{BasicBlockId, BlockGraph, ItemPosition};
 use crate::assembler::exception_owners::ExceptionOwnerProvenance;
 use crate::target::opcodes::{
-    BUILD_TUPLE, CALL, CALL_KW, DELETE_FAST, END_ASYNC_FOR, END_SEND, FOR_ITER, LOAD_ATTR,
-    LOAD_CONST, LOAD_DEREF, LOAD_FAST, LOAD_GLOBAL, LOAD_SMALL_INT, NOP, NOT_TAKEN, POP_EXCEPT,
-    POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE, POP_JUMP_IF_TRUE, POP_TOP,
-    RAISE_VARARGS, RERAISE, RETURN_VALUE, STORE_ATTR, STORE_FAST, SWAP,
+    BUILD_TUPLE, CALL, CALL_INTRINSIC_1, CALL_KW, DELETE_FAST, END_ASYNC_FOR, END_FOR, END_SEND,
+    FOR_ITER, LOAD_ATTR, LOAD_CONST, LOAD_DEREF, LOAD_FAST, LOAD_GLOBAL, LOAD_SMALL_INT, NOP,
+    NOT_TAKEN, POP_EXCEPT, POP_ITER, POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE,
+    POP_JUMP_IF_TRUE, POP_TOP, RAISE_VARARGS, RERAISE, RETURN_VALUE, STORE_ATTR, STORE_FAST, SWAP,
 };
+use crate::target::operands::UnaryIntrinsic;
 use crate::target::{is_conditional_jump, is_unconditional_jump};
 
 #[cfg(test)]
@@ -7337,6 +7338,33 @@ impl OptimizationPipeline {
                         instruction.location = source_location;
                     }
                 }
+            }
+            if inline_small_exit
+                && self.python_version >= crate::PythonVersion::Py314
+                && let [
+                    ..,
+                    Item::Instruction(end_for),
+                    Item::Instruction(pop_iter),
+                    Item::Instruction(intrinsic),
+                    Item::Instruction(jump),
+                ] = graph[source].items()
+                && end_for.opcode == END_FOR
+                && pop_iter.opcode == POP_ITER
+                && intrinsic.opcode == CALL_INTRINSIC_1
+                && intrinsic.value_argument() == Some(UnaryIntrinsic::LIST_TO_TUPLE.argument())
+                && jump.opcode == JUMP_FORWARD
+                && let Some(first) = copied
+                    .iter()
+                    .position(|item| matches!(item, Item::Instruction(_)))
+                && let Item::Instruction(pop) = &copied[first]
+                && pop.opcode == NOP
+                && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
+                && pop.location.line >= 0
+                && pop.location.line == intrinsic.location.line
+            {
+                // The copied POP_BLOCK follows the tuple conversion in the same
+                // original array. Its return line was already emitted by the intrinsic.
+                copied.remove(first);
             }
             original_return_locations.extend(copied_return_locations);
             let inline_exit_copy = inline_small_exit
