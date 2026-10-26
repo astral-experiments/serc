@@ -1629,6 +1629,24 @@ impl LayoutAssembler {
                 instruction
                     .legacy_initial_jump_width()
                     .expect("all native jumps are certified")
+            } else if self
+                .exception_owner_provenance
+                .legacy_original_jump_operands_fit
+                && (crate::target::is_conditional_jump(instruction.opcode)
+                    || instruction.opcode == crate::target::opcodes::FOR_ITER
+                    || (instruction.opcode == crate::target::opcodes::JUMP_FORWARD
+                        && instruction.location.line >= 0)
+                    || (instruction.opcode == crate::target::opcodes::JUMP_BACKWARD
+                        && instruction.jump_target().is_some_and(|target| {
+                            self.exception_owner_provenance
+                                .legacy_for_headers
+                                .contains(&target)
+                        })))
+            {
+                // Threading and conditional inversion preserve the original operand.
+                // A forward cold bridge has no line donor. A normalized loop
+                // backedge uses its nonempty FOR_ITER header's source label.
+                0
             } else if short_source_jump
                 || (self
                     .exception_owner_provenance

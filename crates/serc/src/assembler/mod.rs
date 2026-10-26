@@ -1078,6 +1078,24 @@ impl Assembler {
             .legacy_source_jump_labels_fit = true;
     }
 
+    /// Certifies source jump operands after both native empty-block repairs.
+    pub(crate) fn certify_legacy_original_jump_operands(&mut self) {
+        self.exception_owner_provenance
+            .legacy_original_jump_operands_fit = true;
+    }
+
+    /// Records a nonempty source header for original and normalized 3.12 backedges.
+    pub(crate) fn record_legacy_for_header(&mut self, start: Label) {
+        if self
+            .exception_owner_provenance
+            .legacy_original_jump_operands_fit
+        {
+            self.exception_owner_provenance
+                .legacy_for_headers
+                .insert(start);
+        }
+    }
+
     /// Captures the authored jump to a comprehension's nonempty `FOR_ITER` header.
     pub(crate) fn record_legacy_comprehension_backedge(&mut self, entry: Label) {
         if self
