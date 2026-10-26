@@ -15612,6 +15612,22 @@ impl<'source> Compiler<'source> {
                         .current_original_block_pre_fusion_instruction_count()
                         == 0
                         && self.assembler.current_original_block_location().is_none();
+                    // The direct try exit can be copied into this still-shared join.
+                    // Its conditional bypass and fallthrough give the original jump no line.
+                    let protected_shared_join = inherited_shared_if_exit
+                        && direct_try_body_exit
+                        && self.context.python_version >= crate::PythonVersion::Py314
+                        && !self.control.in_exception_handler()
+                        && self
+                            .control
+                            .exceptions
+                            .active_exception_region_exclusions
+                            .len()
+                            == 1
+                        && self.control.finally.active_finally_try_bodies == 0;
+                    if protected_shared_join {
+                        self.assembler.set_location(SourceLocation::NONE);
+                    }
                     let branch_exit = if exclude_direct_try_body_exit
                         && self.control.in_iterator_loop()
                         && self
@@ -15692,7 +15708,9 @@ impl<'source> Compiler<'source> {
                         // as the simple constant-true branch with an else suite.
                         self.assembler.mark_folded_condition_exit(branch_exit);
                     }
-                    if inherited_shared_if_exit {
+                    if protected_shared_join {
+                        self.assembler.preserve_shared_jump_no_location(branch_exit);
+                    } else if inherited_shared_if_exit {
                         self.assembler.defer_shared_jump_no_location(branch_exit);
                     }
                     if has_declaration_only_else {

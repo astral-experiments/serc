@@ -15,6 +15,31 @@ use serc::{
 };
 
 #[test]
+fn shared_nested_if_exit_keeps_copied_try_cleanup_unlocated() {
+    let source = r"def choose(first, second, third):
+    try:
+        if first:
+            if second:
+                pass
+            else:
+                prepare()
+                if third:
+                    consume()
+        else:
+            other()
+    except Error as err:
+        pass
+    return 0
+";
+    assert_matches_cpython_versions(
+        source,
+        "shared_nested_try_cleanup.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn nested_conversion_handlers_keep_shared_cleanup() {
     let source = r"def sample(items):
     for item in items:
