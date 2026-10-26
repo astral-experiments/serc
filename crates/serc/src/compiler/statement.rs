@@ -27173,6 +27173,23 @@ impl<'source> Compiler<'source> {
                                 self.control.stack.depth.cast_unsigned(),
                             ))
                 }));
+        // The normal exit is an unlocated POP_BLOCK and jump. Copying it into
+        // the located case successes leaves the value-pattern failure as its only donor.
+        let coroutine_value_match_pop = self.context.python_version >= crate::PythonVersion::Py314
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+            && !statement.is_star
+            && statement.orelse.is_empty()
+            && statement.finalbody.is_empty()
+            && self.control.stack.depth == 0
+            && matches!(statement.handlers.as_slice(), [handler]
+                if handler.as_except_handler().is_some_and(|handler| handler.name.is_some()))
+            && matches!(statement.body.last(), Some(Stmt::Match(matched))
+                if matched.cases.last().is_some_and(|case| case.guard.is_none()
+                    && matches!(case.pattern, Pattern::MatchValue(_))))
+            && self
+                .assembler
+                .has_located_match_success_before_try_end(try_end);
+        let copied_match_pop_block = compound_match_pop_block || coroutine_value_match_pop;
         // A discarded false arm still jumps to this original POP_BLOCK before
         // 3.13 compacts NOPs. Materialize it so jump threading sees that first
         // record, instead of threading straight through the normal-exit jump.
@@ -27187,7 +27204,7 @@ impl<'source> Compiler<'source> {
             == crate::PythonVersion::Py312
             || !statement.orelse.is_empty()
             || match_body_pop_block
-            || compound_match_pop_block
+            || copied_match_pop_block
             || false_arm_pop_block)
             && !suite_terminates(&statement.body)
             && (!self.assembler.last_instruction_is_nop()
@@ -27933,7 +27950,7 @@ impl<'source> Compiler<'source> {
                 && matches!(normal_exit_suite.last(), Some(Stmt::Pass(pass))
                     if self.assembler.has_single_omitted_fallthrough_nop_before_label(
                         try_end, self.source_location(pass.range)));
-            if (match_body_pop_block || compound_match_pop_block)
+            if (match_body_pop_block || copied_match_pop_block)
                 && statement.orelse.is_empty()
                 && deferred_try_pop_block
                 && !removed_shared_try_pop_block
@@ -28521,7 +28538,7 @@ impl<'source> Compiler<'source> {
                 self.assembler.set_location(SourceLocation::NONE);
             }
             let normal_exit = if (match_body_pop_block
-                || compound_match_pop_block
+                || copied_match_pop_block
                 || self.assembler.python_version() == crate::PythonVersion::Py312)
                 && statement.orelse.is_empty()
                 && deferred_try_pop_block
@@ -28559,7 +28576,7 @@ impl<'source> Compiler<'source> {
                 self.assembler
                     .preserve_redundant_jump_nop_after_threading(normal_exit);
             }
-            if compound_match_pop_block {
+            if copied_match_pop_block {
                 // These are genuine unlocated original records. Copy them only
                 // onto unconditional case-success edges before failure-line donation.
                 debug_assert_eq!(exception_policy, ExceptionPolicy::default());
@@ -29201,7 +29218,7 @@ impl<'source> Compiler<'source> {
                                     if raised.exc.as_deref().is_some_and(|value| matches!(value, Expr::Name(_)))
                                         && raised.cause.as_deref().is_some_and(|value| matches!(value, Expr::Name(_)))))
                 }));
-            if !compound_match_pop_block
+            if !copied_match_pop_block
                 && ((terminal_handler_exit
                     && !(self.control.statements.context.followed_by_name_return
                         && self.control.withs.active_with_exits.is_empty()

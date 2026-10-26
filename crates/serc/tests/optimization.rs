@@ -15,6 +15,21 @@ use serc::{
 };
 
 #[test]
+fn protected_value_match_preserves_case_and_failure_exits() {
+    for action in ["return item", "consume(item)"] {
+        let source = format!(
+            "async def scan(item):\n    try:\n        match item:\n            case Color.red:\n                consume(item)\n            case Color.blue:\n                consume(item)\n            case Color.green:\n                if enabled:\n                    {action}\n    except ValueError as error:\n        report(error)\n    finish()\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "protected_value_match.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn nested_conversion_handlers_keep_shared_cleanup() {
     let source = r"def sample(items):
     for item in items:

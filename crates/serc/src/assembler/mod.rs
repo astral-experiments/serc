@@ -5933,6 +5933,25 @@ impl Assembler {
         self.push_linear_item(Item::Label(label));
     }
 
+    /// Checks the last case-success jump at an ordinary try's zero-pop match failure.
+    /// A conditional tail can retain the same jump directly instead of carrying
+    /// the ordinary case-success flag.
+    pub(crate) fn has_located_match_success_before_try_end(&self, try_end: Label) -> bool {
+        matches!(self.linear_items(),
+            [.., Item::Instruction(success), Item::Label(failure), Item::Label(join), Item::Label(end)]
+            if *end == try_end
+                && failure != join
+                && failure != end
+                && join != end
+                && self.original_match_join == Some(*join)
+                && self.exception_owner_provenance.original_match_join_boundaries.contains(join)
+                && success.opcode == JUMP_FORWARD
+                && success.forward_target() == Some(*join)
+                && (success.jump_policy.is_original_match_success()
+                    || success.jump_policy.retained_nop() == ir::RetainedJumpNop::DirectTarget)
+                && success.location.line >= 0)
+    }
+
     /// Whether the next instruction starts at the recorded source-authored match end.
     pub(crate) fn at_original_match_join(&self) -> bool {
         self.original_match_join.is_some_and(|join| {
