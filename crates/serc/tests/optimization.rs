@@ -16556,6 +16556,28 @@ fn elided_else_preserves_async_comprehension_exit() {
 }
 
 #[test]
+fn async_comprehension_markers_preserve_iterator_cleanup_slots() {
+    for expression in [
+        "[tuple(part for part in item) async for item in items]",
+        "{any(part for part in item) async for item in items}",
+        "{item.key: item async for item in items if item.matches('ready') and item.enabled}",
+    ] {
+        let source = format!(
+            "async def collect(manager, items):
+    async with manager:
+        return {expression}
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "async_comprehension_cleanup_slot.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn async_comprehension_preserves_conditional_exception_owner() {
     const TRACE_CONDITION: &str = r"
 import dis, marshal, sys

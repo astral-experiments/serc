@@ -5664,12 +5664,7 @@ impl Compiler<'_> {
             .push((cleanup_throw, cleanup_throw_end));
         self.assembler.mark(send_end);
         self.set_depth(loop_depth + 2 + self.iterator_extra_slots());
-        self.emit(END_SEND, 0, -self.iterator_slots())?;
-        if self.context.python_version == PythonVersion::Py314 {
-            // Native compaction erases the POP_BLOCK between END_SEND and target storage.
-            // Its vacant record remains in the original array used by later markers.
-            self.assembler.add_last_hidden_exception_owner_slots(1);
-        }
+        self.emit_async_comprehension_end_send()?;
         self.assembler.mark(protected_end);
         self.compile_store_target(&generator.target)?;
         if self.context.python_version == PythonVersion::Py314 {
@@ -6785,6 +6780,16 @@ impl Compiler<'_> {
         Ok(())
     }
 
+    /// Ends the asynchronous iteration send and accounts for its removed exception block.
+    fn emit_async_comprehension_end_send(&mut self) -> Result<(), CompileError> {
+        self.emit(END_SEND, 0, -self.iterator_slots())?;
+        if self.context.python_version == PythonVersion::Py314 {
+            // The POP_BLOCK between END_SEND and the target store leaves a slot for later markers.
+            self.assembler.add_last_hidden_exception_owner_slots(1);
+        }
+        Ok(())
+    }
+
     /// Initializes an iterator and the target's optional synchronous index slot.
     fn emit_comprehension_iterator(&mut self, is_async: bool) -> Result<(), CompileError> {
         self.emit(
@@ -7100,7 +7105,7 @@ impl Compiler<'_> {
         self.assembler.mark(protected_after_cleanup_start);
         self.assembler.mark(send_end);
         self.set_depth(loop_depth + 2 + self.iterator_extra_slots());
-        self.emit(END_SEND, 0, -self.iterator_slots())?;
+        self.emit_async_comprehension_end_send()?;
         self.assembler.mark(protected_end);
         self.compile_store_target(&generator.target)?;
 
