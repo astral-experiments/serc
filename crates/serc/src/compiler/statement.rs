@@ -377,8 +377,8 @@ pub(super) struct WithState {
     active_with_exits: Vec<WithExitContext>,
     // The last statement of a manager body prefix with a separately compiled tail.
     split_body_prefix_end: Option<TextRange>,
-    // A sole-Pass finalizer keeps the preceding authored Pass in the manager region.
-    split_pass_finally_prefix_end: Option<TextRange>,
+    // A split prefix can still end in an authored Pass owned by the manager.
+    split_finally_pass_prefix_end: Option<TextRange>,
     // Only direct None-condition siblings in the innermost synchronous-with body can reuse a
     // preceding conditional owner. Nested suites and earlier returns use a different layout.
     shifted_sync_with_none_owner_statements: Vec<TextRange>,
@@ -2091,8 +2091,8 @@ impl<'source> Compiler<'source> {
         let split_manager_prefix = body.last().is_some_and(|statement| {
             self.control.withs.split_body_prefix_end == Some(statement.range())
         });
-        let split_pass_finally_prefix = body.last().is_some_and(|statement| {
-            self.control.withs.split_pass_finally_prefix_end == Some(statement.range())
+        let split_finally_pass_prefix = body.last().is_some_and(|statement| {
+            self.control.withs.split_finally_pass_prefix_end == Some(statement.range())
         });
         let legacy_split_sync_manager_prefix = self.context.python_version
             <= crate::PythonVersion::Py313
@@ -2779,7 +2779,7 @@ impl<'source> Compiler<'source> {
                     || protected_sync_with_join_pass
                     || optimized_sync_with_pass_tail
                     || (self.context.python_version >= crate::PythonVersion::Py314
-                        && split_pass_finally_prefix)
+                        && split_finally_pass_prefix)
                     || (self.control.statements.retained_branch_pass == Some(statement.range)
                         && self.assembler.current_block_last_instruction_location().is_some_and(
                             |previous| previous.line >= 0
@@ -2828,7 +2828,7 @@ impl<'source> Compiler<'source> {
                     || body.len() > 1
                     || legacy_split_sync_manager_prefix
                     || (self.context.python_version >= crate::PythonVersion::Py314
-                        && split_pass_finally_prefix))
+                        && split_finally_pass_prefix))
             {
                 self.assembler
                     .set_location(self.source_location(statement.range));
@@ -39829,20 +39829,6 @@ impl<'source> Compiler<'source> {
         let expression_suspends_current_scope = |expression: &Expr| {
             module_can_suspend && super::expression::expression_suspends_current_scope(expression)
         };
-        // The assignment store follows the comprehension's local restoration,
-        // populating its normal completion array before the next protected body.
-        let completed_comprehension_store = |statement: &Stmt| {
-            matches!(statement, Stmt::Assign(assignment)
-                if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
-                    && matches!(assignment.value.as_ref(), Expr::ListComp(comprehension)
-                        if !expression_contains_inline_branch(&comprehension.elt)
-                            && !expression_suspends_current_scope(&assignment.value)
-                            && matches!(comprehension.generators.as_slice(), [iterator]
-                                if !iterator.is_async
-                                    && iterator.ifs.is_empty()
-                                    && matches!(iterator.target, Expr::Name(_))
-                                    && !expression_contains_inline_branch(&iterator.iter))))
-        };
         let mut body_noop = None;
         if remaining.is_empty() {
             let body_start = self.assembler.instruction_count();
@@ -39964,75 +39950,8 @@ impl<'source> Compiler<'source> {
                 )?;
                 self.compile_suite(&body[terminal_body.len()..])?;
             } else if let Some((last @ Stmt::Try(statement), leading)) = terminal_body.split_last()
-                // A prefix ending in an authored marker keeps its original array.
-                // Emitted linear work can precede the extracted try directly.
-                // Erased statements do not change that final array.
-                && (terminal_body.len() == body.len()
-                    || leading.is_empty()
-                    || ((suite_has_linear_borrow_fallthrough(leading)
-                        || leading.iter().all(|prefix| {
-                            matches!(prefix, Stmt::Pass(_))
-                                || self.context.is_elided_statement(prefix)
-                                || suite_has_linear_borrow_fallthrough(std::slice::from_ref(prefix))
-                                // Imports and completed managers can precede the linear
-                                // work that repopulates the prefix's final array.
-                                || matches!(prefix, Stmt::Import(_) | Stmt::ImportFrom(_))
-                                || matches!(prefix, Stmt::With(manager)
-                                    if !manager.is_async
-                                        && matches!(manager.items.as_slice(), [item]
-                                            if !expression_suspends_current_scope(&item.context_expr)
-                                                && !expression_contains_inline_branch(&item.context_expr)
-                                                && item.optional_vars.as_deref().is_none_or(|target| matches!(target, Expr::Name(_))))
-                                        && suite_has_linear_borrow_fallthrough(&manager.body)
-                                        && suite_has_nonsuspending_conditional_work(&manager.body))
-                                // Plain definitions emit linear function creation here. Modern
-                                // annotations and child bodies compile in independent scopes.
-                                || (self.context.python_version >= crate::PythonVersion::Py314
-                                    && matches!(prefix, Stmt::FunctionDef(definition)
-                                        if definition.type_params.is_none()
-                                            && definition.decorator_list.is_empty()
-                                            && definition.parameters.iter_non_variadic_params()
-                                                .all(|parameter| parameter.default.is_none())))
-                                // Completed cleanups and iterators cannot enter the later
-                                // try or its cleanup. The live prefix tail required below
-                                // repopulates the original array after their joins.
-                                || (self.context.python_version >= crate::PythonVersion::Py314
-                                    && matches!(self.unit.scope, Scope::Function { .. })
-                                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
-                                    && match prefix {
-                                        Stmt::Try(completed) => {
-                                            !completed.is_star
-                                                && completed.handlers.is_empty()
-                                                && completed.orelse.is_empty()
-                                                && suite_has_linear_borrow_fallthrough(&completed.body)
-                                                && suite_has_nonsuspending_conditional_work(&completed.body)
-                                                && suite_has_linear_borrow_fallthrough(&completed.finalbody)
-                                                && suite_has_nonsuspending_conditional_work(&completed.finalbody)
-                                        }
-                                        Stmt::For(loop_statement) => {
-                                            !loop_statement.is_async
-                                                && loop_statement.orelse.is_empty()
-                                                && matches!(loop_statement.target.as_ref(), Expr::Name(_))
-                                                && !expression_contains_inline_branch(&loop_statement.iter)
-                                                && !expression_suspends_current_scope(&loop_statement.iter)
-                                                && suite_has_linear_borrow_fallthrough(&loop_statement.body)
-                                                && !suite_contains_yield(&loop_statement.body)
-                                        }
-                                        Stmt::Assign(_) => completed_comprehension_store(prefix),
-                                        _ => false,
-                                    })
-                        }))
-                        && leading
-                            .iter()
-                            .rev()
-                            .find(|prefix| !self.context.is_elided_statement(prefix))
-                            .is_some_and(|statement| {
-                                suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement))
-                                    || (self.context.python_version >= crate::PythonVersion::Py314
-                                        && matches!(self.unit.scope, Scope::Function { .. })
-                                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
-                                        && completed_comprehension_store(statement))
-                            })))
+                // Erased suffix statements emit no instructions between the finalizer
+                // and the manager cleanup, regardless of the preceding statements.
                 // A loop-else cleanup jumps past the conditional's original false join.
                 // That located join keeps the with owner; it is not the manager POP_BLOCK.
                 && !matches!(statement.finalbody.last(), Some(Stmt::If(tail))
@@ -40076,8 +39995,9 @@ impl<'source> Compiler<'source> {
                     leading.last().map(Ranged::range),
                     |compiler| {
                         compiler.with_control_override(
-                            |control| &mut control.withs.split_pass_finally_prefix_end,
-                            matches!(statement.finalbody.as_slice(), [Stmt::Pass(_)])
+                            |control| &mut control.withs.split_finally_pass_prefix_end,
+                            (terminal_body.len() < body.len()
+                                || matches!(statement.finalbody.as_slice(), [Stmt::Pass(_)]))
                                 .then(|| leading.last().map(Ranged::range))
                                 .flatten(),
                             |compiler| {

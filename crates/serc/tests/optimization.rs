@@ -16267,6 +16267,7 @@ print(json.dumps(events))
                 python_version,
                 *optimization_level,
             );
+            assert_eq!(native, actual, "{python_version} {optimization_level:?}");
             assert_outputs_match(
                 probe(index).args(["-I", "-S", "-B", "-c", TRACE]),
                 [&native, &actual],
