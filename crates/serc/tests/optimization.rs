@@ -8829,6 +8829,17 @@ def run(flag, load, note):
 }
 
 #[test]
+fn named_handler_break_threads_through_the_outer_loop_backedge() {
+    let source = "def run(ready, manager):\n    while ready:\n        while True:\n            try:\n                work()\n            except ValueError as error:\n                with manager:\n                    report(error)\n                break\n";
+    assert_matches_cpython_versions(
+        source,
+        "named_handler_break.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn coroutine_erased_inner_arm_preserves_loop_backedges() {
     let source = r"
 async def run(items, mode, note):

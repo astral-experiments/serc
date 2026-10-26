@@ -2430,8 +2430,8 @@ impl OptimizationPipeline {
                 Some((source_index, (source, target)))
             })
             .collect::<FxHashMap<_, _>>();
-        // A post-manager break retains a NOP for small-exit copying. That marker
-        // does not prevent threading its original, unowned single backedge.
+        // A break after a manager or a named handler cleanup retains a NOP for
+        // small-exit copying. Its original, unowned single backedge can still thread.
         // Keep all forward exits and cleanup-bearing targets under the usual guard.
         let mut retained_break_policy = super::super::ir::JumpPolicy::default();
         retained_break_policy.retain_nop();
@@ -2452,11 +2452,40 @@ impl OptimizationPipeline {
                     || jump.exception_policy() != super::super::ExceptionPolicy::default()
                     || jump.no_location_policy != super::super::ir::NoLocationPolicy::default()
                     || offset + 1 != items.len()
-                    || items[..offset]
-                        .iter()
-                        .any(|item| !matches!(item, Item::Label(_)))
                 {
                     return None;
+                }
+                let prefix = &items[..offset];
+                let first = prefix
+                    .iter()
+                    .position(|item| !matches!(item, Item::Label(_)));
+                if let Some(first) = first {
+                    // A break that clears a caught name keeps its authored line
+                    // on the backedge after all four cleanup instructions.
+                    let [
+                        Item::Instruction(pop),
+                        Item::Instruction(load),
+                        Item::Instruction(store),
+                        Item::Instruction(delete),
+                    ] = &prefix[first..]
+                    else {
+                        return None;
+                    };
+                    if pop.opcode != POP_EXCEPT
+                        || load.opcode != LOAD_CONST
+                        || store.opcode != STORE_FAST
+                        || delete.opcode != DELETE_FAST
+                        || store.operand() != delete.operand()
+                        || [pop, load, store, delete].iter().any(|item| {
+                            item.location != jump.location
+                                || item.pre_fold_extra_instructions() != 0
+                                || item.local_policy.hidden_exception_owner_slots() != 0
+                                || item.exception_policy()
+                                    != super::super::ExceptionPolicy::default()
+                        })
+                    {
+                        return None;
+                    }
                 }
                 let entry = jump.forward_target()?;
                 let entry_index = *label_offsets.get(entry)?;
