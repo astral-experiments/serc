@@ -2224,6 +2224,27 @@ fn erased_loop_exit_stays_inside_managed_finally() {
 }
 
 #[test]
+fn finally_attribute_tests_preserve_captured_receiver_owners() {
+    let source = r"async def run(obj, manager, flag):
+    def cleanup():
+        obj.close()
+    with manager:
+        try:
+            if flag:
+                raise ValueError
+        finally:
+            if obj.value is not None:
+                cleanup()
+";
+    assert_matches_cpython_versions(
+        source,
+        "captured_finally.py",
+        &LEVELS,
+        &[PythonVersion::Py314],
+    );
+}
+
+#[test]
 fn generator_finalizers_reuse_the_unwound_try_slot_for_attribute_checks() {
     for (guard, repeat) in [("state.flag", 2), ("state.flag()", 3)] {
         let preparation = "        prepare()\n".repeat(repeat);
