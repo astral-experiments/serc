@@ -16205,12 +16205,21 @@ fn conditional_finalizer_preserves_jump_before_manager_exit() {
         &LEVELS,
         &[PythonVersion::Py314, PythonVersion::Py315],
     );
-    assert_matches_cpython_versions(
-        copied,
-        "copied_finalizer_manager_exit.py",
-        &LEVELS,
-        &[PythonVersion::Py315],
-    );
+    let mut protected = "async with resource:\n    break".to_owned();
+    for depth in 0..4 {
+        let indented = protected.replace('\n', "\n                ");
+        let source = copied.replace("async with resource:\n                    break", &indented);
+        assert_matches_cpython_versions(
+            &source,
+            &format!("copied_finalizer_manager_exit_{depth}.py"),
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+        protected = format!(
+            "try:\n    {}\nexcept LookupError:\n    raise",
+            protected.replace('\n', "\n    ")
+        );
+    }
 }
 
 #[test]

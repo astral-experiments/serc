@@ -298,6 +298,8 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) copied_finally_iterator_returns: Vec<(SourceLocation, Vec<Item>)>,
     // Fresh authored break array through the first truth marker, with two omitted POPs.
     pub(super) copied_conjunction_break_prefixes: Vec<Vec<Item>>,
+    // Await completion and outer manager, followed by the original copied truth test.
+    pub(super) awaited_break_truth_guards: Vec<(Label, Label, Instruction, Instruction)>,
     // Named break: two handler POPs and the following finalizer POP are omitted.
     pub(super) copied_named_break_truth_prefixes: Vec<CopiedNamedBreakTruthPrefix>,
     // Ordinary break, ended try/finally ranges and copied first truth array.
@@ -11514,6 +11516,44 @@ impl LayoutAssembler {
         owners.extend(self.copied_conjunction_break_owners(&label_positions, &jump_targets));
         owners.extend(self.named_handler_truth_owners(&label_positions, &jump_targets));
         owners.extend(certified_method_markers);
+        for &(entry, handler, original_load, original_jump) in
+            &provenance.awaited_break_truth_guards
+        {
+            let Some(&start) = label_positions.get(&entry) else {
+                continue;
+            };
+            let Some([end, pop, load, truth, jump, marker]) =
+                indexed_instructions.get(start..start + 6)
+            else {
+                continue;
+            };
+            // Removing one to three POP_BLOCKs after END_SEND/POP_TOP lets the
+            // appended marker reuse the original jump, TO_BOOL or load. All three
+            // carried the same outer manager before jump normalization.
+            if end.opcode == super::END_SEND
+                && pop.opcode == POP_TOP
+                && (load.opcode == original_load.opcode
+                    || (original_load.opcode == super::LOAD_FAST
+                        && load.opcode == super::LOAD_FAST_BORROW))
+                && load.operand() == original_load.operand()
+                && load.location == original_load.location
+                && truth.opcode == super::TO_BOOL
+                && jump.opcode == original_jump.opcode
+                && marker.opcode == NOT_TAKEN
+                && [truth, jump, marker]
+                    .iter()
+                    .all(|instruction| instruction.location == load.location)
+                && let Some(region) =
+                    self.uniform_exception_owner(start + 2, start + 4, &label_positions)
+                && self.exception_regions[region].target == handler
+                && self.exception_regions[region].preserve_lasti
+            {
+                owners.insert(
+                    start + 5,
+                    ExceptionOwnerDecision::override_with_region(Some(region)),
+                );
+            }
+        }
         owners
     }
 
