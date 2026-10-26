@@ -31526,6 +31526,13 @@ impl<'source> Compiler<'source> {
                             }
                             _ => false,
                         });
+                // A bound exception requires name clearing on normal exit. An unnamed
+                // handler can also share this cleanup when the guarded arm raises.
+                let shared_guard_cleanup = self.context.python_version
+                    >= crate::PythonVersion::Py314
+                    && (handler.name.is_some()
+                        || matches!(handler.body.last(), Some(Stmt::If(tail))
+                            if matches!(tail.body.last(), Some(Stmt::Raise(_)))));
                 let handler_ends_with_terminating_unlocated_cleanup = matches!(
                     handler.body.last(),
                     Some(Stmt::If(tail))
@@ -31564,7 +31571,7 @@ impl<'source> Compiler<'source> {
                                 || self.control.loops.synthesized_loop_tail_predecessor == Some(statement.range)
                                 || self.control.loops.split_loop_tail_prefix_end == Some(statement.range)
                                 // Exiting a manager or entering a finalizer is also a continuation.
-                                || (self.context.python_version >= crate::PythonVersion::Py314
+                                || (shared_guard_cleanup
                                     && (!self.control.withs.active_with_exits.is_empty()
                                         || handler_cleanup_has_normal_finally_successor)))
                             && statement.finalbody.is_empty()
@@ -31573,7 +31580,7 @@ impl<'source> Compiler<'source> {
                             && condition_has_only_runtime_tests(&tail.test)
                             // A negated comparison can put its stack cleanup on the raising arm.
                             && (!expression_contains_chained_comparison(&tail.test)
-                                || (self.context.python_version >= crate::PythonVersion::Py314
+                                || (shared_guard_cleanup
                                     && !condition_has_cleanup_jump_target(&tail.test, false)))
                             && condition_jump_target_count(&tail.test, false) > 1
                 ) || matches!(
