@@ -39370,7 +39370,15 @@ impl<'source> Compiler<'source> {
                                 && condition_has_only_runtime_tests(&tail.test)
                                 && matches!(tail.body.as_slice(), [Stmt::With(manager)]
                                     if !manager.is_async && manager.items.len() == 1));
-                    if !original_sync_conditional_manager_jump
+                    // An open runtime guard sends both normal paths to the jump
+                    // before the enclosing manager's POP_BLOCK. A folded guard
+                    // or an abrupt arm can leave the POP itself in its place.
+                    let conditional_manager_jump = matches!(statement.finalbody.last(), Some(Stmt::If(tail))
+                        if condition_has_only_runtime_tests(&tail.test)
+                            && tail.elif_else_clauses.iter().all(|clause| clause.test.as_ref().is_none_or(condition_has_only_runtime_tests)))
+                        && !suite_contains_abrupt_control_flow(&statement.finalbody);
+                    if !conditional_manager_jump
+                        && !original_sync_conditional_manager_jump
                         && !original_async_generator_conditional_manager_jump
                         && !nested_async_generator_manager_exit
                         && !nested_coroutine_manager_guard
