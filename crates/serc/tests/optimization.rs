@@ -96,6 +96,21 @@ fn erased_named_handler_suffix_preserves_cleanup_copies() {
 }
 
 #[test]
+fn python312_counts_both_visits_to_an_erased_condition_successor() {
+    for action in ["assert check(first)", "check(first)"] {
+        let source = format!(
+            "async def run(values, first, second, last):\n    values = [v async for v in values]\n    if first:\n        {action}\n    if second:\n        assert check(second)\n    elif last:\n        pass\n    if values:\n        finish()\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "conditional_successor_line.py",
+            &LEVELS,
+            &[PythonVersion::Py312],
+        );
+    }
+}
+
+#[test]
 fn conditional_try_body_preserves_else_return_join() {
     let source = r"def sample(flag):
     try:

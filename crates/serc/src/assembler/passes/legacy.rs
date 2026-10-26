@@ -162,7 +162,9 @@ impl OptimizationPipeline {
             self.inline_legacy_exit_blocks(&original_arrays, false);
         }
         let repeated_predecessors = if self.python_version == PythonVersion::Py312 {
-            self.legacy_repeated_tail_predecessors(&original_arrays)
+            let mut tails = self.legacy_repeated_tail_predecessors(&original_arrays);
+            self.record_repeated_conditional_fallthroughs(&original_arrays, &mut tails);
+            tails
         } else {
             Vec::new()
         };
@@ -2054,6 +2056,78 @@ impl OptimizationPipeline {
             }
         }
         Some(tails)
+    }
+
+    /// Records a jump reached only by falling through a twice-queued conditional.
+    fn record_repeated_conditional_fallthroughs(
+        &self,
+        arrays: &LegacyInstructionArrays,
+        tails: &mut Vec<(BasicBlockId, Instruction, usize, usize)>,
+    ) {
+        let mut incoming = None;
+        let conditional_target = |block| {
+            let last = self.graph[block].last_instruction()?;
+            if !is_conditional_jump_for(self.python_version, last.opcode) {
+                return None;
+            }
+            self.graph.label_block(last.jump_target()?)
+        };
+        for &[first, second, exit] in self.graph.order().array_windows() {
+            if conditional_target(first) != Some(second)
+                || conditional_target(second).is_none_or(|target| target == exit)
+            {
+                continue;
+            }
+            let [Some(first_array), Some(second_array), Some(exit_array)] =
+                [first, second, exit].map(|block| arrays.get(block))
+            else {
+                continue;
+            };
+            if first_array == second_array || second_array == exit_array {
+                continue;
+            }
+            let mut instructions = self.graph[exit]
+                .items()
+                .iter()
+                .filter_map(Item::as_instruction);
+            let Some(jump) = instructions.next() else {
+                continue;
+            };
+            if instructions.next().is_some()
+                || jump.opcode != JUMP_FORWARD
+                || jump.location != SourceLocation::NONE
+                || tails.iter().any(|(block, ..)| *block == exit)
+            {
+                continue;
+            }
+            let predecessors = incoming.get_or_insert_with(|| self.legacy_predecessors());
+            if predecessors.get(&second) != Some(&2) || predecessors.get(&exit) != Some(&1) {
+                continue;
+            }
+            // SETUP targets also enter the native walk. Both successors must be
+            // reached exclusively via the ordinary edges above.
+            let enters_join = |label| {
+                self.graph
+                    .label_block(label)
+                    .is_some_and(|block| block == second || block == exit)
+            };
+            if self
+                .exception_regions
+                .iter()
+                .any(|region| enters_join(region.target))
+                || self
+                    .exception_owner_provenance
+                    .legacy_native_setup_targets
+                    .iter()
+                    .any(|(_, label)| enters_join(*label))
+            {
+                continue;
+            }
+            // The first conditional queues its target and fallthrough before
+            // either is marked visited. Each pop of the second conditional
+            // charges its fallthrough; the jump therefore has two predecessors.
+            tails.push((exit, *jump, 1, 2));
+        }
     }
 
     fn legacy_predecessors(&self) -> FxHashMap<BasicBlockId, usize> {
