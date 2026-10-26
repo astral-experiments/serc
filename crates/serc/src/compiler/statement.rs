@@ -1742,6 +1742,26 @@ impl<'source> Compiler<'source> {
                     && condition_jump_target_count(&conditional.test, true) == 1))
     }
 
+    /// A discarded literal, call, await, or local store finishes its branch in
+    /// one original block, even if evaluating the value introduced earlier joins.
+    fn has_terminal_value_fallthrough(&self, body: &[Stmt]) -> bool {
+        let mut emitted = body
+            .iter()
+            .filter(|part| !self.context.is_elided_statement(part));
+        let Some(last) = emitted.next_back() else {
+            return false;
+        };
+        emitted.all(|part| matches!(part, Stmt::Assign(_) | Stmt::Expr(_) | Stmt::Pass(_)))
+            && match last {
+                Stmt::Expr(statement) => {
+                    statement.value.is_literal_expr()
+                        || matches!(statement.value.as_ref(), Expr::Call(_) | Expr::Await(_))
+                }
+                Stmt::Assign(statement) => matches!(statement.targets.as_slice(), [Expr::Name(_)]),
+                _ => false,
+            }
+    }
+
     /// Certifies a terminal branch with erased assertions or a linear conditional prefix.
     fn linear_terminal_branch_before_elided(&self, body: &[Stmt]) -> bool {
         let is_elided = |statement: &Stmt| self.context.is_elided_statement(statement);
@@ -1954,6 +1974,9 @@ impl<'source> Compiler<'source> {
             && (!conditional.body.iter().all(is_elided)
                 || condition_jump_target_count(&conditional.test, true) == 1)
             && (matches!(conditional.body.as_slice(), [Stmt::Pass(_)])
+                || (self.context.python_version >= crate::PythonVersion::Py314
+                    && self.control.exceptions.active_exception_region_exclusions.is_empty()
+                    && self.has_terminal_value_fallthrough(&conditional.body))
                 || conditional.body.iter().all(is_elided)
                 || (suite_has_linear_borrow_fallthrough(&conditional.body)
                     && conditional.body.iter().all(|statement| match statement {
@@ -2310,6 +2333,8 @@ impl<'source> Compiler<'source> {
                         && (suite_has_linear_borrow_fallthrough(&conditional.body)
                             || (self.context.python_version >= crate::PythonVersion::Py314
                                 && self.linear_terminal_branch_before_elided(&conditional.body))
+                            || (self.context.python_version >= crate::PythonVersion::Py314
+                                && self.has_terminal_value_fallthrough(&conditional.body))
                             || matches!(conditional.body.as_slice(), [Stmt::Pass(_)])
                             // The nested pass keeps its original NOP until after
                             // exit copying. Both conditions need separate returns
