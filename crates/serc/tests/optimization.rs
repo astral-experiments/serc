@@ -8296,6 +8296,35 @@ fn handler_break_releases_iterator_exception_owner() {
 }
 
 #[test]
+fn copied_iterator_break_uses_each_finalizer_guard_exit() {
+    let source = r"async def sample(items, a, b):
+    for item in items:
+        try:
+            try:
+                touch(item)
+            except ValueError as error:
+                break
+        finally:
+            prepare(item)
+            if a and b:
+                await item.close()
+    after()
+";
+    let body_break = source.replace(
+        "touch(item)\n            except ValueError as error:\n                break",
+        "touch(item)\n                break\n            except ValueError as error:\n                retry(error)",
+    );
+    for source in [source, &body_break] {
+        assert_matches_cpython_versions(
+            source,
+            "copied_iterator_guard.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn copied_finally_compound_break_threads_both_conditions() {
     let source = r#"async def copied_break(self, key):
     while not self.finished():
