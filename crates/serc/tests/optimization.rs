@@ -5605,6 +5605,33 @@ fn erased_nested_else_preserves_coroutine_loop_exits() {
 }
 
 #[test]
+fn a_finalizer_guard_keeps_the_following_local_load_owned() {
+    let source = r"def read():
+    with manager:
+        try:
+            pass
+        finally:
+            limit = current
+            if state is not None:
+                try:
+                    with resource():
+                        prepare()
+                except ValueError as error:
+                    raise
+                finally:
+                    state.pending = None
+        if state.clock() > limit:
+            raise ValueError
+";
+    assert_matches_cpython_versions(
+        source,
+        "guarded_finalizer_load.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn erased_final_else_suffix_preserves_coroutine_loop_exits() {
     let source = r"async def sample(items, selected, prepare, work, verify):
     for item in items:
