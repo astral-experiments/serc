@@ -39588,11 +39588,7 @@ impl<'source> Compiler<'source> {
         self.emit(COPY, 3, 1)?;
         self.emit(POP_EXCEPT, 0, -1)?;
         self.emit_reraise(ReraiseStackState::HandlerCleanup)?;
-        // The finally end label starts a fresh original instruction array, even when its
-        // normal-exit jump is removed before forward-branch normalization. Borrow analysis
-        // must still reset its reference state and producer indices at that original entry.
-        self.assembler.record_exception_owner_block_boundary(end);
-        self.assembler.record_borrow_analysis_block_boundary(end);
+        self.assembler.record_finally_continuation(end);
         self.assembler.mark(end);
         self.set_depth(base_depth);
         if capture_manager_pop {

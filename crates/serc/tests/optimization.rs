@@ -15909,6 +15909,26 @@ fn optimized_empty_manager_bodies_match_cpython() {
 }
 
 #[test]
+fn first_local_guard_after_finally_keeps_its_fresh_slot() {
+    let source = r"async def sample(enabled, items):
+    def capture():
+        return enabled
+    try:
+        await wait()
+    finally:
+        values = [x for x in items]
+    if enabled:
+        work()
+";
+    assert_matches_cpython_versions(
+        source,
+        "guard_after_finally.py",
+        &LEVELS,
+        &[PythonVersion::Py314],
+    );
+}
+
+#[test]
 fn modern_manager_finally_jump_and_copied_exit_keep_owners() {
     const JUMP_SOURCE: &str = "def f(manager, work):\n    try:\n        raise ValueError()\n    except ValueError:\n        with manager:\n            try:\n                work()\n            finally:\n                pass\n";
     const DIRECT_SOURCE: &str = "def f(manager, work):\n    with manager:\n        try:\n            work()\n        finally:\n            pass\n";

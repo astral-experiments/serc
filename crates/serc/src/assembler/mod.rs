@@ -16556,6 +16556,17 @@ impl Assembler {
             .insert(label);
     }
 
+    /// Retains the original instruction-array boundary following a finally suite.
+    pub(crate) fn record_finally_continuation(&mut self, join: Label) {
+        self.record_exception_owner_block_boundary(join);
+        self.record_borrow_analysis_block_boundary(join);
+        if self.python_version == crate::PythonVersion::Py314 {
+            self.exception_owner_provenance
+                .original_finally_joins
+                .insert(join);
+        }
+    }
+
     /// Retains a source CFG boundary after its conditional jump is folded away.
     pub(crate) fn record_exception_owner_block_boundary(&mut self, label: Label) {
         self.exception_owner_provenance

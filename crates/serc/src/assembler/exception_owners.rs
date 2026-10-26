@@ -339,6 +339,8 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) original_comparison_fallthroughs: Vec<(Label, Label, [Instruction; 6])>,
     // Source-authored match ends establish original arrays independently of case exits.
     pub(super) original_match_join_boundaries: FxHashSet<Label>,
+    // Continuations after the normal copy of an authored finally suite.
+    pub(super) original_finally_joins: FxHashSet<Label>,
     // Original leaf-block entry and exit, case-success join, and following return array.
     pub(super) nested_match_exit_copy_origins: Vec<(Label, Instruction, Label, Label)>,
     // Exact post-threading head and original fallthrough donor of a shared case return.
@@ -3547,7 +3549,14 @@ impl ExceptionOwnerProvenance {
         // Retained SETUPs need an authored NOP proof. A certified comprehension
         // restore followed by a non-swappable operation establishes its array head,
         // including a condition reached without crossing a new SETUP.
-        (setup_count > 0 || comprehension_restore_count > 0)
+        let simple_finally_guard = source_head
+            && leading_labels.iter().any(|label| {
+                self.original_finally_joins.contains(label) && indexes().has_unique_label(*label)
+            })
+            && matches!(body, [load, conversion] if matches!(load.opcode, LOAD_FAST | LOAD_DEREF)
+                && conversion.opcode == TO_BOOL && load.location == conversion.location && load.location == condition.location)
+            && indexes().has_unique_forward_jump(all, *condition);
+        (setup_count > 0 || comprehension_restore_count > 0 || simple_finally_guard)
             // With no folds, the append is fresh. Certified membership/global
             // folds may instead leave the retained SETUP in that exact array cell.
             && (folded_slots == 0 || null_setup_cells.contains(&(instructions.len() - 1)))
