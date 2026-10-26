@@ -15,6 +15,33 @@ use serc::{
 };
 
 #[test]
+fn copied_manager_exit_shares_the_next_finalizer_entry() {
+    for body in ["work()", "raise ValueError"] {
+        let source = format!(
+            "def run(value, manager):
+    try:
+        try:
+            try:
+                return value
+            finally:
+                with manager:
+                    {body}
+        finally:
+            settle()
+    finally:
+        finish()
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "copied_manager_exit.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn nested_conversion_handlers_keep_shared_cleanup() {
     let source = r"def sample(items):
     for item in items:
