@@ -9598,6 +9598,31 @@ impl<'source> Compiler<'source> {
                                 && manager.normal_finally_depth == 0
                                 && manager.exception_region_depth == finally.exception_region_depth
                     );
+                // An ordinary try inside the named handler unwinds immediately
+                // before the handler's two omitted POPs and the name-clear sequence.
+                let captures_inner_try_handler_return = self.context.python_version
+                    == crate::PythonVersion::Py314
+                    && preserve_tos
+                    && !return_is_overridden
+                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                        == CO_COROUTINE
+                    && self.control.exceptions.active_exception_group_handlers == 0
+                    && self.control.finally.active_finally_end_blocks == 0
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_copied_finally_bodies == 0
+                    && self.control.withs.active_with_exits.is_empty()
+                    && self.control.loops.contexts.is_empty()
+                    && self.control.exceptions.active_try_marker_slots.len() == 1
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .len()
+                        == 3
+                    && matches!((self.control.exceptions.active_exception_handlers.as_slice(), return_finally_contexts.as_slice()),
+                        ([handler], [finally]) if handler.name.is_some() && handler.exception_region_depth == 1
+                            && handler.try_body_depth == 0 && finally.exception_region_depth == 0
+                            && finally.handler_depth == 0);
                 let unwinds_return_finally = !return_finally_contexts.is_empty();
                 let preserved_return_value_contexts =
                     self.control.finally.preserved_return_value_contexts.clone();
@@ -9889,11 +9914,12 @@ impl<'source> Compiler<'source> {
                                 self.assembler.mark_last_as_converted_pop_block();
                             }
                         }
-                        if captures_async_manager_handler_return
+                        if (captures_async_manager_handler_return
+                            || captures_inner_try_handler_return)
                             && !preserve_named_handler_pop_slots
                             && handler_index == 0
                             && next_finally == 1
-                            && next_with == 1
+                            && next_with == self.control.withs.active_with_exits.len()
                             && next_loop == 0
                         {
                             saved_named_handler_return_start = Some(self.assembler.item_count());
@@ -12126,7 +12152,7 @@ impl<'source> Compiler<'source> {
                         .filter(|_| {
                             context_index == 0
                                 && next_handler == 0
-                                && next_with == 1
+                                && next_with == self.control.withs.active_with_exits.len()
                                 && next_loop == 0
                         })
                         .map(|start| (start, self.assembler.item_count()));
@@ -12345,8 +12371,11 @@ impl<'source> Compiler<'source> {
                     if result.is_ok()
                         && let Some((start, pop_item)) = saved_named_handler_none_pop
                     {
-                        self.assembler
-                            .record_saved_named_handler_none_prefix(start, pop_item);
+                        self.assembler.record_saved_named_handler_none_prefix(
+                            start,
+                            pop_item,
+                            captures_inner_try_handler_return,
+                        );
                     }
                     if result.is_ok()
                         && let Some((pop_item, manager, handler)) = copied_cleanup_none_pop
