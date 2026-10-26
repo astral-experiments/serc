@@ -11640,6 +11640,25 @@ fn erased_async_for_assertions_preserve_continue_tail() {
 }
 
 #[test]
+fn elided_assertion_keeps_conditional_operands_outside_the_return() {
+    for (definition, operation) in [
+        ("def", "value = items[0 if inner else 1]"),
+        ("async def", "visit('label', left if inner else right)"),
+    ] {
+        let source = format!(
+            "{definition} sample(outer, inner, items, left, right):
+    if outer:
+        {operation}
+        assert inner
+    else:
+        skip()
+"
+        );
+        assert_matches_cpython(&source, "elided_branch_operand.py", &LEVELS);
+    }
+}
+
+#[test]
 fn elided_assertions_preserve_terminal_call_join_boundaries() {
     for call in [
         "sink(x if flag else y)",

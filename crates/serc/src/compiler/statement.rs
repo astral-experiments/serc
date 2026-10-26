@@ -3682,14 +3682,15 @@ impl<'source> Compiler<'source> {
             .is_some_and(|statement| {
                 // A conditional value can leave only STORE_FAST before the outer jump,
                 // so its copied return still fits four slots. A linear value adds a load,
-                // and an ordinary call adds CALL after its arguments rejoin. A
-                // specialized generator call rejoins after its fast and fallback
-                // paths have produced the result, leaving only the store there. An
+                // and a subscript or ordinary call consumes its arguments after they
+                // rejoin. A specialized generator call rejoins after its fast and
+                // fallback paths have produced the result, leaving only the store. An
                 // enclosing arm's exit jump pushes this copy past four slots.
                 matches!(statement, Stmt::Assign(assignment)
                     if !has_later_arm
                         || !matches!(assignment.targets.as_slice(), [Expr::Name(_)])
                         || ((!expression_contains_inline_branch(&assignment.value)
+                            || matches!(assignment.value.as_ref(), Expr::Subscript(_))
                             || matches!(assignment.value.as_ref(), Expr::Call(call)
                                 if optimized_generator_callable_for_target(call, self.context.python_version).is_none()
                                     || self.control.statements.terminal_if_branch_has_forward_exit))
@@ -3698,11 +3699,16 @@ impl<'source> Compiler<'source> {
             });
         let elided_terminal_call = self.context.python_version >= crate::PythonVersion::Py314
             && matches!(self.unit.scope, Scope::Function { .. })
-            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
             && self.control.loops.contexts.is_empty()
             && !self.control.loops.suite_fallthrough_to_loop_backedge
             && self.control.withs.active_with_exits.is_empty()
-            && !self.has_active_control_flow_region()
+            && self.control.withs.active_with_region_exclusions.is_empty()
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
             && !self.control.in_exception_handler()
             && self.control.exceptions.active_exception_group_handlers == 0
             && self.control.finally.is_inactive_for_return_unwind()
