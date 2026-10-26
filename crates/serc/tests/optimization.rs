@@ -9099,6 +9099,27 @@ fn constant_return_keeps_the_try_pop_before_a_managed_finally_guard() {
 }
 
 #[test]
+fn three_local_fusions_reuse_the_return_pop_in_a_finally_guard() {
+    let source = r"async def update(items, state, skip, box, first, second, third):
+    for item in items:
+        try:
+            if skip:
+                continue
+            box.first = first
+            box.second = second
+            box.third = third
+            changed = False
+            return
+        except ValueError:
+            recover()
+        finally:
+            if state is not None:
+                close()
+";
+    assert_matches_cpython_versions(source, "fused_return.py", &LEVELS, &[PythonVersion::Py314]);
+}
+
+#[test]
 fn protected_conditional_store_preserves_erased_else_backedge() {
     let protected = r"def collect(batches, left, right, cleanup, sink):
     try:
