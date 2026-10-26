@@ -42584,11 +42584,19 @@ fn with_body_handler_exit_location(compiler: &Compiler<'_>, body: &[Stmt]) -> Op
         return None;
     }
 
-    let tail = handler
+    let Some(tail) = handler
         .body
         .iter()
         .rev()
-        .find(|statement| is_live(statement))?;
+        .find(|statement| is_live(statement))
+    else {
+        // An erased unnamed handler reaches its cleanup straight from the
+        // exception match. The POP_EXCEPT and its jump inherit the handler range.
+        return (compiler.context.python_version >= crate::PythonVersion::Py314
+            && handler.name.is_none()
+            && !handler.body.is_empty())
+        .then_some(handler.range);
+    };
     let tail = match tail {
         Stmt::Try(inner)
             if compiler.context.python_version >= crate::PythonVersion::Py314
