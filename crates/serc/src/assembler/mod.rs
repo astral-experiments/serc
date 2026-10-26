@@ -8842,6 +8842,19 @@ impl Assembler {
     }
 
     pub(crate) fn preserve_last_inlined_jump_nop(&mut self) {
+        // A break after a manager can unwind a finalizer before reaching this jump.
+        // Its discarded expression already supplies the line of the unlocated break.
+        let items = self.linear_items();
+        let end = items.len() - trailing_labels(items).count();
+        if self.python_version >= crate::PythonVersion::Py314
+            && let [.., Item::Instruction(discard), Item::Instruction(jump)] = &items[..end]
+            && jump.fusion_policy.is_authored_break()
+            && jump.location == SourceLocation::NONE
+            && discard.opcode == POP_TOP
+            && discard.location.line >= 0
+        {
+            return;
+        }
         self.last_jump_instruction_mut("retaining an inlined jump NOP")
             .jump_policy
             .retain_nop();

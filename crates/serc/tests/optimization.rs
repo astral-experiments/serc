@@ -15,6 +15,30 @@ use serc::{
 };
 
 #[test]
+fn break_after_manager_uses_the_copied_finalizer_line() {
+    for result in ["value", "(first, second, third)"] {
+        let source = format!(
+            "async def run(active, manager):
+    while active:
+        try:
+            async with manager:
+                work()
+            break
+        finally:
+            finish()
+    return {result}
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "manager_break_finalizer.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn nested_conversion_handlers_keep_shared_cleanup() {
     let source = r"def sample(items):
     for item in items:
