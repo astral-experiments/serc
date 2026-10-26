@@ -1366,6 +1366,23 @@ fn coroutine_nested_breaks_reach_located_cleanup() {
 }
 
 #[test]
+fn async_manager_recovery_copies_the_final_bare_raise() {
+    let source = "async def sample(manager):
+    try:
+        work()
+    except Cancelled:
+        try:
+            async with manager:
+                await finish()
+        except Expired:
+            recover()
+        finally:
+            raise
+";
+    assert_matches_cpython(source, "async_manager_recovery_raise.py", &LEVELS);
+}
+
+#[test]
 fn reraised_async_manager_keeps_recovery_continuation_cold() {
     let source = "async def sample(owner, lock, records, value, rounds):\n    for iteration in range(rounds):\n        try:\n            value['status'] = 'rejected'\n        except OwnerError as error:\n            if not owner.recoverable(error):\n                async with lock:\n                    records.append(value)\n                raise\n        except (ValueError, TypeError) as error:\n            value['error'] = error\n        async with lock:\n            records.append(value)\n";
     for source in [
