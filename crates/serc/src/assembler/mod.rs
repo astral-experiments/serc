@@ -11863,6 +11863,7 @@ impl Assembler {
         &mut self,
         return_item: usize,
         finally_handler: Label,
+        named_outer: bool,
     ) {
         let items = self.linear_items();
         let Some(start) = items[..return_item].iter().rposition(|item| {
@@ -11890,41 +11891,62 @@ impl Assembler {
                 Item::Label(_) => {}
                 Item::Instruction(record) => {
                     records.push(*record);
-                    if records.len() == 10 {
+                    if records.len() == if named_outer { 12 } else { 10 } {
                         break;
                     }
                 }
             }
         }
-        let Ok(records): Result<[Instruction; 10], _> = records.try_into() else {
-            return;
-        };
         let [
             discard,
             authored,
             first_pop,
             inner,
-            second_pop,
-            outer,
+            middle @ ..,
             final_pop,
             load,
             condition,
             marker,
-        ] = records;
+        ] = records.as_slice()
+        else {
+            return;
+        };
+        let (outer, second_pop) = match middle {
+            [pop, outer] if !named_outer => (outer, Some(pop)),
+            [outer, none, store, delete]
+                if named_outer
+                    && none.opcode == LOAD_CONST
+                    && store.opcode == STORE_FAST
+                    && delete.opcode == DELETE_FAST
+                    && store.operand() == delete.operand()
+                    && none.depth_after() == inner.depth_after()
+                    && store.depth_after() == outer.depth_after()
+                    && delete.depth_after() == outer.depth_after()
+                    && [none, store, delete].iter().all(|record| {
+                        record.exception_policy() == ExceptionPolicy::NoneUnchanged
+                    }) =>
+            {
+                (outer, None)
+            }
+            _ => return,
+        };
         if discard.opcode != POP_TOP
             || discard.value_argument() != Some(0)
             || authored.opcode != NOP
             || authored.fusion_policy.is_converted_pop_block()
-            || items.get(return_item) != Some(&Item::Instruction(authored))
+            || items.get(return_item) != Some(&Item::Instruction(*authored))
             || [inner, outer]
                 .iter()
                 .any(|i| i.opcode != POP_EXCEPT || i.value_argument() != Some(0))
-            || [first_pop, second_pop, final_pop].iter().any(|i| {
-                i.opcode != NOP
-                    || i.value_argument() != Some(0)
-                    || !i.fusion_policy.is_converted_pop_block()
-                    || i.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
-            })
+            || [first_pop, final_pop]
+                .into_iter()
+                .chain(second_pop)
+                .any(|i| {
+                    i.opcode != NOP
+                        || i.value_argument() != Some(0)
+                        || !i.fusion_policy.is_converted_pop_block()
+                        || i.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
+                })
             || load.opcode != LOAD_FAST
             || load.local_policy
                 != LocalPolicy::for_load(load.local_policy.force_owned_load(), false)
@@ -11939,17 +11961,17 @@ impl Assembler {
             || records.iter().enumerate().any(|(index, i)| {
                 i.pre_fold_extra_instructions() != 0
                     || i.local_policy.hidden_exception_owner_slots()
-                        != if index == 8 { 3 } else { 0 }
+                        != if index == records.len() - 2 { 3 } else { 0 }
                     || i.no_location_policy.borrow_fallthrough() != BorrowFallthrough::Reachable
                     || i.jump_policy.borrow_empty_block()
             })
-            || records[1..7]
+            || records[1..records.len() - 3]
                 .iter()
                 .any(|i| i.location != authored.location)
             || authored.depth_after() != discard.depth_after()
             || first_pop.depth_after() != authored.depth_after()
             || inner.depth_after().and_then(|d| d.checked_add(1)) != authored.depth_after()
-            || second_pop.depth_after() != inner.depth_after()
+            || second_pop.is_some_and(|pop| pop.depth_after() != inner.depth_after())
             || outer.depth_after().and_then(|d| d.checked_add(1)) != inner.depth_after()
             || final_pop.depth_after() != outer.depth_after()
             || load.depth_after() != outer.depth_after().map(|d| d + 1)

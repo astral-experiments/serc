@@ -8530,6 +8530,36 @@ fn unnamed_handler_constant_return_preserves_copied_guard_owner() {
 }
 
 #[test]
+fn nested_handler_return_reuses_outer_exception_name_slot() {
+    let source = r"def sample(value, guard):
+    try:
+        work(value)
+    except ValueError as error:
+        try:
+            repair(value)
+        except OSError:
+            return
+    finally:
+        if guard is not None:
+            finish()
+";
+    for source in [
+        source.to_owned(),
+        source.replace("def sample", "async def sample"),
+        source
+            .replace("except ValueError as error", "except ValueError")
+            .replacen("    try:", "    yield value\n    try:", 1),
+    ] {
+        assert_matches_cpython_versions(
+            &source,
+            "nested_handler_name_slot.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn unnamed_handler_match_cleanup_preserves_success_edges() {
     let source = r"async def handler_match(owner, kinds, operation, sink, choice):
     result = None
