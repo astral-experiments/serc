@@ -8334,6 +8334,25 @@ fn copied_finally_compound_break_threads_both_conditions() {
 }
 
 #[test]
+fn shared_manager_cleanup_has_no_while_condition_line() {
+    for first in [
+        "for item in items:\n                work(item)",
+        "return",
+        "try:\n                return\n            except ValueError:\n                return",
+    ] {
+        let source = format!(
+            "def run(manager, flag, ready):\n    with manager:\n        if flag:\n            {first}\n        else:\n            while ready:\n                work()\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "shared_manager_while_cleanup.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn handler_raising_while_else_preserves_break_cleanup() {
     let source = r"async def guarded_finalizer(owner, enabled, marker):
     try:

@@ -17035,27 +17035,37 @@ impl<'source> Compiler<'source> {
         body: &[Stmt],
         shares_false_join: bool,
     ) -> Result<(), CompileError> {
-        // No native record separates a final while's empty anchors from this
-        // handler-final conditional's false/end label. Defer its cleanup marker
-        // to that join; a nested conditional retains its existing donor policy.
-        let while_before_conditional_join = (self.context.python_version
-            >= crate::PythonVersion::Py314
-            && shares_false_join
-            && self
-                .control
-                .exceptions
-                .active_exception_handlers
-                .last()
-                .is_some_and(|handler| handler.trailing_statement == Some(statement.range)))
-        .then(|| match body.last() {
-            Some(Stmt::While(tail)) => Some(tail.range),
-            _ => None,
-        })
-        .flatten();
         let fallthrough_body = statement
             .elif_else_clauses
             .last()
             .map_or(statement.body.as_slice(), |clause| clause.body.as_slice());
+        let while_before_conditional_join = if self.context.python_version
+            >= crate::PythonVersion::Py314
+            && let Some(Stmt::While(tail)) = body.last()
+        {
+            let handler_join = shares_false_join
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_handlers
+                    .last()
+                    .is_some_and(|handler| handler.trailing_statement == Some(statement.range));
+            // The last arm falls straight into the cleanup. A bypass or a normal
+            // exit from another arm prevents the while from donating its line.
+            let manager_join = !self.control.withs.active_with_exits.is_empty()
+                && (shares_false_join
+                    || (statement.elif_else_clauses.last().is_some_and(|clause| {
+                        clause.test.is_none()
+                            && clause.body.last().map(Ranged::range) == Some(tail.range)
+                    }) && if_suites(statement).any(|arm| {
+                        arm.last().map(Ranged::range) != Some(tail.range)
+                            && !suite_terminates_before_constant_folding(arm)
+                            && !with_body_ends_in_terminal_try(arm)
+                    })));
+            (handler_join || manager_join).then_some(tail.range)
+        } else {
+            None
+        };
         let retained_branch_pass = (self.context.python_version >= crate::PythonVersion::Py314
             && body.len() > 1
             && body.last().map(Ranged::range) == fallthrough_body.last().map(Ranged::range))
