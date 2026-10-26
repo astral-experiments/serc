@@ -8296,6 +8296,30 @@ fn handler_break_releases_iterator_exception_owner() {
 }
 
 #[test]
+fn shared_finally_guard_after_handler_cleanup_keeps_manager_owner() {
+    let source = r"def sample(manager, flag):
+    with manager as item:
+        try:
+            yield item
+        finally:
+            if not item.done:
+                if flag:
+                    pause()
+                else:
+                    try:
+                        item.close()
+                    except ValueError:
+                        raise
+";
+    assert_matches_cpython_versions(
+        source,
+        "guarded_handler_manager.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn copied_finally_compound_break_threads_both_conditions() {
     let source = r#"async def copied_break(self, key):
     while not self.finished():

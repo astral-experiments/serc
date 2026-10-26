@@ -38535,6 +38535,12 @@ impl<'source> Compiler<'source> {
                         let Stmt::If(tail) = last else {
                             return false;
                         };
+                        if self.context.python_version >= crate::PythonVersion::Py314
+                            && tail.elif_else_clauses.is_empty()
+                            && self.assembler.at_shared_join_after_handler_cleanup()
+                        {
+                            return true;
+                        }
                         (leading.is_empty()
                             || suite_has_linear_borrow_fallthrough(leading)
                             // An earlier closed guard rejoins before this condition. Its
