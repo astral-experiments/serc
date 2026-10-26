@@ -2559,6 +2559,21 @@ fn completed_while_prefixes_preserve_erased_exit_borrow_boundaries() {
 }
 
 #[test]
+fn generators_copy_manager_returns_through_erased_finalizers() {
+    for definition in ["def", "async def"] {
+        let source = format!(
+            "{definition} run(manager, value):\n    try:\n        with manager:\n            yield value\n    finally:\n        assert value\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "generator_manager_exit.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn erased_sync_manager_finalizer_keeps_empty_exit() {
     for source in [
         "def sample():\n    try:\n        with expecting(Failure) as error:\n            second.start()\n    finally:\n        assert first.close(1)\n    restarted = factory(lambda: store)\n    restarted.start()\n",
