@@ -5795,6 +5795,53 @@ impl LayoutAssembler {
         original == origin.unwind_offset + 9 && live == marker + 1
     }
 
+    /// Counts original return/POP sequences that compacted into this None guard.
+    fn count_compacted_return_none_prefixes(
+        &self,
+        pop: usize,
+        instructions: &[&Instruction],
+        positions: &OwnerLabelPositions,
+        jump_targets: &FxHashSet<Label>,
+    ) -> usize {
+        let Some([actual_pop, load, condition]) = instructions.get(pop..pop + 3) else {
+            return 0;
+        };
+        let matches = self
+            .exception_owner_provenance
+            .copied_return_none_prefixes
+            .iter()
+            .filter(|origin| {
+                let removed = if origin.additional_pop.is_some() {
+                    3
+                } else {
+                    2
+                };
+                let mut expected_pop = origin.pops[1];
+                expected_pop
+                    .local_policy
+                    .add_hidden_exception_owner_slots(removed);
+                let mut expected_load = origin.load;
+                if load.opcode == crate::target::opcodes::LOAD_FAST_BORROW {
+                    expected_load.opcode = load.opcode;
+                }
+                origin.return_nop.is_some()
+                    && expected_pop == **actual_pop
+                    && expected_load == **load
+                    && origin.condition == **condition
+            })
+            .count();
+        if matches > 0
+            && jump_targets.iter().any(|target| {
+                positions
+                    .get(target)
+                    .is_some_and(|position| pop < *position && *position <= pop + 3)
+            })
+        {
+            return 0;
+        }
+        matches
+    }
+
     /// Replays only fully captured constant-return cleanup and its original NULL cells.
     fn copied_cleanup_return_none_owner(
         &self,
@@ -7730,64 +7777,31 @@ impl LayoutAssembler {
                             && !self.exception_regions[region].is_scope_fallback
                             && !self.exception_regions[region].preserve_lasti
                         {
-                            let matching_pairs = if instruction
-                                .local_policy
-                                .hidden_exception_owner_slots()
-                                == 1
-                            {
-                                self.exception_owner_provenance
-                                    .early_return_nop_pairs
-                                    .iter()
-                                    .filter(|(_, pop, target)| {
-                                        let mut expected = *pop;
-                                        expected.local_policy.add_hidden_exception_owner_slots(1);
-                                        expected == *instruction
-                                            && self.exception_regions[region].target == *target
-                                    })
-                                    .count()
-                            } else {
-                                // The authored return NOP and ordinary-try POPs compact
-                                // into the finally POP. The authored cell stays owned;
-                                // every captured POP cell remains NULL.
-                                self.exception_owner_provenance
-                                    .copied_return_none_prefixes
-                                    .iter()
-                                    .filter(|origin| {
-                                        let removed = if origin.additional_pop.is_some() {
-                                            3
-                                        } else {
-                                            2
-                                        };
-                                        let mut expected_pop = origin.pops[1];
-                                        expected_pop
-                                            .local_policy
-                                            .add_hidden_exception_owner_slots(removed);
-                                        let Some(load) =
-                                            indexed_instructions.get(instruction_index + 1)
-                                        else {
-                                            return false;
-                                        };
-                                        let mut expected_load = origin.load;
-                                        if load.opcode == crate::target::opcodes::LOAD_FAST_BORROW {
-                                            expected_load.opcode = load.opcode;
-                                        }
-                                        origin.return_nop.is_some()
-                                            && expected_pop == *instruction
-                                            && expected_load == **load
-                                            && indexed_instructions
-                                                .get(instruction_index + 2)
-                                                .is_some_and(|condition| {
-                                                    **condition == origin.condition
-                                                })
-                                            && jump_targets.iter().all(|target| {
-                                                label_positions.get(target).is_none_or(|position| {
-                                                    *position <= instruction_index
-                                                        || *position > instruction_index + 3
-                                                })
-                                            })
-                                    })
-                                    .count()
-                            };
+                            let matching_pairs =
+                                if instruction.local_policy.hidden_exception_owner_slots() == 1 {
+                                    self.exception_owner_provenance
+                                        .early_return_nop_pairs
+                                        .iter()
+                                        .filter(|(_, pop, target)| {
+                                            let mut expected = *pop;
+                                            expected
+                                                .local_policy
+                                                .add_hidden_exception_owner_slots(1);
+                                            expected == *instruction
+                                                && self.exception_regions[region].target == *target
+                                        })
+                                        .count()
+                                } else {
+                                    // The authored return NOP and ordinary-try POPs compact
+                                    // into the finally POP. The authored cell stays owned;
+                                    // every captured POP cell remains NULL.
+                                    self.count_compacted_return_none_prefixes(
+                                        instruction_index,
+                                        &indexed_instructions,
+                                        &label_positions,
+                                        &jump_targets,
+                                    )
+                                };
                             if matching_pairs == 1
                                 && let Some(slot) =
                                     instruction_index.checked_add(tail.early_removals)
@@ -10436,6 +10450,34 @@ impl LayoutAssembler {
                                 &label_positions,
                                 &jump_targets,
                             )
+                        {
+                            owners.insert(
+                                instruction_index,
+                                ExceptionOwnerDecision::override_with_region(None),
+                            );
+                        }
+                        // At a block entry, a return NOP and three POP_BLOCKs compact into
+                        // one NOP. The appended marker occupies the last unowned POP cell.
+                        if instruction.exception_policy() == super::ExceptionPolicy::NonePresent
+                            && owner_history_exact
+                            && original_array_start.checked_add(3) == Some(instruction_index)
+                            && tail.early_removals == 6
+                            && tail.late_removals == 0
+                            && tail.insertions == 0
+                            && tail.post_compaction_fusions == 0
+                            && indexed_instructions[original_array_start]
+                                .local_policy
+                                .hidden_exception_owner_slots()
+                                == 3
+                            && owners
+                                .get(instruction_index)
+                                .is_none_or(|decision| !decision.is_definitive())
+                            && self.count_compacted_return_none_prefixes(
+                                original_array_start,
+                                &indexed_instructions,
+                                &label_positions,
+                                &jump_targets,
+                            ) == 1
                         {
                             owners.insert(
                                 instruction_index,
