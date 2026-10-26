@@ -319,6 +319,7 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) copied_bare_handler_none_prefixes: Vec<(Label, Label, [Instruction; 10])>,
     pub(super) copied_iterator_attribute_none_prefixes: Vec<[Instruction; 4]>,
     pub(super) copied_cleanup_return_none_prefixes: Vec<CopiedCleanupReturnNonePrefix>,
+    pub(super) copied_return_setups: Vec<CopiedReturnSetup>,
     pub(super) copied_return_pop_prefixes: Vec<CopiedReturnPopPrefix>,
     pub(super) copied_return_truth_prefixes: Vec<CopiedReturnTruthPrefix>,
     pub(super) copied_return_membership_prefixes: Vec<CopiedReturnMembershipPrefix>,
@@ -608,6 +609,11 @@ impl ExceptionOwnerProvenance {
                     .map(|origin| &origin.condition),
             )
             .chain(
+                self.copied_return_setups
+                    .iter()
+                    .filter_map(|origin| origin.records.last()),
+            )
+            .chain(
                 self.copied_cleanup_return_none_prefixes
                     .iter()
                     .map(|origin| &origin.condition),
@@ -838,6 +844,11 @@ impl ExceptionOwnerProvenance {
         for prefix in &mut self.copied_iterator_attribute_none_prefixes {
             for instruction in prefix.iter_mut() {
                 visit(instruction);
+            }
+        }
+        for origin in &mut self.copied_return_setups {
+            for record in &mut origin.records {
+                visit(record);
             }
         }
         for origin in &mut self.copied_cleanup_return_none_prefixes {
@@ -1113,6 +1124,14 @@ pub(super) struct CopiedReturnNonePrefix {
     pub(super) additional_pop: Option<Instruction>,
     pub(super) load: Instruction,
     pub(super) condition: Instruction,
+}
+
+/// The retained SETUP and its primitive condition after a return unwinds a finally.
+#[derive(Debug)]
+pub(super) struct CopiedReturnSetup {
+    pub(super) records: SmallVec<[Instruction; 4]>,
+    pub(super) missing_pops: usize,
+    pub(super) adjacent_pops: usize,
 }
 
 /// Exact emitted iterator/manager cleanup before a copied local None finalizer.
@@ -5795,6 +5814,75 @@ impl LayoutAssembler {
         original == origin.unwind_offset + 9 && live == marker + 1
     }
 
+    /// Locates the retained SETUP and preceding unowned POPs in the original return block.
+    fn copied_return_setup_is_null(
+        &self,
+        marker: usize,
+        array: usize,
+        tail: ExceptionOwnerTail,
+        instructions: &[&Instruction],
+        positions: &OwnerLabelPositions,
+        jump_targets: &FxHashSet<Label>,
+    ) -> bool {
+        let Some(condition_index) = marker.checked_sub(1) else {
+            return false;
+        };
+        let mut origins = self
+            .exception_owner_provenance
+            .copied_return_setups
+            .iter()
+            .filter(|origin| origin.records.last() == instructions.get(condition_index).copied());
+        let Some(origin) = origins.next() else {
+            return false;
+        };
+        let Some(setup) = marker.checked_sub(origin.records.len()) else {
+            return false;
+        };
+        if origins.next().is_some()
+            || setup < array
+            || !self
+                .exception_owner_provenance
+                .setups
+                .iter()
+                .any(|(label, location)| {
+                    *location == Some(origin.records[0].location)
+                        && positions.get(label) == Some(&(setup + 1))
+                })
+            || jump_targets.iter().any(|label| {
+                positions
+                    .get(label)
+                    .is_some_and(|at| setup < *at && *at <= marker)
+            })
+            || origin
+                .records
+                .iter()
+                .zip(&instructions[setup..marker])
+                .enumerate()
+                .any(|(i, (record, actual))| {
+                    let mut expected = *record;
+                    if i == 0 {
+                        expected.local_policy.add_hidden_exception_owner_slots(1);
+                    }
+                    if i == 1 && actual.opcode == crate::target::opcodes::LOAD_FAST_BORROW {
+                        expected.opcode = actual.opcode;
+                    }
+                    expected != **actual
+                })
+        {
+            return false;
+        }
+        let condition = *instructions[condition_index];
+        let Some(before) = tail.early_removals.checked_sub(usize::from(
+            condition.local_policy.hidden_exception_owner_slots(),
+        )) else {
+            return false;
+        };
+        let original_setup = setup + before + origin.missing_pops;
+        original_setup
+            .checked_sub(marker)
+            .is_some_and(|distance| distance <= origin.adjacent_pops)
+    }
+
     /// Replays only fully captured constant-return cleanup and its original NULL cells.
     fn copied_cleanup_return_none_owner(
         &self,
@@ -10429,6 +10517,27 @@ impl LayoutAssembler {
                                 .get(instruction_index)
                                 .is_none_or(|decision| !decision.is_definitive())
                             && self.saved_named_handler_none_is_null(
+                                instruction_index,
+                                original_array_start,
+                                tail,
+                                &indexed_instructions,
+                                &label_positions,
+                                &jump_targets,
+                            )
+                        {
+                            owners.insert(
+                                instruction_index,
+                                ExceptionOwnerDecision::override_with_region(None),
+                            );
+                        }
+                        if owner_history_exact
+                            && tail.insertions == 0
+                            && tail.late_removals == 0
+                            && tail.post_compaction_fusions == 0
+                            && owners
+                                .get(instruction_index)
+                                .is_none_or(|decision| !decision.is_definitive())
+                            && self.copied_return_setup_is_null(
                                 instruction_index,
                                 original_array_start,
                                 tail,

@@ -12130,6 +12130,60 @@ impl<'source> Compiler<'source> {
                                 && next_loop == 0
                         })
                         .map(|start| (start, self.assembler.item_count()));
+                    let ordinary_pops = self.control.exceptions.active_try_marker_slots.len();
+                    let setup_region_depth = self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .len();
+                    let nested_setup_return = self.context.python_version
+                        == crate::PythonVersion::Py314
+                        && matches!(finally_context.body.first(), Some(Stmt::Try(inner))
+                            if !inner.is_star && inner.handlers.is_empty() && !inner.finalbody.is_empty()
+                                && matches!(inner.body.first(),Some(Stmt::If(_))))
+                        && !return_is_overridden
+                        && context_index == 0
+                        && return_finally_contexts.len() == 1
+                        && finally_context.exception_region_depth == 0
+                        && finally_context.try_body_depth == 0
+                        && finally_context.handler_depth == 0
+                        && handler_count == 0
+                        && self.control.exceptions.active_exception_group_handlers == 0
+                        && self.control.finally.active_finally_end_blocks == 0
+                        && self.control.finally.active_normal_finally_bodies == 0
+                        && self.control.finally.active_copied_finally_bodies == 0
+                        && self
+                            .control
+                            .finally
+                            .preserved_return_value_contexts
+                            .is_empty()
+                        && setup_region_depth == ordinary_pops + 1
+                        && ordinary_pops <= 1
+                        && next_with == finally_context.with_depth
+                        && with_unwind_starts.len() <= 1
+                        && self.control.withs.active_with_exits.iter().enumerate().all(
+                            |(index, manager)| {
+                                !manager.is_async
+                                    && manager.normal_finally_depth == 0
+                                    && manager.exception_region_depth
+                                        == if index < next_with {
+                                            0
+                                        } else {
+                                            setup_region_depth
+                                        }
+                            },
+                        )
+                        && with_unwind_starts
+                            .iter()
+                            .map(|unwind| unwind.index)
+                            .eq((next_with..self.control.withs.active_with_exits.len()).rev())
+                        && next_loop == self.control.loops.contexts.len()
+                        && finally_context.loop_depth == 0
+                        && self.control.loops.contexts.iter().all(|active_loop| {
+                            active_loop.finally_end_depth == 0
+                                && active_loop.exception_region_depth == setup_region_depth
+                        });
+                    let setup_pop_item = self.assembler.item_count();
                     let copied_finally_pop_instruction = self.assembler.instruction_count();
                     self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
                     if !starts_jump_target
@@ -12336,6 +12390,14 @@ impl<'source> Compiler<'source> {
                     if result.is_ok() && preserve_tos {
                         self.assembler
                             .record_copied_finally_none_prefix(copied_finally_pop_instruction);
+                    }
+                    if result.is_ok() && nested_setup_return {
+                        self.assembler.record_copied_return_setup(
+                            copied_handler_return_item,
+                            setup_pop_item,
+                            ordinary_pops,
+                            with_unwind_starts.len(),
+                        );
                     }
                     if result.is_ok()
                         && let Some(pop_item) = named_handler_try_pop
