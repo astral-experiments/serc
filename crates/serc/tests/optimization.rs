@@ -10286,6 +10286,21 @@ fn elided_conditional_preserves_jump_before_nested_finalizers() {
 }
 
 #[test]
+fn trailing_expressions_keep_nested_handler_cleanup_unlocated() {
+    for expression in ["await save(item)", "item.value", "save(item)"] {
+        let source = format!(
+            "async def handle(item, ready, retry):\n    try:\n        process(item)\n    except ValueError as error:\n        if ready:\n            if retry:\n                try:\n                    process(item)\n                except OSError as problem:\n                    recover(error)\n            {expression}\n    finally:\n        release(item)\n    release(item)\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "nested_handler_cleanup.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn elided_handler_assertion_preserves_shared_false_cleanup() {
     for (condition, suffix) in [
         ("config.recover and not stopped", "assert False"),

@@ -31306,11 +31306,11 @@ impl<'source> Compiler<'source> {
                             Stmt::If(_) => !tail.body.iter().any(|statement| matches!(statement, Stmt::Assert(_)))
                                 && (handler_cleanup_has_runtime_if_join(tail)
                                     || handler_has_terminating_recovery_join
-                                    // A final call follows every normal prefix branch and supplies
-                                    // a concrete predecessor for the outer shared cleanup.
+                                    // A live final expression follows every normal prefix branch
+                                    // and supplies a predecessor for the outer shared cleanup.
                                     || (condition_has_only_runtime_tests(&tail.test)
                                         && matches!(tail.body.last(), Some(Stmt::Expr(expression))
-                                            if matches!(expression.value.as_ref(), Expr::Call(_))))),
+                                            if fold_constant(&expression.value).is_none()))),
                             Stmt::For(loop_statement)
                                 if suite_terminates(&loop_statement.orelse) => false,
                             Stmt::Try(_) | Stmt::With(_) | Stmt::For(_) | Stmt::While(_)
