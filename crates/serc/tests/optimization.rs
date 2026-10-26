@@ -9073,6 +9073,28 @@ fn completed_manager_work_preserves_retained_loop_owners() {
 }
 
 #[test]
+fn unpacked_branch_returns_keep_the_rightmost_target_location() {
+    let source = r"def unpack(enabled):
+    if enabled:
+        pass
+    else:
+        first, middle, last = (1, 2, 3)
+    assert enabled
+
+async def swap(enabled, first, last):
+    if enabled:
+        first, last = (last, first)
+    assert enabled
+";
+    assert_matches_cpython_versions(
+        source,
+        "unpacked_branch.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn protected_conditional_store_preserves_erased_else_backedge() {
     let protected = r"def collect(batches, left, right, cleanup, sink):
     try:
