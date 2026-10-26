@@ -9094,6 +9094,19 @@ impl Assembler {
         !shared_fallthrough_line
     }
 
+    /// Finds the last conditional whose false edge reaches this case exit.
+    pub(crate) fn last_condition_location_to(
+        &self,
+        target: Label,
+        start: usize,
+    ) -> Option<SourceLocation> {
+        self.linear_items()[start..].iter().rev().find_map(|item| {
+            let instruction = item.as_instruction()?;
+            (is_conditional_jump(instruction.opcode) && instruction.jump_target() == Some(target))
+                .then_some(instruction.location)
+        })
+    }
+
     /// Records a CPython ordinary jump block before small exits can replace its jump.
     pub(crate) fn mark_conditional_threading_target(
         &mut self,

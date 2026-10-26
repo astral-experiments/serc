@@ -1580,6 +1580,7 @@ impl Compiler<'_> {
             super::legacy_native_labels::NativeRole::IfEnd(statement.range),
             false_exit,
         );
+        let condition_start = self.assembler.item_count();
         self.compile_jump_if(&statement.test, false, false_exit)?;
         self.mark_definitely_evaluated_locals(&statement.test);
 
@@ -1650,12 +1651,39 @@ impl Compiler<'_> {
                         self.source_location(test.range())
                     })
                 });
-            self.assembler.mark_conditional_threading_target(
-                false_exit,
-                self.source_location(synthetic_condition_exit_range(&statement.test)),
-            );
             let original_unlocated_head = self.assembler.at_jump_target();
+            // A nested match at its enclosing case exit can copy that unlocated
+            // exit onto each condition before the false edges donate their lines.
+            let protected_case_exit = !final_case
+                && self
+                    .control
+                    .statements
+                    .match_tail_before_case_exit
+                    .is_some()
+                && self.context.python_version >= PythonVersion::Py314
+                && !self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty()
+                && original_unlocated_head;
+            let location = protected_case_exit
+                .then(|| {
+                    self.assembler
+                        .last_condition_location_to(false_exit, condition_start)
+                })
+                .flatten()
+                .unwrap_or_else(|| {
+                    self.source_location(synthetic_condition_exit_range(&statement.test))
+                });
+            self.assembler
+                .mark_conditional_threading_target(false_exit, location);
             let success_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, match_end)?;
+            if protected_case_exit {
+                self.assembler
+                    .prepare_no_location_block_for_inlining(success_exit);
+                self.assembler.mark_as_artificial_eval_break(success_exit);
+            }
             if final_case || (cleanup_exit && unique_false_edge.is_some()) {
                 // The final case crosses an empty pattern failure; cleanup predecessors
                 // also need the original empty-join slot after threading. Record it before
