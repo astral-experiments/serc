@@ -10,10 +10,11 @@ use super::super::{
 use crate::assembler::block_graph::{BasicBlockId, BlockGraph, ItemPosition};
 use crate::assembler::exception_owners::ExceptionOwnerProvenance;
 use crate::target::opcodes::{
-    BUILD_LIST, BUILD_MAP, BUILD_SET, BUILD_TUPLE, CALL, CALL_KW, DELETE_FAST, END_ASYNC_FOR,
-    END_SEND, FOR_ITER, LOAD_ATTR, LOAD_CONST, LOAD_DEREF, LOAD_FAST, LOAD_GLOBAL, LOAD_SMALL_INT,
-    NOP, NOT_TAKEN, POP_EXCEPT, POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE,
-    POP_JUMP_IF_TRUE, POP_TOP, RAISE_VARARGS, RERAISE, RETURN_VALUE, STORE_ATTR, STORE_FAST, SWAP,
+    BUILD_LIST, BUILD_MAP, BUILD_SET, BUILD_TUPLE, CALL, CALL_KW, DELETE_FAST, DICT_UPDATE,
+    END_ASYNC_FOR, END_SEND, FOR_ITER, LIST_EXTEND, LOAD_ATTR, LOAD_CONST, LOAD_DEREF, LOAD_FAST,
+    LOAD_GLOBAL, LOAD_SMALL_INT, NOP, NOT_TAKEN, POP_EXCEPT, POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE,
+    POP_JUMP_IF_NOT_NONE, POP_JUMP_IF_TRUE, POP_TOP, RAISE_VARARGS, RERAISE, RETURN_VALUE,
+    SET_UPDATE, STORE_ATTR, STORE_FAST, SWAP,
 };
 use crate::target::{is_conditional_jump, is_unconditional_jump};
 
@@ -192,7 +193,8 @@ fn is_four_slot_reraise_predecessor(items: &[Item]) -> bool {
         [Item::Instruction(first), Item::Instruction(second), Item::Instruction(third), Item::Instruction(jump)]
             if matches!((first.opcode, second.opcode, third.opcode),
                 (LOAD_CONST | LOAD_SMALL_INT, LOAD_FAST, STORE_ATTR)
-                | (BUILD_LIST | BUILD_MAP | BUILD_SET | BUILD_TUPLE, CALL, POP_TOP))
+                | (BUILD_LIST | BUILD_MAP | BUILD_SET | BUILD_TUPLE
+                        | DICT_UPDATE | LIST_EXTEND | SET_UPDATE, CALL, POP_TOP))
                 && jump.opcode == JUMP_FORWARD
                 && [first, second, third, jump].iter().all(|instruction| {
                     instruction.location.line >= 0
