@@ -2164,6 +2164,26 @@ fn named_handler_none_while_break_copies_cleanup() {
 }
 
 #[test]
+fn finally_assertion_keeps_the_line_of_its_successful_exit() {
+    let source = r"def sample(items, value):
+    try:
+        work()
+    finally:
+        for item in items:
+            if item:
+                pass
+        assert value
+    finish()
+";
+    assert_matches_cpython_versions(
+        source,
+        "finally_assertion_success.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn finally_assertion_exits_inherit_the_successful_operand() {
     for test in [
         "first and not second",
