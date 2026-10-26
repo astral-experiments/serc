@@ -215,6 +215,27 @@ fn guarded_finally_arms_keep_their_manager_exit_location() {
 }
 
 #[test]
+fn conditional_comprehension_keeps_its_exceptional_restore_jump() {
+    let source = r"def run(resource, enabled):
+    try:
+        work()
+    finally:
+        rows = (
+            [decode(item) for item in resource.read().splitlines()]
+            if enabled
+            else []
+        )
+    return rows
+";
+    assert_matches_cpython_versions(
+        source,
+        "conditional_comprehension_restore.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn completed_coroutine_prefixes_keep_comprehension_return_locations() {
     for iterator in ["for", "async for"] {
         for suffix in ["", "        finish(values)\n"] {

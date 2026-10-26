@@ -7988,6 +7988,17 @@ impl Compiler<'_> {
         let optimized_tuple_join = matches!(expression.body.as_ref(), Expr::Call(call)
             if matches!(optimized_generator_callable_for_target(call, self.context.python_version), Some("tuple" | "list" | "set")))
             && self.assembler.at_jump_target();
+        if self.context.python_version >= PythonVersion::Py314
+            && self.control.finally.active_finally_end_blocks > 0
+            && matches!(
+                expression.body.as_ref(),
+                Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_)
+            )
+        {
+            // Copying the exceptional exit replaces this arm's jump. Its original
+            // slot still counts when the comprehension jumps to its local restores.
+            self.assembler.add_last_original_block_slots(1);
+        }
         let body_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, end)?;
         if let Expr::If(nested) = expression.body.as_ref()
             && early_condition_truthiness(&nested.test).is_none()
