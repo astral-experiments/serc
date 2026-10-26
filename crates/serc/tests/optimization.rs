@@ -3782,6 +3782,39 @@ fn wrapped_terminal_recovery_stops_borrowed_continuation() {
 }
 
 #[test]
+fn loop_assertion_jumps_compact_their_pop_block() {
+    for source in [
+        r"def scan(records):
+    for record in records:
+        try:
+            assert valid(record), record
+        except ValueError as error:
+            if verbose:
+                report(error)
+    finish()
+",
+        r"def scan(records):
+    for record in records:
+        if enabled:
+            try:
+                assert valid(record)
+            except ValueError as error:
+                report(error)
+        else:
+            skip(record)
+        finish()
+",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "loop_assertion_jump.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn asserted_recovery_retains_enclosing_manager_successor() {
     for managers in 1..=3 {
         for context in ["acquire()", "acquire() as holder"] {

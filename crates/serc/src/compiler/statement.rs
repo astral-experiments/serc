@@ -29463,6 +29463,9 @@ impl<'source> Compiler<'source> {
             if statement.orelse.is_empty() && retained_assertion_exit {
                 self.assembler.prevent_jump_threading_target(normal_exit);
             }
+            let named_iterator_handler = self.control.in_iterator_loop()
+                && matches!(statement.handlers.as_slice(), [handler]
+                    if handler.as_except_handler().is_some_and(|handler| handler.name.is_some()));
             if retained_assertion_exit
                 && matches!(
                     self.context.python_version,
@@ -29485,20 +29488,21 @@ impl<'source> Compiler<'source> {
                 && self.control.finally.active_normal_finally_bodies == 0
                 && self.control.finally.active_copied_finally_bodies == 0
                 && self.control.finally.active_finally_end_blocks == 0
-                && statement.body.split_last().is_some_and(|(tail, prefix)| {
-                    (prefix.is_empty() || suite_has_linear_borrow_fallthrough(prefix))
-                        && matches!(tail, Stmt::Assert(assertion)
-                            if assertion.msg.is_none()
-                                && early_condition_truthiness(&assertion.test).is_none()
-                                && original_condition_has_unique_jump_target(&assertion.test, true))
-                })
-                && matches!(statement.handlers.as_slice(), [handler]
-                if handler.as_except_handler().is_some_and(|handler| {
-                    handler.type_.is_some()
-                        && matches!(handler.body.as_slice(), [Stmt::Raise(raise)]
-                            if raise.exc.as_ref().is_some_and(|exception| !expression_contains_inline_branch(exception))
-                                && raise.cause.as_ref().is_none_or(|cause| !expression_contains_inline_branch(cause)))
-                }))
+                && (named_iterator_handler
+                    || (statement.body.split_last().is_some_and(|(tail, prefix)| {
+                        (prefix.is_empty() || suite_has_linear_borrow_fallthrough(prefix))
+                            && matches!(tail, Stmt::Assert(assertion)
+                                if assertion.msg.is_none()
+                                    && early_condition_truthiness(&assertion.test).is_none()
+                                    && original_condition_has_unique_jump_target(&assertion.test, true))
+                    })
+                    && matches!(statement.handlers.as_slice(), [handler]
+                    if handler.as_except_handler().is_some_and(|handler| {
+                        handler.type_.is_some()
+                            && matches!(handler.body.as_slice(), [Stmt::Raise(raise)]
+                                if raise.exc.as_ref().is_some_and(|exception| !expression_contains_inline_branch(exception))
+                                    && raise.cause.as_ref().is_none_or(|cause| !expression_contains_inline_branch(cause)))
+                    }))))
             {
                 // The successful assertion's POP_BLOCK and normal exit share one
                 // original array even inside a loop or manager. The exact record
