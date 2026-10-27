@@ -3608,6 +3608,29 @@ fn erased_loop_break_keeps_async_manager_finally_boundary() {
 }
 
 #[test]
+fn local_fusions_before_a_try_keep_the_original_source_block_owner() {
+    for count in [5, 6, 7] {
+        let stores = "    target.field = value\n".repeat(count);
+        let source = format!(
+            "def update(target, value, flag):
+    if flag:
+        prepare()
+{stores}    try:
+        target.result = value if flag else None
+    except ValueError:
+        pass
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "fused_try_prefix.py",
+            &LEVELS,
+            &VERSIONS.map(|(version, _, _)| version),
+        );
+    }
+}
+
+#[test]
 fn stored_finalizer_value_keeps_retained_setup_marker_owner() {
     let params = (0..16)
         .map(|n| format!("p{n}"))

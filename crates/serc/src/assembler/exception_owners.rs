@@ -8889,8 +8889,10 @@ impl LayoutAssembler {
                                 proven_unprotected_slot = true;
                             }
                             // More prefix fusions can place the append before SETUP,
-                            // inside the same original entry's entirely NULL prefix.
+                            // inside the enclosing original array's entirely NULL prefix.
                             // No suffix rewrite may change the fusion-stage coordinates.
+                            let null_prefix =
+                                |source| null_original_prefix(source, start, setup_label, &owners);
                             let fused_unprotected_prefix = instruction.opcode == NOT_TAKEN
                                 && instruction.exception_policy().owner()
                                     == NormalizedExceptionOwner::DynamicCondition
@@ -8905,12 +8907,18 @@ impl LayoutAssembler {
                                     .checked_sub(tail.insertions)
                                     .and_then(|slots| slots.checked_sub(instruction_index - start))
                                     .is_some_and(|before| {
-                                        before > 1 && ((original_array_start == 0 && null_original_prefix(0, start, setup_label, &owners)) ||
-                                            start.checked_sub(before).is_some_and(|source| {
-                                                original_array_start <= source
-                                                    && !indexed_instructions[source..start].iter().any(|op| matches!(op.opcode, LOAD_FAST_LOAD_FAST | LOAD_FAST_BORROW_LOAD_FAST_BORROW | STORE_FAST_STORE_FAST | STORE_FAST_LOAD_FAST))
-                                                    && null_original_prefix(source, start, setup_label, &owners)
-                                            }))
+                                        before > 1
+                                            && (((original_array_start == 0 || source_block)
+                                                && null_prefix(original_array_start))
+                                                || start.checked_sub(before).is_some_and(
+                                                    |source| {
+                                                        original_array_start <= source
+                                                            && !indexed_instructions[source..start]
+                                                                .iter()
+                                                                .any(|op| is_local_fusion(op))
+                                                            && null_prefix(source)
+                                                    },
+                                                ))
                                     });
                             has_owner &= !(fused_retained_setup_cell || fused_unprotected_prefix);
                             proven_unprotected_slot |=
