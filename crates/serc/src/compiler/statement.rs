@@ -34550,10 +34550,11 @@ impl<'source> Compiler<'source> {
                                 && !suite_terminates(&handler.body)
                         }))))
                 && self.assembler.at_original_unconditional_join();
-            // A nested conditional that reaches this jump target leaves an unlocated
-            // handler exit. Each incoming branch then copies the cleanup with its own span.
+            // An unconditional arm can take a private copy of its unlocated handler exit.
+            // Conditional edges retain their shared cleanup when no such jump reaches it.
             let inline_join_cleanup = inline_join_cleanup
-                || (matches!(body.last(), Some(Stmt::If(_))) && self.assembler.at_jump_target());
+                || (matches!(body.last(), Some(Stmt::If(_)))
+                    && self.assembler.at_unconditional_jump_target());
             // A nested runtime conditional's normal edges also reach one original
             // artificial cleanup. Assign each copied exit its own predecessor's location.
             let shared_conditional_cleanup = matches!(
