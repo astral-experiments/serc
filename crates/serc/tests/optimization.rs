@@ -25977,3 +25977,33 @@ fn short_circuit_value_after_manager_entries_uses_the_prior_handler() {
 ";
     assert_matches_cpython(source, "manager_value_guard.py", &LEVELS);
 }
+
+#[test]
+fn a_fallthrough_handler_locates_manager_cleanup() {
+    let source = r"def update(manager, value):
+    with manager:
+        try:
+            return lookup()
+        except LookupError:
+            value.count += 1
+
+def split(manager, flag, value):
+    with manager:
+        try:
+            if flag:
+                return value
+            else:
+                raise ValueError
+        except ValueError:
+            recover(value)
+
+def shared(manager, flag, value):
+    with manager:
+        try:
+            if flag:
+                return value
+        except ValueError:
+            value.count += 1
+";
+    assert_matches_cpython(source, "handler_manager_cleanup.py", &LEVELS);
+}

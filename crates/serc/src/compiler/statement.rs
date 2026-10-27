@@ -44684,7 +44684,9 @@ fn with_body_handler_exit_location(compiler: &Compiler<'_>, body: &[Stmt]) -> Op
             matches!(statement, Stmt::Return(_) | Stmt::Raise(_) | Stmt::Break(_))
         });
     let nested_exit = compiler.context.python_version >= crate::PythonVersion::Py314
-        && with_body_ends_in_terminal_try(&statement.body);
+        && (with_body_ends_in_terminal_try(&statement.body)
+            || matches!(statement.body.last(), Some(Stmt::If(_)))
+                && suite_terminates_before_constant_folding(&statement.body));
     if statement.is_star || !statement.finalbody.is_empty() || !(direct_exit || nested_exit) {
         return None;
     }
@@ -44732,6 +44734,14 @@ fn with_body_handler_exit_location(compiler: &Compiler<'_>, body: &[Stmt]) -> Op
         Stmt::Assert(statement) => Some(statement.test.range()),
         Stmt::If(statement) => {
             terminating_if_fallthrough_test(statement).map(synthetic_condition_exit_range)
+        }
+        Stmt::AugAssign(assignment)
+            if compiler.context.python_version >= crate::PythonVersion::Py314 =>
+        {
+            Some(super::source::last_store_target_range(
+                compiler,
+                &assignment.target,
+            ))
         }
         // The final store locates the handler's artificial cleanup and the manager exit.
         statement @ Stmt::Assign(_) => Some(implicit_return_range(compiler, statement)),
