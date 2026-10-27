@@ -1879,8 +1879,7 @@ impl<'source> Compiler<'source> {
             && !expression_suspends_current_scope(&iterator.iter)
     }
 
-    /// Locate a try-else conditional whose two fallthrough edges reach the same
-    /// implicit return after CPython removes the trailing assertions.
+    /// Finds the final conditional in a try-else before trailing erased assertions.
     fn erased_try_else_return_end(&self, body: &[Stmt]) -> Option<usize> {
         if self.context.python_version < crate::PythonVersion::Py314 {
             return None;
@@ -1891,13 +1890,15 @@ impl<'source> Compiler<'source> {
         let Stmt::If(branch) = &body[end] else {
             return None;
         };
+        let linear_test = |test: &Expr| {
+            condition_has_linear_runtime_leaves(test) && !expression_suspends_current_scope(test)
+        };
         (end + 1 < body.len()
-            && branch.elif_else_clauses.is_empty()
-            && condition_has_linear_runtime_leaves(&branch.test)
-            && !expression_suspends_current_scope(&branch.test)
-            && branch.body.iter().all(|part| {
-                matches!(part, Stmt::Pass(_)) || self.context.is_elided_statement(part)
-            }))
+            && linear_test(&branch.test)
+            && branch
+                .elif_else_clauses
+                .iter()
+                .all(|clause| clause.test.as_ref().is_none_or(linear_test)))
         .then_some(end + 1)
     }
 

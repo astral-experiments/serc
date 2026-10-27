@@ -17413,6 +17413,29 @@ fn erased_assertions_preserve_raising_try_guard_exit_locations() {
 }
 
 #[test]
+fn erased_try_else_assertions_keep_their_conditional_return_donors() {
+    let source = r"def sample(choose, ready):
+    try:
+        value = read()
+    except LookupError:
+        pass
+    else:
+        if choose:
+            if ready:
+                assert value
+            else:
+                assert choose
+        else:
+            if ready:
+                assert choose
+            else:
+                assert value
+        assert value
+";
+    assert_matches_cpython(source, "erased_try_else_returns.py", &LEVELS);
+}
+
+#[test]
 fn erased_assertions_preserve_raising_try_else_guard_exit_locations() {
     for scope in ["def", "async def"] {
         for condition in ["flag is not None", "not flag", "flag or other"] {
