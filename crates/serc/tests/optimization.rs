@@ -25977,3 +25977,39 @@ fn short_circuit_value_after_manager_entries_uses_the_prior_handler() {
 ";
     assert_matches_cpython(source, "manager_value_guard.py", &LEVELS);
 }
+
+#[test]
+fn nested_conditional_stores_reach_the_borrowed_continuation() {
+    let source = r"def body(flag, value):
+    try:
+        try:
+            if flag:
+                pass
+            else:
+                saved = value
+        except LookupError:
+            pass
+    except OSError:
+        pass
+    if value is not None:
+        return value
+
+async def recovered(flag, value):
+    try:
+        await work()
+    except OSError:
+        saved = value
+    else:
+        try:
+            saved = initial()
+            if flag:
+                saved = transform(value)
+            else:
+                saved = value
+        except LookupError:
+            saved = value
+    if value is not None:
+        return value
+";
+    assert_matches_cpython(source, "nested_conditional_store.py", &LEVELS);
+}

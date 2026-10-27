@@ -27796,41 +27796,51 @@ impl<'source> Compiler<'source> {
             && self.control.finally.active_copied_finally_bodies == 0
             && self.control.finally.active_finally_end_blocks == 0
             && nested_pass_recovery_has_populated_call_arm(statement);
-        // A live conditional arm in a nested pass-only recovery can jump past
+        // A live conditional arm in a nested recovery can jump past
         // both normal try exits into the enclosing continuation.
+        let straight_stores = |body: &[Stmt]| {
+            !body.is_empty()
+                && body.iter().all(|part| {
+                    matches!(part, Stmt::Assign(assign)
+                    if matches!(assign.targets.as_slice(), [Expr::Name(_)])
+                        && !expression_contains_inline_branch(&assign.value)
+                        && !expression_suspends_current_scope(&assign.value))
+                })
+        };
+        let falls_through = |handler: &ruff_python_ast::ExceptHandler| {
+            handler.as_except_handler().is_some_and(|handler| {
+                handler.type_.is_some()
+                    && (matches!(handler.body.as_slice(), [Stmt::Pass(_)])
+                        || straight_stores(&handler.body))
+            })
+        };
         let populated_arm = |arm: &[Stmt]| {
-            matches!(arm, [Stmt::Expr(expression)]
+            straight_stores(arm)
+                || matches!(arm, [Stmt::Expr(expression)]
             if matches!(expression.value.as_ref(), Expr::Call(_))
                 || matches!(expression.value.as_ref(), Expr::Await(await_)
                     if matches!(await_.value.as_ref(), Expr::Call(_))))
         };
-        let nested_conditional_pass_entry = borrow_exit_has_source_successor
+        let nested_conditional_entry = borrow_exit_has_source_successor
             && self.context.python_version >= crate::PythonVersion::Py314
             && matches!(self.unit.scope, Scope::Function { .. })
             && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
             && !statement.is_star
-            && statement.orelse.is_empty()
             && statement.finalbody.is_empty()
             && self.control.exceptions.active_exception_handlers.is_empty()
             && self.control.exceptions.active_exception_group_handlers == 0
-            && self.control.finally.active_finally_try_bodies == 0
             && self.control.finally.active_normal_finally_bodies == 0
             && self.control.finally.active_copied_finally_bodies == 0
             && self.control.finally.active_finally_end_blocks == 0
-            && matches!(statement.handlers.as_slice(), [handler]
-            if handler.as_except_handler().is_some_and(|handler| {
-                handler.type_.is_some() && matches!(handler.body.as_slice(), [Stmt::Pass(_)])
-            }))
-            && matches!(statement.body.as_slice(), [Stmt::Try(nested)]
+            && matches!(statement.handlers.as_slice(), [handler] if falls_through(handler))
+            && matches!(normal_exit_suite, [Stmt::Try(nested)]
                 if !nested.is_star
                     && nested.orelse.is_empty()
                     && nested.finalbody.is_empty()
-                    && matches!(nested.handlers.as_slice(), [handler]
-                        if handler.as_except_handler().is_some_and(|handler| {
-                            handler.type_.is_some() && matches!(handler.body.as_slice(), [Stmt::Pass(_)])
-                        }))
-                    && matches!(nested.body.as_slice(), [Stmt::If(branch)]
-                        if condition_has_only_runtime_tests(&branch.test)
+                    && matches!(nested.handlers.as_slice(), [handler] if falls_through(handler))
+                    && matches!(nested.body.split_last(), Some((Stmt::If(branch), prefix))
+                        if (prefix.is_empty() || straight_stores(prefix))
+                            && condition_has_only_runtime_tests(&branch.test)
                             && !expression_contains_inline_branch(&branch.test)
                             && !expression_suspends_current_scope(&branch.test)
                             && matches!(branch.elif_else_clauses.as_slice(), [otherwise]
@@ -27874,7 +27884,7 @@ impl<'source> Compiler<'source> {
                 && !nested_else_call_entry
                 && !managed_await_store_entry
                 && !nested_pass_call_entry
-                && !nested_conditional_pass_entry
+                && !nested_conditional_entry
                 && !nested_for_break_entry)
         {
             self.assembler.prevent_borrow_reachability(end);
