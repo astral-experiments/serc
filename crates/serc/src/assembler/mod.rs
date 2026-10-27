@@ -15816,12 +15816,11 @@ impl Assembler {
             && jump.jump_policy == ir::JumpPolicy::default()
     }
 
-    /// Finds the original manager exit following a completed cold handler cleanup.
+    /// Finds the original manager exit after a cold cleanup and whether a handler targets it.
     pub(crate) fn original_manager_cleanup_join(
         &self,
         protected_end: Label,
-        has_cold_normal_donor: bool,
-    ) -> Option<Label> {
+    ) -> Option<(Label, bool)> {
         let items = self.linear_items();
         let aliases = trailing_labels(items).collect::<Vec<_>>();
         if !aliases.contains(&protected_end) {
@@ -15855,16 +15854,15 @@ impl Assembler {
             .copied()
             .filter(|label| provenance.block_boundaries.contains(label));
         let entry = entries.next()?;
-        if entries.next().is_some()
-            || !provenance.source_boundaries.contains(&entry)
-            || (!has_cold_normal_donor
-                && !provenance
-                    .original_handler_cleanup_join_exits
-                    .contains(&entry))
-        {
+        if entries.next().is_some() || !provenance.source_boundaries.contains(&entry) {
             return None;
         }
-        Some(entry)
+        Some((
+            entry,
+            provenance
+                .original_handler_cleanup_join_exits
+                .contains(&entry),
+        ))
     }
 
     /// Locates a manager exit reached only by a break's copied finalizer.

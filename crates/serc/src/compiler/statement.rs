@@ -42556,14 +42556,18 @@ impl<'source> Compiler<'source> {
         });
         // This original handler cleanup reaches the separate manager POP_BLOCK.
         // Its end identity excludes finally joins already represented upstream.
+        let cleanup_join = matches!(body_noop, None | Some(WithBodyExitNoop::ConvertedPopBlock))
+            .then(|| self.assembler.original_manager_cleanup_join(protected_end))
+            .flatten();
         let body_noop = match body_noop {
-            None | Some(WithBodyExitNoop::ConvertedPopBlock) => self
-                .assembler
-                .original_manager_cleanup_join(
-                    protected_end,
-                    remaining.is_empty() && with_body_has_cold_normal_donor(self, body),
-                )
-                .map(|entry| WithBodyExitNoop::RetainedManagerPopBlock(SourceLocation::NONE, entry))
+            None | Some(WithBodyExitNoop::ConvertedPopBlock) => cleanup_join
+                .filter(|(_, recorded)| {
+                    *recorded
+                        || (remaining.is_empty() && with_body_has_cold_normal_donor(self, body))
+                })
+                .map(|(entry, _)| {
+                    WithBodyExitNoop::RetainedManagerPopBlock(SourceLocation::NONE, entry)
+                })
                 .or_else(|| {
                     if !remaining.is_empty()
                         || !matches!(body_noop, Some(WithBodyExitNoop::ConvertedPopBlock))
@@ -42618,11 +42622,19 @@ impl<'source> Compiler<'source> {
             Some(WithBodyExitNoop::RetainedManagerPopBlock(location, entry))
         });
         let body_noop = body_noop.or_else(|| {
-            // Both legacy targets resolve the original POP_BLOCK's location
-            // before NOP cleanup. A structured body can leave one continuing
-            // predecessor whose span remains visible on the manager exit.
-            (self.context.python_version <= crate::PythonVersion::Py313)
-                .then_some(WithBodyExitNoop::ConvertedPopBlock)
+            // Ordinary handler and nested manager exits can donate a line to the
+            // original POP_BLOCK. Let location resolution decide whether it survives.
+            (self.context.python_version <= crate::PythonVersion::Py313
+                || (remaining.is_empty()
+                    && cleanup_join.is_some()
+                    && body.last().is_some_and(|part| match part {
+                        Stmt::Try(statement) => {
+                            !statement.is_star && statement.finalbody.is_empty()
+                        }
+                        Stmt::With(_) => true,
+                        _ => false,
+                    })))
+            .then_some(WithBodyExitNoop::ConvertedPopBlock)
         });
         let mut unlocated_body_pop = None;
         if let Some(body_noop) = body_noop {
