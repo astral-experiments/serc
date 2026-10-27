@@ -7158,13 +7158,12 @@ impl OptimizationPipeline {
             // Match-success jumps are originally unlocated. A located replacement
             // may be retained only after their sole surviving fallthrough has supplied
             // the donor; copying it into another predecessor would carry the wrong line.
-            let single_entry_match_join = !planned_copy
+            let located_match_join = !planned_copy
                 && inline_unprotected_return
                 && target_chain_end == target_position
                 && (super::control_flow::is_original_constant_return(graph, target_label)
                     || super::normal_try_copies::original_local_return(graph[target].items()))
                 && source_location.line >= 0
-                && remaining_predecessors[source.index()] == 1
                 && graph[source].items().iter().any(|item| {
                     matches!(item, Item::Label(label)
                         if self.exception_owner_provenance.original_match_join_boundaries.contains(label)
@@ -7183,6 +7182,8 @@ impl OptimizationPipeline {
                         && !instruction.no_location_policy.preserves_location()
                         && instruction.exception_policy() == ExceptionPolicy::default()
                 });
+            let single_entry_match_join =
+                located_match_join && remaining_predecessors[source.index()] == 1;
             let preserve_single_fallthrough_match_nop = single_entry_match_join
                 && graph[source]
                     .last_instruction()
@@ -7260,6 +7261,40 @@ impl OptimizationPipeline {
                     })
                 })
                 .flatten();
+            // Keep the original jump marker unlocated until successful cases take
+            // their copies. The remaining pattern failure then supplies its range.
+            let pattern_failure_donor = (located_match_join
+                && super::normal_try_copies::original_local_return(graph[target].items())
+                && graph[source].last_instruction().is_some_and(|jump| {
+                    jump.jump_policy.retained_nop()
+                        == super::super::ir::RetainedJumpNop::DirectTarget
+                }))
+            .then(|| {
+                let failure = graph[source].first_label()?;
+                let mut conditions =
+                    jump_sources[source.index()]
+                        .iter()
+                        .filter_map(|predecessor| {
+                            let [.., Item::Instruction(compare), Item::Instruction(guard)] =
+                                graph[*predecessor].items()
+                            else {
+                                return None;
+                            };
+                            (!drop_blocks[predecessor.index()]
+                                && compare.opcode == crate::target::opcodes::COMPARE_OP
+                                && guard.opcode == POP_JUMP_IF_FALSE
+                                && guard.forward_target() == Some(failure)
+                                && guard.location == compare.location
+                                && guard.location.line >= 0
+                                && guard.location != source_location
+                                && guard.pre_fold_extra_instructions() == 0)
+                                .then_some(guard.location)
+                        });
+                let location = conditions.next()?;
+                conditions.next().is_none().then_some(location)
+            })
+            .flatten();
+            let deferred_match_donor = deferred_match_donor.or(pattern_failure_donor);
             // After exception cleanup, a detached join can have a single incoming
             // branch assignment. Its jump donates the line of the NOP left beside
             // the copied return, which also discards the loop iterator.
@@ -7684,7 +7719,13 @@ impl OptimizationPipeline {
                     original.depth_after(),
                 );
                 marker.set_exception_policy(original.exception_policy());
-                original_join_marker_donors.push((source, copied_label, marker, location, false));
+                original_join_marker_donors.push((
+                    source,
+                    copied_label,
+                    marker,
+                    location,
+                    pattern_failure_donor.is_some(),
+                ));
                 graph.insert_item(
                     ItemPosition::new(source, position),
                     Item::Instruction(marker),
@@ -8746,10 +8787,10 @@ impl OptimizationPipeline {
         // Location restoration must follow every copy round: locating a join's NOP
         // earlier can change the eligibility of a later original-array copy. Copies
         // receive new labels, so this seam certifies only the original jump marker.
-        for (source, successor, mut expected, location, store_donor) in original_join_marker_donors
+        for (source, successor, mut expected, location, unique_donor) in original_join_marker_donors
         {
-            // A surviving shared original cannot inherit this fallthrough store's line.
-            if store_donor && remaining_predecessors[source.index()] != 1 {
+            // A fallthrough store or a failed pattern must be the original marker's sole donor.
+            if unique_donor && remaining_predecessors[source.index()] != 1 {
                 continue;
             }
             let items = graph[source].items();

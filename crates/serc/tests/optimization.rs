@@ -8418,6 +8418,12 @@ fn erased_loop_prefix_keeps_the_enclosing_condition_return() {
 }
 
 #[test]
+fn copied_match_return_keeps_the_final_value_pattern_on_failure() {
+    let source = "def choose(value, enabled, ready):\n    if enabled:\n        if value is None:\n            pass\n        else:\n            match value:\n                case Color.red:\n                    pass\n    elif ready or check(value):\n        pass\n    return value\n";
+    assert_matches_cpython(source, "case.py", &LEVELS);
+}
+
+#[test]
 fn nested_match_case_guard_keeps_each_exit_position() {
     let source = r"async def run(outer, inner, first, second, visit):
     try:
