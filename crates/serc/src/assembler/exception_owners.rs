@@ -10309,6 +10309,56 @@ impl LayoutAssembler {
                         );
                     }
                     if instruction.opcode == NOT_TAKEN {
+                        if owner_history_exact
+                            && tail.late_removals == 0
+                            && tail.post_compaction_fusions == 0
+                            && tail.insertions == 0
+                            && let Some(value_index) = instruction_index.checked_sub(5)
+                            && value_index >= original_array_start
+                            && let [value, setup, load, truth, jump] =
+                                &indexed_instructions[value_index..instruction_index]
+                            && value.opcode == crate::target::opcodes::BUILD_LIST
+                            && setup.opcode == NOP
+                            && setup.local_policy.hidden_exception_owner_slots() == 2
+                            && tail.early_removals
+                                == instruction_index - value_index
+                                    + usize::from(setup.local_policy.hidden_exception_owner_slots())
+                            && matches!(
+                                load.opcode,
+                                crate::target::opcodes::LOAD_FAST
+                                    | crate::target::opcodes::LOAD_FAST_BORROW
+                            )
+                            && truth.opcode == crate::target::opcodes::TO_BOOL
+                            && matches!(
+                                jump.opcode,
+                                crate::target::opcodes::POP_JUMP_IF_FALSE
+                                    | crate::target::opcodes::POP_JUMP_IF_TRUE
+                            )
+                            && jump.location == instruction.location
+                            && truth.location == jump.location
+                            && self
+                                .exception_owner_provenance
+                                .setups
+                                .iter()
+                                .any(|(_, location)| *location == Some(setup.location))
+                            && !jump_targets.iter().any(|label| {
+                                label_positions.get(label).is_some_and(|position| {
+                                    value_index < *position && *position <= instruction_index
+                                })
+                            })
+                            && let Some(region) = self.uniform_exception_owner(
+                                value_index,
+                                value_index + 1,
+                                &label_positions,
+                            )
+                        {
+                            // The appended marker occupies the original return value's slot
+                            // before both removed POPs and the retained cleanup setup.
+                            owners.insert(
+                                instruction_index,
+                                ExceptionOwnerDecision::override_with_region(Some(region)),
+                            );
+                        }
                         if instruction.exception_policy().exclusion()
                             == super::ExceptionExclusion::None
                             && let Some((index, region)) = pending_normal_none_owner.take()
