@@ -803,7 +803,7 @@ fn deferred_name_return_requires_a_noncopyable_original_target() {
             let boundary = assembler.label();
             assembler.mark(boundary);
             if case == "erased pop" {
-                assembler.record_name_return_pop_boundary(boundary, 1);
+                assembler.record_name_return_pop_boundary(boundary, 1, SourceLocation::NONE);
             } else if case == "original block" {
                 assembler.preserved_block_boundaries.insert(boundary);
             }
@@ -1009,7 +1009,7 @@ fn deferred_name_return_materialized_pop_requires_exact_label_prefix() {
                 assembler.preserved_block_boundaries.insert(aliases[1]);
             }
             "omitted pop collision" => {
-                assembler.record_name_return_pop_boundary(aliases[1], 1);
+                assembler.record_name_return_pop_boundary(aliases[1], 1, SourceLocation::NONE);
             }
             _ => {}
         }

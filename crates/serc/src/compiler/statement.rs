@@ -14868,12 +14868,19 @@ impl<'source> Compiler<'source> {
                         let original_pop = exception_unwind_start
                             .or(return_exclusion_start)
                             .expect("ordinary return unwind has a boundary");
+                        // A computed value stays on the stack while each ordinary try
+                        // pops at the return statement's location.
                         self.assembler.record_name_return_pop_boundary(
                             original_pop,
                             self.control
                                 .exceptions
                                 .active_exception_region_exclusions
                                 .len(),
+                            if preserve_tos {
+                                self.source_location(statement.range)
+                            } else {
+                                SourceLocation::NONE
+                            },
                         );
                         // A shared value join can alias the first POP with the iterator
                         // footer's entry. No physical block split counts that slot there.

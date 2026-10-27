@@ -13000,6 +13000,23 @@ fn guarded_inner_finalizer_preserves_the_empty_outer_join() {
 }
 
 #[test]
+fn returning_a_multiline_conditional_keeps_the_try_pop_on_the_return_line() {
+    let source = r"def choose(value, flag):
+    try:
+        return (value if flag else
+                transform(value))
+    except LookupError:
+        return None
+";
+    assert_matches_cpython_versions(
+        source,
+        "conditional_return_pop.py",
+        &LEVELS,
+        &VERSIONS.map(|(version, _, _)| version),
+    );
+}
+
+#[test]
 fn multiline_return_leaving_a_managed_while_keeps_its_cleanup_line() {
     for enter in ["with owner", "async with owner"] {
         let source = format!(
