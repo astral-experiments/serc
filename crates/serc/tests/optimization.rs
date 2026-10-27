@@ -25977,3 +25977,25 @@ fn short_circuit_value_after_manager_entries_uses_the_prior_handler() {
 ";
     assert_matches_cpython(source, "manager_value_guard.py", &LEVELS);
 }
+
+#[test]
+fn same_line_returns_retain_their_unwind_location() {
+    let source = r"def run(ready, value):
+    try:
+        if ready: return
+        consume(value)
+    finally:
+        cleanup(value)
+    return done(value)
+
+def check(value):
+    with guard():
+        try:
+            if value == 2: return 2
+            consume(value)
+        except Error:
+            recover(value)
+    return done(value)
+";
+    assert_matches_cpython(source, "single_line_return.py", &LEVELS);
+}

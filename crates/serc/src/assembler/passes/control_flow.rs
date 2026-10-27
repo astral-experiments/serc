@@ -7002,7 +7002,14 @@ impl OptimizationPipeline {
                             !previous.fusion_policy.location_from_next()
                                 && previous.location.line == instruction.location.line
                                 && !(ends_scope(previous.opcode)
-                                    || is_unconditional_jump(previous.opcode))
+                                    || is_unconditional_jump(previous.opcode)
+                                    // NOT_TAKEN is added after NOP removal in CPython.
+                                    // A return's original marker started the next block.
+                                    || (previous.opcode == NOT_TAKEN
+                                        && previous_original.is_some_and(|(_, original)| {
+                                            original.opcode == NOP
+                                                && original.location == instruction.location
+                                        })))
                         }))
                     || setup_nop_predecessor
                     || (previous_graph_block == Some(graph_block)
