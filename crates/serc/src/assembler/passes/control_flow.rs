@@ -4023,8 +4023,18 @@ impl OptimizationPipeline {
                                         if normal_try_exits.contains(&(*entry, target)))
                                 })
                             });
+                            let path = &order[source_index..target_index];
+                            let iterator_fallthrough = path.last().is_some_and(|cleanup| {
+                                let mut ops = graph[*cleanup].items().iter().filter_map(Item::as_instruction);
+                                matches!((ops.next(),ops.next(),ops.next()), (Some(end),Some(pop),None)
+                                    if end.opcode == crate::target::opcodes::END_FOR
+                                        && pop.opcode == crate::target::opcodes::POP_ITER)
+                                    && path.iter().any(|header| graph[*header].last_instruction().is_some_and(|jump|
+                                        jump.opcode == crate::target::opcodes::FOR_ITER
+                                            && jump.forward_target().and_then(|label| graph.label_block(label)) == Some(*cleanup)))
+                            });
                             recorded_exit
-                                && order[source_index..target_index].iter().enumerate().all(
+                                && (iterator_fallthrough || path.iter().enumerate().all(
                                     |(offset, path_block)| {
                                         original_reachable[path_block.index()]
                                             && super::super::block_has_fallthrough(graph[*path_block].items())
@@ -4034,7 +4044,7 @@ impl OptimizationPipeline {
                                                         if instruction.opcode.has_jump())
                                                 }))
                                     },
-                                )
+                                ))
                         }))
             })
             .filter_map(|block| {
