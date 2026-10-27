@@ -29123,8 +29123,7 @@ impl<'source> Compiler<'source> {
             } else if self.context.python_version >= crate::PythonVersion::Py314
                 && let Some(Stmt::While(while_loop)) = normal_exit_suite.last()
                 && suite_terminates(&while_loop.orelse)
-                && matches!(while_loop.body.last(), Some(Stmt::Try(inner))
-                    if inner.finalbody.is_empty() && matches!(inner.orelse.last(), Some(Stmt::Break(_))))
+                && suite_contains_loop_break(&while_loop.body)
             {
                 // Exhaustion exits in the while-else suite. Only breaks reach the implicit
                 // return, so each copy inherits its own edge's location.
