@@ -39531,6 +39531,7 @@ impl<'source> Compiler<'source> {
             && !statement.handlers.is_empty()
             && statement.orelse.is_empty()
             && !suite_terminates_before_constant_folding(&statement.body)
+            && !suite_ends_in_manager_with_folded_normal_exit(&statement.body)
             && handlers_terminate_before_folding();
         // 3.12 keeps this original POP_BLOCK through both exit-copy passes.
         // After copying, an omitted else NOP can donate its line to this
