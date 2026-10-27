@@ -26622,8 +26622,11 @@ impl<'source> Compiler<'source> {
         };
         let condition_truthiness = early_condition_truthiness(&statement.test);
         let retained_chained_comparison_exit = final_chained_comparison_jump(&statement.test);
-        let empty_folded_failure_block =
-            condition_truthiness == Some(false) && self.assembler.at_empty_borrow_block();
+        let empty_folded_failure_block = condition_truthiness == Some(false)
+            && self.assembler.at_empty_borrow_block_without_nops(
+                (self.context.python_version == crate::PythonVersion::Py314)
+                    .then(|| self.source_location(statement.range).line),
+            );
         // Legacy constant conditions must survive the early small-exit copy pass.
         // Normal assertion lowering preserves that conditional and its failure block.
         if condition_truthiness == Some(true)
