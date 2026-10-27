@@ -11681,6 +11681,43 @@ impl<'source> Compiler<'source> {
                         && self.control.finally.active_copied_finally_bodies == 0
                         && self.control.finally.preserved_return_value_contexts.is_empty())
                         .then(|| (self.assembler.item_count(), self.control.withs.active_with_exits.len()));
+                    if self.context.python_version == crate::PythonVersion::Py314
+                        && !return_is_overridden
+                        && context_index == 0
+                        && return_finally_contexts.len() == 1
+                        && finally_context.exception_region_depth == 0
+                        && matches!(finally_context.body.first(), Some(Stmt::Try(block))
+                            if !block.finalbody.is_empty() && matches!(block.body.first(), Some(Stmt::If(_))))
+                        && let [manager] = self.control.withs.active_with_exits.as_slice()
+                        && !manager.is_async
+                        && next_with == 0
+                        && let [unwind] = with_unwind_starts.as_slice()
+                        && unwind.index == 0
+                        && self.control.loops.contexts.is_empty()
+                        && let try_pops = self.control.exceptions.active_try_marker_slots.len()
+                        && ((!preserve_tos
+                            && handler_count == 0
+                            && try_pops == 0
+                            && self
+                                .control
+                                .exceptions
+                                .active_exception_region_exclusions
+                                .len()
+                                == 1)
+                            || (preserve_tos
+                                && try_pops == 1
+                                && self
+                                    .control
+                                    .exceptions
+                                    .active_exception_region_exclusions
+                                    .len()
+                                    == 3
+                                && matches!(self.control.exceptions.active_exception_handlers.as_slice(), [handler]
+                                    if handler.name.is_none())))
+                    {
+                        self.assembler
+                            .record_nested_finally_manager_return(unwind.start, try_pops);
+                    }
                     let copied_manager_return_pop = (matches!(
                             self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR),
                             0 | CO_COROUTINE
