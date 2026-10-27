@@ -19066,3 +19066,33 @@ fn nested_conditional_arms_donate_implicit_return_locations() {
 ";
     assert_matches_cpython(source, "nested_implicit_returns.py", &LEVELS);
 }
+
+#[test]
+fn iterator_cleanup_reuses_inner_call_discard_for_finally_guard() {
+    let source = r"async def stream(sink):
+    handle = source
+    try:
+        for item in items:
+            try:
+                while active:
+                    try:
+                        if done:
+                            return
+                        elif ready:
+                            if enabled:
+                                yield value
+                    except Error:
+                        pass
+                    finally:
+                        elapsed = clock()
+                        sink('ok', flag, make(tags, key=flag))
+            except Error as caught:
+                pass
+    except Error:
+        pass
+    finally:
+        if handle is not None:
+            pass
+";
+    assert_matches_cpython(source, "iterator_finally_call.py", &LEVELS);
+}
