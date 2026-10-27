@@ -19066,3 +19066,21 @@ fn nested_conditional_arms_donate_implicit_return_locations() {
 ";
     assert_matches_cpython(source, "nested_implicit_returns.py", &LEVELS);
 }
+
+#[test]
+fn fused_locals_preserve_the_finally_method_guard_handler() {
+    let source = r"async def check(manager, limit, job, key, one, two, good):
+    async with manager:
+        try:
+            async with limit:
+                pass
+            value0 = box.call(one, {two: key})
+            value1 = box.call(one, {two: key})
+            assert good
+        finally:
+            if not job.ready():
+                finish()
+            await release()
+";
+    assert_matches_cpython(source, "finalizer_method_guard.py", &LEVELS);
+}
