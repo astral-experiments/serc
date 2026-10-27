@@ -107,3 +107,13 @@ def in_manager(manager, value, stop):
 ";
     common::assert_matches_cpython_marshal(source, "borrowed_try_exits.py");
 }
+
+#[test]
+fn nested_recovery_backedge_remains_empty_before_loop_else() {
+    for tail in ["break", "consume(item)"] {
+        let source = format!(
+            "def f(value, items):\n    try:\n        value = read()\n    except First:\n        for item in items:\n            try:\n                value = fetch(item)\n                {tail}\n            except Second:\n                pass\n        else:\n            value = default\n        finish()\n    return consume(value)\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "recovery_loop_else_borrow.py");
+    }
+}
