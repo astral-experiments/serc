@@ -9449,11 +9449,7 @@ impl<'source> Compiler<'source> {
                             if ((handler.name.is_none() && self.control.loops.contexts.is_empty())
                                 // Restoring a handler does not exit the enclosing try or
                                 // discard an older iterator before the copied finalizer.
-                                || ((self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                                            == CO_COROUTINE
-                                        || (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                                                == 0
-                                            && self.control.loops.contexts.is_empty()))
+                                || (self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
                                     && handler.finally_end_depth == 0
                                     && handler.with_depth == 0
                                     && finally.with_depth == 0
