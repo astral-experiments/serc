@@ -29566,10 +29566,10 @@ impl<'source> Compiler<'source> {
                         self.source_location(location.test.range()),
                     )
                 });
-            // A final runtime comparison assertion has one original success array
+            // A final runtime assertion can have one original success array
             // after its failure RAISE. The try's POP_BLOCK precedes the else suite;
             // this array contains only the existing unlocated normal-exit jump.
-            let retained_comparison_asserted_else_exit = self.context.python_version >= crate::PythonVersion::Py314
+            let retained_asserted_else_exit = self.context.python_version >= crate::PythonVersion::Py314
                     // The same authored continuation fits this original jump array;
                     // pending cleanup or intervening work must retain their borrow path.
                     && self.following_name_return_fits_match_copy_budget()
@@ -29580,8 +29580,6 @@ impl<'source> Compiler<'source> {
                     && !statement.orelse.is_empty()
                     && matches!(statement.orelse.last(), Some(Stmt::Assert(assertion))
                     if assertion.msg.is_none()
-                        && matches!(assertion.test.as_ref(), Expr::Compare(comparison)
-                            if comparison.ops.len() == 1)
                         && assertion_has_only_runtime_tests(&assertion.test)
                         && original_condition_has_unique_jump_target(&assertion.test, true)
                         && !expression_contains_inline_branch(&assertion.test)
@@ -30307,7 +30305,7 @@ impl<'source> Compiler<'source> {
                     .prepare_no_location_block_for_inlining(normal_exit);
                 self.assembler.allow_last_unconditional_block_inlining();
             }
-            if retained_comparison_asserted_else_exit {
+            if retained_asserted_else_exit {
                 // Keep the actual jump replacement through eligible return copying
                 // and cold-handler relocation; the existing original-join verifier
                 // retains its source boundary, alias and unique-predecessor checks.

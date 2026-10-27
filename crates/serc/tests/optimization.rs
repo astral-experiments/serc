@@ -1959,6 +1959,26 @@ fn compound_handler_loop_exits_keep_separate_cleanup_copies() {
 }
 
 #[test]
+fn an_asserted_else_keeps_its_success_line_before_a_local_return() {
+    let source = r"def check(value):
+    try:
+        value = build()
+    except ValueError:
+        value = fallback()
+    else:
+        assert ready(value)
+    return value
+";
+    for guard in ["ready(value)", "not ready(value)", "ready(value) or value"] {
+        assert_matches_cpython(
+            &source.replace("assert ready(value)", &format!("assert {guard}")),
+            "asserted_else_return.py",
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn nested_recovery_reaches_a_separate_tuple_return() {
     let source = "def sample(flag, left, right):
     if flag:
