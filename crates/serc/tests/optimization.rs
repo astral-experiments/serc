@@ -16089,6 +16089,16 @@ fn folded_comprehension_and_tail_preserves_borrow_boundary() {
 }
 
 #[test]
+fn folded_conditional_keeps_a_shared_return_jump_unlocated() {
+    for test in ["True", "__debug__"] {
+        let source = format!(
+            "def choose(value, worker):\n    if value:\n        if {test}:\n            worker.send(value)\n    else:\n        worker.wait()\n    return value\n"
+        );
+        assert_matches_cpython(&source, "folded_return.py", &LEVELS);
+    }
+}
+
+#[test]
 fn linear_prefix_and_elided_suffix_preserve_nested_if_join() {
     let source = "def update(state):\n    if state.ready():\n        item = state.next()\n        if available(item):\n            apply(item)\n        else:\n            discard(item)\n        assert state.valid()\n    else:\n        assert state.valid()\n    result = state.finish()\n    assert result\n";
     for source in [

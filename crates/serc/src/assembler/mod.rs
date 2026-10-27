@@ -9561,6 +9561,13 @@ impl Assembler {
             })
             .take(2)
             .count();
+        // CPython copies short exits while the original guard can still reach
+        // this join, before folding an always-true condition.
+        let folded_conditional = self.python_version >= crate::PythonVersion::Py314
+            && labels
+                .iter()
+                .any(|label| self.folded_away_condition_targets.contains(label));
+        let conditional_predecessors = conditional_predecessors + usize::from(folded_conditional);
         let has_fallthrough = items
             .iter()
             .rev()

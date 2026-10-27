@@ -15365,6 +15365,9 @@ impl<'source> Compiler<'source> {
                 } else if !suite_terminates(&statement.body) {
                     let end = self.assembler.label();
                     self.assembler.record_exception_owner_block_boundary(end);
+                    if self.context.python_version >= crate::PythonVersion::Py314 {
+                        self.assembler.record_folded_condition_predecessor(end);
+                    }
                     self.assembler.mark(end);
                 }
             } else {
