@@ -6047,6 +6047,18 @@ impl<'source> Compiler<'source> {
         has_siblings: bool,
     ) -> Result<(), CompileError> {
         if is_final_else
+            && self.context.python_version >= crate::PythonVersion::Py314
+            && matches!(body.last(), Some(Stmt::Expr(expression))
+                if matches!(expression.value.as_ref(), Expr::If(_) | Expr::BoolOp(_)))
+        {
+            // The final arm falls through its shared POP_TOP into the enclosing
+            // if's implicit return. Earlier expression arms can only copy an exit.
+            self.compile_suite_inner(body, false)?;
+            let footer = self.assembler.label();
+            self.assembler.mark(footer);
+            return Ok(());
+        }
+        if is_final_else
             && matches!(body, [Stmt::Expr(expression)] if is_literal_constant(&expression.value))
         {
             // Keep the constant's original NOP in its fallthrough block, separate from the
