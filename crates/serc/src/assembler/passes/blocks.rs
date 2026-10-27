@@ -3475,6 +3475,30 @@ impl OptimizationPipeline {
             return omitted_markers;
         }
 
+        let mut copied_exit_successors = Vec::new();
+        if !self
+            .exception_owner_provenance
+            .copied_unlocated_try_exit_handlers
+            .is_empty()
+        {
+            let handlers: FxHashSet<_> = self
+                .exception_owner_provenance
+                .copied_unlocated_try_exit_handlers
+                .iter()
+                .filter_map(|handler| graph.label_block(*handler))
+                .collect();
+            let mut stranded = false;
+            for &block in &order {
+                if temperatures[block.index()] == COLD_BLOCK && handlers.contains(&block) {
+                    stranded = true;
+                } else if temperatures[block.index()] == WARM_BLOCK && std::mem::take(&mut stranded)
+                {
+                    // Cold ordering leaves the emptied original in the warm sequence.
+                    copied_exit_successors.push(block);
+                }
+            }
+        }
+
         if self.python_version >= crate::PythonVersion::Py314 {
             for pair in order.windows(2) {
                 let [current, next] = *pair else {
@@ -4004,6 +4028,14 @@ impl OptimizationPipeline {
             .expect("cold-block pass produced an invalid emission order");
         if let Some(final_label) = final_label {
             graph.push_block(vec![Item::Label(final_label)]);
+        }
+        for successor in copied_exit_successors {
+            // The stranded array precedes the continuation's labels. A live jump
+            // into the continuation still bypasses the empty fallthrough.
+            let marker = Label::from_u32(self.next_label);
+            self.next_label += 1;
+            graph.insert_label(successor, 0, marker);
+            omitted_markers.insert(marker);
         }
         omitted_markers
     }

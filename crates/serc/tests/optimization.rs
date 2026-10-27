@@ -5846,6 +5846,19 @@ fn terminal_recovery_scopes_preserve_normal_exits() {
 }
 
 #[test]
+fn copied_unlocated_try_exit_stops_only_borrow_fallthrough() {
+    for first in [
+        "return None",
+        "try:\n                prepare()\n            except ValueError:\n                pass",
+    ] {
+        let source = format!(
+            "def run(value, ready):\n    try:\n        if ready:\n            {first}\n        else:\n            try:\n                prepare()\n            except ValueError:\n                pass\n    except TypeError:\n        pass\n    consume(value)\n"
+        );
+        assert_matches_cpython(&source, "copied_try_exit.py", &LEVELS);
+    }
+}
+
+#[test]
 fn terminal_recovery_body_stops_borrowed_continuation() {
     for prefix in ["", "            resource.prepare()\n"] {
         for terminal in ["return", "return resource", "raise Error(resource)"] {

@@ -384,6 +384,8 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) normal_try_exits: Vec<(Label, Label)>,
     pub(super) borrow_normal_try_exits: Vec<(Label, Instruction)>,
     pub(super) initial_borrow_normal_try_exits: Vec<NormalTryBorrowExit>,
+    // Handler labels locate the emptied original exits through cold-block relocation.
+    pub(super) copied_unlocated_try_exit_handlers: Vec<Label>,
     pub(super) retired_normal_try_exits: Vec<RetiredNormalTryExit>,
     // Sole authored break, retired ordinary-try bridge, and intact normal-finally array.
     pub(super) normal_try_break_pop_owners: Vec<NormalTryBreakPopOwner>,
@@ -498,6 +500,66 @@ impl ExceptionOwnerProvenance {
             && self.ordinary_try_setups.get(setup) == Some(target)
     }
 
+    /// Finds original two-slot exits copied into all their unconditional predecessors.
+    fn bind_copied_unlocated_try_exits(&mut self, graph: &super::block_graph::BlockGraph) {
+        let mut entries = self
+            .borrow_normal_try_exits
+            .iter()
+            .filter_map(|(entry, jump)| {
+                (jump.location == SourceLocation::NONE).then_some(())?;
+                Some((graph.label_block(*entry)?, (jump.forward_target()?, false)))
+            })
+            .collect::<FxHashMap<_, _>>();
+        if entries.is_empty() {
+            return;
+        }
+        for instruction in graph.iter_items().filter_map(Item::as_instruction) {
+            if let Some(block) = instruction
+                .jump_target()
+                .and_then(|label| graph.label_block(label))
+                && let Some((_, incoming)) = entries.get_mut(&block)
+            {
+                if super::is_unconditional_jump(instruction.opcode) {
+                    *incoming = true;
+                } else {
+                    entries.remove(&block);
+                }
+            }
+        }
+        let handlers: FxHashSet<_> = self.ordinary_try_setups.values().copied().collect();
+        for blocks in graph.order().windows(3) {
+            let [previous, block, following] = *blocks else {
+                unreachable!()
+            };
+            let Some(&(target, true)) = entries.get(&block) else {
+                continue;
+            };
+            let Some((Item::Instruction(jump), labels)) = graph[block].items().split_last() else {
+                continue;
+            };
+            // The preceding error cleanup cannot fall through to the original exit.
+            if jump.opcode == crate::target::opcodes::JUMP_FORWARD
+                && jump.forward_target() == Some(target)
+                && jump.location == SourceLocation::NONE
+                && labels.iter().all(|item| matches!(item, Item::Label(_)))
+                && graph[previous].last_instruction().is_some_and(|op| {
+                    op.opcode == crate::target::opcodes::RERAISE && op.value_argument() == Some(1)
+                })
+                && graph[following]
+                    .items()
+                    .iter()
+                    .find_map(Item::as_instruction)
+                    .is_some_and(|op| op.opcode == crate::target::opcodes::PUSH_EXC_INFO)
+                && let Some(handler) = graph[following].items().iter().find_map(|item| match item {
+                    Item::Label(label) if handlers.contains(label) => Some(*label),
+                    _ => None,
+                })
+            {
+                self.copied_unlocated_try_exit_handlers.push(handler);
+            }
+        }
+    }
+
     /// Separates original jump-target roles from compiler-authored boundaries.
     pub(super) fn bind_normal_try_borrow_exits(
         &mut self,
@@ -506,6 +568,7 @@ impl ExceptionOwnerProvenance {
         regions: &[super::ExceptionRegion],
         folded_loop_exit_anchors: &FxHashSet<Label>,
     ) {
+        self.bind_copied_unlocated_try_exits(graph);
         for (entry, instruction) in std::mem::take(&mut self.borrow_normal_try_exits) {
             let Some(block) = graph.label_block(entry) else {
                 continue;
