@@ -19865,7 +19865,7 @@ impl<'source> Compiler<'source> {
                 && matches!(guard.body.as_slice(), [Stmt::Try(cleanup)] if !cleanup.is_star))
     }
 
-    /// Emits the ordinary try's POP_BLOCK before a loop exit calls its manager.
+    /// Emits the ordinary try's `POP_BLOCK` before a loop exit calls its manager.
     fn emit_loop_control_manager_try_pop(
         &mut self,
         context: LoopContext,
