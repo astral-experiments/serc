@@ -6696,7 +6696,7 @@ fn conditional_handler_return_preserves_normal_finally_borrows() {
 
 #[test]
 fn nested_iterators_copy_the_return_after_guarded_recovery() {
-    let source = r#"async def sample(items, value, ok):
+    let source = r"async def sample(items, value, ok):
     for group in items:
         for item in group:
             try:
@@ -6707,7 +6707,7 @@ fn nested_iterators_copy_the_return_after_guarded_recovery() {
                         finish()
                     except ValueError as error:
                         save(error)
-"#;
+";
     assert_matches_cpython(source, "nested_iterator_return.py", &LEVELS);
 }
 
