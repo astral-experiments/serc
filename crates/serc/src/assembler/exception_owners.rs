@@ -12966,7 +12966,18 @@ impl LayoutAssembler {
                             == Some(region)
                 })
         } else {
-            current.is_none_or(|current| self.exception_regions[current].is_scope_fallback)
+            current.is_none_or(|current| {
+                let retained = self.exception_regions[current];
+                // One live iterator separates its enclosing try from the manager's
+                // body. The missing POP still contributes a NULL cell to this array.
+                retained.is_scope_fallback
+                    || (!owns_cleanup_record
+                        && !retained.preserve_lasti
+                        && retained.depth.checked_add(1) == Some(owner.depth)
+                        && origin.pop.depth_after() == owner.depth.checked_add(1)
+                        && self.uniform_exception_owner(load_index, marker + 1, positions)
+                            == Some(current))
+            })
         };
         (!owner.is_scope_fallback && !owner.preserve_lasti && current_owner_matches).then_some(
             ExceptionOwnerDecision::override_with_region(owns_cleanup_record.then_some(region)),

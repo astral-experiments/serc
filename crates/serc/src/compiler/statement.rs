@@ -11681,6 +11681,20 @@ impl<'source> Compiler<'source> {
                         && self.control.finally.active_copied_finally_bodies == 0
                         && self.control.finally.preserved_return_value_contexts.is_empty())
                         .then(|| (self.assembler.item_count(), self.control.withs.active_with_exits.len()));
+                    // The iterator's ordinary try remains active while its inner manager
+                    // exits. Only the tries entered inside the iterator contribute POPs.
+                    let enclosing_iterator_try = matches!(
+                        (self.control.loops.contexts.as_slice(), self.control.withs.active_with_exits.as_slice()),
+                        ([iterator],[manager]) if finally_context.exception_region_depth == 1
+                            && finally_context.try_body_depth == 1
+                            && finally_context.loop_depth == 1
+                            && finally_context.with_depth == 0
+                            && iterator.iterator_cleanup == IteratorCleanup::Sync
+                            && iterator.exception_region_depth == 1
+                            && iterator.with_depth == 0
+                            && manager.loop_depth == 1
+                            && manager.exception_region_depth == self.control.exceptions.active_exception_region_exclusions.len()
+                    );
                     let copied_manager_return_pop = (matches!(
                             self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR),
                             0 | CO_COROUTINE
@@ -11690,20 +11704,20 @@ impl<'source> Compiler<'source> {
                         && context_index == 0
                         && return_finally_contexts.len() == 1
                         && handler_count == 0
-                        && finally_context.exception_region_depth == 0
+                        && (finally_context.exception_region_depth == 0 || enclosing_iterator_try)
                         && matches!(
                             (
                                 self.control
                                     .exceptions
                                     .active_exception_region_exclusions
-                                    .len(),
+                                    .len().checked_sub(finally_context.exception_region_depth),
                                 self.control
                                     .exceptions
                                     .active_try_marker_slots
                                     .len()
                                     .checked_sub(finally_context.try_body_depth),
                             ),
-                            (1, Some(0)) | (2, Some(1))
+                            (Some(1), Some(0)) | (Some(2), Some(1))
                         )
                         && (1..=2).contains(&self.control.withs.active_with_exits.len())
                         && self
@@ -11717,7 +11731,7 @@ impl<'source> Compiler<'source> {
                             .iter()
                             .map(|unwind| unwind.index)
                             .eq((0..self.control.withs.active_with_exits.len()).rev())
-                        && (self.control.loops.contexts.is_empty()
+                        && (enclosing_iterator_try || self.control.loops.contexts.is_empty()
                             // This iterator emits retained SWAP/POP_TOP records before
                             // its manager's seven cleanup records. It adds no omitted POP.
                             || matches!(
@@ -11753,7 +11767,7 @@ impl<'source> Compiler<'source> {
                                     .exceptions
                                     .active_exception_region_exclusions
                                     .len()
-                                    - 1,
+                                    - finally_context.exception_region_depth - 1,
                                 self.control.withs.active_with_exits.len(),
                             )
                         });
