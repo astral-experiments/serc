@@ -15,6 +15,26 @@ use serc::{
 };
 
 #[test]
+fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
+    let source = r"def scan(items, keep):
+    for item in items:
+        try:
+            work(item)
+        except ValueError as error:
+            try:
+                if keep:
+                    continue
+            except LookupError:
+                recover(error)
+        finally:
+            if keep is not None:
+                done()
+            finish()
+";
+    assert_matches_cpython(source, "named_handler_continue.py", &LEVELS);
+}
+
+#[test]
 fn nested_conversion_handlers_keep_shared_cleanup() {
     let source = r"def sample(items):
     for item in items:
