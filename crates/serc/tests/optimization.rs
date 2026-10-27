@@ -3272,6 +3272,25 @@ fn surviving_break_reaches_cleanup_inside_nested_managers() {
 }
 
 #[test]
+fn finalizer_conditional_arguments_reuse_a_protected_call_slot() {
+    let source = r"async def sample(value, flag):
+    with first:
+        try:
+            async with second:
+                await run(value)
+            record(value)
+        finally:
+            await work([value] if flag else [])
+";
+    assert_matches_cpython_versions(
+        source,
+        "finalizer_conditional_argument.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn guarded_recovery_inside_normal_finally_keeps_its_continuation() {
     for coroutine in ["", "async "] {
         for manager in [false, true] {

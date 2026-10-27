@@ -5324,6 +5324,79 @@ impl Assembler {
                 && provenance.block_boundaries.contains(label))
         })?;
         let prefix = &items[begin..];
+        if truth && self.python_version == crate::PythonVersion::Py314 {
+            let mut records = prefix.iter().rev().filter_map(Item::as_instruction);
+            if let [
+                Some(jump),
+                Some(convert),
+                Some(load),
+                Some(global),
+                Some(pop),
+            ] = [
+                records.next(),
+                records.next(),
+                records.next(),
+                records.next(),
+                records.next(),
+            ] && convert.opcode == TO_BOOL
+                && load.opcode == LOAD_FAST
+                && load.location == jump.location
+                && convert.location == jump.location
+                && global.opcode == LOAD_GLOBAL
+                && global.value_argument().is_some_and(|arg| arg & 1 == 1)
+                && pop.opcode == NOP
+                && pop.fusion_policy.is_converted_pop_block()
+                && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
+                && jump.forward_target().is_some()
+            {
+                // LOAD_GLOBAL folds its PUSH_NULL and the normal POP_BLOCK disappears.
+                // A preceding global call can fold one more PUSH_NULL. Either way the
+                // appended marker reuses a record on the protected side of the POP.
+                let preceding_call = match [
+                    records.next(),
+                    records.next(),
+                    records.next(),
+                    records.next(),
+                ] {
+                    [None, None, None, None] => true,
+                    [Some(discard), Some(call), Some(arg), Some(callee)] => {
+                        discard.opcode == POP_TOP
+                            && call.opcode == CALL
+                            && call.value_argument() == Some(1)
+                            && matches!(arg.opcode, LOAD_FAST | LOAD_DEREF)
+                            && callee.opcode == LOAD_GLOBAL
+                            && callee.value_argument().is_some_and(|arg| arg & 1 == 1)
+                            && records.next().is_none()
+                    }
+                    _ => false,
+                };
+                if preceding_call
+                    && prefix
+                        .iter()
+                        .filter_map(Item::as_instruction)
+                        .all(|record| {
+                            record.pre_fold_extra_instructions() == 0
+                                && record.local_policy.hidden_exception_owner_slots() == 0
+                        })
+                    && prefix
+                        .iter()
+                        .skip_while(|item| matches!(item, Item::Label(_)))
+                        .all(|item| match item {
+                            Item::Instruction(_) => true,
+                            Item::Label(label) => {
+                                !provenance.source_boundaries.contains(label)
+                                    && !provenance.block_boundaries.contains(label)
+                                    && !items
+                                        .iter()
+                                        .filter_map(Item::as_instruction)
+                                        .any(|record| record.jump_target() == Some(*label))
+                            }
+                        })
+                {
+                    return Some(true);
+                }
+            }
+        }
         let mut leading_labels = FxHashSet::default();
         let mut labels = FxHashSet::default();
         let mut instructions = Vec::new();
