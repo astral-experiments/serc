@@ -1100,6 +1100,16 @@ fn negated_comparison_keeps_the_nonfinal_loop_branch() {
 }
 
 #[test]
+fn assertion_success_locates_the_normal_exit_after_cold_handlers_move() {
+    for guard in ["item", "item and ready", "item or ready"] {
+        let source = format!(
+            "def walk(items, ready):\n    for item in items:\n        try:\n            inspect(item)\n            assert {guard}\n        except ValueError as error:\n            try:\n                recover(error)\n            except TypeError:\n                continue\n        consume(item)\n"
+        );
+        assert_matches_cpython(&source, "assertion_handler_exit.py", &LEVELS);
+    }
+}
+
+#[test]
 fn chained_assertions_copy_the_loop_exit_for_each_success() {
     let source = r"def run(items, low, high, ready):
     for value in items:

@@ -30767,16 +30767,19 @@ impl<'source> Compiler<'source> {
                         && condition_has_only_runtime_tests(&loop_statement.test)
                         && condition_jump_target_count(&loop_statement.test, false) == 1
                         && original_condition_has_unique_jump_target(&loop_statement.test, false));
-            // The loop's unique false edge keeps the normal try jump's line when
-            // cold handlers move away from a nonempty finally continuation.
-            let retained_while_finally_exit = self.context.python_version
-                >= crate::PythonVersion::Py314
+            // The loop's sole false edge or a terminal assertion's sole success
+            // edge locates the normal jump even after nested handlers move cold.
+            let retained_normal_exit = self.context.python_version >= crate::PythonVersion::Py314
                 && !statement.is_star
-                && !statement.finalbody.is_empty()
                 && handler_contains_nested_handler_cold_join
-                && runtime_while_has_sole_exit;
+                && ((!statement.finalbody.is_empty() && runtime_while_has_sole_exit)
+                    || (statement.orelse.is_empty()
+                        && statement.finalbody.is_empty()
+                        && matches!(normal_exit_suite.last(), Some(Stmt::Assert(assertion))
+                            if assertion_has_only_runtime_tests(&assertion.test)
+                                && original_condition_has_unique_jump_target(&assertion.test, true))));
             if (normal_exit_starts_in_empty_block
-                && !retained_while_finally_exit
+                && !retained_normal_exit
                 && borrow_exit_has_source_successor
                 && !nonempty_finally_normal_source
                 && !populated_guarded_handler_suffix
