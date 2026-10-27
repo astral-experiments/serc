@@ -4754,6 +4754,16 @@ fn finalizer_copies_named_handler_cleanup_onto_elif_exits() {
 }
 
 #[test]
+fn negated_comparisons_drop_a_redundant_operand_line() {
+    for comparison in ["needle in items[key]", "needle is items[key]"] {
+        let source = format!(
+            "def check(needle, items, key):\n    return not (\n        {comparison}\n    )\n"
+        );
+        assert_matches_cpython(&source, "negated_comparison.py", &LEVELS);
+    }
+}
+
+#[test]
 fn nested_handler_raise_keeps_empty_outer_exit() {
     for scope in ["def", "async def"] {
         for binding in ["", " as parse_error"] {

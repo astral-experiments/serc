@@ -894,11 +894,11 @@ impl OptimizationPipeline {
             .iter_items()
             .filter_map(|item| match item {
                 Item::Instruction(instruction) => {
-                    // A comparison folded into its following TO_BOOL also leaves an
+                    // A comparison folded into TO_BOOL or UNARY_NOT leaves an
                     // original NOP slot whose line may already have been recorded.
                     Some(matches!(
                         instruction.opcode,
-                        TO_BOOL | UNARY_NOT | COMPARE_OP
+                        TO_BOOL | UNARY_NOT | COMPARE_OP | CONTAINS_OP | IS_OP
                     ))
                 }
                 Item::Label(_) => None,
