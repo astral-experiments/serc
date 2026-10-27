@@ -15774,6 +15774,25 @@ fn final_elif_after_recovery_keeps_each_false_backedge() {
 }
 
 #[test]
+fn loop_value_discards_follow_the_original_branch_exit() {
+    let source = r"def visit(items, flag):
+    for item in items:
+        if item:
+            first(item) if flag else second(item)
+        else:
+            flag and consume(item)
+
+
+async def drain(items, flag):
+    async for item in items:
+        first(item) if flag else second(item)
+    while True:
+        flag or finish()
+";
+    assert_matches_cpython(source, "loop_branch_value_discards.py", &LEVELS);
+}
+
+#[test]
 fn while_loop_copies_the_discard_of_each_conditional_value() {
     let source = "def sample(active, choose):
     try:
