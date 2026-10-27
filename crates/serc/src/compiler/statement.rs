@@ -38335,7 +38335,10 @@ impl<'source> Compiler<'source> {
                     // at the end of the body becomes a line NOP before that same
                     // barrier; only an earlier independent break can bypass it.
                     && (original_condition_has_unique_jump_target(&loop_.test, false)
-                        || suite_contains_borrow_reachable_conditional_loop_break(&loop_.body)))
+                        || suite_contains_borrow_reachable_conditional_loop_break(&loop_.body)
+                        || loop_.body.split_last().is_some_and(|(_, prefix)| {
+                            suite_contains_borrow_reachable_conditional_loop_break(prefix)
+                        })))
             && statement.finalbody.first().is_some_and(|entry| {
                 self.suite_has_nonempty_borrow_entry(std::slice::from_ref(entry))
                     || matches!(entry, Stmt::If(guard)
