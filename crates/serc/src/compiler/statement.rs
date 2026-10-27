@@ -6824,7 +6824,7 @@ impl<'source> Compiler<'source> {
             Stmt::If(statement) => self.compile_if(statement)?,
             Stmt::While(statement) => self.compile_while(statement)?,
             Stmt::For(statement) if statement.is_async => self.compile_async_for(statement)?,
-            Stmt::For(statement) => self.compile_for(statement)?,
+            Stmt::For(statement) => self.compile_for(statement, None)?,
             Stmt::Break(statement) => {
                 // Loop-control cleanup runs after CPython unwinds the active exception block.
                 let unreachable_depth = self.control.stack.depth;
@@ -19545,6 +19545,18 @@ impl<'source> Compiler<'source> {
                 )?;
                 self.compile_loop_tail_if(statement, restart, split_short_circuit, mode, leading)
             }
+            Some((Stmt::For(statement), leading))
+                if !statement.is_async
+                    && mode == LoopTailMode::default()
+                    && matches!(statement.orelse.last(), Some(Stmt::If(_)))
+                    && self.control.in_loop_tail_without_nested_cleanup() =>
+            {
+                self.compile_loop_tail_prefix(leading)?;
+                // Exhausting the inner loop enters its else suite; a break
+                // bypasses it and still needs the outer loop's shared backedge.
+                self.compile_for(statement, Some(restart))?;
+                Ok(LoopBackedge::Required)
+            }
             Some((Stmt::While(statement), leading))
                 if statement.orelse.is_empty()
                     && early_condition_truthiness(&statement.test).is_none()
@@ -25695,7 +25707,11 @@ impl<'source> Compiler<'source> {
         }
     }
 
-    fn compile_for(&mut self, statement: &ruff_python_ast::StmtFor) -> Result<(), CompileError> {
+    fn compile_for(
+        &mut self,
+        statement: &ruff_python_ast::StmtFor,
+        else_restart: Option<Label>,
+    ) -> Result<(), CompileError> {
         use super::legacy_native_labels::NativeRole;
 
         let base_depth = self.control.stack.depth;
@@ -25890,7 +25906,11 @@ impl<'source> Compiler<'source> {
             self.symbols.initialized_locals.remove(name);
         }
         let orelse_start = self.assembler.instruction_count();
-        self.compile_suite(&statement.orelse)?;
+        if let Some(restart) = else_restart {
+            self.compile_loop_tail_suite(&statement.orelse, restart, true)?;
+        } else {
+            self.compile_suite(&statement.orelse)?;
+        }
         if self.assembler.instruction_count() == orelse_start
             && let [Stmt::Pass(statement)] = statement.orelse.as_slice()
             && self
