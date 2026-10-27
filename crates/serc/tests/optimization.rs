@@ -19573,6 +19573,36 @@ print(json.dumps(rows))
 }
 
 #[test]
+fn returning_through_nested_finally_restores_the_outer_exception_last() {
+    let source = r"def run(value):
+    try:
+        start()
+    finally:
+        try:
+            return value
+        finally:
+            finish()
+
+async def recover(value):
+    try:
+        start()
+    finally:
+        try:
+            await inspect(value)
+        except ValueError as error:
+            return result(error)
+        finally:
+            await finish()
+";
+    assert_matches_cpython_versions(
+        source,
+        "nested_finally.py",
+        &LEVELS,
+        &[PythonVersion::Py312, PythonVersion::Py313],
+    );
+}
+
+#[test]
 fn exceptional_finally_return_inside_older_handler() {
     const GENERATOR: &str = r"def f(manager, work):
     try:

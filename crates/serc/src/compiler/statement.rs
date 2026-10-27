@@ -8744,23 +8744,22 @@ impl<'source> Compiler<'source> {
                 // A nested try/finally inside the manager must run its copied
                 // cleanup before the manager exits. Its enclosing exceptional
                 // finalizer ends only after those managers have exited.
-                let (inner_manager_boundary, inner_loop_boundary, defer_finally_end_for_managers) =
-                    self.return_finally_manager_boundaries(
+                let (inner_manager_boundary, inner_loop_boundary, defer_finally_end) = self
+                    .return_finally_manager_boundaries(
                         return_is_overridden,
                         handler_before_finally_end,
                         next_with,
                     );
                 let handler_outside_finally_end =
                     self.handler_outside_finally_end(inner_manager_boundary);
-                let deferred_finally_end_start =
-                    defer_finally_end_for_managers.then(|| self.assembler.label());
+                let deferred_finally_end_start = defer_finally_end.then(|| self.assembler.label());
                 let mut deferred_finally_end_marked = false;
-                let nested_finally_region_depth = if defer_finally_end_for_managers {
-                    self.control.withs.active_with_exits[inner_manager_boundary.unwrap()]
-                        .exception_region_depth
-                } else {
-                    self.control.finally.active_finally_end_blocks
-                };
+                let nested_finally_region_depth =
+                    if defer_finally_end && let Some(boundary) = inner_manager_boundary {
+                        self.control.withs.active_with_exits[boundary].exception_region_depth
+                    } else {
+                        self.control.finally.active_finally_end_blocks
+                    };
                 let nested_finally_region_unwind_start = (!handler_before_finally_end
                     && self.control.finally.active_finally_end_blocks > 0
                     && self
@@ -9964,7 +9963,7 @@ impl<'source> Compiler<'source> {
                     starts[1] = finally_end_unwind_start;
                 }
                 if unwinds_finally_end_inside_handler
-                    && !defer_finally_end_for_managers
+                    && !defer_finally_end
                     && let Some((depth, start)) = nested_finally_region_unwind_start
                     && let Some(starts) = &mut handler_region_unwind_starts
                 {
@@ -10917,7 +10916,7 @@ impl<'source> Compiler<'source> {
                             && !deferred_finally_end_marked
                             && next_handler == 1
                             && next_finally == 0
-                            && next_with <= inner_manager_boundary.unwrap()
+                            && next_with <= inner_manager_boundary.unwrap_or(0)
                             && next_loop <= inner_loop_boundary
                         {
                             with_unwind_before_exception_start = with_unwind_starts.len();
@@ -14379,7 +14378,7 @@ impl<'source> Compiler<'source> {
                     && !deferred_finally_end_marked
                     && next_handler == 0
                     && next_finally == 0
-                    && next_with <= inner_manager_boundary.unwrap()
+                    && next_with <= inner_manager_boundary.unwrap_or(0)
                     && deferred_outer_iterator_depth <= inner_loop_boundary
                 {
                     with_unwind_before_exception_start = with_unwind_starts.len();
@@ -20946,7 +20945,7 @@ impl<'source> Compiler<'source> {
             .iter()
             .position(|context| context.finally_end_depth == 1)
             .unwrap_or(self.control.loops.contexts.len());
-        let defer_finally_end_for_managers = !return_is_overridden
+        let defer_finally_end = !return_is_overridden
             && !handler_before_finally_end
             && self.control.finally.active_finally_end_blocks == 1
             && self.control.finally.active_normal_finally_bodies == 0
@@ -20975,14 +20974,19 @@ impl<'source> Compiler<'source> {
             && self.control.loops.contexts[inner_loop_boundary..]
                 .iter()
                 .all(|context| context.finally_end_depth == 1)
-            && inner_manager_boundary.is_some_and(|boundary| {
+            // A return in a nested try also runs its finally before restoring the
+            // exception saved by the outer finally, even without a manager.
+            && (inner_manager_boundary.is_some_and(|boundary| {
                 self.control.withs.active_with_exits[..boundary]
                     .iter()
                     .all(|context| context.finally_end_depth == 0)
                     && self.control.withs.active_with_exits[boundary..next_with]
                         .iter()
                         .all(|context| context.finally_end_depth == 1)
-            })
+            }) || (self.control.withs.active_with_exits.is_empty()
+                && self.control.loops.contexts.is_empty()
+                && self.control.finally.active_return_finally_contexts.first()
+                    .is_some_and(|context| context.finally_end_depth == 1)))
             && self
                 .control
                 .finally
@@ -20995,7 +20999,7 @@ impl<'source> Compiler<'source> {
         (
             inner_manager_boundary,
             inner_loop_boundary,
-            defer_finally_end_for_managers,
+            defer_finally_end,
         )
     }
 
