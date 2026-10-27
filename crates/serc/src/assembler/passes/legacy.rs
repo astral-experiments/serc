@@ -1362,8 +1362,10 @@ impl OptimizationPipeline {
                     // Ordinary try lowering keeps POP_BLOCK as a hidden copy
                     // slot. Its surviving unlocated exit jump has the same
                     // original constant-loop predecessor before line resolution.
-                    || (is_unconditional_jump(first.opcode)
-                        && first.location == SourceLocation::NONE)
+                    // After copying a small return, that same jump is its leading NOP.
+                    || (first.location == SourceLocation::NONE
+                        && (is_unconditional_jump(first.opcode)
+                            || (first.opcode == NOP && self.graph[target].last_instruction().is_some_and(|tail| crate::target::is_scope_exit_for(self.python_version, tail.opcode)))))
                 })
                 && restored.insert((source, target))
             {
