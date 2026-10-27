@@ -6306,6 +6306,16 @@ impl<'source> Compiler<'source> {
         // CPython's conditional-expression join is a jump target. Its redundant-pair
         // optimizer therefore does not remove a constant else value with this POP_TOP.
         let end = self.assembler.label();
+        if self.context.python_version >= crate::PythonVersion::Py313
+            && matches!(
+                expression.orelse.as_ref(),
+                Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_)
+            )
+        {
+            // The fallthrough arm restores comprehension locals before it enters the
+            // shared discard. Static swaps cannot reorder stores across that entry.
+            self.assembler.preserve_block_boundary(end);
+        }
         self.assembler.mark(end);
         // The discarded expression's POP_TOP is authored without a location.
         // Nested arms keep the shared discard unlocated until exit copying gives

@@ -35,6 +35,18 @@ fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
 }
 
 #[test]
+fn a_terminal_conditional_discards_the_comprehension_after_restoring_its_locals() {
+    for result in [
+        "[visit(x) for x in xs]",
+        "{x for x in xs}",
+        "{x: x for x in xs}",
+    ] {
+        let source = format!("def render(xs, enabled):\n    visit(xs) if enabled else {result}\n");
+        assert_matches_cpython(&source, "discard_comprehension.py", &LEVELS);
+    }
+}
+
+#[test]
 fn nested_finally_guard_inherits_the_preceding_calls_handler() {
     let source = r"def run(group):
     try:
