@@ -17028,7 +17028,8 @@ impl<'source> Compiler<'source> {
                     if self.context.python_version == crate::PythonVersion::Py314
                         && self.control.in_exception_handler()
                     {
-                        self.assembler.record_unlocated_handler_jump(branch_exit);
+                        self.assembler
+                            .record_unlocated_handler_jump(branch_exit, None);
                     }
                     if discarded_if_exit
                         && !direct_try_body_exit
@@ -30287,10 +30288,12 @@ impl<'source> Compiler<'source> {
                 )?
             };
             if self.context.python_version == crate::PythonVersion::Py314
-                && self.control.in_exception_handler()
-                && !statement.orelse.is_empty()
+                && (statement.orelse.is_empty() || self.control.in_exception_handler())
             {
-                self.assembler.record_unlocated_handler_jump(normal_exit);
+                self.assembler.record_unlocated_handler_jump(
+                    normal_exit,
+                    statement.orelse.is_empty().then_some(handler_start),
+                );
             }
             // Break edges bypass the loop's else suite. After threading those
             // edges, the try's normal jump retains the physical else fallthrough's line.
