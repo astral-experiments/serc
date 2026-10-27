@@ -2227,7 +2227,14 @@ impl OptimizationPipeline {
                         || (matches!(last.opcode,
                             STORE_ATTR | STORE_DEREF | STORE_FAST | STORE_GLOBAL | STORE_NAME
                                 | STORE_SLICE | STORE_SUBSCR)
-                            && !last.local_policy.may_store_null()))
+                            && (!last.local_policy.may_store_null()
+                                // Static swaps put the assigned comprehension's result store
+                                // before its iteration-local restores. The last restore still
+                                // supplies the fallthrough location for the implicit return.
+                                || self.graph[source].items().iter().rev()
+                                    .filter_map(Item::as_instruction)
+                                    .find(|store| !store.local_policy.may_store_null())
+                                    .is_some_and(|store| store.opcode == STORE_FAST))))
                     && self.graph[target].last_instruction().is_some_and(|instruction| {
                         crate::target::is_scope_exit_for(self.python_version, instruction.opcode)
                     })

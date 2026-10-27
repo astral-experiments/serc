@@ -12161,6 +12161,7 @@ fn elided_assertions_preserve_legacy_nested_call_footers() {
 #[test]
 fn empty_conditionals_preserve_legacy_terminal_return_locations() {
     for (case, source) in [
+        "def f(a, b, items):\n    if a:\n        assert a\n    if b:\n        result = [left + right for left, right in items]\n",
         "def f(a, b, items):\n    if a:\n        assert a\n    if b:\n        for item in items:\n            pass\n",
         "def f(a, b):\n    if a:\n        pass\n    else:\n        if b:\n            assert b\n        work()\n",
         "def f(a, b, obj):\n    if a:\n        assert a\n    if b:\n        obj.action()\n",
