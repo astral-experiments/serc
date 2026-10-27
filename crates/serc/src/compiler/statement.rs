@@ -39425,10 +39425,12 @@ impl<'source> Compiler<'source> {
         if self.context.python_version >= crate::PythonVersion::Py313
             && statement.handlers.is_empty()
             && !overriding_return
-            && suite_ends_in_manager_with_folded_normal_exit(&statement.body)
+            && (suite_ends_in_manager_with_folded_normal_exit(&statement.body)
+                || (self.context.python_version >= crate::PythonVersion::Py314
+                    && suite_ends_in_try_with_folded_normal_exit(&statement.body)))
         {
-            // The manager's normal exit and suppression exit both reach this POP_BLOCK
-            // before constant folding removes the infinite loop's normal exit.
+            // Both exits still reach the enclosing POP_BLOCK when CPython assigns
+            // lines. The constant loop's false edge disappears afterward.
             self.assembler.preserve_last_no_location();
         }
         if self.context.python_version >= crate::PythonVersion::Py314
@@ -42682,16 +42684,10 @@ impl<'source> Compiler<'source> {
             if self.context.python_version >= crate::PythonVersion::Py314
                 && matches!(body_noop, WithBodyExitNoop::ConvertedPopBlock)
                 && remaining.is_empty()
-                && matches!(body.last(), Some(Stmt::Try(statement))
-                    if !statement.is_star
-                        && statement.orelse.is_empty()
-                        && statement.finalbody.is_empty()
-                        && suite_ends_in_manager_with_folded_normal_exit(&statement.body)
-                        && statement.handlers.iter().all(|handler| handler.as_except_handler()
-                            .is_some_and(|handler| suite_terminates_before_constant_folding(&handler.body))))
+                && suite_ends_in_try_with_folded_normal_exit(body)
             {
-                // Both original manager exits thread through the try's normal
-                // jump before constant folding removes the ordinary exit.
+                // Both original paths reach the manager POP_BLOCK through the
+                // try's normal exit before the constant loop loses its false edge.
                 self.assembler.preserve_last_no_location();
             }
             let noop_end = self.assembler.label();
@@ -44880,6 +44876,22 @@ fn suite_ends_in_manager_with_folded_normal_exit(body: &[Stmt]) -> bool {
     matches!(body.last(), Some(Stmt::With(manager))
         if suite_terminates(&manager.body)
             && !suite_terminates_before_constant_folding(&manager.body))
+}
+
+/// Recognizes distinct original loop exits that reach cleanup through a terminal try.
+fn suite_ends_in_try_with_folded_normal_exit(body: &[Stmt]) -> bool {
+    matches!(body.last(), Some(Stmt::Try(statement))
+        if !statement.is_star
+            && statement.orelse.is_empty()
+            && statement.finalbody.is_empty()
+            && !statement.handlers.is_empty()
+            && statement.handlers.iter().all(|handler| handler.as_except_handler()
+                .is_some_and(|handler| suite_terminates_before_constant_folding(&handler.body)))
+            && (suite_ends_in_manager_with_folded_normal_exit(&statement.body)
+                || matches!(statement.body.last(), Some(Stmt::While(tail))
+                    if tail.orelse.is_empty()
+                        && early_condition_truthiness(&tail.test) == Some(true)
+                        && suite_contains_loop_break(&tail.body))))
 }
 
 /// Recognizes the two original predecessors of a manager's folded while join.
