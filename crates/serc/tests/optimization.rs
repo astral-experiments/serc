@@ -3972,6 +3972,28 @@ fn erased_assertions_after_finally_preserve_conditional_and_loop_returns() {
 }
 
 #[test]
+fn folded_while_break_preserves_try_else_borrow_boundary() {
+    let source = r"def run(value, ready):
+    try:
+        prepare(value)
+    except ValueError:
+        pass
+    else:
+        while True:
+            if ready:
+                break
+    consume(value)
+";
+    for continuation in ["consume(value)", "return consume(value)"] {
+        assert_matches_cpython(
+            &source.replace("consume(value)", continuation),
+            "folded_while_else.py",
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn folded_while_breaks_copy_unnamed_handler_cleanup() {
     let source = r"def sample(values, limit):
     try:

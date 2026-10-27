@@ -28996,6 +28996,14 @@ impl<'source> Compiler<'source> {
                 )
             },
         )?;
+        if self.context.python_version == crate::PythonVersion::Py314
+            && !statement.is_star
+            && statement.finalbody.is_empty()
+            && matches!(statement.orelse.last(), Some(Stmt::While(loop_))
+                if early_condition_truthiness(&loop_.test) == Some(true))
+        {
+            self.assembler.mark_trailing_folded_while_break();
+        }
         if deferred_try_pop_block
             && !removed_shared_try_pop_block
             && !statement.is_star
