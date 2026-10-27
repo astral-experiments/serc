@@ -13222,6 +13222,25 @@ fn constant_return_keeps_the_try_pop_before_a_managed_finally_guard() {
 }
 
 #[test]
+fn a_break_after_a_managed_async_loop_keeps_its_own_line() {
+    for prefix in ["", "async "] {
+        let source = format!(
+            "async def drain(items, ready, manager, finish):\n    while ready:\n        {prefix}with manager:\n            async for item in items:\n                use(item)\n        break\n    return finish(ready)\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "managed_loop_break.py",
+            &LEVELS,
+            &[
+                PythonVersion::Py313,
+                PythonVersion::Py314,
+                PythonVersion::Py315,
+            ],
+        );
+    }
+}
+
+#[test]
 fn python313_cold_break_before_an_erased_while_test_keeps_its_line() {
     let source = r"def drain(ready):
     try:

@@ -4132,7 +4132,12 @@ impl Assembler {
             || original.operand() != Operand::Forward(end)
             || original.location.line < 0
             || !original.fusion_policy.is_authored_break()
-            || original.jump_policy.retained_nop() != ir::RetainedJumpNop::DirectTarget
+            // A break at a block entry keeps its line on both direct and inlined
+            // exits. Either retention policy leaves the same original empty anchor.
+            || !matches!(
+                original.jump_policy.retained_nop(),
+                ir::RetainedJumpNop::DirectTarget | ir::RetainedJumpNop::Always
+            )
             // Legacy lowering emits the break NOP separately. Modern lowering
             // records it in the jump's original instruction count.
             || original.pre_fold_extra_instructions() != u8::from(self.python_version != crate::PythonVersion::Py313)
