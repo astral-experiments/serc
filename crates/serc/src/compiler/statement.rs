@@ -42626,15 +42626,19 @@ impl<'source> Compiler<'source> {
             // original POP_BLOCK. Let location resolution decide whether it survives.
             (self.context.python_version <= crate::PythonVersion::Py313
                 || (remaining.is_empty()
-                    && cleanup_join.is_some()
                     && body.last().is_some_and(|part| {
                         let inner = match part {
+                            Stmt::If(branch) => {
+                                return manager_condition_has_one_fallthrough(branch);
+                            }
                             Stmt::Try(statement)
-                                if !statement.is_star && statement.finalbody.is_empty() =>
+                                if cleanup_join.is_some()
+                                    && !statement.is_star
+                                    && statement.finalbody.is_empty() =>
                             {
                                 &statement.body
                             }
-                            Stmt::With(manager) => &manager.body,
+                            Stmt::With(manager) if cleanup_join.is_some() => &manager.body,
                             _ => return false,
                         };
                         // Line resolution still sees the normal edge of a loop
@@ -44920,6 +44924,33 @@ fn with_body_has_folded_while_predecessor(body: &[Stmt]) -> bool {
     };
     (infinite_loop(&statement.body) && suite_has_linear_borrow_fallthrough(&otherwise.body))
         || (infinite_loop(&otherwise.body) && suite_has_linear_borrow_fallthrough(&statement.body))
+}
+
+/// Whether exactly one explicit arm can supply the normal manager exit's location.
+fn manager_condition_has_one_fallthrough(branch: &ruff_python_ast::StmtIf) -> bool {
+    if branch
+        .elif_else_clauses
+        .last()
+        .is_none_or(|arm| arm.test.is_some())
+    {
+        return false;
+    }
+    let mut continuing = std::iter::once(branch.body.as_slice())
+        .chain(
+            branch
+                .elif_else_clauses
+                .iter()
+                .map(|arm| arm.body.as_slice()),
+        )
+        .filter(|suite| !suite_terminates_before_constant_folding(suite));
+    let Some(arm) = continuing.next() else {
+        return false;
+    };
+    continuing.next().is_none()
+        && match arm.last() {
+            Some(Stmt::If(nested)) => manager_condition_has_one_fallthrough(nested),
+            _ => true,
+        }
 }
 
 // A complete conditional with one terminal arm leaves the other arm as the sole
