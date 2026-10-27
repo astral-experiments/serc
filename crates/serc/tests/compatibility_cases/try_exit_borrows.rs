@@ -2362,3 +2362,13 @@ fn terminal_deletion_preserves_original_return_boundary() {
         common::assert_matches_cpython_marshal(&source, "terminal_deletion_return.py");
     }
 }
+
+#[test]
+fn borrows_finalizer_locals_after_generator_for_exhaustion() {
+    for scope in ["def", "async def"] {
+        let source = format!(
+            "{scope} values(manager, items, target):\n    with manager:\n        try:\n            for item in items:\n                if usable(item):\n                    yield item\n        except Error as error:\n            if fatal(error):\n                raise Failure() from error\n        finally:\n            if target is not None:\n                target.close()\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "generator_loop_cleanup.py");
+    }
+}
