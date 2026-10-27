@@ -19066,3 +19066,18 @@ fn nested_conditional_arms_donate_implicit_return_locations() {
 ";
     assert_matches_cpython(source, "nested_implicit_returns.py", &LEVELS);
 }
+
+#[test]
+fn erased_try_setup_preserves_the_outer_manager_on_a_none_guard() {
+    let source = r"async def run(resource, flag):
+    with manager():
+        if flag:
+            prepare(resource)
+        try:
+            assert flag
+        finally:
+            if resource is not None:
+                consume()
+";
+    assert_matches_cpython(source, "erased_setup_none_guard.py", &LEVELS);
+}
