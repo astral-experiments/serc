@@ -19549,10 +19549,16 @@ impl<'source> Compiler<'source> {
                 if statement.orelse.is_empty()
                     && early_condition_truthiness(&statement.test).is_none()
                     && (!suite_contains_loop_break(&statement.body) || !mode.non_final_branch)
-                    && !matches!(
+                    // An async iterator's next-item backedge stays ahead of the inner
+                    // while body even when the try inside it needs its own exit copies.
+                    && (!matches!(
                         statement.body.last(),
                         Some(Stmt::Try(statement)) if try_requires_loop_tail_inlining(statement)
-                    ) =>
+                    ) || (self.context.python_version >= crate::PythonVersion::Py314
+                        && !mode.non_final_branch
+                        && self.control.loops.contexts.last().is_some_and(|context| {
+                            context.iterator_cleanup == IteratorCleanup::Async
+                        }))) =>
             {
                 self.compile_loop_tail_prefix(leading)?;
                 self.compile_loop_tail_while(statement, restart, mode.non_final_branch)?;
