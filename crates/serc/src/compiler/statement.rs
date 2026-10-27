@@ -13166,6 +13166,24 @@ impl<'source> Compiler<'source> {
                 // Unwind managers and loop iterators in their lexical nesting order. An
                 // iterator surrounding an inner manager remains below its exit callable
                 // until that manager has finished.
+                // A copied finalizer ending in another try/finally reaches a normal
+                // exit before the surrounding try is popped and its manager unwinds.
+                if self.context.python_version >= crate::PythonVersion::Py314
+                    && let Some(manager) = self.control.withs.active_with_exits[..next_with].last()
+                    && self.control.finally.active_normal_finally_bodies == manager.normal_finally_depth
+                    && self.control.finally.active_finally_end_blocks == manager.finally_end_depth
+                    && self.assembler.at_jump_target()
+                    && self.control.finally.active_return_finally_contexts.first().is_some_and(|finally| {
+                        finally.with_depth == next_with
+                            && finally.try_body_depth > 0
+                            && finally.exception_region_depth > manager.exception_region_depth
+                            && matches!(finally.body.last(), Some(Stmt::Try(cleanup)) if !cleanup.finalbody.is_empty())
+                    })
+                {
+                    self.assembler.set_location(SourceLocation::NONE);
+                    self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
+                    self.assembler.mark_last_as_converted_pop_block();
+                }
                 let mut remaining_with_starts = Vec::new();
                 for with_index in (0..next_with).rev() {
                     if self.control.withs.direct_return_handler_try_with_depth
