@@ -221,6 +221,7 @@ pub(super) struct CompilationContext<'source> {
     constant_origins: Option<RefCell<ConstantOrigins>>,
     // Discarded code can intern an equal literal tuple without interning standalone literals.
     interned_metadata_tuples: Option<RefCell<Vec<Vec<String>>>>,
+    annotation_local_tails: RefCell<FxHashSet<Vec<crate::code_object::MetadataName>>>,
     static_attribute_names: FxHashSet<String>,
     active_class_static_attributes: RefCell<Vec<BTreeSet<String>>>,
     cached_static_attribute_tuples: RefCell<FxHashSet<Vec<String>>>,
@@ -477,6 +478,7 @@ impl<'source> CompilationContext<'source> {
             dotted_constant_origins: RefCell::default(),
             constant_origins,
             interned_metadata_tuples,
+            annotation_local_tails: RefCell::default(),
             static_attribute_names,
             active_class_static_attributes: RefCell::default(),
             cached_static_attribute_tuples: RefCell::new(FxHashSet::default()),
@@ -763,6 +765,20 @@ impl<'source> CompilationContext<'source> {
     }
 
     pub(super) fn record_code_assembly(&self, code: &CodeObject) -> Option<usize> {
+        if code.marshal_provenance.locals_identity == crate::code_object::LocalsIdentity::Fresh
+            || code
+                .locals
+                .first()
+                .is_some_and(|name| name.as_str() == ".format")
+        {
+            // CPython interns annotation locals before replacing the parameter's
+            // public spelling. Type-alias scopes retain the original name.
+            let tail = &code.locals[1..];
+            let mut tails = self.annotation_local_tails.borrow_mut();
+            if !tails.contains(tail) {
+                tails.insert(tail.to_vec());
+            }
+        }
         if let Some(tuples) = &self.interned_metadata_tuples {
             let mut tuples = tuples.borrow_mut();
             if code.names.iter().any(|name| !name.is_ascii()) {
@@ -817,9 +833,16 @@ impl<'source> CompilationContext<'source> {
     }
 
     pub(super) fn take_interned_metadata_tuples(&self) -> Vec<Vec<String>> {
-        self.interned_metadata_tuples
+        let mut tuples = self
+            .interned_metadata_tuples
             .as_ref()
-            .map_or_else(Vec::new, RefCell::take)
+            .map_or_else(Vec::new, RefCell::take);
+        tuples.extend(self.annotation_local_tails.take().into_iter().map(|tail| {
+            std::iter::once(".format".to_string())
+                .chain(tail.iter().map(ToString::to_string))
+                .collect()
+        }));
+        tuples
     }
 
     pub(super) fn has_tracked_string_origins(&self) -> bool {

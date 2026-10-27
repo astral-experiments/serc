@@ -1618,10 +1618,12 @@ impl<'source> Compiler<'source> {
             code.marshal_provenance.constant_hashes =
                 crate::marshal::constant_hashes_for_code(&code);
             code.marshal_provenance.interning_events = self.context.take_interning_events();
-            code.marshal_provenance.interned_metadata_tuples =
-                self.context.take_interned_metadata_tuples();
             code.marshal_provenance.metadata_alias_scan_unnecessary =
                 metadata_alias_scan_unnecessary(&code, &self.context.scopes.names);
+            if !code.marshal_provenance.metadata_alias_scan_unnecessary {
+                code.marshal_provenance.interned_metadata_tuples =
+                    self.context.take_interned_metadata_tuples();
+            }
             let context = Rc::get_mut(&mut self.context)
                 .expect("completed module exclusively owns its compilation context");
             code.marshal_provenance.metadata_name_lookup = Some(std::sync::Arc::new(

@@ -1044,6 +1044,12 @@ impl Compiler<'_> {
         }
 
         impl<'ast> Collector<'_, '_, 'ast> {
+            /// Modern annotation scopes intern their locals even when their definition is discarded.
+            fn needs_discarded_definition(&self) -> bool {
+                self.record_string_origins
+                    && (self.build_discarded || self.python_version >= PythonVersion::Py314)
+            }
+
             fn legacy_folded_constant(&self, expression: &Expr) -> Option<Constant> {
                 let compiler = self.legacy_compiler?;
                 if matches!(
@@ -1360,7 +1366,7 @@ impl Compiler<'_> {
                         return;
                     }
                     Stmt::FunctionDef(definition) => {
-                        let build = self.build_discarded && self.record_string_origins;
+                        let build = self.needs_discarded_definition();
                         if build {
                             self.flush_origins();
                             self.actions.push(SkippedAction::Statement(statement));
@@ -1458,7 +1464,7 @@ impl Compiler<'_> {
                         return;
                     }
                     Stmt::ClassDef(definition) => {
-                        let build = self.build_discarded && self.record_string_origins;
+                        let build = self.needs_discarded_definition();
                         if build {
                             self.flush_origins();
                             self.actions.push(SkippedAction::Statement(statement));
@@ -1508,9 +1514,7 @@ impl Compiler<'_> {
                         self.constants.push(Constant::None);
                         return;
                     }
-                    Stmt::TypeAlias(alias)
-                        if self.build_discarded && self.record_string_origins =>
-                    {
+                    Stmt::TypeAlias(alias) if self.needs_discarded_definition() => {
                         self.flush_origins();
                         self.actions.push(SkippedAction::Statement(statement));
                         if let Expr::Name(name) = alias.name.as_ref() {
@@ -1973,15 +1977,13 @@ impl Compiler<'_> {
         collector.flush_origins();
         let Collector {
             actions,
-            build_discarded,
             has_untracked_collection,
             constants,
             folded_expressions,
             names,
             ..
         } = collector;
-        let mut builder =
-            (build_discarded || first_expression.is_some()).then(|| self.discarded_builder());
+        let mut builder = None;
         for action in actions {
             match action {
                 SkippedAction::StaticAttribute(name) => {
@@ -1998,7 +2000,7 @@ impl Compiler<'_> {
                     }
                 }
                 SkippedAction::Statement(statement) => {
-                    let builder = builder.as_mut().unwrap();
+                    let builder = builder.get_or_insert_with(|| self.discarded_builder());
                     match statement {
                         Stmt::FunctionDef(definition) => {
                             builder.compile_function_definition(definition)?;
@@ -2014,12 +2016,12 @@ impl Compiler<'_> {
                     }
                 }
                 SkippedAction::Expression(expression) => {
-                    let builder = builder.as_mut().unwrap();
+                    let builder = builder.get_or_insert_with(|| self.discarded_builder());
                     builder.compile_expression(expression)?;
                     builder.emit(super::POP_TOP, 0, -1)?;
                 }
                 SkippedAction::FirstExpression(expression) => {
-                    let builder = builder.as_mut().unwrap();
+                    let builder = builder.get_or_insert_with(|| self.discarded_builder());
                     builder.compile_expression(expression)?;
                     self.retain_discarded_first_constant(builder)?;
                     builder.emit(super::POP_TOP, 0, -1)?;
