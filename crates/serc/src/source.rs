@@ -3,7 +3,7 @@ use std::error::Error;
 use std::fmt;
 use std::str::Utf8Error;
 
-use encoding_rs::{EUC_JP, ISO_8859_15, KOI8_R, WINDOWS_1251, WINDOWS_1252};
+use encoding_rs::{BIG5, EUC_JP, Encoding, ISO_8859_15, KOI8_R, WINDOWS_1251, WINDOWS_1252};
 
 const UTF8_BOM: &[u8] = b"\xef\xbb\xbf";
 
@@ -62,6 +62,7 @@ enum SourceEncoding {
     Ascii,
     Latin1,
     Iso885915,
+    Big5,
     EucJp,
     Koi8R,
     Windows1251,
@@ -80,6 +81,7 @@ pub(crate) enum SourceCodec {
     Ascii,
     Latin1,
     Iso885915,
+    Big5,
     EucJp,
     Koi8R,
     Windows1251,
@@ -95,7 +97,7 @@ pub(crate) struct DecodedSource<'a> {
 /// Decode Python source bytes and normalize them for parsing.
 ///
 /// Serc accepts UTF-8 source, including a single UTF-8 BOM and CPython-compatible UTF-8
-/// encoding cookies on the first or second physical line. ASCII, Latin-1, Latin-9, EUC-JP, KOI8-R, and
+/// encoding cookies on the first or second physical line. ASCII, Latin-1, Latin-9, Big5, EUC-JP, KOI8-R, and
 /// Windows 1251 and 1252 cookies are also decoded with CPython-compatible aliases and strict mappings.
 /// Newlines are normalized to `\n`. The returned value borrows `bytes` for unchanged UTF-8 source.
 pub fn decode_source(bytes: &[u8]) -> Result<Cow<'_, str>, SourceDecodeError> {
@@ -144,6 +146,7 @@ pub(crate) fn decode_source_with_codec(
         }
         SourceEncoding::Latin1 => Cow::Owned(bytes.iter().copied().map(char::from).collect()),
         SourceEncoding::Iso885915
+        | SourceEncoding::Big5
         | SourceEncoding::EucJp
         | SourceEncoding::Koi8R
         | SourceEncoding::Windows1251
@@ -182,6 +185,7 @@ fn codec_registry_effects(
                 )
         }
         SourceEncoding::Iso885915
+        | SourceEncoding::Big5
         | SourceEncoding::EucJp
         | SourceEncoding::Koi8R
         | SourceEncoding::Windows1251
@@ -197,6 +201,7 @@ fn codec_registry_effects(
         SourceEncoding::Ascii => Some(SourceCodec::Ascii),
         SourceEncoding::Latin1 => Some(SourceCodec::Latin1),
         SourceEncoding::Iso885915 => Some(SourceCodec::Iso885915),
+        SourceEncoding::Big5 => Some(SourceCodec::Big5),
         SourceEncoding::EucJp => Some(SourceCodec::EucJp),
         SourceEncoding::Koi8R => Some(SourceCodec::Koi8R),
         SourceEncoding::Windows1251 => Some(SourceCodec::Windows1251),
@@ -210,7 +215,8 @@ fn decode_legacy(encoding: SourceEncoding, bytes: &[u8]) -> Option<Cow<'_, str>>
         SourceEncoding::Iso885915 => {
             ISO_8859_15.decode_without_bom_handling_and_without_replacement(bytes)
         }
-        SourceEncoding::EucJp => decode_euc_jp(bytes),
+        SourceEncoding::Big5 => decode_multibyte(bytes, BIG5, big5_character),
+        SourceEncoding::EucJp => decode_multibyte(bytes, EUC_JP, euc_jp_character),
         SourceEncoding::Koi8R => KOI8_R.decode_without_bom_handling_and_without_replacement(bytes),
         SourceEncoding::Windows1251 if !bytes.contains(&0x98) => {
             WINDOWS_1251.decode_without_bom_handling_and_without_replacement(bytes)
@@ -229,45 +235,100 @@ fn decode_legacy(encoding: SourceEncoding, bytes: &[u8]) -> Option<Cow<'_, str>>
     }
 }
 
-/// Decode with CPython's EUC-JP mappings instead of the web encoding's variants.
-/// Reject web-only extensions and replace the few mappings that differ in CPython.
-fn decode_euc_jp(bytes: &[u8]) -> Option<Cow<'_, str>> {
-    let decoded = EUC_JP.decode_without_bom_handling_and_without_replacement(bytes)?;
-    let mut has_override = false;
+/// Decode the common mappings in runs. Each character is first checked against
+/// CPython's repertoire, which omits web extensions and maps some bytes differently.
+fn decode_multibyte<'a>(
+    bytes: &'a [u8],
+    encoding: &'static Encoding,
+    character: fn(&[u8], usize) -> Option<(usize, Option<char>)>,
+) -> Option<Cow<'a, str>> {
+    let mut output = None;
+    let mut segment_start = 0;
     let mut index = 0;
     while index < bytes.len() {
-        let length = euc_jp_character_len(bytes, index)?;
-        let sequence = &bytes[index..index + length];
-        if length == 2 && euc_jp_web_extension(sequence[0], sequence[1]) {
-            return None;
-        }
-        has_override |= euc_jp_override(sequence).is_some();
-        index += length;
-    }
-    if !has_override {
-        return Some(decoded);
-    }
-
-    let mut output = String::with_capacity(decoded.len());
-    let mut segment_start = 0;
-    index = 0;
-    while index < bytes.len() {
-        let length = euc_jp_character_len(bytes, index)?;
-        let sequence = &bytes[index..index + length];
-        if let Some(character) = euc_jp_override(sequence) {
-            let segment = EUC_JP.decode_without_bom_handling_and_without_replacement(
+        let (length, replacement) = character(bytes, index)?;
+        if let Some(replacement) = replacement {
+            let text = output.get_or_insert_with(|| String::with_capacity(bytes.len()));
+            let segment = encoding.decode_without_bom_handling_and_without_replacement(
                 &bytes[segment_start..index],
             )?;
-            output.push_str(&segment);
-            output.push(character);
+            text.push_str(&segment);
+            text.push(replacement);
             segment_start = index + length;
         }
         index += length;
     }
-    let segment =
-        EUC_JP.decode_without_bom_handling_and_without_replacement(&bytes[segment_start..])?;
-    output.push_str(&segment);
-    Some(Cow::Owned(output))
+    let tail =
+        encoding.decode_without_bom_handling_and_without_replacement(&bytes[segment_start..])?;
+    if let Some(mut output) = output {
+        output.push_str(&tail);
+        Some(Cow::Owned(output))
+    } else {
+        Some(tail)
+    }
+}
+
+fn big5_character(bytes: &[u8], index: usize) -> Option<(usize, Option<char>)> {
+    let lead = bytes[index];
+    if lead.is_ascii() {
+        return Some((1, None));
+    }
+    let trail = *bytes.get(index + 1)?;
+    let last_trail = match lead {
+        0xa1..=0xa2 | 0xa4..=0xc6 | 0xc9..=0xf8 => 0xfe,
+        0xa3 => 0xbf,
+        0xc7 => 0xfc,
+        0xf9 => 0xd5,
+        _ => return None,
+    };
+    if !(0x40..=0x7e).contains(&trail) && !(0xa1..=last_trail).contains(&trail) {
+        return None;
+    }
+    Some((2, big5_override(u16::from_be_bytes([lead, trail]))))
+}
+
+/// CPython uses the Big5 punctuation, kana, Cyrillic and enclosed-number rows
+/// where the WHATWG index uses different characters.
+fn big5_override(pair: u16) -> Option<char> {
+    let (first, codepoint) = match pair {
+        0xa145 => return Some('\u{2022}'),
+        0xa14e => return Some('\u{ff64}'),
+        0xa1c2 => return Some('\u{203e}'),
+        0xa1e3 => return Some('\u{223c}'),
+        0xa1f2 => return Some('\u{2641}'),
+        0xa1f3 => return Some('\u{2609}'),
+        0xa241 => return Some('\u{ff0f}'),
+        0xa242 => return Some('\u{ff3c}'),
+        0xa244 => return Some('\u{00a5}'),
+        0xa246 => return Some('\u{00a2}'),
+        0xa247 => return Some('\u{00a3}'),
+        0xc6a1 => return Some('\u{30fe}'),
+        0xc6a2..=0xc6a3 => (0xc6a2, 0x309d),
+        0xc6a4 => return Some('\u{3005}'),
+        0xc6a5..=0xc6f7 => (0xc6a5, 0x3041),
+        0xc6f8..=0xc6fe => (0xc6f8, 0x30a1),
+        0xc740..=0xc77e => (0xc740, 0x30a8),
+        0xc7a1..=0xc7b0 => (0xc7a1, 0x30e7),
+        0xc7b1..=0xc7b2 => (0xc7b1, 0x0414),
+        0xc7b3 => return Some('\u{0401}'),
+        0xc7b4..=0xc7ba => (0xc7b4, 0x0416),
+        0xc7bb..=0xc7cd => (0xc7bb, 0x0423),
+        0xc7ce => return Some('\u{0451}'),
+        0xc7cf..=0xc7e8 => (0xc7cf, 0x0436),
+        0xc7e9..=0xc7f2 => (0xc7e9, 0x2460),
+        0xc7f3..=0xc7fc => (0xc7f3, 0x2474),
+        _ => return None,
+    };
+    char::from_u32(codepoint + u32::from(pair - first))
+}
+
+fn euc_jp_character(bytes: &[u8], index: usize) -> Option<(usize, Option<char>)> {
+    let length = euc_jp_character_len(bytes, index)?;
+    let sequence = &bytes[index..index + length];
+    if length == 2 && euc_jp_web_extension(sequence[0], sequence[1]) {
+        return None;
+    }
+    Some((length, euc_jp_override(sequence)))
 }
 
 fn euc_jp_character_len(bytes: &[u8], index: usize) -> Option<usize> {
@@ -336,6 +397,7 @@ fn classify_source_encoding(name: &str) -> Option<SourceEncoding> {
             Some(SourceEncoding::Latin1)
         }
         "iso8859_15" | "iso_8859_15" | "l9" | "latin9" => Some(SourceEncoding::Iso885915),
+        "big5" | "big5_tw" | "csbig5" | "x_mac_trad_chinese" => Some(SourceEncoding::Big5),
         "euc_jp" | "eucjp" | "ujis" | "u_jis" => Some(SourceEncoding::EucJp),
         "koi8_r" | "cskoi8r" => Some(SourceEncoding::Koi8R),
         "windows_1251" | "cp1251" | "1251" => Some(SourceEncoding::Windows1251),
@@ -353,6 +415,7 @@ fn classify_dotted_codec_alias(name: &str) -> Option<SourceEncoding> {
             Some(SourceEncoding::Latin1)
         }
         "iso8859_15" | "iso_8859_15" => Some(SourceEncoding::Iso885915),
+        "big5_tw" | "x_mac_trad_chinese" => Some(SourceEncoding::Big5),
         "u_jis" => Some(SourceEncoding::EucJp),
         "windows_1251" => Some(SourceEncoding::Windows1251),
         "windows_1252" => Some(SourceEncoding::Windows1252),
@@ -524,7 +587,7 @@ mod tests {
 
     use super::{
         SourceCodec, SourceDecodeError, SourceEncoding, classify_source_encoding,
-        declared_encoding, decode_euc_jp, decode_source, decode_source_with_codec,
+        declared_encoding, decode_legacy, decode_source, decode_source_with_codec,
         normalize_source,
     };
 
@@ -713,8 +776,8 @@ mod tests {
             Err(SourceDecodeError::InvalidEncoding("euc-jp".to_string()))
         );
         assert_eq!(
-            decode_source(b"# coding: big5\npass\n"),
-            Err(SourceDecodeError::UnsupportedEncoding("big5".to_string()))
+            decode_source(b"# coding: koi8_u\npass\n"),
+            Err(SourceDecodeError::UnsupportedEncoding("koi8_u".to_string()))
         );
         for source in [
             b"\xff\0".as_slice(),
@@ -723,6 +786,42 @@ mod tests {
             b"\xef\xbb\xbf\xef\xbb\xbf\0",
         ] {
             assert_eq!(decode_source(source), Err(SourceDecodeError::NullByte));
+        }
+    }
+
+    #[test]
+    fn decodes_cpython_big5_rows_and_rejects_extensions() {
+        for encoding in [
+            "big5",
+            "big5-tw",
+            "csbig5",
+            "x-mac-trad-chinese",
+            "big5.tw",
+            "x.mac.trad.chinese",
+        ] {
+            assert_eq!(
+                classify_source_encoding(encoding),
+                Some(SourceEncoding::Big5)
+            );
+        }
+        assert_eq!(
+            decode_legacy(
+                SourceEncoding::Big5,
+                b"a\xa1\x45\xa4\x40\xc6\xa5\xc7\xb3\xc7\xe9z"
+            )
+            .unwrap(),
+            "a•一ぁЁ①z"
+        );
+        for invalid in [
+            &[0xa4][..],
+            &[0x81, 0x40],
+            &[0xa3, 0xc0],
+            &[0xc7, 0xfd],
+            &[0xc8, 0x40],
+            &[0xf9, 0xd6],
+            &[0xa4, 0x7f],
+        ] {
+            assert!(decode_legacy(SourceEncoding::Big5, invalid).is_none());
         }
     }
 
@@ -737,7 +836,10 @@ mod tests {
             (b"\xa2\xcc".as_slice(), '\u{00ac}'),
             (b"\x8f\xa2\xb7".as_slice(), '~'),
         ] {
-            assert_eq!(decode_euc_jp(encoded).unwrap(), expected.to_string());
+            assert_eq!(
+                decode_legacy(SourceEncoding::EucJp, encoded).unwrap(),
+                expected.to_string()
+            );
         }
     }
 
@@ -752,7 +854,7 @@ mod tests {
         ] {
             for &(start, end) in ranges {
                 for trail in start..=end {
-                    assert!(decode_euc_jp(&[lead, trail]).is_none());
+                    assert!(decode_legacy(SourceEncoding::EucJp, &[lead, trail]).is_none());
                 }
             }
         }
@@ -891,10 +993,10 @@ mod tests {
             let legacy = format!("# first{newline}# coding: latin-1{newline}pass{newline}");
             assert!(decode_source(legacy.as_bytes()).is_ok(), "{newline:?}");
 
-            let unsupported = format!("# first{newline}# coding: big5{newline}pass{newline}");
+            let unsupported = format!("# first{newline}# coding: koi8_u{newline}pass{newline}");
             assert_eq!(
                 decode_source(unsupported.as_bytes()),
-                Err(SourceDecodeError::UnsupportedEncoding("big5".to_string())),
+                Err(SourceDecodeError::UnsupportedEncoding("koi8_u".to_string())),
                 "{newline:?}",
             );
         }
