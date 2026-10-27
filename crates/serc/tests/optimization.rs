@@ -15,6 +15,24 @@ use serc::{
 };
 
 #[test]
+fn reraising_cleanup_leaves_one_iterator_discard_predecessor() {
+    let source = r"def scan(items, manager):
+    with manager:
+        for item in items:
+            try:
+                return
+            finally:
+                try:
+                    work(item)
+                except ValueError:
+                    raise
+                else:
+                    finish(item)
+";
+    assert_matches_cpython(source, "located_iterator_discard.py", &LEVELS);
+}
+
+#[test]
 fn guarded_cleanup_keeps_the_outer_iterators_discard_unlocated() {
     let source = r"def scan(items, manager, active):
     with manager:

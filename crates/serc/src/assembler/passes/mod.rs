@@ -241,7 +241,7 @@ impl Assembler {
         let mut exception_owner_provenance = self.exception_owner_provenance.into_box();
         debug_assert_eq!(exception_owner_provenance.original_pass_nops.len(), 0);
         exception_owner_provenance.original_pass_nops = self.original_pass_nops;
-        let (mut graph, initial_reachable) = match self.code {
+        let (mut graph, mut initial_reachable) = match self.code {
             UnoptimizedCode::Linear(items) => (
                 BlockGraph::from_items(items, &rustc_hash::FxHashSet::default()),
                 None,
@@ -256,6 +256,33 @@ impl Assembler {
                 (graph, Some(reachable))
             }
         };
+        // A dead handler tail cannot share a discard with the normal exit. Let a
+        // sole live predecessor donate its position, including to cold copies.
+        if !self.iterator_discard_joins.is_empty() {
+            let reachable = initial_reachable
+                .get_or_insert_with(|| graph.reachable_blocks(&self.exception_regions));
+            let mut incoming = vec![0u32; graph.len()];
+            for (source, block) in graph.iter() {
+                if reachable[source.index()]
+                    && let Some(target) = block
+                        .successors()
+                        .1
+                        .and_then(|label| graph.label_block(label))
+                {
+                    incoming[target.index()] += 1;
+                }
+            }
+            for join in self.iterator_discard_joins {
+                if let Some(block) = graph.label_block(join)
+                    && incoming[block.index()] > 1
+                    && let Some(discard) = graph.instructions_mut(block).next()
+                    && discard.opcode == crate::target::opcodes::POP_TOP
+                    && discard.location == SourceLocation::NONE
+                {
+                    discard.no_location_policy.preserve_location();
+                }
+            }
+        }
         if self.python_version <= crate::PythonVersion::Py313
             && let Some(index) = self.deferred_none_constant_index
         {

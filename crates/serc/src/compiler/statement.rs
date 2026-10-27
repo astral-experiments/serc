@@ -18296,8 +18296,8 @@ impl<'source> Compiler<'source> {
         preserve_tos: bool,
     ) -> Result<(), CompileError> {
         for index in (from_depth..to_depth).rev() {
-            // An enclosing manager or finalizer keeps the shared iterator exit
-            // too large to copy. Its unlocated POP has no unique predecessor.
+            // Capture the original join before emitting the discard. A finalizer's
+            // terminating handler can still have an unreachable jump into that join.
             let shared_iterator_discard = !preserve_tos
                 && self.context.python_version == crate::PythonVersion::Py314
                 && self.control.loops.contexts[index].iterator_cleanup == IteratorCleanup::Sync
@@ -18320,7 +18320,7 @@ impl<'source> Compiler<'source> {
                 preserve_tos,
             )?;
             if shared_iterator_discard {
-                self.assembler.preserve_last_no_location();
+                self.assembler.record_iterator_discard_join();
             }
         }
         Ok(())

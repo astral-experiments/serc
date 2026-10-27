@@ -11484,6 +11484,15 @@ impl Assembler {
         instruction.no_location_policy.mark_artificial_eval_break();
     }
 
+    /// Defers an iterator discard's location until its live predecessors are known.
+    pub(crate) fn record_iterator_discard_join(&mut self) {
+        if let [.., Item::Label(join), Item::Instruction(discard)] = self.linear_items()
+            && discard.opcode == POP_TOP
+        {
+            self.iterator_discard_joins.push(*join);
+        }
+    }
+
     pub(crate) fn preserve_last_no_location(&mut self) {
         self.required_last_instruction_mut("preserving a no-location instruction")
             .no_location_policy
