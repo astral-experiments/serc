@@ -11563,6 +11563,25 @@ fn nested_handler_returns_keep_enclosing_try_owner_inside_while() {
 }
 
 #[test]
+fn generator_handler_returns_keep_the_try_around_their_finalizer() {
+    let source = r"def visit(items):
+    try:
+        while True:
+            try:
+                item = take(items)
+            except StopIteration as stop:
+                return stop.value
+            finally:
+                finish(items)
+            yield item
+    except GeneratorExit:
+        close(items)
+        raise
+";
+    assert_matches_cpython(source, "generator_handler_finalizer.py", &LEVELS);
+}
+
+#[test]
 fn a_handlers_copied_finalizer_stays_inside_the_try_around_its_loop() {
     let source = r"def run(value, ready):
     try:
