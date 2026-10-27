@@ -9448,7 +9448,8 @@ impl<'source> Compiler<'source> {
                         ([handler, nested @ ..], [finally])
                             if ((handler.name.is_none() && self.control.loops.contexts.is_empty())
                                 // Restoring a handler does not exit the enclosing try or
-                                // discard an older iterator before the copied finalizer.
+                                // discard an older iterator before the copied finalizer. An
+                                // intervening try ends after the copy and before that iterator.
                                 || (self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
                                     && handler.finally_end_depth == 0
                                     && handler.with_depth == 0
@@ -9459,7 +9460,7 @@ impl<'source> Compiler<'source> {
                                         matches!(context.iterator_cleanup, IteratorCleanup::None | IteratorCleanup::Sync)
                                             && context.with_depth == 0
                                             && context.finally_end_depth == 0
-                                            && context.exception_region_depth == finally.exception_region_depth
+                                            && context.exception_region_depth <= finally.exception_region_depth
                                     })
                                     && self.control.finally.active_pass_finally_locations.is_empty()
                                     && self.control.finally.copied_return_finally_preserved_values == 0
@@ -14354,6 +14355,7 @@ impl<'source> Compiler<'source> {
                     preserve_tos,
                     if tracks_iterator_region_unwinds
                         || tracks_handler_enclosing_try_unwinds
+                        || tracks_outer_try_handler_finally_unwinds
                         || (tracks_handler_iterator_region_unwinds && unwinds_return_finally)
                         || (tracks_finally_region_unwinds
                             && (copied_finally_iterator_location.is_some()
