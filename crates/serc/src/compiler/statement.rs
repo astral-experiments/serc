@@ -37539,7 +37539,7 @@ impl<'source> Compiler<'source> {
             // A linear normal exit supplies the converted POP_BLOCK's line independently
             // of a following nested try's setup marker. Preserve this ownerless marker;
             // empty or shared exits do not have the same predecessor location.
-            if !statement.handlers.is_empty()
+            let linear_exit = !statement.handlers.is_empty()
                 && !suite_terminates(&statement.body)
                 && !suite_terminates(&statement.orelse)
                 && (if statement.orelse.is_empty() {
@@ -37600,16 +37600,11 @@ impl<'source> Compiler<'source> {
                         .as_except_handler()
                         .is_some_and(|handler| suite_terminates(&handler.body))
                 })
-                && matches!(statement.finalbody.first(), Some(Stmt::Try(_)))
-            {
-                self.assembler.preserve_last_nop();
-                self.assembler
-                    .record_retained_pop_block_origin(protected_end);
-            }
+                && matches!(statement.finalbody.first(), Some(Stmt::Try(_)));
             // A sole normal handler supplies the same original POP_BLOCK when the
             // protected body already exits before constant folding. Preserve that
             // ownerless marker independently of the nested try's setup line.
-            if !statement.is_star
+            let handler_exit = !statement.is_star
                 && statement.orelse.is_empty()
                 && suite_terminates_before_constant_folding(&statement.body)
                 && {
@@ -37624,9 +37619,31 @@ impl<'source> Compiler<'source> {
                                 || matches!(handler.body.as_slice(), [Stmt::Pass(_)]))
                     }) && handlers.next().is_none()
                 }
-                && matches!(statement.finalbody.first(), Some(Stmt::Try(_)))
-            {
+                && matches!(statement.finalbody.first(), Some(Stmt::Try(_)));
+            if linear_exit || handler_exit {
                 self.assembler.preserve_last_nop();
+            }
+            // CPython resolves the POP_BLOCK's line before folding a constant loop's
+            // false edge. A surviving jump through the prefix can then look unique
+            // even though a second exit originally reached it.
+            let loses_loop_exit = |body: &[Stmt]| {
+                !suite_terminates_before_constant_folding(body)
+                    && (suite_terminates(body)
+                        || matches!(body.last(), Some(Stmt::While(tail)) if early_condition_truthiness(&tail.test) == Some(true)))
+            };
+            if linear_exit
+                || handler_exit
+                || (self.context.python_version >= crate::PythonVersion::Py314
+                    && !statement.is_star
+                    && !statement.handlers.is_empty()
+                    && matches!(statement.finalbody.first(), Some(Stmt::Try(_)))
+                    && !match statement.body.last() {
+                        Some(Stmt::With(manager)) => loses_loop_exit(&manager.body),
+                        Some(Stmt::Try(nested)) => loses_loop_exit(&nested.body),
+                        Some(Stmt::If(branch)) => if_suites(branch).any(loses_loop_exit),
+                        _ => false,
+                    })
+            {
                 self.assembler
                     .record_retained_pop_block_origin(protected_end);
             }

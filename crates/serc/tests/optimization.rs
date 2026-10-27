@@ -16178,6 +16178,50 @@ fn nested_function_finally_retains_terminating_handler_boundary() {
 }
 
 #[test]
+fn guarded_handler_donates_nested_finally_entry_marker() {
+    let source = r"def run(flag, item):
+    try:
+        return item
+    except ValueError as error:
+        if flag:
+            raise
+    finally:
+        try:
+            finish()
+        except OSError:
+            recover()
+";
+    for source in [source.to_owned(), source.replace("return item", "work()")] {
+        assert_matches_cpython_versions(
+            &source,
+            "guarded_handler_finally_entry.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
+fn folded_loop_exit_precedes_nested_finally_line_propagation() {
+    for protected in [
+        "with manager:\n            while True:\n                work()",
+        "try:\n            while True:\n                work()\n        except KeyError:\n            recover()",
+        "if flag:\n            while True:\n                work()\n        else:\n            recover()",
+        "with manager:\n            raise KeyError",
+    ] {
+        let source = format!(
+            "def run(manager, flag):\n    try:\n        {protected}\n    except ValueError:\n        raise\n    finally:\n        try:\n            finish()\n        except OSError:\n            pass\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "folded_loop_finally_entry.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn sole_handler_retains_nested_finally_entry_marker() {
     for (header, suspension) in [("def", ""), ("async def", "await ")] {
         for recovery in ["pass", "recover(resource)"] {

@@ -1588,7 +1588,6 @@ fn restore_retained_pop_block_locations(
         };
         if first.opcode != NOP
             || !first.fusion_policy.is_converted_pop_block()
-            || !first.jump_policy.preserves_explicit_nop()
             || first.jump_policy.borrow_empty_block()
             || first.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
             || first.location != SourceLocation::NONE
