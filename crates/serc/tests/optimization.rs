@@ -19163,6 +19163,22 @@ fn multiline_conditional_assertion_copies_chained_failures() {
 }
 
 #[test]
+fn folded_conditional_arms_keep_their_call_return_target() {
+    let source = r"def choose(ready, value):
+    if ready or (check(value) if value else False):
+        return finish(value)
+    return fallback()
+
+
+def select(ready, value, defaults):
+    if ready or (check(value) if value else False):
+        return finish(value)
+    return defaults.choose()
+";
+    assert_matches_cpython(source, "conditional_arm_call_returns.py", &LEVELS);
+}
+
+#[test]
 fn conditional_comparison_arms_keep_a_copied_return_line() {
     for result in ["None", "finish(value)"] {
         let source = format!(

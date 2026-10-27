@@ -462,42 +462,36 @@ impl Assembler {
             let mut instructions = graph[target]
                 .items()
                 .iter()
+                .rev()
                 .filter_map(Item::as_instruction);
-            let (Some(first), Some(second)) = (instructions.next(), instructions.next()) else {
+            let (Some(ret), Some(value)) = (instructions.next(), instructions.next()) else {
                 continue;
             };
-            let (marker, load, ret) = if first.opcode == NOP {
-                let Some(ret) = instructions.next() else {
-                    continue;
-                };
-                (Some(first), second, ret)
-            } else {
-                (None, first, second)
-            };
-            if instructions.next().is_some()
-                // A literal return emits this plain marker at the expression's
-                // original location before loading its constant. It is not an
-                // arbitrary NOP or a location donated to an implicit return.
-                || marker.is_some_and(|marker| {
-                    load.opcode != crate::target::opcodes::LOAD_CONST
-                        || load.location != ret.location
-                        || load.depth_after() != Some(1)
-                        || ret.depth_after() != Some(0)
-                        || *marker
-                            != Instruction::new(NOP, Operand::Value(0), load.location, Some(0))
-                })
-                || !matches!(
-                    load.opcode,
-                    crate::target::opcodes::LOAD_FAST | crate::target::opcodes::LOAD_CONST
-                )
-                || ret.opcode != crate::target::opcodes::RETURN_VALUE
-                || load.location.line < 0
+            if ret.opcode != crate::target::opcodes::RETURN_VALUE
                 || ret.location.line < 0
-                || [load, ret].iter().any(|instruction| {
+                || value.location.line < 0
+                || [ret, value].iter().any(|instruction| {
                     instruction.pre_fold_extra_instructions() != 0
                         || instruction.local_policy.hidden_exception_owner_slots() != 0
                 })
             {
+                continue;
+            }
+            let simple_return = match value.opcode {
+                crate::target::opcodes::CALL => true,
+                crate::target::opcodes::LOAD_FAST => instructions.next().is_none(),
+                crate::target::opcodes::LOAD_CONST => instructions.next().is_none_or(|marker| {
+                    // An explicit literal return can still have its original leading NOP.
+                    value.location == ret.location
+                        && value.depth_after() == Some(1)
+                        && ret.depth_after() == Some(0)
+                        && *marker
+                            == Instruction::new(NOP, Operand::Value(0), value.location, Some(0))
+                        && instructions.next().is_none()
+                }),
+                _ => false,
+            };
+            if !simple_return {
                 continue;
             }
             // CPython's earlier small-exit pass still sees the arm's original
