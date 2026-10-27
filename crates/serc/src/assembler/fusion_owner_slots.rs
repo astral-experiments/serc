@@ -964,7 +964,11 @@ impl FallbackCertificate {
         let (start, condition, _) = self.interval.range(view, borrow)?;
         let (owner, removed) = match self.interval.anchor {
             Anchor::Label(_) => {
-                if view.original_array_start(start)? != start {
+                let folded_try_entry = borrow
+                    && self.observed_local_fusion
+                    && self.interval.marker.exception_policy()
+                        == ExceptionPolicy::AlwaysAbsentPostTryCondition;
+                if !folded_try_entry && view.original_array_start(start)? != start {
                     return None;
                 }
                 if self.interval.marker.exception_policy()
@@ -1009,7 +1013,8 @@ impl View<'_> {
         let Item::Label(anchor) = self.items[start] else {
             return None;
         };
-        if self.original_array_start(start)? != start
+        if (self.original_array_start(start) != Some(start)
+            && !(fused && self.has_adjacent_ordinary_try_end(start, anchor)))
             || !self.provenance.source_boundaries.contains(&anchor)
             || self.items[start + 1..=marker].iter().any(|item| {
                 matches!(item,
@@ -1022,6 +1027,36 @@ impl View<'_> {
         }
         let (owner, removed) = self.uniform_fallback_interval(start, condition, fused)?;
         (removed == usize::from(fused)).then_some(owner)
+    }
+
+    /// Jump removal can leave the end of the preceding ordinary try directly
+    /// before a source entry that was distinct when local-load fusion occurred.
+    fn has_adjacent_ordinary_try_end(&self, start: usize, anchor: Label) -> bool {
+        if !self.provenance.block_boundaries.contains(&anchor) {
+            return false;
+        }
+        let mut boundaries = self.items[..start]
+            .iter()
+            .rev()
+            .map_while(|item| match item {
+                Item::Label(label) => Some(*label),
+                Item::Instruction(_) => None,
+            })
+            .filter(|label| self.provenance.block_boundaries.contains(label));
+        let (Some(end), None) = (boundaries.next(), boundaries.next()) else {
+            return false;
+        };
+        self.provenance.source_boundaries.contains(&end)
+            && self.regions.iter().any(|region| {
+                region.end == end
+                    && !region.is_scope_fallback
+                    && !region.preserve_lasti
+                    && self
+                        .provenance
+                        .ordinary_try_setups
+                        .values()
+                        .any(|handler| *handler == region.target)
+            })
     }
 
     /// Certifies literal-fold vacancies in one uninterrupted post-try source array.
