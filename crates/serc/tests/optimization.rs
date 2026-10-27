@@ -15,6 +15,16 @@ use serc::{
 };
 
 #[test]
+fn folded_tuple_exits_use_the_existing_iterator_line() {
+    for builtin in ["all", "any"] {
+        let source = format!(
+            "def check(items, flag):\n    return (\n        flag and {builtin}(item for item in items),\n        'tag',\n    )\n"
+        );
+        assert_matches_cpython(&source, "case.py", &LEVELS);
+    }
+}
+
+#[test]
 fn nested_conversion_handlers_keep_shared_cleanup() {
     let source = r"def sample(items):
     for item in items:
