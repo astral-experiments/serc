@@ -14904,7 +14904,7 @@ impl Assembler {
         }
     }
 
-    /// Keeps an empty normal POP_BLOCK between a guard and a finalizer's loop header.
+    /// Keeps an empty normal `POP_BLOCK` between a guard and a finalizer's loop header.
     pub(crate) fn record_empty_finally_loop_entry(
         &mut self,
         ordinal: usize,
