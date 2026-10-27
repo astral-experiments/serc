@@ -26035,3 +26035,23 @@ fn nested_returns_clear_the_enclosing_exception_name() {
 ";
     assert_matches_cpython(source, "nested_handler_return.py", &LEVELS);
 }
+
+#[test]
+fn manager_suppression_copies_the_handler_exit_before_a_return() {
+    for binding in ["", " as error"] {
+        let source = format!(
+            "def remove(flag):
+    try:
+        work()
+    except OSError{binding}:
+        if flag:
+            return False
+        else:
+            with resource():
+                raise ValueError()
+    return True
+"
+        );
+        assert_matches_cpython(&source, "suppressed_handler_return.py", &LEVELS);
+    }
+}
