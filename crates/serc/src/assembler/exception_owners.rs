@@ -8211,7 +8211,22 @@ impl LayoutAssembler {
                             != super::ExceptionExclusion::None
                     {
                         retained_owned_suffix = None;
-                        source_owned_prefix = None;
+                        // Folding a positional default can transfer an erased tuple builder
+                        // to its constant. Start after that cell, where the next records
+                        // retain their own handlers and the replay knows the new tail.
+                        source_owned_prefix = (original_array_start == instruction_index
+                            && source_owned_prefix
+                                .is_some_and(|(start, _)| start == instruction_index)
+                            && owner_history_exact
+                            && instruction.opcode == crate::target::opcodes::LOAD_CONST
+                            && instruction.exception_policy().exclusion()
+                                == super::ExceptionExclusion::None
+                            && instruction.local_policy.hidden_exception_owner_slots() > 0
+                            && instruction.pre_fold_extra_instructions() == 0
+                            && tail.insertions == 0
+                            && tail.late_removals == 0
+                            && tail.post_compaction_fusions == 0)
+                            .then_some((instruction_index + 1, tail));
                     }
                     // The exact For target store carries its removed tracing NOP. Start
                     // after that record; later clean cells can donate an owner without
