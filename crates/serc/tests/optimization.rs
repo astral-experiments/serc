@@ -25977,3 +25977,18 @@ fn short_circuit_value_after_manager_entries_uses_the_prior_handler() {
 ";
     assert_matches_cpython(source, "manager_value_guard.py", &LEVELS);
 }
+
+#[test]
+fn nested_else_assertion_shares_its_success_exit() {
+    let source = r"def check(enabled, ready, left, right):
+    if enabled:
+        if ready:
+            prepare()
+        else:
+            assert left or right, message()
+    else:
+        recover()
+    finish()
+";
+    assert_matches_cpython(source, "shared_assertion_exit.py", &LEVELS);
+}

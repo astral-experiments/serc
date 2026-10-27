@@ -18948,7 +18948,13 @@ impl<'source> Compiler<'source> {
                 final_else_body = &clause.body;
                 descended_else = true;
             }
-            if assertion_fallthrough
+            // Multiple successful operands reach the same empty else exit.
+            if descended_else
+                && matches!(final_else_body.last(), Some(Stmt::Assert(assertion))
+                    if condition_jump_target_count(&assertion.test, true) > 1)
+            {
+                self.assembler.set_location(SourceLocation::NONE);
+            } else if assertion_fallthrough
                 && let Some(range) = suite_assert_success_fallthrough_range(final_else_body)
             {
                 self.assembler.set_location(self.source_location(range));
