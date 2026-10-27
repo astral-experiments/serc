@@ -37623,14 +37623,26 @@ impl<'source> Compiler<'source> {
             if linear_exit || handler_exit {
                 self.assembler.preserve_last_nop();
             }
-            // Other exits need the original empty prefix. The assembler retains their
-            // POP_BLOCK only after a single reachable jump supplies its location.
+            // CPython resolves the POP_BLOCK's line before folding a constant loop's
+            // false edge. A surviving jump through the prefix can then look unique
+            // even though a second exit originally reached it.
+            let loses_loop_exit = |body: &[Stmt]| {
+                !suite_terminates_before_constant_folding(body)
+                    && (suite_terminates(body)
+                        || matches!(body.last(), Some(Stmt::While(tail)) if early_condition_truthiness(&tail.test) == Some(true)))
+            };
             if linear_exit
                 || handler_exit
                 || (self.context.python_version >= crate::PythonVersion::Py314
                     && !statement.is_star
                     && !statement.handlers.is_empty()
-                    && matches!(statement.finalbody.first(), Some(Stmt::Try(_))))
+                    && matches!(statement.finalbody.first(), Some(Stmt::Try(_)))
+                    && !match statement.body.last() {
+                        Some(Stmt::With(manager)) => loses_loop_exit(&manager.body),
+                        Some(Stmt::Try(nested)) => loses_loop_exit(&nested.body),
+                        Some(Stmt::If(branch)) => if_suites(branch).any(loses_loop_exit),
+                        _ => false,
+                    })
             {
                 self.assembler
                     .record_retained_pop_block_origin(protected_end);
