@@ -10302,6 +10302,27 @@ impl LayoutAssembler {
                             ExceptionOwnerDecision::override_with_region(None),
                         );
                     }
+                    if instruction.opcode == NOT_TAKEN
+                        && instruction.exception_policy().exclusion()
+                            == super::ExceptionExclusion::None
+                        && owner_history_exact
+                        && tail.late_removals == 0
+                        && tail.insertions == 0
+                        && tail.post_compaction_fusions == 0
+                        && let Some(region) = self.nested_finally_call_owner(
+                            instruction_index,
+                            original_array_start,
+                            tail.early_removals,
+                            &indexed_instructions,
+                            &label_positions,
+                            &jump_targets,
+                        )
+                    {
+                        owners.insert(
+                            instruction_index,
+                            ExceptionOwnerDecision::override_with_region(Some(region)),
+                        );
+                    }
                     if retained_setup_value_null_markers.contains(&instruction_index) {
                         owners.insert(
                             instruction_index,
@@ -13291,6 +13312,65 @@ impl LayoutAssembler {
             && !owner.preserve_lasti
             && owner.target == handler
             && outer_setup_matches)
+            .then_some(region)
+    }
+
+    /// Finds the protected call record reused by a nested finally's None guard.
+    fn nested_finally_call_owner(
+        &self,
+        marker: usize,
+        array: usize,
+        removed: usize,
+        instructions: &[&Instruction],
+        positions: &OwnerLabelPositions,
+        jump_targets: &FxHashSet<Label>,
+    ) -> Option<usize> {
+        use crate::target::opcodes::{CALL, LOAD_FAST, LOAD_FAST_BORROW};
+
+        let call_index = marker.checked_sub(4)?;
+        let [call, discard, load, guard] = &instructions[call_index..marker] else {
+            return None;
+        };
+        if call.opcode != CALL
+            || discard.opcode != POP_TOP
+            || discard.location != call.location
+            || !matches!(load.opcode, LOAD_GLOBAL | LOAD_FAST | LOAD_FAST_BORROW)
+            || load.local_policy.hidden_exception_owner_slots() != 1
+            || !matches!(guard.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+            || guard.local_policy.hidden_exception_owner_slots() != 3
+        {
+            return None;
+        }
+        let function = call_index
+            .checked_sub(usize::try_from(call.value_argument()?).ok()?)?
+            .checked_sub(1)?;
+        let head = instructions[array];
+        if function <= array
+            || instructions[function - 1].opcode != NOP
+            || instructions[function].opcode != LOAD_GLOBAL
+            || instructions[function].value_argument()? & 1 == 0
+            || !instructions[function + 1..call_index].iter().all(|arg| matches!(arg.opcode, LOAD_FAST | LOAD_FAST_BORROW) || (arg.opcode == LOAD_GLOBAL && arg.value_argument().is_some_and(|arg| arg & 1 == 0)))
+            || instructions[function..call_index + 2].iter().any(|i| i.local_policy.hidden_exception_owner_slots() != 0 || i.pre_fold_extra_instructions() != 0)
+            // An authored break can hide a second, unrecorded POP at the array head.
+            || (head.opcode == NOP && !head.fusion_policy.is_converted_pop_block()
+                    && head.local_policy.hidden_exception_owner_slots() == 0
+                    && self.uniform_exception_owner(array, array + 1, positions).is_some())
+            || jump_targets.iter().any(|label| positions.get(label).is_some_and(|&p| function <= p && p <= marker))
+            || self.uniform_exception_owner(call_index + 2, marker + 1, positions).is_some()
+        {
+            return None;
+        }
+        // After the discard, the live load and jump replace a POP_BLOCK and a
+        // four-record None test. The callable's fused PUSH_NULL adds one original cell.
+        let after_call = call_index + 2;
+        let distance = removed.checked_sub(marker - after_call + 4)?;
+        let call_width = after_call - function + 1;
+        if !(1..=call_width).contains(&distance) {
+            return None;
+        }
+        let region = self.uniform_exception_owner(function, after_call, positions)?;
+        (!self.exception_regions[region].preserve_lasti
+            && !self.exception_regions[region].is_scope_fallback)
             .then_some(region)
     }
 
