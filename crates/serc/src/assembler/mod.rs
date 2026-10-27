@@ -11122,8 +11122,10 @@ impl Assembler {
         expected_nop.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
         let mut expected_load =
             Instruction::new(LOAD_FAST, load.operand(), load.location, Some(loaded));
-        expected_load.local_policy =
-            LocalPolicy::for_load(load.local_policy.force_owned_load(), false);
+        expected_load.local_policy = LocalPolicy::for_load(
+            load.local_policy.force_owned_load(),
+            load.local_policy.strict_owned_load(),
+        );
         let mut expected_marker =
             Instruction::new(NOT_TAKEN, Operand::Value(0), load.location, Some(depth));
         expected_marker.set_exception_policy(ExceptionPolicy::NoneDynamicCondition);
