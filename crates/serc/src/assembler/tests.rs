@@ -3007,6 +3007,53 @@ fn fallthrough_termination_accounts_for_jumps_to_any_trailing_label() {
 }
 
 #[test]
+fn copied_finalizer_guard_accepts_only_a_converted_pre_manager_pop() {
+    for converted in [false, true] {
+        let mut assembler = Assembler::with_python_version(crate::PythonVersion::Py314);
+        let emit_pop = |asm: &mut Assembler| {
+            asm.emit_with_depth(NOP, 0, 1, ExceptionPolicy::EXCLUDE_ALWAYS);
+            asm.mark_last_as_converted_pop_block();
+        };
+        assembler.emit(END_SEND, 0);
+        assembler.emit_with_depth(NOP, 0, 1, ExceptionPolicy::EXCLUDE_ALWAYS);
+        if converted {
+            assembler.mark_last_as_converted_pop_block();
+        }
+        for (opcode, arg) in [
+            (SWAP, 3),
+            (SWAP, 2),
+            (LOAD_CONST, 0),
+            (LOAD_CONST, 0),
+            (LOAD_CONST, 0),
+            (CALL, 3),
+            (POP_TOP, 0),
+        ] {
+            assembler.emit(opcode, arg);
+        }
+        emit_pop(&mut assembler);
+        assembler.emit(LOAD_GLOBAL, 1);
+        assembler.emit(CALL, 0);
+        assembler.emit(POP_TOP, 0);
+        let entry = assembler.item_count();
+        emit_pop(&mut assembler);
+        assembler.emit(LOAD_FAST, 0);
+        assembler.emit(TO_BOOL, 0);
+        let target = assembler.label();
+        assembler.emit_forward_with_depth(POP_JUMP_IF_FALSE, target, 1, ExceptionPolicy::default());
+        assembler.emit_with_depth(NOT_TAKEN, 0, 1, ExceptionPolicy::NoneDynamicCondition);
+        assembler.exclude_nested_awaited_finally_marker(entry, 3, 1);
+        assert_eq!(
+            assembler.last_instruction_mut().unwrap().exception_policy(),
+            if converted {
+                ExceptionPolicy::EXCLUDE_ALWAYS
+            } else {
+                ExceptionPolicy::NoneDynamicCondition
+            }
+        );
+    }
+}
+
+#[test]
 fn dynamic_exception_owner_tracks_fusible_loads_and_null_globals() {
     let location = SourceLocation::new(1, 1, 0, 1);
 

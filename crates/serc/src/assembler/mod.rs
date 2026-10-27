@@ -11726,6 +11726,19 @@ impl Assembler {
             return;
         }
         let mut instructions = prefix.iter().filter_map(Item::as_instruction);
+        // Some return paths materialize the pre-manager POP_BLOCK after END_SEND.
+        // The unwind count already includes that slot, even when its NOP is absent.
+        if instructions.clone().next().is_some_and(|first| {
+            first.opcode == NOP
+                && first.fusion_policy.is_converted_pop_block()
+                && first.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
+        }) && instructions
+            .clone()
+            .nth(1)
+            .is_some_and(|next| next.opcode == SWAP)
+        {
+            instructions.next();
+        }
         let Some(inner_pop) = instructions
             .clone()
             .position(|instruction| instruction.opcode == NOP)
