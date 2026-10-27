@@ -48393,6 +48393,16 @@ fn suite_contains_orphan_cold_cleanup(body: &[Stmt], return_copies_terminal_with
             if self.found || matches!(statement, Stmt::TypeAlias(_)) {
                 return;
             }
+            // A bare handler consumes every exception. Its unmatched RERAISE
+            // empties before cold ordering and stays in the normal path when
+            // the live blocks of this enclosing handler move to the end.
+            if matches!(statement, Stmt::Try(recovery) if !recovery.is_star
+            && recovery.handlers.last().is_some_and(|handler| {
+                handler.as_except_handler().is_some_and(|handler| handler.type_.is_none())
+            })) {
+                self.found = true;
+                return;
+            }
             // Copying the enclosing terminal manager leaves the same empty exit
             // as a manager authored directly in this handler.
             if self.return_copies_terminal_with && matches!(statement, Stmt::Return(_)) {
