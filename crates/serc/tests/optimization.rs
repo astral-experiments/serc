@@ -1944,6 +1944,28 @@ fn finalizer_copies_named_cleanup_after_an_elif() {
 }
 
 #[test]
+fn loop_backedges_keep_each_boolean_finalizer_discard() {
+    let source = r"def repeat(ready, predicate, first, second):
+    while ready():
+        try:
+            if predicate():
+                consume()
+        finally:
+            first() and second()
+    return result()
+
+
+def visit(items, first, second):
+    for item in items:
+        try:
+            consume(item)
+        finally:
+            first(item) or second(item)
+";
+    assert_matches_cpython(source, "boolean_finalizer_backedges.py", &LEVELS);
+}
+
+#[test]
 fn compound_handler_loop_exits_keep_separate_cleanup_copies() {
     let source = "async def sample(outer, ready, active):
     while outer:

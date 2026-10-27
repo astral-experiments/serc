@@ -21373,6 +21373,17 @@ impl<'source> Compiler<'source> {
         }
     }
 
+    /// Whether the try's normal exit needs a private loop backedge for each value donor.
+    fn try_tail_has_shared_loop_exit(&self, body: &[Stmt]) -> bool {
+        body.last().is_some_and(|tail| {
+            try_has_conditional_shared_loop_exit(tail)
+                || (self.context.python_version >= crate::PythonVersion::Py314
+                    && matches!(tail, Stmt::Try(cleanup)
+                        if matches!(cleanup.finalbody.last(), Some(Stmt::Expr(expr))
+                            if matches!(expr.value.as_ref(), Expr::BoolOp(_)))))
+        })
+    }
+
     fn emit_while_backedge(
         &mut self,
         body: &[Stmt],
@@ -21411,9 +21422,7 @@ impl<'source> Compiler<'source> {
             self.assembler
                 .prepare_no_location_block_for_inlining(backedge);
         }
-        if body
-            .last()
-            .is_some_and(try_has_conditional_shared_loop_exit)
+        if self.try_tail_has_shared_loop_exit(body)
             || (self.context.python_version >= crate::PythonVersion::Py314
                 && matches!(body.last(), Some(Stmt::Expr(statement))
                     if matches!(statement.value.as_ref(), Expr::If(conditional)
@@ -23070,10 +23079,7 @@ impl<'source> Compiler<'source> {
                         self.assembler.mark_as_artificial_eval_break(backedge);
                         self.assembler.record_last_original_loop_backedge();
                     }
-                    if body
-                        .last()
-                        .is_some_and(try_has_conditional_shared_loop_exit)
-                    {
+                    if self.try_tail_has_shared_loop_exit(body) {
                         // The selected try's shared exit copies this backedge onto each
                         // conditional fallthrough before predecessor locations propagate.
                         self.assembler.mark_as_artificial_eval_break(backedge);
@@ -25866,11 +25872,7 @@ impl<'source> Compiler<'source> {
                 // CPython duplicates this unlocated loop exit onto every short-circuit edge.
                 self.assembler.mark_as_artificial_eval_break(backedge);
             }
-            if statement
-                .body
-                .last()
-                .is_some_and(try_has_conditional_shared_loop_exit)
-            {
+            if self.try_tail_has_shared_loop_exit(&statement.body) {
                 self.assembler.mark_as_artificial_eval_break(backedge);
             }
             self.assembler.record_last_original_loop_backedge();
