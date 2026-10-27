@@ -36006,6 +36006,26 @@ impl<'source> Compiler<'source> {
                     && matches!(branch.body.as_slice(), [Stmt::Pass(pass)]
                     if self.source_location(pass.range).line
                         != self.source_location(branch.range).line));
+        // A nested guard's false edge keeps the outer arm's jump to cleanup. A
+        // surrounding manager does not consume that jump when its body completes.
+        let managed_guard_context = self.context.python_version == crate::PythonVersion::Py314
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.control.in_synchronous_with()
+            && self.control.withs.active_with_exits.len() == 1
+            && !self.control.in_synchronous_with_nested_exception_region()
+            && self.control.loops.contexts.is_empty()
+            && !self.control.in_exception_handler()
+            && self.control.finally.active_finally_try_bodies == 0
+            && self.control.finally.active_copied_finally_bodies == 0;
+        let nested_guard_keeps_arm_jump = matches!(statement.body.last(), Some(Stmt::If(conditional))
+            if matches!(conditional.body.split_last(), Some((Stmt::If(guard), leading))
+                if (leading.is_empty() || suite_has_nonsuspending_linear_fallthrough(leading))
+                    && guard.elif_else_clauses.is_empty()
+                    && (condition_has_completed_call_leaves(&guard.test, self.context.python_version)
+                        || (managed_guard_context && condition_has_linear_runtime_leaves(&guard.test)))
+                    && !expression_suspends_current_scope(&guard.test)
+                    && original_condition_has_unique_jump_target(&guard.test, false)
+                    && suite_has_nonsuspending_linear_fallthrough(&guard.body)));
         // A live linear arm before the final else keeps a reachable jump directly
         // into normal cleanup after handlers move cold. Folded assertions can leave
         // that jump behind an empty block, so a merely nonterminal arm is insufficient.
@@ -36014,7 +36034,8 @@ impl<'source> Compiler<'source> {
         // their input there, while a leading while starts with a separate empty block.
         let conditional_body_reaches_finally = !statement.is_star
             && statement.orelse.is_empty()
-            && self.control.withs.active_with_region_exclusions.is_empty()
+            && (self.control.withs.active_with_region_exclusions.is_empty()
+                || (managed_guard_context && nested_guard_keeps_arm_jump))
             && (self.control.finally.active_normal_finally_bodies == 0
                 || (coroutine_reraise_cleanup && conditional_reraise_entry))
             && self.control.finally.active_finally_end_blocks == 0
@@ -36107,13 +36128,7 @@ impl<'source> Compiler<'source> {
                             && matches!(self.unit.scope, Scope::Function { .. })
                             && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0,
                     )
-                    || matches!(conditional.body.split_last(), Some((Stmt::If(guard), leading))
-                        if (leading.is_empty() || suite_has_nonsuspending_linear_fallthrough(leading))
-                            && guard.elif_else_clauses.is_empty()
-                            && condition_has_completed_call_leaves(&guard.test, self.context.python_version)
-                            && !expression_suspends_current_scope(&guard.test)
-                            && original_condition_has_unique_jump_target(&guard.test, false)
-                            && suite_has_nonsuspending_linear_fallthrough(&guard.body))
+                    || nested_guard_keeps_arm_jump
                     || synchronous_guarded_recovery_entry
                     || coroutine_guarded_recovery_entry
                     || coroutine_manager_arm_reaches_finally(&conditional.body)
