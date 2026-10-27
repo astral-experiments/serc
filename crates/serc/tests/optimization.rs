@@ -7221,6 +7221,26 @@ fn coroutine_nested_finalizers_keep_iterator_return_locations() {
 }
 
 #[test]
+fn restored_handler_exits_its_manager_before_the_enclosing_iterator() {
+    let source = r"async def run(groups, stream, manager):
+    try:
+        for group in groups:
+            try:
+                async with manager:
+                    async for item in stream:
+                        try:
+                            await inspect(item)
+                        except ValueError:
+                            return result(item)
+            except LookupError:
+                recover(group)
+    finally:
+        finish()
+";
+    assert_matches_cpython(source, "manager_iterator_return.py", &LEVELS);
+}
+
+#[test]
 fn return_unwinds_interleaved_managers_and_iterators() {
     let source = r"async def sample(items, manager, stream, flag, finish):
     try:

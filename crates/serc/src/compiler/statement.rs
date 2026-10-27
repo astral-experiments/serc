@@ -11135,8 +11135,10 @@ impl<'source> Compiler<'source> {
                     } else {
                         inner_async_manager_start
                     };
+                    // A handler already restored on this return no longer intervenes
+                    // between a manager and the iterators surrounding it.
                     let lexical_manager_unwind = !return_is_overridden
-                        && handler_count == 0
+                        && next_handler == 0
                         && finally_context.handler_depth == 0
                         && next_with > finally_context.with_depth
                         && finally_context.loop_depth < next_loop
@@ -11400,7 +11402,8 @@ impl<'source> Compiler<'source> {
                         finally_context.loop_depth,
                         next_loop,
                         preserve_tos,
-                        if tracks_handler_iterator_region_unwinds
+                        if lexical_manager_unwind
+                            || tracks_handler_iterator_region_unwinds
                             || (tracks_finally_region_unwinds
                                 && handler_count == 0
                                 && (self.control.withs.active_with_exits.is_empty()
