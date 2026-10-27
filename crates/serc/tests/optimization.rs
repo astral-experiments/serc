@@ -15,6 +15,26 @@ use serc::{
 };
 
 #[test]
+fn continued_named_handlers_keep_copied_value_guard_slots() {
+    let source = r"async def sample(flag):
+    while running():
+        try:
+            work()
+        except FirstError as first:
+            if retry(first):
+                continue
+            try:
+                recover(first)
+            except SecondError as second:
+                if retry(second):
+                    continue
+        finally:
+            flag = provider.current()[1] or flag
+";
+    assert_matches_cpython(source, "continued_value_guard.py", &LEVELS);
+}
+
+#[test]
 fn nested_conversion_handlers_keep_shared_cleanup() {
     let source = r"def sample(items):
     for item in items:

@@ -7213,9 +7213,10 @@ impl<'source> Compiler<'source> {
                 let context = self.control.loops.contexts.last().copied().ok_or_else(|| {
                     CompileError::invalid_syntax("'continue' not properly in loop", statement.range)
                 })?;
-                // This direct named handler contributes two original POP_BLOCKs before
-                // its four name-cleanup records. No other unwind may add hidden records.
-                let continued_handler_origin = (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+                // Each named handler contributes its own POPs and name cleanup before
+                // the finalizer. They must all leave the same loop without another unwind.
+                let handlers = &self.control.exceptions.active_exception_handlers;
+                let named_handler_continue = (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
                     && self.control.withs.active_with_exits.is_empty()
                     && self.control.exceptions.active_try_marker_slots.is_empty()
                     && self.control.exceptions.active_exception_group_handlers == 0
@@ -7227,19 +7228,28 @@ impl<'source> Compiler<'source> {
                     && self.control.finally.preserved_return_value_contexts.is_empty()
                     && self.control.finally.copied_return_finally_preserved_values == 0
                     && self.control.finally.active_pass_finally_locations.is_empty()
-                    && matches!(self.control.exceptions.active_exception_handlers.as_slice(), [handler]
-                        if handler.name.is_some()
-                            && handler.with_depth == 0
-                            && handler.loop_depth == self.control.loops.contexts.len()
+                    && (1..=2).contains(&handlers.len())
+                    && matches!(self.control.finally.active_loop_finally_contexts.as_slice(), [finally]
+                        if finally.handler_depth == 0 && finally.with_depth == 0
+                            && finally.loop_depth == self.control.loops.contexts.len()
+                            && finally.exception_region_depth == context.exception_region_depth
                             && self.control.exceptions.active_exception_region_exclusions.len()
-                                == handler.exception_region_depth + 1
-                            && matches!(self.control.finally.active_loop_finally_contexts.as_slice(), [finally]
-                                if finally.handler_depth == 0
-                                    && finally.with_depth == 0
-                                    && finally.loop_depth == handler.loop_depth
-                                    && finally.exception_region_depth + 1 == handler.exception_region_depth
-                                    && finally.exception_region_depth == context.exception_region_depth)))
+                                == finally.exception_region_depth + 1 + handlers.len()
+                            && handlers.iter().enumerate().all(|(depth, handler)| handler.name.is_some()
+                                && handler.with_depth == 0 && handler.loop_depth == finally.loop_depth
+                                && handler.exception_region_depth == finally.exception_region_depth + 1 + depth)))
                     .then(|| self.assembler.item_count());
+                let continued_handler_origin =
+                    named_handler_continue.filter(|_| handlers.len() == 1);
+                let continued_value_handler_origin = named_handler_continue.filter(|_| {
+                    self.context.python_version == crate::PythonVersion::Py314
+                        && matches!(self.control.finally.active_loop_finally_contexts[0].body.first(),
+                            Some(Stmt::Assign(assignment)) if matches!(assignment.value.as_ref(),
+                                Expr::BoolOp(boolean) if handlers.len() == 1
+                                    // After two name cleanups, a short operand can still
+                                    // reuse the earlier handler rather than the finalizer.
+                                    || matches!(boolean.values.first(), Some(Expr::Call(_) | Expr::Subscript(_)))))
+                });
                 // A direct unnamed handler pops its handler block, then its finalizer.
                 // Keep both original NULL slots when the copy starts with a local None test.
                 let continued_unnamed_handler_origin = (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
@@ -7614,7 +7624,9 @@ impl<'source> Compiler<'source> {
                             context.with_depth,
                             Some(context.continue_label),
                             None,
-                            continued_unnamed_handler_origin.or(continued_handler_try_origin),
+                            continued_unnamed_handler_origin
+                                .or(continued_handler_try_origin)
+                                .or(continued_value_handler_origin),
                             defer_finally_end.then_some((
                                 context.finally_end_depth,
                                 copied_finally_exclusion_lengths.as_slice(),
