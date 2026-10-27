@@ -3846,41 +3846,14 @@ pub(super) fn first_literal_constant(expression: &Expr) -> Option<Constant> {
 
 pub(super) enum FirstConstant {
     Literal(Constant),
-    NestedScope,
+    /// Index of the statement that first constructs a child code object.
+    NestedScope(usize),
 }
 
-pub(super) fn first_suite_literal_constant(
-    compiler: &Compiler<'_>,
-    body: &[Stmt],
-) -> Option<Constant> {
-    match first_constant(compiler, body, None, false, false) {
-        Some(FirstConstant::Literal(constant)) => Some(constant),
-        Some(FirstConstant::NestedScope) | None => None,
-    }
-}
-
+/// Finds the first constant admitted in code-generation order, including implicit cleanup.
 pub(super) fn first_suite_constant(
     compiler: &Compiler<'_>,
     body: &[Stmt],
-) -> Option<FirstConstant> {
-    // A live generator expression admits its code object before evaluating its iterable.
-    // Do not reserve a later literal ahead of that allocation.
-    first_constant(compiler, body, None, true, true)
-}
-
-pub(super) fn first_expression_constant(
-    compiler: &Compiler<'_>,
-    expression: &Expr,
-) -> Option<FirstConstant> {
-    first_constant(compiler, &[], Some(expression), true, false)
-}
-
-fn first_constant(
-    compiler: &Compiler<'_>,
-    body: &[Stmt],
-    expression: Option<&Expr>,
-    stop_at_generators: bool,
-    include_implicit_constants: bool,
 ) -> Option<FirstConstant> {
     #[derive(Clone, Copy)]
     enum Frame<'ast> {
@@ -3893,8 +3866,6 @@ fn first_constant(
         compiler: &'compiler Compiler<'source>,
         constant: Option<Constant>,
         reached_nested_scope: bool,
-        stop_at_generators: bool,
-        include_implicit_constants: bool,
         frames: Vec<Frame<'ast>>,
     }
 
@@ -4090,121 +4061,106 @@ fn first_constant(
                 self.reached_nested_scope = true;
                 return;
             }
-            if self.include_implicit_constants {
-                match statement {
-                    Stmt::With(manager) => {
-                        for item in &manager.items {
-                            self.visit_expr(&item.context_expr);
-                            if manager.is_async && !self.is_complete() {
-                                self.constant = Some(Constant::None);
-                            }
-                            if let Some(target) = &item.optional_vars {
-                                self.visit_expr(target);
-                            }
-                        }
-                        self.frames.push(Frame::ImplicitNone);
-                        self.visit_body(&manager.body);
-                        self.frames.pop();
-                        if !self.is_complete() {
-                            self.constant = Some(Constant::None);
-                        }
-                        return;
-                    }
-                    Stmt::Break(_) | Stmt::Continue(_) => {
-                        // Finalizers run before any enclosing manager's exit constants.
-                        // A loop jump unwinds only frames entered inside its own loop.
-                        self.visit_unwind(true);
-                        return;
-                    }
-                    Stmt::For(loop_) => {
-                        if loop_.is_async {
-                            self.visit_expr(&loop_.iter);
-                        } else {
-                            self.visit_iterable_expression(&loop_.iter);
-                        }
-                        if loop_.is_async && !self.is_complete() {
-                            self.constant = Some(Constant::None);
-                        }
-                        self.frames.push(Frame::Loop);
-                        self.visit_expr(&loop_.target);
-                        self.visit_body(&loop_.body);
-                        self.frames.pop();
-                        self.visit_body(&loop_.orelse);
-                        return;
-                    }
-                    Stmt::While(loop_) => {
-                        self.visit_expr(&loop_.test);
-                        self.frames.push(Frame::Loop);
-                        self.visit_body(&loop_.body);
-                        self.frames.pop();
-                        self.visit_body(&loop_.orelse);
-                        return;
-                    }
-                    Stmt::Return(return_) => {
-                        // CPython defers AST constants until after unwind, including values
-                        // folded before code generation by the older targets.
-                        if let Some(value) = &return_.value
-                            && !self.compiler.return_value_is_constant(value)
-                        {
-                            self.visit_expr(value);
-                        }
-                        self.visit_unwind(false);
-                        if !self.is_complete() {
-                            if let Some(value) = &return_.value {
-                                self.visit_expr(value);
-                            } else {
-                                self.constant = Some(Constant::None);
-                            }
-                        }
-                        return;
-                    }
-                    Stmt::Try(try_) => {
-                        if !try_.finalbody.is_empty() {
-                            self.frames.push(Frame::Finally(&try_.finalbody));
-                        }
-                        self.visit_body(&try_.body);
-                        // Ordinary except emits else before its handlers; except* emits
-                        // else after them. This is constant admission order, not AST order.
-                        if !try_.is_star {
-                            self.visit_body(&try_.orelse);
-                        }
-                        for handler in &try_.handlers {
-                            let handler = handler.as_except_handler().unwrap();
-                            if let Some(type_) = &handler.type_ {
-                                self.visit_expr(type_);
-                            }
-                            if handler.name.is_some() {
-                                self.frames.push(Frame::ImplicitNone);
-                            }
-                            self.visit_body(&handler.body);
-                            if handler.name.is_some() {
-                                self.frames.pop();
-                                if !self.is_complete() {
-                                    self.constant = Some(Constant::None);
-                                }
-                            }
-                        }
-                        if try_.is_star {
-                            self.visit_body(&try_.orelse);
-                        }
-                        if !try_.finalbody.is_empty() {
-                            self.frames.pop();
-                            self.visit_body(&try_.finalbody);
-                        }
-                        return;
-                    }
-                    _ => {}
-                }
-            }
             match statement {
-                Stmt::For(loop_)
-                    if self.compiler.context.python_version <= PythonVersion::Py313
-                        && !loop_.is_async =>
-                {
-                    self.visit_iterable_expression(&loop_.iter);
+                Stmt::With(manager) => {
+                    for item in &manager.items {
+                        self.visit_expr(&item.context_expr);
+                        if manager.is_async && !self.is_complete() {
+                            self.constant = Some(Constant::None);
+                        }
+                        if let Some(target) = &item.optional_vars {
+                            self.visit_expr(target);
+                        }
+                    }
+                    self.frames.push(Frame::ImplicitNone);
+                    self.visit_body(&manager.body);
+                    self.frames.pop();
+                    if !self.is_complete() {
+                        self.constant = Some(Constant::None);
+                    }
+                    return;
+                }
+                Stmt::Break(_) | Stmt::Continue(_) => {
+                    // Finalizers run before any enclosing manager's exit constants.
+                    // A loop jump unwinds only frames entered inside its own loop.
+                    self.visit_unwind(true);
+                    return;
+                }
+                Stmt::For(loop_) => {
+                    if loop_.is_async {
+                        self.visit_expr(&loop_.iter);
+                    } else {
+                        self.visit_iterable_expression(&loop_.iter);
+                    }
+                    if loop_.is_async && !self.is_complete() {
+                        self.constant = Some(Constant::None);
+                    }
+                    self.frames.push(Frame::Loop);
                     self.visit_expr(&loop_.target);
                     self.visit_body(&loop_.body);
+                    self.frames.pop();
                     self.visit_body(&loop_.orelse);
+                    return;
+                }
+                Stmt::While(loop_) => {
+                    self.visit_expr(&loop_.test);
+                    self.frames.push(Frame::Loop);
+                    self.visit_body(&loop_.body);
+                    self.frames.pop();
+                    self.visit_body(&loop_.orelse);
+                    return;
+                }
+                Stmt::Return(return_) => {
+                    // CPython defers AST constants until after unwind, including values
+                    // folded before code generation by the older targets.
+                    if let Some(value) = &return_.value
+                        && !self.compiler.return_value_is_constant(value)
+                    {
+                        self.visit_expr(value);
+                    }
+                    self.visit_unwind(false);
+                    if !self.is_complete() {
+                        if let Some(value) = &return_.value {
+                            self.visit_expr(value);
+                        } else {
+                            self.constant = Some(Constant::None);
+                        }
+                    }
+                    return;
+                }
+                Stmt::Try(try_) => {
+                    if !try_.finalbody.is_empty() {
+                        self.frames.push(Frame::Finally(&try_.finalbody));
+                    }
+                    self.visit_body(&try_.body);
+                    // Ordinary except emits else before its handlers; except* emits
+                    // else after them. This is constant admission order, not AST order.
+                    if !try_.is_star {
+                        self.visit_body(&try_.orelse);
+                    }
+                    for handler in &try_.handlers {
+                        let handler = handler.as_except_handler().unwrap();
+                        if let Some(type_) = &handler.type_ {
+                            self.visit_expr(type_);
+                        }
+                        if handler.name.is_some() {
+                            self.frames.push(Frame::ImplicitNone);
+                        }
+                        self.visit_body(&handler.body);
+                        if handler.name.is_some() {
+                            self.frames.pop();
+                            if !self.is_complete() {
+                                self.constant = Some(Constant::None);
+                            }
+                        }
+                    }
+                    if try_.is_star {
+                        self.visit_body(&try_.orelse);
+                    }
+                    if !try_.finalbody.is_empty() {
+                        self.frames.pop();
+                        self.visit_body(&try_.finalbody);
+                    }
                     return;
                 }
                 Stmt::AnnAssign(assignment) => {
@@ -4272,9 +4228,7 @@ fn first_constant(
             if self.is_complete() {
                 return;
             }
-            if self.include_implicit_constants
-                && self.compiler.context.python_version >= PythonVersion::Py314
-            {
+            if self.compiler.context.python_version >= PythonVersion::Py314 {
                 match pattern {
                     Pattern::MatchSequence(sequence) => {
                         let starred = sequence
@@ -4341,9 +4295,7 @@ fn first_constant(
                 ));
                 return;
             }
-            if matches!(expression, Expr::Lambda(_))
-                || self.stop_at_generators && matches!(expression, Expr::Generator(_))
-            {
+            if matches!(expression, Expr::Lambda(_)) || matches!(expression, Expr::Generator(_)) {
                 self.reached_nested_scope = true;
                 return;
             }
@@ -4514,25 +4466,18 @@ fn first_constant(
         compiler,
         constant: None,
         reached_nested_scope: false,
-        stop_at_generators,
-        include_implicit_constants,
         frames: Vec::new(),
     };
-    if let Some(expression) = expression {
-        collector.visit_expr(expression);
-    } else {
-        for statement in body {
-            collector.visit_stmt(statement);
-            if collector.is_complete() {
-                break;
-            }
+    for (index, statement) in body.iter().enumerate() {
+        collector.visit_stmt(statement);
+        if let Some(constant) = collector.constant {
+            return Some(FirstConstant::Literal(constant));
+        }
+        if collector.reached_nested_scope {
+            return Some(FirstConstant::NestedScope(index));
         }
     }
-    collector.constant.map(FirstConstant::Literal).or_else(|| {
-        collector
-            .reached_nested_scope
-            .then_some(FirstConstant::NestedScope)
-    })
+    None
 }
 pub(super) fn is_literal_constant(expression: &Expr) -> bool {
     matches!(

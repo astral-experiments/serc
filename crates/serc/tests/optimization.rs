@@ -22894,6 +22894,17 @@ assert (sets[0] is sets[1]) == (sys.argv[1] == 'shared')
 }
 
 #[test]
+fn unreachable_suites_reserve_the_first_generated_constant() {
+    for source in [
+        "def f():\n    raise Error\n    return collect(lambda item: item)\n",
+        "def f(xs):\n    return xs\n    observe()\n    items = (item for item in xs)\n",
+        "def f(flag):\n    return flag\n    if flag: return\n    observe(17)\n",
+    ] {
+        assert_matches_cpython(source, "unreachable_first_constant.py", &LEVELS);
+    }
+}
+
+#[test]
 fn unreachable_literal_statements_leave_the_first_constant_slot_free() {
     for source in [
         "def lookup(obj):\n    return obj.value\n    'field documentation'\n",
