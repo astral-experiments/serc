@@ -15,7 +15,9 @@ use super::{
     LOAD_LOCALS, LOAD_NAME, LOAD_SPECIAL, RERAISE, RESUME, SET_FUNCTION_ATTRIBUTE, STORE_DEREF,
     STORE_FAST, STORE_GLOBAL, STORE_NAME, YIELD_VALUE,
 };
-use crate::assembler::{EmittedInstruction, EmittedJump, ExceptionPolicy, Label, SourceLocation};
+use crate::assembler::{
+    EmittedInstruction, EmittedJump, ExceptionPolicy, Label, RemovedNop, SourceLocation,
+};
 use crate::code_object::Constant;
 use crate::target::code_flags::{CO_ASYNC_GENERATOR, CO_COROUTINE, CO_FUTURE_ANNOTATIONS};
 use crate::target::operands::{
@@ -2612,13 +2614,18 @@ impl Compiler<'_> {
             && is_unconditional_jump(opcode))
         .then(|| self.take_trailing_nop_location())
         .flatten();
-        if !preserve_location && let Some((location, _)) = removed_nop {
-            self.assembler.set_location(location);
+        if !preserve_location && let Some(removed) = &removed_nop {
+            if self.context.python_version == crate::PythonVersion::Py314
+                && opcode == crate::target::opcodes::JUMP_FORWARD
+            {
+                self.assembler.record_compacted_nop_borrow_entry(removed);
+            }
+            self.assembler.set_location(removed.location);
         }
-        removed_nop.map_or(0, |(_, slots)| slots)
+        removed_nop.map_or(0, |removed| removed.original_slots)
     }
 
-    pub(super) fn take_trailing_nop_location(&mut self) -> Option<(SourceLocation, usize)> {
+    pub(super) fn take_trailing_nop_location(&mut self) -> Option<RemovedNop> {
         let removed = self.assembler.take_trailing_nop_location()?;
         if let Some(exclusion) = removed.exclusion {
             self.control
@@ -2639,7 +2646,7 @@ impl Compiler<'_> {
                 exclusions.retain(|candidate| *candidate != exclusion);
             }
         }
-        Some((removed.location, removed.original_slots))
+        Some(removed)
     }
 
     pub(super) fn apply_compiler_stack_effect(
