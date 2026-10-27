@@ -18410,6 +18410,7 @@ impl<'source> Compiler<'source> {
                 .last()
                 .is_some_and(|clause| clause.test.is_none())
             && if_normal_exit_count(statement) == 1
+            && !self.assembler.at_empty_borrow_block()
         {
             // A terminating earlier arm loses its jump to the join. The final
             // else still ends its own instruction array before the continuation.
