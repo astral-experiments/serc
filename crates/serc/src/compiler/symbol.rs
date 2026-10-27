@@ -15,9 +15,7 @@ use super::{
     LOAD_LOCALS, LOAD_NAME, LOAD_SPECIAL, RERAISE, RESUME, SET_FUNCTION_ATTRIBUTE, STORE_DEREF,
     STORE_FAST, STORE_GLOBAL, STORE_NAME, YIELD_VALUE,
 };
-use crate::assembler::{
-    EmittedInstruction, EmittedJump, ExceptionPolicy, Label, RemovedNop, SourceLocation,
-};
+use crate::assembler::{EmittedInstruction, EmittedJump, ExceptionPolicy, Label, RemovedNop};
 use crate::code_object::Constant;
 use crate::target::code_flags::{CO_ASYNC_GENERATOR, CO_COROUTINE, CO_FUTURE_ANNOTATIONS};
 use crate::target::operands::{
