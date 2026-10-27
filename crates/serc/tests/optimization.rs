@@ -10406,6 +10406,18 @@ fn conditional_attribute_copies_fuse_aliased_local_entries() {
 }
 
 #[test]
+fn while_loop_copies_the_discard_of_each_conditional_value() {
+    let source = "def sample(active, choose):
+    try:
+        while active:
+            first() if choose else second()
+    finally:
+        cleanup()
+";
+    assert_matches_cpython(source, "loop_conditional_discard.py", &LEVELS);
+}
+
+#[test]
 fn conditional_call_preserves_erased_else_try_exit() {
     for (index, (call, otherwise)) in [
         ("consume(item if enabled else values)", "assert item"),

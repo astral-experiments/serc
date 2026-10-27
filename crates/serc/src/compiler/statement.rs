@@ -19901,8 +19901,17 @@ impl<'source> Compiler<'source> {
         if body
             .last()
             .is_some_and(try_has_conditional_shared_loop_exit)
+            || (self.context.python_version >= crate::PythonVersion::Py314
+                && matches!(body.last(), Some(Stmt::Expr(statement))
+                    if matches!(statement.value.as_ref(), Expr::If(conditional)
+                        if condition_has_linear_runtime_leaves(&conditional.test)
+                            && original_condition_has_unique_jump_target(&conditional.test, true)
+                            && original_condition_has_unique_jump_target(&conditional.test, false)
+                            && [conditional.body.as_ref(), conditional.orelse.as_ref()].into_iter().all(|arm|
+                                !expression_contains_inline_branch(arm) && !expression_suspends_current_scope(arm)))))
         {
-            // CPython copies this shared backedge onto each conditional fallthrough.
+            // A conditional result reaches a shared POP_TOP before the backedge.
+            // Each arm supplies the location of its own discard and jump.
             self.assembler.mark_as_artificial_eval_break(backedge);
         }
         self.assembler.record_last_original_loop_backedge();
