@@ -835,11 +835,19 @@ impl OptimizationPipeline {
         for (before, after) in &copied_exit_owner_retargets {
             // Duplicating the exit retargets the surviving guard. Preserve that exact
             // substitution only for a unique captured and live instruction.
-            let mut returns = self
-                .exception_owner_provenance
+            let provenance = &mut self.exception_owner_provenance;
+            let mut returns = provenance
                 .copied_return_guards
                 .iter_mut()
-                .filter(|origin| origin.condition == *before);
+                .map(|origin| &mut origin.condition)
+                .chain(
+                    provenance
+                        .copied_cleanup_return_none_prefixes
+                        .iter_mut()
+                        .filter(|prefix| prefix.managed_iterator)
+                        .map(|prefix| &mut prefix.condition),
+                )
+                .filter(|condition| **condition == *before);
             if let Some(origin) = returns.next()
                 && returns.next().is_none()
                 && self
@@ -849,7 +857,7 @@ impl OptimizationPipeline {
                     .count()
                     == 1
             {
-                origin.condition = *after;
+                *origin = *after;
             }
 
             if self

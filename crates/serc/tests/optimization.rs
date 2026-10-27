@@ -11091,6 +11091,30 @@ fn managed_handler_returns_retain_outer_recovery_cleanup() {
 }
 
 #[test]
+fn copied_finally_none_guards_keep_the_iterator_disposal_owner() {
+    for condition in ["item is None", "state is not None and ready is not None"] {
+        let source = format!(
+            r"def run(items, manager, ready):
+    try:
+        for item in items:
+            try:
+                work(item)
+            except ValueError as error:
+                with manager:
+                    if ready:
+                        return
+    except LookupError:
+        recover()
+    finally:
+        if {condition}:
+            finish()
+"
+        );
+        assert_matches_cpython(&source, "managed_iterator_guard.py", &LEVELS);
+    }
+}
+
+#[test]
 fn a_handler_return_inside_a_manager_restores_the_handler_before_its_iterator() {
     let source = r"def run(items, manager):
     try:

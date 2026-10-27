@@ -1232,13 +1232,14 @@ pub(super) struct CopiedFinalizerSetup {
     pub(super) adjacent_pops: usize,
 }
 
-/// Exact emitted iterator/manager cleanup before a copied local None finalizer.
+/// Exact emitted iterator/manager cleanup before a copied None guard.
 #[derive(Debug)]
 pub(super) struct CopiedCleanupReturnNonePrefix {
     pub(super) entry: Label,
     pub(super) cleanup: Vec<Instruction>,
     pub(super) manager: bool,
     pub(super) handler: bool,
+    pub(super) managed_iterator: bool,
     // A try unwinds before or after the iterator, according to their nesting.
     pub(super) iterator_try_pop_slot: Option<usize>,
     pub(super) pop: Instruction,
@@ -6297,6 +6298,9 @@ impl LayoutAssembler {
             (false, false, 1) => Some(start),
             (false, false, 2) | (false, true, 1 | 4) => None,
             (false, true, 2..=3) => Some(start + slot - 2),
+            // An iterator below the named handler shifts the ordinary try POP by one.
+            // The preceding cell still contains the protected iterator disposal.
+            (true, true, 13) if origin.managed_iterator => Some(start + 10),
             (true, false, 1 | 7 | 8) | (true, true, 1 | 7 | 8 | 13) => None,
             (true, _, 2..=6) => Some(start + slot - 1),
             (true, true, 9..=12) => Some(start + slot - 3),
