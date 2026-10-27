@@ -12726,7 +12726,26 @@ impl LayoutAssembler {
                     || !instructions[start..load_index]
                         .iter()
                         .zip(&origin.cleanup)
-                        .all(|(actual, expected)| **actual == *expected)
+                        .enumerate()
+                        .all(|(offset, (actual, expected))| {
+                            if **actual == *expected {
+                                return true;
+                            }
+                            if offset != 0
+                                || !origin.inner_try_pop
+                                || expected.opcode != crate::target::opcodes::SWAP
+                                || expected.value_argument() != Some(3)
+                                || expected.local_policy.hidden_exception_owner_slots() != 0
+                            {
+                                return false;
+                            }
+                            // Removing the inner try's POP transfers its slot to the
+                            // manager's first SWAP. Its original position is already
+                            // included in the captured cleanup's source offset below.
+                            let mut expected = *expected;
+                            expected.local_policy.add_hidden_exception_owner_slots(1);
+                            **actual == expected
+                        })
                     || !origin.earlier_cleanup.is_none_or(|cleanup| {
                         start.checked_sub(cleanup.len()).is_some_and(|earlier| {
                             array_start <= earlier
@@ -12914,9 +12933,15 @@ impl LayoutAssembler {
             }
             prefix_tail.instruction(instruction, None);
         }
+        let transferred_inner_pop = usize::from(
+            origin.inner_try_pop
+                && origin.cleanup[0].local_policy.hidden_exception_owner_slots() == 0
+                && instructions[start].local_policy.hidden_exception_owner_slots() == 1,
+        );
         if prefix_tail.insertions != 0
             || prefix_tail
                 .early_removals
+                .checked_add(transferred_inner_pop)?
                 .checked_add(if origin.to_bool.is_some() { 1 } else { 4 })
                 != Some(tail.early_removals)
             || prefix_tail.post_compaction_fusions != tail.post_compaction_fusions
@@ -13867,6 +13892,9 @@ mod tests {
             "hidden",
             "folded",
             "wider pop",
+            "transferred inner pop",
+            "unrecorded inner pop",
+            "two inner pops",
         ] {
             let entry = Label::from_u32(0);
             let end = Label::from_u32(1);
@@ -13904,7 +13932,16 @@ mod tests {
                 Item::Label(alias),
                 Item::Instruction(prefix),
             ];
-            items.extend(cleanup.into_iter().map(Item::Instruction));
+            let mut live_cleanup = cleanup;
+            if matches!(
+                change,
+                "transferred inner pop" | "unrecorded inner pop" | "two inner pops"
+            ) {
+                live_cleanup[0].local_policy.add_hidden_exception_owner_slots(
+                    if change == "two inner pops" { 2 } else { 1 },
+                );
+            }
+            items.extend(live_cleanup.into_iter().map(Item::Instruction));
             items.extend([
                 Item::Label(end),
                 Item::Instruction(live_load),
@@ -13939,7 +13976,7 @@ mod tests {
                         rustc_hash::FxHashMap::default()
                     },
                     copied_manager_return_compactions: vec![CopiedManagerReturnCompaction {
-                        inner_try_pop: false,
+                        inner_try_pop: matches!(change, "transferred inner pop" | "two inner pops"),
                         ordinary_try_pops: 1,
                         retained_outer_handler: None,
                         cleanup: cleanup.to_vec(),
@@ -13973,7 +14010,8 @@ mod tests {
                 10,
                 0,
                 ExceptionOwnerTail {
-                    early_removals: 5,
+                    early_removals: 5
+                        + usize::from(live_cleanup[0].local_policy.hidden_exception_owner_slots()),
                     ..ExceptionOwnerTail::default()
                 },
                 &instructions,
@@ -13981,12 +14019,16 @@ mod tests {
                 &[target].into_iter().collect(),
                 false,
             );
-            assert_eq!(decision.is_some(), change == "unchanged", "{change}");
+            assert_eq!(
+                decision.is_some(),
+                matches!(change, "unchanged" | "transferred inner pop"),
+                "{change}"
+            );
             if let Some(decision) = decision {
                 assert!(
                     decision.is_definitive()
                         && decision.overrides_existing()
-                        && !decision.has_owner()
+                        && decision.has_owner() == (change == "transferred inner pop")
                 );
             }
         }
