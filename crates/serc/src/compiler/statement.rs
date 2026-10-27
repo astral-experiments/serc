@@ -27259,7 +27259,8 @@ impl<'source> Compiler<'source> {
                 .is_some_and(|handler| matches!(handler.type_.as_deref(), Some(Expr::Tuple(_))))
         });
         // 3.12 retargets original jumps in place, preserving the enclosing handler.
-        // Later targets can replace these exits with fresh ownerless threaded jumps.
+        // Later targets can thread linear exits into fresh, ownerless jumps.
+        // A branch in the inner suite can instead copy the original protected exit.
         let trailing_fallthrough_handler_try = self.context.python_version
             != crate::PythonVersion::Py312
             && self
@@ -27271,18 +27272,8 @@ impl<'source> Compiler<'source> {
             && self
                 .control
                 .is_direct_trailing_handler_statement(statement.range)
-            && (try_has_fallthrough_body_and_handler(
-                statement,
-                self.control.exceptions.active_exception_handlers.len() == 1
-                    && self
-                        .control
-                        .exceptions
-                        .active_exception_region_exclusions
-                        .len()
-                        == 1
-                    && self.control.finally.active_normal_finally_bodies == 0
-                    && self.control.finally.active_finally_end_blocks == 0,
-            ) || nested_loop_conversion_try);
+            && (try_has_fallthrough_body_and_handler(statement, false)
+                || nested_loop_conversion_try);
         // An ordinary try/except emits its normal POP_BLOCK before the handlers.
         // Nested body conditions still target that forward exit during jump
         // threading, regardless of whether a handler branches or terminates.
