@@ -12890,7 +12890,7 @@ impl Assembler {
             .push((entry, records, final_pops));
     }
 
-    /// Captures a saved named-handler return whose enclosing async manager unwinds later.
+    /// Captures the name cleanup of a saved return before its enclosing finalizer.
     pub(crate) fn record_saved_named_handler_none_prefix(
         &mut self,
         start: usize,
@@ -12946,12 +12946,11 @@ impl Assembler {
             || pop.value_argument() != Some(0)
             || !pop.fusion_policy.is_converted_pop_block()
             || items.get(pop_item) != Some(&Item::Instruction(*pop))
-            || load.opcode != LOAD_FAST
+            || !matches!(load.opcode, LOAD_FAST | LOAD_FAST_CHECK)
             || !matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
             || condition.forward_target().is_none()
             || marker.opcode != NOT_TAKEN
             || marker.location != condition.location
-            || swap.location.line < 0
             || records[..5]
                 .iter()
                 .any(|record| record.location != swap.location)

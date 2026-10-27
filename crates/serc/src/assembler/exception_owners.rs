@@ -6028,6 +6028,16 @@ impl LayoutAssembler {
                     {
                         folded_nulls += 1;
                     }
+                    if (origin.unwind_offset..origin.unwind_offset + 5).contains(&offset)
+                        && expected.location == SourceLocation::NONE
+                    {
+                        // After a copied finalizer, the name cleanup borrows the
+                        // last source position in its original instruction array.
+                        expected.location = instructions
+                            .get(array..array + origin.unwind_offset)?
+                            .last()?
+                            .location;
+                    }
                     if offset == origin.unwind_offset + 6 {
                         expected.local_policy.add_hidden_exception_owner_slots(1);
                     }

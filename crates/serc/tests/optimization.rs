@@ -24322,6 +24322,40 @@ fn nested_leaf_returns_preserve_repeated_scope_footer() {
 }
 
 #[test]
+fn nested_handler_return_uses_the_original_outer_finalizer_marker_slot() {
+    for tail in ["del flag", "done()"] {
+        let source = format!(
+            r"def choose(value):
+    try:
+        return read(value)
+    except ValueError as first:
+        prior = saved()
+        try:
+            try:
+                return retry(first)
+            except RuntimeError as second:
+                flag = saved()
+                try:
+                    return fallback(second)
+                finally:
+                    if flag is not None:
+                        restore(flag)
+                    else:
+                        purge(flag)
+                    {tail}
+        finally:
+            if prior is not None:
+                restore(prior)
+            else:
+                purge(prior)
+            del prior
+"
+        );
+        assert_matches_cpython(&source, "outer_finalizer_marker.py", &LEVELS);
+    }
+}
+
+#[test]
 fn nested_handler_return_keeps_the_outer_named_handler_pop_slots() {
     let source = r"def sample(flag, item):
     try:
