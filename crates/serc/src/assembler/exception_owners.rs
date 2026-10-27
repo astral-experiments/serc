@@ -9871,13 +9871,63 @@ impl LayoutAssembler {
                                 pending_normal_none_owner = Some((instruction_index + 1, None));
                                 continue;
                             }
+                            // A retained setup and a complete method-call statement fix
+                            // the old normal POP boundary even after leaving an outer epoch.
+                            let method_call_before_pop = !paired
+                                && !copied_finally
+                                && copied.is_none()
+                                && removed_pop == 1
+                                && indexed_instructions[original_array_start..load_index]
+                                    .iter()
+                                    .rposition(|record| record.opcode == NOP)
+                                    .is_some_and(|offset| {
+                                        use crate::target::opcodes::{
+                                            CALL, LOAD_ATTR, LOAD_DEREF, LOAD_FAST, POP_TOP,
+                                        };
+                                        let records = &indexed_instructions
+                                            [original_array_start + offset..load_index];
+                                        let [setup, receiver, method, args @ .., call, pop] =
+                                            records
+                                        else {
+                                            return false;
+                                        };
+                                        setup.local_policy.hidden_exception_owner_slots() == 1
+                                            && matches!(
+                                                receiver.opcode,
+                                                LOAD_FAST
+                                                    | LOAD_DEREF
+                                                    | crate::target::opcodes::LOAD_FAST_BORROW
+                                            )
+                                            && method.opcode == LOAD_ATTR
+                                            && method
+                                                .value_argument()
+                                                .is_some_and(|arg| arg & 1 != 0)
+                                            && args.iter().all(|arg| {
+                                                matches!(
+                                                    arg.opcode,
+                                                    LOAD_FAST
+                                                        | LOAD_DEREF
+                                                        | crate::target::opcodes::LOAD_FAST_BORROW
+                                                )
+                                            })
+                                            && call.opcode == CALL
+                                            && call.value_argument() == Some(args.len() as u32)
+                                            && pop.opcode == POP_TOP
+                                            && pop.location == call.location
+                                            && !jump_targets.iter().any(|label| {
+                                                label_positions.get(label).is_some_and(|position| {
+                                                    original_array_start + offset < *position
+                                                        && *position < load_index
+                                                })
+                                            })
+                                    });
                             // A copied local-return finalizer can follow an earlier try's
                             // POP in the same array. Only the unchanged owned suffix before
                             // this captured final POP must cover the marker's old cell.
                             if !paired
                                 && copied.is_none()
                                 && removed_pop == 1
-                                && pop_slot_epoch_known
+                                && (pop_slot_epoch_known || method_call_before_pop)
                                 && let Some(distance) = original_pop_slot
                                     .and_then(|pop| pop.checked_sub(instruction_index + 1))
                                     .filter(|distance| *distance > 0)
@@ -9976,7 +10026,7 @@ impl LayoutAssembler {
                             if paired
                                 || copied.is_some()
                                 || (tail.early_removals != 3 + usize::from(removed_pop)
-                                    && !(pop_slot_epoch_known
+                                    && !((pop_slot_epoch_known || method_call_before_pop)
                                         && original_load_slot == Some(instruction_index + 1)))
                             {
                                 continue;

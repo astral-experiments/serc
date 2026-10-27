@@ -15,6 +15,43 @@ use serc::{
 };
 
 #[test]
+fn method_call_before_finally_none_test_keeps_the_original_handler() {
+    let managed = r"async def finish(manager, service, resource, ready):
+    with manager:
+        try:
+            pass
+        except ValueError:
+            pass
+        finally:
+            try:
+                service.finish()
+            finally:
+                if resource is not None:
+                    if ready:
+                        close()
+";
+    let returning = r"def finish(service, item, flag):
+    if flag:
+        pass
+    elif available():
+        resource = item
+    try:
+        pass
+    except ValueError:
+        return
+    finally:
+        try:
+            service.finish(item)
+        finally:
+            if resource is not None:
+                pass
+";
+    for source in [managed, returning] {
+        assert_matches_cpython_versions(source, "case.py", &LEVELS, &[PythonVersion::Py314]);
+    }
+}
+
+#[test]
 fn nested_conversion_handlers_keep_shared_cleanup() {
     let source = r"def sample(items):
     for item in items:
