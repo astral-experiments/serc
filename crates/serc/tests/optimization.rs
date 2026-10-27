@@ -19428,6 +19428,21 @@ fn named_handler_loop_cleanup_after_elided_assertions_matches_cpython() {
 }
 
 #[test]
+fn a_while_loop_in_finally_preserves_handler_restoration_order() {
+    let source = r"def collect(flag):
+    try:
+        perform()
+    finally:
+        while flag:
+            try:
+                finish()
+            except ValueError:
+                return
+";
+    assert_matches_cpython(source, "finally_while_handler_return.py", &LEVELS);
+}
+
+#[test]
 fn exceptional_finally_return_unwinds_managers_in_order() {
     const FINALLY: &str = r"def f(outer, inner, work, cleanup):
     with outer:

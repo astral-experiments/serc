@@ -8590,6 +8590,7 @@ impl<'source> Compiler<'source> {
                 // An inner handler restores its exception state before leaving the
                 // exceptional finally body in which that handler was entered. The saved
                 // depth distinguishes this from a finally entered inside a handler.
+                // A while loop leaves no iterator above the saved exception state.
                 let handler_before_finally_end = !return_is_overridden
                     && self.control.finally.active_finally_end_blocks == 1
                     && self.control.exceptions.active_exception_handlers.len() == 1
@@ -8626,12 +8627,10 @@ impl<'source> Compiler<'source> {
                         .active_with_exits
                         .iter()
                         .all(|context| context.finally_end_depth == 0)
-                    && self
-                        .control
-                        .loops
-                        .contexts
-                        .iter()
-                        .all(|context| context.finally_end_depth == 0);
+                    && self.control.loops.contexts.iter().all(|context| {
+                        context.finally_end_depth == 0
+                            || context.iterator_cleanup == IteratorCleanup::None
+                    });
                 // Iterators entered by an exceptional finally sit above its saved
                 // exception state. Unwind that inner suffix before FINALLY_END, then
                 // leave older iterators for the later return cleanup.
