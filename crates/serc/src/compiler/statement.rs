@@ -6385,9 +6385,12 @@ impl<'source> Compiler<'source> {
                         if optimized_generator_callable_for_target(call, self.context.python_version).is_some()))
             }
             [Expr::Attribute(attribute)] => {
-                // Keep an optimized tuple call's original join until the assembler
-                // copies the attribute-store exit and accounts for its jump slot.
-                matches!(attribute.value.as_ref(), Expr::Name(_))
+                // A normal finally exit adds its jump slot to the load, store and
+                // implicit return. Only 3.12 revisits that exit after NOP compaction.
+                // An optimized tuple call also needs the original attribute-store join.
+                (self.context.python_version == crate::PythonVersion::Py312
+                    || self.control.finally.active_normal_finally_bodies == 0)
+                    && matches!(attribute.value.as_ref(), Expr::Name(_))
                     && !matches!(assignment.value.as_ref(), Expr::If(expression)
                         if matches!(expression.body.as_ref(), Expr::Call(call)
                             if optimized_generator_callable(call) == Some("tuple")))

@@ -15718,6 +15718,18 @@ fn erased_conditional_preserves_join_before_async_manager_exit() {
 }
 
 #[test]
+fn conditional_attribute_stores_share_the_normal_finally_exit() {
+    for setup in ["work()", "yield key"] {
+        for value in ["key.value", "measure(key)"] {
+            let source = format!(
+                "def update(target, key):\n    try:\n        {setup}\n    finally:\n        target.value = {value} if key.ready else -1\n"
+            );
+            assert_matches_cpython(&source, "finalizer_attribute_store.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn conditional_attribute_copies_fuse_aliased_local_entries() {
     for operator in ["and", "or"] {
         for condition in ["flag", "isinstance(value, str)"] {
