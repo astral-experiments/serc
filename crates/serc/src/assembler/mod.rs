@@ -1843,6 +1843,13 @@ impl Assembler {
         instruction
     }
 
+    /// Identifies a rotation emitted while collecting pattern captures.
+    pub(crate) fn mark_pattern_capture_swap(&mut self, emitted: EmittedInstruction) {
+        let swap = self.emitted_instruction_mut(emitted, "recording a pattern capture rotation");
+        debug_assert_eq!(swap.opcode, SWAP);
+        swap.pattern_capture_swap = true;
+    }
+
     fn emitted_instruction_mut(
         &mut self,
         emitted: EmittedInstruction,

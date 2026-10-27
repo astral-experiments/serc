@@ -766,7 +766,8 @@ impl OptimizationPipeline {
                     // An unprotected exchange on one physical line cannot change a line
                     // event or the number of compacted slots belonging to a handler.
                     let line = swap.location.line;
-                    let single_line = self.exception_regions.is_empty()
+                    let single_line = swap.pattern_capture_swap
+                        && self.exception_regions.is_empty()
                         && line >= 0
                         && [
                             swap.location,

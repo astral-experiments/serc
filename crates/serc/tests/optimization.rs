@@ -12434,6 +12434,7 @@ fn sequence_capture_before_trailing_wildcards_matches_cpython() {
 fn single_line_patterns_exchange_discarded_captures() {
     let source = r#"
 def classify(item):
+    0 < item < 10
     match item:
         case [first, _, middle, _, _, last]:
             return first, middle, last
