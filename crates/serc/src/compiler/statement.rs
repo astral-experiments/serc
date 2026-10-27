@@ -52086,9 +52086,13 @@ pub(super) fn nested_if_exit_location(
             || matches!(body.last(), Some(Stmt::Assert(assertion))
                 if jump_constant_truthiness(&assertion.test) == Some(false))
             || matches!(body.last(), Some(Stmt::If(nested))
-            if nested.elif_else_clauses.last().is_some_and(|clause| {
-                clause.test.is_none() && suite_terminates(&clause.body)
-            }))
+            if (early_condition_truthiness(&nested.test) == Some(true)
+                && suite_terminates(&nested.body))
+                || nested.elif_else_clauses.last().is_some_and(|clause| {
+                    clause.test.is_none()
+                        && (suite_terminates(&clause.body)
+                            || suite_is_constant_false_assertion(&clause.body))
+                }))
             || suite_has_unconditional_cleanup_exit(body))
             && !unlocated_multi_exit_boolean
         {
