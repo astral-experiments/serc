@@ -6455,6 +6455,45 @@ fn iterator_handler_returns_preserve_conditional_finalizer_entry() {
 }
 
 #[test]
+fn inner_try_return_preserves_the_named_cleanup_owner() {
+    let source = r"async def run(value, flag, active):
+    try:
+        work()
+    except OSError as error:
+        try:
+            if active:
+                return value
+        except KeyError:
+            pass
+    finally:
+        if flag is None:
+            finish()
+        done()
+";
+    let folded = r"async def run(manager, active, flag, value, other):
+    async with manager:
+        try:
+            work()
+        except LookupError as error:
+            if active:
+                value = other
+            return combine(value, label=3)
+        finally:
+            if flag is not None:
+                clean()
+            finish()
+";
+    for source in [source, folded] {
+        assert_matches_cpython_versions(
+            source,
+            "inner_try_named_return.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn boolean_returns_preserve_enclosing_named_handler_owners() {
     let source = r"def sample(items, flag):
     for value in items:

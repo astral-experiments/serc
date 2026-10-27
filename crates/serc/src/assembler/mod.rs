@@ -12093,7 +12093,12 @@ impl Assembler {
     }
 
     /// Captures a saved named-handler return whose enclosing async manager unwinds later.
-    pub(crate) fn record_saved_named_handler_none_prefix(&mut self, start: usize, pop_item: usize) {
+    pub(crate) fn record_saved_named_handler_none_prefix(
+        &mut self,
+        start: usize,
+        pop_item: usize,
+        inner_try_pop: bool,
+    ) {
         let items = self.linear_items();
         let Some(suffix) = items.get(pop_item..) else {
             return;
@@ -12227,6 +12232,7 @@ impl Assembler {
             entry,
             items: items[entry_at..end].to_vec(),
             unwind_offset: prefix.len(),
+            inner_try_pop,
         };
         self.exception_owner_provenance
             .saved_named_handler_none_prefixes
