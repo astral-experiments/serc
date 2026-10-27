@@ -7731,6 +7731,22 @@ impl OptimizationPipeline {
                 }
                 let mut marker =
                     Instruction::synthetic(NOP, Operand::Value(0), source_location, None);
+                if preserve_threaded_join_nop
+                    && inline_unprotected_return
+                    && target_pre_fusion_size == 4
+                    && remaining_predecessors[source.index()] > 1
+                    && source_position
+                        .checked_sub(1)
+                        .and_then(|position| graph[order[position]].last_instruction())
+                        .is_some_and(|store| {
+                            store.opcode == STORE_FAST && store.location == source_location
+                        })
+                {
+                    // The replaced jump makes five records, so the remaining jumps
+                    // cannot copy this exit. Its fallthrough store is not a unique donor.
+                    marker.location = SourceLocation::NONE;
+                    marker.no_location_policy.preserve_location();
+                }
                 if copied_return_crosses_empty_join {
                     marker
                         .no_location_policy

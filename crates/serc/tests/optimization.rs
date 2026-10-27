@@ -7883,6 +7883,22 @@ fn recovery_finalizer_preserves_local_return_borrow_boundary() {
 }
 
 #[test]
+fn shared_nested_exit_does_not_inherit_the_fallthrough_store_line() {
+    let source = r"def select(outer, inner, manager, left, right):
+    if outer:
+        if inner:
+            with manager:
+                left = 1
+        else:
+            left = 2
+    else:
+        left = 3
+    return left, right
+";
+    assert_matches_cpython(source, "shared_store_exit.py", &LEVELS);
+}
+
+#[test]
 fn chained_comparison_copies_a_store_and_bare_raise() {
     let source = r"def classify(value):
     try:
