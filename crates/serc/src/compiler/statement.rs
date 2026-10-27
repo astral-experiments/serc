@@ -32990,9 +32990,14 @@ impl<'source> Compiler<'source> {
         let capture_manager_pop =
             std::mem::take(&mut self.control.finally.capture_next_finally_manager_pop);
         let erased_try_truth = self.context.python_version == crate::PythonVersion::Py314
-                    && statement.handlers.is_empty() && statement.orelse.is_empty()
-                    && !statement.body.is_empty() && statement.body.iter().all(|part| self.context.is_elided_statement(part))
-                    && matches!(statement.finalbody.first(), Some(Stmt::If(branch)) if
+            && statement.handlers.is_empty()
+            && statement.orelse.is_empty()
+            && !statement.body.is_empty()
+            && statement
+                .body
+                .iter()
+                .all(|part| self.context.is_elided_statement(part))
+            && matches!(statement.finalbody.first(), Some(Stmt::If(branch)) if
                         matches!(branch.test.as_ref(), Expr::Attribute(_) | Expr::Call(_))
                         || matches!(branch.test.as_ref(), Expr::UnaryOp(unary) if unary.op == UnaryOp::Not && matches!(unary.operand.as_ref(),Expr::Call(_) | Expr::Attribute(_))));
         let mut captured_manager_pop = None;
