@@ -277,3 +277,18 @@ fn excludes_retained_conditional_pop_blocks_from_enclosing_tries() {
         assert_matches_cpython_marshal(&source, "conditional_pop_block_enclosing_owner.py");
     }
 }
+
+#[test]
+fn borrows_at_guarded_try_else_after_a_managed_break() {
+    for (scope, work) in [("with", "work(key)"), ("async with", "await work(key)")] {
+        for branch in [
+            "if flag:\n                    break\n                ",
+            "break\n                ",
+        ] {
+            let source = format!(
+                "async def choose(key, flag, manager):\n    {scope} manager:\n        try:\n            while True:\n                {branch}{work}\n        except Error:\n            raise\n        else:\n            if flag:\n                use(key)\n"
+            );
+            assert_matches_cpython_marshal(&source, "managed_break_to_else.py");
+        }
+    }
+}

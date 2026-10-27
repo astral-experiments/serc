@@ -472,6 +472,8 @@ pub(super) struct ExceptionState {
     // crossing the enclosing handler boundary.
     direct_try_body_has_else: bool,
     direct_try_body_else_falls_through: bool,
+    // A direct final loop can jump into this guarded else before an enclosing manager exits.
+    managed_try_else_break: Option<TextRange>,
     // A direct final assignment branch whose copied normal exit crosses to a following statement
     // outside the try.
     direct_try_assignment_branch_exit: Option<TextRange>,
@@ -1163,6 +1165,23 @@ impl<'source> Compiler<'source> {
         } else {
             Vec::new()
         };
+        let managed_try_else_break = match (statement.body.last(), statement.orelse.first()) {
+            (Some(Stmt::While(loop_)), Some(Stmt::If(guard)))
+                if self.context.python_version == crate::PythonVersion::Py314
+                    && !statement.is_star
+                    && !statement.handlers.is_empty()
+                    && !self.control.withs.active_with_exits.is_empty()
+                    && condition_has_linear_runtime_leaves(&guard.test)
+                    && !expression_suspends_current_scope(&guard.test) =>
+            {
+                Some(loop_.range)
+            }
+            _ => None,
+        };
+        let previous_managed_try_else_break = std::mem::replace(
+            &mut self.control.exceptions.managed_try_else_break,
+            managed_try_else_break,
+        );
         let direct_try_body_has_else = !statement.orelse.is_empty();
         let previous_direct_try_body_else_falls_through = std::mem::replace(
             &mut self.control.exceptions.direct_try_body_else_falls_through,
@@ -1274,6 +1293,7 @@ impl<'source> Compiler<'source> {
             .exceptions
             .direct_try_body_has_literal_return_successor =
             previous_direct_try_body_literal_return_successor;
+        self.control.exceptions.managed_try_else_break = previous_managed_try_else_break;
         self.control.exceptions.direct_try_body_else_falls_through =
             previous_direct_try_body_else_falls_through;
         result
@@ -25071,7 +25091,8 @@ impl<'source> Compiler<'source> {
                         && self.control.exceptions.active_exception_handlers.is_empty()
                         && self.control.exceptions.active_exception_group_handlers == 0
                         && self.control.finally.active_copied_finally_bodies == 0))
-                    && self.control.withs.active_with_region_exclusions.is_empty()
+                    && (self.control.withs.active_with_region_exclusions.is_empty()
+                        || self.control.exceptions.managed_try_else_break == Some(statement.range))
                     && self.control.finally.active_normal_finally_bodies == 0
                     && self.control.finally.active_finally_end_blocks == 0
                 {
