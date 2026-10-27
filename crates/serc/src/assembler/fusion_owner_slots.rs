@@ -1228,21 +1228,29 @@ impl View<'_> {
                 .iter()
                 .find_map(Item::as_instruction)
                 .is_some_and(|first| first.opcode == crate::target::opcodes::UNPACK_SEQUENCE);
-        let mut handlers = regions.iter().filter(|region| {
+        let is_named_cleanup = |region: &ExceptionRegion| {
             !region.is_scope_fallback
-                && ((region.preserve_lasti
-                    && region.depth > 0
+                && region.preserve_lasti
+                && region.depth > 0
+                && self
+                    .provenance
+                    .named_handler_cleanup_targets
+                    .contains(&region.target)
+        };
+        // In a named handler, the cleanup owns the pattern even when an outer try
+        // also covers it. Only use an ordinary try to identify a pattern outside one.
+        let in_named_handler = regions.iter().any(is_named_cleanup);
+        let mut handlers = regions.iter().filter(|region| {
+            is_named_cleanup(region)
+                || (!in_named_handler
+                    && pattern_fallthrough
+                    && !region.is_scope_fallback
+                    && !region.preserve_lasti
                     && self
                         .provenance
-                        .named_handler_cleanup_targets
-                        .contains(&region.target))
-                    || (pattern_fallthrough
-                        && !region.preserve_lasti
-                        && self
-                            .provenance
-                            .ordinary_try_setups
-                            .values()
-                            .any(|target| *target == region.target)))
+                        .ordinary_try_setups
+                        .values()
+                        .any(|target| *target == region.target))
         });
         let target = handlers.next()?.target;
         if handlers.next().is_some() {
