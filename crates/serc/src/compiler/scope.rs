@@ -1504,6 +1504,10 @@ impl FunctionPlan {
         plan.inlined_comprehension_cellvars
             .extend(comprehension_fast_cellvars);
         if private_name.is_some() && plan.cellvars.len() > 1 {
+            #[expect(
+                clippy::iter_over_hash_type,
+                reason = "Only the lookup keys are collected here. Cell ordering uses their spellings."
+            )]
             for &name in &plan.cellvars {
                 if let Cow::Owned(spelling) = mangle_name(names.resolve(name), private_name) {
                     plan.cell_sort_names.insert(name, spelling);
