@@ -1916,7 +1916,8 @@ impl Assembler {
                         return self.instruction_count() > 0;
                     }
                 }
-                Item::Instruction(op) if op.opcode == NOP && Some(op.location.line) == nop_line => {}
+                Item::Instruction(op) if op.opcode == NOP && Some(op.location.line) == nop_line => {
+                }
                 Item::Instruction(instruction) => {
                     return instruction.opcode == NOT_TAKEN
                         || instruction.jump_target().is_some()
