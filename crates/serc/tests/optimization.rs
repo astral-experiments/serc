@@ -7883,6 +7883,28 @@ fn recovery_finalizer_preserves_local_return_borrow_boundary() {
 }
 
 #[test]
+fn a_guarded_assertion_keeps_one_line_event_on_its_normal_try_exit() {
+    let source = r"def verify(enabled, value):
+    if enabled:
+        try:
+            assert value
+        except ValueError:
+            pass
+    else:
+        skip()
+    finish()
+
+def folded():
+    try:
+        assert True
+    except ValueError:
+        pass
+    finish()
+";
+    assert_matches_cpython(source, "assertion_success_exit.py", &LEVELS);
+}
+
+#[test]
 fn chained_comparison_copies_a_store_and_bare_raise() {
     let source = r"def classify(value):
     try:

@@ -31257,16 +31257,7 @@ impl<'source> Compiler<'source> {
             }
             let named_iterator_handler = self.control.in_iterator_loop()
                 && matches!(statement.handlers.as_slice(), [handler]
-                    if handler.as_except_handler().is_some_and(|handler| handler.name.is_some()));
-            if retained_assertion_exit
-                && matches!(
-                    self.context.python_version,
-                    crate::PythonVersion::Py314 | crate::PythonVersion::Py315
-                )
-                && matches!(self.unit.scope, Scope::Function { .. })
-                && !statement.is_star
-                && statement.orelse.is_empty()
-                && statement.finalbody.is_empty()
+                    if handler.as_except_handler().is_some_and(|handler| handler.name.is_some()))
                 && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                 && self.control.exceptions.active_exception_handlers.is_empty()
                 && self.control.exceptions.active_exception_group_handlers == 0
@@ -31279,35 +31270,15 @@ impl<'source> Compiler<'source> {
                 && self.control.finally.active_finally_try_bodies == 0
                 && self.control.finally.active_normal_finally_bodies == 0
                 && self.control.finally.active_copied_finally_bodies == 0
-                && self.control.finally.active_finally_end_blocks == 0
+                && self.control.finally.active_finally_end_blocks == 0;
+            let function_assertion = self.context.python_version >= crate::PythonVersion::Py314
+                && matches!(self.unit.scope, Scope::Function { .. })
                 && (named_iterator_handler
-                    || (statement.body.split_last().is_some_and(|(tail, prefix)| {
-                        (prefix.is_empty() || suite_has_linear_borrow_fallthrough(prefix))
-                            && matches!(tail, Stmt::Assert(assertion)
-                                if assertion.msg.is_none()
-                                    && early_condition_truthiness(&assertion.test).is_none()
-                                    && original_condition_has_unique_jump_target(&assertion.test, true))
-                    })
-                    && matches!(statement.handlers.as_slice(), [handler]
-                    if handler.as_except_handler().is_some_and(|handler| {
-                        handler.type_.is_some()
-                            && matches!(handler.body.as_slice(), [Stmt::Raise(raise)]
-                                if raise.exc.as_ref().is_some_and(|exception| !expression_contains_inline_branch(exception))
-                                    && raise.cause.as_ref().is_none_or(|cause| !expression_contains_inline_branch(cause)))
-                    }))))
-            {
-                // The successful assertion's POP_BLOCK and normal exit share one
-                // original array even inside a loop or manager. The exact record
-                // verifier leaves compaction and removed owner slots to the NOP pass.
-                self.assembler
-                    .allow_original_assertion_pop_compaction(normal_exit);
-            }
-            if retained_assertion_exit
-                && !statement.is_star
-                && statement.orelse.is_empty()
-                && statement.finalbody.is_empty()
-                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                    == CO_COROUTINE
+                    || matches!(statement.body.last(), Some(Stmt::Assert(assertion))
+                        if early_condition_truthiness(&assertion.test).is_none()));
+            let caught_coroutine_assertion = self.unit.flags
+                & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                == CO_COROUTINE
                 && self.control.exceptions.active_exception_group_handlers == 0
                 && self.control.exceptions.active_try_marker_slots.is_empty()
                 && self
@@ -31338,10 +31309,15 @@ impl<'source> Compiler<'source> {
                     if handler.as_except_handler().is_some_and(|handler| handler.name.is_some()))
                 && matches!(statement.body.last(), Some(Stmt::Assert(assertion))
                     if early_condition_truthiness(&assertion.test).is_none()
-                        && original_condition_has_unique_jump_target(&assertion.test, true))
+                        && original_condition_has_unique_jump_target(&assertion.test, true));
+            if retained_assertion_exit
+                && !statement.is_star
+                && statement.orelse.is_empty()
+                && statement.finalbody.is_empty()
+                && (function_assertion || caught_coroutine_assertion)
             {
-                // The successful assertion's converted POP and ordinary exit can share
-                // one original array. Its following jump supplies the same source location.
+                // The successful runtime test supplies the POP_BLOCK's location. A
+                // matching forward jump can carry that line after NOP compaction.
                 self.assembler
                     .allow_original_assertion_pop_compaction(normal_exit);
             }
