@@ -12973,8 +12973,7 @@ impl LayoutAssembler {
                 retained.is_scope_fallback
                     || (!owns_cleanup_record
                         && !retained.preserve_lasti
-                        && retained.depth.checked_add(1)
-                            == Some(owner.depth)
+                        && retained.depth.checked_add(1) == Some(owner.depth)
                         && origin.pop.depth_after() == owner.depth.checked_add(1)
                         && self.uniform_exception_owner(load_index, marker + 1, positions)
                             == Some(current))
