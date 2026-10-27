@@ -34519,7 +34519,17 @@ impl<'source> Compiler<'source> {
             } else {
                 let instruction_count = self.assembler.instruction_count();
                 self.compile_suite(body)?;
-                if let Some(range) = suite_unary_not_fallthrough_range(body) {
+                if self.context.python_version >= crate::PythonVersion::Py313
+                    && let Some(Stmt::If(tail)) = body.last()
+                    && let Some(test) = terminating_if_fallthrough_test(tail)
+                    && condition_has_only_runtime_tests(test)
+                    && original_condition_has_unique_jump_target(test, false)
+                    && let Some(donor) = unique_condition_jump_target(test, false)
+                {
+                    // The terminating arms cannot reach this cleanup. Its only normal
+                    // predecessor is the final guard's false edge.
+                    self.source_location(donor.range())
+                } else if let Some(range) = suite_unary_not_fallthrough_range(body) {
                     self.source_location(range)
                 } else if self.assembler.instruction_count() > instruction_count {
                     self.assembler
