@@ -2173,49 +2173,6 @@ impl Assembler {
         })
     }
 
-    /// Whether an unlocated handler exit has only its normal branch as a donor.
-    pub(crate) fn at_reraising_handler_exit(&self) -> bool {
-        let items = self.linear_items();
-        let labels = trailing_labels(items).collect::<Vec<_>>();
-        let mut incoming = items.iter().enumerate().filter_map(|(index, item)| {
-            let jump = item.as_instruction()?;
-            labels
-                .contains(&jump.jump_target()?)
-                .then_some((index, jump))
-        });
-        let (Some((_, normal)), Some((handler_index, handler)), None) =
-            (incoming.next(), incoming.next(), incoming.next())
-        else {
-            return false;
-        };
-        let [
-            ..,
-            Item::Instruction(raise),
-            Item::Label(entry),
-            Item::Instruction(pop),
-        ] = &items[..handler_index]
-        else {
-            return false;
-        };
-        // The range ends after the terminal raise. No jump or exception handler
-        // enters the following POP_EXCEPT, so its jump cannot share the discard.
-        normal.opcode == JUMP_FORWARD
-            && handler.opcode == JUMP_FORWARD
-            && raise.opcode == RAISE_VARARGS
-            && pop.opcode == POP_EXCEPT
-            && raise.location == pop.location
-            && pop.location == handler.location
-            && items
-                .get(items.len().saturating_sub(labels.len() + 1))
-                .and_then(Item::as_instruction)
-                .is_some_and(|end| end.opcode == RERAISE)
-            && !self.exception_regions.iter().any(|r| r.target == *entry)
-            && !items
-                .iter()
-                .filter_map(Item::as_instruction)
-                .any(|i| i.jump_target() == Some(*entry))
-    }
-
     /// Whether an authored break enters the empty original join at this position.
     ///
     /// An iterator's exhaustion arm may fall through here as well. It does not locate
@@ -11525,6 +11482,15 @@ impl Assembler {
             self.emitted_jump_mut(emitted, "marking an artificial eval-break instruction");
         debug_assert!(matches!(instruction.opcode, JUMP_FORWARD | JUMP_BACKWARD));
         instruction.no_location_policy.mark_artificial_eval_break();
+    }
+
+    /// Defers an iterator discard's location until its live predecessors are known.
+    pub(crate) fn record_iterator_discard_join(&mut self) {
+        if let [.., Item::Label(join), Item::Instruction(discard)] = self.linear_items()
+            && discard.opcode == POP_TOP
+        {
+            self.iterator_discard_joins.push(*join);
+        }
     }
 
     pub(crate) fn preserve_last_no_location(&mut self) {
