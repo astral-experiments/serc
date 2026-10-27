@@ -6462,6 +6462,16 @@ fn terminal_nested_recovery_else_stops_borrowed_continuation() {
 }
 
 #[test]
+fn terminal_try_else_keeps_separate_legacy_loop_returns() {
+    for body in ["process(item)", "yield item"] {
+        let source = format!(
+            "def run(item, ready):\n    try:\n        prepare()\n    except LookupError:\n        pass\n    else:\n        while ready(item):\n            {body}\n"
+        );
+        assert_matches_cpython(&source, "try_else_loop.py", &LEVELS);
+    }
+}
+
+#[test]
 fn terminal_try_else_loop_return_uses_the_false_edge() {
     let source = r"def run(items, ready):
     if ready:
