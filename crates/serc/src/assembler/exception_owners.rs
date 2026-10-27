@@ -8592,6 +8592,60 @@ impl LayoutAssembler {
                                 );
                             }
                         }
+                        // A try with handlers and a finalizer has two SETUP records
+                        // at the same entry. Late SETUP compaction keeps the first as
+                        // a NOP and removes the second. Both original slots are NULL.
+                        if owner_history_exact
+                            && pop_slot_epoch_known
+                            && tail.late_removals > 0
+                            && tail.insertions == 0
+                            && tail.post_compaction_fusions == 0
+                            && late_setup_positions.len() == tail.late_removals
+                            && instruction.exception_policy().exclusion()
+                                == super::ExceptionExclusion::None
+                            && owners
+                                .get(instruction_index)
+                                .is_none_or(|owner| !owner.is_definitive())
+                        {
+                            let before = late_setup_positions
+                                .partition_point(|position| *position < instruction_index);
+                            // The append slot is either the removed setup or its
+                            // predecessor, the retained NOP at the same try entry.
+                            if let Some(&erased) = late_setup_positions.get(before)
+                                && (instruction_index..=instruction_index + 1).contains(&erased)
+                                && let Some(nop) = erased.checked_sub(before + 1)
+                                && original_array_start <= nop
+                                && (3..=4).contains(&(instruction_index - nop))
+                                && retained_setup_nops.contains(&nop)
+                                && indexed_instructions[nop].exception_policy()
+                                    == super::ExceptionPolicy::EXCLUDE_ALWAYS
+                                && !indexed_instructions[nop]
+                                    .fusion_policy
+                                    .is_converted_pop_block()
+                                && let Some(region) = self.uniform_exception_owner(
+                                    nop + 1,
+                                    instruction_index + 1,
+                                    &label_positions,
+                                )
+                                && let region = self.exception_regions[region]
+                                && !region.is_scope_fallback
+                                && !region.preserve_lasti
+                                && label_positions.get(&region.start) == Some(&(nop + 1))
+                                && self
+                                    .exception_owner_provenance
+                                    .ordinary_try_setups
+                                    .iter()
+                                    .any(|(entry, target)| {
+                                        label_positions.get(entry) == Some(&(nop + 1))
+                                            && *target == region.target
+                                    })
+                            {
+                                owners.insert(
+                                    instruction_index,
+                                    ExceptionOwnerDecision::Definitive(ExceptionOwner::Absent),
+                                );
+                            }
+                        }
                         // Local fusion is the last compaction. When its stale suffix
                         // begins exactly at the retained SETUP, the append slot is that
                         // unprotected record, even with an enclosing handler on both sides.
