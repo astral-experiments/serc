@@ -14899,6 +14899,24 @@ impl<'source> Compiler<'source> {
                         .exceptions
                         .active_exception_region_exclusions
                         .len();
+                    // CPython 3.12 counts each POP_BLOCK before copying a conditional
+                    // return's shared cleanup of local deletions and RETURN_VALUE.
+                    if self.context.python_version == crate::PythonVersion::Py312
+                        && preserve_tos
+                        && !return_is_overridden
+                        && handler_count == 0
+                        && with_unwind_starts.is_empty()
+                        && finally_end_unwind_start.is_none()
+                        && matches!(statement.value.as_deref(), Some(Expr::If(_)))
+                        && let [cleanup] = self.control.finally.active_return_finally_contexts.as_slice()
+                        && region_count + cleanup.body.len() + 1 > 4
+                        && cleanup.body.iter().all(|part| {
+                            matches!(part, Stmt::Delete(deletion) if matches!(deletion.targets.as_slice(), [Expr::Name(_)]))
+                        })
+                    {
+                        self.assembler
+                            .record_name_return_pop_boundary(exclusion_start, region_count);
+                    }
                     for (index, exclusions) in self
                         .control
                         .exceptions

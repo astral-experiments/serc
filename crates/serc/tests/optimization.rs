@@ -3895,6 +3895,27 @@ fn erased_coroutine_join_preserves_predating_async_managers() {
 }
 
 #[test]
+fn deleting_finalizer_counts_try_unwinds_before_copying_conditional_returns() {
+    let source = r"def choose(ready, first, second):
+    try:
+        while ready:
+            try:
+                return load(first) if ready else load(second)
+            except LookupError:
+                continue
+    finally:
+        del first
+        del second
+";
+    assert_matches_cpython_versions(
+        source,
+        "conditional_cleanup_return.py",
+        &LEVELS,
+        &[PythonVersion::Py312],
+    );
+}
+
+#[test]
 fn nested_finalizers_keep_shared_attribute_deletion() {
     let source = r"def sample(manager, value):
     try:
