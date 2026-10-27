@@ -15968,7 +15968,7 @@ impl Assembler {
         if instructions.len() != expected_len
             || instructions[0].opcode != crate::target::opcodes::POP_EXCEPT
             || (named
-                && instructions.chunks_exact(4).any(|cleanup| {
+                && instructions.as_chunks::<4>().0.iter().any(|cleanup| {
                     cleanup[0].opcode != POP_EXCEPT
                         || cleanup[1].opcode != LOAD_CONST
                         || cleanup[2].opcode != STORE_FAST
