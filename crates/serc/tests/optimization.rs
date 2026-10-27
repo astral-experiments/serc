@@ -11981,6 +11981,38 @@ fn break_keeps_its_line_before_a_small_attribute_return() {
 }
 
 #[test]
+fn folded_loop_breaks_keep_their_shared_return_location() {
+    let conditional = r"def choose(flag, value):
+    if flag:
+        while True:
+            value = step(value)
+            if keep(value):
+                continue
+            else:
+                break
+    elif enabled():
+        while value:
+            value -= 1
+    return value
+";
+    let cleanup = r"def finish():
+    try:
+        work()
+    finally:
+        while True:
+            try:
+                close()
+            except LookupError:
+                pass
+            else:
+                break
+    return True
+";
+    assert_matches_cpython(conditional, "conditional_loop_break.py", &LEVELS);
+    assert_matches_cpython(cleanup, "cleanup_loop_break.py", &LEVELS);
+}
+
+#[test]
 fn breaks_keep_their_line_before_a_shared_return() {
     for source in [
         r"def choose(flag, value):

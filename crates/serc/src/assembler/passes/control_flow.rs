@@ -2250,12 +2250,13 @@ impl OptimizationPipeline {
                     return None;
                 };
                 let target = bridge.forward_target()?;
-                let clean_label = |item: &Item| matches!(item, Item::Label(label)
-                    if self.exception_owner_provenance.block_boundaries.contains(label)
-                        && !self.original_nop_targets.contains(label)
+                let unchanged_label = |item: &Item| matches!(item, Item::Label(label)
+                    if !self.original_nop_targets.contains(label)
                         && !self.borrow_block_aliases.contains(label)
                         && !self.exception_owner_provenance.omitted_nop_counts.contains_key(label)
                         && !self.exception_owner_provenance.omitted_nop_locations.contains_key(label));
+                let original_label = |item: &Item| matches!(item, Item::Label(label)
+                    if self.exception_owner_provenance.block_boundaries.contains(label));
                 if bridge.opcode != JUMP_FORWARD
                     || bridge.fusion_policy.is_authored_break()
                     || bridge.fusion_policy.is_converted_pop_block()
@@ -2265,11 +2266,11 @@ impl OptimizationPipeline {
                     // A constant loop has only its exit label; a dynamic loop can
                     // add an alias. Both identify the same intact native jump array.
                     || labels.is_empty()
-                    || !labels.iter().all(clean_label)
+                    || !labels.iter().all(|label| original_label(label) && unchanged_label(label))
                     || !labels.iter().any(|item| matches!(item, Item::Label(label)
                         if self.exception_owner_provenance.source_boundaries.contains(label)))
                     || !((bridge.location == SourceLocation::NONE
-                        && bridge.no_location_policy.preserves_location())
+                        && (bridge.no_location_policy.preserves_location() || bridge.jump_policy.borrow_empty_block()))
                         || (bridge.location.line >= 0
                             && !bridge.no_location_policy.preserves_location()
                             && bridge.jump_policy.retained_nop()
@@ -2297,7 +2298,9 @@ impl OptimizationPipeline {
                 };
                 if return_.opcode != RETURN_VALUE
                     || !targets_small_scope_exit(graph, target)
-                    || !target_items[..first].iter().all(clean_label)
+                    // An elif condition can add a co-located label to the original return.
+                    || !target_items[..first].iter().any(original_label)
+                    || !target_items[..first].iter().all(unchanged_label)
                     || return_.depth_after() != Some(0)
                     || return_.location.line < 0
                     || source.location.line == return_.location.line
