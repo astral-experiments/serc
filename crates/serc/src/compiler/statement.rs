@@ -12115,8 +12115,12 @@ impl<'source> Compiler<'source> {
                             .preserved_return_value_contexts
                             .is_empty()
                         && self.control.withs.active_with_exits.len() == next_with
-                        && self.control.withs.active_with_exits.iter().all(|manager| manager.is_async && manager.exception_region_depth == 0
-                                && manager.loop_depth == 0 && manager.normal_finally_depth == 0)
+                        && self.control.withs.active_with_exits.iter().all(|manager| {
+                            manager.is_async
+                                && manager.exception_region_depth == 0
+                                && manager.loop_depth == 0
+                                && manager.normal_finally_depth == 0
+                        })
                         && matches!(self.control.loops.contexts.as_slice(), [iterator]
                             if iterator.iterator_cleanup == IteratorCleanup::Async && iterator.with_depth == next_with
                                 && iterator.finally_end_depth == 0 && iterator.exception_region_depth == 1);
