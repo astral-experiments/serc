@@ -932,6 +932,56 @@ fn represented_setup_nops(
         )
 }
 
+/// Finds the region end already represented by a returned local's `POP_BLOCK`.
+fn local_return_finally_pop(
+    graph: &BlockGraph,
+    blocks: &[BasicBlockId],
+    regions: &[ExceptionRegion],
+) -> Option<Label> {
+    let [value, cleanup] = blocks else {
+        return None;
+    };
+    let [value_labels @ .., Item::Instruction(value)] = graph[*value].items() else {
+        return None;
+    };
+    let [
+        cleanup_labels @ ..,
+        Item::Instruction(pop),
+        Item::Instruction(delete),
+        Item::Instruction(ret),
+    ] = graph[*cleanup].items()
+    else {
+        return None;
+    };
+    if !value_labels
+        .iter()
+        .chain(cleanup_labels)
+        .all(|item| matches!(item, Item::Label(_)))
+        || value.opcode != LOAD_FAST
+        || value.depth_after() != Some(1)
+        || pop.opcode != NOP
+        || !pop.fusion_policy.is_converted_pop_block()
+        || pop.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
+        || pop.location.line < 0
+        || delete.opcode != DELETE_FAST
+        || ret.opcode != RETURN_VALUE
+    {
+        return None;
+    }
+    // Multiple owners ending at the same point can represent more unwind slots.
+    let contains = |label| cleanup_labels.contains(&Item::Label(label));
+    let mut owners = regions.iter().filter(|region| contains(region.end));
+    let owner = owners.next()?;
+    (owners.next().is_none()
+        && !owner.is_scope_fallback
+        && owner.depth == 0
+        && !owner.preserve_lasti
+        && regions
+            .iter()
+            .all(|region| !contains(region.start) && !contains(region.target)))
+    .then_some(owner.end)
+}
+
 /// Reconstructs one original exit array across exception-table-only splits.
 fn metadata_split_exit_chain<'a>(
     graph: &BlockGraph,
@@ -1240,6 +1290,7 @@ fn exit_block_analysis(
                 && (target_chain_end == target_position
                     || matches!(target_last.opcode, RAISE_VARARGS | RETURN_VALUE))
             {
+                let represented_pop = local_return_finally_pop(graph, target_blocks, exception_regions);
                 let represented_setups = represented_setup_nops(graph, target_blocks, provenance);
                 let mut at_target_entry = true;
                 target_blocks
@@ -1254,7 +1305,8 @@ fn exit_block_analysis(
                             target_chain_end > target_position
                                 && exception_split_labels.contains(label)
                                 && !provenance.return_region_reentries.contains(label)
-                                && !represented_setups.labels.contains(label)
+                                && represented_pop != Some(*label)
+                                    && !represented_setups.labels.contains(label)
                                 && !(at_target_entry
                                     && is_metadata_range_entry(
                                         *label,
@@ -5910,6 +5962,8 @@ impl OptimizationPipeline {
             {
                 continue;
             }
+            let represented_pop =
+                local_return_finally_pop(graph, target_blocks, &self.exception_regions);
             let represented_setups =
                 represented_setup_nops(graph, target_blocks, &self.exception_owner_provenance);
             let mut at_target_entry = true;
@@ -5931,6 +5985,7 @@ impl OptimizationPipeline {
                                 .exception_owner_provenance
                                 .return_region_reentries
                                 .contains(label)
+                            && represented_pop != Some(*label)
                             && !represented_setups.labels.contains(label)
                             && !(at_target_entry
                                 && is_metadata_range_entry(
