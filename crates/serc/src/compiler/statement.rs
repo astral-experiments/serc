@@ -37009,6 +37009,33 @@ impl<'source> Compiler<'source> {
                                         if return_.value.is_none()))
                     })
             });
+        // A protected yield resumes with POP_TOP in its original block. Its
+        // normal fallthrough enters guarded cleanup even when a handler exits.
+        let resumed_yield_reaches_finally = self.context.python_version
+            == crate::PythonVersion::Py314
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_GENERATOR
+            && !statement.is_star
+            && statement.orelse.is_empty()
+            && !statement.handlers.is_empty()
+            && statement.handlers.iter().all(|handler| {
+                handler.as_except_handler().is_some_and(|handler| {
+                    // A copied continue can leave an empty loop-backedge block
+                    // between the resumed yield and normal cleanup.
+                    handler.type_.is_some() && !suite_contains_loop_continue(&handler.body)
+                })
+            })
+            && !self.control.in_exception_handler()
+            && self.control.finally.is_inactive_for_return_unwind()
+            && matches!(statement.body.split_last(), Some((Stmt::Expr(tail), leading))
+            if suite_has_normal_fallthrough(leading)
+                && matches!(tail.value.as_ref(), Expr::Yield(yield_)
+                    if yield_.value.as_deref().is_none_or(|value| {
+                        !expression_contains_inline_branch(value)
+                            && !expression_suspends_current_scope(value)
+                    })))
+            && matches!(statement.finalbody.first(), Some(Stmt::If(cleanup))
+                if condition_has_linear_runtime_leaves(&cleanup.test)
+                    && !expression_suspends_current_scope(&cleanup.test));
         // A resumed plain yield reaches guarded cleanup through a populated recovery
         // suffix. Keep this certificate local to one synchronous manager and handler.
         let generator_manager_recovery_context = matches!(self.unit.scope, Scope::Function { .. })
@@ -38153,6 +38180,7 @@ impl<'source> Compiler<'source> {
             || dispatcher_break_reaches_finally
             || inner_try_break_loop_range.is_some()
             || conditional_handler_reaches_finally
+            || resumed_yield_reaches_finally
             || nested_fallthrough_handler_reaches_finally
             || managed_recovery_reaches_finally
             || managed_coroutine_recovery_reaches_finally
