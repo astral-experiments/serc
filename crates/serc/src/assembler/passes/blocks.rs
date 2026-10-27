@@ -5991,9 +5991,28 @@ impl OptimizationPipeline {
                         if instruction.no_location_policy.is_artificial_eval_break())
                 })
             });
-            let target_allows_no_location_block_inlining = graph[target_exit]
-                .last_instruction()
-                .is_some_and(|instruction| instruction.no_location_policy.allows_block_inlining());
+            // The handler's POP_BLOCK splits SWAP from POP_EXCEPT and RETURN.
+            // The unlocated return array can still be copied onto a finalizer guard.
+            let split_handler_return = self.python_version == crate::PythonVersion::Py314
+                && target_chain_end > target_position
+                && target_has_no_location
+                && target_terminal_opcode == Some(RETURN_VALUE)
+                && target_blocks
+                    .iter()
+                    .flat_map(|block| graph[*block].items())
+                    .filter_map(Item::as_instruction)
+                    .map(|record| (record.opcode, record.operand()))
+                    .eq([
+                        (SWAP, Operand::Value(2)),
+                        (POP_EXCEPT, Operand::Value(0)),
+                        (RETURN_VALUE, Operand::Value(0)),
+                    ]);
+            let target_allows_no_location_block_inlining = split_handler_return
+                || graph[target_exit]
+                    .last_instruction()
+                    .is_some_and(|instruction| {
+                        instruction.no_location_policy.allows_block_inlining()
+                    });
             let target_has_unlocated_jump_eval_check = target_has_no_location
                 && graph[target_exit]
                     .last_instruction()
@@ -8101,7 +8120,9 @@ impl OptimizationPipeline {
                 // Exception-region labels can split one original cleanup array. Insert its
                 // copies after the whole array so the original still reaches its own jump.
                 if target != target_exit
-                    && (target_has_unlocated_jump_eval_check || split_iterator_return)
+                    && (target_has_unlocated_jump_eval_check
+                        || split_iterator_return
+                        || split_handler_return)
                 {
                     copied_split_eval_starts.insert(target_exit, target_position);
                 }
