@@ -15572,38 +15572,85 @@ impl Assembler {
         let Item::Instruction(previous) = items.get(start.checked_sub(1)?)? else {
             return None;
         };
-        let intact = |instruction: &Instruction| {
+        let intact = |instruction: &Instruction, allow_retained_nop| {
             instruction.pre_fold_extra_instructions() == 0
                 && instruction.local_policy.hidden_exception_owner_slots() == 0
                 && instruction.exception_policy() == ExceptionPolicy::default()
                 && !instruction.fusion_policy.is_authored_break()
                 && !instruction.fusion_policy.is_converted_pop_block()
                 && !instruction.jump_policy.borrow_empty_block()
-                && !instruction.jump_policy.always_retains_nop()
+                && (allow_retained_nop || !instruction.jump_policy.always_retains_nop())
                 && !instruction.no_location_policy.preserves_location()
                 && instruction.depth_after().is_some()
         };
         let incoming = |targets: &[Label]| {
-            items.iter().filter_map(move |item| match item {
+            items.iter().enumerate().filter_map(move |(index, item)| match item {
                 Item::Instruction(instruction)
                     if matches!(instruction.operand(), Operand::Forward(label) | Operand::Backward(label)
-                        if targets.contains(&label)) => Some(instruction),
+                        if targets.contains(&label)) => Some((index, instruction)),
                 _ => None,
             }).collect::<Vec<_>>()
         };
         let mut entries = incoming(&aliases).into_iter();
-        if let Some(jump) = entries.next() {
+        if let Some((index, jump)) = entries.next() {
+            if entries.next().is_some()
+                || !ends_scope(previous.opcode)
+                || jump.opcode != JUMP_FORWARD
+                || jump.operand() != Operand::Forward(entry)
+                || !jump.jump_policy.is_original_match_success()
+                || !intact(jump, true)
+            {
+                return None;
+            }
             // A terminating fallback leaves only this original successful case.
-            // Its located body is the sole donor for the separate manager array.
-            return (entries.next().is_none()
-                && ends_scope(previous.opcode)
-                && jump.opcode == JUMP_FORWARD
-                && jump.operand() == Operand::Forward(entry)
-                && jump.jump_policy.is_original_match_success()
+            let location = if !jump.jump_policy.always_retains_nop()
                 && jump.location.line >= 0
                 && !jump.no_location_policy.is_artificial_eval_break()
-                && intact(jump))
-            .then_some((entry, jump.location));
+            {
+                jump.location
+            } else if self.python_version < crate::PythonVersion::Py314 {
+                // Legacy manager cleanup already resolves its own converted POP_BLOCK.
+                return None;
+            } else if jump.jump_policy.always_retains_nop() {
+                // An erased case body leaves its capture store or guard immediately before
+                // the unlocated success jump. The original manager POP_BLOCK inherits it.
+                let previous = items.get(index.checked_sub(1)?)?.as_instruction()?;
+                (jump.location == SourceLocation::NONE
+                    && matches!(
+                        previous.opcode,
+                        STORE_FAST | STORE_DEREF | STORE_NAME | STORE_GLOBAL | NOT_TAKEN
+                    )
+                    && previous.depth_after() == jump.depth_after())
+                .then_some(previous.location)?
+            } else if jump.location == SourceLocation::NONE
+                && jump.no_location_policy.is_artificial_eval_break()
+            {
+                // An assertion with several success edges leaves an original jump and
+                // copies for earlier operands. Its last success locates the original.
+                let before = &items[..index];
+                let labels = trailing_labels(before).collect::<Vec<_>>();
+                if labels.is_empty()
+                    || self.join_labels_have_authored_location(&labels)
+                    || before.iter().rev().find_map(Item::as_instruction)?.opcode != RAISE_VARARGS
+                {
+                    return None;
+                }
+                let predecessors = incoming(&labels);
+                let [earlier @ .., (_, last)] = predecessors.as_slice() else {
+                    return None;
+                };
+                (!earlier.is_empty()
+                    && predecessors
+                        .iter()
+                        .all(|(at, edge)| *at < index && is_conditional_jump(edge.opcode)))
+                .then_some(last.location)?
+            } else {
+                // A single conditional success locates the jump across an assertion's raise.
+                jump.jump_policy
+                    .is_original_empty_join()
+                    .then_some(jump.location)?
+            };
+            return (location.line >= 0).then_some((entry, location));
         }
         // With all successful cases terminated, CPython's dead case-success
         // edges still establish the end after the final class failure pops.
@@ -15626,8 +15673,8 @@ impl Assembler {
             || last.value_argument() != Some(0)
             || first.location.line < 0
             || first.location != last.location
-            || !intact(first)
-            || !intact(last)
+            || !intact(first, false)
+            || !intact(last, false)
             || first.depth_after().and_then(|depth| depth.checked_sub(1)) != last.depth_after()
             || !incoming(&[*last_label]).is_empty()
         {
@@ -15646,13 +15693,13 @@ impl Assembler {
             return None;
         }
         let mut failures = incoming(&first_aliases).into_iter();
-        let condition = failures.next()?;
+        let (_, condition) = failures.next()?;
         (failures.next().is_none()
             && condition.opcode == POP_JUMP_IF_NONE
             && condition.forward_target().is_some()
             && condition.location.line == first.location.line
             && condition.location.column == first.location.column
-            && intact(condition)
+            && intact(condition, false)
             && condition
                 .depth_after()
                 .and_then(|depth| depth.checked_sub(1))

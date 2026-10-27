@@ -25977,3 +25977,34 @@ fn short_circuit_value_after_manager_entries_uses_the_prior_handler() {
 ";
     assert_matches_cpython(source, "manager_value_guard.py", &LEVELS);
 }
+
+#[test]
+fn match_assertions_locate_the_manager_exit() {
+    let source = r"def check(subject):
+    with acquire():
+        match subject:
+            case [first, second]:
+                assert first
+                assert second
+            case _:
+                raise ValueError
+
+def alternatives(subject, enabled):
+    with acquire():
+        match subject:
+            case [item]:
+                assert (item
+                        or enabled)
+            case _:
+                return
+
+def shared_exit(subject):
+    with acquire():
+        match subject:
+            case [item]:
+                assert item
+            case _:
+                recover()
+";
+    assert_matches_cpython(source, "match_assertion_cleanup.py", &LEVELS);
+}
