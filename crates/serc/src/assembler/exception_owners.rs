@@ -10315,17 +10315,34 @@ impl LayoutAssembler {
                             && tail.insertions == 0
                             && tail.late_removals == 0
                             && tail.post_compaction_fusions == 0
-                            && let [authored, exits @ .., load, guard] =
+                            && let [authored, prefix @ .., guard] =
                                 &indexed_instructions[original_array_start..instruction_index]
                             && authored.opcode == NOP
                             && authored.location.line >= 0
                             && !authored.fusion_policy.is_converted_pop_block()
-                            && matches!(
-                                load.opcode,
-                                crate::target::opcodes::LOAD_FAST
-                                    | crate::target::opcodes::LOAD_FAST_BORROW
-                                    | crate::target::opcodes::LOAD_FAST_CHECK
-                            )
+                            && let Some(load_index) = prefix.iter().rposition(|record| {
+                                matches!(
+                                    record.opcode,
+                                    crate::target::opcodes::LOAD_FAST
+                                        | crate::target::opcodes::LOAD_FAST_BORROW
+                                        | crate::target::opcodes::LOAD_FAST_CHECK
+                                        | crate::target::opcodes::LOAD_DEREF
+                                        | crate::target::opcodes::LOAD_GLOBAL
+                                )
+                            })
+                            && let (exits, [load, attributes @ ..]) = prefix.split_at(load_index)
+                            && (load.opcode != crate::target::opcodes::LOAD_GLOBAL
+                                || load
+                                    .value_argument()
+                                    .is_some_and(|argument| argument & 1 == 0))
+                            && attributes.iter().all(|record| {
+                                record.opcode == crate::target::opcodes::LOAD_ATTR
+                                    && record
+                                        .value_argument()
+                                        .is_some_and(|argument| argument & 1 == 0)
+                                    && record.local_policy.hidden_exception_owner_slots() == 0
+                                    && record.pre_fold_extra_instructions() == 0
+                            })
                             && load.local_policy.hidden_exception_owner_slots() == 1
                             && matches!(guard.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
                             && guard.local_policy.hidden_exception_owner_slots() == 3
@@ -10354,8 +10371,8 @@ impl LayoutAssembler {
                                 })
                             })
                             && let Some(region) = self.uniform_exception_owner(
-                                instruction_index - 4,
-                                instruction_index - 2,
+                                original_array_start + load_index - 1,
+                                original_array_start + load_index + 1,
                                 &label_positions,
                             )
                             && !self.exception_regions[region].preserve_lasti

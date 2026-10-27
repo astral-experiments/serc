@@ -19068,6 +19068,20 @@ fn nested_conditional_arms_donate_implicit_return_locations() {
 }
 
 #[test]
+fn copied_manager_exit_owns_an_attribute_guard() {
+    let source = r"def publish(manager, ready, result):
+    try:
+        with manager(1), manager(2), manager(3), manager(4):
+            if ready:
+                return
+    finally:
+        if result.value is not None:
+            finish()
+";
+    assert_matches_cpython(source, "manager_attribute_guard.py", &LEVELS);
+}
+
+#[test]
 fn copied_manager_exit_discard_owns_the_finally_guard() {
     let source = r"def run(flag, state):
     try:
