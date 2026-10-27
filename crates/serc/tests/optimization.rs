@@ -23233,6 +23233,24 @@ for value in (False, True):
 }
 
 #[test]
+fn a_retained_try_entry_leaves_the_next_conditional_marker_unprotected() {
+    let source = r"def dispatch():
+    try:
+        while True:
+            value = current
+            try:
+                if enabled:
+                    consume(value)
+            except ValueError:
+                pass
+            finish(value)
+    except KeyError:
+        pass
+";
+    assert_matches_cpython(source, "retained_try_entry.py", &LEVELS);
+}
+
+#[test]
 fn nested_try_fallthrough_preserves_conditional_exception_owners() {
     const EXACT: &str = "def f(a,b,c,d):\n    while c:\n        try:\n            try:\n                if a:\n                    pass\n            except Exception:\n                pass\n        finally:\n            x = 0\n        break\n";
     const FRESH: &str = "def f(a,b,c,d):\n    while c:\n        try:\n            try:\n                if a:\n                    pass\n            except Exception:\n                pass\n        finally:\n            d.clear()\n        break\n";

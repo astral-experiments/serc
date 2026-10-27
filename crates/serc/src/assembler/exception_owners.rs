@@ -7251,6 +7251,7 @@ impl LayoutAssembler {
         let mut transferred_pop_setup: Option<(Label, usize)> = None;
         let mut transferred_setup_null_slots = None;
         let mut retained_pop_prefix = None;
+        let mut last_retained_setup = None;
         let mut early_return_nop_slot = None;
         let mut early_return_iterator_slot = None;
         let mut early_return_truth_slot = None;
@@ -8142,6 +8143,9 @@ impl LayoutAssembler {
                             Some((original_array_start, instruction_index, slot, region));
                     }
                     if instruction.opcode == NOP {
+                        if retained_setup_nops.contains(&instruction_index) {
+                            last_retained_setup = Some(instruction_index);
+                        }
                         early_return_iterator_slot = None;
                         early_return_nop_slot = None;
                         early_return_truth_slot = None;
@@ -11247,7 +11251,25 @@ impl LayoutAssembler {
                             ExceptionOwnerDecision::override_with_region(None),
                         );
                     }
-                    if retained_setup_null_markers.contains(&instruction_index) {
+                    // A retained SETUP still occupies its original slot. An unchanged
+                    // array appends its marker in a fresh slot, even inside another try.
+                    let fresh_retained_setup_marker = instruction.opcode == NOT_TAKEN
+                        && instruction.exception_policy()
+                            == super::ExceptionPolicy::NoneDynamicCondition
+                        && owner_history_exact
+                        && pop_slot_epoch_known
+                        && tail.early_removals == 0
+                        && tail.late_removals == 0
+                        && tail.insertions == 0
+                        && tail.post_compaction_fusions == 0
+                        && last_retained_setup.is_some_and(|setup| setup >= original_array_start)
+                        && matches!(
+                            owners.get(instruction_index),
+                            Some(ExceptionOwnerDecision::Tentative(ExceptionOwner::Absent))
+                        );
+                    if retained_setup_null_markers.contains(&instruction_index)
+                        || fresh_retained_setup_marker
+                    {
                         owners.insert(
                             instruction_index,
                             ExceptionOwnerDecision::override_with_region(None),
