@@ -25562,6 +25562,9 @@ impl<'source> Compiler<'source> {
         if statement.orelse.is_empty() {
             self.assembler
                 .record_empty_while_break_anchor(else_label, end);
+        } else if suite_contains_loop_break(&statement.body) {
+            // A break skips the else suite into its own original exit block.
+            self.assembler.record_exception_owner_block_boundary(end);
         }
         self.assembler.mark(end);
         self.set_depth(base_depth);

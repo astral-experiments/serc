@@ -2231,8 +2231,13 @@ impl OptimizationPipeline {
                     || !source.jump_policy.inline_small_exit()
                     || source.jump_policy.allows_threading_target()
                     || source.depth_after() != Some(0)
-                    // The producer's authored break NOP is the sole omitted slot.
-                    || source.pre_fold_extra_instructions() != 1
+                    // The break's NOP is the sole omitted slot unless a preceding
+                    // protected block kept it on its own side of the try exit.
+                    || !(source.pre_fold_extra_instructions() == 1
+                        || (source.pre_fold_extra_instructions() == 0
+                            && region_ranges.iter().any(|range| {
+                                range.start < source_index && range.end == source_index
+                            })))
                     || offset + 1 != source_items.len()
                     // A completed expression before the break occupies the same
                     // source block but does not supply the break's line.
