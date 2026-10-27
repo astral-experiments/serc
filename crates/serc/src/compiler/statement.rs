@@ -37018,9 +37018,11 @@ impl<'source> Compiler<'source> {
             && statement.orelse.is_empty()
             && !statement.handlers.is_empty()
             && statement.handlers.iter().all(|handler| {
-                handler
-                    .as_except_handler()
-                    .is_some_and(|handler| handler.type_.is_some())
+                handler.as_except_handler().is_some_and(|handler| {
+                    // A copied continue can leave an empty loop-backedge block
+                    // between the resumed yield and normal cleanup.
+                    handler.type_.is_some() && !suite_contains_loop_continue(&handler.body)
+                })
             })
             && !self.control.in_exception_handler()
             && self.control.finally.is_inactive_for_return_unwind()

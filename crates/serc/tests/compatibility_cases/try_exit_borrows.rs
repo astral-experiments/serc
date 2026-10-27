@@ -2365,7 +2365,7 @@ fn terminal_deletion_preserves_original_return_boundary() {
 
 #[test]
 fn borrows_locals_when_a_yield_resumes_into_guarded_cleanup() {
-    for transfer in ["return", "raise"] {
+    for transfer in ["return", "raise", "continue"] {
         let source = format!(
             "def values(manager, items, enabled, strict):\n    with manager:\n        for item in items:\n            try:\n                yield item\n            except Error as error:\n                if strict:\n                    {transfer}\n            finally:\n                if enabled:\n                    close(item)\n"
         );
