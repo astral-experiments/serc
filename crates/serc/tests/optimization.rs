@@ -1959,6 +1959,30 @@ fn compound_handler_loop_exits_keep_separate_cleanup_copies() {
 }
 
 #[test]
+fn folded_conditions_keep_shared_return_copies_unlocated() {
+    let source = r"def choose(a, b, c):
+    if a:
+        if b:
+            if c:
+                result = first()
+            elif True:
+                result = second()
+        elif True:
+            result = third()
+    else:
+        result = fallback()
+    return result
+";
+    for clause in ["elif True:", "elif c:", "else:"] {
+        assert_matches_cpython(
+            &source.replace("elif True:", clause),
+            "folded_shared_return.py",
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn nested_recovery_reaches_a_separate_tuple_return() {
     let source = "def sample(flag, left, right):
     if flag:
