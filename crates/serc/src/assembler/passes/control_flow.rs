@@ -2213,7 +2213,7 @@ impl OptimizationPipeline {
             }));
         }
         // A cleanup-free break first copies its original loop-exit bridge, then
-        // the small constant, local or tuple return. Keep that break's requested NOP through
+        // any small, single-line return. Keep that break's requested NOP through
         // our earlier threading only when all three original arrays still match.
         let original_break_return_bridges = original_authored_forward_jump_positions
             .iter()
@@ -2234,12 +2234,13 @@ impl OptimizationPipeline {
                     // The producer's authored break NOP is the sole omitted slot.
                     || source.pre_fold_extra_instructions() != 1
                     || offset + 1 != source_items.len()
-                    // A completed expression before the break occupies the same
-                    // source block but does not supply the break's line.
+                    // A completed statement in the same block is a separate line
+                    // event from the authored break.
                     || !(source_items[..offset].iter().all(|item| matches!(item, Item::Label(_)))
-                        || matches!(source_items[..offset].last(), Some(Item::Instruction(pop))
-                            if pop.opcode == POP_TOP && pop.depth_after() == Some(0)
-                                && pop.location.line >= 0 && pop.location.line != source.location.line))
+                        || matches!(source_items[..offset].last(), Some(Item::Instruction(previous))
+                            if matches!(previous.opcode, POP_TOP | STORE_FAST | crate::target::opcodes::STORE_ATTR)
+                                && previous.depth_after() == Some(0)
+                                && previous.location.line >= 0 && previous.location.line != source.location.line))
                 {
                     return None;
                 }
@@ -2291,16 +2292,11 @@ impl OptimizationPipeline {
                         matches!(item, Item::Instruction(instruction)
                             if instruction.depth_after() == Some(depth))
                     });
-                let tuple_return = super::normal_try_copies::original_local_tuple_return(return_items)
-                    .is_some()
-                    && return_items.iter().zip([1, 2, 1, 0]).all(|(item, depth)| {
-                        matches!(item, Item::Instruction(instruction)
-                            if instruction.depth_after() == Some(depth))
-                    });
                 let Some(Item::Instruction(return_)) = return_items.last() else {
                     return None;
                 };
-                if !(constant_return || local_return || tuple_return)
+                if return_.opcode != RETURN_VALUE
+                    || !targets_small_scope_exit(graph, target)
                     || !target_items[..first].iter().all(clean_label)
                     || return_.depth_after() != Some(0)
                     || return_.location.line < 0
