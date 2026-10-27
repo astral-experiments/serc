@@ -22240,6 +22240,16 @@ fn deferred_handler_return_replays_the_inner_finalizer_owner() {
 }
 
 #[test]
+fn sole_handler_locates_finally_after_an_unreachable_loop_exit() {
+    for handler in ["await recover(value)", "value = recover(value)", "pass"] {
+        let source = format!(
+            "async def run(value, recover, release):\n    try:\n        while True:\n            pass\n        return value\n    except KeyError:\n        raise\n    except ValueError as error:\n        {handler}\n    finally:\n        release(value)\n"
+        );
+        assert_matches_cpython(&source, "handler_finally_line.py", &LEVELS);
+    }
+}
+
+#[test]
 fn folded_loop_exit_precedes_nested_finally_line_propagation() {
     for protected in [
         "with manager:\n            while True:\n                work()",
