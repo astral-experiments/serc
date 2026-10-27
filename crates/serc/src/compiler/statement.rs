@@ -16717,6 +16717,27 @@ impl<'source> Compiler<'source> {
                     },
                 )?;
                 let pass_only_body = matches!(body, [Stmt::Pass(_)]);
+                let trailing_pass_starts_block = match body {
+                    [.., _, Stmt::Pass(pass)]
+                        if self.context.python_version >= crate::PythonVersion::Py314 =>
+                    {
+                        let location = self.source_location(pass.range);
+                        let previous = self.assembler.current_block_last_instruction_location();
+                        let emitted_pass = self.assembler.last_instruction_is_nop()
+                            && self.assembler.last_instruction_location() == Some(location);
+                        let repeats_line = if emitted_pass {
+                            self.assembler.last_nop_repeats_previous_line()
+                        } else {
+                            previous.is_some_and(|previous| previous.line == location.line)
+                        };
+                        (!repeats_line).then(|| {
+                            self.assembler
+                                .current_original_block_pre_fusion_instruction_count()
+                                <= usize::from(emitted_pass)
+                        })
+                    }
+                    _ => None,
+                };
                 // Declarations emit no instruction or source-line marker in CPython.
                 if self.assembler.instruction_count() == body_start
                     && !declaration_only_body
@@ -18151,6 +18172,12 @@ impl<'source> Compiler<'source> {
                     } else if pass_only_body && is_none_pass_assignment_branch(statement) {
                         self.assembler
                             .preserve_redundant_jump_nop_after_threading(branch_exit);
+                    } else if let Some(starts_block) = trailing_pass_starts_block {
+                        self.assembler.preserve_authored_pass_jump_nop(branch_exit);
+                        if starts_block {
+                            // An authored NOP at the original join blocks early threading.
+                            self.assembler.prevent_jump_threading_target(branch_exit);
+                        }
                     } else if pass_only_body {
                         self.assembler.preserve_authored_pass_jump_nop(branch_exit);
                         if final_chained_comparison_jump(test).is_some() {
