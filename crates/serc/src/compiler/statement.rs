@@ -52244,10 +52244,10 @@ fn suite_has_shared_terminal_condition_exit(body: &[Stmt]) -> bool {
         Some(Stmt::For(iterator))
             if !iterator.is_async && !suite_contains_loop_break(&iterator.body) =>
         {
-            // The else arms jump to one unlocated return. Each copied exit
-            // inherits its own fallthrough line before the final arm reaches it.
+            // The exhaustion guard shares an unlocated return with the outer
+            // branch. Each arm and the guard’s false edge supply their own lines.
             matches!(iterator.orelse.last(), Some(Stmt::If(guard))
-                if guard.elif_else_clauses.last().is_some_and(|clause| clause.test.is_none())
+                if guard.elif_else_clauses.last().is_none_or(|clause| clause.test.is_none())
                     && if_suites(guard).any(|arm| !suite_terminates_before_constant_folding(arm)))
         }
         _ => false,

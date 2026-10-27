@@ -8870,6 +8870,15 @@ fn loop_else_branches_locate_each_copy_of_an_implicit_return() {
                 yield second()
 ";
     assert_matches_cpython(source, "loop_else_branch_returns.py", &LEVELS);
+    let guarded = r"def iterate(values, active, ready):
+    if active:
+        for value in values:
+            work(value)
+        else:
+            if ready:
+                yield value
+";
+    assert_matches_cpython(guarded, "loop_else_guard_return.py", &LEVELS);
 }
 
 #[test]
