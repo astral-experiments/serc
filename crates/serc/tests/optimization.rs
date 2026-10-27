@@ -15,6 +15,27 @@ use serc::{
 };
 
 #[test]
+fn iterator_returns_reuse_the_finalizer_pop_for_attribute_tests() {
+    let source = r"async def first(items, item):
+    try:
+        for item in items:
+            observe(item)
+            return 1
+    except LookupError:
+        recover()
+    finally:
+        if item.active:
+            finish()
+";
+    assert_matches_cpython_versions(
+        source,
+        "iterator_attribute.py",
+        &LEVELS,
+        &VERSIONS.map(|(version, _, _)| version),
+    );
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
