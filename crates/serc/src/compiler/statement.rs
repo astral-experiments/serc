@@ -25136,6 +25136,23 @@ impl<'source> Compiler<'source> {
                 // under an outer manager. Keep the removed-break barrier: only the
                 // assembler's surviving authored jump can open this original entry.
                 // Suspension changes the manager exit, not this direct cleanup edge.
+                // A runtime conditional starts a populated normal cleanup even without a
+                // manager. In contrast, a folded guard can leave an empty original target.
+                let conditional_cleanup_entry = self.control.finally.active_return_finally_contexts
+                    .last().is_some_and(|context| {
+                        matches!(context.body.split_first(), Some((Stmt::If(guard), suffix))
+                            if condition_has_linear_runtime_leaves(&guard.test)
+                                && !expression_suspends_current_scope(&guard.test)
+                                && guard.elif_else_clauses.iter().all(|clause| clause.test.as_ref().is_none_or(|test|
+                                    condition_has_linear_runtime_leaves(test)
+                                        && !expression_suspends_current_scope(test)))
+                                && if_suites(guard).all(|arm| {
+                                    // Later recovery blocks do not precede the guard's entry.
+                                    arm.first().is_some_and(|first| suite_has_linear_borrow_fallthrough(std::slice::from_ref(first)))
+                                        && !suite_contains_abrupt_control_flow(arm)
+                                })
+                                && (suffix.is_empty() || suite_has_linear_borrow_fallthrough(suffix)))
+                    });
                 if matches!(self.unit.scope, Scope::Function { .. })
                     && !self.control.statements.context.has_following
                     && (self.control.loops.contexts.is_empty()
@@ -25152,7 +25169,7 @@ impl<'source> Compiler<'source> {
                     && self.control.finally.active_normal_finally_bodies == 0
                     && self.control.finally.active_finally_end_blocks == 0
                     && self.control.finally.active_copied_finally_bodies == 0
-                    && !self.control.withs.active_with_exits.is_empty()
+                    && (!self.control.withs.active_with_exits.is_empty() || conditional_cleanup_entry)
                     && self.control.withs.active_with_region_exclusions.len()
                         == self.control.withs.active_with_exits.len()
                     && self.control.finally.innermost_finally_exception_exclusion_depth
@@ -25169,7 +25186,7 @@ impl<'source> Compiler<'source> {
                             && context.exception_region_depth + 1
                                 == self.control.exceptions.active_exception_region_exclusions.len()
                             && !suite_contains_yield(context.body)
-                            && (self.suite_has_nonempty_borrow_entry(context.body)
+                            && (conditional_cleanup_entry || self.suite_has_nonempty_borrow_entry(context.body)
                                 || matches!(context.body, [Stmt::Assign(assignment), suffix @ ..]
                                     if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
                                         && cleanup_conditional_argument_has_eager_call_prefix(&assignment.value)
@@ -25187,7 +25204,7 @@ impl<'source> Compiler<'source> {
                                 // Preserve the existing synchronous recovery entry,
                                 // whose call survives even when its setup NOP shares a line.
                                 || (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
-                                    && !self.control.withs.active_with_exits[0].is_async
+                                    && self.control.withs.active_with_exits.first().is_some_and(|manager| !manager.is_async)
                                     && suite_has_live_conditional_break(&statement.body, true)
                                     && matches!(context.body, [Stmt::Try(cleanup)]
                                         if !cleanup.is_star
