@@ -3066,9 +3066,7 @@ impl<'source> Compiler<'source> {
                         if !previous.is_async);
                 // Keep the final literal's authored NOP in its original array until
                 // small-exit copying has counted it, before later NOP cleanup.
-                let retain_final_literal_nop = self.context.python_version
-                    >= crate::PythonVersion::Py314
-                    && is_final
+                let retain_final_literal_nop = is_final
                     && final_expression_becomes_return
                     && literal_constant(&expression.value).is_some()
                     // Existing module markers retain their boundary for manager suppression.
