@@ -12380,7 +12380,7 @@ impl Assembler {
                 return;
             };
             if compare.opcode != COMPARE_OP
-                || !compare.value_argument().is_some_and(|arg| arg & 16 != 0)
+                || compare.value_argument().is_none_or(|arg| arg & 16 == 0)
                 || !matches!(jump.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE)
             {
                 return;
