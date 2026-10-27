@@ -32696,6 +32696,15 @@ impl<'source> Compiler<'source> {
                         && matches!(tail.body.as_slice(), [Stmt::Raise(raised)]
                             if raised.exc.is_none() && raised.cause.is_none()))
                 && self.assembler.at_original_jump_only_conditional_join();
+            // An iterator break and its exhaustion suite can enter the same
+            // unlocated cleanup. Each copy then inherits its own predecessor's line.
+            let copy_break_cleanup = if handler.name.is_some() {
+                !terminal && !cleanup_has_small_return_successor
+            } else {
+                self.context.python_version >= crate::PythonVersion::Py314
+                    && matches!(handler.body.last(), Some(Stmt::For(iterator))
+                        if !iterator.is_async && !iterator.orelse.is_empty())
+            };
             let handler_ends_with_inlineable_cleanup = (guarded_loop_try && shared_guard(&handler.body) && self.assembler.at_original_shared_cleanup_join())
                 || handler_ends_with_preordered_cleanup
                 || handler_has_elided_for_break_cleanup
@@ -32711,12 +32720,7 @@ impl<'source> Compiler<'source> {
                 || handler_ends_with_loop_tail_join
                 || handler_ends_with_runtime_while_break_cleanup
                 || handler_has_folded_while_break_cleanup
-                // A named handler's five-record cleanup can be copied onto original
-                // break edges even when a loop's exhaustion arm also falls through.
-                || (handler.name.is_some()
-                    && !terminal
-                    && !cleanup_has_small_return_successor
-                    && self.assembler.at_original_authored_break_join())
+                || (copy_break_cleanup && self.assembler.at_original_authored_break_join())
                 // The original unnamed cleanup retains POP_BLOCK in its recorded width.
                 // Nested joins can therefore remain unlocated before a small return is copied;
                 // the copy pass preserves the earlier threaded edge's original visit order.

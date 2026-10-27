@@ -4465,6 +4465,23 @@ fn nested_finalizers_reuse_unowned_setup_slots_after_manager_returns() {
 }
 
 #[test]
+fn handler_cleanup_after_for_else_inherits_the_break_location() {
+    let source = r"def lookup(items):
+    try:
+        result = cached()
+    except LookupError:
+        for item in items:
+            if item:
+                result = item
+                break
+        else:
+            result = None
+    return result
+";
+    assert_matches_cpython(source, "handler_for_else_break.py", &LEVELS);
+}
+
+#[test]
 fn handler_and_iterator_returns_reuse_the_final_cleanup_pop() {
     for source in [
         r"async def sample(value, flag):
