@@ -6397,6 +6397,22 @@ fn managed_mixed_erased_iterator_guard_preserves_shared_backedge() {
 }
 
 #[test]
+fn guarded_finalizer_copies_the_handler_value_return() {
+    let source = r"def sample(ready, flag, value):
+    try:
+        work()
+    except ValueError:
+        if flag:
+            try:
+                return value
+            finally:
+                if ready:
+                    finish(value)
+";
+    assert_matches_cpython(source, "guarded_handler_return.py", &LEVELS);
+}
+
+#[test]
 fn iterator_handler_returns_preserve_conditional_finalizer_entry() {
     let source = r"def sample(values, flag):
     resource = None
