@@ -38131,6 +38131,21 @@ impl<'source> Compiler<'source> {
                             && context.finally_end_depth == 0
                             && context.exception_region_depth == 0))
                     && managed_guarded_raise_has_finally_route(statement)));
+        // The true arm of a terminal if jumps over a populated else suite.
+        // When both endpoints survive, that normal jump enters the finalizer
+        // independently of the removed POP_BLOCK or any cold handler exits.
+        let guarded_arm_jump_reaches_finally = self.context.python_version
+            == crate::PythonVersion::Py314
+            && !statement.is_star
+            && statement.orelse.is_empty()
+            && !statement.handlers.is_empty()
+            && self.suite_has_nonempty_borrow_entry(&statement.finalbody)
+            && matches!(statement.body.last(), Some(Stmt::If(guard))
+                if early_condition_truthiness(&guard.test).is_none()
+                    && suite_has_fallthrough(&guard.body, false)
+                    && matches!(guard.elif_else_clauses.as_slice(), [clause]
+                        if clause.test.is_none()
+                            && suite_has_nonsuspending_linear_fallthrough(&clause.body)));
         let normal_finally_is_borrow_reachable = (simple_fallthrough_handlers_reach_finally
             || compound_fallthrough_handlers_reach_finally
             || runtime_while_handlers_reach_finally)
@@ -38143,6 +38158,7 @@ impl<'source> Compiler<'source> {
             || coroutine_guarded_nested_cleanup_entry
             || raising_alternative_reaches_finally
             || guarded_recovery_arm_reaches_finally
+            || guarded_arm_jump_reaches_finally
             || coroutine_manager_raise_else_reaches_finally
             || runtime_while_false_edge_reaches_finally
             || async_generator_while_cleanup
