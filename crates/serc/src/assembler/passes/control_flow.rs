@@ -2212,6 +2212,88 @@ impl OptimizationPipeline {
                 Item::Instruction(_) => None,
             }));
         }
+        // Unwinding an ordinary try can split an authored break from the end of
+        // its original block. CPython copies the unlocated loop and try exits
+        // before it copies the small return, retaining the break's own line.
+        let provenance = &self.exception_owner_provenance;
+        let split_break_sources = if provenance.ordinary_try_region_origins.is_empty() {
+            &[]
+        } else {
+            original_authored_forward_jump_positions
+        };
+        let split_break_returns = split_break_sources
+            .iter()
+            .filter_map(|&(source_index, (block, offset))| {
+                let items = graph[block].items();
+                let Item::Instruction(source) = items[offset] else {
+                    return None;
+                };
+                let entry = source.forward_target()?;
+                let mut original = Instruction::new(
+                    JUMP_FORWARD,
+                    Operand::Forward(entry),
+                    source.location,
+                    Some(0),
+                );
+                original.fusion_policy.mark_authored_break();
+                original.jump_policy.retain_nop_for_direct_target();
+                original.jump_policy.prevent_threading_target();
+                if source != original
+                    || source.location.line < 0
+                    || offset + 1 != items.len()
+                    || offset == 0
+                    || !items[..offset].iter().all(|item| {
+                        matches!(item,
+                        Item::Label(label) if !provenance.block_boundaries.contains(label))
+                    })
+                    || !provenance
+                        .ordinary_try_region_origins
+                        .iter()
+                        .any(|&(_, start, end, _)| {
+                            label_offsets[&start] < source_index
+                                && label_offsets[&end] == source_index
+                        })
+                {
+                    return None;
+                }
+                let mut target = entry;
+                loop {
+                    let target_block = &graph[graph.label_block(target)?];
+                    if target_block.last_instruction()?.opcode == RETURN_VALUE
+                        && targets_small_scope_exit(graph, target)
+                    {
+                        return (target != entry).then_some((source_index, (source, target)));
+                    }
+                    let (Item::Instruction(bridge), labels) = target_block.items().split_last()?
+                    else {
+                        return None;
+                    };
+                    let next = bridge.forward_target()?;
+                    let folded_exit = bridge.jump_policy.retained_nop()
+                        == super::super::ir::RetainedJumpNop::DirectTarget
+                        && provenance.source_boundaries.contains(&target);
+                    if bridge.opcode != JUMP_FORWARD
+                        || !bridge.jump_policy.allows_threading_target()
+                        || bridge.jump_policy.is_interruptible()
+                        || bridge.pre_fold_extra_instructions() != 0
+                        || bridge.depth_after() != Some(0)
+                        || label_offsets[&next] <= label_offsets[&target]
+                        || !labels.iter().all(|item| {
+                            matches!(item, Item::Label(label)
+                            if !self.original_nop_targets.contains(label)
+                                && !provenance.omitted_nop_counts.contains_key(label)
+                                && !provenance.omitted_nop_locations.contains_key(label))
+                        })
+                        || !(bridge.location == SourceLocation::NONE
+                            || normal_try_exits.contains(&label_offsets[&target])
+                            || folded_exit)
+                    {
+                        return None;
+                    }
+                    target = next;
+                }
+            })
+            .collect::<FxHashMap<_, _>>();
         // A cleanup-free break first copies its original loop-exit bridge, then
         // any small, single-line return. Keep that break's requested NOP through
         // our earlier threading only when all three original arrays still match.
@@ -3322,6 +3404,13 @@ impl OptimizationPipeline {
                         .iter()
                         .filter_map(|(entry, origin)| (*origin == original_jump).then_some(*entry)),
                 );
+            }
+            if retargeted
+                && split_break_returns.get(&source_index) == Some(&(original_jump, target))
+                && matches!(operand, Operand::Forward(_))
+                && !instruction.jump_policy.is_interruptible()
+            {
+                instruction.jump_policy.retain_nop_for_direct_target();
             }
             if authored_break_copy_nop
                 && threaded_jump_count == 1
