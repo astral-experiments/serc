@@ -26452,15 +26452,12 @@ impl<'source> Compiler<'source> {
                 self.compile_expression(value)?;
                 self.compile_store_target(&assignment.target)?;
             }
-            if self
+            if let Some(index) = self
                 .unit
-                .class_conditional_annotations
-                .front()
-                .is_some_and(|range| *range == assignment.range)
+                .class_conditional_annotation_indices
+                .get_mut(&assignment.range)
+                .and_then(|indices| indices.pop())
             {
-                self.unit.class_conditional_annotations.pop_front();
-                let index = self.unit.module_annotation_index;
-                self.unit.module_annotation_index += 1;
                 self.assembler
                     .set_location(self.source_location(assignment.range));
                 let cell = self.closure_index("__conditional_annotations__")?;

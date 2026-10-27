@@ -7883,6 +7883,21 @@ fn recovery_finalizer_preserves_local_return_borrow_boundary() {
 }
 
 #[test]
+fn class_annotation_indices_include_unreachable_branches() {
+    let source = r"class Row:
+    if False:
+        unused: A
+    if enabled:
+        field: B
+    try:
+        work()
+    finally:
+        outcome: C
+";
+    assert_matches_cpython(source, "conditional_class_annotations.py", &LEVELS);
+}
+
+#[test]
 fn chained_comparison_copies_a_store_and_bare_raise() {
     let source = r"def classify(value):
     try:
