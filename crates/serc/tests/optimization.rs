@@ -25977,3 +25977,21 @@ fn short_circuit_value_after_manager_entries_uses_the_prior_handler() {
 ";
     assert_matches_cpython(source, "manager_value_guard.py", &LEVELS);
 }
+
+#[test]
+fn async_manager_none_guard_keeps_its_inner_handler() {
+    let source = r"async def receive(manager, stopped):
+    try:
+        async with manager:
+            while not stopped:
+                frame = await read()
+                try:
+                    if frame is not None:
+                        await handle(frame)
+                except LookupError as error:
+                    record(error)
+    except OSError:
+        pass
+";
+    assert_matches_cpython(source, "managed_frame_guard.py", &LEVELS);
+}
