@@ -8625,12 +8625,6 @@ impl<'source> Compiler<'source> {
                         .withs
                         .active_with_exits
                         .iter()
-                        .all(|context| context.finally_end_depth == 0)
-                    && self
-                        .control
-                        .loops
-                        .contexts
-                        .iter()
                         .all(|context| context.finally_end_depth == 0);
                 // Iterators entered by an exceptional finally sit above its saved
                 // exception state. Unwind that inner suffix before FINALLY_END, then
@@ -10902,7 +10896,17 @@ impl<'source> Compiler<'source> {
                                 }
                             }
                         }
+                        let mut remaining_loop_depth = loop_depth;
                         if handler_before_finally_end {
+                            // Iterators entered by this finalizer sit below the handler
+                            // it is leaving, but above the finalizer's saved exception.
+                            if let Some(depth) = self.control.loops.contexts[..loop_depth]
+                                .iter()
+                                .position(|context| context.finally_end_depth == 1)
+                            {
+                                self.emit_loop_iterator_cleanup(depth, loop_depth, preserve_tos)?;
+                                remaining_loop_depth = depth;
+                            }
                             let start = self.emit_finally_end_unwind(0, preserve_tos, None)?;
                             if let Some(region_starts) = &mut handler_region_unwind_starts
                                 && let Some(&owner) =
@@ -10929,7 +10933,7 @@ impl<'source> Compiler<'source> {
 
                             deferred_finally_end_marked = true;
                         }
-                        next_loop = loop_depth;
+                        next_loop = remaining_loop_depth;
                         next_handler -= 1;
                         continue;
                     }

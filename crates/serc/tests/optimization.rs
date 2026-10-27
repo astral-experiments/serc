@@ -19573,6 +19573,16 @@ print(json.dumps(rows))
 }
 
 #[test]
+fn handler_returns_unwind_iterators_before_the_enclosing_finalizer() {
+    for returned in ["1", "result(item)"] {
+        let source = format!(
+            "async def run(groups, stream):\n    for group in groups:\n        try:\n            use(group)\n        finally:\n            async for item in stream:\n                try:\n                    inspect(item)\n                except Error as caught:\n                    report(caught)\n                    return {returned}\n"
+        );
+        assert_matches_cpython(&source, "handler_finally_iterators.py", &LEVELS);
+    }
+}
+
+#[test]
 fn exceptional_finally_return_inside_older_handler() {
     const GENERATOR: &str = r"def f(manager, work):
     try:
