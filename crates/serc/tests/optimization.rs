@@ -15,6 +15,28 @@ use serc::{
 };
 
 #[test]
+fn identity_test_in_generator_finally_keeps_the_manager_handler() {
+    let source = r"def sample(active, item, one, other):
+    with acquire():
+        try:
+            while active:
+                if stop():
+                    break
+                yield item
+        finally:
+            if one is not other:
+                clean()
+";
+    for operator in ["is", "is not"] {
+        assert_matches_cpython(
+            &source.replace("is not", operator),
+            "finally_identity.py",
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn nested_conversion_handlers_keep_shared_cleanup() {
     let source = r"def sample(items):
     for item in items:

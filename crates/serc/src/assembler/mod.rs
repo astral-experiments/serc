@@ -5402,8 +5402,11 @@ impl Assembler {
                 && pop.location == SourceLocation::NONE
                 && pop.fusion_policy.is_converted_pop_block()
                 && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
-                && comparison.opcode == crate::target::opcodes::COMPARE_OP
-                && matches!(comparison.operand(), Operand::Value(argument) if argument & 16 != 0)
+                && match comparison.opcode {
+                    crate::target::opcodes::COMPARE_OP => matches!(comparison.operand(), Operand::Value(argument) if argument & 16 != 0),
+                    crate::target::opcodes::IS_OP => matches!(comparison.value_argument(), Some(0 | 1)),
+                    _ => false,
+                }
                 && comparison.location == condition.location
                 && condition.location.line >= 0
                 && condition.forward_target().is_some()
@@ -5413,7 +5416,8 @@ impl Assembler {
                     == base_depth.checked_add(2)
                 && instructions.iter().all(|record| {
                     record.pre_fold_extra_instructions() == 0
-                        && record.local_policy.hidden_exception_owner_slots() == 0
+                        && record.local_policy.hidden_exception_owner_slots() == u16::from(
+                            record == comparison && comparison.opcode == crate::target::opcodes::IS_OP)
                         && record.no_location_policy.borrow_fallthrough()
                             == BorrowFallthrough::Reachable
                 })
