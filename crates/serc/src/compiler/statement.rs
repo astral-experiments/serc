@@ -35222,6 +35222,12 @@ impl<'source> Compiler<'source> {
                 handler.as_except_handler().is_some_and(|handler| {
                     handler.type_.is_some()
                         && suite_has_plain_recovery_fallthrough(&handler.body, false)
+                        // A chained comparison has a separate operand-cleanup
+                        // block before the handler's ordinary false edge.
+                        && !suite_any_statement(&handler.body, |part| {
+                            matches!(part, Stmt::If(guard)
+                                if expression_contains_chained_comparison(&guard.test))
+                        })
                 })
             });
         let compound_fallthrough_handlers_reach_finally = !statement.is_star
