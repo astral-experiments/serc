@@ -6808,6 +6808,35 @@ fn continue_copies_inner_cleanup_inside_an_enclosing_finalizer() {
 }
 
 #[test]
+fn continue_from_nested_handlers_preserves_the_outer_cleanup_owner() {
+    let source = r"async def run(items, flag):
+    for item in items:
+        try:
+            try:
+                try:
+                    work(item)
+                except LookupError as outer:
+                    try:
+                        recover()
+                    except ValueError as inner:
+                        await finish()
+                        continue
+            except OSError:
+                pass
+        finally:
+            if flag is not None:
+                close(item)
+            done()
+";
+    assert_matches_cpython_versions(
+        source,
+        "nested_handler_continue.py",
+        &LEVELS,
+        &[PythonVersion::Py314],
+    );
+}
+
+#[test]
 fn continue_from_a_named_handler_preserves_the_name_cleanup_owner() {
     let source = r"async def run(items, flag):
     for item in items:
