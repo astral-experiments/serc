@@ -16445,6 +16445,7 @@ impl<'source> Compiler<'source> {
                         .exclude_terminal_if_not_taken_from_generator,
                     exclude_later_async_with_terminal,
                 );
+                let condition_start = self.assembler.item_count();
                 let compile_condition = self.with_control_override(
                     |control| &mut control.loops.protected_iterator_continue_condition,
                     protected_iterator_continue_condition,
@@ -16511,6 +16512,9 @@ impl<'source> Compiler<'source> {
                     self.assembler.set_forced_borrowed_loads(previous);
                 }
                 compile_condition?;
+                if self.context.python_version == crate::PythonVersion::Py314 {
+                    self.assembler.record_taken_if_borrow_jump(condition_start, next);
+                }
                 if branch_index == 0
                     && self.control.conditions.copied_finally_condition_owner == Some(test.range())
                 {

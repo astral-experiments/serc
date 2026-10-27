@@ -7285,6 +7285,20 @@ impl Assembler {
         }
     }
 
+    /// Records a taken constant at the entry of an authored if condition.
+    pub(crate) fn record_taken_if_borrow_jump(&mut self, start: usize, target: Label) {
+        let Some(jump) = self.linear_items()[start..].iter().find_map(Item::as_instruction) else {
+            return;
+        };
+        if jump.forward_target() == Some(target)
+            && jump.jump_policy.always_retains_nop()
+            && jump.no_location_policy.borrow_fallthrough() == BorrowFallthrough::BarrierIfRemoved
+        {
+            let original = *jump;
+            self.exception_owner_provenance.taken_constant_borrow_jumps.insert(original);
+        }
+    }
+
     /// Keeps a folded condition's empty block only when its located NOP is removed.
     pub(crate) fn mark_last_nop_borrow_barrier_if_removed(&mut self) {
         let instruction = self.required_last_instruction_mut("marking a removable NOP barrier");

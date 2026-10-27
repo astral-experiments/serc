@@ -253,6 +253,7 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) legacy_protocol_await_setups: Vec<LegacyProtocolAwaitSetup>,
     // Authored ordinary-try SETUP and its original handler, independently of split ranges.
     pub(super) ordinary_try_setups: FxHashMap<Label, Label>,
+    pub(super) taken_constant_borrow_jumps: FxHashSet<Instruction>,
     // Handler of a retained try/finally SETUP whose body starts with a conditional.
     pub(super) guarded_finally_setups: FxHashMap<Label, Label>,
     // Original SETUP and exact depth-zero fragment start, end and handler.
