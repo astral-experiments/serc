@@ -676,6 +676,12 @@ impl OptimizationPipeline {
         let retired_labels = &self
             .exception_owner_provenance
             .retired_normal_try_copy_labels;
+        let original_boundaries = &self.exception_owner_provenance.block_boundaries;
+        let unchanged_join = |items: &[Item], label: Label, expected: Instruction| {
+            matches!(items, [Item::Label(head), aliases @ .., Item::Instruction(jump)]
+                if *head == label && *jump == expected
+                    && aliases.iter().all(|item| matches!(item, Item::Label(_))))
+        };
         let graph = &mut self.graph;
         // Resolve original labels only within this pass. A saved item offset could
         // otherwise name a different store after earlier graph rewrites.
@@ -694,8 +700,11 @@ impl OptimizationPipeline {
                     if retired_labels.contains(&origin.predecessor)
                         || graph[pair[0]].first_label() != Some(origin.predecessor)
                         || graph[pair[0]].last_instruction() != Some(&origin.store)
-                        || !matches!(graph[pair[1]].items(), [Item::Label(head), Item::Instruction(jump)]
-                            if *head == label && *jump == origin.jump)
+                        || !unchanged_join(graph[pair[1]].items(), label, origin.jump)
+                        || graph[pair[1]].items().iter().skip(1).any(|item| {
+                            matches!(item, Item::Label(alias)
+                                if !original_boundaries.contains(alias) || retired_labels.contains(alias))
+                        })
                     {
                         return None;
                     }
@@ -802,8 +811,7 @@ impl OptimizationPipeline {
                     if let Some((label, origin)) = join_stores.get(&positions[last])
                         && origin.store == last_instruction
                         && graph.label_block(*label).is_some_and(|block| {
-                            matches!(graph[block].items(), [Item::Label(head), Item::Instruction(jump)]
-                                if *head == *label && *jump == origin.jump)
+                            unchanged_join(graph[block].items(), *label, origin.jump)
                         })
                     {
                         // The original assignment store really moves in this exchange.

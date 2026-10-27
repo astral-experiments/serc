@@ -1959,6 +1959,30 @@ fn compound_handler_loop_exits_keep_separate_cleanup_copies() {
 }
 
 #[test]
+fn pair_assignments_keep_the_original_store_line_on_copied_returns() {
+    let pair = "left, right = obj.left, obj.right";
+    let nested =
+        format!("if ready():\n                {pair}\n            else:\n                {pair}");
+    for (first, second) in [(nested.as_str(), pair), (pair, nested.as_str())] {
+        let source = format!(
+            r"def choose(flag, obj):
+    if flag == 1:
+        if ready():
+            {first}
+        else:
+            {second}
+    elif flag == 2:
+        {pair}
+    else:
+        {pair}
+    return left, right
+"
+        );
+        assert_matches_cpython(&source, "pair_assignment_return.py", &LEVELS);
+    }
+}
+
+#[test]
 fn nested_recovery_reaches_a_separate_tuple_return() {
     let source = "def sample(flag, left, right):
     if flag:

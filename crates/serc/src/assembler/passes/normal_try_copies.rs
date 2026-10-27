@@ -369,6 +369,20 @@ impl OptimizationPipeline {
             found
         };
 
+        // BUILD_TUPLE and its UNPACK_SEQUENCE share one located SWAP after lowering.
+        let original_tuple_swap = |instruction: &Instruction| {
+            instruction.opcode == SWAP
+                && instruction.value_argument() == Some(2)
+                && instruction.depth_after() == Some(2)
+                && instruction.location.line >= 0
+                && instruction.pre_fold_extra_instructions() == 1
+                && instruction.local_policy.hidden_exception_owner_slots() == 1
+                && self
+                    .exception_owner_provenance
+                    .uniform_fold_owner_slots
+                    .contains(&(instruction.location, SWAP, 1))
+        };
+
         // Exact original arrays have only head labels and no erased records.
         // Folded-prefix admission below relaxes only their instruction-slot count.
         // Reject only concrete regions touching selected arrays: coroutine scope
@@ -435,7 +449,9 @@ impl OptimizationPipeline {
                     }
                     Item::Instruction(instruction) => {
                         seen_instruction = true;
-                        if (!folded_prefix && instruction.pre_fold_extra_instructions() != 0)
+                        if (!folded_prefix
+                            && instruction.pre_fold_extra_instructions() != 0
+                            && !original_tuple_swap(instruction))
                             || instruction.fusion_policy.is_converted_pop_block()
                             || instruction.fusion_policy.is_authored_break()
                         {
@@ -1299,9 +1315,8 @@ impl OptimizationPipeline {
                     prefix: prefix
                         .iter()
                         .flat_map(|instruction| {
-                            // CPython copies before folding LOAD_GLOBAL/PUSH_NULL.
-                            // The fused operand preserves the second original slot,
-                            // whose callee location is the same as LOAD_GLOBAL's.
+                            // Restore a fused PUSH_NULL or BUILD_TUPLE before copying.
+                            // Both share the surviving instruction's location.
                             let fused_push_null = instruction.opcode == LOAD_GLOBAL
                                 && matches!(instruction.operand(), Operand::Value(argument) if argument & 1 != 0);
                             std::iter::repeat_n(
@@ -1309,7 +1324,7 @@ impl OptimizationPipeline {
                                     is_nop: instruction.opcode == NOP,
                                     located: instruction.location.line >= 0,
                                 },
-                                1 + usize::from(fused_push_null),
+                                1 + usize::from(fused_push_null) + usize::from(original_tuple_swap(instruction)),
                             )
                         })
                         .collect(),
