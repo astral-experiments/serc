@@ -24555,10 +24555,54 @@ impl<'source> Compiler<'source> {
         })?;
         self.assembler.mark(anchor);
         self.set_depth(base_depth);
-        self.compile_suite(&statement.orelse)?;
+        self.compile_loop_else_suite(&statement.orelse, statement.range)?;
         self.assembler.mark(end);
         self.set_depth(base_depth);
         Ok(())
+    }
+
+    /// Keeps an authored loop-else pass on the exhaustion edge inside a try.
+    fn compile_loop_else_suite(
+        &mut self,
+        body: &[Stmt],
+        loop_range: TextRange,
+    ) -> Result<(), CompileError> {
+        if let [Stmt::Pass(pass)] = body
+            && !self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && self.control.withs.active_with_region_exclusions.is_empty()
+        {
+            // Modern NOP removal keeps the line on the following POP_BLOCK slot.
+            // At the end of the try body that slot is outside its own handler.
+            let ordinary_try_tail = self.context.python_version >= crate::PythonVersion::Py314
+                && self.control.exceptions.active_try_body_tail == Some(loop_range);
+            let start = ordinary_try_tail.then(|| {
+                let label = self.assembler.label();
+                self.assembler.mark(label);
+                label
+            });
+            self.assembler
+                .set_location(self.source_location(pass.range));
+            self.emit(NOP, 0, 0)?;
+            self.assembler.record_original_pass_nop();
+            if let Some(start) = start {
+                self.assembler.preserve_last_nop();
+                let end = self.assembler.label();
+                self.assembler.mark(end);
+                self.control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .last_mut()
+                    .expect("protected loop else")
+                    .push((start, end));
+            }
+            Ok(())
+        } else {
+            self.compile_suite(body)
+        }
     }
 
     fn compile_while(
@@ -24596,7 +24640,7 @@ impl<'source> Compiler<'source> {
                 self.assembler
                     .set_location(self.source_location(statement.test.range()));
                 self.emit(NOP, 0, 0)?;
-                self.compile_suite(&statement.orelse)?;
+                self.compile_loop_else_suite(&statement.orelse, statement.range)?;
                 return Ok(());
             }
 
@@ -25558,7 +25602,7 @@ impl<'source> Compiler<'source> {
                 exclusions.push((exclusion_start, exclusion_end));
             }
         }
-        self.compile_suite(&statement.orelse)?;
+        self.compile_loop_else_suite(&statement.orelse, statement.range)?;
         if statement.orelse.is_empty() {
             self.assembler
                 .record_empty_while_break_anchor(else_label, end);
@@ -25890,7 +25934,7 @@ impl<'source> Compiler<'source> {
             self.symbols.initialized_locals.remove(name);
         }
         let orelse_start = self.assembler.instruction_count();
-        self.compile_suite(&statement.orelse)?;
+        self.compile_loop_else_suite(&statement.orelse, statement.range)?;
         if self.assembler.instruction_count() == orelse_start
             && let [Stmt::Pass(statement)] = statement.orelse.as_slice()
             && self
@@ -26218,7 +26262,7 @@ impl<'source> Compiler<'source> {
             let name = self.required_name_id(name);
             self.symbols.initialized_locals.remove(name);
         }
-        self.compile_suite(&statement.orelse)?;
+        self.compile_loop_else_suite(&statement.orelse, statement.range)?;
         if has_break {
             self.assembler.mark(end);
             let has_conditional_tail_break = (statement.orelse.is_empty()
