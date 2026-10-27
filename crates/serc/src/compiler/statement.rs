@@ -42627,12 +42627,19 @@ impl<'source> Compiler<'source> {
             (self.context.python_version <= crate::PythonVersion::Py313
                 || (remaining.is_empty()
                     && cleanup_join.is_some()
-                    && body.last().is_some_and(|part| match part {
-                        Stmt::Try(statement) => {
-                            !statement.is_star && statement.finalbody.is_empty()
-                        }
-                        Stmt::With(_) => true,
-                        _ => false,
+                    && body.last().is_some_and(|part| {
+                        let inner = match part {
+                            Stmt::Try(statement)
+                                if !statement.is_star && statement.finalbody.is_empty() =>
+                            {
+                                &statement.body
+                            }
+                            Stmt::With(manager) => &manager.body,
+                            _ => return false,
+                        };
+                        // Line resolution still sees the normal edge of a loop
+                        // that becomes infinite only after constant folding.
+                        !suite_terminates(inner) || suite_terminates_before_constant_folding(inner)
                     })))
             .then_some(WithBodyExitNoop::ConvertedPopBlock)
         });
