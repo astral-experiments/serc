@@ -7351,9 +7351,24 @@ impl<'source> Compiler<'source> {
                         finally_unwind_start,
                         original_shared_break_join,
                     );
-                    if copied_finally_with_join {
-                        // Both manager exits copy this synthetic loop cleanup before copying
-                        // the final return, so preserve it for repeated no-location inlining.
+                    let guarded_recovery = self.context.python_version >= crate::PythonVersion::Py314
+                        && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR) != 0
+                        && context.iterator_cleanup == IteratorCleanup::None
+                        && !context.prevent_break_exit_inlining
+                        && !context.break_policy.preserves_jump_exit()
+                        && self.control.exceptions.active_exception_handlers.last().is_some_and(|handler|
+                            handler.loop_depth == self.control.loops.contexts.len())
+                        && self.control.finally.active_loop_finally_contexts.last().is_some_and(|cleanup|{
+                            cleanup.loop_depth == self.control.loops.contexts.len()
+                                && cleanup.with_depth == context.with_depth
+                                && copied_finally_has_guarded_linear_cleanup(cleanup.body, false, |body| {
+                                    matches!(body, [Stmt::Pass(_)])
+                                        || matches!(body, [Stmt::Expr(work)] if matches!(work.value.as_ref(), Expr::Await(_)))
+                                })
+                        });
+                    if copied_finally_with_join || guarded_recovery {
+                        // The normal and recovered cleanup exits copy the unlocated break
+                        // before inheriting their separate source positions.
                         self.assembler
                             .prepare_no_location_block_for_inlining(break_jump);
                     } else if let Some(entry) = copied_finally_try_iterator_entry {

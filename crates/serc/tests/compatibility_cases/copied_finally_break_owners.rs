@@ -26,3 +26,11 @@ fn matches_cpython_single_finally_pop_before_copied_break_condition() {
         }
     }
 }
+
+#[test]
+fn matches_copied_break_after_guarded_await_recovery() {
+    common::assert_matches_cpython_marshal(
+        "async def events(ready):\n    try:\n        while ready():\n            try:\n                yield await read()\n            except End:\n                break\n            finally:\n                if ready():\n                    try:\n                        await finish()\n                    except Cancelled:\n                        pass\n    finally:\n        await close()\n",
+        "copied_break_after_await.py",
+    );
+}
