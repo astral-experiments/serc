@@ -730,6 +730,8 @@ pub(super) struct StatementContext {
     preceded_by_suffixed_try: bool,
     // Whether this statement directly follows a conditional whose body terminates in a return.
     pub(super) preceded_by_terminating_if: bool,
+    // A leading percent-format literal at a join with two original predecessors.
+    pub(super) shared_format_prefix: Option<TextRange>,
     // Whether a synchronous-with value expression follows a returning conditional, including
     // through assert and non-terminating conditional gaps.
     pub(super) follows_sync_with_return_join: bool,
@@ -3434,6 +3436,26 @@ impl<'source> Compiler<'source> {
                                     || free_indices.contains_key(&name))
                         )
                     });
+                let formatted_value = match statement {
+                    Stmt::Assign(assign) => Some(assign.value.as_ref()),
+                    Stmt::Return(returned) => returned.value.as_deref(),
+                    Stmt::Expr(expression) => Some(expression.value.as_ref()),
+                    _ => None,
+                };
+                // Native line propagation sees both the false edge and the original
+                // body's fallthrough before it folds the constant test.
+                let shared_format_prefix = formatted_value.and_then(|value| {
+                    (self.context.python_version >= crate::PythonVersion::Py313
+                        && matches!(value, Expr::BinOp(binary)
+                            if binary.op == ruff_python_ast::Operator::Mod
+                                && matches!(binary.left.as_ref(), Expr::StringLiteral(_)))
+                        && matches!(previous_statement, Some(Stmt::If(guard))
+                            if guard.elif_else_clauses.is_empty()
+                                && self.context.fold_constant(&guard.test).is_some_and(|c| !c.is_truthy())
+                                && !suite_terminates(&guard.body)
+                                && guard.body.iter().any(|part| !self.context.is_elided_statement(part))))
+                        .then(|| value.range())
+                });
                 let preceded_by_terminating_if = matches!(
                     previous_statement,
                     Some(Stmt::If(previous))
@@ -3577,6 +3599,7 @@ impl<'source> Compiler<'source> {
                     preceded_by_try,
                     preceded_by_suffixed_try,
                     preceded_by_terminating_if,
+                    shared_format_prefix,
                     follows_sync_with_return_join,
                     follows_sync_with_return_join_after_gap,
                     follows_sync_with_nonterminal_join,

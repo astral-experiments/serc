@@ -3280,7 +3280,7 @@ impl Compiler<'_> {
 
         let expression_location = self.source_location(expression.range);
         let part_count = parts.len();
-        for part in parts {
+        for (index, part) in parts.into_iter().enumerate() {
             match part {
                 PercentFormatPart::Literal(value) => {
                     if matches!(&value, Constant::String(value) if value == "%") {
@@ -3291,8 +3291,15 @@ impl Compiler<'_> {
                     self.assembler.set_location(SourceLocation::NONE);
                     let constant = self.add_constant(value)?;
                     self.emit(LOAD_CONST, constant, 1)?;
-                    self.assembler
-                        .inherit_percent_target_location_for_last_instruction();
+                    if index == 0
+                        && self.control.statements.context.shared_format_prefix
+                            == Some(expression.range)
+                    {
+                        self.assembler.preserve_last_no_location();
+                    } else {
+                        self.assembler
+                            .inherit_percent_target_location_for_last_instruction();
+                    }
                 }
                 PercentFormatPart::Formatted {
                     expression,

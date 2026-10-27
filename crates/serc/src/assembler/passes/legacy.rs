@@ -2417,7 +2417,7 @@ impl OptimizationPipeline {
                     // Native propagation ignores modern preservation flags except
                     // certified shared POP_BLOCKs and later prefix insertion.
                     if !inserted_generator_pop
-                        && !legacy_pop_block_keeps_no_location(self.python_version, instruction)
+                        && !legacy_shared_entry_keeps_no_location(self.python_version, instruction)
                     {
                         instruction.location = location;
                     }
@@ -2451,7 +2451,7 @@ impl OptimizationPipeline {
                 if predecessors.get(&successor) == Some(&1)
                     && let Some(first) = self.graph.instructions_mut(successor).next()
                     && first.location.line < 0
-                    && !legacy_pop_block_keeps_no_location(self.python_version, first)
+                    && !legacy_shared_entry_keeps_no_location(self.python_version, first)
                     // A cold bridge beyond an erased loop test has no located
                     // predecessor in its original layout.
                     && !(self.python_version == PythonVersion::Py313
@@ -2466,16 +2466,19 @@ impl OptimizationPipeline {
     }
 }
 
-/// Keeps a shared `POP_BLOCK` unlocated while 3.13 still has its folded predecessor.
+/// Keeps a shared `POP_BLOCK` or synthesized format prefix unlocated across 3.13 folding.
 ///
 /// The compiler certifies joins whose constant-test false edge has already been
 /// elided. Native 3.13 resolves locations before folding that edge; 3.12 folds
 /// first, so its remaining predecessor may donate a location normally.
-fn legacy_pop_block_keeps_no_location(version: PythonVersion, instruction: &Instruction) -> bool {
+fn legacy_shared_entry_keeps_no_location(
+    version: PythonVersion,
+    instruction: &Instruction,
+) -> bool {
     version == PythonVersion::Py313
-        && instruction.opcode == NOP
-        && instruction.fusion_policy.is_converted_pop_block()
         && instruction.no_location_policy.preserves_location()
+        && (instruction.opcode == LOAD_CONST
+            || (instruction.opcode == NOP && instruction.fusion_policy.is_converted_pop_block()))
 }
 
 /// Recovers native 3.13's direction-independent JUMP pseudo-op.
