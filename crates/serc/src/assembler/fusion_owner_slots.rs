@@ -598,15 +598,24 @@ impl FreshSingletonCertificate {
                 Item::Label(_) => None,
             })
             .collect::<Vec<_>>();
-        let tail = match instructions.as_slice() {
-            [constant, identity, condition, marker] => [*constant, *identity, *condition, *marker],
-            [unpack, constant, identity, condition, marker]
-                if unpack.opcode == crate::target::opcodes::UNPACK_SEQUENCE =>
-            {
-                [*constant, *identity, *condition, *marker]
-            }
-            _ => return None,
+        let (prefix, tail) = instructions.split_last_chunk::<4>()?;
+        // A non-final case preserves its subject for the following pattern.
+        let copied_subject = |copy: &Instruction| {
+            copy.opcode == crate::target::opcodes::COPY && copy.value_argument() == Some(1)
         };
+        match prefix {
+            [] => {}
+            [unpack] if unpack.opcode == crate::target::opcodes::UNPACK_SEQUENCE => {}
+            [copy] if copied_subject(copy) => {}
+            [subject, copy]
+                if copied_subject(copy)
+                    && (matches!(
+                        subject.opcode,
+                        LOAD_FAST | crate::target::opcodes::LOAD_DEREF
+                    ) || (subject.opcode == crate::target::opcodes::LOAD_GLOBAL
+                        && subject.value_argument().is_some_and(|arg| arg & 1 == 0))) => {}
+            _ => return None,
+        }
         if tail[0].opcode != crate::target::opcodes::LOAD_CONST
             || !matches!(tail[0].operand(), Operand::Value(_))
             || tail[1].opcode != crate::target::opcodes::IS_OP
@@ -1223,6 +1232,11 @@ impl View<'_> {
                 || !matches!(
                     instruction.opcode,
                     crate::target::opcodes::UNPACK_SEQUENCE
+                        | crate::target::opcodes::COPY
+                        | LOAD_FAST
+                        | LOAD_FAST_BORROW
+                        | crate::target::opcodes::LOAD_DEREF
+                        | crate::target::opcodes::LOAD_GLOBAL
                         | crate::target::opcodes::LOAD_CONST
                         | crate::target::opcodes::IS_OP
                         | POP_JUMP_IF_FALSE
@@ -1344,10 +1358,11 @@ impl View<'_> {
                     && literal_fold_slots.is_none()
                 || instruction.no_location_policy.borrow_fallthrough()
                     == super::BorrowFallthrough::Barrier
+                || (instruction.opcode == crate::target::opcodes::COPY
+                    && (manager_regions.is_none() || instruction.value_argument() != Some(1)))
                 || matches!(
                     instruction.opcode,
                     NOP | NOT_TAKEN
-                        | crate::target::opcodes::COPY
                         | COPY_FREE_VARS
                         | MAKE_CELL
                         | RETURN_GENERATOR
