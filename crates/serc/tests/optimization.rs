@@ -1906,6 +1906,29 @@ fn erased_loop_break_keeps_async_manager_finally_boundary() {
 }
 
 #[test]
+fn folded_constant_keeps_its_following_protected_prefix() {
+    for count in [1, 2, 3, 6] {
+        let calls = "        record(value)\n".repeat(count);
+        let source = format!(
+            "def sample(value, flag):
+    with manager:
+        if flag:
+            prepare()
+        def action(key=(1, 2)):
+            pass
+{calls}        value.ready()
+        try:
+            if flag:
+                work()
+        finally:
+            pass
+"
+        );
+        assert_matches_cpython(&source, "discarded_call_before_try.py", &LEVELS);
+    }
+}
+
+#[test]
 fn tuple_unpack_prefix_keeps_retained_setup_marker_owner() {
     let source = r#"async def sample(healthy):
     group = attach({**originals, **({"peer": peer} if healthy else {})})
