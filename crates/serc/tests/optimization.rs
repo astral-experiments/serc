@@ -2481,8 +2481,14 @@ fn erased_loop_before_managed_dispatch_keeps_empty_exit() {
 #[test]
 fn folded_manager_loop_preserves_shared_cleanup_locations() {
     for (outer, cleanup) in [
-        ("with outer", "except LookupError:\n            return value"),
-        ("async with outer", "finally:\n            if value:\n                release()"),
+        (
+            "with outer",
+            "except LookupError:\n            return value",
+        ),
+        (
+            "async with outer",
+            "finally:\n            if value:\n                release()",
+        ),
     ] {
         let source = format!(
             r"async def sample(outer, inner, value):
