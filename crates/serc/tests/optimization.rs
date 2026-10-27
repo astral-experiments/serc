@@ -15,6 +15,16 @@ use serc::{
 };
 
 #[test]
+fn manager_covers_none_guards_after_a_finalizer_statement() {
+    for prefix in ["worker.join(timeout=2)", "tasks: list = [*pending]"] {
+        let source = format!(
+            "def finish(manager, worker, pending, resource):\n    try:\n        with manager:\n            try:\n                pass\n            finally:\n                {prefix}\n                if resource is not None:\n                    resource.close()\n    finally:\n        pass\n"
+        );
+        assert_matches_cpython(&source, "case.py", &LEVELS);
+    }
+}
+
+#[test]
 fn nested_conversion_handlers_keep_shared_cleanup() {
     let source = r"def sample(items):
     for item in items:

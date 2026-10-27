@@ -372,6 +372,14 @@ pub(super) struct ComprehensionState {
     pub(super) exclude_optimized_tuple_guard_from_comprehension: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) enum NormalFinallyWithMarkers {
+    #[default]
+    Exclude,
+    Include,
+    Condition(SourceLocation),
+}
+
 #[derive(Debug, Default)]
 pub(super) struct WithState {
     active_with_exits: Vec<WithExitContext>,
@@ -392,7 +400,7 @@ pub(super) struct WithState {
     // The final while statement in the innermost async-with body. Nested branch tails still
     // supply the location of their redundant exit jump to CPython's line table.
     direct_final_async_with_while: Option<ruff_text_size::TextRange>,
-    pub(super) include_simple_normal_finally_not_taken_from_with: bool,
+    pub(super) normal_finally_with_markers: NormalFinallyWithMarkers,
     // The final synchronous-with `if` test whose converted POP_BLOCK exclusion can be
     // routed across a short-circuit condition without affecting nested body expressions.
     pub(super) terminal_with_condition: Option<ruff_text_size::TextRange>,
@@ -37774,9 +37782,29 @@ impl<'source> Compiler<'source> {
                             && matches!(tail.body.as_slice(), [Stmt::Expr(_)] | [Stmt::Expr(_), Stmt::Expr(_)])
                             && tail.body.iter().all(|statement| matches!(statement, Stmt::Expr(expression)
                                 if matches!(expression.value.as_ref(), Expr::Call(_))))));
+                let with_markers = if include_simple_normal_finally_not_taken_from_with {
+                    NormalFinallyWithMarkers::Include
+                } else if compiler.context.python_version == crate::PythonVersion::Py314
+                    && statement.handlers.is_empty()
+                    && let Some(index) = statement.finalbody.iter().position(|stmt| matches!(stmt, Stmt::If(_)))
+                    && let (prefix, [Stmt::If(guard), ..]) = statement.finalbody.split_at(index)
+                    && suite_has_linear_borrow_fallthrough(prefix)
+                    && prefix.iter().all(|stmt| matches!(stmt, Stmt::Expr(expr) if matches!(expr.value.as_ref(), Expr::Call(_)))
+                        || matches!(stmt, Stmt::AnnAssign(assign) if matches!(assign.value.as_deref(), Some(Expr::List(list)) if matches!(list.elts.as_slice(), [Expr::Starred(_)]))))
+                    && guard.elif_else_clauses.is_empty()
+                    && matches!(guard.test.as_ref(), Expr::Compare(c) if c.ops.len() == 1
+                        && matches!(c.ops[0], CmpOp::Is | CmpOp::IsNot)
+                        && matches!(c.operands.first(), Some(Expr::Name(_) | Expr::Attribute(_)))
+                        && matches!(c.comparators()[0], Expr::NoneLiteral(_)))
+                {
+                    // The folded None test reuses a protected slot after these statements.
+                    NormalFinallyWithMarkers::Condition(compiler.source_location(guard.test.range()))
+                } else {
+                    NormalFinallyWithMarkers::Exclude
+                };
                 compiler.with_control_override(
-                    |control| &mut control.withs.include_simple_normal_finally_not_taken_from_with,
-                    include_simple_normal_finally_not_taken_from_with,
+                    |control| &mut control.withs.normal_finally_with_markers,
+                    with_markers,
                     |compiler| {
                         let legacy_nested_pass = if legacy_terminal_try_body_owner
                             || compiler.context.python_version == crate::PythonVersion::Py312
