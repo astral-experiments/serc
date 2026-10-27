@@ -13262,6 +13262,18 @@ impl<'source> Compiler<'source> {
                             return_finally_contexts[1].exception_region_depth,
                         )
                     });
+                    if self.context.python_version == crate::PythonVersion::Py314
+                        && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) != 0
+                        && statement.value.is_none()
+                        && !return_is_overridden
+                        && !starts_jump_target
+                        && handler_count == 0
+                        && return_finally_contexts.len() == 1
+                        && let Some(try_pops) =
+                            ordinary_pops.checked_sub(finally_context.try_body_depth)
+                    {
+                        self.assembler.record_resumed_yield_return_pops(try_pops);
+                    }
                     let copied_finally_pop_instruction = self.assembler.instruction_count();
                     self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
                     if !starts_jump_target
