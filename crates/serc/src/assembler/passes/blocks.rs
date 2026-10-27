@@ -7312,10 +7312,47 @@ impl OptimizationPipeline {
                 None
             };
             let source_location = loop_return_join_location.unwrap_or(source_location);
+            // The original folded condition was still a second predecessor during
+            // line propagation. Its copied jump cannot take the fallthrough's line.
+            let shared_folded_return_join = !self.folded_predecessor_sources.is_empty()
+                && inline_unprotected_return
+                && !planned_copy
+                && preserve_threaded_join_nop
+                && remaining_predecessors[source.index()] == 1
+                && source_position.checked_sub(1).is_some_and(|index| {
+                    let previous = order[index];
+                    !drop_blocks[previous.index()]
+                        && block_has_fallthrough(graph[previous].items())
+                        && graph[previous]
+                            .last_instruction()
+                            .is_some_and(|instruction| instruction.location == source_location)
+                })
+                && graph[source].last_instruction().is_some_and(|jump| {
+                    (jump.pre_fold_extra_instructions() == 0
+                        && jump.jump_policy.retained_nop()
+                            == super::super::ir::RetainedJumpNop::DirectTarget)
+                        || (jump.pre_fold_extra_instructions() == 1
+                            && jump.jump_policy.retained_nop()
+                                == super::super::ir::RetainedJumpNop::None)
+                })
+                && graph[source].first_label().is_some_and(|label|
+                    self.folded_original_predecessor_targets.contains(&label))
+                && self.folded_predecessor_sources.iter().any(|&(marker, target, location)| {
+                    graph.label_block(target) == Some(source)
+                        && !self.exception_owner_provenance.block_boundaries.contains(&marker)
+                        && !self.exception_owner_provenance.source_boundaries.contains(&marker)
+                        && graph.label_block(marker).is_some_and(|block| {
+                            !drop_blocks[block.index()]
+                                && graph[block].items().windows(2).any(|pair|
+                                    matches!(pair, [Item::Label(label), Item::Instruction(nop)]
+                                        if *label == marker && nop.opcode == NOP && nop.location == location))
+                        })
+                });
             let preserve_inlined_jump_nop = planned_copy
                 || loop_return_join_location.is_some()
                 || deferred_match_donor.is_some()
                 || (inline_small_exit
+                    && !shared_folded_return_join
                     && (preserve_unlocated_join_nop
                         || (retain_guard_nop && guard_location.is_some())
                         || preserve_threaded_join_nop
