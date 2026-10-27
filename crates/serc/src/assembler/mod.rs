@@ -3456,7 +3456,7 @@ impl Assembler {
         {
             return;
         }
-        // Constant returns author a value-location NOP before LOAD_CONST and
+        // Constant returns author a value-location NOP before their load and
         // RETURN_VALUE. Together with POP_BLOCK this is exactly four original
         // records, so it participates in the same pre-line copy pass.
         let constant_return_prefix =
@@ -3483,9 +3483,10 @@ impl Assembler {
                     // Exact default instructions exclude converted POPs, synthetic
                     // markers, custom owners, and every hidden or folded slot.
                     *nop == Instruction::value_with_depth(NOP, 0, nop.location, depth)
+                        && matches!(load.opcode, LOAD_CONST | LOAD_SMALL_INT)
                         && *load
                             == Instruction::value_with_depth(
-                                LOAD_CONST,
+                                load.opcode,
                                 constant,
                                 nop.location,
                                 value_depth,
