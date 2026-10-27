@@ -18112,6 +18112,23 @@ impl<'source> Compiler<'source> {
                                     && tail.elif_else_clauses.is_empty()
                                     && suite_terminates_before_constant_folding(&tail.body))
                         });
+                    if self.context.python_version >= crate::PythonVersion::Py314
+                        && let Some(tail) = body.last()
+                        && (matches!(tail, Stmt::Expr(expr) if is_literal_constant(&expr.value))
+                            || matches!(
+                                body,
+                                [
+                                    ..,
+                                    Stmt::Expr(_) | Stmt::Assign(_) | Stmt::AugAssign(_),
+                                    Stmt::Pass(_)
+                                ]
+                            ))
+                    {
+                        self.assembler.preserve_distinct_noop_exit(
+                            branch_exit,
+                            self.source_location(tail.range()),
+                        );
+                    }
                     if coroutine_guard_donor
                         || erased_join_has_donor
                         || optimized_empty_both

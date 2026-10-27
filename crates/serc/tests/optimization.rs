@@ -18370,6 +18370,44 @@ fn nested_branch_returns_survive_removed_inner_assertions() {
 }
 
 #[test]
+fn copied_conditional_exits_keep_a_separate_noop_line() {
+    let source = r#"def choose(flag, value):
+    if flag:
+        ...
+    else:
+        pass
+    return value
+
+
+def select(flag, value, fallback):
+    if flag:
+        value = fallback
+        "finished"
+    else:
+        fallback = value
+    return value
+
+
+def checked(flag, value):
+    if flag:
+        inspect(value)
+        pass
+    else:
+        recover()
+    raise LookupError
+
+
+def same_line(flag, value):
+    if flag:
+        inspect(value); ...
+    else:
+        recover()
+    return value
+"#;
+    assert_matches_cpython(source, "conditional_literal_exit.py", &LEVELS);
+}
+
+#[test]
 fn copied_normal_try_exits_keep_their_trailing_pass() {
     let source = r"def finalized(value):
     try:
