@@ -4653,30 +4653,25 @@ impl OptimizationPipeline {
                 if !previous_falls_through {
                     return None;
                 }
-                Some((
-                    *label,
-                    block,
-                    previous,
-                    jump.operand(),
-                    *location,
-                    last.location,
-                    last.depth_after(),
-                ))
+                let mut fallthrough =
+                    Instruction::new(JUMP_FORWARD, jump.operand(), last.location, last.depth_after());
+                // Splitting the jump gives each predecessor its own location. Both
+                // copies retain the original eval-breaker check on a backward edge.
+                if jump.opcode == JUMP_BACKWARD
+                    || jump.jump_policy.is_interruptible()
+                    || jump.fusion_policy.is_authored_break()
+                {
+                    fallthrough.jump_policy.mark_interruptible();
+                }
+                Some((*label, block, previous, *location, fallthrough))
             })
             .collect::<Vec<_>>();
         self.exception_owner_provenance
             .shared_match_return_donors
             .extend(shared_match_donors);
-        for (label, block, previous, operand, condition_location, body_location, depth) in splits {
-            self.graph.append_to_block(
-                previous,
-                vec![Item::Instruction(Instruction::new(
-                    JUMP_FORWARD,
-                    operand,
-                    body_location,
-                    depth,
-                ))],
-            );
+        for (label, block, previous, condition_location, fallthrough) in splits {
+            self.graph
+                .append_to_block(previous, vec![Item::Instruction(fallthrough)]);
             if let Some(jump) = self.graph.instructions_mut(block).next_back() {
                 jump.location = condition_location;
                 jump.jump_policy.prevent_threading_target();

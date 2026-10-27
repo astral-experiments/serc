@@ -79,3 +79,25 @@ fn matches_cpython_continue_stays_inside_its_finally_context() {
         }
     }
 }
+
+#[test]
+fn preserves_split_break_jumps_in_conditional_finalizers() {
+    let source = r"async def run(active):
+    try:
+        while active:
+            try:
+                break
+            except First:
+                pass
+            except Second:
+                break
+            finally:
+                if active:
+                    pass
+    except Other:
+        pass
+    finally:
+        active = False
+";
+    common::assert_matches_cpython_marshal(source, "conditional_finally_break.py");
+}
