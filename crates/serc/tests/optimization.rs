@@ -2316,6 +2316,29 @@ fn erased_manager_prefix_keeps_empty_finalizer_exit() {
 }
 
 #[test]
+fn nested_async_managers_keep_saved_handler_return_guard_slot() {
+    let source = r"async def sample(first, second, item, guard):
+    async with first, second:
+        try:
+            work()
+        except ValueError as error:
+            if choose(error):
+                item.note(error)
+                return item, error
+            return item
+        finally:
+            if guard is not None:
+                await finish(guard)
+";
+    assert_matches_cpython_versions(
+        source,
+        "nested_manager_handler_return.py",
+        &LEVELS,
+        &[PythonVersion::Py314],
+    );
+}
+
+#[test]
 fn copied_named_iterator_break_keeps_none_guard_owner() {
     let source = r#"async def sample(client, response):
     for attempt in range(client.attempts):
