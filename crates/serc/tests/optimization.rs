@@ -15,6 +15,21 @@ use serc::{
 };
 
 #[test]
+fn raising_wildcard_does_not_locate_the_normal_try_exit() {
+    for continuation in ["return item", "selected = item.color"] {
+        let source = format!(
+            "async def scan(item):\n    try:\n        match item:\n            case captured if ready:\n                pass\n            case 2:\n                consume(item)\n            case _:\n                raise ValueError(item)\n    except ValueError as error:\n        report(error)\n    {continuation}\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "raising_wildcard_exit.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn protected_value_match_preserves_case_and_failure_exits() {
     for action in ["return item", "consume(item)"] {
         let source = format!(
