@@ -8755,11 +8755,45 @@ impl<'source> Compiler<'source> {
                 let deferred_finally_end_start =
                     defer_finally_end_for_managers.then(|| self.assembler.label());
                 let mut deferred_finally_end_marked = false;
+                // A value returned by the exceptional finalizer remains above the
+                // pending exception until its SWAP/POP_TOP/SWAP cleanup is complete.
+                let returning_finally_region = self
+                    .control
+                    .finally
+                    .finally_end_region_indices
+                    .last()
+                    .copied()
+                    .filter(|&region| {
+                        preserve_tos
+                            && !return_is_overridden
+                            && region > 0
+                            && self.control.finally.active_finally_end_blocks == 1
+                            && self
+                                .control
+                                .exceptions
+                                .active_exception_region_exclusions
+                                .len()
+                                == region + 1
+                            && self.control.exceptions.active_try_marker_slots.len()
+                                + self.control.finally.active_return_finally_contexts.len()
+                                == region
+                            && self.control.exceptions.active_exception_handlers.is_empty()
+                            && self.control.withs.active_with_exits.is_empty()
+                            && self.control.loops.contexts.is_empty()
+                            && self.control.finally.active_normal_finally_bodies == 0
+                            && self.control.finally.active_copied_finally_bodies == 0
+                            && self
+                                .control
+                                .finally
+                                .preserved_return_value_contexts
+                                .is_empty()
+                    });
                 let nested_finally_region_depth = if defer_finally_end_for_managers {
                     self.control.withs.active_with_exits[inner_manager_boundary.unwrap()]
                         .exception_region_depth
                 } else {
-                    self.control.finally.active_finally_end_blocks
+                    returning_finally_region
+                        .unwrap_or(self.control.finally.active_finally_end_blocks)
                 };
                 let nested_finally_region_unwind_start = (!handler_before_finally_end
                     && self.control.finally.active_finally_end_blocks > 0
@@ -8781,9 +8815,15 @@ impl<'source> Compiler<'source> {
                 } else {
                     self.emit_finally_end_unwind(0, preserve_tos, None)?
                 };
+                let outer_finally_pop_end = returning_finally_region.map(|_| {
+                    let end = self.assembler.label();
+                    self.assembler.mark(end);
+                    end
+                });
                 let nested_finally_region_unwind_start =
                     nested_finally_region_unwind_start.map(|(depth, start)| {
-                        let start = if self.control.exceptions.active_exception_handlers.is_empty()
+                        let start = if outer_finally_pop_end.is_none()
+                            && self.control.exceptions.active_exception_handlers.is_empty()
                         {
                             start
                         } else {
@@ -8847,6 +8887,8 @@ impl<'source> Compiler<'source> {
                         && !self.control.exceptions.active_exception_handlers.is_empty());
                 let mut exception_unwind_start = if overriding_unwind_start.is_some() {
                     overriding_unwind_start
+                } else if outer_finally_pop_end.is_some() {
+                    outer_finally_pop_end
                 } else if return_finally_unwind_start.is_some() {
                     return_finally_unwind_start
                 } else if finally_end_unwind_start.is_some() {
