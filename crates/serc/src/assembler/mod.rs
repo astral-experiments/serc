@@ -11703,6 +11703,127 @@ impl Assembler {
         instruction.jump_policy.preserve_explicit_nop();
     }
 
+    /// Excludes a copied finalizer's truth marker when it reuses an unowned `POP_BLOCK`.
+    pub(crate) fn exclude_nested_awaited_finally_marker(
+        &mut self,
+        entry: usize,
+        removed_pops: usize,
+        final_pops: usize,
+    ) {
+        use crate::target::opcodes::{CALL, LOAD_ATTR, LOAD_DEREF, TO_BOOL};
+
+        let prefix = &self.linear_items()[..entry];
+        let Some(awaited) = prefix.iter().rposition(
+            |item| matches!(item, Item::Instruction(instruction) if instruction.opcode == END_SEND),
+        ) else {
+            return;
+        };
+        let prefix = &prefix[awaited + 1..];
+        if prefix.iter().any(|item| {
+            matches!(item, Item::Label(label)
+                if self.exception_owner_provenance.source_boundaries.contains(label))
+        }) {
+            return;
+        }
+        let mut instructions = prefix.iter().filter_map(Item::as_instruction);
+        // Some return paths materialize the pre-manager POP_BLOCK after END_SEND.
+        // The unwind count already includes that slot, even when its NOP is absent.
+        if instructions.clone().next().is_some_and(|first| {
+            first.opcode == NOP
+                && first.fusion_policy.is_converted_pop_block()
+                && first.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
+        }) && instructions
+            .clone()
+            .nth(1)
+            .is_some_and(|next| next.opcode == SWAP)
+        {
+            instructions.next();
+        }
+        let Some(inner_pop) = instructions
+            .clone()
+            .position(|instruction| instruction.opcode == NOP)
+        else {
+            return;
+        };
+        if inner_pop != 0
+            && !instructions.clone().take(inner_pop).map(|i| i.opcode).eq([
+                SWAP, SWAP, LOAD_CONST, LOAD_CONST, LOAD_CONST, CALL, POP_TOP,
+            ])
+        {
+            return;
+        }
+        let Some(inner) = instructions.nth(inner_pop) else {
+            return;
+        };
+        if !inner.fusion_policy.is_converted_pop_block()
+            || inner.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
+        {
+            return;
+        }
+        let cleanup = instructions.collect::<Vec<_>>();
+        let [head, args @ .., call, discard] = cleanup.as_slice() else {
+            return;
+        };
+        if call.opcode != CALL || discard.opcode != POP_TOP {
+            return;
+        }
+        // A global call folds PUSH_NULL into LOAD_GLOBAL. A method call keeps its
+        // original LOAD_GLOBAL/LOAD_FAST and LOAD_ATTR records.
+        let (folded_null, args) = if head.opcode == LOAD_GLOBAL
+            && head.value_argument().is_some_and(|arg| arg & 1 != 0)
+        {
+            (1, args)
+        } else if matches!(head.opcode, LOAD_GLOBAL | LOAD_FAST | LOAD_DEREF)
+            && let [attr, args @ ..] = args
+            && attr.opcode == LOAD_ATTR
+            && attr.value_argument().is_some_and(|arg| arg & 1 != 0)
+        {
+            (0, args)
+        } else {
+            return;
+        };
+        if args.len() > 1
+            || !args
+                .iter()
+                .all(|arg| matches!(arg.opcode, LOAD_FAST | LOAD_DEREF))
+            || call.value_argument() != u32::try_from(args.len()).ok()
+        {
+            return;
+        }
+        // The original array ends in the final POP_BLOCKs followed by LOAD_FAST,
+        // TO_BOOL and the jump. The appended NOT_TAKEN reuses a POP only when
+        // compaction removes more than those three records.
+        if !(4..=3 + final_pops).contains(&(removed_pops + folded_null)) {
+            return;
+        }
+        let mut guards = self.linear_items_mut()[entry..]
+            .iter_mut()
+            .filter_map(Item::as_instruction_mut);
+        let (Some(pop), Some(load), Some(truth), Some(condition), Some(marker)) = (
+            guards.next(),
+            guards.next(),
+            guards.next(),
+            guards.next(),
+            guards.next(),
+        ) else {
+            return;
+        };
+        if pop.opcode == NOP
+            && pop.fusion_policy.is_converted_pop_block()
+            && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
+            && matches!(load.opcode, LOAD_FAST | LOAD_DEREF)
+            && truth.opcode == TO_BOOL
+            && matches!(condition.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE)
+            && marker.opcode == NOT_TAKEN
+            && marker.exception_policy() == ExceptionPolicy::NoneDynamicCondition
+            && [truth.location, condition.location, marker.location]
+                .iter()
+                .all(|location| *location == load.location)
+        {
+            marker.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
+        }
+    }
+
     /// Captures a copied finalizer's local None test without normal-fallthrough provenance.
     pub(crate) fn record_copied_finally_none_prefix(&mut self, ordinal: usize) {
         let mut instructions = self
