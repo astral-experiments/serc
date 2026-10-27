@@ -416,6 +416,7 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) cold_handler_borrow_jumps: Vec<(Label, Label)>,
     // The following cold blocks locate emptied originals through relocation.
     pub(super) copied_borrow_exit_anchors: Vec<Label>,
+    pub(super) threaded_borrow_backedges: Vec<(Label, Instruction)>,
     pub(super) retired_normal_try_exits: Vec<RetiredNormalTryExit>,
     // Sole authored break, retired ordinary-try bridge, and intact normal-finally array.
     pub(super) normal_try_break_pop_owners: Vec<NormalTryBreakPopOwner>,
@@ -674,6 +675,42 @@ impl ExceptionOwnerProvenance {
         }
     }
 
+    /// Locates loop-backedge copies emptied when their conditional edge threads backward.
+    fn bind_threaded_borrow_backedges(&mut self, graph: &super::block_graph::BlockGraph) {
+        if self.threaded_borrow_backedges.is_empty() {
+            return;
+        }
+        let exits: FxHashMap<_, _> = self
+            .threaded_borrow_backedges
+            .iter()
+            .filter_map(|(entry, exit)| Some((graph.label_block(*entry)?, *exit)))
+            .collect();
+        for (i, &block) in graph.order().iter().enumerate() {
+            let Some(exit) = exits.get(&block) else {
+                continue;
+            };
+            if graph[block].last_instruction() != Some(exit) {
+                continue;
+            }
+            let mut following = graph.order()[i + 1..].iter().copied();
+            let Some(mut next) = following.next() else {
+                continue;
+            };
+            // Continue lowering can still leave its own unreachable unlocated jump.
+            if matches!(graph[next].items(), [Item::Instruction(op)] if op.opcode == exit.opcode && op.operand() == exit.operand() && op.location == SourceLocation::NONE)
+            {
+                let Some(after) = following.next() else {
+                    continue;
+                };
+                next = after;
+            }
+            // Cold relocation moves this successor away and strands the copy in warm order.
+            if let Some(anchor) = graph[next].first_label() {
+                self.copied_borrow_exit_anchors.push(anchor);
+            }
+        }
+    }
+
     /// Separates original jump-target roles from compiler-authored boundaries.
     pub(super) fn bind_normal_try_borrow_exits(
         &mut self,
@@ -682,6 +719,7 @@ impl ExceptionOwnerProvenance {
         regions: &[super::ExceptionRegion],
         folded_loop_exit_anchors: &FxHashSet<Label>,
     ) {
+        self.bind_threaded_borrow_backedges(graph);
         self.bind_copied_borrow_exits(graph, regions);
         for (entry, instruction) in std::mem::take(&mut self.borrow_normal_try_exits) {
             let Some(block) = graph.label_block(entry) else {

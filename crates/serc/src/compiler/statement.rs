@@ -19548,7 +19548,21 @@ impl<'source> Compiler<'source> {
                         )
                     },
                 )?;
-                self.compile_loop_tail_if(statement, restart, split_short_circuit, mode, leading)
+                let start = self.assembler.item_count();
+                let tail = self.compile_loop_tail_if(
+                    statement,
+                    restart,
+                    split_short_circuit,
+                    mode,
+                    leading,
+                )?;
+                if self.context.python_version == crate::PythonVersion::Py314
+                    && statement.elif_else_clauses.is_empty()
+                {
+                    self.assembler
+                        .record_threaded_borrow_backedge(start, restart);
+                }
+                Ok(tail)
             }
             Some((Stmt::While(statement), leading))
                 if statement.orelse.is_empty()
