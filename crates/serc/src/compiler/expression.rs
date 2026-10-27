@@ -5114,7 +5114,11 @@ impl Compiler<'_> {
                 self.assembler.set_location(SourceLocation::NONE);
                 self.emit(POP_TOP, 0, -1)?;
             }
-            if !discard_result {
+            if !discard_result
+                || self.context.python_version == crate::PythonVersion::Py314
+                    && temporary_restores.len() == 1
+                    && generators.iter().all(|generator| !generator.is_async)
+            {
                 self.assembler
                     .record_original_comprehension_normal_restores(normal_cleanup);
             }

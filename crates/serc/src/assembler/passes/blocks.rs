@@ -3478,12 +3478,12 @@ impl OptimizationPipeline {
         let mut copied_exit_successors = Vec::new();
         if !self
             .exception_owner_provenance
-            .copied_unlocated_try_exit_handlers
+            .copied_borrow_exit_handlers
             .is_empty()
         {
             let handlers: FxHashSet<_> = self
                 .exception_owner_provenance
-                .copied_unlocated_try_exit_handlers
+                .copied_borrow_exit_handlers
                 .iter()
                 .filter_map(|handler| graph.label_block(*handler))
                 .collect();
