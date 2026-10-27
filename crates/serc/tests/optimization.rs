@@ -25977,3 +25977,47 @@ fn short_circuit_value_after_manager_entries_uses_the_prior_handler() {
 ";
     assert_matches_cpython(source, "manager_value_guard.py", &LEVELS);
 }
+
+#[test]
+fn a_branch_pass_keeps_its_line_before_a_copied_exit() {
+    let source = r"def sample(flag, value):
+    if flag:
+        inspect(value)
+        pass
+    else:
+        record(value)
+    return value
+
+def joined(flag, second, value):
+    try:
+        if flag:
+            if second:
+                inspect(value)
+            else:
+                record(value)
+            pass
+        else:
+            recover()
+    finally:
+        cleanup()
+    return value
+
+def same_line(flag, value):
+    if flag:
+        inspect(value); pass
+    else:
+        record(value)
+    return value
+
+def longer_tail(flag, value):
+    if flag:
+        inspect(value)
+        pass
+    else:
+        record(value)
+    prepare(value)
+    commit(value)
+    return value
+";
+    assert_matches_cpython(source, "branch_pass.py", &LEVELS);
+}
