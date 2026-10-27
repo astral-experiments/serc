@@ -2098,6 +2098,23 @@ fn comprehension_assignment_exit_location(
         {
             jump
         }
+        [
+            Item::Instruction(pop),
+            Item::Instruction(load),
+            Item::Instruction(store),
+            Item::Instruction(delete),
+            Item::Instruction(jump),
+        ] if pop.opcode == POP_EXCEPT
+            && load.opcode == LOAD_CONST
+            && store.opcode == STORE_FAST
+            && delete.opcode == DELETE_FAST
+            && store.operand() == delete.operand()
+            && [pop, load, store, delete]
+                .iter()
+                .all(|op| op.location == SourceLocation::NONE) =>
+        {
+            jump
+        }
         _ => return None,
     };
     if !matches!(jump.opcode, JUMP_FORWARD | JUMP_BACKWARD) || jump.location.line >= 0 {

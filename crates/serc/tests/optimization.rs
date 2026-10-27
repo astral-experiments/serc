@@ -4754,6 +4754,22 @@ fn finalizer_copies_named_handler_cleanup_onto_elif_exits() {
 }
 
 #[test]
+fn named_handler_uses_the_original_comprehension_assignment_span() {
+    let source = "def work(flag, items):
+    try:
+        prepare()
+    except ValueError as error:
+        if flag:
+            pass
+        else:
+            result = [item for item in items]
+    finally:
+        done()
+";
+    assert_matches_cpython(source, "named_comprehension_cleanup.py", &LEVELS);
+}
+
+#[test]
 fn nested_handler_raise_keeps_empty_outer_exit() {
     for scope in ["def", "async def"] {
         for binding in ["", " as parse_error"] {

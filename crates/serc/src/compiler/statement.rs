@@ -18395,9 +18395,7 @@ impl<'source> Compiler<'source> {
                 .exceptions
                 .active_exception_handlers
                 .last()
-                .is_some_and(|handler| {
-                    handler.name.is_none() && handler.trailing_statement == Some(statement.range)
-                })
+                .is_some_and(|handler| handler.trailing_statement == Some(statement.range))
         {
             // A final comprehension can fall through to an unlocated loop exit or
             // handler cleanup. Preserve its store donor before static SWAP reordering.
