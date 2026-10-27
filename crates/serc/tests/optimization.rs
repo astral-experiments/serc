@@ -15884,6 +15884,21 @@ fn erased_while_else_normalizes_protected_backedges() {
 }
 
 #[test]
+fn loop_exits_preserve_the_backedge_of_an_erased_else() {
+    for exit in [
+        "return item",
+        "raise LookupError(item)",
+        "break",
+        "continue",
+    ] {
+        let source = format!(
+            "def scan(items, ready):\n    try:\n        for item in items:\n            if ready:\n                visit(item)\n                {exit}\n            else:\n                assert item\n    except LookupError:\n        recover()\n"
+        );
+        assert_matches_cpython(&source, "erased_loop_else.py", &LEVELS);
+    }
+}
+
+#[test]
 fn erased_protected_loop_arms_preserve_condition_polarity() {
     for condition in ["check(item)", "not check(item)"] {
         for body in [

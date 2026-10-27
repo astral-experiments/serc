@@ -21928,28 +21928,24 @@ impl<'source> Compiler<'source> {
                     .map(|test| (test, clause.body.as_slice()))
             })
             .unwrap_or((statement.test.as_ref(), statement.body.as_slice()));
-        // A final Pass or iterator Continue reaches the same loop backedge,
-        // including inside an enclosing try/finally. Earlier elif arms cannot
-        // enter its erased false edge, so that edge still normalizes independently.
+        // A final Pass or iterator Continue reaches the loop backedge. A direct
+        // return, raise, or break leaves only the erased false arm to reach it.
         // Comparison chains retain a separate jump to the Pass backedge.
-        let protected_direct_loop_else =
-            eligible_else
-                && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
-                && self.control.in_loop_tail_without_nested_cleanup()
-                && self
-                    .control
-                    .loops
-                    .contexts
-                    .last()
-                    .is_some_and(|context| context.continue_label == restart)
-                && condition_has_runtime_iterator_leaves(final_test)
-                && !expression_suspends_current_scope(final_test)
-                && ((matches!(final_body, [Stmt::Pass(_)])
-                    && condition_has_linear_runtime_leaves(final_test))
-                    || (matches!(final_body, [Stmt::Continue(_)])
-                        && self.control.loops.contexts.last().is_some_and(|context| {
-                            context.iterator_cleanup != IteratorCleanup::None
-                        })));
+        let protected_direct_loop_else = eligible_else
+            && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+            && self.control.in_loop_tail_without_nested_cleanup()
+            && condition_has_runtime_iterator_leaves(final_test)
+            && !expression_suspends_current_scope(final_test)
+            && self.control.loops.contexts.last().is_some_and(|context| {
+                context.continue_label == restart
+                    && ((matches!(final_body, [Stmt::Pass(_)])
+                        && condition_has_linear_runtime_leaves(final_test))
+                        || final_body.iter().any(|part| match part {
+                            Stmt::Return(_) | Stmt::Raise(_) | Stmt::Break(_) => true,
+                            Stmt::Continue(_) => context.iterator_cleanup != IteratorCleanup::None,
+                            _ => false,
+                        }))
+            });
         // A finally entered before this synchronous iterator is not unwound by
         // its backedge. The saved protected-loop depth distinguishes that owner
         // from a try/finally entered inside the iteration.
