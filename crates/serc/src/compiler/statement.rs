@@ -17033,6 +17033,13 @@ impl<'source> Compiler<'source> {
                         // conditional expression's unconditional true-arm jump.
                         self.assembler.allow_last_unconditional_block_inlining();
                     }
+                    let folded_disjunction = matches!(test, Expr::BoolOp(boolean)
+                    if boolean.op == BoolOp::Or
+                        && boolean.values.split_last().is_some_and(|(last, leading)| {
+                            jump_constant_truthiness(last) == Some(true)
+                                && !leading.is_empty()
+                                && leading.iter().all(condition_has_only_runtime_tests)
+                        }));
                     let folded_or_true_exit = branch_index == 0
                         && matches!(self.unit.scope, Scope::Function { .. })
                         && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
@@ -17054,13 +17061,7 @@ impl<'source> Compiler<'source> {
                             if clause.test.is_none())
                         && (suite_has_linear_borrow_fallthrough(body)
                             || body_ends_with_discarded_call)
-                        && matches!(test, Expr::BoolOp(boolean)
-                        if boolean.op == BoolOp::Or
-                            && boolean.values.split_last().is_some_and(|(last, leading)| {
-                                jump_constant_truthiness(last) == Some(true)
-                                    && !leading.is_empty()
-                                    && leading.iter().all(condition_has_only_runtime_tests)
-                            }));
+                        && folded_disjunction;
                     if (branch_index == 0 && first_branch_is_always_true) || folded_or_true_exit {
                         // Later arms are discarded, leaving the same empty original join
                         // as the simple constant-true branch with an else suite.
@@ -18304,7 +18305,16 @@ impl<'source> Compiler<'source> {
                         let relocate_try_else_exit = branch_index == 0
                             && self.control.exceptions.relocated_try_else_exit
                                 == Some(statement.range);
+                        let folded_fallthrough = self.context.python_version
+                            >= crate::PythonVersion::Py314
+                            && folded_disjunction
+                            && matches!(statement.elif_else_clauses.as_slice(), [clause] if clause.test.is_none())
+                            && nested
+                                .elif_else_clauses
+                                .last()
+                                .is_some_and(|clause| clause.test.is_none());
                         if relocate_try_else_exit
+                            || folded_fallthrough
                             || (branch_index == 0
                                 && body.len() == 1
                                 && statement.elif_else_clauses.len() >= 2
