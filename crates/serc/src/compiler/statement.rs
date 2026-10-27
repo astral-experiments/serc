@@ -38142,6 +38142,7 @@ impl<'source> Compiler<'source> {
             && self.suite_has_nonempty_borrow_entry(&statement.finalbody)
             && matches!(statement.body.last(), Some(Stmt::If(guard))
                 if early_condition_truthiness(&guard.test).is_none()
+                    && !suite_contains_abrupt_control_flow(&guard.body)
                     && suite_has_fallthrough(&guard.body, false)
                     && matches!(guard.elif_else_clauses.as_slice(), [clause]
                         if clause.test.is_none()
