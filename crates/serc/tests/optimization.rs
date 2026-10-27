@@ -15,6 +15,22 @@ use serc::{
 };
 
 #[test]
+fn manager_return_keeps_the_exit_handler_on_a_comparison_guard() {
+    let source = r"def scan(manager, value):
+    try:
+        with manager:
+            item = {key: element for key, element in pairs if key}
+            visit(item)
+            visit(item)
+            return visit(item), True
+    finally:
+        if value >= 0:
+            finish()
+";
+    assert_matches_cpython(source, "manager_comparison_guard.py", &LEVELS);
+}
+
+#[test]
 fn nested_conversion_handlers_keep_shared_cleanup() {
     let source = r"def sample(items):
     for item in items:

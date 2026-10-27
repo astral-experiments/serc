@@ -13159,6 +13159,17 @@ impl Assembler {
         ordinary_pops: usize,
         nested_named_handler: bool,
     ) {
+        self.record_copied_guard_cleanup(pop_item, ordinary_pops, nested_named_handler, None);
+    }
+
+    /// Captures a copied return guard and its optional manager exit call.
+    fn record_copied_guard_cleanup(
+        &mut self,
+        pop_item: usize,
+        ordinary_pops: usize,
+        nested_named_handler: bool,
+        manager_call: Option<Instruction>,
+    ) {
         let items = self.linear_items();
         let mut preceding = items[..pop_item]
             .iter()
@@ -13219,7 +13230,8 @@ impl Assembler {
         let [load, operands @ .., condition, marker] = guard.as_slice() else {
             return;
         };
-        if !matches!(load.opcode, LOAD_FAST | crate::target::opcodes::LOAD_DEREF)
+        if !(matches!(load.opcode, LOAD_FAST | crate::target::opcodes::LOAD_DEREF)
+            || (manager_call.is_some() && load.opcode == LOAD_GLOBAL))
             || load.local_policy.hidden_exception_owner_slots() != 0
             || marker.opcode != NOT_TAKEN
             || condition.forward_target().is_none()
@@ -13239,6 +13251,7 @@ impl Assembler {
         self.exception_owner_provenance.copied_return_guards.push(
             exception_owners::CopiedReturnGuard {
                 cleanup,
+                manager_call,
                 operands: guard,
                 condition,
                 marker,
@@ -13359,6 +13372,18 @@ impl Assembler {
         else {
             return;
         };
+        if matches!(
+            condition.opcode,
+            LOAD_CONST | crate::target::opcodes::LOAD_SMALL_INT
+        ) && manager_count == 1
+            && ordinary_try_pops == 0
+            && retained_outer_handler.is_none()
+            && !named_handler
+        {
+            // The manager POP precedes all seven records of the saved-return unwind.
+            self.record_copied_guard_cleanup(pop_item, 1, false, Some(cleanup[5]));
+            return;
+        }
         if pop.opcode == NOP
             && pop.fusion_policy.is_converted_pop_block()
             && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS

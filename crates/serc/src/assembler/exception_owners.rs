@@ -1236,6 +1236,8 @@ pub(super) struct ConstantManagerReturnPrefix {
 #[derive(Debug)]
 pub(super) struct CopiedReturnGuard {
     pub(super) cleanup: Instruction,
+    /// The captured exit call immediately before a saved return’s manager discard.
+    pub(super) manager_call: Option<Instruction>,
     pub(super) operands: Vec<Instruction>,
     pub(super) condition: Instruction,
     pub(super) marker: Instruction,
@@ -10277,7 +10279,7 @@ impl LayoutAssembler {
                         && tail.late_removals == 0
                         && tail.insertions == 0
                         && tail.post_compaction_fusions == 0
-                        && self.copied_return_guard_uses_final_pop(
+                        && let Some(owner) = self.copied_return_guard_owner(
                             instruction_index,
                             original_array_start,
                             tail,
@@ -10286,10 +10288,7 @@ impl LayoutAssembler {
                             &jump_targets,
                         )
                     {
-                        owners.insert(
-                            instruction_index,
-                            ExceptionOwnerDecision::override_with_region(None),
-                        );
+                        owners.insert(instruction_index, owner);
                     }
                     // The retained SETUP's original cell is NULL, even if its compacted
                     // live record is surrounded by protected instructions. An appended
@@ -13005,7 +13004,7 @@ impl LayoutAssembler {
     }
 
     /// Projects an appended guard through the original return cleanup and its final POP.
-    fn copied_return_guard_uses_final_pop(
+    fn copied_return_guard_owner(
         &self,
         marker: usize,
         array: usize,
@@ -13013,10 +13012,8 @@ impl LayoutAssembler {
         instructions: &[&Instruction],
         positions: &OwnerLabelPositions,
         targets: &FxHashSet<Label>,
-    ) -> bool {
-        let Some(condition) = marker.checked_sub(1) else {
-            return false;
-        };
+    ) -> Option<ExceptionOwnerDecision> {
+        let condition = marker.checked_sub(1)?;
         let mut origins = self
             .exception_owner_provenance
             .copied_return_guards
@@ -13025,15 +13022,9 @@ impl LayoutAssembler {
                 origin.marker == *instructions[marker]
                     && origin.condition == *instructions[condition]
             });
-        let Some(origin) = origins.next() else {
-            return false;
-        };
-        let Some(load) = condition.checked_sub(origin.operands.len()) else {
-            return false;
-        };
-        let Some(previous) = load.checked_sub(1) else {
-            return false;
-        };
+        let origin = origins.next()?;
+        let load = condition.checked_sub(origin.operands.len())?;
+        let previous = load.checked_sub(1)?;
         if origins.next().is_some()
             || previous < array
             || targets
@@ -13046,7 +13037,7 @@ impl LayoutAssembler {
                         .is_some_and(|&pos| previous < pos && pos <= marker)
                 })
         {
-            return false;
+            return None;
         }
         // Earlier return and handler POPs can compact into the last cleanup record.
         let mut cleanup = origin.cleanup;
@@ -13056,7 +13047,7 @@ impl LayoutAssembler {
                 .hidden_exception_owner_slots(),
         );
         if cleanup != *instructions[previous] {
-            return false;
+            return None;
         }
         let mut suffix = ExceptionOwnerTail::default();
         for (offset, mut expected) in origin.operands.iter().copied().enumerate() {
@@ -13070,18 +13061,37 @@ impl LayoutAssembler {
                 }
             }
             if expected != *actual {
-                return false;
+                return None;
             }
             suffix.instruction(actual, None);
         }
         suffix.instruction(instructions[condition], None);
         // The compacted load occupies the final POP's position. Restore only the
         // preceding cells, including omitted handler and ordinary-try POPs.
-        tail.early_removals
-            .checked_sub(suffix.early_removals)
-            .and_then(|earlier| load.checked_add(earlier))
-            .and_then(|slot| slot.checked_add(origin.omitted_pops))
-            == Some(marker)
+        let pop_slot = load
+            .checked_add(tail.early_removals.checked_sub(suffix.early_removals)?)?
+            .checked_add(origin.omitted_pops)?;
+        if pop_slot == marker {
+            return Some(ExceptionOwnerDecision::override_with_region(None));
+        }
+        // A saved return's manager POP comes before CALL and POP_TOP. A marker
+        // one or two cells before the final POP instead inherits their handler.
+        let call = previous.checked_sub(1)?;
+        if call < array
+            || !(1..=2).contains(&pop_slot.checked_sub(marker)?)
+            || *instructions[call] != origin.manager_call?
+            || targets
+                .iter()
+                .chain(&self.exception_owner_provenance.source_boundaries)
+                .chain(&self.exception_owner_provenance.block_boundaries)
+                .any(|label| positions.get(label) == Some(&previous))
+        {
+            return None;
+        }
+        let region = self.uniform_exception_owner(call, load, positions)?;
+        (!self.exception_regions[region].preserve_lasti
+            && !self.exception_regions[region].is_scope_fallback)
+            .then(|| ExceptionOwnerDecision::override_with_region(Some(region)))
     }
 
     /// Locates a NULL SETUP record in an entry array's last compacted tail.
