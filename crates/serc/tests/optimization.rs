@@ -23623,6 +23623,12 @@ fn nested_else_assertion_exit_inherits_its_success_operand() {
 }
 
 #[test]
+fn nested_finalizer_keeps_its_unprotected_return_marker() {
+    let source = "def clear(obj):\n    try:\n        try:\n            try: pass\n            finally: obj.value = None\n        except ValueError: pass\n    except KeyError: pass\n    return result.value\n";
+    assert_matches_cpython(source, "nested_finalizer_return.py", &LEVELS);
+}
+
+#[test]
 fn loop_breaks_preserve_shared_try_exit_positions() {
     for source in [
         "async def run(items, left, right, flag, value):\n    if right:\n        pass\n    elif flag:\n        try:\n            try:\n                async for value in items:\n                    if flag:\n                        break\n                else:\n                    if flag:\n                        value = left\n            except ValueError:\n                pass\n        finally:\n            pass\n    else:\n        raise ValueError\n    observe(value)\n",
