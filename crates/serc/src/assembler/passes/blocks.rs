@@ -5873,6 +5873,24 @@ impl OptimizationPipeline {
                         && graph[target].items() == target_items
                 },
             );
+            // An emitted POP_BLOCK/JUMP can replace a retained case-success jump before
+            // its guard is visited. Keep that shared exit available for the guard's copy.
+            let emitted_shared_match_exit = !planned_copy
+                && self.python_version >= crate::PythonVersion::Py314
+                && remaining_predecessors[source.index()] > 1
+                && matches!(graph[source].items(), [labels @ .., Item::Instruction(jump)]
+                    if labels.iter().all(|item| matches!(item, Item::Label(_)))
+                        && jump.opcode == JUMP_FORWARD
+                        && jump.jump_policy.is_original_match_success()
+                        && jump.jump_policy.always_retains_nop()
+                        && jump.exception_policy() == ExceptionPolicy::default()
+                        && self.exception_owner_provenance.original_match_join_boundaries.contains(&target_label))
+                && matches!(graph[target].items(), [labels @ .., Item::Instruction(pop), Item::Instruction(exit)]
+                    if labels.iter().all(|item| matches!(item, Item::Label(_)))
+                        && pop.opcode == NOP && pop.fusion_policy.is_converted_pop_block()
+                        && pop.value_argument() == Some(0) && pop.location == SourceLocation::NONE
+                        && exit.opcode == JUMP_FORWARD && exit.location == SourceLocation::NONE
+                        && exit.only_allows_unconditional_inlining() && !exit.jump_policy.allows_threading_target());
             let copy_shared_match_exit = source_has_fallthrough
                 && remaining_predecessors[target.index()] > 1
                 && shared_match_cleanup_copies
@@ -7965,7 +7983,9 @@ impl OptimizationPipeline {
                 let copied_jump_target =
                     block_jump_target(&copied).and_then(|label| graph.label_block(label));
                 graph.append_to_block(source, copied);
-                if preserves_shared_match_exit && generic_original_copy {
+                if (preserves_shared_match_exit && generic_original_copy)
+                    || emitted_shared_match_exit
+                {
                     // Recheck the complete expanded array for each conditional copy;
                     // another inlining, retarget or label edit retires this admission.
                     shared_match_cleanup_copies.insert(source, graph[source].items().to_vec());
