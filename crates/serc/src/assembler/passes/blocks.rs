@@ -1631,7 +1631,6 @@ fn restore_retained_pop_block_locations(
             && let Some(first) = graph.instructions_mut(target).next()
         {
             first.location = location;
-            first.jump_policy.preserve_explicit_nop();
         }
     }
 }
