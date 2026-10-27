@@ -7345,6 +7345,17 @@ impl<'source> Compiler<'source> {
                         self.assembler.prevent_jump_threading_target(break_jump);
                     }
                     self.assembler.mark_jump_as_authored_break(break_jump);
+                    // POP_BLOCK can split the local load from RETURN_VALUE in this graph.
+                    // CPython copies that short exit before removing the adjacent break.
+                    if self.context.python_version >= crate::PythonVersion::Py314
+                        && context.break_target_is_short_return
+                        && context.iterator_cleanup == IteratorCleanup::None
+                        && context.with_depth == 0
+                        && context.exception_region_depth == 1
+                        && has_no_emitted_cleanup
+                    {
+                        self.assembler.defer_jump_removal(break_jump);
+                    }
                     self.assembler.record_copied_finally_break_head(
                         break_jump,
                         context.break_label,
