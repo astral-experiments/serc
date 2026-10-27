@@ -14436,13 +14436,31 @@ impl Assembler {
         if entries.next().is_some() || !provenance.source_boundaries.contains(&entry) {
             return None;
         }
-        let mut incoming = items.iter().filter_map(|item| match item {
-            Item::Instruction(instruction)
-                if matches!(instruction.operand(), Operand::Forward(label) | Operand::Backward(label)
-                    if aliases.contains(&label)) => Some(instruction),
-            _ => None,
+        let mut incoming = items.iter().enumerate().filter_map(|(index, item)| {
+            let instruction = item.as_instruction()?;
+            instruction
+                .jump_target()
+                .is_some_and(|label| aliases.contains(&label))
+                .then_some((index, instruction))
         });
-        let jump = incoming.next()?;
+        let (jump_index, jump) = incoming.next()?;
+        // A jump at the start of a shared block cannot inherit one arm's line.
+        let source = &items[..jump_index];
+        let starts = trailing_labels(source).collect::<Vec<_>>();
+        if !starts.is_empty() {
+            let incoming_edges = items
+                .iter()
+                .filter_map(Item::as_instruction)
+                .filter(|instruction| {
+                    instruction
+                        .jump_target()
+                        .is_some_and(|label| starts.contains(&label))
+                })
+                .count();
+            if incoming_edges + usize::from(block_has_fallthrough(source)) > 1 {
+                return None;
+            }
+        }
         (incoming.next().is_none()
             && jump.opcode == JUMP_FORWARD
             && jump.operand() == Operand::Forward(entry)

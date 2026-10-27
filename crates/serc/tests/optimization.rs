@@ -9090,6 +9090,18 @@ def update(resource, ready, counter):
             counter.total += 1
         else:
             return counter
+
+
+def select(resource, outer, inner):
+    with resource:
+        if outer:
+            if inner:
+                use_left()
+            else:
+                use_right()
+        else:
+            return None
+    finish()
 ";
     assert_matches_cpython_versions(
         source,
