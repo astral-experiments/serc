@@ -6828,6 +6828,24 @@ fn literal_handler_returns_retire_inner_try_before_managed_iterator() {
 }
 
 #[test]
+fn returning_from_a_handler_preserves_the_iterators_enclosing_try() {
+    let source = r"def collect(items):
+    try:
+        for item in items:
+            try:
+                try:
+                    visit(item)
+                except ValueError as error:
+                    return False
+            except LookupError:
+                pass
+    except TypeError:
+        pass
+";
+    assert_matches_cpython(source, "handler_iterator_return.py", &LEVELS);
+}
+
+#[test]
 fn coroutine_iterator_handler_returns_preserve_outer_try_owner() {
     let source = r"async def sample(items, work, finish):
     try:
