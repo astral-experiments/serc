@@ -20504,8 +20504,25 @@ impl<'source> Compiler<'source> {
                                     && handler.name.is_none()
                                     && matches!(handler.body.as_slice(), [Stmt::Pass(_)])
                             })));
+                // Once the last break finalizer has unwound, its named handler can
+                // copy the loop exit after clearing the exception local.
+                let inline_named_break_cleanup = self.context.python_version
+                    >= crate::PythonVersion::Py314
+                    && continue_target.is_none()
+                    && index == 0
+                    && context.loop_depth == loop_depth
+                    && with_depth == 0
+                    && next_with == 0
+                    && outer_overriding_returns == 0
+                    && self.control.exceptions.active_exception_handlers.is_empty()
+                    && matches!(context.body.last(), Some(Stmt::Try(cleanup))
+                        if !cleanup.is_star && cleanup.orelse.is_empty() && cleanup.finalbody.is_empty()
+                            && matches!(cleanup.handlers.as_slice(), [handler]
+                                if handler.as_except_handler().is_some_and(|handler| handler.name.is_some()
+                                    && !suite_terminates(&handler.body))));
                 let prevent_try_exit_inlining = self.control.exceptions.prevent_try_exit_inlining
-                    && !inline_terminal_break_cleanup;
+                    && !inline_terminal_break_cleanup
+                    && !inline_named_break_cleanup;
                 // The new loop-return copy runs after its protected regions have popped.
                 // Keep outer collectors active for cleanup emitted by the copied return.
                 let unwound_loop_return_regions = context.loop_exit_outer_return_depth.map(|_| {
