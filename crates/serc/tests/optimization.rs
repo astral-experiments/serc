@@ -1254,6 +1254,20 @@ fn async_iterator_exhaustion_keeps_copied_branch_exit() {
 }
 
 #[test]
+fn an_authored_loop_break_reaches_the_normal_finalizer_load() {
+    let source = "async def poll(ready):\n    local = open_resource()\n    try:\n        if first():\n            while True:\n                if ready:\n                    break\n        elif second():\n            pass\n    except ValueError:\n        pass\n    finally:\n        await local.finish()\n";
+    for source in [
+        source.to_owned(),
+        source.replace(
+            "if ready:\n                    break",
+            "if ready or second():\n                    break\n                await local.step()",
+        ),
+    ] {
+        assert_matches_cpython(&source, "loop_finalizer_load.py", &LEVELS);
+    }
+}
+
+#[test]
 fn a_final_guard_locates_the_normal_exit_before_async_cleanup() {
     let source = r"async def run(manager, value):
     async with manager:

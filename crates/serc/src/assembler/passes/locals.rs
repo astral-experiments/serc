@@ -2204,6 +2204,7 @@ impl OptimizationPipeline {
     pub(in crate::assembler) fn snapshot_threaded_borrow_entries(
         graph: &crate::assembler::block_graph::BlockGraph,
         eligible_global_instructions: &FxHashSet<usize>,
+        original_boundaries: Option<&FxHashSet<Label>>,
     ) -> ThreadedBorrowEntries {
         let mut entries = ThreadedBorrowEntries::default();
         if eligible_global_instructions.is_empty() {
@@ -2222,13 +2223,31 @@ impl OptimizationPipeline {
                 })
                 .collect::<FxHashSet<_>>();
             global_instruction += count;
-            if !eligible_jumps.is_empty()
-                && let Some(Item::Label(anchor)) = contents.items().first()
-            {
+            if eligible_jumps.is_empty() {
+                continue;
+            }
+            let mut labels = contents
+                .items()
+                .iter()
+                .map_while(|item| match item {
+                    Item::Label(label) => Some(*label),
+                    Item::Instruction(_) => None,
+                })
+                .enumerate();
+            // A break can start with exception-range aliases or empty guard arrays.
+            // The last original label before its first instruction owns the break.
+            let anchor = if let Some(boundaries) = original_boundaries {
+                labels
+                    .filter(|(_, label)| boundaries.contains(label))
+                    .last()
+            } else {
+                labels.next()
+            };
+            if let Some((start, label)) = anchor {
                 entries.insert(
-                    *anchor,
+                    label,
                     ThreadedBorrowSnapshot {
-                        items: contents.items().to_vec(),
+                        items: contents.items()[start..].to_vec(),
                         eligible_jumps,
                     },
                 );
@@ -3260,8 +3279,6 @@ impl OptimizationPipeline {
             // including any preceding statements. Its explicit finally route is checked
             // after cleanup-call capture and again after actual threading.
             if borrowed[block.index()]
-                && matches!(items.first(), Some(Item::Label(label))
-                    if self.exception_owner_provenance.block_boundaries.contains(label))
                 && last.opcode == crate::target::opcodes::JUMP_FORWARD
                 && last.fusion_policy.is_authored_break()
                 && last.location.line >= 0
@@ -3289,7 +3306,11 @@ impl OptimizationPipeline {
         }
         self.borrow_finally_jump_sources = sources;
         self.borrow_authored_finally_break_origins.snapshots =
-            Self::snapshot_threaded_borrow_entries(&self.graph, &authored_breaks);
+            Self::snapshot_threaded_borrow_entries(
+                &self.graph,
+                &authored_breaks,
+                Some(&self.exception_owner_provenance.block_boundaries),
+            );
     }
 
     /// Records nonempty cleanup targets before optimizer passes can merge their labels.
