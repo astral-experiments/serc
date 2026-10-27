@@ -762,7 +762,7 @@ impl ExceptionOwnerProvenance {
                 }
                 visit(&mut record.1);
             }
-            if let Some(record) = origin.continued_attribute_none.as_mut() {
+            if let Some(record) = origin.continued_guard.as_mut() {
                 for instruction in &mut record.0 {
                     visit(instruction);
                 }
@@ -1398,7 +1398,7 @@ pub(super) struct CopiedHandlerCleanup {
     pub(super) assignment_pop: Option<(Label, Instruction)>,
     pub(super) continued_call: Option<([Instruction; 6], Instruction)>,
     // Direct named-handler continue: the original finalizer POP follows name cleanup.
-    pub(super) continued_attribute_none: Option<([Instruction; 3], Instruction)>,
+    pub(super) continued_guard: Option<([Instruction; 3], Instruction)>,
 }
 
 /// A single-line source None comparison whose three removed records precede late SETUP cleanup.
@@ -5834,7 +5834,7 @@ impl LayoutAssembler {
             || origin.return_iterator.is_some()
             || origin.assignment_pop.is_some()
             || origin.continued_call.is_some()
-            || origin.continued_attribute_none.is_some()
+            || origin.continued_guard.is_some()
             || origin.return_nop.opcode != NOP
             || origin.return_nop.location != origin.instructions[0].location
             || [origin.start, origin.end].into_iter().any(|label| {
@@ -7422,7 +7422,7 @@ impl LayoutAssembler {
                                 tail.early_removals,
                                 original.missing_null_pops,
                                 original.continued_call,
-                                original.continued_attribute_none,
+                                original.continued_guard,
                                 *original,
                             ));
                         }
@@ -12135,7 +12135,7 @@ impl LayoutAssembler {
                                 end_removed,
                                 missing,
                                 continued_call,
-                                continued_attribute_none,
+                                continued_guard,
                                 copied_handler_origin,
                             )) = copied_handler_prefix
                             && array == original_array_start
@@ -12162,7 +12162,7 @@ impl LayoutAssembler {
                                             == 3
                                             && condition.location == instruction.location
                                     })
-                            } else if let Some((prefix, marker)) = continued_attribute_none {
+                            } else if let Some((prefix, marker)) = continued_guard {
                                 instruction_index - end == prefix.len()
                                     && *instruction == marker
                                     && indexed_instructions[end..instruction_index]
@@ -12219,7 +12219,7 @@ impl LayoutAssembler {
                                                     && origin.instructions.len() == 4
                                                     && origin.assignment_pop.is_none()
                                                     && origin.continued_call.is_none()
-                                                    && origin.continued_attribute_none.is_none()
+                                                    && origin.continued_guard.is_none()
                                                     && label_positions.get(&origin.start) == Some(&start)
                                                     && label_positions.get(&origin.end) == Some(&end)
                                                     && self.exception_owner_provenance
@@ -12306,7 +12306,7 @@ impl LayoutAssembler {
                                                             && origin.instructions.len() == 4
                                                             && origin.assignment_pop.is_none()
                                                             && origin.continued_call.is_none()
-                                                            && origin.continued_attribute_none.is_none()
+                                                            && origin.continued_guard.is_none()
                                                             && label_positions.get(&origin.start) == Some(&start)
                                                             && label_positions.get(&origin.end) == Some(&end)
                                                             && self.exception_owner_provenance
@@ -12341,15 +12341,19 @@ impl LayoutAssembler {
                                 instruction_index - end + tail.early_removals - end_removed;
                             // The authenticated direct continue originally emitted its NOP,
                             // two handler POPs, the four name-cleanup records, then the
-                            // finalizer POP. The exact attribute None prefix appends into
-                            // that last NULL cell; it adds no earlier live or hidden record.
-                            if continued_attribute_none.is_some()
-                                && array == start
+                            // finalizer POP. The marker appends into that last NULL cell.
+                            // A None test hides three comparison records after the POP.
+                            if let Some((guard, _)) = continued_guard
+                                && (array == start || pop_slot_epoch_known)
                                 && end - start == 4
                                 && end_removed == 1
                                 && missing == 2
-                                && tail.early_removals == end_removed + 3
-                                && instruction_index - array == 1 + missing + end - start
+                                && tail.early_removals
+                                    == end_removed
+                                        + usize::from(
+                                            guard[2].local_policy.hidden_exception_owner_slots(),
+                                        )
+                                && instruction_index - end == end_removed + missing
                             {
                                 owners.insert(
                                     instruction_index,
@@ -12365,7 +12369,7 @@ impl LayoutAssembler {
                                         && end - start == 4
                                         && instruction_index - end == 3
                                         && continued_call.is_none()
-                                        && continued_attribute_none.is_none()
+                                        && continued_guard.is_none()
                                         && previous.is_some_and(|condition| {
                                             matches!(
                                                 condition.opcode,
@@ -12441,7 +12445,7 @@ impl LayoutAssembler {
                                 && instruction.local_policy.hidden_exception_owner_slots() == 0
                                 && instruction.pre_fold_extra_instructions() == 0
                                 && continued_call.is_none()
-                                && continued_attribute_none.is_none()
+                                && continued_guard.is_none()
                                 && copied_handler_origin.following_iterator
                                 && copied_handler_origin.missing_null_pops == 0
                                 && copied_handler_origin.removed_prefix_slots == 3
