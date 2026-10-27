@@ -583,10 +583,10 @@ struct FallbackCertificate {
 /// An authored singleton's entire original fallthrough array, with no vacant-slot reuse.
 struct FreshSingletonCertificate {
     interval: Certificate,
-    // Protected ranges transferred through cold splits, or recorded named-handler copy splits.
+    // Protected ranges transferred through cold splits or recorded exit copies.
     manager_regions: Vec<ExceptionRegion>,
-    // A separate fresh-array proof may retain overlapping named-handler/outer ranges.
-    named_handler_target: Option<Label>,
+    // A fresh array can lie within overlapping handler and outer ranges.
+    handler_target: Option<Label>,
 }
 
 impl FreshSingletonCertificate {
@@ -643,14 +643,15 @@ impl FreshSingletonCertificate {
                     })
             })
             .collect::<Vec<_>>();
-        let (owner, removed, named_handler_target) = if let Some((owner, removed)) =
+        let (owner, removed, handler_target) = if let Some((owner, removed)) =
             view.uniform_owned_interval(start, condition, false, Some(&manager_regions), false)
         {
             (owner, removed, None)
         } else {
             // Overlapping exception ranges do not populate a never-used array cell.
             // Keep this authored handler proof separate from uniform-owner recovery.
-            let (target, regions) = view.fresh_named_handler_singleton_regions(start, condition)?;
+            let (target, regions) =
+                view.fresh_handler_singleton_regions(start, condition, &anchor)?;
             manager_regions = regions;
             (None, 0, Some(target))
         };
@@ -671,7 +672,7 @@ impl FreshSingletonCertificate {
                 setups: view.provenance.setups.clone(),
             },
             manager_regions,
-            named_handler_target,
+            handler_target,
         };
         result.valid(view, false)?;
         Some(result)
@@ -684,9 +685,9 @@ impl FreshSingletonCertificate {
         {
             return None;
         }
-        if let Some(target) = self.named_handler_target {
+        if let Some(target) = self.handler_target {
             let (current_target, current) =
-                view.fresh_named_handler_singleton_regions(start, condition)?;
+                view.fresh_handler_singleton_regions(start, condition, &self.interval.anchor)?;
             if current_target != target {
                 return None;
             }
@@ -1140,12 +1141,13 @@ impl View<'_> {
         self.uniform_owned_interval(start, condition, observed_local_fusion, None, false)
     }
 
-    /// Proves a literal singleton array under one authored named-handler target.
+    /// Proves a literal singleton array under one source-authored handler target.
     /// No owner is copied: the marker is appended beyond every original live cell.
-    fn fresh_named_handler_singleton_regions(
+    fn fresh_handler_singleton_regions(
         &self,
         start: usize,
         condition: usize,
+        anchor: &Anchor,
     ) -> Option<(Label, Vec<ExceptionRegion>)> {
         if start > condition || condition >= self.items.len() {
             return None;
@@ -1219,7 +1221,14 @@ impl View<'_> {
             position += 1;
         }
         let regions = original_regions?;
-        let mut named = regions.iter().filter(|region| {
+        // Pattern unpacking and the previous conditional start original fallthrough arrays.
+        // A later split can change a try range's endpoints while retaining its handler.
+        let pattern_fallthrough = matches!(anchor, Anchor::Marker(..) | Anchor::OriginalMarker(..))
+            || self.items[start..=condition]
+                .iter()
+                .find_map(Item::as_instruction)
+                .is_some_and(|first| first.opcode == crate::target::opcodes::UNPACK_SEQUENCE);
+        let is_named_cleanup = |region: &ExceptionRegion| {
             !region.is_scope_fallback
                 && region.preserve_lasti
                 && region.depth > 0
@@ -1227,9 +1236,24 @@ impl View<'_> {
                     .provenance
                     .named_handler_cleanup_targets
                     .contains(&region.target)
+        };
+        // In a named handler, the cleanup owns the pattern even when an outer try
+        // also covers it. Only use an ordinary try to identify a pattern outside one.
+        let in_named_handler = regions.iter().any(is_named_cleanup);
+        let mut handlers = regions.iter().filter(|region| {
+            is_named_cleanup(region)
+                || (!in_named_handler
+                    && pattern_fallthrough
+                    && !region.is_scope_fallback
+                    && !region.preserve_lasti
+                    && self
+                        .provenance
+                        .ordinary_try_setups
+                        .values()
+                        .any(|target| *target == region.target))
         });
-        let target = named.next()?.target;
-        if named.next().is_some() {
+        let target = handlers.next()?.target;
+        if handlers.next().is_some() {
             return None;
         }
         Some((target, regions))
@@ -2395,19 +2419,19 @@ impl FusionOwnerCertificates {
         }
         result
     }
-    /// Carries original fallback arrays and named-handler singleton proofs across exit copying.
+    /// Carries original fallback arrays and protected singleton proofs across exit copying.
     pub(super) fn retain_after_exit_copy(
         &mut self,
         p: &OptimizationPipeline,
         retargets: &[(Instruction, Instruction)],
         region_retargets: &[(ExceptionRegion, ExceptionRegion)],
     ) {
-        // Copies carve exact holes in the original named-handler ranges. Transfer only
+        // Copies carve exact holes in the original handler ranges. Transfer only
         // those certificates through the producer's records before checking the full array.
         for certificate in self
             .fresh_singleton_certificates
             .iter_mut()
-            .filter(|certificate| certificate.named_handler_target.is_some())
+            .filter(|certificate| certificate.handler_target.is_some())
         {
             let mut transferred = Vec::new();
             for region in &certificate.manager_regions {

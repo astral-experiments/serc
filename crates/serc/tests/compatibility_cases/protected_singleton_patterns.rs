@@ -145,3 +145,31 @@ fn preserves_class_singleton_match_break_return_locations() {
         }
     }
 }
+
+#[test]
+fn unpacked_booleans_keep_fresh_marker_slots_inside_try() {
+    for pattern in ["[True]", "[False, True]"] {
+        let source = format!(
+            "def accept(value):\n    try:\n        match value:\n            case {pattern}:\n                select(value)\n            case _:\n                skip()\n    except ValueError:\n        recover()\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "try_boolean_pattern.py");
+    }
+}
+
+#[test]
+fn unpacked_boolean_marker_in_a_named_handler_inside_try() {
+    let source = r#"def check(value):
+    try:
+        try:
+            read()
+        except KeyError as error:
+            match value:
+                case {"ready": True}:
+                    use(error)
+                case _:
+                    raise
+    except OSError:
+        recover()
+"#;
+    common::assert_matches_cpython_marshal(source, "nested_handler_boolean_pattern.py");
+}
