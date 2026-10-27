@@ -2964,6 +2964,25 @@ fn nested_recovery_shares_the_outer_call_return() {
 }
 
 #[test]
+fn iterator_returns_inside_a_handler_keep_the_surrounding_finally() {
+    let source = r"async def read(items):
+    try:
+        start()
+    except KeyError:
+        async with lock():
+            try:
+                for item in items:
+                    try:
+                        return await fetch(item)
+                    except ValueError:
+                        continue
+            finally:
+                release()
+";
+    assert_matches_cpython(source, "handler_finally_iterator_return.py", &LEVELS);
+}
+
+#[test]
 fn managed_returns_into_nested_finally_keep_the_guard_owner() {
     for body in [
         "if check():\n                used(used(value))\n                return 0",

@@ -11402,7 +11402,9 @@ impl<'source> Compiler<'source> {
                         preserve_tos,
                         if tracks_handler_iterator_region_unwinds
                             || (tracks_finally_region_unwinds
-                                && handler_count == 0
+                                // Handlers entered before this finally stay active through
+                                // iterator cleanup, just like the surrounding managers.
+                                && handler_count == finally_context.handler_depth
                                 && (self.control.withs.active_with_exits.is_empty()
                                     || retained_managers_surround_finally
                                     || retained_manager_surrounds_iterators)
