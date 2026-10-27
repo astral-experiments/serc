@@ -29134,16 +29134,17 @@ impl<'source> Compiler<'source> {
                 // edges, including loops in its else suite. Copies inherit each
                 // predecessor's own authored location.
                 self.assembler.set_location(SourceLocation::NONE);
-            } else if statement.orelse.is_empty()
-                && let Some(Stmt::While(loop_statement)) = statement.body.last()
+            } else if (statement.orelse.is_empty()
+                || self.context.python_version >= crate::PythonVersion::Py314)
+                && let Some(Stmt::While(loop_statement)) = normal_exit_suite.last()
                 && loop_statement.orelse.is_empty()
                 && !suite_contains_loop_break(&loop_statement.body)
                 && early_condition_truthiness(&loop_statement.test).is_none()
                 && condition_jump_target_count(&loop_statement.test, false) == 1
                 && original_condition_has_unique_jump_target(&loop_statement.test, false)
             {
-                // The sole original false edge supplies the normal try exit's location;
-                // the last emitted loop-body instruction can belong to a nested iterator.
+                // The normal exit inherits the while condition's false edge. On
+                // 3.14+ this also holds when the loop ends the try's else suite.
                 self.assembler.set_location(
                     self.source_location(while_condition_exit_range(&loop_statement.test)),
                 );

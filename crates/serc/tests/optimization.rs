@@ -6462,6 +6462,22 @@ fn terminal_nested_recovery_else_stops_borrowed_continuation() {
 }
 
 #[test]
+fn terminal_try_else_loop_return_uses_the_false_edge() {
+    let source = r"def run(items, ready):
+    if ready:
+        try:
+            prepare(items)
+        except LookupError:
+            pass
+        else:
+            while ready:
+                for item in items:
+                    process(item)
+";
+    assert_matches_cpython(source, "try_else_loop.py", &LEVELS);
+}
+
+#[test]
 fn asserted_try_else_retains_borrowed_continuation() {
     let indent = |source: &str| {
         let mut result = String::new();
