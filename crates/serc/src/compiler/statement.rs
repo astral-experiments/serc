@@ -24127,18 +24127,17 @@ impl<'source> Compiler<'source> {
             };
             let short_circuit_value = boolean.op == BoolOp::Or;
             if short_circuit_value == jump_on {
-                if self.control.loops.protected_iterator_continue_condition
-                    == Some(expression.range())
-                    && let Some((first, remaining)) = leading.split_first()
-                {
-                    self.compile_jump_if(first, jump_on, success)?;
-                    self.assembler.preserve_last_not_taken_exception_owner();
-                    for value in remaining {
-                        self.compile_jump_if(value, jump_on, success)?;
+                for (index, value) in leading.iter().enumerate() {
+                    self.compile_jump_if(value, jump_on, success)?;
+                    if jump_constant_truthiness(value) == Some(short_circuit_value) {
+                        // Folding skips the remaining operand arrays before the loop body.
+                        self.assembler.record_folded_condition_borrow_entry(success);
                     }
-                } else {
-                    for value in leading {
-                        self.compile_jump_if(value, jump_on, success)?;
+                    if index == 0
+                        && self.control.loops.protected_iterator_continue_condition
+                            == Some(expression.range())
+                    {
+                        self.assembler.preserve_last_not_taken_exception_owner();
                     }
                 }
             } else {

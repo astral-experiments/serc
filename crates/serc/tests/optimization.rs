@@ -5846,6 +5846,16 @@ fn terminal_recovery_scopes_preserve_normal_exits() {
 }
 
 #[test]
+fn folded_loop_tail_disjunction_preserves_borrow_entries() {
+    for condition in ["True or ready", "ready or True", "not (False and ready)"] {
+        let source = format!(
+            "def run(value, items, ready):\n    for item in items:\n        if {condition}:\n            consume(value, item)\n"
+        );
+        assert_matches_cpython(&source, "folded_loop_condition.py", &LEVELS);
+    }
+}
+
+#[test]
 fn terminal_recovery_body_stops_borrowed_continuation() {
     for prefix in ["", "            resource.prepare()\n"] {
         for terminal in ["return", "return resource", "raise Error(resource)"] {
