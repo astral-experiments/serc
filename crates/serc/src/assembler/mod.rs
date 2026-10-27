@@ -13162,7 +13162,7 @@ impl Assembler {
         adjacent_pops: usize,
         transferred: bool,
     ) {
-        use crate::target::opcodes::{LOAD_FAST, LOAD_SMALL_INT, TO_BOOL};
+        use crate::target::opcodes::{LOAD_DEREF, LOAD_FAST, LOAD_SMALL_INT, TO_BOOL};
         let mut suffix = self.linear_items()[start..]
             .iter()
             .filter_map(Item::as_instruction)
@@ -13206,7 +13206,7 @@ impl Assembler {
             || setup.fusion_policy.is_converted_pop_block()
             || setup.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
             || setup.location.line < 0
-            || load.opcode != LOAD_FAST
+            || !matches!(load.opcode, LOAD_FAST | LOAD_DEREF)
             || load.location.line != condition.location.line
             || condition.forward_target().is_none()
             || marker.opcode != NOT_TAKEN

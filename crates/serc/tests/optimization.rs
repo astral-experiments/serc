@@ -4421,6 +4421,30 @@ fn named_handler_return_keeps_the_nested_finalizer_setup_unowned() {
 }
 
 #[test]
+fn a_captured_local_keeps_the_unowned_setup_in_a_returned_finalizer() {
+    let source = r"def visit(value, manager, ready):
+    try:
+        with manager:
+            if ready:
+                return
+    except LookupError:
+        recover()
+    finally:
+        try:
+            if value is not None:
+                defer(lambda: value)
+        finally:
+            finish()
+";
+    assert_matches_cpython_versions(
+        source,
+        "captured_finalizer_guard.py",
+        &LEVELS,
+        &VERSIONS.map(|(version, _, _)| version),
+    );
+}
+
+#[test]
 fn nested_finalizers_reuse_unowned_setup_slots_after_manager_returns() {
     let samples = [
         r"def sample(value, enabled):
