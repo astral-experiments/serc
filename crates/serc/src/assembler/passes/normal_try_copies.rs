@@ -2169,7 +2169,19 @@ impl OptimizationPipeline {
         self.prepare_unlocated_normal_try_discards();
         self.restore_empty_try_jump_owners();
         let mut selected = Vec::new();
-        for &(entry, target) in &self.exception_owner_provenance.normal_try_exits {
+        let mut compound_donors = Vec::new();
+        for (&(entry, target), compound) in self
+            .exception_owner_provenance
+            .normal_try_exits
+            .iter()
+            .map(|edge| (edge, false))
+            .chain(
+                self.exception_owner_provenance
+                    .compound_try_owner_exits
+                    .iter()
+                    .map(|edge| (edge, true)),
+            )
+        {
             let (Some(block), Some(target_block)) = (
                 self.graph.label_block(entry),
                 self.graph.label_block(target),
@@ -2494,9 +2506,30 @@ impl OptimizationPipeline {
                     continue;
                 }
             }
+            if compound {
+                // This normal try/except jump leads into an enclosing finalizer.
+                // Its successful predecessors copy the jump, so the remaining
+                // guard supplies its line without splitting the cleanup’s borrow path.
+                if jump.location == SourceLocation::NONE
+                    && let Some(test) =
+                        conditional_source.and_then(|source| self.graph[source].last_instruction())
+                {
+                    compound_donors.push((block, test.location));
+                }
+                continue;
+            }
             if !selected.contains(&block) {
                 selected.push(block);
             }
+        }
+        for (block, location) in compound_donors {
+            let jump = self
+                .graph
+                .instructions_mut(block)
+                .next_back()
+                .expect("normal exit jump");
+            jump.location = location;
+            jump.jump_policy.retain_redundant_nop_after_threading();
         }
         let mut pop_intervals = Vec::new();
         for block in selected {
