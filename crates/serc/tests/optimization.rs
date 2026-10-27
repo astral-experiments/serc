@@ -3984,7 +3984,7 @@ fn folded_while_break_preserves_try_else_borrow_boundary() {
                 break
     consume(value)
 ";
-    for continuation in ["consume(value)", "return value"] {
+    for continuation in ["consume(value)", "return consume(value)"] {
         assert_matches_cpython(
             &source.replace("consume(value)", continuation),
             "folded_while_else.py",
