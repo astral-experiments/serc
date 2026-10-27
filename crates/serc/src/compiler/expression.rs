@@ -1222,6 +1222,15 @@ impl Compiler<'_> {
                                 .assembler
                                 .instruction_opcode_at(self.assembler.instruction_count() - 1)
                                 == Some(END_ASYNC_FOR);
+                        let final_iterator_break_join = match_has_following
+                            && self.context.python_version >= PythonVersion::Py314
+                            && index + 1 == matched_cases
+                            && !has_default
+                            && self
+                                .assembler
+                                .instruction_opcode_at(self.assembler.instruction_count() - 1)
+                                == Some(POP_ITER)
+                            && self.assembler.at_original_authored_break_join();
                         let success_exit = self
                             .emit_jump_forward_instruction_with_exception_policy(
                                 JUMP_FORWARD,
@@ -1238,6 +1247,12 @@ impl Compiler<'_> {
                             )?;
                         self.assembler
                             .record_original_match_success(success_exit, original_empty_join);
+                        if final_iterator_break_join {
+                            // Breaks copy the case's jump over the iterator cleanup. The
+                            // original jump keeps the exhaustion line when it becomes a NOP.
+                            self.assembler
+                                .preserve_redundant_jump_nop_after_threading(success_exit);
+                        }
                         if original_unlocated_head
                             && self.can_descend_match_tail_wrappers()
                             && self
