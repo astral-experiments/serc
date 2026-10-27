@@ -2009,6 +2009,29 @@ fn matches_cpython_partial_terminal_match_handler_borrow_entries() {
 }
 
 #[test]
+fn copied_manager_reraise_stops_borrow_fallthrough() {
+    for tail in [
+        "saved = item.value",
+        "del registry.value",
+        "saved = item.value.extra",
+        "saved = next_value()",
+    ] {
+        let source = format!(
+            r"def run(value, resource):
+    try:
+        prepare()
+    finally:
+        with resource as item:
+            work(item)
+        {tail}
+    consume(value)
+"
+        );
+        common::assert_matches_cpython_marshal(&source, "copied_manager_reraise.py");
+    }
+}
+
+#[test]
 fn copied_comprehension_restore_stops_borrow_fallthrough() {
     for cleanup in [
         "result = [work(x) for x in items]",
