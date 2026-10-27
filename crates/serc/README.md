@@ -10,9 +10,9 @@ CLI usage, [architecture](ARCHITECTURE.md) for internals, and
 `compile_bytes` accepts source bytes without filesystem I/O. It validates
 encoding cookies and UTF-8 BOMs, rejects null bytes, and normalizes CRLF and CR
 newlines. Supported encodings are UTF-8, ASCII, Latin-1, Latin-9, EUC-JP,
-KOI8-R, and Windows-1251. `compile` accepts decoded UTF-8 text. Both default to
-Python 3.14 and reject filenames containing a null character before processing
-the source.
+KOI8-R, Windows-1251, and Windows-1252. `compile` accepts decoded UTF-8 text.
+Both default to Python 3.14 and reject filenames containing a null character
+before processing the source.
 
 When the source timestamp is known, `compile_bytes_to_pyc` also writes a
 timestamp-invalidated header with the original source byte length:
