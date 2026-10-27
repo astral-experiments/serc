@@ -13261,6 +13261,7 @@ impl<'source> Compiler<'source> {
                             return_finally_contexts[1].exception_region_depth,
                         )
                     });
+                    let copied_finally_pop_item = self.assembler.item_count();
                     let copied_finally_pop_instruction = self.assembler.instruction_count();
                     self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
                     if !starts_jump_target
@@ -13510,6 +13511,18 @@ impl<'source> Compiler<'source> {
                             pop,
                             ordinary_pops,
                             nested_named_handler,
+                        );
+                    }
+                    if result.is_ok()
+                        && self.context.python_version == crate::PythonVersion::Py314
+                        && preserve_tos
+                        && handler_count > finally_context.handler_depth
+                        && matches!(statement.value.as_deref(), Some(Expr::Call(_)))
+                        && matches!(finally_context.body.first(), Some(Stmt::If(_)))
+                    {
+                        self.assembler.exclude_returned_named_handler_guard_slot(
+                            copied_handler_return_item,
+                            copied_finally_pop_item,
                         );
                     }
                     if result.is_ok() && (preserve_tos || nested_handler_exit) {

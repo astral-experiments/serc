@@ -19573,6 +19573,36 @@ print(json.dumps(rows))
 }
 
 #[test]
+fn named_handler_return_compaction_selects_the_finalizer_truth_marker_owner() {
+    for returned in ["finish(item)", "finish(item, other)", "callback(item)"] {
+        for guard in ["ready", "not ready"] {
+            let source = format!(
+                r"async def run(item, other, ready, callback):
+    try:
+        begin()
+    finally:
+        try:
+            try:
+                visit(item)
+            except LookupError as caught:
+                if ready:
+                    return {returned}
+        finally:
+            if {guard}:
+                release()
+"
+            );
+            assert_matches_cpython_versions(
+                &source,
+                "named_handler_guard_slot.py",
+                &LEVELS,
+                &[PythonVersion::Py314],
+            );
+        }
+    }
+}
+
+#[test]
 fn deferred_finalizer_returns_keep_their_cleanup_range_and_line() {
     let linear = r"async def run(value, ready):
     try:
