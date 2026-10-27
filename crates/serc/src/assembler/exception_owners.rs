@@ -1228,6 +1228,8 @@ impl CopiedReturnNonePrefix {
 #[derive(Debug)]
 pub(super) struct CopiedFinalizerSetup {
     pub(super) records: SmallVec<[Instruction; 4]>,
+    /// Entry of the straight-line work between the unwind and this SETUP.
+    pub(super) work_entry: Option<Label>,
     pub(super) missing_pops: usize,
     pub(super) adjacent_pops: usize,
 }
@@ -6130,6 +6132,13 @@ impl LayoutAssembler {
         let Some(setup) = marker.checked_sub(origin.records.len()) else {
             return false;
         };
+        let work = match origin.work_entry {
+            Some(entry) => match positions.get(&entry) {
+                Some(&entry) if array < entry && entry < setup => entry,
+                _ => return false,
+            },
+            None => setup,
+        };
         if origins.next().is_some()
             || setup < array
             || !self
@@ -6141,9 +6150,9 @@ impl LayoutAssembler {
                         && positions.get(label) == Some(&(setup + 1))
                 })
             || jump_targets.iter().any(|label| {
-                positions
-                    .get(label)
-                    .is_some_and(|at| setup < *at && *at <= marker)
+                positions.get(label).is_some_and(|at| {
+                    (work < *at || (origin.work_entry.is_some() && work == *at)) && *at <= marker
+                })
             })
             || origin
                 .records
