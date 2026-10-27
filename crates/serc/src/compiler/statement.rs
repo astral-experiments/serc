@@ -16982,7 +16982,11 @@ impl<'source> Compiler<'source> {
                         >= crate::PythonVersion::Py313
                         && (self.control.statements.context.followed_by_return_or_raise
                             || (!self.control.statements.context.has_following
-                                && self.control.statements.context.inherited_followed_by_small_return))
+                                && self
+                                    .control
+                                    .statements
+                                    .context
+                                    .inherited_followed_by_small_return))
                         && matches!(branch_tail, Some(Stmt::If(guard))
                             if guard.elif_else_clauses.is_empty()
                                 && matches!(guard.body.last(), Some(Stmt::While(tail))
