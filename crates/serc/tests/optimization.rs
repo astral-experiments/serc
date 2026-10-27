@@ -19066,3 +19066,17 @@ fn nested_conditional_arms_donate_implicit_return_locations() {
 ";
     assert_matches_cpython(source, "nested_implicit_returns.py", &LEVELS);
 }
+
+#[test]
+fn normal_finalizer_comprehension_keeps_its_result_guard_owner() {
+    let source = r"async def collect(source):
+    async with acquire():
+        try:
+            yield
+        finally:
+            result = [item async for item in source]
+            if result:
+                await consume(result)
+";
+    assert_matches_cpython(source, "normal_finalizer_comprehension_guard.py", &LEVELS);
+}

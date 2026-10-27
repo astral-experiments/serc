@@ -5318,6 +5318,37 @@ impl Assembler {
             return None;
         }
         let provenance = &self.exception_owner_provenance;
+        // A deferred comprehension restore exchanges its SWAP with the result
+        // store. The following marker reuses the protected condition cell.
+        if self.python_version == crate::PythonVersion::Py314
+            && truth
+            && let [.., Item::Label(entry), Item::Instruction(result), Item::Label(barrier),
+                Item::Instruction(restore), Item::Instruction(load), Item::Instruction(convert),
+                Item::Instruction(condition)] = items
+            && provenance.fusion_boundaries.contains(barrier)
+            && result.opcode == STORE_FAST
+            && !result.local_policy.may_store_null()
+            && restore.opcode == STORE_FAST
+            && restore.local_policy.may_store_null()
+            && restore.local_policy.hidden_exception_owner_slots() == 1
+            && result.operand() != restore.operand()
+            && load.opcode == LOAD_FAST
+            && load.operand() == result.operand()
+            && convert.opcode == TO_BOOL
+            && convert.location == condition.location
+            && condition.forward_target().is_some()
+            && result.depth_after() == load.depth_after()
+            && restore.depth_after() == condition.depth_after()
+            && convert.depth_after() == load.depth_after()
+            && provenance.original_primitive_condition_boundaries.contains(condition)
+            && provenance.original_comprehension_normal_exits.iter().any(|(target, jump)| {
+                target == entry
+                    && jump.opcode == JUMP_FORWARD
+                    && jump.forward_target() == Some(*entry)
+            })
+        {
+            return Some(true);
+        }
         let begin = items.iter().rposition(|item| {
             matches!(item, Item::Label(label)
             if provenance.source_boundaries.contains(label)
