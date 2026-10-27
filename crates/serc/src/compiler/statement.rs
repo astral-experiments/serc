@@ -1882,7 +1882,7 @@ impl<'source> Compiler<'source> {
     /// Locate a try-else conditional whose two fallthrough edges reach the same
     /// implicit return after CPython removes the trailing assertions.
     fn erased_try_else_return_end(&self, body: &[Stmt]) -> Option<usize> {
-        if self.context.python_version < crate::PythonVersion::Py314 {
+        if self.context.python_version < crate::PythonVersion::Py313 {
             return None;
         }
         let end = body
@@ -1893,11 +1893,8 @@ impl<'source> Compiler<'source> {
         };
         (end + 1 < body.len()
             && branch.elif_else_clauses.is_empty()
-            && condition_has_linear_runtime_leaves(&branch.test)
-            && !expression_suspends_current_scope(&branch.test)
-            && branch.body.iter().all(|part| {
-                matches!(part, Stmt::Pass(_)) || self.context.is_elided_statement(part)
-            }))
+            && condition_has_only_runtime_tests(&branch.test)
+            && !expression_suspends_current_scope(&branch.test))
         .then_some(end + 1)
     }
 
