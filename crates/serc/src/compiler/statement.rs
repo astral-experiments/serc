@@ -960,6 +960,12 @@ impl ControlFlowState<'_> {
         })
     }
 
+    /// Whether this backedge reaches the current loop header without crossing cleanup.
+    fn reaches_loop_header(&self, restart: Label) -> bool {
+        self.loop_at_current_cleanup_depth()
+            .is_some_and(|context| context.continue_label == restart)
+    }
+
     fn in_loop_tail_without_nested_cleanup(&self) -> bool {
         self.loop_at_current_cleanup_depth()
             .is_some_and(|context| !context.has_orelse)
@@ -19326,7 +19332,10 @@ impl<'source> Compiler<'source> {
             && body[end + 1..]
                 .iter()
                 .any(|statement| self.context.is_elided_statement(statement))
-            && (matches!(&body[end], Stmt::While(statement)
+            && ((mode == LoopTailMode::default()
+                && matches!(&body[end], Stmt::If(_))
+                && self.control.reaches_loop_header(restart))
+                || matches!(&body[end], Stmt::While(statement)
                 if statement.orelse.is_empty()
                     && condition_has_only_runtime_tests(&statement.test)
                     && !suite_contains_loop_break(&statement.body))
@@ -22441,10 +22450,7 @@ impl<'source> Compiler<'source> {
         let optimized_empty_else = (optimized_empty_else
             || (eligible_else
                 && mode == LoopTailMode::default()
-                && self
-                    .control
-                    .loop_at_current_cleanup_depth()
-                    .is_some_and(|context| context.continue_label == restart)))
+                && self.control.reaches_loop_header(restart)))
             // Outside a direct loop exit, a suspended scope's final chained
             // condition can own a backedge inside its implicit exception wrapper.
             && (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
@@ -22471,10 +22477,7 @@ impl<'source> Compiler<'source> {
             // threading. Only the backedge's owners matter here; loop exhaustion
             // enters an else suite on a separate edge.
             let copied_loop_branch_exit = non_final_branch
-                && self
-                    .control
-                    .loop_at_current_cleanup_depth()
-                    .is_some_and(|context| context.continue_label == restart)
+                && self.control.reaches_loop_header(restart)
                 && (!self.has_active_control_flow_region()
                     || condition_has_only_runtime_tests(&statement.test));
             // Managers and protected tries entered before the iterator keep
@@ -22871,10 +22874,7 @@ impl<'source> Compiler<'source> {
                     return Ok(LoopBackedge::Emitted);
                 }
                 let copied_loop_branch_exit = non_final_branch
-                    && self
-                        .control
-                        .loop_at_current_cleanup_depth()
-                        .is_some_and(|context| context.continue_label == restart)
+                    && self.control.reaches_loop_header(restart)
                     && (!expression_contains_chained_comparison(test)
                         // A direct runtime chain has two false paths into this original
                         // exit: its comparison edge and the intermediate-value cleanup.
