@@ -27183,19 +27183,24 @@ impl<'source> Compiler<'source> {
         // Copy the normal POP_BLOCK and jump into the successful cases. A final
         // value-pattern failure can then donate its line. A raising wildcard has
         // no fallthrough and its raise line cannot locate the normal exit.
-        let coroutine_match_pop = self.context.python_version >= crate::PythonVersion::Py314
-            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+        let named_coroutine_handler =
+            self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+                && matches!(statement.handlers.as_slice(), [handler]
+                    if handler.as_except_handler().is_some_and(|handler| handler.name.is_some()));
+        // A copied return can retain its surrounding exception owner on the marker.
+        let live_continuation = self.control.statements.context.has_following
+            && !self.control.statements.context.followed_by_return_or_raise;
+        let ordinary_match_pop = self.context.python_version >= crate::PythonVersion::Py314
             && !statement.is_star
             && statement.orelse.is_empty()
             && statement.finalbody.is_empty()
             && self.control.stack.depth == 0
-            && matches!(statement.handlers.as_slice(), [handler]
-                if handler.as_except_handler().is_some_and(|handler| handler.name.is_some()))
             && matches!(statement.body.last(), Some(Stmt::Match(matched))
                 if matched.cases.split_last().is_some_and(|(case, earlier)| case.guard.is_none()
-                    && ((matches!(case.pattern, Pattern::MatchValue(_))
+                    && (((named_coroutine_handler || live_continuation)
+                        && matches!(case.pattern, Pattern::MatchValue(_))
                         && self.assembler.has_located_match_success_before_try_end(try_end))
-                        || (is_wildcard_pattern(&case.pattern)
+                        || (named_coroutine_handler && is_wildcard_pattern(&case.pattern)
                             && matches!(case.body.last(), Some(Stmt::Raise(_)))
                             && (self.control.statements.context.followed_by_call_expression
                                 || self.control.statements.context.followed_by_attribute_or_call_assignment)
@@ -27205,7 +27210,7 @@ impl<'source> Compiler<'source> {
                             && self.assembler.instruction_opcode_at(
                                 self.assembler.instruction_count().saturating_sub(1),
                             ) == Some(RAISE_VARARGS)))));
-        let copied_match_pop_block = compound_match_pop_block || coroutine_match_pop;
+        let copied_match_pop_block = compound_match_pop_block || ordinary_match_pop;
         // A discarded false arm still jumps to this original POP_BLOCK before
         // 3.13 compacts NOPs. Materialize it so jump threading sees that first
         // record, instead of threading straight through the normal-exit jump.
