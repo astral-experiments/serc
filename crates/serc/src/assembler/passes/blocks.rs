@@ -6746,7 +6746,15 @@ impl OptimizationPipeline {
                                     && !self.borrow_block_aliases.contains(label))
                             })
                     } else {
-                        jump.pre_fold_extra_instructions() == 1
+                        (jump.pre_fold_extra_instructions() == 1
+                            // Several enclosing conditionals can thread through
+                            // this normal exit before the local return is copied.
+                            || (jump.pre_fold_extra_instructions() > 1
+                                && inline_unprotected_return
+                                && super::normal_try_copies::original_local_return(graph[target].items())
+                                && source_position.checked_sub(1).is_some_and(|position|
+                                    graph[order[position]].last_instruction().is_some_and(|previous|
+                                        previous.opcode == RAISE_VARARGS))))
                             && self.exception_owner_provenance.normal_try_exits.iter().any(
                                 |(entry, join)| {
                                     graph.label_block(*entry) == Some(source)
