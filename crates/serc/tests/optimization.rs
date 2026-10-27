@@ -2616,6 +2616,33 @@ fn guarded_recovery_preserves_loop_cleanup_entry() {
 }
 
 #[test]
+fn nested_assignments_copy_the_normal_try_tuple_return() {
+    let source = r"def choose(active, mode, left, right):
+    try:
+        if active:
+            if mode:
+                if ready():
+                    left = first()
+                else:
+                    left = second()
+            elif enabled():
+                left = other()
+        else:
+            left = default()
+    except LookupError:
+        pass
+    return left, right
+";
+    for tail in ["left, right", "left, right, mode"] {
+        assert_matches_cpython(
+            &source.replace("return left, right", &format!("return {tail}")),
+            "nested_assignment_return.py",
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn protected_assignment_locates_a_shared_tuple_return() {
     let source = r"def choose(enabled, test, left, right):
     if enabled:

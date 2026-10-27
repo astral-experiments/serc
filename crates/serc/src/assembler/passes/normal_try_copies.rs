@@ -3883,6 +3883,7 @@ impl OptimizationPipeline {
         // absent line without authorizing NOP retention from conditional donors;
         // current singleton shape alone is insufficient.
         let mut joins = FxHashMap::default();
+        let mut assignment_exits = FxHashSet::default();
         for &block in order {
             if exits.contains_key(&block) {
                 continue;
@@ -3916,9 +3917,31 @@ impl OptimizationPipeline {
             let Some(target) = graph.label_block(label) else {
                 continue;
             };
+            // An elif arm can end in an originally unlocated jump as well. It
+            // enters the normal try exit before any nested assignments copy it.
+            let mut unlocated = Instruction::new(
+                JUMP_FORWARD,
+                Operand::Forward(label),
+                SourceLocation::NONE,
+                Some(0),
+            );
+            unlocated.no_location_policy.preserve_location();
+            let assignment_exit = **jump == unlocated
+                && exits.get(&target).is_some_and(|(_, tail, pass)| {
+                    pass.is_none()
+                        && matches!(
+                            returns.get(tail),
+                            Some(OriginalTail::LocalTupleReturn { .. })
+                        )
+                })
+                && graph[block].items().iter().any(|item| {
+                    matches!(item, Item::Label(label)
+                    if self.exception_owner_provenance.source_boundaries.contains(label))
+                });
             if jump.opcode != JUMP_FORWARD
                 || (!jump.jump_policy.is_original_empty_join()
-                    && !jump.jump_policy.is_original_shared_empty_join())
+                    && !jump.jump_policy.is_original_shared_empty_join()
+                    && !assignment_exit)
                 || !jump.jump_policy.inline_small_exit()
                 || jump.jump_policy.always_retains_nop()
                 || jump.pre_fold_extra_instructions() != 0
@@ -3933,6 +3956,9 @@ impl OptimizationPipeline {
                 })
             {
                 continue;
+            }
+            if assignment_exit {
+                assignment_exits.insert(target);
             }
             joins.insert(block, target);
             if let Some(tail) = original_return_tail(label)
@@ -4762,6 +4788,18 @@ impl OptimizationPipeline {
             .into_iter()
             .flat_map(|(_, _, _, owners)| owners.iter().copied())
             .collect::<Vec<_>>();
+        // A copy of an unowned normal exit must keep its jump unowned when
+        // the surrounding protected jumps collapse onto the same source line.
+        assignment_exits.retain(|block| {
+            let index = original_offsets[&exits[block].0];
+            self.exception_regions
+                .iter()
+                .chain(&original_jump_owners)
+                .all(|region| {
+                    !(original_offsets[&region.start]..original_offsets[&region.end])
+                        .contains(&index)
+                })
+        });
         let ordered_joins = order
             .iter()
             .copied()
@@ -4821,6 +4859,9 @@ impl OptimizationPipeline {
                 .instructions_mut(*block)
                 .next_back()
                 .expect("certified normal exit");
+            if assignment_exits.contains(block) {
+                jump.set_exception_policy(super::super::ExceptionPolicy::EXCLUDE_ALWAYS);
+            }
             jump.location = SourceLocation::NONE;
             jump.no_location_policy.allow_block_inlining();
             let depth = jump.depth_after();
