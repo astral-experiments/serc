@@ -35212,10 +35212,11 @@ impl<'source> Compiler<'source> {
         let guarded_reraise_has_normal_exit = self.context.python_version
             == crate::PythonVersion::Py314
             && statement.orelse.is_empty()
-            && matches!(effective_body_tail,
+            && (matches!(effective_body_tail,
                 Some(Stmt::Expr(work)) if matches!(work.value.as_ref(),
                     Expr::Call(_) | Expr::Await(_) | Expr::Yield(_))
-            )
+            ) || matches!(effective_body_tail, Some(Stmt::Assign(assignment))
+                if matches!(assignment.targets.as_slice(), [Expr::Name(_) | Expr::Attribute(_)])))
             && self.suite_has_nonempty_borrow_entry(&statement.finalbody)
             && statement.handlers.iter().all(|handler| {
                 handler.as_except_handler().is_some_and(|handler| {

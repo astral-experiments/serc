@@ -2,6 +2,16 @@
 mod common;
 
 #[test]
+fn conditional_reraise_keeps_the_normal_finalizer_entry() {
+    for alternative in ["", "        else:\n            handle(value)\n"] {
+        let source = format!(
+            "def close(value, ready):\n    try:\n        yield value\n    except Error:\n        if ready:\n            raise\n{alternative}    finally:\n        consume(value)\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "conditional_reraise.py");
+    }
+}
+
+#[test]
 fn nested_recovery_blocks_later_conditional_borrow_entry() {
     for inner in ["if other:\n                    use(value)", "use(value)"] {
         let source = format!(
