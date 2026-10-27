@@ -29134,6 +29134,13 @@ impl<'source> Compiler<'source> {
                 // edges, including loops in its else suite. Copies inherit each
                 // predecessor's own authored location.
                 self.assembler.set_location(SourceLocation::NONE);
+            } else if self.context.python_version == crate::PythonVersion::Py313
+                && matches!(statement.orelse.last(), Some(Stmt::While(_)))
+                && loop_false_fallthrough_range(&statement.orelse).is_some()
+            {
+                // The preheader and backedge each get a copy of the unlocated
+                // return before CPython resolves them from their conditions.
+                self.assembler.set_location(SourceLocation::NONE);
             } else if (statement.orelse.is_empty()
                 || self.context.python_version >= crate::PythonVersion::Py314)
                 && let Some(Stmt::While(loop_statement)) = normal_exit_suite.last()
