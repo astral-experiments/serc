@@ -21289,6 +21289,13 @@ impl<'source> Compiler<'source> {
                     && (!self.has_active_control_flow_region() || protected_try_normal_exit)
                     && condition_jump_target_count(&statement.test, false) == 1
                     && (condition_jump_target_count(&statement.test, true) == 1
+                        // The successful comparisons enter the same arm. Its
+                        // fallthrough precedes the fallback backedge of a for/else.
+                        || (self.control.loops.contexts.last().is_some_and(|context|
+                                context.has_orelse && context.iterator_cleanup == IteratorCleanup::Sync)
+                            && matches!(statement.test.as_ref(), Expr::BoolOp(boolean)
+                                if boolean.op == BoolOp::Or && boolean.values.iter().all(|part|
+                                    matches!(part, Expr::Compare(comparison) if comparison.ops.len() == 1))))
                         || (statement.body.len() == 1
                             && matches!(statement.body.first(), Some(Stmt::Assign(_))))))
             {
