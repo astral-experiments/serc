@@ -748,8 +748,8 @@ impl Compiler<'_> {
             && self.source_location(expression.range()).line
                 == self.source_location(expression.range()).end_line
         {
-            // Each folded binary operation removes two adjacent literal loads. A single
-            // source line keeps all nested operands in the same owner without line NOPs.
+            // The literal loads, small tuple builds and binary operations share one
+            // owner on a single source line, with no intervening line NOPs.
             self.assembler
                 .record_last_uniform_fold_owner_slots(hidden_owner_slots);
         }
@@ -1347,7 +1347,7 @@ impl Compiler<'_> {
     }
 }
 
-/// Returns whether a binary-expression tree contains only primitive literal leaves.
+/// Returns whether a binary-expression tree has only primitive or small tuple literal leaves.
 fn is_literal_binary_tree(expression: &Expr) -> bool {
     if crate::stack_growth_required() {
         return crate::grow_stack(|| is_literal_binary_tree(expression));
@@ -1356,7 +1356,7 @@ fn is_literal_binary_tree(expression: &Expr) -> bool {
         Expr::BinOp(binary) => {
             is_literal_binary_tree(&binary.left) && is_literal_binary_tree(&binary.right)
         }
-        _ => is_literal_constant(expression),
+        _ => is_small_literal_tuple_element(expression),
     }
 }
 
@@ -1366,6 +1366,12 @@ fn is_literal_binary_tree(expression: &Expr) -> bool {
 /// Nonliteral folds may retain line NOPs or contain control-flow boundaries.
 pub(super) fn is_small_literal_tuple_element(expression: &Expr) -> bool {
     match expression {
+        Expr::UnaryOp(unary)
+            if matches!(unary.op, UnaryOp::USub | UnaryOp::UAdd)
+                && matches!(unary.operand.as_ref(), Expr::NumberLiteral(_)) =>
+        {
+            true
+        }
         Expr::Tuple(tuple) => {
             tuple.elts.len() <= 30 && tuple.elts.iter().all(is_small_literal_tuple_element)
         }

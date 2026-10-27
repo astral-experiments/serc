@@ -2,7 +2,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::super::block_graph::ItemPosition;
 use super::super::{
-    ConstantTable, Item, Label, Operand, OptimizationPipeline, SourceLocation,
+    ConstantTable, ExceptionPolicy, Item, Label, Operand, OptimizationPipeline, SourceLocation,
     block_has_fallthrough, block_jump_target,
 };
 use crate::code_object::Constant;
@@ -150,7 +150,14 @@ impl OptimizationPipeline {
                             Item::Instruction(instruction)
                                 if instruction.opcode == NOP && instruction.location.line < 0 => {}
                             Item::Instruction(instruction) => {
-                                if instruction.opcode == NOP {
+                                // The tuple intrinsic keeps the display's own span.
+                                // Moving an excluded donor onto its cleared prefix
+                                // would move that line inside the protected region.
+                                if instruction.opcode == NOP
+                                    && !(intrinsic
+                                        && instruction.exception_policy()
+                                            == ExceptionPolicy::EXCLUDE_ALWAYS)
+                                {
                                     nop_location = Some(instruction.location);
                                 }
                                 break 'find_donor;
@@ -528,10 +535,17 @@ impl OptimizationPipeline {
                             load.no_location_policy.preserve_location();
                         }
                         if let Some((marker_position, marker_location)) = copied_jump_marker {
-                            // Folding can consume a unary result, but the replaced join's
-                            // marker still belongs to its original source operand.
+                            // Both exits from an inlined all/any call already report
+                            // its source line while discarding the iterator.
+                            let iterator_exit = self.graph[marker_position.block()].items()
+                                [..marker_position.offset()].last().is_some_and(|item| {
+                                    matches!(item, Item::Instruction(pop) if pop.opcode == crate::target::opcodes::POP_ITER
+                                        && pop.location.line == marker_location.line)
+                                });
                             let marker = self.graph.instruction_mut(marker_position).unwrap();
-                            marker.location = if marker_location.line == instruction.location.line {
+                            marker.location = if iterator_exit
+                                || marker_location.line == instruction.location.line
+                            {
                                 SourceLocation::NONE
                             } else {
                                 marker_location

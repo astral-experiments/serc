@@ -11,11 +11,12 @@ use super::super::{
 };
 use crate::target::opcodes::{
     CALL, CALL_FUNCTION_EX, CALL_INTRINSIC_1, CLEANUP_THROW, COMPARE_OP, CONTAINS_OP, COPY,
-    COPY_FREE_VARS, END_SEND, IS_OP, JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD,
-    LOAD_CLOSURE, LOAD_CONST, LOAD_FAST, LOAD_FAST_LOAD_FAST, LOAD_GLOBAL, MAKE_CELL, NOP, POP_TOP,
-    PUSH_NULL, RERAISE, RESUME, RETURN_CONST, RETURN_GENERATOR, RETURN_VALUE, SEND, STORE_ATTR,
-    STORE_DEREF, STORE_FAST, STORE_FAST_LOAD_FAST, STORE_FAST_STORE_FAST, STORE_GLOBAL, STORE_NAME,
-    STORE_SLICE, STORE_SUBSCR, TO_BOOL, UNARY_NOT, YIELD_VALUE,
+    COPY_FREE_VARS, END_ASYNC_FOR, END_SEND, GET_ANEXT, IS_OP, JUMP_BACKWARD,
+    JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD, LOAD_CLOSURE, LOAD_CONST, LOAD_FAST,
+    LOAD_FAST_LOAD_FAST, LOAD_GLOBAL, MAKE_CELL, NOP, POP_TOP, PUSH_NULL, RERAISE, RESUME,
+    RETURN_CONST, RETURN_GENERATOR, RETURN_VALUE, SEND, STORE_ATTR, STORE_DEREF, STORE_FAST,
+    STORE_FAST_LOAD_FAST, STORE_FAST_STORE_FAST, STORE_GLOBAL, STORE_NAME, STORE_SLICE,
+    STORE_SUBSCR, TO_BOOL, UNARY_NOT, YIELD_VALUE,
 };
 use crate::target::operands::ResumeLocation;
 use crate::target::{is_conditional_jump_for, is_unconditional_jump};
@@ -161,8 +162,10 @@ impl OptimizationPipeline {
         if self.python_version == PythonVersion::Py312 {
             self.inline_legacy_exit_blocks(&original_arrays, false);
         }
-        let repeated_predecessors = if self.python_version == PythonVersion::Py312 {
-            self.legacy_repeated_tail_predecessors(&original_arrays)
+        let mut repeated_predecessors = if self.python_version == PythonVersion::Py312 {
+            let mut tails = self.legacy_repeated_tail_predecessors(&original_arrays);
+            self.record_repeated_conditional_fallthroughs(&original_arrays, &mut tails);
+            tails
         } else {
             Vec::new()
         };
@@ -176,7 +179,21 @@ impl OptimizationPipeline {
             }
         }
         if let Some(constants) = constants {
-            self.prune_legacy_constants(constants);
+            let indices = self.prune_legacy_constants(constants);
+            // These exits must still match their live instructions after constant compaction.
+            repeated_predecessors.retain_mut(|(_, expected, _, _)| {
+                if expected.opcode != RETURN_CONST {
+                    return true;
+                }
+                let Some(index) = expected
+                    .value_argument()
+                    .and_then(|index| indices[index as usize])
+                else {
+                    return false;
+                };
+                expected.set_operand(Operand::Value(index));
+                true
+            });
         }
         self.add_legacy_checks_for_uninitialized_loads(
             local_count,
@@ -255,8 +272,10 @@ impl OptimizationPipeline {
                     });
                     if surviving_blocks.contains(&block)
                         && let Some(instruction) = instructions.next()
-                        && instructions.next().is_none()
                         && *instruction == expected
+                        && (instructions.next().is_none()
+                            || (expected.opcode == NOP
+                                && expected.fusion_policy.is_converted_pop_block()))
                         && predecessors.get(&block) == Some(&before)
                     {
                         predecessors.insert(block, native);
@@ -264,7 +283,9 @@ impl OptimizationPipeline {
                 }
             }
         }
+        let blocks_before_exit_copies = self.graph.len();
         self.resolve_legacy_locations(predecessors, &original_arrays);
+        let exit_copies = self.graph.len() - blocks_before_exit_copies;
         if self.python_version == PythonVersion::Py312 {
             self.guarantee_legacy_exit_line_numbers(first_line_number);
         }
@@ -286,7 +307,14 @@ impl OptimizationPipeline {
             self.remove_legacy_nops(&original_arrays, true);
         }
         self.normalize_legacy_jump_directions();
-        self.normalize_backward_conditionals()?;
+        let reversed = self.normalize_backward_conditionals()?;
+        // Exit duplication retargets the block pointer but keeps the original operand.
+        // Only a new backedge from conditional normalization reads the copied label.
+        self.legacy_uniform_jump_seed |= self
+            .legacy_native_labels
+            .as_ref()
+            .and_then(|native| native.exit_copy_budget)
+            .is_some_and(|budget| !reversed || exit_copies <= usize::from(budget));
         if !self
             .legacy_native_labels
             .as_ref()
@@ -1763,7 +1791,18 @@ impl OptimizationPipeline {
             let target = label_group(targets[&entry])?;
             // The handler's cleanup SETUP is its first instruction. A body
             // SETUP instead precedes its entry label in the preceding array.
-            let owner = if Some(entry) == wrapper || handler_groups.contains(&position) {
+            // The exhaustion SETUP starts the async iteration header. Its
+            // backedge enters the same array again on every iteration.
+            let async_iteration = group_instructions(position)
+                .next()
+                .is_some_and(|i| i.opcode == GET_ANEXT)
+                && group_instructions(target)
+                    .next()
+                    .is_some_and(|i| i.opcode == END_ASYNC_FOR);
+            let owner = if Some(entry) == wrapper
+                || handler_groups.contains(&position)
+                || async_iteration
+            {
                 position
             } else if self
                 .exception_owner_provenance
@@ -1964,6 +2003,28 @@ impl OptimizationPipeline {
             let Some((block, instruction)) = instructions.next() else {
                 continue;
             };
+            if instruction.opcode == NOP
+                && instruction.fusion_policy.is_converted_pop_block()
+                && instruction.location == SourceLocation::NONE
+                && self.graph[block].items().iter().any(|item| {
+                    matches!(item, Item::Label(label)
+                    if self.exception_owner_provenance.original_manager_pop_blocks.contains(label)
+                        || self.exception_regions.iter().any(|region| {
+                            !region.is_scope_fallback && region.end == *label
+                                && (!region.preserve_lasti
+                                    || label_group(region.target)
+                                        .and_then(|handler| group_instructions(handler).nth(1))
+                                        .is_some_and(|instruction| instruction.opcode == crate::target::opcodes::WITH_EXCEPT_START))
+                        }))
+                })
+            {
+                // A shared cleanup POP cannot inherit a line from the array
+                // visited twice. Recheck the physical block after cold placement
+                // before restoring its native count.
+                let (ordinary, native) = predecessor_counts[index];
+                tails.push((block, *instruction, ordinary, native));
+                continue;
+            }
             // Completed SETUP regions do not own a later original scope footer.
             // Its repeated count still prevents the final call's line donation.
             let original_scope_exit = fragments.iter().any(|block| {
@@ -2023,6 +2084,17 @@ impl OptimizationPipeline {
                     start <= end && (start..end).contains(&source) == (start..end).contains(&target)
                 })
             };
+            // A conditional can also be the protected jump's sole ordinary
+            // predecessor. Every visit to the conditional charges that fallthrough.
+            let sole_conditional_fallthrough = || {
+                predecessor_counts[index].0 == 1
+                    && index
+                        .checked_sub(1)
+                        .and_then(|previous| group_instructions(previous).next_back())
+                        .is_some_and(|last| {
+                            is_conditional_jump_for(self.python_version, last.opcode)
+                        })
+            };
             if instructions.next().is_none()
                 && (matches!(
                     instruction.opcode,
@@ -2030,14 +2102,18 @@ impl OptimizationPipeline {
                 ) || (instruction.opcode == JUMP_FORWARD
                     && (wrapper.is_none()
                         || has_only_scope_owner()
-                        || forward_join_keeps_owners()))
+                        || forward_join_keeps_owners()
+                        || sole_conditional_fallthrough()))
+                    || (instruction.opcode == RERAISE
+                        && instruction.operand() == Operand::Value(0))
                     || (instruction.opcode == RETURN_CONST
                         && original_scope_exit
                         && (wrapper.is_none() || has_only_scope_owner())))
                 && instruction.location == SourceLocation::NONE
             {
                 let mut expected = *instruction;
-                let counts = if matches!(instruction.opcode, JUMP_FORWARD | RETURN_CONST) {
+                let counts = if matches!(instruction.opcode, JUMP_FORWARD | RERAISE | RETURN_CONST)
+                {
                     if instruction.opcode == JUMP_FORWARD
                         && let Operand::Forward(target) = instruction.operand()
                         && label_group(target) == Some(index + 1)
@@ -2054,6 +2130,88 @@ impl OptimizationPipeline {
             }
         }
         Some(tails)
+    }
+
+    /// Records a jump reached only by falling through a twice-queued conditional.
+    fn record_repeated_conditional_fallthroughs(
+        &self,
+        arrays: &LegacyInstructionArrays,
+        tails: &mut Vec<(BasicBlockId, Instruction, usize, usize)>,
+    ) {
+        let mut incoming = None;
+        let conditional_target = |block| {
+            let last = self.graph[block].last_instruction()?;
+            if !is_conditional_jump_for(self.python_version, last.opcode) {
+                return None;
+            }
+            self.graph.label_block(last.jump_target()?)
+        };
+        let order = self.graph.order();
+        for (index, &[first, second, exit]) in order.array_windows().enumerate() {
+            if conditional_target(first) != Some(second)
+                || conditional_target(second).is_none_or(|target| target == exit)
+            {
+                continue;
+            }
+            let [Some(first_array), Some(second_array), Some(exit_array)] =
+                [first, second, exit].map(|block| arrays.get(block))
+            else {
+                continue;
+            };
+            if first_array == second_array || second_array == exit_array {
+                continue;
+            }
+            let mut instructions = self.graph[exit]
+                .items()
+                .iter()
+                .filter_map(Item::as_instruction);
+            let Some(jump) = instructions.next() else {
+                continue;
+            };
+            if instructions.next().is_some()
+                || !matches!(jump.opcode, JUMP_FORWARD | JUMP_BACKWARD)
+                || jump.location != SourceLocation::NONE
+                || tails.iter().any(|(block, ..)| *block == exit)
+            {
+                continue;
+            }
+            let predecessors = incoming.get_or_insert_with(|| self.legacy_predecessors());
+            if predecessors.get(&second) != Some(&2) || predecessors.get(&exit) != Some(&1) {
+                continue;
+            }
+            // SETUP targets also enter the native walk. Both successors must be
+            // reached exclusively via the ordinary edges above.
+            let enters_join = |label| {
+                self.graph
+                    .label_block(label)
+                    .is_some_and(|block| block == second || block == exit)
+            };
+            if self
+                .exception_regions
+                .iter()
+                .any(|region| enters_join(region.target))
+                || self
+                    .exception_owner_provenance
+                    .legacy_native_setup_targets
+                    .iter()
+                    .any(|(_, label)| enters_join(*label))
+            {
+                continue;
+            }
+            // The first conditional queues its target and fallthrough before
+            // either is marked visited. Each pop of the second conditional
+            // charges its fallthrough; the jump therefore has two predecessors.
+            let mut expected = *jump;
+            if let Some(target) = jump
+                .forward_target()
+                .and_then(|label| self.graph.label_block(label))
+                && order.get(index + 3) == Some(&target)
+            {
+                // Removing a jump to the following block preserves its location and predecessors.
+                legacy_nop(&mut expected);
+            }
+            tails.push((exit, expected, 1, 2));
+        }
     }
 
     fn legacy_predecessors(&self) -> FxHashMap<BasicBlockId, usize> {
@@ -2215,7 +2373,7 @@ impl OptimizationPipeline {
         }
         let order = self.graph.order().to_vec();
         if self.python_version == PythonVersion::Py312 {
-            // Tests and ordinary stores retain their native locations. Donate
+            // Tests, NOPs and ordinary stores retain their native locations. Donate
             // those spans before propagation, even with inflated predecessor counts.
             for pair in order.windows(2) {
                 let source = pair[0];
@@ -2223,10 +2381,18 @@ impl OptimizationPipeline {
                 if block_has_fallthrough(self.graph[source].items())
                     && let Some(last) = self.graph[source].last_instruction().copied()
                     && (is_conditional_jump_for(self.python_version, last.opcode)
+                        || last.opcode == NOP
                         || (matches!(last.opcode,
                             STORE_ATTR | STORE_DEREF | STORE_FAST | STORE_GLOBAL | STORE_NAME
                                 | STORE_SLICE | STORE_SUBSCR)
-                            && !last.local_policy.may_store_null()))
+                            && (!last.local_policy.may_store_null()
+                                // Static swaps put the assigned comprehension's result store
+                                // before its iteration-local restores. The last restore still
+                                // supplies the fallthrough location for the implicit return.
+                                || self.graph[source].items().iter().rev()
+                                    .filter_map(Item::as_instruction)
+                                    .find(|store| !store.local_policy.may_store_null())
+                                    .is_some_and(|store| store.opcode == STORE_FAST))))
                     && self.graph[target].last_instruction().is_some_and(|instruction| {
                         crate::target::is_scope_exit_for(self.python_version, instruction.opcode)
                     })
@@ -2286,6 +2452,12 @@ impl OptimizationPipeline {
                     && let Some(first) = self.graph.instructions_mut(successor).next()
                     && first.location.line < 0
                     && !legacy_pop_block_keeps_no_location(self.python_version, first)
+                    // A cold bridge beyond an erased loop test has no located
+                    // predecessor in its original layout.
+                    && !(self.python_version == PythonVersion::Py313
+                        && original_arrays.get(successor).is_none()
+                        && first.opcode == JUMP_BACKWARD_NO_INTERRUPT
+                        && first.no_location_policy.preserves_location())
                 {
                     first.location = location;
                 }

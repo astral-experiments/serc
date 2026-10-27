@@ -4,8 +4,7 @@ use std::rc::Rc;
 
 use ruff_python_ast::token::Tokens;
 use ruff_python_ast::{Expr, Stmt, Suite};
-use ruff_text_size::Ranged;
-use ruff_text_size::TextRange;
+use ruff_text_size::{Ranged, TextRange, TextSize};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{
@@ -31,7 +30,6 @@ use crate::{CompileError, PythonVersion};
 
 use super::constant::{DeferredConstantTarget, OutputState, fold_constant, literal_constant};
 use super::definition::clean_doc;
-use super::expression::early_condition_truthiness;
 use super::scope::{
     LoweringFunctionPlan, NameId, NameInterner, NameSet, ScopeId,
     collect_conditional_simple_annotations, collect_simple_annotations, has_annotations,
@@ -258,6 +256,7 @@ impl<'source> Compiler<'source> {
                 control: ControlFlowState::default(),
                 assembler,
                 native_label_plan: None,
+                legacy_short_label_prefix: TextSize::default(),
             },
         )
     }
@@ -639,9 +638,8 @@ impl<'source> Compiler<'source> {
     ) -> Result<Box<CodeObject>, CompileError> {
         self.assembler.reserve_items(body.len().saturating_mul(16));
         if self.context.python_version == PythonVersion::Py312 {
-            if super::legacy_native_seed_bound::certifies(body) {
-                self.assembler.certify_legacy_uniform_jump_seed();
-            }
+            self.legacy_short_label_prefix =
+                super::legacy_native_seed_bound::record(&mut self.assembler, body);
             self.native_label_plan = super::legacy_native_labels::NativeLabelPlan::module(
                 body,
                 self.unit.flags & CO_FUTURE_ANNOTATIONS != 0,
@@ -867,9 +865,8 @@ impl<'source> Compiler<'source> {
     ) -> Result<Box<CodeObject>, CompileError> {
         self.assembler.reserve_items(body.len().saturating_mul(16));
         if self.context.python_version == PythonVersion::Py312 {
-            if super::legacy_native_seed_bound::certifies(body) {
-                self.assembler.certify_legacy_uniform_jump_seed();
-            }
+            self.legacy_short_label_prefix =
+                super::legacy_native_seed_bound::record(&mut self.assembler, body);
             self.native_label_plan = super::legacy_native_labels::NativeLabelPlan::function(
                 body,
                 self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) != 0,
@@ -987,26 +984,9 @@ impl<'source> Compiler<'source> {
         if self.context.python_version == PythonVersion::Py312
             && add_implicit_return
             && self.assembler.location() == SourceLocation::NONE
-            && terminal_statement.is_some_and(is_elided_statement)
-            && let Some(Stmt::If(conditional)) = body
-                .iter()
-                .rev()
-                .find(|statement| !is_elided_statement(statement))
-            && early_condition_truthiness(&conditional.test).is_none()
-            && ((self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                == CO_COROUTINE
-                && conditional.elif_else_clauses.is_empty()
-                && matches!(conditional.body.iter().rfind(|part| !is_elided_statement(part)),
-                    Some(Stmt::Expr(expression))
-                        if matches!(expression.value.as_ref(), Expr::Call(_) | Expr::Await(_))))
-                || (conditional.body.iter().all(is_elided_statement)
-                    && matches!(conditional.elif_else_clauses.as_slice(), [clause]
-                        if clause.test.is_none() && clause.body.iter().all(is_elided_statement))))
         {
-            // General If lowering leaves its original end label here, including
-            // discarded coroutine calls before an erased suffix. Stores retain
-            // their early line donor. Keep the call footer until
-            // native repeated predecessor counts decide which returns survive.
+            // A reachability visit can count this original footer twice, preventing
+            // the final fallthrough instruction from donating its source location.
             self.assembler.record_current_original_scope_exit();
         }
         self.finish_inner(add_implicit_return)

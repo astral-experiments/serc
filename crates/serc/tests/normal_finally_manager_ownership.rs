@@ -42,3 +42,17 @@ fn awaited_guarded_recovery_preserves_manager_owner_on_later_cleanup_exit() {
 ";
     common::assert_matches_cpython_marshal(source, "awaited_finally_guards.py");
 }
+
+#[test]
+fn a_fallthrough_finally_guard_keeps_the_enclosing_manager_on_its_jump() {
+    for (body, guard, cleanup) in [
+        ("return value", "ready", "observe(value)"),
+        ("return value", "False", "observe(value)"),
+        ("observe(value)", "ready", "return value"),
+    ] {
+        let source = format!(
+            "def read(outer, inner, ready, value):\n    with outer:\n        try:\n            with inner:\n                {body}\n        finally:\n            if {guard}:\n                {cleanup}\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "guarded_manager_exit.py");
+    }
+}

@@ -23,3 +23,17 @@ fn matches_cpython_marshal_for_boolean_value_end_owner_boundaries() {
         }
     }
 }
+
+#[test]
+fn negated_comparison_uses_one_original_boolean_slot() {
+    for operand in [
+        "not item <= limit",
+        "not item <= check(limit)",
+        "item <= limit",
+    ] {
+        let source = format!(
+            "def select(items, limit):\n    return ({operand} or item for item in items)\n"
+        );
+        assert_matches_cpython_marshal(&source, "negated_comparison_value_jump.py");
+    }
+}

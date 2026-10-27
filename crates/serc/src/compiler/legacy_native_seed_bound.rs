@@ -2,25 +2,53 @@
 //!
 //! Count source labels S, true jumps J, and scope exits E before dead-code removal.
 //! K bounds jumps with an unlabeled successor. Usually K = J; explicit suspension
-//! helper backedges, synchronous For backedges, and synchronous With cleanup jumps
-//! already have labeled successors.
+//! helper backedges, iterator backedges, and jumps over cleanup handlers already
+//! have labeled successors.
 //! There are at most U = K + E + 1 original unlabeled blocks and B = S + U blocks.
 //! Empty-block repair and cold placement label at most U original blocks. Cold
 //! placement adds at most C = min(J, floor(B / 2)) bridges: each cold-to-warm
 //! adjacency needs a distinct incoming warm jump because its cold predecessor
 //! cannot make the successor warm. Exit duplication adds at most J + C labels.
 //! Normalization adds unlabeled bridges only, so S + U + J + C bounds every label.
+//! When only S + U fits, defer the decision until exit copies and normalized
+//! backedges are known. Copying an exit leaves the incoming jump operand intact.
 //!
 //! This certificate controls initial `EXTENDED_ARG` widths, not final jump distances.
-//! Unsupported syntax declines the complete code object. Finally copies follow
-//! native frame unwinding; pattern failure stacks remain unsupported.
+//! A later unsupported statement ends the whole-object proof. Earlier complete
+//! statements still bound the nonempty targets of their suspension loops. Finally
+//! copies follow native frame unwinding.
 
 use ruff_python_ast::{
-    Comprehension, Expr, FStringPartRef, InterpolatedStringElement, Parameters, Stmt, UnaryOp,
+    BoolOp, Comprehension, Expr, FStringPartRef, InterpolatedStringElement, Parameters, Pattern,
+    Stmt, UnaryOp,
 };
+use ruff_text_size::{Ranged, TextSize};
 
-/// Proves that native source generation and every CFG allocation stay below 256.
-pub(super) fn certifies(body: &[Stmt]) -> bool {
+/// Certifies one-byte labels and returns the bounded source prefix when the whole unit exceeds it.
+pub(super) fn record(assembler: &mut crate::assembler::Assembler, body: &[Stmt]) -> TextSize {
+    let (counter, prefix) = function_budget(body);
+    if let Some(counter) = counter {
+        let counts = counter.counts;
+        if counts.max_label() < 256 {
+            assembler.certify_legacy_uniform_jump_seed();
+            return TextSize::default();
+        }
+        if let Ok(max_label) = u8::try_from(counts.max_original_label()) {
+            assembler.set_legacy_exit_copy_budget(u8::MAX - max_label);
+        }
+        if counts.labels < 256 {
+            assembler.certify_legacy_source_jump_labels();
+            if counts.labels.saturating_add(counter.foldable_tests) < 256 {
+                assembler.certify_legacy_original_jump_operands();
+            }
+            return TextSize::default();
+        }
+    }
+    prefix
+}
+
+#[cfg(test)]
+fn certifies(body: &[Stmt]) -> bool {
     function_counts(body).is_some_and(|counts| counts.max_label() < 256)
 }
 
@@ -54,12 +82,16 @@ impl Counts {
         debug_assert!(self.unlabeled_jump_successors <= self.jumps);
     }
 
-    fn max_label(self) -> u32 {
+    fn max_original_label(self) -> u32 {
         let unlabeled = self
             .unlabeled_jump_successors
             .saturating_add(self.exits)
             .saturating_add(1);
-        let blocks = self.labels.saturating_add(unlabeled);
+        self.labels.saturating_add(unlabeled)
+    }
+
+    fn max_label(self) -> u32 {
+        let blocks = self.max_original_label();
         let cold_bridges = self.jumps.min(blocks / 2);
         blocks
             .saturating_add(self.jumps)
@@ -79,19 +111,35 @@ enum Frame<'ast> {
 #[derive(Default)]
 struct Counter<'ast> {
     counts: Counts,
+    foldable_tests: u32,
     frames: Vec<Frame<'ast>>,
     has_await: bool,
     in_annotation: bool,
 }
 
+#[cfg(test)]
 fn function_counts(body: &[Stmt]) -> Option<Counts> {
+    function_budget(body).0.map(|counter| counter.counts)
+}
+
+/// Retains complete statements whose source labels fit even if a later statement
+/// exceeds the bound. A statement includes any copies emitted by unwinding its body.
+fn function_budget(body: &[Stmt]) -> (Option<Counter<'_>>, TextSize) {
     let mut counter = Counter::default();
     // Function start, optional StopIteration handler, its RETURN/RERAISE, and
     // the implicit footer. This also overcounts modules: their prologue adds no
     // labels or jumps, and their footer adds only one scope exit.
     counter.counts.add(2, 0, 3);
-    counter.suite(body)?;
-    Some(counter.counts)
+    let mut prefix = TextSize::default();
+    for statement in body {
+        if counter.counts.labels >= 256 || counter.statement(statement).is_none() {
+            return (None, prefix);
+        }
+        if counter.counts.labels < 256 {
+            prefix = statement.range().end();
+        }
+    }
+    (Some(counter), prefix)
 }
 
 fn count(length: usize) -> u32 {
@@ -102,7 +150,7 @@ impl<'ast> Counter<'ast> {
     fn suite(&mut self, statements: &'ast [Stmt]) -> Option<()> {
         // Native source generation visits discarded suites and post-return tails.
         for statement in statements {
-            if self.counts.max_label() >= 256 {
+            if self.counts.labels >= 256 {
                 return None;
             }
             self.statement(statement)?;
@@ -150,22 +198,25 @@ impl<'ast> Counter<'ast> {
             }
             Stmt::Assert(statement) => {
                 self.counts.add(1, 0, 1);
-                self.condition(&statement.test)?;
+                self.condition(&statement.test, true)?;
                 self.optional(statement.msg.as_deref())?;
             }
             Stmt::If(statement) => {
                 let clauses = &statement.elif_else_clauses;
                 let has_else = u32::from(!clauses.is_empty());
-                self.counts.add(1 + has_else, has_else, 0);
-                self.condition(&statement.test)?;
+                // The jump over an else suite is immediately followed by its label.
+                self.counts
+                    .add_with_unlabeled_successors(1 + has_else, has_else, 0, 0);
+                self.condition(&statement.test, false)?;
                 self.suite(&statement.body)?;
                 // Ruff flattens elif; native recursively emits another If with
                 // its own end and optional else label for every tested clause.
                 for (index, clause) in clauses.iter().enumerate() {
                     if let Some(test) = &clause.test {
                         let has_else = u32::from(index + 1 < clauses.len());
-                        self.counts.add(1 + has_else, has_else, 0);
-                        self.condition(test)?;
+                        self.counts
+                            .add_with_unlabeled_successors(1 + has_else, has_else, 0, 0);
+                        self.condition(test, false)?;
                     }
                     self.suite(&clause.body)?;
                 }
@@ -173,15 +224,17 @@ impl<'ast> Counter<'ast> {
             Stmt::While(statement) => {
                 self.counts.add(4, 0, 0);
                 self.frames.push(Frame::Loop);
-                self.condition(&statement.test)?;
+                self.condition(&statement.test, false)?;
                 self.suite(&statement.body)?;
-                self.condition(&statement.test)?;
+                self.condition(&statement.test, true)?;
                 self.frames.pop();
                 self.suite(&statement.orelse)?;
             }
             Stmt::For(statement) => {
                 if statement.is_async {
-                    self.counts.add(6, 3, 0);
+                    // The await helper and the loop backedge both jump over
+                    // labeled handlers. Only SEND has an unlabeled successor.
+                    self.counts.add_with_unlabeled_successors(6, 3, 1, 0);
                 } else {
                     // Only FOR_ITER can create an unlabeled successor. The
                     // original backedge is followed by the cleanup label/END_FOR.
@@ -198,7 +251,10 @@ impl<'ast> Counter<'ast> {
             Stmt::With(statement) => {
                 for item in &statement.items {
                     if statement.is_async {
-                        self.counts.add(15, 9, 2);
+                        // Enter, normal exit and exceptional exit each await
+                        // once. Only their SENDs and the suppression test have
+                        // unlabeled successors.
+                        self.counts.add_with_unlabeled_successors(15, 9, 4, 2);
                     } else {
                         // The normal exit jump is followed by the final label;
                         // the suppression helper's jump by the cleanup label.
@@ -225,7 +281,7 @@ impl<'ast> Counter<'ast> {
                 } else {
                     // Native reserves body/end/exit/cleanup and emits one normal
                     // jump plus two reraises around its normal/exceptional copies.
-                    self.counts.add(4, 1, 2);
+                    self.counts.add_with_unlabeled_successors(4, 1, 0, 2);
                     self.frames.push(Frame::Finally(&statement.finalbody));
                     if statement.handlers.is_empty() {
                         self.suite(&statement.body)?;
@@ -237,6 +293,45 @@ impl<'ast> Counter<'ast> {
                     // FINALLY_END only pops stack values on unwind, so it adds
                     // no projected frame or label/jump/exit budget.
                     self.suite(&statement.finalbody)?;
+                }
+            }
+            Stmt::Match(statement) => {
+                self.expression(&statement.subject)?;
+                self.counts.add(1, 0, 0); // Common match end.
+                for case in &statement.cases {
+                    match &case.pattern {
+                        Pattern::MatchValue(value) => {
+                            self.expression(&value.value)?;
+                            // The comparison jumps to the failure label. The
+                            // successful suite jumps over that labeled failure.
+                            self.counts.add_with_unlabeled_successors(1, 2, 1, 0);
+                        }
+                        Pattern::MatchOr(pattern) => {
+                            // Each value alternative has one failure label. Its
+                            // success jump and the final failure jump lead over
+                            // labeled successors; only the comparisons can split.
+                            for alternative in &pattern.patterns {
+                                let Pattern::MatchValue(value) = alternative else {
+                                    return None;
+                                };
+                                self.expression(&value.value)?;
+                                self.counts.add_with_unlabeled_successors(1, 2, 1, 0);
+                            }
+                            // OR success, enclosing case failure, and their jumps.
+                            self.counts.add_with_unlabeled_successors(2, 2, 0, 0);
+                        }
+                        Pattern::MatchAs(wildcard)
+                            if wildcard.pattern.is_none() && wildcard.name.is_none() =>
+                        {
+                            // Also covers a sole wildcard, which can emit a case-end jump.
+                            self.counts.add(1, 1, 0);
+                        }
+                        _ => return None,
+                    }
+                    if let Some(guard) = &case.guard {
+                        self.condition(guard, false)?;
+                    }
+                    self.suite(&case.body)?;
                 }
             }
             Stmt::FunctionDef(definition) => {
@@ -278,7 +373,7 @@ impl<'ast> Counter<'ast> {
 
     /// Mirrors native pop/cleanup/recurse/restore, including unreachable copies.
     fn unwind(&mut self, stop_at_loop: bool) -> Option<()> {
-        if self.counts.max_label() >= 256 {
+        if self.counts.labels >= 256 {
             return None;
         }
         let Some(frame) = self.frames.pop() else {
@@ -288,7 +383,7 @@ impl<'ast> Counter<'ast> {
             Frame::Loop if stop_at_loop => Some(()),
             Frame::Loop => self.unwind(stop_at_loop),
             Frame::AsyncManager => {
-                self.counts.add(3, 2, 0);
+                self.explicit_suspension();
                 self.unwind(stop_at_loop)
             }
             Frame::Finally(body) => {
@@ -307,7 +402,7 @@ impl<'ast> Counter<'ast> {
         if statement.is_star {
             self.counts.add(7, 4, 2);
         } else {
-            self.counts.add(4, 1, 2);
+            self.counts.add_with_unlabeled_successors(4, 1, 0, 2);
         }
         self.suite(&statement.body)?;
         if !statement.is_star {
@@ -319,9 +414,12 @@ impl<'ast> Counter<'ast> {
                 self.counts.add(5, 4, 0);
                 self.frames.push(Frame::ExceptStarBarrier);
             } else {
-                self.counts.add(
+                // Both normal exits jump over the following labeled handler or cleanup.
+                // Only a typed handler's test has an unlabeled successor.
+                self.counts.add_with_unlabeled_successors(
                     if handler.name.is_some() { 3 } else { 2 },
                     1 + u32::from(handler.type_.is_some()),
+                    u32::from(handler.type_.is_some()),
                     u32::from(handler.name.is_some()),
                 );
             }
@@ -373,24 +471,44 @@ impl<'ast> Counter<'ast> {
         Some(())
     }
 
-    fn condition(&mut self, expression: &Expr) -> Option<()> {
+    /// Bounds labels assigned when empty-block repair skips a folded truth test.
+    ///
+    /// An initially empty block is followed by another source label. An originally
+    /// unlabeled successor can need a label only after its reachable predecessor
+    /// loses its terminating jump. Before empty-block repair, only a truth jump
+    /// following a constant can disappear; returns and unconditional jumps survive.
+    fn count_foldable_test(&mut self, expression: &Expr) {
+        if !matches!(
+            expression,
+            Expr::Attribute(_) | Expr::Await(_) | Expr::Call(_) | Expr::Compare(_) | Expr::Named(_)
+        ) && !matches!(expression, Expr::Name(name) if name.id.as_str() != "__debug__")
+        {
+            self.foldable_tests = self.foldable_tests.saturating_add(1);
+        }
+    }
+
+    fn condition(&mut self, expression: &Expr, jump_on: bool) -> Option<()> {
         if crate::stack_growth_required() {
-            return crate::grow_stack(|| self.condition(expression));
+            return crate::grow_stack(|| self.condition(expression, jump_on));
         }
         match expression {
-            Expr::UnaryOp(unary) if unary.op == UnaryOp::Not => self.condition(&unary.operand)?,
+            Expr::UnaryOp(unary) if unary.op == UnaryOp::Not => {
+                self.condition(&unary.operand, !jump_on)?;
+            }
             Expr::BoolOp(boolean) => {
-                // At most one private short-circuit label in either polarity.
-                self.counts.add(1, 0, 0);
-                for value in &boolean.values {
-                    self.condition(value)?;
+                let short = boolean.op == BoolOp::Or;
+                self.counts.add(u32::from(short != jump_on), 0, 0);
+                let (last, leading) = boolean.values.split_last()?;
+                for value in leading {
+                    self.condition(value, short)?;
                 }
+                self.condition(last, jump_on)?;
             }
             Expr::If(conditional) => {
-                self.counts.add(2, 1, 0);
-                self.condition(&conditional.test)?;
-                self.condition(&conditional.body)?;
-                self.condition(&conditional.orelse)?;
+                self.counts.add_with_unlabeled_successors(2, 1, 0, 0);
+                self.condition(&conditional.test, false)?;
+                self.condition(&conditional.body, jump_on)?;
+                self.condition(&conditional.orelse, jump_on)?;
             }
             Expr::Compare(comparison) if comparison.ops.len() > 1 => {
                 self.counts
@@ -402,6 +520,7 @@ impl<'ast> Counter<'ast> {
             }
             _ => {
                 self.expression(expression)?;
+                self.count_foldable_test(expression);
                 self.counts.add(0, 1, 0);
             }
         }
@@ -417,16 +536,20 @@ impl<'ast> Counter<'ast> {
         generators.first()?;
         let outer_await = std::mem::take(&mut self.has_await);
         // Count locals cleanup even when native needs no locals preservation.
-        self.counts.add(2, 1, 1);
+        // The normal exit jumps over the labeled locals-restoration handler.
+        self.counts.add_with_unlabeled_successors(2, 1, 0, 1);
         let mut is_async = false;
         for generator in generators {
             let (labels, jumps) = if generator.is_async { (6, 3) } else { (3, 2) };
-            self.counts.add(labels, jumps, 0);
+            // Both loop backedges precede labeled cleanup blocks. Only FOR_ITER
+            // or the async SEND can introduce an unlabeled successor.
+            self.counts
+                .add_with_unlabeled_successors(labels, jumps, 1, 0);
             is_async |= generator.is_async;
             self.expression(&generator.iter)?;
             self.expression(&generator.target)?;
             for condition in &generator.ifs {
-                self.condition(condition)?;
+                self.condition(condition, false)?;
             }
         }
         self.optional(key)?;
@@ -434,7 +557,7 @@ impl<'ast> Counter<'ast> {
         if is_async || self.has_await {
             // Inlining usually avoids this; bound a possible coroutine caller
             // await as well, propagating it to any enclosing comprehension.
-            self.counts.add(3, 2, 0);
+            self.explicit_suspension();
             self.has_await = true;
         }
         self.has_await |= outer_await;
@@ -479,14 +602,17 @@ impl<'ast> Counter<'ast> {
             }
             Expr::Yield(yielded) => self.optional(yielded.value.as_deref())?,
             Expr::If(conditional) => {
-                self.counts.add(2, 1, 0);
-                self.condition(&conditional.test)?;
+                self.counts.add_with_unlabeled_successors(2, 1, 0, 0);
+                self.condition(&conditional.test, false)?;
                 self.expression(&conditional.body)?;
                 self.expression(&conditional.orelse)?;
             }
             Expr::BoolOp(boolean) => {
                 self.counts
                     .add(1, count(boolean.values.len()).saturating_sub(1), 0);
+                for value in &boolean.values[..boolean.values.len().saturating_sub(1)] {
+                    self.count_foldable_test(value);
+                }
                 for value in &boolean.values {
                     self.expression(value)?;
                 }
@@ -588,6 +714,15 @@ mod tests {
     use ruff_python_ast::Stmt;
     use ruff_python_parser::parse_module;
 
+    #[test]
+    fn potential_constant_jumps_bound_empty_target_repairs() {
+        let parsed = parse_module(
+            "if flag: pass\nif (value := flag): pass\nif __debug__: pass\nif True: pass\nvalue = False and flag\n",
+        ).unwrap();
+        let counter = super::function_budget(parsed.suite()).0.unwrap();
+        assert_eq!(counter.foldable_tests, 3);
+    }
+
     fn counts(source: &str) -> Option<Counts> {
         let parsed = parse_module(source).unwrap();
         let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
@@ -662,13 +797,13 @@ mod tests {
             Counts {
                 labels: 95,
                 jumps: 51,
-                unlabeled_jump_successors: 22,
+                unlabeled_jump_successors: 19,
                 exits: 29,
             },
         );
-        assert_eq!(budget.max_label(), 249);
+        assert_eq!(budget.max_label(), 246);
         // Source generation still visits unreachable exits, and 256 is excluded.
-        for (extra_exits, expected) in [(6, true), (7, false)] {
+        for (extra_exits, expected) in [(9, true), (10, false)] {
             let source = format!("{source}{}", "    raise Error\n".repeat(extra_exits));
             let parsed = parse_module(&source).unwrap();
             let Stmt::FunctionDef(function) = &parsed.suite()[0] else {
@@ -687,7 +822,7 @@ mod tests {
             Some(Counts {
                 labels: 24,
                 jumps: 10,
-                unlabeled_jump_successors: 4,
+                unlabeled_jump_successors: 3,
                 exits: 12,
             }),
         );
@@ -719,7 +854,7 @@ mod tests {
             Some(Counts {
                 labels: 6,
                 jumps: 4,
-                unlabeled_jump_successors: 4,
+                unlabeled_jump_successors: 2,
                 exits: 4
             }),
         );
@@ -743,7 +878,7 @@ mod tests {
             Some(Counts {
                 labels: 38,
                 jumps: 22,
-                unlabeled_jump_successors: 22,
+                unlabeled_jump_successors: 10,
                 exits: 9
             }),
         );
@@ -755,7 +890,7 @@ mod tests {
             Some(Counts {
                 labels: 21,
                 jumps: 12,
-                unlabeled_jump_successors: 11,
+                unlabeled_jump_successors: 6,
                 exits: 5
             }),
         );
@@ -770,7 +905,7 @@ mod tests {
             Some(Counts {
                 labels: 11,
                 jumps: 4,
-                unlabeled_jump_successors: 4,
+                unlabeled_jump_successors: 1,
                 exits: 6
             }),
         );
@@ -792,7 +927,7 @@ mod tests {
             Some(Counts {
                 labels: 6,
                 jumps: 1,
-                unlabeled_jump_successors: 1,
+                unlabeled_jump_successors: 0,
                 exits: 5,
             }),
         );
@@ -803,7 +938,7 @@ mod tests {
             Some(Counts {
                 labels: 9,
                 jumps: 4,
-                unlabeled_jump_successors: 4,
+                unlabeled_jump_successors: 3,
                 exits: 6,
             }),
         );
@@ -812,7 +947,7 @@ mod tests {
             Some(Counts {
                 labels: 6,
                 jumps: 1,
-                unlabeled_jump_successors: 1,
+                unlabeled_jump_successors: 0,
                 exits: 7,
             }),
         );
@@ -829,7 +964,7 @@ mod tests {
             Some(Counts {
                 labels: 19,
                 jumps: 11,
-                unlabeled_jump_successors: 11,
+                unlabeled_jump_successors: 9,
                 exits: 17,
             }),
         );
@@ -842,7 +977,7 @@ mod tests {
             Some(Counts {
                 labels: 33,
                 jumps: 18,
-                unlabeled_jump_successors: 18,
+                unlabeled_jump_successors: 8,
                 exits: 11,
             }),
         );
@@ -857,7 +992,7 @@ mod tests {
             Some(Counts {
                 labels: 13,
                 jumps: 10,
-                unlabeled_jump_successors: 9,
+                unlabeled_jump_successors: 8,
                 exits: 5,
             }),
         );
@@ -868,7 +1003,7 @@ mod tests {
             Some(Counts {
                 labels: 12,
                 jumps: 6,
-                unlabeled_jump_successors: 5,
+                unlabeled_jump_successors: 4,
                 exits: 5,
             }),
         );
@@ -883,7 +1018,7 @@ mod tests {
             Some(Counts {
                 labels: 17,
                 jumps: 9,
-                unlabeled_jump_successors: 9,
+                unlabeled_jump_successors: 6,
                 exits: 9,
             }),
         );
@@ -894,7 +1029,7 @@ mod tests {
             Some(Counts {
                 labels: 25,
                 jumps: 15,
-                unlabeled_jump_successors: 14,
+                unlabeled_jump_successors: 13,
                 exits: 8,
             }),
         );
@@ -917,12 +1052,12 @@ mod tests {
             Some(Counts {
                 labels: 9,
                 jumps: 4,
-                unlabeled_jump_successors: 4,
+                unlabeled_jump_successors: 3,
                 exits: 9,
             }),
         );
         let source = format!(
-            "def f(flag):\n    try:\n        pass\n    finally:\n{}",
+            "def f(flag):\n    try:\n        pass\n    finally:\n{}    raise Error\n",
             "        if flag:\n            pass\n".repeat(30),
         );
         let budget = counts(&source).unwrap();
@@ -931,8 +1066,8 @@ mod tests {
             Counts {
                 labels: 66,
                 jumps: 61,
-                unlabeled_jump_successors: 61,
-                exits: 5,
+                unlabeled_jump_successors: 60,
+                exits: 6,
             },
         );
         assert_eq!(budget.max_label(), 255);
@@ -966,7 +1101,7 @@ mod tests {
             Some(Counts {
                 labels: 13,
                 jumps: 8,
-                unlabeled_jump_successors: 7,
+                unlabeled_jump_successors: 4,
                 exits: 4
             }),
         );
@@ -979,7 +1114,7 @@ mod tests {
             Some(Counts {
                 labels: 21,
                 jumps: 11,
-                unlabeled_jump_successors: 11,
+                unlabeled_jump_successors: 4,
                 exits: 5
             }),
         );
@@ -1012,7 +1147,7 @@ mod tests {
     #[test]
     fn unsupported_allocation_routes_decline_the_whole_function() {
         for source in [
-            "def f(value):\n    match value:\n        case _: pass\n",
+            "def f(value):\n    match value:\n        case [first, second]: pass\n",
             "def f():\n    def generic[T]():\n        pass\n",
             "def f():\n    type Alias = int\n",
         ] {
@@ -1088,7 +1223,9 @@ mod tests {
             panic!()
         };
         assert!(!certifies(&function.body));
-        assert_eq!(counts(&format!("{source}    await discarded()\n")), None);
+        let counts = counts(&format!("{source}    await discarded()\n")).unwrap();
+        assert_eq!(counts.max_original_label(), 136);
+        assert!(counts.max_label() >= 256);
     }
 
     #[test]
@@ -1102,12 +1239,11 @@ mod tests {
             Some(Counts {
                 labels: 61,
                 jumps: 32,
-                unlabeled_jump_successors: 17,
+                unlabeled_jump_successors: 15,
                 exits: 17,
             }),
         );
-        // Yield-from has the same explicit SEND helper. A possible implicit
-        // manager await always keeps the full charge, as asserted separately.
+        // Yield-from and implicit manager awaits use the same SEND helper.
         assert_eq!(
             counts("def f():\n    yield from items\n"),
             Some(Counts {
@@ -1124,7 +1260,7 @@ mod tests {
             Some(Counts {
                 labels: 23,
                 jumps: 13,
-                unlabeled_jump_successors: 12,
+                unlabeled_jump_successors: 6,
                 exits: 6,
             }),
         );

@@ -1072,6 +1072,58 @@ impl Assembler {
         }
     }
 
+    /// Certifies the width of original 3.12 codegen labels before any CFG allocation.
+    pub(crate) fn certify_legacy_source_jump_labels(&mut self) {
+        self.exception_owner_provenance
+            .legacy_source_jump_labels_fit = true;
+    }
+
+    /// Records the nonempty `SEND` and `END_SEND` labels of a source-bounded suspension.
+    pub(crate) fn record_legacy_short_await_labels(&mut self, send: Label, end: Label) {
+        self.exception_owner_provenance
+            .legacy_short_await_labels
+            .extend([send, end]);
+    }
+
+    /// Certifies source jump operands after both native empty-block repairs.
+    pub(crate) fn certify_legacy_original_jump_operands(&mut self) {
+        self.exception_owner_provenance
+            .legacy_original_jump_operands_fit = true;
+    }
+
+    /// Records a nonempty source header for original and normalized 3.12 backedges.
+    pub(crate) fn record_legacy_for_header(&mut self, start: Label) {
+        if self
+            .exception_owner_provenance
+            .legacy_original_jump_operands_fit
+        {
+            self.exception_owner_provenance
+                .legacy_for_headers
+                .insert(start);
+        }
+    }
+
+    /// Captures the authored jump to a comprehension's nonempty `FOR_ITER` header.
+    pub(crate) fn record_legacy_comprehension_backedge(&mut self, entry: Label) {
+        if self
+            .exception_owner_provenance
+            .legacy_source_jump_labels_fit
+        {
+            let jump = *self.required_last_instruction_mut("recording a comprehension backedge");
+            debug_assert_eq!(jump.opcode, JUMP_BACKWARD);
+            self.exception_owner_provenance
+                .legacy_comprehension_backedges
+                .push((entry, jump));
+        }
+    }
+
+    /// Records a bound on all labels allocated before 3.12 duplicates its exits.
+    pub(crate) fn set_legacy_exit_copy_budget(&mut self, budget: u8) {
+        self.legacy_native_labels
+            .get_or_insert_with(Default::default)
+            .exit_copy_budget = Some(budget);
+    }
+
     /// Binds a physical entry to its canonical native 3.12 codegen label.
     pub(crate) fn bind_legacy_native_label(&mut self, physical: Label, native: u32) {
         debug_assert_eq!(self.python_version, crate::PythonVersion::Py312);
@@ -1870,6 +1922,34 @@ impl Assembler {
         false
     }
 
+    /// Checks the original short-circuit edge and the unchanged truth test following it.
+    pub(crate) fn truth_test_in_fresh_fallthrough(&self, start: usize) -> bool {
+        let (before, test) = self.linear_items().split_at(start);
+        let [Item::Instruction(load), _, ..] = test else {
+            return false;
+        };
+        if load.opcode != LOAD_FAST || !test[1..].iter().all(|item| matches!(item,
+            Item::Instruction(ins) if matches!(ins.opcode, LOAD_ATTR | TO_BOOL | POP_JUMP_IF_TRUE | POP_JUMP_IF_FALSE)
+                || (ins.opcode == crate::target::opcodes::CALL && ins.value_argument() == Some(0))))
+            || !test.iter().all(|item| matches!(item, Item::Instruction(ins) if ins.pre_fold_extra_instructions() == 0 &&
+                ins.local_policy.hidden_exception_owner_slots() == 0))
+        { return false }
+        let provenance = &self.exception_owner_provenance;
+        match before {
+            [prefix @ .., Item::Instruction(pop)] if pop.opcode == POP_TOP => provenance
+                .original_value_jump_prefixes
+                .last()
+                .is_some_and(|(_, origin)| prefix.ends_with(origin)),
+            [.., Item::Instruction(condition), Item::Instruction(marker)]
+                if marker.opcode == NOT_TAKEN =>
+            {
+                matches!(provenance.original_primitive_condition_boundaries.as_slice(),
+                    [.., prior, current] if prior == condition && test.last() == Some(&Item::Instruction(*current)))
+            }
+            _ => false,
+        }
+    }
+
     /// Returns the preceding instruction's location within the current fallthrough block.
     pub(crate) fn current_block_last_instruction_location(&self) -> Option<SourceLocation> {
         self.linear_items()[self.current_block_start()..]
@@ -2046,25 +2126,42 @@ impl Assembler {
             })
     }
 
-    /// Whether one intact local or closure store follows an original expression join.
-    pub(crate) fn follows_original_join_store(&self) -> bool {
+    /// Whether a store or discarded positional call consumes an original expression join.
+    pub(crate) fn follows_original_join_store_or_call(&self) -> bool {
         let items = self.linear_items();
-        let Some((Item::Instruction(store), before)) = items.split_last() else {
+        let Some((Item::Instruction(last), prefix)) = items.split_last() else {
             return false;
         };
-        if !matches!(store.opcode, STORE_FAST | STORE_DEREF)
-            || store.value_argument().is_none()
-            || store.depth_after() != Some(0)
-            || store.location.line < 0
-            || store.local_policy != LocalPolicy::default()
-            || store.no_location_policy != ir::NoLocationPolicy::default()
-            || store.fusion_policy != ir::FusionPolicy::default()
-            || store.jump_policy != ir::JumpPolicy::default()
-            || store.pre_fold_extra_instructions() != 0
-            || store.exception_policy() != ExceptionPolicy::default()
+        if last.value_argument().is_none()
+            || last.depth_after() != Some(0)
+            || last.location.line < 0
+            || last.local_policy != LocalPolicy::default()
+            || last.no_location_policy != ir::NoLocationPolicy::default()
+            || last.fusion_policy != ir::FusionPolicy::default()
+            || last.jump_policy != ir::JumpPolicy::default()
+            || last.pre_fold_extra_instructions() != 0
+            || last.exception_policy() != ExceptionPolicy::default()
         {
             return false;
         }
+        let (before, entry_depth) = if matches!(last.opcode, STORE_FAST | STORE_DEREF) {
+            (prefix, 1)
+        } else if self.python_version >= crate::PythonVersion::Py314
+            && last.opcode == POP_TOP
+            && last.value_argument() == Some(0)
+            && let Some((Item::Instruction(call), before)) = prefix.split_last()
+            && call.opcode == crate::target::opcodes::CALL
+            && call.location == last.location
+            && *call == Instruction::new(call.opcode, call.operand(), call.location, Some(1))
+            && let Some(depth) = call
+                .value_argument()
+                .and_then(|arguments| arguments.checked_add(2))
+        {
+            // CALL consumes the argument slots plus the callable and self/NULL pair.
+            (before, depth)
+        } else {
+            return false;
+        };
         let labels = trailing_labels(before).collect::<Vec<_>>();
         let head = before.len() - labels.len();
         if self.join_labels_have_authored_location(&labels)
@@ -2128,7 +2225,7 @@ impl Assembler {
                     JUMP_FORWARD,
                     Operand::Forward(target),
                     jump.location,
-                    Some(1),
+                    Some(entry_depth),
                 )
             {
                 return false;
@@ -2598,6 +2695,14 @@ impl Assembler {
             None,
         )
         .is_some()
+    }
+
+    /// Checks that a nested cleanup's unlocated jump bypasses the guard's original exit.
+    pub(crate) fn original_guarded_exit_has_empty_cleanup(&self, location: SourceLocation) -> bool {
+        let items = self.linear_items();
+        self.original_guarded_finally_exit_origin(items, Some(location), true, None)
+            .and_then(|(_, index)| items[index].as_instruction())
+            .is_some_and(|jump| jump.location == SourceLocation::NONE)
     }
 
     /// Certifies a source None guard, including its retained multiline literal NOP.
@@ -3154,6 +3259,51 @@ impl Assembler {
             .then_some(edge.location)
     }
 
+    /// Finds the condition that still enters an unlocated normal try exit after copying.
+    pub(crate) fn try_exit_condition_donor(&self) -> Option<SourceLocation> {
+        let items = self.linear_items();
+        let labels = trailing_labels(items).collect::<Vec<_>>();
+        let Item::Instruction(previous) = items.get(items.len().checked_sub(labels.len() + 1)?)?
+        else {
+            return None;
+        };
+        if labels.is_empty()
+            || !(ends_scope(previous.opcode) || is_unconditional_jump(previous.opcode))
+            || self.join_labels_have_authored_location(&labels)
+            || labels.iter().any(|label| {
+                self.folded_away_condition_targets.contains(label)
+                    || self.folded_away_loop_else_targets.contains(label)
+            })
+        {
+            return None;
+        }
+        let mut donor = None;
+        for item in items {
+            let Item::Instruction(edge) = item else {
+                continue;
+            };
+            if !edge
+                .jump_target()
+                .is_some_and(|target| labels.contains(&target))
+            {
+                continue;
+            }
+            if !matches!(edge.operand(), Operand::Forward(_)) {
+                return None;
+            }
+            // The original try exit is an unlocated block ending in a jump. CPython
+            // copies it onto unconditional predecessors before it propagates lines.
+            if is_unconditional_jump(edge.opcode) {
+                continue;
+            }
+            if !is_conditional_jump(edge.opcode) || edge.location.line < 0 || donor.is_some() {
+                return None;
+            }
+            donor = Some(edge.location);
+        }
+        donor
+    }
+
     /// Returns the sole physical donor at an empty original source join.
     ///
     /// Folded edges, range-only labels, handler entries, and authored NOPs cannot
@@ -3189,12 +3339,47 @@ impl Assembler {
         .then_some(previous.location)
     }
 
-    /// Records an original POP whose jumping predecessors copy a small return.
+    /// Checks the fallthrough into an erased try-else after its earlier edges copy the exit.
+    pub(crate) fn try_exit_has_store_or_iterator_fallthrough(&self, try_end: Label) -> bool {
+        let items = self.linear_items();
+        let labels = trailing_labels(items).collect::<Vec<_>>();
+        let Some(Item::Instruction(previous)) =
+            items.get(items.len().saturating_sub(labels.len() + 1))
+        else {
+            return false;
+        };
+        if !labels.contains(&try_end)
+            || !matches!(previous.opcode, STORE_FAST | POP_ITER)
+            || previous.depth_after().is_none()
+            || previous.location.line < 0
+            || self.join_labels_have_authored_location(&labels)
+        {
+            return false;
+        }
+        let mut incoming = items.iter().filter_map(|item| match item {
+            Item::Instruction(jump)
+                if jump
+                    .forward_target()
+                    .is_some_and(|target| labels.contains(&target)) =>
+            {
+                Some(jump)
+            }
+            _ => None,
+        });
+        let is_copyable = |jump: &Instruction| {
+            jump.opcode == JUMP_FORWARD
+                && jump.depth_after() == previous.depth_after()
+                && jump.location.line >= 0
+        };
+        incoming.next().is_some_and(is_copyable) && incoming.all(is_copyable)
+    }
+
+    /// Records an original POP whose jumping predecessors copy a small return or raise.
     ///
     /// Native pre-line copying counts the POP itself and stops at four original
     /// records. The remaining physical predecessor supplies only the location;
     /// the POP retains its own owner and starts a fresh NOP-compaction array.
-    pub(crate) fn record_copied_return_fallthrough_pop(&mut self, instruction_offset: usize) {
+    pub(crate) fn record_copied_exit_fallthrough_pop(&mut self, instruction_offset: usize) {
         if self.python_version <= crate::PythonVersion::Py313 {
             return;
         }
@@ -3308,7 +3493,7 @@ impl Assembler {
                         && *ret
                             == Instruction::value_with_depth(RETURN_VALUE, 0, nop.location, depth)
                 });
-        let mut returned = false;
+        let mut exits = false;
         let mut original_size = 1;
         for item in items.iter().skip(marker_item + 1).take(3) {
             let Item::Instruction(instruction) = item else {
@@ -3334,11 +3519,11 @@ impl Assembler {
                 return;
             }
             if ends_scope(instruction.opcode) {
-                returned = instruction.opcode == RETURN_VALUE;
+                exits = matches!(instruction.opcode, RETURN_VALUE | RAISE_VARARGS);
                 break;
             }
         }
-        if !returned {
+        if !exits {
             return;
         }
         // Keep the marker unlocated through copying: each copied POP must inherit
@@ -3577,6 +3762,18 @@ impl Assembler {
     /// must retain its original source boundary and have no omitted instruction slots.
     pub(crate) fn at_original_shared_handler_join(&self) -> bool {
         self.original_shared_handler_join(&[], false)
+    }
+
+    /// Checks that a handler cleanup cannot fall through into a shared original jump.
+    pub(crate) fn at_shared_join_after_handler_cleanup(&self) -> bool {
+        let items = self.linear_items();
+        let end = items.len() - trailing_labels(items).count();
+        matches!(&items[..end], [.., Item::Instruction(copy), Item::Instruction(pop), Item::Instruction(reraise)]
+            if copy.opcode == COPY && copy.value_argument() == Some(3)
+                && pop.opcode == POP_EXCEPT && pop.value_argument() == Some(0)
+                && reraise.opcode == RERAISE && reraise.value_argument() == Some(1)
+                && [copy, pop, reraise].iter().all(|instruction| instruction.location == SourceLocation::NONE))
+            && self.at_original_shared_handler_join()
     }
 
     /// Certifies a guarded finalizer join with one recorded same-line None comparison.
@@ -3912,17 +4109,33 @@ impl Assembler {
                 }
                 Item::Instruction(instruction) => Some(*instruction),
             });
-        let Some(original) = original else {
-            return;
-        };
-        if !has_anchor
-            || original.opcode != JUMP_FORWARD
+        if let Some(original) = original.filter(|_| has_anchor) {
+            self.record_terminal_while_break(anchor, end, original);
+        }
+    }
+
+    /// Captures the break before a legacy loop emits its repeated condition.
+    pub(crate) fn record_while_break_before_repeated_test(&mut self, anchor: Label, end: Label) {
+        if let Some(original) = self
+            .linear_items()
+            .iter()
+            .rev()
+            .find_map(Item::as_instruction)
+            .copied()
+        {
+            self.record_terminal_while_break(anchor, end, original);
+        }
+    }
+
+    fn record_terminal_while_break(&mut self, anchor: Label, end: Label, original: Instruction) {
+        if original.opcode != JUMP_FORWARD
             || original.operand() != Operand::Forward(end)
             || original.location.line < 0
             || !original.fusion_policy.is_authored_break()
             || original.jump_policy.retained_nop() != ir::RetainedJumpNop::DirectTarget
-            // Jump emission compacts the authored break NOP into this one slot.
-            || original.pre_fold_extra_instructions() != 1
+            // Legacy lowering emits the break NOP separately. Modern lowering
+            // records it in the jump's original instruction count.
+            || original.pre_fold_extra_instructions() != u8::from(self.python_version != crate::PythonVersion::Py313)
             || original.local_policy.hidden_exception_owner_slots() != 0
         {
             return;
@@ -4173,10 +4386,9 @@ impl Assembler {
 
     /// Keeps a manager's original `POP_BLOCK` unlocated after a folded loop exit.
     ///
-    /// Before constant folding, an ordinary try's unlocated two-slot exit is copied
-    /// onto its break predecessor. The folded conditional still enters the original
-    /// exit, so the following manager cleanup has no sole location donor. Certify that
-    /// original graph while its labels and emitted instruction slots are still intact.
+    /// Both a break and the loop's original false edge can reach the normal try exit
+    /// before folding. The jump surviving at the break's line keeps its handler.
+    /// The following manager POP has no sole location donor.
     pub(crate) fn preserve_with_pop_after_folded_try_bridge(&mut self, instruction_offset: usize) {
         let items = self.linear_items();
         let mut instructions = Vec::new();
@@ -4271,6 +4483,10 @@ impl Assembler {
         let mut conditional_break_policy = ir::JumpPolicy::default();
         conditional_break_policy.prevent_threading_target();
         conditional_break_policy.retain_nop_for_direct_target();
+        let mut first_break_policy = conditional_break_policy;
+        first_break_policy.retain_nop();
+        let mut uncopied_bridge_policy = ir::JumpPolicy::default();
+        uncopied_bridge_policy.prevent_small_exit_inlining();
         let mut certified = false;
         for &(entry, target) in &self.exception_owner_provenance.normal_try_exits {
             let Some(&bridge_index) = entries.get(&entry) else {
@@ -4304,14 +4520,14 @@ impl Assembler {
                 || bridge.operand() != Operand::Forward(target)
                 || bridge.pre_fold_extra_instructions() != 0
                 || bridge.local_policy.hidden_exception_owner_slots() != 0
-                || !ordinary_jump_policy(&bridge)
+                || !(ordinary_jump_policy(&bridge) || bridge.jump_policy == uncopied_bridge_policy)
                 || bridge.no_location_policy.preserves_location()
                 || !(is_unconditional_jump(previous.opcode) || ends_scope(previous.opcode))
             {
                 continue;
             }
             let mut has_break = false;
-            let mut all_predecessors_copyable = true;
+            let mut only_breaks = true;
             for (index, (_, instruction)) in instructions.iter().enumerate() {
                 let (Operand::Forward(label) | Operand::Backward(label)) = instruction.operand()
                 else {
@@ -4320,26 +4536,28 @@ impl Assembler {
                 if entries.get(&label) != Some(&bridge_index) {
                     continue;
                 }
-                // A next-instruction edge can disappear before the original copy round.
-                // Admit only the ordinary forward break edges whose complete bridge is copied.
+                // An adjacent break may keep its own line and an extra original
+                // instruction slot. It still reaches the same normal try exit.
+                let adjacent = index + 1 == bridge_index;
                 if !is_unconditional_jump(instruction.opcode)
                     || instruction.forward_target().is_none()
                     || !instruction.fusion_policy.is_authored_break()
                     // Ordinary conditional breaks preserve their source jump's NOP and
                     // reject incoming threading. Neither flag prevents copying their target.
                     || !(ordinary_jump_policy(instruction)
-                        || instruction.jump_policy == conditional_break_policy)
+                        || instruction.jump_policy == conditional_break_policy
+                        || (adjacent && instruction.jump_policy == first_break_policy))
                     || instruction.location.line < 0
-                    || instruction.pre_fold_extra_instructions() != 0
+                    || instruction.pre_fold_extra_instructions() > u8::from(adjacent)
                     || instruction.local_policy.hidden_exception_owner_slots() != 0
-                    || index + 1 >= bridge_index
+                    || index >= bridge_index
                 {
-                    all_predecessors_copyable = false;
+                    only_breaks = false;
                     break;
                 }
                 has_break = true;
             }
-            if has_break && all_predecessors_copyable {
+            if has_break && only_breaks {
                 certified = true;
                 break;
             }
@@ -4678,9 +4896,9 @@ impl Assembler {
             || swap.operand() != Operand::Value(u32::try_from(restores.len() + 1).ok()?)
             || store.opcode != STORE_FAST
             || store.local_policy.may_store_null()
-            || restores.iter().any(|restore| {
-                restore.opcode != STORE_FAST || !restore.local_policy.may_store_null()
-            })
+            // The recorded normal restore also covers a saved comprehension cell,
+            // whose STORE_FAST uses a storage slot outside the ordinary fast locals.
+            || restores.iter().any(|restore| restore.opcode != STORE_FAST)
             || !restores.iter().chain([store]).all(|instruction| {
                 matches!(instruction.operand(), Operand::Value(local) if locals.insert(local))
             })
@@ -5318,12 +5536,244 @@ impl Assembler {
             return None;
         }
         let provenance = &self.exception_owner_provenance;
+        // A deferred comprehension restore exchanges its SWAP with the result
+        // store. The following marker reuses the protected condition cell.
+        if self.python_version == crate::PythonVersion::Py314
+            && truth
+            && let [
+                ..,
+                Item::Label(entry),
+                Item::Instruction(result),
+                Item::Label(barrier),
+                Item::Instruction(restore),
+                Item::Instruction(load),
+                Item::Instruction(convert),
+                Item::Instruction(condition),
+            ] = items
+            && provenance.fusion_boundaries.contains(barrier)
+            && result.opcode == STORE_FAST
+            && !result.local_policy.may_store_null()
+            && restore.opcode == STORE_FAST
+            && restore.local_policy.may_store_null()
+            && restore.local_policy.hidden_exception_owner_slots() == 1
+            && result.operand() != restore.operand()
+            && load.opcode == LOAD_FAST
+            && load.operand() == result.operand()
+            && convert.opcode == TO_BOOL
+            && convert.location == condition.location
+            && condition.forward_target().is_some()
+            && result.depth_after() == load.depth_after()
+            && restore.depth_after() == condition.depth_after()
+            && convert.depth_after() == load.depth_after()
+            && provenance
+                .original_primitive_condition_boundaries
+                .contains(condition)
+            && provenance
+                .original_comprehension_normal_exits
+                .iter()
+                .any(|(target, jump)| {
+                    target == entry
+                        && jump.opcode == JUMP_FORWARD
+                        && jump.forward_target() == Some(*entry)
+                })
+        {
+            return Some(true);
+        }
         let begin = items.iter().rposition(|item| {
             matches!(item, Item::Label(label)
             if provenance.source_boundaries.contains(label)
                 && provenance.block_boundaries.contains(label))
         })?;
         let prefix = &items[begin..];
+        if truth && self.python_version == crate::PythonVersion::Py314 {
+            let mut records = prefix.iter().rev().filter_map(Item::as_instruction);
+            if let [
+                Some(jump),
+                Some(convert),
+                Some(load),
+                Some(global),
+                Some(pop),
+            ] = [
+                records.next(),
+                records.next(),
+                records.next(),
+                records.next(),
+                records.next(),
+            ] && convert.opcode == TO_BOOL
+                && load.opcode == LOAD_FAST
+                && load.location == jump.location
+                && convert.location == jump.location
+                && global.opcode == LOAD_GLOBAL
+                && global.value_argument().is_some_and(|arg| arg & 1 == 1)
+                && pop.opcode == NOP
+                && pop.fusion_policy.is_converted_pop_block()
+                && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
+                && jump.forward_target().is_some()
+            {
+                // LOAD_GLOBAL folds its PUSH_NULL and the normal POP_BLOCK disappears.
+                // A preceding global call can fold one more PUSH_NULL. Either way the
+                // appended marker reuses a record on the protected side of the POP.
+                let preceding_call = match [
+                    records.next(),
+                    records.next(),
+                    records.next(),
+                    records.next(),
+                ] {
+                    [None, None, None, None] => true,
+                    [Some(discard), Some(call), Some(arg), Some(callee)] => {
+                        discard.opcode == POP_TOP
+                            && call.opcode == CALL
+                            && call.value_argument() == Some(1)
+                            && matches!(arg.opcode, LOAD_FAST | LOAD_DEREF)
+                            && callee.opcode == LOAD_GLOBAL
+                            && callee.value_argument().is_some_and(|arg| arg & 1 == 1)
+                            && records.next().is_none()
+                    }
+                    _ => false,
+                };
+                if preceding_call
+                    && prefix
+                        .iter()
+                        .filter_map(Item::as_instruction)
+                        .all(|record| {
+                            record.pre_fold_extra_instructions() == 0
+                                && record.local_policy.hidden_exception_owner_slots() == 0
+                        })
+                    && prefix
+                        .iter()
+                        .skip_while(|item| matches!(item, Item::Label(_)))
+                        .all(|item| match item {
+                            Item::Instruction(_) => true,
+                            Item::Label(label) => {
+                                !provenance.source_boundaries.contains(label)
+                                    && !provenance.block_boundaries.contains(label)
+                                    && !items
+                                        .iter()
+                                        .filter_map(Item::as_instruction)
+                                        .any(|record| record.jump_target() == Some(*label))
+                            }
+                        })
+                {
+                    return Some(true);
+                }
+            }
+        }
+        // The outer normal POP starts at an incoming jump. The nested try's
+        // SETUP retains its line, but its final POP compacts into the method
+        // receiver. The appended marker then reuses the conditional jump.
+        if truth && self.python_version == crate::PythonVersion::Py314 && prefix.len() >= 18 {
+            let records = prefix
+                .iter()
+                .filter_map(Item::as_instruction)
+                .take(19)
+                .collect::<smallvec::SmallVec<[_; 32]>>();
+            if let [
+                outer,
+                outer_load,
+                outer_method,
+                outer_call,
+                outer_pop,
+                setup,
+                inner_load,
+                inner_method,
+                value,
+                names,
+                inner_call,
+                inner_pop,
+                final_pop,
+                load,
+                method,
+                call,
+                boolean,
+                condition,
+            ] = records.as_slice()
+                && [outer, final_pop].into_iter().all(|pop| {
+                    pop.opcode == NOP
+                        && pop.location == SourceLocation::NONE
+                        && pop.fusion_policy.is_converted_pop_block()
+                        && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
+                })
+                && setup.opcode == NOP
+                && setup.location.line >= 0
+                && !setup.fusion_policy.is_converted_pop_block()
+                && matches!(outer_load.opcode, LOAD_FAST | LOAD_DEREF)
+                && [inner_load, load]
+                    .into_iter()
+                    .all(|record| record.opcode == LOAD_FAST)
+                && [outer_method, inner_method, method]
+                    .into_iter()
+                    .all(|record| {
+                        record.opcode == LOAD_ATTR
+                            && record.value_argument().is_some_and(|arg| arg & 1 != 0)
+                    })
+                && [outer_call, call]
+                    .into_iter()
+                    .all(|record| record.opcode == CALL && record.value_argument() == Some(0))
+                && [outer_pop, inner_pop]
+                    .into_iter()
+                    .all(|record| record.opcode == POP_TOP)
+                && matches!(
+                    value.opcode,
+                    LOAD_CONST | crate::target::opcodes::LOAD_SMALL_INT
+                )
+                && names.opcode == LOAD_CONST
+                && inner_call.opcode == crate::target::opcodes::CALL_KW
+                && inner_call.value_argument() == Some(1)
+                && boolean.opcode == TO_BOOL
+                && boolean.location == condition.location
+                && call.location == condition.location
+                && records.iter().all(|record| {
+                    record.local_policy.hidden_exception_owner_slots() == 0
+                        && record.pre_fold_extra_instructions() == 0
+                        && record.no_location_policy.borrow_fallthrough()
+                            == BorrowFallthrough::Reachable
+                })
+            {
+                let outer_index = prefix
+                    .iter()
+                    .position(|item| item.as_instruction() == Some(*outer))?;
+                let setup_index = prefix
+                    .iter()
+                    .position(|item| item.as_instruction() == Some(*setup))?;
+                // Both the try-line NOP and its following SETUP belong to this
+                // array. Only the leading labels may receive a jump from outside.
+                let [
+                    Item::Label(start),
+                    _,
+                    Item::Label(end),
+                    Item::Label(setup_label),
+                    ..,
+                ] = prefix.get(setup_index.checked_sub(1)?..)?
+                else {
+                    return None;
+                };
+                if !provenance.setup_nop_ranges.contains(&(*start, *end))
+                    || !provenance
+                        .setups
+                        .iter()
+                        .any(|(label, _)| label == setup_label)
+                    || !items[..begin]
+                        .iter()
+                        .filter_map(Item::as_instruction)
+                        .any(|jump| {
+                            jump.forward_target().is_some_and(|target| {
+                                prefix[..outer_index].contains(&Item::Label(target))
+                            })
+                        })
+                    || items[..begin]
+                        .iter()
+                        .filter_map(Item::as_instruction)
+                        .any(|jump| {
+                            jump.jump_target().is_some_and(|target| {
+                                prefix[outer_index..].contains(&Item::Label(target))
+                            })
+                        })
+                {
+                    return None;
+                }
+                return Some(true);
+            }
+        }
         let mut leading_labels = FxHashSet::default();
         let mut labels = FxHashSet::default();
         let mut instructions = Vec::new();
@@ -5378,12 +5828,78 @@ impl Assembler {
                     }
                 }
                 Item::Instruction(instruction) => {
-                    if instructions.len() == 8 {
+                    if instructions.len() == 10 {
                         return None;
                     }
                     instructions.push(*instruction);
                 }
             }
+        }
+        // Removing the unprotected POP_BLOCK and folding PUSH_NULL into a global
+        // call leave its following truth marker inside the protected suffix.
+        if self.python_version == crate::PythonVersion::Py314
+            && truth
+            && let [
+                pop,
+                global,
+                arguments @ ..,
+                call,
+                discard,
+                load,
+                convert,
+                condition,
+            ] = instructions.as_slice()
+            && pop.opcode == NOP
+            && pop.location == SourceLocation::NONE
+            && pop.fusion_policy.is_converted_pop_block()
+            && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
+            && let Some(depth) = pop.depth_after()
+            && global.opcode == LOAD_GLOBAL
+            && global.value_argument().is_some_and(|name| name & 1 != 0)
+            && global.depth_after() == depth.checked_add(2)
+            && call.opcode == CALL
+            && matches!(call.value_argument(), Some(1 | 2))
+            && call.depth_after() == depth.checked_add(1)
+            && discard.opcode == POP_TOP
+            && discard.depth_after() == Some(depth)
+            && load.opcode == LOAD_FAST
+            && convert.opcode == TO_BOOL
+            && load.depth_after() == depth.checked_add(1)
+            && convert.depth_after() == load.depth_after()
+            && condition.depth_after() == Some(depth)
+            && condition.forward_target().is_some()
+            && convert.location == condition.location
+            && global.location.line >= 0
+            && global.location.end_line < load.location.line
+            && arguments
+                .iter()
+                .try_fold(0_u32, |count, arg| match arg.opcode {
+                    LOAD_FAST => count.checked_add(1),
+                    LOAD_ATTR
+                        if count > 0 && arg.value_argument().is_some_and(|name| name & 1 == 0) =>
+                    {
+                        Some(count)
+                    }
+                    _ => None,
+                })
+                == call.value_argument()
+            && prefix[prefix
+                .iter()
+                .rposition(|item| matches!(item, Item::Label(_)))?
+                + 1..]
+                .iter()
+                .copied()
+                .eq(instructions[1..].iter().copied().map(Item::Instruction))
+            && with_exclusions.iter().flatten().any(|(start, end)| {
+                leading_labels.contains(start)
+                    && labels.contains(end)
+                    && !leading_labels.contains(end)
+            })
+            && provenance
+                .original_primitive_condition_boundaries
+                .contains(condition)
+        {
+            return Some(true);
         }
         // The comparison folds into its original TO_BOOL record. In this complete
         // original array, removing that NOP and the normal POP leaves the appended
@@ -5402,8 +5918,11 @@ impl Assembler {
                 && pop.location == SourceLocation::NONE
                 && pop.fusion_policy.is_converted_pop_block()
                 && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
-                && comparison.opcode == crate::target::opcodes::COMPARE_OP
-                && matches!(comparison.operand(), Operand::Value(argument) if argument & 16 != 0)
+                && match comparison.opcode {
+                    crate::target::opcodes::COMPARE_OP => matches!(comparison.operand(), Operand::Value(argument) if argument & 16 != 0),
+                    crate::target::opcodes::IS_OP => matches!(comparison.value_argument(), Some(0 | 1)),
+                    _ => false,
+                }
                 && comparison.location == condition.location
                 && condition.location.line >= 0
                 && condition.forward_target().is_some()
@@ -5413,7 +5932,8 @@ impl Assembler {
                     == base_depth.checked_add(2)
                 && instructions.iter().all(|record| {
                     record.pre_fold_extra_instructions() == 0
-                        && record.local_policy.hidden_exception_owner_slots() == 0
+                        && record.local_policy.hidden_exception_owner_slots() == u16::from(
+                            record == comparison && comparison.opcode == crate::target::opcodes::IS_OP)
                         && record.no_location_policy.borrow_fallthrough()
                             == BorrowFallthrough::Reachable
                 })
@@ -5931,6 +6451,25 @@ impl Assembler {
 
     pub(crate) fn mark(&mut self, label: Label) {
         self.push_linear_item(Item::Label(label));
+    }
+
+    /// Checks the last case-success jump at an ordinary try's zero-pop match failure.
+    /// A conditional tail can retain the same jump directly instead of carrying
+    /// the ordinary case-success flag.
+    pub(crate) fn has_located_match_success_before_try_end(&self, try_end: Label) -> bool {
+        matches!(self.linear_items(),
+            [.., Item::Instruction(success), Item::Label(failure), Item::Label(join), Item::Label(end)]
+            if *end == try_end
+                && failure != join
+                && failure != end
+                && join != end
+                && self.original_match_join == Some(*join)
+                && self.exception_owner_provenance.original_match_join_boundaries.contains(join)
+                && success.opcode == JUMP_FORWARD
+                && success.forward_target() == Some(*join)
+                && (success.jump_policy.is_original_match_success()
+                    || success.jump_policy.retained_nop() == ir::RetainedJumpNop::DirectTarget)
+                && success.location.line >= 0)
     }
 
     /// Whether the next instruction starts at the recorded source-authored match end.
@@ -7866,6 +8405,111 @@ impl Assembler {
         }
     }
 
+    /// Excludes a truth marker appended to an uncompacted method-call prefix in a value case.
+    pub(crate) fn exclude_uncompacted_case_method_marker(&mut self, start: usize) {
+        use crate::target::opcodes::{LOAD_ATTR, TO_BOOL};
+
+        let items = self.linear_items();
+        let [
+            Item::Label(begin),
+            Item::Instruction(setup),
+            Item::Label(end),
+            Item::Label(entry),
+            rest @ ..,
+        ] = &items[start..]
+        else {
+            return;
+        };
+        let mut preceding = &items[..start];
+        if let [earlier @ .., Item::Instruction(discard)] = preceding
+            && discard.opcode == POP_TOP
+        {
+            if !discard.fusion_policy.location_from_next() || discard.location != setup.location {
+                return;
+            }
+            preceding = earlier;
+        }
+        let [
+            ..,
+            Item::Instruction(compare),
+            Item::Instruction(failure),
+            Item::Instruction(success),
+        ] = preceding
+        else {
+            return;
+        };
+        if compare.opcode != crate::target::opcodes::COMPARE_OP
+            || failure.opcode != POP_JUMP_IF_FALSE
+            || failure.forward_target().is_none()
+            || success.opcode != NOT_TAKEN
+            || success.location != failure.location
+            || compare.location != failure.location
+        {
+            return;
+        }
+        let provenance = &self.exception_owner_provenance;
+        if setup.opcode != NOP
+            || setup.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
+            || !provenance.setup_nop_ranges.contains(&(*begin, *end))
+            || !provenance.setups.contains(&(*entry, Some(setup.location)))
+            || !provenance.ordinary_try_setups.contains_key(entry)
+        {
+            return;
+        }
+        // The match conditional starts a fresh success array. Its subject discard,
+        // when present, takes its line from the following setup only after NOP removal.
+        let mut records = rest
+            .iter()
+            .map_while(Item::as_instruction)
+            .enumerate()
+            .peekable();
+        let Some((_, receiver)) = records.next() else {
+            return;
+        };
+        if receiver.opcode != LOAD_FAST || receiver.location.line == setup.location.line {
+            return;
+        }
+        while records
+            .next_if(|(_, part)| {
+                part.opcode == LOAD_ATTR && part.value_argument().is_some_and(|arg| arg & 1 == 0)
+            })
+            .is_some()
+        {}
+        let Some((_, method)) = records.next() else {
+            return;
+        };
+        if method.opcode != LOAD_ATTR || method.value_argument().is_none_or(|arg| arg & 1 == 0) {
+            return;
+        }
+        let Some((_, mut load)) = records.next_if(|(_, part)| part.opcode == LOAD_FAST) else {
+            return;
+        };
+        while let Some((_, next)) = records.next_if(|(_, part)| part.opcode == LOAD_FAST) {
+            // Same-line local loads can fuse before the marker slot is chosen.
+            if load.location.line == next.location.line {
+                return;
+            }
+            load = next;
+        }
+        let (Some((_, truth)), Some((_, jump)), Some((offset, marker))) =
+            (records.next(), records.next(), records.next())
+        else {
+            return;
+        };
+        if truth.opcode == TO_BOOL
+            && matches!(jump.opcode, POP_JUMP_IF_TRUE | POP_JUMP_IF_FALSE)
+            && jump.forward_target().is_some()
+            && marker.opcode == NOT_TAKEN
+            && marker.exception_policy() == ExceptionPolicy::NoneDynamicCondition
+            && [truth.location, jump.location, marker.location]
+                .iter()
+                .all(|location| *location == load.location)
+            && let Item::Instruction(marker) = &mut self.linear_items_mut()[start + 4 + offset]
+        {
+            marker.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
+        }
+    }
+
     /// Marks the fallthrough created by backward conditional normalization as a fresh block.
     pub(crate) fn mark_last_condition_fallthrough_fresh(&mut self) {
         let instruction =
@@ -7995,127 +8639,6 @@ impl Assembler {
         self.emitted_jump_mut(emitted, "allowing transitive small-exit inlining")
             .fusion_policy
             .allow_transitive_small_exit_inlining();
-    }
-
-    /// Binds an authored synchronous for-else end to its original stack depth.
-    pub(crate) fn record_sync_for_else_end(&mut self, end: Label, depth: u32) {
-        if self.python_version >= crate::PythonVersion::Py314 {
-            self.original_sync_for_else_ends.insert(end, depth);
-        }
-    }
-
-    /// Retains the original normal-finally slot after a for-else call fallthrough.
-    pub(crate) fn preserve_sync_for_else_finally_exit(
-        &mut self,
-        emitted: EmittedJump,
-        break_location: SourceLocation,
-        call_location: SourceLocation,
-    ) {
-        let jump = *self.emitted_jump_mut(emitted, "certifying a for-else finally exit");
-        let Some(target) = jump.forward_target() else {
-            return;
-        };
-        let index = usize::try_from(emitted.instruction().item_index)
-            .expect("emitted instruction index should fit in usize");
-        let items = &self.linear_items()[..index];
-        let [head @ .., Item::Instruction(pop), Item::Label(end)] = items else {
-            return;
-        };
-        let Some(&depth) = self.original_sync_for_else_ends.get(end) else {
-            return;
-        };
-        if self.python_version < crate::PythonVersion::Py314
-            || !self.exception_regions.is_empty()
-            || index + 1 != self.linear_items().len()
-            || *end == target
-            || break_location.line < 0
-            || call_location.line < 0
-            || jump
-                != Instruction::new(
-                    JUMP_FORWARD,
-                    Operand::Forward(target),
-                    call_location,
-                    Some(depth),
-                )
-            || *pop != Instruction::new(POP_TOP, Operand::Value(0), call_location, Some(depth))
-            || !self
-                .exception_owner_provenance
-                .source_boundaries
-                .contains(end)
-            || !self
-                .exception_owner_provenance
-                .block_boundaries
-                .contains(end)
-            || self.join_labels_have_authored_location(&[*end])
-            || self.folded_away_condition_targets.contains(end)
-            || self.folded_away_loop_else_targets.contains(end)
-            || self.folded_condition_exit_targets.contains(end)
-            || self.conditional_threading_targets.contains_key(end)
-            || self
-                .exception_owner_provenance
-                .omitted_nop_counts
-                .contains_key(end)
-            || self
-                .exception_owner_provenance
-                .omitted_nop_locations
-                .contains_key(end)
-            || head.contains(&Item::Label(*end))
-        {
-            return;
-        }
-        let mut incoming = None;
-        for (index, item) in head.iter().enumerate() {
-            let Item::Instruction(instruction) = item else {
-                continue;
-            };
-            if !matches!(instruction.operand(), Operand::Forward(label) | Operand::Backward(label) if label == *end)
-            {
-                continue;
-            }
-            if incoming.replace(index).is_some() {
-                return;
-            }
-            let mut expected = Instruction::new(
-                JUMP_FORWARD,
-                Operand::Forward(*end),
-                break_location,
-                Some(depth),
-            );
-            expected.fusion_policy.mark_authored_break();
-            expected.jump_policy.prevent_threading_target();
-            if *instruction != expected {
-                return;
-            }
-        }
-        let Some(incoming) = incoming else {
-            return;
-        };
-        let slots = 1 + usize::from(self.python_version == crate::PythonVersion::Py315);
-        let Some(cleanup) = incoming
-            .checked_sub(slots)
-            .and_then(|start| head.get(start..incoming))
-        else {
-            return;
-        };
-        for (index, item) in cleanup.iter().enumerate() {
-            let Some(pop_depth) = depth.checked_add(u32::try_from(slots - index - 1).unwrap())
-            else {
-                return;
-            };
-            if *item
-                != Item::Instruction(Instruction::new(
-                    POP_TOP,
-                    Operand::Value(0),
-                    break_location,
-                    Some(pop_depth),
-                ))
-            {
-                return;
-            }
-        }
-        // Initial exit copying can bypass this original block. Only its else
-        // fallthrough donates the line retained by late redundant-jump removal.
-        self.preserve_redundant_jump_nop_after_threading(emitted);
     }
 
     pub(crate) fn preserve_redundant_jump_nop_after_threading(&mut self, emitted: EmittedJump) {
@@ -8842,9 +9365,32 @@ impl Assembler {
     }
 
     pub(crate) fn preserve_last_inlined_jump_nop(&mut self) {
+        // A break after a manager can unwind a finalizer before reaching this jump.
+        // Its discarded expression already supplies the line of the unlocated break.
+        let items = self.linear_items();
+        let end = items.len() - trailing_labels(items).count();
+        if self.python_version >= crate::PythonVersion::Py314
+            && let [.., Item::Instruction(discard), Item::Instruction(jump)] = &items[..end]
+            && jump.fusion_policy.is_authored_break()
+            && jump.location == SourceLocation::NONE
+            && discard.opcode == POP_TOP
+            && discard.location.line >= 0
+        {
+            return;
+        }
         self.last_jump_instruction_mut("retaining an inlined jump NOP")
             .jump_policy
             .retain_nop();
+    }
+
+    /// A break that threads out of a try-else arm can donate its line to the copied exit.
+    pub(crate) fn limit_break_nop_to_direct_target(&mut self, location: SourceLocation) {
+        if let Some(jump) = self.last_instruction_mut()
+            && jump.fusion_policy.is_authored_break()
+            && jump.location == location
+        {
+            jump.jump_policy.limit_nop_retention_to_direct_target();
+        }
     }
 
     /// Certifies an original case-success edge without introducing a block boundary.
@@ -9092,6 +9638,19 @@ impl Assembler {
                 .mark_original_shared_empty_join();
         }
         !shared_fallthrough_line
+    }
+
+    /// Finds the last conditional whose false edge reaches this case exit.
+    pub(crate) fn last_condition_location_to(
+        &self,
+        target: Label,
+        start: usize,
+    ) -> Option<SourceLocation> {
+        self.linear_items()[start..].iter().rev().find_map(|item| {
+            let instruction = item.as_instruction()?;
+            (is_conditional_jump(instruction.opcode) && instruction.jump_target() == Some(target))
+                .then_some(instruction.location)
+        })
     }
 
     /// Records a CPython ordinary jump block before small exits can replace its jump.
@@ -10843,7 +11402,7 @@ impl Assembler {
                 .iter()
                 .rposition(|item| matches!(item, Item::Instruction(_)))
             {
-                self.record_copied_break_handler_cleanup(break_item);
+                self.record_copied_loop_none_handler_cleanup(break_item, 1, false, 0);
             }
             self.prepare_no_location_block_for_inlining(emitted);
             self.mark_as_artificial_eval_break(emitted);
@@ -10857,7 +11416,7 @@ impl Assembler {
             if named_handler {
                 // Preserve the authored break and name-clear prefix before the None
                 // marker replays its original exception-owner slot.
-                self.record_copied_break_handler_cleanup(break_item);
+                self.record_copied_loop_none_handler_cleanup(break_item, 1, false, 0);
             }
             self.prepare_no_location_block_for_inlining(emitted);
             self.mark_as_artificial_eval_break(emitted);
@@ -11127,6 +11686,55 @@ impl Assembler {
         self.copied_finally_iterator_break_origins.push(origin);
     }
 
+    /// Records a copied truth test at the completion of an awaited manager exit.
+    pub(crate) fn record_awaited_break_truth_guard(
+        &mut self,
+        unwind_start: usize,
+        manager: SourceLocation,
+        handler: Label,
+    ) {
+        let records = self.linear_items()[unwind_start..]
+            .windows(8)
+            .find_map(|items| {
+                let [
+                    Item::Label(entry),
+                    Item::Instruction(end),
+                    Item::Instruction(pop),
+                    Item::Label(_),
+                    Item::Instruction(load),
+                    Item::Instruction(truth),
+                    Item::Instruction(jump),
+                    Item::Instruction(marker),
+                ] = items
+                else {
+                    return None;
+                };
+                (end.opcode == END_SEND
+                    && end.location == manager
+                    && pop.opcode == POP_TOP
+                    && pop.location == manager
+                    && matches!(load.opcode, LOAD_FAST | LOAD_GLOBAL)
+                    && truth.opcode == TO_BOOL
+                    && matches!(jump.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE)
+                    && marker.opcode == NOT_TAKEN
+                    && [truth, jump, marker]
+                        .iter()
+                        .all(|instruction| instruction.location == load.location)
+                    && [end, pop, load, truth, jump, marker]
+                        .iter()
+                        .all(|instruction| {
+                            instruction.pre_fold_extra_instructions() == 0
+                                && instruction.local_policy.hidden_exception_owner_slots() == 0
+                        }))
+                .then_some((*entry, handler, *load, *jump))
+            });
+        if let Some(records) = records {
+            self.exception_owner_provenance
+                .awaited_break_truth_guards
+                .push(records);
+        }
+    }
+
     /// Certifies a conditional join that starts at the jump after copied finalizer cleanup.
     pub(crate) fn record_copied_finally_break_head(
         &mut self,
@@ -11241,7 +11849,7 @@ impl Assembler {
         }
     }
 
-    /// Lets a copied await finalizer's false edge receive a private, unlocated exit copy.
+    /// Lets a copied finalizer's false edge receive a private, unlocated exit copy.
     pub(crate) fn allow_copied_finally_continue_exit(
         &mut self,
         emitted: EmittedJump,
@@ -11484,6 +12092,15 @@ impl Assembler {
         instruction.no_location_policy.mark_artificial_eval_break();
     }
 
+    /// Defers an iterator discard's location until its live predecessors are known.
+    pub(crate) fn record_iterator_discard_join(&mut self) {
+        if let [.., Item::Label(join), Item::Instruction(discard)] = self.linear_items()
+            && discard.opcode == POP_TOP
+        {
+            self.iterator_discard_joins.push(*join);
+        }
+    }
+
     pub(crate) fn preserve_last_no_location(&mut self) {
         self.required_last_instruction_mut("preserving a no-location instruction")
             .no_location_policy
@@ -11494,6 +12111,18 @@ impl Assembler {
         self.emitted_instruction_mut(emitted, "preserving a no-location instruction")
             .no_location_policy
             .preserve_location();
+    }
+
+    /// Keeps the line of each artificial iterator discard unresolved at a shared join.
+    pub(crate) fn preserve_iterator_cleanup_positions(&mut self, start: usize) {
+        for item in &mut self.linear_items_mut()[start..] {
+            if let Item::Instruction(instruction) = item
+                && matches!(instruction.opcode, crate::target::opcodes::SWAP | POP_TOP)
+                && instruction.location == SourceLocation::NONE
+            {
+                instruction.no_location_policy.preserve_location();
+            }
+        }
     }
 
     /// Records a nested join until its original match-case successor is emitted.
@@ -11703,6 +12332,127 @@ impl Assembler {
         instruction.jump_policy.preserve_explicit_nop();
     }
 
+    /// Excludes a copied finalizer's truth marker when it reuses an unowned `POP_BLOCK`.
+    pub(crate) fn exclude_nested_awaited_finally_marker(
+        &mut self,
+        entry: usize,
+        removed_pops: usize,
+        final_pops: usize,
+    ) {
+        use crate::target::opcodes::{CALL, LOAD_ATTR, LOAD_DEREF, TO_BOOL};
+
+        let prefix = &self.linear_items()[..entry];
+        let Some(awaited) = prefix.iter().rposition(
+            |item| matches!(item, Item::Instruction(instruction) if instruction.opcode == END_SEND),
+        ) else {
+            return;
+        };
+        let prefix = &prefix[awaited + 1..];
+        if prefix.iter().any(|item| {
+            matches!(item, Item::Label(label)
+                if self.exception_owner_provenance.source_boundaries.contains(label))
+        }) {
+            return;
+        }
+        let mut instructions = prefix.iter().filter_map(Item::as_instruction);
+        // Some return paths materialize the pre-manager POP_BLOCK after END_SEND.
+        // The unwind count already includes that slot, even when its NOP is absent.
+        if instructions.clone().next().is_some_and(|first| {
+            first.opcode == NOP
+                && first.fusion_policy.is_converted_pop_block()
+                && first.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
+        }) && instructions
+            .clone()
+            .nth(1)
+            .is_some_and(|next| next.opcode == SWAP)
+        {
+            instructions.next();
+        }
+        let Some(inner_pop) = instructions
+            .clone()
+            .position(|instruction| instruction.opcode == NOP)
+        else {
+            return;
+        };
+        if inner_pop != 0
+            && !instructions.clone().take(inner_pop).map(|i| i.opcode).eq([
+                SWAP, SWAP, LOAD_CONST, LOAD_CONST, LOAD_CONST, CALL, POP_TOP,
+            ])
+        {
+            return;
+        }
+        let Some(inner) = instructions.nth(inner_pop) else {
+            return;
+        };
+        if !inner.fusion_policy.is_converted_pop_block()
+            || inner.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
+        {
+            return;
+        }
+        let cleanup = instructions.collect::<Vec<_>>();
+        let [head, args @ .., call, discard] = cleanup.as_slice() else {
+            return;
+        };
+        if call.opcode != CALL || discard.opcode != POP_TOP {
+            return;
+        }
+        // A global call folds PUSH_NULL into LOAD_GLOBAL. A method call keeps its
+        // original LOAD_GLOBAL/LOAD_FAST and LOAD_ATTR records.
+        let (folded_null, args) = if head.opcode == LOAD_GLOBAL
+            && head.value_argument().is_some_and(|arg| arg & 1 != 0)
+        {
+            (1, args)
+        } else if matches!(head.opcode, LOAD_GLOBAL | LOAD_FAST | LOAD_DEREF)
+            && let [attr, args @ ..] = args
+            && attr.opcode == LOAD_ATTR
+            && attr.value_argument().is_some_and(|arg| arg & 1 != 0)
+        {
+            (0, args)
+        } else {
+            return;
+        };
+        if args.len() > 1
+            || !args
+                .iter()
+                .all(|arg| matches!(arg.opcode, LOAD_FAST | LOAD_DEREF))
+            || call.value_argument() != u32::try_from(args.len()).ok()
+        {
+            return;
+        }
+        // The original array ends in the final POP_BLOCKs followed by LOAD_FAST,
+        // TO_BOOL and the jump. The appended NOT_TAKEN reuses a POP only when
+        // compaction removes more than those three records.
+        if !(4..=3 + final_pops).contains(&(removed_pops + folded_null)) {
+            return;
+        }
+        let mut guards = self.linear_items_mut()[entry..]
+            .iter_mut()
+            .filter_map(Item::as_instruction_mut);
+        let (Some(pop), Some(load), Some(truth), Some(condition), Some(marker)) = (
+            guards.next(),
+            guards.next(),
+            guards.next(),
+            guards.next(),
+            guards.next(),
+        ) else {
+            return;
+        };
+        if pop.opcode == NOP
+            && pop.fusion_policy.is_converted_pop_block()
+            && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
+            && matches!(load.opcode, LOAD_FAST | LOAD_DEREF)
+            && truth.opcode == TO_BOOL
+            && matches!(condition.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE)
+            && marker.opcode == NOT_TAKEN
+            && marker.exception_policy() == ExceptionPolicy::NoneDynamicCondition
+            && [truth.location, condition.location, marker.location]
+                .iter()
+                .all(|location| *location == load.location)
+        {
+            marker.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
+        }
+    }
+
     /// Captures a copied finalizer's local None test without normal-fallthrough provenance.
     pub(crate) fn record_copied_finally_none_prefix(&mut self, ordinal: usize) {
         let mut instructions = self
@@ -11737,7 +12487,7 @@ impl Assembler {
         }
     }
 
-    /// Records a direct local None test following a normal finalizer's `POP_BLOCK`.
+    /// Records a local or attribute test following a normal finalizer's `POP_BLOCK`.
     pub(crate) fn record_normal_finally_none_prefix(&mut self, ordinal: usize) {
         let mut instructions = self
             .linear_items()
@@ -11754,48 +12504,61 @@ impl Assembler {
         ) else {
             return;
         };
-        // A zero-argument method test retains two more records than a local test.
-        // Capture them before either the normal POP or its range labels disappear.
+        // Attribute tests retain a receiver and attribute load, plus the call
+        // instruction when the attribute is a zero-argument method.
         if condition.opcode == crate::target::opcodes::LOAD_ATTR {
-            if let (Some(call), Some(comparison)) = (instructions.next(), instructions.next()) {
-                let prefix = [pop, load, condition, call, comparison];
-                if pop.opcode == NOP
-                    && pop.value_argument() == Some(0)
-                    && pop.location == SourceLocation::NONE
-                    && pop.fusion_policy.is_converted_pop_block()
-                    && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
-                    && load.opcode == LOAD_FAST
-                    && load.value_argument().is_some()
-                    && matches!(condition.operand(), Operand::Value(argument) if argument & 1 != 0)
-                    && call.opcode == crate::target::opcodes::CALL
-                    && call.value_argument() == Some(0)
-                    && matches!(comparison.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
-                    && comparison.forward_target().is_some()
-                    && comparison.location.line >= 0
-                    && prefix[1..].iter().all(|record| {
-                        record.location.line == comparison.location.line
-                            && record.location.end_line == comparison.location.end_line
-                            && record.location.column == comparison.location.column
-                            && record.location.end_column <= comparison.location.end_column
-                            && record.exception_policy() == ExceptionPolicy::default()
-                    })
-                    && prefix.iter().enumerate().all(|(index, record)| {
-                        record.pre_fold_extra_instructions() == 0
-                            && record.local_policy.hidden_exception_owner_slots()
-                                == if index == 4 { 3 } else { 0 }
-                            && record.no_location_policy.borrow_fallthrough()
-                                == BorrowFallthrough::Reachable
-                    })
-                    && pop.depth_after().is_some()
-                    && load.depth_after() == pop.depth_after().map(|depth| depth + 1)
-                    && condition.depth_after() == pop.depth_after().map(|depth| depth + 2)
-                    && call.depth_after() == load.depth_after()
-                    && comparison.depth_after() == pop.depth_after()
-                {
-                    self.exception_owner_provenance
-                        .normal_finally_method_none_prefixes
-                        .push(prefix);
-                }
+            let Some(argument) = condition.value_argument() else {
+                return;
+            };
+            let method = argument & 1 != 0;
+            let call = if method { instructions.next() } else { None };
+            let Some(comparison) = instructions.next() else {
+                return;
+            };
+            let mut prefix: smallvec::SmallVec<[Instruction; 5]> =
+                smallvec::smallvec![pop, load, condition];
+            prefix.extend(call);
+            prefix.push(comparison);
+            if pop.opcode == NOP
+                && pop.value_argument() == Some(0)
+                && pop.location == SourceLocation::NONE
+                && pop.fusion_policy.is_converted_pop_block()
+                && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
+                && (load.opcode == LOAD_FAST
+                    || (!method && load.opcode == crate::target::opcodes::LOAD_DEREF))
+                && load.value_argument().is_some()
+                && (!method
+                    || call.is_some_and(|record| {
+                        record.opcode == crate::target::opcodes::CALL
+                            && record.value_argument() == Some(0)
+                            && record.depth_after() == load.depth_after()
+                    }))
+                && matches!(comparison.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+                && comparison.forward_target().is_some()
+                && comparison.location.line >= 0
+                && prefix[1..].iter().all(|record| {
+                    record.location.line == comparison.location.line
+                        && record.location.end_line == comparison.location.end_line
+                        && record.location.column == comparison.location.column
+                        && record.location.end_column <= comparison.location.end_column
+                        && record.exception_policy() == ExceptionPolicy::default()
+                })
+                && prefix.iter().enumerate().all(|(index, record)| {
+                    record.pre_fold_extra_instructions() == 0
+                        && record.local_policy.hidden_exception_owner_slots()
+                            == if index + 1 == prefix.len() { 3 } else { 0 }
+                        && record.no_location_policy.borrow_fallthrough()
+                            == BorrowFallthrough::Reachable
+                })
+                && pop.depth_after().is_some()
+                && load.depth_after() == pop.depth_after().map(|depth| depth + 1)
+                && condition.depth_after()
+                    == load.depth_after().map(|depth| depth + u32::from(method))
+                && comparison.depth_after() == pop.depth_after()
+            {
+                self.exception_owner_provenance
+                    .normal_finally_attribute_none_prefixes
+                    .push(prefix);
             }
             return;
         }
@@ -11863,6 +12626,7 @@ impl Assembler {
         &mut self,
         return_item: usize,
         finally_handler: Label,
+        named_outer: bool,
     ) {
         let items = self.linear_items();
         let Some(start) = items[..return_item].iter().rposition(|item| {
@@ -11890,41 +12654,62 @@ impl Assembler {
                 Item::Label(_) => {}
                 Item::Instruction(record) => {
                     records.push(*record);
-                    if records.len() == 10 {
+                    if records.len() == if named_outer { 12 } else { 10 } {
                         break;
                     }
                 }
             }
         }
-        let Ok(records): Result<[Instruction; 10], _> = records.try_into() else {
-            return;
-        };
         let [
             discard,
             authored,
             first_pop,
             inner,
-            second_pop,
-            outer,
+            middle @ ..,
             final_pop,
             load,
             condition,
             marker,
-        ] = records;
+        ] = records.as_slice()
+        else {
+            return;
+        };
+        let (outer, second_pop) = match middle {
+            [pop, outer] if !named_outer => (outer, Some(pop)),
+            [outer, none, store, delete]
+                if named_outer
+                    && none.opcode == LOAD_CONST
+                    && store.opcode == STORE_FAST
+                    && delete.opcode == DELETE_FAST
+                    && store.operand() == delete.operand()
+                    && none.depth_after() == inner.depth_after()
+                    && store.depth_after() == outer.depth_after()
+                    && delete.depth_after() == outer.depth_after()
+                    && [none, store, delete].iter().all(|record| {
+                        record.exception_policy() == ExceptionPolicy::NoneUnchanged
+                    }) =>
+            {
+                (outer, None)
+            }
+            _ => return,
+        };
         if discard.opcode != POP_TOP
             || discard.value_argument() != Some(0)
             || authored.opcode != NOP
             || authored.fusion_policy.is_converted_pop_block()
-            || items.get(return_item) != Some(&Item::Instruction(authored))
+            || items.get(return_item) != Some(&Item::Instruction(*authored))
             || [inner, outer]
                 .iter()
                 .any(|i| i.opcode != POP_EXCEPT || i.value_argument() != Some(0))
-            || [first_pop, second_pop, final_pop].iter().any(|i| {
-                i.opcode != NOP
-                    || i.value_argument() != Some(0)
-                    || !i.fusion_policy.is_converted_pop_block()
-                    || i.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
-            })
+            || [first_pop, final_pop]
+                .into_iter()
+                .chain(second_pop)
+                .any(|i| {
+                    i.opcode != NOP
+                        || i.value_argument() != Some(0)
+                        || !i.fusion_policy.is_converted_pop_block()
+                        || i.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
+                })
             || load.opcode != LOAD_FAST
             || load.local_policy
                 != LocalPolicy::for_load(load.local_policy.force_owned_load(), false)
@@ -11939,17 +12724,17 @@ impl Assembler {
             || records.iter().enumerate().any(|(index, i)| {
                 i.pre_fold_extra_instructions() != 0
                     || i.local_policy.hidden_exception_owner_slots()
-                        != if index == 8 { 3 } else { 0 }
+                        != if index == records.len() - 2 { 3 } else { 0 }
                     || i.no_location_policy.borrow_fallthrough() != BorrowFallthrough::Reachable
                     || i.jump_policy.borrow_empty_block()
             })
-            || records[1..7]
+            || records[1..records.len() - 3]
                 .iter()
                 .any(|i| i.location != authored.location)
             || authored.depth_after() != discard.depth_after()
             || first_pop.depth_after() != authored.depth_after()
             || inner.depth_after().and_then(|d| d.checked_add(1)) != authored.depth_after()
-            || second_pop.depth_after() != inner.depth_after()
+            || second_pop.is_some_and(|pop| pop.depth_after() != inner.depth_after())
             || outer.depth_after().and_then(|d| d.checked_add(1)) != inner.depth_after()
             || final_pop.depth_after() != outer.depth_after()
             || load.depth_after() != outer.depth_after().map(|d| d + 1)
@@ -12037,9 +12822,22 @@ impl Assembler {
                 Item::Instruction(instruction) => Some((index, *instruction)),
                 Item::Label(_) => None,
             })
-            .take(3)
+            .take(4)
             .collect::<Vec<_>>();
-        let [(.., pop_except), (.., handler_pop), (swap_item, swap)] = preceding.as_slice() else {
+        let (unwind, final_pops) = match preceding.as_slice() {
+            [(_, extra), tail @ ..]
+                if extra.opcode == NOP
+                    && extra.fusion_policy.is_converted_pop_block()
+                    && extra.value_argument() == Some(0)
+                    && extra.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
+                    && extra.local_policy.hidden_exception_owner_slots() == 0
+                    && extra.pre_fold_extra_instructions() == 0 =>
+            {
+                (tail, 2)
+            }
+            tail => (tail, 1),
+        };
+        let [(_, pop_except), (_, handler_pop), (swap_item, swap), ..] = unwind else {
             return;
         };
         let following = items[final_pop_item..]
@@ -12089,11 +12887,16 @@ impl Assembler {
         };
         self.exception_owner_provenance
             .copied_handler_return_none_prefixes
-            .push((entry, records));
+            .push((entry, records, final_pops));
     }
 
     /// Captures a saved named-handler return whose enclosing async manager unwinds later.
-    pub(crate) fn record_saved_named_handler_none_prefix(&mut self, start: usize, pop_item: usize) {
+    pub(crate) fn record_saved_named_handler_none_prefix(
+        &mut self,
+        start: usize,
+        pop_item: usize,
+        inner_try_pop: bool,
+    ) {
         let items = self.linear_items();
         let Some(suffix) = items.get(pop_item..) else {
             return;
@@ -12218,7 +13021,10 @@ impl Assembler {
                 || record.no_location_policy.borrow_fallthrough() != BorrowFallthrough::Reachable
                 || record.jump_policy.borrow_empty_block()
                 || record.opcode == NOP
-                || record.value_argument().is_none()
+                || (record.value_argument().is_none()
+                    && !(inner_try_pop
+                        && record.opcode == LOAD_CONST
+                        && matches!(record.operand(), Operand::Deferred(_))))
                 || ends_scope(record.opcode)
         }) {
             return;
@@ -12227,10 +13033,210 @@ impl Assembler {
             entry,
             items: items[entry_at..end].to_vec(),
             unwind_offset: prefix.len(),
+            inner_try_pop,
         };
         self.exception_owner_provenance
             .saved_named_handler_none_prefixes
             .push(origin);
+    }
+
+    /// Captures the retained SETUP and the adjacent POPs of a copied return finalizer.
+    pub(crate) fn record_copied_return_setup(
+        &mut self,
+        start: usize,
+        pop: usize,
+        ordinary: usize,
+        managers: usize,
+        named_handler: bool,
+    ) {
+        use crate::target::opcodes::{CALL, DELETE_FAST, STORE_FAST};
+        let items = self.linear_items();
+        let cleanup: Vec<_> = items[start..pop]
+            .iter()
+            .filter_map(Item::as_instruction)
+            .collect();
+        // A saved value crosses the named-handler POP before SWAP and the
+        // name-cleanup POP before POP_EXCEPT. Both precede the final ordinary try.
+        let missing_pops = ordinary + managers + 2 * usize::from(named_handler);
+        if missing_pops == 0
+            || cleanup
+                .iter()
+                .any(|record| record.fusion_policy.is_converted_pop_block())
+        {
+            return;
+        }
+        if named_handler
+            && !matches!(cleanup.as_slice(), [.., swap, pop, value, store, clear]
+                if swap.opcode == SWAP && swap.value_argument() == Some(2)
+                    && pop.opcode == POP_EXCEPT && value.opcode == LOAD_CONST
+                    && store.opcode == STORE_FAST && clear.opcode == DELETE_FAST
+                    && store.operand() == clear.operand()
+                    && [pop, value, store, clear].iter().all(|r| r.location == swap.location))
+        {
+            return;
+        }
+        // Confirm the one manager has finished exiting before the surrounding try POPs.
+        if managers > 0
+            && !matches!(cleanup.as_slice(),
+            [.., a, b, c, call, discard] if a.opcode == LOAD_CONST && b.opcode == LOAD_CONST && c.opcode == LOAD_CONST
+                && a.operand() == b.operand() && b.operand() == c.operand() && call.opcode == CALL
+                && call.value_argument() == Some(3) && discard.opcode == POP_TOP
+                && [a, b, c, call, discard].iter().all(|r| r.location == a.location))
+        {
+            return;
+        }
+        let Some((index, final_pop)) = items[pop..]
+            .iter()
+            .enumerate()
+            .find_map(|(i, item)| Some((i, item.as_instruction()?)))
+        else {
+            return;
+        };
+        if final_pop.opcode == NOP
+            && final_pop.fusion_policy.is_converted_pop_block()
+            && final_pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
+        {
+            self.record_copied_setup_guard(pop + index + 1, missing_pops, ordinary + 1, true);
+        }
+    }
+
+    /// Captures both handler exits and the retained setup of a continued finalizer.
+    pub(crate) fn record_copied_continue_setup(&mut self, start: usize, names: [bool; 2]) {
+        use crate::target::opcodes::{DELETE_FAST, STORE_FAST};
+        let items = self.linear_items();
+        let mut records = items[start..]
+            .iter()
+            .enumerate()
+            .filter_map(|(i, item)| Some((start + i, item.as_instruction()?)));
+        let Some((_, authored)) = records.next() else {
+            return;
+        };
+        if authored.opcode != NOP
+            || authored.fusion_policy.is_converted_pop_block()
+            || authored.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
+        {
+            return;
+        }
+        for named in names {
+            let Some((_, pop)) = records.next() else {
+                return;
+            };
+            if pop.opcode != POP_EXCEPT || pop.location != authored.location {
+                return;
+            }
+            if named {
+                let (Some((_, value)), Some((_, store)), Some((_, clear))) =
+                    (records.next(), records.next(), records.next())
+                else {
+                    return;
+                };
+                if value.opcode != LOAD_CONST
+                    || store.opcode != STORE_FAST
+                    || clear.opcode != DELETE_FAST
+                    || store.operand() != clear.operand()
+                    || [value, store, clear]
+                        .iter()
+                        .any(|r| r.location != authored.location)
+                {
+                    return;
+                }
+            }
+        }
+        if let Some((setup, _)) = records.next() {
+            // The two handlers and the finalizer each omit a POP. A bound
+            // exception name also unwinds its own protected cleanup block.
+            self.record_copied_setup_guard(
+                setup,
+                3 + names.into_iter().filter(|named| *named).count(),
+                1,
+                false,
+            );
+        }
+    }
+
+    /// Records the first guard of a copied nested try with its original POP boundaries.
+    fn record_copied_setup_guard(
+        &mut self,
+        start: usize,
+        missing_pops: usize,
+        adjacent_pops: usize,
+        transferred: bool,
+    ) {
+        use crate::target::opcodes::{LOAD_FAST, LOAD_SMALL_INT, TO_BOOL};
+        let mut suffix = self.linear_items()[start..]
+            .iter()
+            .filter_map(Item::as_instruction)
+            .copied();
+        let (Some(setup), Some(load), Some(test)) = (suffix.next(), suffix.next(), suffix.next())
+        else {
+            return;
+        };
+        let mut records: smallvec::SmallVec<[Instruction; 4]> =
+            smallvec::smallvec![setup, load, test];
+        let condition = if test.opcode == TO_BOOL {
+            let Some(condition) = suffix.next() else {
+                return;
+            };
+            if !matches!(condition.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE) {
+                return;
+            }
+            records.push(condition);
+            condition
+        } else if !transferred && test.opcode == LOAD_SMALL_INT {
+            let (Some(compare), Some(jump)) = (suffix.next(), suffix.next()) else {
+                return;
+            };
+            if compare.opcode != COMPARE_OP
+                || compare.value_argument().is_none_or(|arg| arg & 16 == 0)
+                || !matches!(jump.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE)
+            {
+                return;
+            }
+            records.extend([compare, jump]);
+            jump
+        } else if matches!(test.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE) {
+            test
+        } else {
+            return;
+        };
+        let Some(marker) = suffix.next() else {
+            return;
+        };
+        if setup.opcode != NOP
+            || setup.fusion_policy.is_converted_pop_block()
+            || setup.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
+            || setup.location.line < 0
+            || load.opcode != LOAD_FAST
+            || load.location.line != condition.location.line
+            || condition.forward_target().is_none()
+            || marker.opcode != NOT_TAKEN
+            || marker.location != condition.location
+            || records.iter().enumerate().any(|(i, r)| {
+                r.pre_fold_extra_instructions() != 0
+                    || r.jump_policy.borrow_empty_block()
+                    || r.local_policy.hidden_exception_owner_slots()
+                        != if i == 2
+                            && matches!(test.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+                        {
+                            3
+                        } else {
+                            0
+                        }
+                    || (i > 0 && r.exception_policy() != ExceptionPolicy::NoneUnchanged)
+            })
+        {
+            return;
+        }
+        if transferred {
+            records[0].local_policy.add_hidden_exception_owner_slots(1);
+        }
+        self.exception_owner_provenance
+            .copied_finalizer_setups
+            .push(exception_owners::CopiedFinalizerSetup {
+                records,
+                missing_pops,
+                adjacent_pops,
+            });
     }
 
     /// Captures a constant coroutine return through one iterator or sync manager.
@@ -12240,6 +13246,7 @@ impl Assembler {
         pop_item: usize,
         manager: bool,
         handler: bool,
+        iterator_try_pop_slot: Option<usize>,
     ) {
         use crate::target::opcodes::{CALL, DELETE_FAST, STORE_FAST};
 
@@ -12381,6 +13388,7 @@ impl Assembler {
                 cleanup,
                 manager,
                 handler,
+                iterator_try_pop_slot,
                 pop: *pop,
                 load: *load,
                 condition: *condition,
@@ -12394,6 +13402,7 @@ impl Assembler {
         return_item: usize,
         first_pop_item: usize,
         allow_additional_pop: bool,
+        inner_finally_boundary: bool,
     ) {
         let (pops, additional_pop, load, condition) =
             match self.linear_items().get(first_pop_item..) {
@@ -12412,6 +13421,30 @@ impl Assembler {
                     *load,
                     *condition,
                 ),
+                // A nested finalizer can start its exception range between the last
+                // POP and the guard. The label must stay inside the same basic block.
+                Some(
+                    [
+                        Item::Instruction(first),
+                        Item::Instruction(last),
+                        Item::Label(boundary),
+                        Item::Instruction(load),
+                        Item::Instruction(condition),
+                        ..,
+                    ],
+                ) if inner_finally_boundary
+                    && !self
+                        .exception_owner_provenance
+                        .source_boundaries
+                        .contains(boundary)
+                    && !self
+                        .exception_owner_provenance
+                        .block_boundaries
+                        .contains(boundary)
+                    && !self.preserved_block_boundaries.contains(boundary) =>
+                {
+                    ([*first, *last], None, *load, *condition)
+                }
                 Some(
                     [
                         Item::Instruction(first_pop),
@@ -13152,22 +14185,179 @@ impl Assembler {
             });
     }
 
+    /// Records the final POP and the first local test of the copied finally suite.
+    pub(crate) fn record_copied_return_guard(
+        &mut self,
+        pop_item: usize,
+        ordinary_pops: usize,
+        nested_named_handler: bool,
+    ) {
+        self.record_copied_guard_cleanup(pop_item, ordinary_pops, nested_named_handler, None);
+    }
+
+    /// Captures a copied return guard and its optional manager exit call.
+    fn record_copied_guard_cleanup(
+        &mut self,
+        pop_item: usize,
+        ordinary_pops: usize,
+        nested_named_handler: bool,
+        manager_call: Option<Instruction>,
+    ) {
+        let items = self.linear_items();
+        let mut preceding = items[..pop_item]
+            .iter()
+            .rev()
+            .filter_map(Item::as_instruction);
+        let Some(&cleanup) = preceding.next() else {
+            return;
+        };
+        let omitted_pops = if nested_named_handler {
+            // The outer named handler omits a POP before its SWAP and POP_EXCEPT.
+            // The inner handler's POP_EXCEPT starts the uninterrupted unwind tail.
+            let [
+                Some(store),
+                Some(none),
+                Some(outer_pop),
+                Some(swap),
+                Some(inner_pop),
+            ] = std::array::from_fn(|_| preceding.next())
+            else {
+                return;
+            };
+            if cleanup.opcode != DELETE_FAST
+                || store.opcode != STORE_FAST
+                || store.operand() != cleanup.operand()
+                || none.opcode != LOAD_CONST
+                || outer_pop.opcode != POP_EXCEPT
+                || swap.opcode != SWAP
+                || swap.value_argument() != Some(2)
+                || inner_pop.opcode != POP_EXCEPT
+            {
+                return;
+            }
+            2
+        } else if matches!(cleanup.opcode, POP_EXCEPT | POP_TOP) {
+            ordinary_pops
+        } else {
+            return;
+        };
+        let mut records = items[pop_item..].iter().filter_map(|item| match item {
+            Item::Instruction(i) => Some(*i),
+            Item::Label(_) => None,
+        });
+        let Some(pop) = records.next() else { return };
+        if pop.opcode != NOP
+            || !pop.fusion_policy.is_converted_pop_block()
+            || pop.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
+            || pop.local_policy.hidden_exception_owner_slots() != 0
+        {
+            return;
+        }
+        let mut guard = Vec::new();
+        for record in records.take(5) {
+            guard.push(record);
+            if record.opcode == NOT_TAKEN {
+                break;
+            }
+        }
+        let [load, operands @ .., condition, marker] = guard.as_slice() else {
+            return;
+        };
+        if !(matches!(load.opcode, LOAD_FAST | crate::target::opcodes::LOAD_DEREF)
+            || (manager_call.is_some() && load.opcode == LOAD_GLOBAL))
+            || load.local_policy.hidden_exception_owner_slots() != 0
+            || marker.opcode != NOT_TAKEN
+            || condition.forward_target().is_none()
+            || condition.location != marker.location
+            || !(matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+                && operands.is_empty()
+                || matches!(condition.opcode, POP_JUMP_IF_TRUE | POP_JUMP_IF_FALSE)
+                    && (matches!(operands, [to_bool] if to_bool.opcode==TO_BOOL)
+                        || matches!(operands, [value, compare] if matches!(value.opcode, LOAD_CONST | crate::target::opcodes::LOAD_SMALL_INT)
+                            && compare.opcode==COMPARE_OP && compare.value_argument().is_some_and(|arg| arg & 16!=0))))
+        {
+            return;
+        }
+        let marker = *marker;
+        let condition = *condition;
+        guard.truncate(guard.len() - 2);
+        self.exception_owner_provenance.copied_return_guards.push(
+            exception_owners::CopiedReturnGuard {
+                cleanup,
+                manager_call,
+                operands: guard,
+                condition,
+                marker,
+                omitted_pops,
+            },
+        );
+    }
+
+    /// Captures the try POP between an async exit and two synchronous manager exits.
+    pub(crate) fn record_awaited_manager_return_compaction(
+        &mut self,
+        pop_item: usize,
+        location: SourceLocation,
+    ) {
+        let before = &self.linear_items()[..pop_item];
+        let mut preceding = before
+            .iter()
+            .enumerate()
+            .rev()
+            .filter_map(|(offset, item)| Some((offset, *item.as_instruction()?)))
+            .skip(14); // Each synchronous manager retains seven cleanup instructions.
+        let (Some((_, pop)), Some((end, send))) = (preceding.next(), preceding.next()) else {
+            return;
+        };
+        let Some(Item::Label(entry)) = end.checked_sub(1).and_then(|index| before.get(index))
+        else {
+            return;
+        };
+        if send.opcode != END_SEND
+            || pop.opcode != POP_TOP
+            || send.location != location
+            || pop.location != location
+        {
+            return;
+        }
+        let prefix = (*entry, [send, pop]);
+        let count = self
+            .exception_owner_provenance
+            .copied_manager_return_compactions
+            .len();
+        self.record_copied_manager_return_compaction(pop_item, (false, 1), 2, None, false);
+        if let Some(origin) = self
+            .exception_owner_provenance
+            .copied_manager_return_compactions
+            .get_mut(count)
+        {
+            origin.awaited_exit = Some(prefix);
+        }
+    }
+
+    /// Records the omitted POPs before a manager unwinds into a nested finally guard.
+    pub(crate) fn record_nested_finally_manager_return(&mut self, entry: Label, try_pops: usize) {
+        self.exception_owner_provenance
+            .nested_finally_manager_returns
+            .insert(entry, try_pops);
+    }
+
     /// Captures the actual manager unwind and first None test of its copied finally.
     pub(crate) fn record_copied_manager_return_compaction(
         &mut self,
         pop_item: usize,
-        ordinary_try_pops: usize,
+        (inner_try_pop, ordinary_try_pops): (bool, usize),
         manager_count: usize,
         retained_outer_handler: Option<Label>,
         named_handler: bool,
     ) {
-        use crate::target::opcodes::{CALL, DELETE_FAST, LOAD_CONST, STORE_FAST, SWAP};
+        use crate::target::opcodes::{CALL, DELETE_FAST, LOAD_CONST, LOAD_DEREF, STORE_FAST, SWAP};
 
         let items = self.linear_items();
         let Some(before) = items.get(..pop_item) else {
             return;
         };
-        if !(1..=2).contains(&manager_count) {
+        if manager_count == 0 {
             return;
         }
         let mut records = before
@@ -13198,7 +14388,11 @@ impl Assembler {
         {
             return;
         }
-        let cleanup = records[records.len() - 7..].to_vec();
+        let (cleanup, earlier_cleanups) = records
+            .as_chunks::<7>()
+            .0
+            .split_last()
+            .expect("at least one cleanup");
         let named_handler_cleanup = if named_handler {
             if manager_count != 1 || ordinary_try_pops != 1 || retained_outer_handler.is_none() {
                 return;
@@ -13250,11 +14444,6 @@ impl Assembler {
         } else {
             None
         };
-        let earlier_cleanup = (manager_count == 2).then(|| {
-            records[..7]
-                .try_into()
-                .expect("seven earlier cleanup records")
-        });
         let mut suffix = items[pop_item..].iter().filter_map(|item| match item {
             Item::Instruction(instruction) => Some(*instruction),
             Item::Label(_) => None,
@@ -13264,29 +14453,60 @@ impl Assembler {
         else {
             return;
         };
+        if matches!(
+            condition.opcode,
+            LOAD_CONST | crate::target::opcodes::LOAD_SMALL_INT
+        ) && manager_count == 1
+            && ordinary_try_pops == 0
+            && retained_outer_handler.is_none()
+            && !named_handler
+        {
+            // The manager POP precedes all seven records of the saved-return unwind.
+            self.record_copied_guard_cleanup(pop_item, 1, false, Some(cleanup[5]));
+            return;
+        }
+        let (to_bool, condition) = if condition.opcode == TO_BOOL {
+            let Some(jump) = suffix.next() else {
+                return;
+            };
+            if !matches!(jump.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE)
+                || condition.value_argument() != Some(0)
+                || condition.local_policy.hidden_exception_owner_slots() != 0
+                || condition.pre_fold_extra_instructions() != 0
+            {
+                return;
+            }
+            (Some(condition), jump)
+        } else if matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE) {
+            (None, condition)
+        } else {
+            return;
+        };
         if pop.opcode == NOP
             && pop.fusion_policy.is_converted_pop_block()
             && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
             && pop.local_policy.hidden_exception_owner_slots() == 0
             && pop.pre_fold_extra_instructions() == 0
-            && load.opcode == LOAD_FAST
+            && matches!(load.opcode, LOAD_FAST | LOAD_GLOBAL | LOAD_DEREF)
             && load.local_policy.hidden_exception_owner_slots() == 0
             && load.pre_fold_extra_instructions() == 0
-            && matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
             && condition.forward_target().is_some()
-            && condition.local_policy.hidden_exception_owner_slots() == 3
+            && condition.local_policy.hidden_exception_owner_slots()
+                == if to_bool.is_some() { 0 } else { 3 }
             && condition.pre_fold_extra_instructions() == 0
         {
             self.exception_owner_provenance
                 .copied_manager_return_compactions
                 .push(exception_owners::CopiedManagerReturnCompaction {
+                    inner_try_pop,
                     ordinary_try_pops,
                     retained_outer_handler,
-                    cleanup,
-                    earlier_cleanup,
+                    cleanup: cleanup.to_vec(),
+                    earlier_cleanups: earlier_cleanups.to_vec(),
+                    awaited_exit: None,
                     named_handler_cleanup,
                     constant_return_prefix: None,
-                    to_bool: None,
+                    to_bool,
                     pop,
                     load,
                     condition,
@@ -13307,7 +14527,7 @@ impl Assembler {
         use crate::target::opcodes::{CALL, DELETE_FAST, LOAD_CONST, STORE_FAST};
 
         if outer_try_pops > 1
-            || ((named_handler || unnamed_handler_managers != 0) && outer_try_pops != 0)
+            || (named_handler && outer_try_pops != 0)
             || (named_handler && missing_null_pops != 2)
             || (!named_handler && missing_null_pops > 1)
             || (unnamed_handler_managers != 0
@@ -13431,10 +14651,12 @@ impl Assembler {
             self.exception_owner_provenance
                 .copied_manager_return_compactions
                 .push(exception_owners::CopiedManagerReturnCompaction {
+                    inner_try_pop: false,
                     retained_outer_handler: None,
                     ordinary_try_pops: outer_try_pops,
                     cleanup: cleanup.to_vec(),
-                    earlier_cleanup: None,
+                    earlier_cleanups: Vec::new(),
+                    awaited_exit: None,
                     named_handler_cleanup: None,
                     constant_return_prefix: Some(exception_owners::ConstantManagerReturnPrefix {
                         authored_nop: authored,
@@ -13617,10 +14839,12 @@ impl Assembler {
         self.exception_owner_provenance
             .copied_manager_return_compactions
             .push(exception_owners::CopiedManagerReturnCompaction {
+                inner_try_pop: false,
                 retained_outer_handler: None,
                 ordinary_try_pops: usize::from(!retained_inner_try),
                 cleanup: cleanup.to_vec(),
-                earlier_cleanup: None,
+                earlier_cleanups: Vec::new(),
+                awaited_exit: None,
                 named_handler_cleanup: None,
                 constant_return_prefix: Some(exception_owners::ConstantManagerReturnPrefix {
                     authored_nop: authored,
@@ -13641,6 +14865,43 @@ impl Assembler {
                 load: *load,
                 condition: *condition,
             });
+    }
+
+    /// Restores the enclosing handler when a folded operand takes the normal `POP_BLOCK`'s line.
+    pub(crate) fn use_folded_finally_operand_owner(&mut self, ordinal: usize) {
+        if self.python_version < crate::PythonVersion::Py314 {
+            return;
+        }
+        let Some((pop_index, pop)) = self.indexed_instruction_at(ordinal) else {
+            return;
+        };
+        if pop.opcode != NOP || !pop.fusion_policy.is_converted_pop_block() {
+            return;
+        }
+        let Some((next_index, fold)) = self.indexed_instruction_at(ordinal + 1) else {
+            return;
+        };
+        let slots = fold.local_policy.hidden_exception_owner_slots();
+        if matches!(
+            fold.opcode,
+            LOAD_CONST | crate::target::opcodes::LOAD_SMALL_INT
+        ) && fold.exception_policy() == ExceptionPolicy::default()
+            && (fold.jump_policy.has_original_uniform_fold()
+                || self
+                    .exception_owner_provenance
+                    .uniform_fold_owner_slots
+                    .contains(&(fold.location, fold.opcode, slots)))
+            && self
+                .last_block_boundary(&self.linear_items()[pop_index + 1..next_index])
+                .is_none()
+        {
+            // CPython erases the operand's location during folding. NOP compaction
+            // transfers the POP_BLOCK's line into that operand, which keeps its handler.
+            let Item::Instruction(pop) = &mut self.linear_items_mut()[pop_index] else {
+                unreachable!()
+            };
+            pop.set_exception_policy(ExceptionPolicy::default());
+        }
     }
 
     /// Captures the unchanged first array of an ordinary normal-finally entry.
@@ -13829,12 +15090,11 @@ impl Assembler {
                         Item::Instruction(jump) if matches!(jump.operand(), Operand::Forward(target) | Operand::Backward(target) if labels.contains(&target)) => Some(*jump),
                         _ => None,
                     }).collect::<Vec<_>>();
-                    if incoming.is_empty()
-                        || incoming.iter().any(|jump| {
-                            !is_unconditional_jump(jump.opcode)
-                                || jump.operand() != Operand::Forward(*entry)
-                        })
-                    {
+                    if !exception_owners::OriginalNormalFinallyArray::has_forward_predecessors(
+                        *entry,
+                        &incoming,
+                        retained_setup.is_some(),
+                    ) {
                         return;
                     }
                     // This recorder runs after the finalizer suite and before its
@@ -13981,7 +15241,7 @@ impl Assembler {
             );
     }
 
-    /// Records the original empty prefix before a retained normal-finally `POP_BLOCK`.
+    /// Records the original empty prefix used to resolve a normal-finally `POP_BLOCK`.
     pub(crate) fn record_retained_pop_block_origin(&mut self, entry: Label) {
         let items = self.linear_items();
         let Some(Item::Instruction(marker)) = items.last() else {
@@ -13989,7 +15249,6 @@ impl Assembler {
         };
         if marker.opcode != NOP
             || !marker.fusion_policy.is_converted_pop_block()
-            || !marker.jump_policy.preserves_explicit_nop()
             || marker.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
             || !self.preserved_block_boundaries.contains(&entry)
         {
@@ -14401,16 +15660,13 @@ impl Assembler {
         .then_some((entry, last.location))
     }
 
-    /// Certifies a sole located branch jump into a manager's original normal cleanup.
-    ///
-    /// The final continue has already emitted its separate manager exit and backedge.
-    /// Its physical adjacency therefore contributes no fallthrough to this empty join.
-    pub(crate) fn original_manager_has_unique_branch_donor(
+    /// Finds the sole located jump into an empty manager join after a terminal arm.
+    pub(crate) fn original_manager_branch_donor(
         &self,
         protected_end: Label,
-        location: SourceLocation,
+        terminals: &[Opcode],
         removed_slots: u8,
-    ) -> bool {
+    ) -> Option<(Label, SourceLocation)> {
         let items = self.linear_items();
         let aliases = trailing_labels(items).collect::<Vec<_>>();
         if !aliases.contains(&protected_end)
@@ -14420,41 +15676,54 @@ impl Assembler {
                     || self.folded_away_loop_else_targets.contains(label)
             })
         {
-            return false;
+            return None;
         }
         let Some(Item::Instruction(previous)) =
             items.get(items.len().saturating_sub(aliases.len() + 1))
         else {
-            return false;
+            return None;
         };
-        if previous.opcode != JUMP_BACKWARD {
-            return false;
+        if !terminals.contains(&previous.opcode) {
+            return None;
         }
         let provenance = &self.exception_owner_provenance;
         let mut entries = aliases
             .iter()
             .copied()
             .filter(|label| provenance.block_boundaries.contains(label));
-        let Some(entry) = entries.next() else {
-            return false;
-        };
+        let entry = entries.next()?;
         if entries.next().is_some() || !provenance.source_boundaries.contains(&entry) {
-            return false;
+            return None;
         }
-        let mut incoming = items.iter().filter_map(|item| match item {
-            Item::Instruction(instruction)
-                if matches!(instruction.operand(), Operand::Forward(label) | Operand::Backward(label)
-                    if aliases.contains(&label)) => Some(instruction),
-            _ => None,
+        let mut incoming = items.iter().enumerate().filter_map(|(index, item)| {
+            let instruction = item.as_instruction()?;
+            instruction
+                .jump_target()
+                .is_some_and(|label| aliases.contains(&label))
+                .then_some((index, instruction))
         });
-        let Some(jump) = incoming.next() else {
-            return false;
-        };
-        incoming.next().is_none()
+        let (jump_index, jump) = incoming.next()?;
+        // A jump at the start of a shared block cannot inherit one arm's line.
+        let source = &items[..jump_index];
+        let starts = trailing_labels(source).collect::<Vec<_>>();
+        if !starts.is_empty() {
+            let incoming_edges = items
+                .iter()
+                .filter_map(Item::as_instruction)
+                .filter(|instruction| {
+                    instruction
+                        .jump_target()
+                        .is_some_and(|label| starts.contains(&label))
+                })
+                .count();
+            if incoming_edges + usize::from(block_has_fallthrough(source)) > 1 {
+                return None;
+            }
+        }
+        (incoming.next().is_none()
             && jump.opcode == JUMP_FORWARD
             && jump.operand() == Operand::Forward(entry)
-            && jump.location == location
-            && location.line >= 0
+            && jump.location.line >= 0
             && jump.pre_fold_extra_instructions() == removed_slots
             && jump.local_policy.hidden_exception_owner_slots() == 0
             && jump.exception_policy() == ExceptionPolicy::default()
@@ -14463,7 +15732,8 @@ impl Assembler {
             && !jump.fusion_policy.is_converted_pop_block()
             && jump.jump_policy.retained_nop() == ir::RetainedJumpNop::DirectTarget
             && !jump.jump_policy.borrow_empty_block()
-            && jump.depth_after().is_some()
+            && jump.depth_after().is_some())
+        .then_some((entry, jump.location))
     }
 
     /// Certifies the sole original donor of a manager join beside a separate break exit.
@@ -14597,15 +15867,15 @@ impl Assembler {
         Some(entry)
     }
 
-    /// Locates a manager exit reached only by a break's copied-finally store.
+    /// Locates a manager exit reached only by a break's copied finalizer.
     ///
-    /// The source has one break and a terminating loop else. Its original cleanup
-    /// array ends with `STORE_FAST`, the target's unlocated iterator pops, and the
-    /// authored break. Resolve this donor before exit copying, which precedes the
-    /// within-block location propagation that would locate the pops and jump.
+    /// Only the break reaches the manager after the loop else terminates. Its
+    /// copied finalizer ends in a store or expression pop followed by the
+    /// unlocated jump. A `for` also unwinds its iterator before jumping.
     pub(crate) fn original_manager_copied_finally_break_join(
         &self,
         protected_end: Label,
+        has_iterator: bool,
     ) -> Option<(Label, SourceLocation)> {
         let items = self.linear_items();
         let aliases = trailing_labels(items).collect::<Vec<_>>();
@@ -14626,12 +15896,17 @@ impl Assembler {
             return None;
         }
         let provenance = &self.exception_owner_provenance;
-        let mut entries = aliases
-            .iter()
-            .copied()
-            .filter(|label| provenance.block_boundaries.contains(label));
+        let mut entries = aliases.iter().copied().filter(|label| {
+            if has_iterator {
+                provenance.block_boundaries.contains(label)
+            } else {
+                *label != protected_end
+            }
+        });
         let entry = entries.next()?;
-        if entries.next().is_some() || !provenance.source_boundaries.contains(&entry) {
+        if entries.next().is_some()
+            || (has_iterator && !provenance.source_boundaries.contains(&entry))
+        {
             return None;
         }
         let mut incoming = items.iter().enumerate().filter_map(|(index, item)| match item {
@@ -14644,17 +15919,16 @@ impl Assembler {
         if incoming.next().is_some() {
             return None;
         }
-        let iterator_slots = match self.python_version {
-            crate::PythonVersion::Py312
-            | crate::PythonVersion::Py313
-            | crate::PythonVersion::Py314 => 1,
-            crate::PythonVersion::Py315 => 2,
+        let iterator_slots = match (has_iterator, self.python_version) {
+            (false, _) => 0,
+            (true, crate::PythonVersion::Py315) => 2,
+            (true, _) => 1,
         };
         let tail = items.get(index.checked_sub(iterator_slots + 1)?..=index)?;
-        let [Item::Instruction(store), pops @ .., Item::Instruction(jump)] = tail else {
+        let [Item::Instruction(donor), pops @ .., Item::Instruction(jump)] = tail else {
             return None;
         };
-        let mut depth = store.depth_after()?;
+        let mut depth = donor.depth_after()?;
         for item in pops {
             let Item::Instruction(pop) = item else {
                 return None;
@@ -14668,9 +15942,9 @@ impl Assembler {
                 return None;
             }
         }
-        (store.opcode == STORE_FAST
-            && store.value_argument().is_some()
-            && store.location.line >= 0
+        ((donor.opcode == STORE_FAST || (!has_iterator && donor.opcode == POP_TOP))
+            && donor.value_argument().is_some()
+            && donor.location.line >= 0
             && jump.opcode == JUMP_FORWARD
             && jump.operand() == Operand::Forward(entry)
             && jump.location == SourceLocation::NONE
@@ -14688,7 +15962,7 @@ impl Assembler {
                     && !instruction.jump_policy.borrow_empty_block()
                     && instruction.depth_after().is_some()
             }))
-        .then_some((entry, store.location))
+        .then_some((entry, donor.location))
     }
 
     /// Records a manager's original `POP_BLOCK` at the head of its cleanup array.
@@ -15094,6 +16368,72 @@ impl Assembler {
         self.exception_owner_provenance
             .named_handler_truth_prefixes
             .push(origin);
+    }
+
+    /// Captures the two finalizer POPs around a copied assignment and outer attribute guard.
+    pub(crate) fn record_copied_assignment_finally_guard(&mut self, return_item: usize) {
+        let records = self.linear_items()[return_item..]
+            .iter()
+            .filter_map(Item::as_instruction)
+            .copied()
+            .take(9)
+            .collect::<smallvec::SmallVec<[_; 16]>>();
+        let [
+            authored,
+            inner_finally,
+            value,
+            store,
+            outer_finally,
+            load,
+            attr,
+            condition,
+            marker,
+        ] = records.as_slice()
+        else {
+            return;
+        };
+        if authored.opcode != NOP
+            || authored.location.line < 0
+            || authored.fusion_policy.is_converted_pop_block()
+            || authored.exception_policy() != ExceptionPolicy::default()
+            || [inner_finally, outer_finally].iter().any(|pop| {
+                pop.opcode != NOP
+                    || pop.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
+                    || !pop.fusion_policy.is_converted_pop_block()
+            })
+            || inner_finally.location != authored.location
+            || outer_finally.location != SourceLocation::NONE
+            || value.opcode != LOAD_CONST
+            || store.opcode != STORE_FAST
+            || !matches!(load.opcode, LOAD_FAST | crate::target::opcodes::LOAD_DEREF)
+            || attr.opcode != LOAD_ATTR
+            || attr.value_argument().is_none_or(|arg| arg & 1 != 0)
+            || !matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+            || condition.forward_target().is_none()
+            || marker.opcode != NOT_TAKEN
+            || marker.location != condition.location
+            || records.iter().enumerate().any(|(index, record)| {
+                record.pre_fold_extra_instructions() != 0
+                    || record.local_policy.hidden_exception_owner_slots()
+                        != if index == 7 { 3 } else { 0 }
+                    || record.no_location_policy.borrow_fallthrough()
+                        != BorrowFallthrough::Reachable
+            })
+        {
+            return;
+        }
+        // The authored return compacts into the inner finally POP. The outer
+        // finally POP moves into the receiver. The ordinary tries' two omitted
+        // POPs are counted separately when locating the original append slot.
+        let mut retained = *inner_finally;
+        retained.local_policy.add_hidden_exception_owner_slots(1);
+        let mut receiver = *load;
+        receiver.local_policy.add_hidden_exception_owner_slots(1);
+        self.exception_owner_provenance
+            .copied_assignment_finally_guards
+            .push([
+                retained, *value, *store, receiver, *attr, *condition, *marker,
+            ]);
     }
 
     /// Captures the two source POPs and intact method cleanup copied by a return.
@@ -15761,7 +17101,14 @@ impl Assembler {
         return_item: usize,
         named: bool,
     ) {
-        self.record_copied_handler_cleanup_inner(start, end, return_item, named, None, false);
+        self.record_copied_handler_cleanup_inner(
+            start,
+            end,
+            return_item,
+            usize::from(named),
+            None,
+            false,
+        );
     }
 
     /// Captures a named handler followed by one compiler-certified synchronous iterator.
@@ -15797,7 +17144,7 @@ impl Assembler {
             start,
             end,
             return_item,
-            false,
+            0,
             Some(handler_end),
             false,
         );
@@ -15810,7 +17157,7 @@ impl Assembler {
         end: Label,
         return_item: usize,
     ) {
-        self.record_copied_handler_cleanup_inner(start, end, return_item, true, None, true);
+        self.record_copied_handler_cleanup_inner(start, end, return_item, 1, None, true);
     }
 
     fn record_copied_handler_cleanup_inner(
@@ -15818,10 +17165,11 @@ impl Assembler {
         start: Label,
         end: Label,
         return_item: usize,
-        named: bool,
+        named_handlers: usize,
         assignment_pop_boundary: Option<Label>,
         inner_iterator: bool,
     ) {
+        let named = named_handlers != 0;
         let copied_assignment = assignment_pop_boundary.is_some();
         let items = self.linear_items();
         let Some(Item::Instruction(return_nop)) = items.get(return_item) else {
@@ -15877,7 +17225,7 @@ impl Assembler {
             (3, 0)
         } else {
             match (named, prefix.as_slice()) {
-                (true, [_]) => (2, 1),
+                (true, [_]) => (2 * named_handlers, 1),
                 (true, [_, first, second])
                     if return_nop.exception_policy() == ExceptionPolicy::NoneUnchanged
                         && return_nop.local_policy.hidden_exception_owner_slots() == 0
@@ -15953,17 +17301,20 @@ impl Assembler {
         let expected_len = if copied_assignment {
             3
         } else if named {
-            4
+            4 * named_handlers
         } else {
             1
         };
         if instructions.len() != expected_len
             || instructions[0].opcode != crate::target::opcodes::POP_EXCEPT
             || (named
-                && (instructions[1].opcode != crate::target::opcodes::LOAD_CONST
-                    || instructions[2].opcode != crate::target::opcodes::STORE_FAST
-                    || instructions[3].opcode != crate::target::opcodes::DELETE_FAST
-                    || instructions[2].operand() != instructions[3].operand()))
+                && instructions.as_chunks::<4>().0.iter().any(|cleanup| {
+                    cleanup[0].opcode != POP_EXCEPT
+                        || cleanup[1].opcode != LOAD_CONST
+                        || cleanup[2].opcode != STORE_FAST
+                        || cleanup[3].opcode != DELETE_FAST
+                        || cleanup[2].operand() != cleanup[3].operand()
+                }))
         {
             return;
         }
@@ -15984,34 +17335,37 @@ impl Assembler {
             });
     }
 
-    /// Captures a direct named-handler break followed by its copied local None test.
-    pub(crate) fn record_copied_break_handler_cleanup(&mut self, break_item: usize) {
+    /// Captures the named-handler cleanups before a loop jump's copied local None test.
+    pub(crate) fn record_copied_loop_none_handler_cleanup(
+        &mut self,
+        jump_item: usize,
+        named_handlers: usize,
+        continued: bool,
+        extra_try_pops: usize,
+    ) {
+        let load_at = 1 + 4 * named_handlers;
+        let marker_at = load_at + 2;
         let items = self.linear_items();
         let records = items
             .iter()
             .enumerate()
-            .skip(break_item)
+            .skip(jump_item)
             .filter_map(|(index, item)| match item {
                 Item::Instruction(instruction) => Some((index, *instruction)),
                 Item::Label(_) => None,
             })
-            .take(8)
+            .take(marker_at + 1)
             .collect::<Vec<_>>();
-        if records.len() != 8 || records[0].0 != break_item {
+        if records.len() != marker_at + 1 || records[0].0 != jump_item {
             return;
         }
         let authored = records[0].1;
-        let cleanup = &records[1..5];
-        let load = records[5].1;
-        let condition = records[6].1;
-        let marker = records[7].1;
+        let cleanup = &records[1..load_at];
+        let load = records[load_at].1;
+        let condition = records[load_at + 1].1;
+        let marker = records[marker_at].1;
         if authored.opcode != NOP
             || authored.location.line < 0
-            || cleanup[0].1.opcode != POP_EXCEPT
-            || cleanup[1].1.opcode != LOAD_CONST
-            || cleanup[2].1.opcode != STORE_FAST
-            || cleanup[3].1.opcode != DELETE_FAST
-            || cleanup[2].1.operand() != cleanup[3].1.operand()
             || cleanup.iter().any(|(_, instruction)| {
                 instruction.location != authored.location
                     || instruction.exception_policy() != ExceptionPolicy::default()
@@ -16026,7 +17380,8 @@ impl Assembler {
             || marker.location != condition.location
             || marker.value_argument() != Some(0)
             || records.iter().enumerate().any(|(index, (_, instruction))| {
-                (index != 6 && instruction.local_policy.hidden_exception_owner_slots() != 0)
+                (index != load_at + 1
+                    && instruction.local_policy.hidden_exception_owner_slots() != 0)
                     || instruction.pre_fold_extra_instructions() != 0
                     || instruction.no_location_policy.borrow_fallthrough()
                         != BorrowFallthrough::Reachable
@@ -16034,7 +17389,37 @@ impl Assembler {
         {
             return;
         }
-        let labels = items[break_item..records[7].0]
+        if continued {
+            let Some(target) = condition.forward_target() else {
+                return;
+            };
+            let mut targets = items
+                .iter()
+                .enumerate()
+                .filter_map(|(index, item)| (*item == Item::Label(target)).then_some(index));
+            let Some(target_index) = targets.next() else {
+                return;
+            };
+            if targets.next().is_some() || target_index <= records[marker_at].0 {
+                return;
+            }
+            let Some(suffix) = items[target_index + 1..]
+                .iter()
+                .find_map(Item::as_instruction)
+            else {
+                return;
+            };
+            // This recorder runs before the pending continue jump is emitted. A terminal
+            // join has no stable suffix yet and may acquire a fresh backward marker.
+            if matches!(suffix.opcode, NOP | NOT_TAKEN)
+                || is_conditional_jump(suffix.opcode)
+                || is_unconditional_jump(suffix.opcode)
+                || ends_scope(suffix.opcode)
+            {
+                return;
+            }
+        }
+        let labels = items[jump_item..records[marker_at].0]
             .iter()
             .filter_map(|item| match item {
                 Item::Label(label) => Some(*label),
@@ -16061,7 +17446,7 @@ impl Assembler {
         }) {
             return;
         }
-        let Some(start) = items[break_item + 1..records[1].0]
+        let Some(start) = items[jump_item + 1..records[1].0]
             .iter()
             .find_map(|item| match item {
                 Item::Label(label) => Some(*label),
@@ -16070,7 +17455,7 @@ impl Assembler {
         else {
             return;
         };
-        let Some(end) = items[records[4].0 + 1..records[5].0]
+        let Some(end) = items[records[load_at - 1].0 + 1..records[load_at].0]
             .iter()
             .find_map(|item| match item {
                 Item::Label(label) => Some(*label),
@@ -16079,58 +17464,25 @@ impl Assembler {
         else {
             return;
         };
-        self.record_copied_handler_cleanup(start, end, break_item, true);
-    }
-
-    /// Captures a continued local None test with an emitted fallthrough suffix.
-    pub(crate) fn record_copied_continue_none_handler_cleanup(&mut self, continue_item: usize) {
-        let items = self.linear_items();
-        let records = items
-            .iter()
-            .enumerate()
-            .skip(continue_item)
-            .filter_map(|(index, item)| match item {
-                Item::Instruction(instruction) => Some((index, *instruction)),
-                Item::Label(_) => None,
-            })
-            .take(8)
-            .collect::<Vec<_>>();
-        if records.len() != 8 || records[0].0 != continue_item {
-            return;
-        }
-        let condition = records[6].1;
-        if !matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE) {
-            return;
-        }
-        let Some(target) = condition.forward_target() else {
-            return;
-        };
-        let mut targets = items
-            .iter()
-            .enumerate()
-            .filter_map(|(index, item)| (*item == Item::Label(target)).then_some(index));
-        let Some(target_index) = targets.next() else {
-            return;
-        };
-        if targets.next().is_some() || target_index <= records[7].0 {
-            return;
-        }
-        let Some(suffix) = items[target_index + 1..]
-            .iter()
-            .find_map(Item::as_instruction)
-        else {
-            return;
-        };
-        // This recorder runs before the pending continue jump is emitted. A terminal
-        // join has no stable suffix yet and may acquire a fresh backward marker.
-        if matches!(suffix.opcode, NOP | NOT_TAKEN)
-            || is_conditional_jump(suffix.opcode)
-            || is_unconditional_jump(suffix.opcode)
-            || ends_scope(suffix.opcode)
+        let origin = self
+            .exception_owner_provenance
+            .copied_handler_cleanups
+            .len();
+        self.record_copied_handler_cleanup_inner(
+            start,
+            end,
+            jump_item,
+            named_handlers,
+            None,
+            false,
+        );
+        if let Some(cleanup) = self
+            .exception_owner_provenance
+            .copied_handler_cleanups
+            .get_mut(origin)
         {
-            return;
+            cleanup.missing_null_pops += extra_try_pops;
         }
-        self.record_copied_break_handler_cleanup(continue_item);
     }
 
     /// Captures a direct named-handler continue and its first copied call or attribute None test.
@@ -16556,6 +17908,17 @@ impl Assembler {
             .insert(label);
     }
 
+    /// Retains the original instruction-array boundary following a finally suite.
+    pub(crate) fn record_finally_continuation(&mut self, join: Label) {
+        self.record_exception_owner_block_boundary(join);
+        self.record_borrow_analysis_block_boundary(join);
+        if self.python_version == crate::PythonVersion::Py314 {
+            self.exception_owner_provenance
+                .original_finally_joins
+                .insert(join);
+        }
+    }
+
     /// Retains a source CFG boundary after its conditional jump is folded away.
     pub(crate) fn record_exception_owner_block_boundary(&mut self, label: Label) {
         self.exception_owner_provenance
@@ -16657,6 +18020,25 @@ impl Assembler {
         }
     }
 
+    /// Registers both original Python 3.12 SETUP edges in an async iteration header.
+    pub(crate) fn record_legacy_async_iteration(
+        &mut self,
+        (entry, exhaustion): (Label, Label),
+        (yielded, yielded_end): (Label, Label),
+        cleanup_throw: Label,
+        (send, send_end): (Label, Label),
+    ) {
+        self.record_legacy_native_setup_target(entry, exhaustion);
+        self.record_legacy_native_setup_target(yielded, cleanup_throw);
+        self.record_legacy_protocol_await_setup(
+            yielded,
+            yielded_end,
+            cleanup_throw,
+            send,
+            send_end,
+        );
+    }
+
     /// Records protocol-await labels without treating the await as ordinary source work.
     pub(crate) fn record_legacy_protocol_await_setup(
         &mut self,
@@ -16693,6 +18075,13 @@ impl Assembler {
                     exit,
                 });
         }
+    }
+
+    /// Retains the exception target of a try/finally whose protected body begins with a guard.
+    pub(crate) fn record_guarded_finally_setup(&mut self, setup: Label, handler: Label) {
+        self.exception_owner_provenance
+            .guarded_finally_setups
+            .insert(setup, handler);
     }
 
     /// Retains the authored handler identity of an ordinary try's original SETUP.
@@ -17085,6 +18474,25 @@ impl Assembler {
             }
         }
 
+        // A deferred constant in a handler type refers to the same source instruction
+        // as its patch. Preserve that identity only while the entire record matches.
+        if let Some(provenance) = self.exception_owner_provenance.as_mut_if_present() {
+            for origin in &mut provenance.handler_dispatch_arrays {
+                for item in &mut origin.items {
+                    if let Item::Instruction(instruction) = item
+                        && instruction.opcode == LOAD_CONST
+                        && let Operand::Deferred(id) = instruction.operand()
+                        && let Some(patch) = self.operand_patches.get(id.index())
+                        && let Some(argument) = patch.argument
+                        && let Some(Item::Instruction(live)) = items.get(patch.item_index as usize)
+                        && live == instruction
+                    {
+                        instruction.set_operand(Operand::Value(argument));
+                    }
+                }
+            }
+        }
+
         // Each patch belongs to one deferred instruction. Resolved witnesses
         // cannot match a later deferred operand, so the index stays valid.
         let mut original_uniform_fold_indices = None;
@@ -17159,6 +18567,17 @@ impl Assembler {
                 let origin = origins.next().map(|(index, _)| index);
                 origin.filter(|_| origins.next().is_none())
             };
+            // Resolve the same deferred constant in any captured name-cleanup prefix.
+            for origin in &mut self
+                .exception_owner_provenance
+                .saved_named_handler_none_prefixes
+            {
+                for saved in origin.items.iter_mut().filter_map(Item::as_instruction_mut) {
+                    if *saved == *instruction {
+                        saved.set_operand(Operand::Value(argument));
+                    }
+                }
+            }
             instruction.set_operand(Operand::Value(argument));
             if let Some(index) = membership_origin {
                 // The checked operand patch belongs to this one original LOAD_CONST.
@@ -17374,6 +18793,39 @@ impl Assembler {
                 origin.constant.set_operand(Operand::Value(*remapped));
                 true
             });
+        provenance
+            .copied_manager_return_compactions
+            .retain_mut(|origin| {
+                origin
+                    .cleanup
+                    .iter_mut()
+                    .chain(origin.earlier_cleanups.iter_mut().flatten())
+                    .chain(origin.named_handler_cleanup.iter_mut().flatten())
+                    .chain(
+                        origin
+                            .constant_return_prefix
+                            .iter_mut()
+                            .flat_map(|prefix| &mut prefix.instructions),
+                    )
+                    .filter(|record| record.opcode == LOAD_CONST)
+                    .all(|record| {
+                        let Some(index) = record.value_argument() else {
+                            return false;
+                        };
+                        let index = if index == u32::MAX {
+                            deferred_none
+                        } else {
+                            Some(index)
+                        };
+                        let Some(remapped) =
+                            index.and_then(|index| *index_map.get(index as usize)?)
+                        else {
+                            return false;
+                        };
+                        record.set_operand(Operand::Value(remapped));
+                        true
+                    })
+            });
         provenance.copied_return_pop_prefixes.retain_mut(|origin| {
             let load = &mut origin.records[2];
             if load.opcode != LOAD_CONST {
@@ -17388,26 +18840,30 @@ impl Assembler {
             load.set_operand(Operand::Value(*remapped));
             true
         });
+        let remap_items = |items: &mut [Item]| {
+            for item in items {
+                let Item::Instruction(instruction) = item else {
+                    continue;
+                };
+                if instruction.opcode != LOAD_CONST {
+                    continue;
+                }
+                let Some(index) = instruction.value_argument() else {
+                    return false;
+                };
+                let Some(Some(remapped)) = index_map.get(index as usize) else {
+                    return false;
+                };
+                instruction.set_operand(Operand::Value(*remapped));
+            }
+            true
+        };
         provenance
             .saved_named_handler_none_prefixes
-            .retain_mut(|origin| {
-                for item in &mut origin.items {
-                    let Item::Instruction(instruction) = item else {
-                        continue;
-                    };
-                    if instruction.opcode != LOAD_CONST {
-                        continue;
-                    }
-                    let Some(index) = instruction.value_argument() else {
-                        return false;
-                    };
-                    let Some(Some(remapped)) = index_map.get(index as usize) else {
-                        return false;
-                    };
-                    instruction.set_operand(Operand::Value(*remapped));
-                }
-                true
-            });
+            .retain_mut(|origin| remap_items(&mut origin.items));
+        provenance
+            .handler_dispatch_arrays
+            .retain_mut(|origin| remap_items(&mut origin.items));
         provenance
             .original_normal_finally_arrays
             .retain_mut(|origin| {
