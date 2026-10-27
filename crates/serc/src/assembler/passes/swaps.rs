@@ -813,14 +813,8 @@ impl OptimizationPipeline {
                             .normal_try_copy_join_donors
                             .insert(*label, (origin.jump, last_instruction.location));
                     }
-                }
-                if self.python_version >= crate::PythonVersion::Py313
-                    && first_instruction.local_policy.may_store_null()
-                    && last_instruction.opcode == STORE_FAST
-                    && !last_instruction.local_policy.may_store_null()
-                {
-                    // Native resolves unlocated successors before exchanging the target
-                    // store with a comprehension restore. Retain that original origin.
+                    // Native resolves unlocated successors before the stores change order.
+                    // They inherit the original final store, including after a copied finalizer.
                     for position in &positions[last + 1..] {
                         let Some(next) = graph.instruction_mut(*position) else {
                             break;
