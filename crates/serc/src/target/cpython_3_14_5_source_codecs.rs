@@ -8,6 +8,7 @@
 // Lib/encodings/iso8859_15.py: sha256 01976a81811873dc9a0c79db9fc00d1c30103487f3c6bc3a6d81b4043cd48e02
 // Lib/encodings/koi8_r.py: sha256 4d4e353aee8039bb71e2145a6e68fe1e6833a1b4250b70ee0ac5ec70bbb8c51d
 // Lib/encodings/euc_jp.py: sha256 b453a439787b0efa031e43416a7d852a6be705c985e1200693eb96d87ea79cdc
+// Lib/encodings/big5.py: sha256 98fac6f86a20dd05da197e2058176ebfd47edee7074c3248f5f48fe0fb672d7c
 // Objects/codeobject.c: sha256 717ccef5cfdf32c3213eb5dac2f87ee79b9f41adb08c1046178ec8b70b9d87ca
 // Objects/dictobject.c: sha256 812b530bc1ad9fb6e9f6801e6445df466598775a3b9e66c2020408a002f08fbe
 // Objects/descrobject.c: sha256 4ff41f8a4028f5402ee620df7dbaff3a1a5c0cef26ee73f6d70044074dfe362f
@@ -15,6 +16,7 @@
 // Python/codecs.c: sha256 94cc13df09177cf4b50b9d7f289df2a20e70cbe2a7bc5c07b9d48feb7bcf53dd
 // Python/modsupport.c: sha256 facb026540bc4a76e3c47c0b101147d05469ee6616a43a5e92aacf7cd9c1b3ae
 // Modules/cjkcodecs/_codecs_jp.c: sha256 b2f18a31b427c3b2c454c2e903101ec08644541fb2bb33daaea130b26a72a20e
+// Modules/cjkcodecs/_codecs_tw.c: sha256 bd156987b58714a877453fcc67f81cc569e46a2c29a33caebbd6aaa71ad10ede
 // Modules/cjkcodecs/cjkcodecs.h: sha256 cd7e1e3736cfe360cf2b8c34e7d8a1c3c67664418423038a5cabe5bf0c331fe9
 // Modules/cjkcodecs/multibytecodec.c: sha256 7abf840e22fbb3f6ce23671c11d4933412b13d470155e169012dd679cef38160
 // Modules/cjkcodecs/clinic/multibytecodec.c.h: sha256 532eba5dc8601c12a532175999a07d2da4a97b7e3508111b9c8c2c63ae49e2dd
@@ -284,6 +286,52 @@ pub(super) const EUC_JP: &[&str] = &[
     "encode",
     "errors",
     "euc_jp",
+    "getcodec",
+    "getregentry",
+    "getstate",
+    "incrementaldecoder",
+    "incrementalencoder",
+    "mbc",
+    "name",
+    "read",
+    "readline",
+    "readlines",
+    "reset",
+    "setstate",
+    "stream",
+    "streamreader",
+    "streamwriter",
+    "write",
+    "writelines",
+];
+
+pub(super) const BIG5: &[&str] = &[
+    "Codec",
+    "CodecInfo",
+    "IncrementalDecoder",
+    "IncrementalEncoder",
+    "MultibyteIncrementalDecoder",
+    "MultibyteIncrementalEncoder",
+    "MultibyteStreamReader",
+    "MultibyteStreamWriter",
+    "StreamReader",
+    "StreamWriter",
+    "__create_codec",
+    "__firstlineno__",
+    "__map_big5",
+    "__map_cp950ext",
+    "__module__",
+    "__name__",
+    "__qualname__",
+    "__static_attributes__",
+    "_codecs_tw",
+    "_multibytecodec",
+    "big5",
+    "codec",
+    "codecs",
+    "decode",
+    "encode",
+    "errors",
     "getcodec",
     "getregentry",
     "getstate",

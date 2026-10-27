@@ -2462,7 +2462,7 @@ fn compile_accepts_ascii_cookies_and_rejects_non_ascii_source_bytes() {
 fn compile_rejects_unsupported_encoding_cookies() {
     let directory = tempfile::tempdir().unwrap();
 
-    for encoding in ["cp932", "gbk", "big5"] {
+    for encoding in ["cp932", "gbk", "koi8_u"] {
         let source_path = directory.path().join(format!("{encoding}.py"));
         fs_err::write(
             &source_path,
