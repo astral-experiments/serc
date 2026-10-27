@@ -19066,3 +19066,23 @@ fn nested_conditional_arms_donate_implicit_return_locations() {
 ";
     assert_matches_cpython(source, "nested_implicit_returns.py", &LEVELS);
 }
+
+#[test]
+fn import_arm_falling_through_an_erased_finalizer_keeps_its_own_line() {
+    for first_arm in ["pass", "return"] {
+        let source = format!(
+            "def use_resource(resource, flag):
+    with resource:
+        try:
+            if flag:
+                {first_arm}
+            else:
+                from sample import item
+                assert item
+        finally:
+            assert flag
+"
+        );
+        assert_matches_cpython(&source, "import_finalizer_join.py", &LEVELS);
+    }
+}
