@@ -18915,7 +18915,7 @@ impl<'source> Compiler<'source> {
                                 .contexts
                                 .last()
                                 .is_some_and(|loop_context| {
-                                    copied_finally_has_closed_none_continue(
+                                    copied_finally_has_closed_guard_continue(
                                         context.body,
                                         self.unit.flags,
                                         loop_context.iterator_cleanup,
@@ -48816,12 +48816,12 @@ fn copied_finally_has_guarded_linear_cleanup(body: &[Stmt], captured_none_prefix
                 && matches!(leading, [Stmt::If(first)] if guarded_cleanup(first))))
 }
 
-/// Certifies a copied None-test conjunction whose false exits need no nested cleanup.
+/// Certifies a copied guard whose false exits need no nested cleanup.
 ///
 /// A completed ordinary recovery prefix cannot intercept those exits. A guarded
 /// recovery starts only on the true edge. Keep both on the existing loop-tail
 /// emitter so operand loads retain their owner while condition/backedge cells do not.
-fn copied_finally_has_closed_none_continue(
+fn copied_finally_has_closed_guard_continue(
     body: &[Stmt],
     flags: u32,
     iterator_cleanup: IteratorCleanup,
@@ -48856,6 +48856,23 @@ fn copied_finally_has_closed_none_continue(
     let Some((Stmt::If(tail), leading)) = body.split_last() else {
         return false;
     };
+    // Both exits from the earlier guarded recovery rejoin before the final
+    // condition. Its false edge can go directly to the copied continue.
+    if matches!(
+        flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR),
+        0 | CO_COROUTINE
+    ) && matches!(
+        iterator_cleanup,
+        IteratorCleanup::None | IteratorCleanup::Sync
+    ) && matches!(leading, [Stmt::If(prefix)] if prefix.body.iter().any(|stmt| matches!(stmt, Stmt::Try(_))))
+        && closed_prefix(leading)
+        && tail.elif_else_clauses.is_empty()
+        && condition_has_linear_runtime_leaves(&tail.test)
+        && !expression_suspends_current_scope(&tail.test)
+        && suite_has_linear_borrow_fallthrough(&tail.body)
+    {
+        return true;
+    }
     let Expr::BoolOp(condition) = tail.test.as_ref() else {
         return false;
     };

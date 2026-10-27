@@ -6808,6 +6808,26 @@ fn continue_copies_inner_cleanup_inside_an_enclosing_finalizer() {
 }
 
 #[test]
+fn guard_after_finalizer_recovery_copies_continue_edge() {
+    let source = r"def sample(items, ready, enabled, active, value):
+    for value in items:
+        try:
+            if ready:
+                if enabled:
+                    continue
+        finally:
+            if active:
+                try:
+                    run()
+                except ValueError as error:
+                    record(error)
+            if value == 4:
+                act(value)
+";
+    assert_matches_cpython(source, "guard_after_recovery.py", &LEVELS);
+}
+
+#[test]
 fn negated_finally_guard_preserves_copied_continue_owner() {
     let source = r"async def sample(state, cleanup, recover):
     while True:
