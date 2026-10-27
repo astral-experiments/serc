@@ -9761,6 +9761,23 @@ fn boolean_returns_preserve_enclosing_named_handler_owners() {
 }
 
 #[test]
+fn nested_handler_value_returns_protect_the_resumed_handler_swap() {
+    let source = r"def read(key):
+    try:
+        return first(key)
+    except LookupError:
+        try:
+            return second(key)
+        except KeyError as middle:
+            try:
+                return third(middle)
+            except ValueError as last:
+                return recover(last)
+";
+    assert_matches_cpython(source, "nested_handler_value_swap.py", &LEVELS);
+}
+
+#[test]
 fn three_handler_returns_preserve_each_outer_cleanup_owner() {
     let source = r"def sample(value):
     try:

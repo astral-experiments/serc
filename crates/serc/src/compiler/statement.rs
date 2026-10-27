@@ -10435,7 +10435,20 @@ impl<'source> Compiler<'source> {
                             self.assembler.mark_last_as_converted_pop_block();
                         }
                         if preserve_tos {
+                            // After a directly nested handler has restored the exception state,
+                            // this handler's own cleanup protects the value-preserving SWAP.
+                            let handlers = &self.control.exceptions.active_exception_handlers;
+                            let resumed_handler =
+                                handlers.get(handler_index + 1).is_some_and(|inner| {
+                                    inner.exception_region_depth == region_depth + 1
+                                        && inner.try_body_depth == try_body_depth
+                                        && inner.with_depth == with_depth
+                                        && inner.loop_depth == loop_depth
+                                        && inner.finally_end_depth
+                                            == handlers[handler_index].finally_end_depth
+                                });
                             let common_cleanup_start = (name.is_some()
+                                || resumed_handler
                                 || ((handler_count == 1
                                     || unwinds_plain_nested_handlers
                                     || (unwinds_named_outer_unnamed_handlers
