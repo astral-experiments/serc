@@ -2922,8 +2922,10 @@ impl<'source> Compiler<'source> {
                     || optimized_sync_with_pass_tail
                     || (self.context.python_version >= crate::PythonVersion::Py314
                         && split_finally_pass_prefix)
+                    // At an empty join, the Pass is the first instruction of a
+                    // protected block and has no preceding line to repeat.
                     || (self.control.statements.retained_branch_pass == Some(statement.range)
-                        && self.assembler.current_block_last_instruction_location().is_some_and(
+                        && self.assembler.current_block_last_instruction_location().is_none_or(
                             |previous| previous.line >= 0
                                 && previous.line != self.source_location(statement.range).line,
                         ))
