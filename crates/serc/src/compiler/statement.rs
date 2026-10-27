@@ -36543,7 +36543,7 @@ impl<'source> Compiler<'source> {
                     _ => false,
                 });
         // Runtime loop cleanup shares these enclosing-scope constraints.
-        let loop_break_context = matches!(self.unit.scope, Scope::Function { .. })
+        let loop_cleanup_context = matches!(self.unit.scope, Scope::Function { .. })
             && self.control.loops.contexts.is_empty()
             && self.control.withs.active_with_exits.is_empty()
             && self
@@ -36558,8 +36558,9 @@ impl<'source> Compiler<'source> {
                 handler
                     .as_except_handler()
                     .is_some_and(|handler| handler.type_.is_some())
-            })
-            && !suite_contains_abrupt_control_flow(&statement.finalbody);
+            });
+        let loop_break_context =
+            loop_cleanup_context && !suite_contains_abrupt_control_flow(&statement.finalbody);
         let runtime_coroutine_break_context = loop_break_context
             && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE;
         // Runtime exhaustion reaches cleanup independently of the yielding handler.
@@ -36651,7 +36652,10 @@ impl<'source> Compiler<'source> {
         let runtime_while_false_edge_reaches_finally = self.context.python_version
             == crate::PythonVersion::Py314
             && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
-            && loop_break_context
+            && loop_cleanup_context
+            // There is no enclosing loop here. A break or continue in a cleanup-local
+            // loop does not exit the finalizer or change its entry from the while test.
+            && !suite_any_statement(&statement.finalbody, |part| matches!(part, Stmt::Return(_) | Stmt::Raise(_)))
             && conditional_break_cleanup_entry
             && statement.handlers.iter().all(|handler| {
                 handler.as_except_handler().is_some_and(|handler| {
