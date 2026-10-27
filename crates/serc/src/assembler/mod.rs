@@ -4594,9 +4594,9 @@ impl Assembler {
         })
     }
 
-    /// Whether multiple emitted branches enter a label before jump threading.
-    pub(crate) fn has_multiple_jump_sources(&self, label: Label) -> bool {
-        self.linear_items()
+    /// Whether multiple branches in an emitted expression enter the same label.
+    pub(crate) fn has_multiple_jump_sources(&self, label: Label, start: usize) -> bool {
+        self.linear_items()[start..]
             .iter()
             .filter(|item| {
                 matches!(item, Item::Instruction(instruction)

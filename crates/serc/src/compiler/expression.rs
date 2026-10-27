@@ -6582,9 +6582,12 @@ impl Compiler<'_> {
         self.assembler.preserve_block_boundary(body_accepted);
         self.assembler.preserve_block_boundary(accepted);
         self.compile_jump_if(&conditional.test, false, otherwise)?;
+        let body_start = self.assembler.item_count();
         compile_arm(self, &conditional.body, body_accepted)?;
         self.assembler.mark(body_accepted);
-        let shared_body_exit = self.assembler.has_multiple_jump_sources(body_accepted);
+        let shared_body_exit = self
+            .assembler
+            .has_multiple_jump_sources(body_accepted, body_start);
         let exit_location = if shared_body_exit {
             SourceLocation::NONE
         } else {

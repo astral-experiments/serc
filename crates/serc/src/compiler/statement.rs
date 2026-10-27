@@ -34485,12 +34485,14 @@ impl<'source> Compiler<'source> {
         let branch_count = branches.len();
         let mut exclusions = Vec::new();
         let mut last_test: &Expr = statement.test.as_ref();
+        let mut shared_false_exit = false;
 
         for (branch_index, (test, body)) in branches.into_iter().enumerate() {
             let branch_suspension_epoch = self.control.generators.coroutine_suspension_epoch;
             let next = if let Some(test) = test {
                 last_test = test;
                 let next = self.assembler.label();
+                let condition_start = self.assembler.item_count();
                 if branch_index > 0 && branch_index + 1 == branch_count && !has_else {
                     let ((), branch_exclusions) = self.with_region_exclusion_collector(
                         |control| &mut control.withs.active_with_region_exclusions,
@@ -34505,6 +34507,16 @@ impl<'source> Compiler<'source> {
                     exclusions.extend(branch_exclusions);
                 } else {
                     self.compile_jump_if(test, false, next)?;
+                }
+                if branch_index + 1 == branch_count {
+                    shared_false_exit =
+                        if self.context.python_version >= crate::PythonVersion::Py313 {
+                            self.assembler
+                                .has_multiple_jump_sources(next, condition_start)
+                        } else {
+                            condition_has_linear_runtime_leaves(test)
+                                && condition_jump_target_count(test, false) > 1
+                        };
                 }
                 Some(next)
             } else {
@@ -34642,9 +34654,7 @@ impl<'source> Compiler<'source> {
         if !has_else {
             // CPython duplicates this unlocated exit once per original false edge before
             // propagating line numbers. A sole false edge retains its operand's location.
-            let location = if condition_has_linear_runtime_leaves(last_test)
-                && condition_jump_target_count(last_test, false) > 1
-            {
+            let location = if shared_false_exit {
                 self.assembler.record_unlocated_cleanup_targets();
                 SourceLocation::NONE
             } else {
