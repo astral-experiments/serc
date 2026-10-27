@@ -5488,7 +5488,9 @@ impl<'source> Compiler<'source> {
                                                     },
                                                     retained_chained_comparison_exit,
                                                     |compiler| {
-                                                        compiler.compile_jump_if(test, false, next)
+                                                        compiler.compile_statement_if_condition(
+                                                            test, next,
+                                                        )
                                                     },
                                                 )
                                             },
@@ -15206,6 +15208,20 @@ impl<'source> Compiler<'source> {
         })
     }
 
+    /// Captures a taken constant that skips the statement's original true arm.
+    fn compile_statement_if_condition(
+        &mut self,
+        test: &Expr,
+        next: Label,
+    ) -> Result<(), CompileError> {
+        let start = self.assembler.item_count();
+        self.compile_jump_if(test, false, next)?;
+        if self.context.python_version == crate::PythonVersion::Py314 {
+            self.assembler.record_taken_if_borrow_jump(start, next);
+        }
+        Ok(())
+    }
+
     fn compile_if(&mut self, statement: &ruff_python_ast::StmtIf) -> Result<(), CompileError> {
         if self.context.python_version == crate::PythonVersion::Py314 {
             // Only names evaluated before any other part of the authored test.
@@ -16487,7 +16503,7 @@ impl<'source> Compiler<'source> {
                                                                 if let Some(conditional) = erased_ternary {
                                                                     compiler.compile_if_expression_jump(conditional, false, next, next, true)
                                                                 } else {
-                                                                    compiler.compile_jump_if(test, false, next)
+                                                                    compiler.compile_statement_if_condition(test, next)
                                                                 }
                                                             },
                                                         )

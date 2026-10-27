@@ -668,6 +668,7 @@ impl OptimizationPipeline {
         let mut discarded_admissions = Vec::new();
         let mut previous_live = None;
         let mut erased_original_block = false;
+        let mut erased_instructions = false;
         for block_index in 0..graph.len() {
             let block = graph.block_at(block_index);
             if reachable[block.index()] {
@@ -686,8 +687,30 @@ impl OptimizationPipeline {
                         .erased_match_tails
                         .push((end, *jump));
                 }
+                if erased_instructions
+                    && let Some(source) = previous_live
+                    && let Some((Item::Instruction(jump), prefix)) =
+                        graph[source].items().split_last()
+                    && self
+                        .exception_owner_provenance
+                        .taken_constant_borrow_jumps
+                        .contains(jump)
+                    && jump
+                        .forward_target()
+                        .and_then(|label| graph.label_block(label))
+                        == Some(block)
+                {
+                    // The folded jump becomes a NOP, but the original skipped
+                    // arm still lies between that NOP and its destination.
+                    let jump = graph
+                        .instruction_mut(ItemPosition::new(source, prefix.len()))
+                        .expect("the folded jump was checked above");
+                    jump.no_location_policy
+                        .set_borrow_fallthrough(BorrowFallthrough::Barrier);
+                }
                 previous_live = Some(block);
                 erased_original_block = false;
+                erased_instructions = false;
                 if !discarded_admissions.is_empty()
                     && let Some(label) = graph[block].first_label()
                 {
@@ -700,6 +723,7 @@ impl OptimizationPipeline {
                 continue;
             }
             let had_instructions = graph[block].last_instruction().is_some();
+            erased_instructions |= had_instructions;
             erased_original_block |= self.python_version >= crate::PythonVersion::Py314
                 && had_instructions
                 && graph[block]
