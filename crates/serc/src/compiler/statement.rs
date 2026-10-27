@@ -33852,6 +33852,18 @@ impl<'source> Compiler<'source> {
                         end,
                         exception_policy,
                     )?;
+                    // A folded true loop can reach this cleanup only through a break.
+                    // Its copied jump keeps the eval check when ordered backward.
+                    if self.context.python_version >= crate::PythonVersion::Py314
+                        && !statement.is_star
+                        && matches!(handler.body.last(), Some(Stmt::While(tail))
+                            if early_condition_truthiness(&tail.test) == Some(true)
+                                && tail.orelse.is_empty()
+                                && suite_contains_loop_break(&tail.body)
+                                && !suite_contains_loop_break_with_finally(&tail.body))
+                    {
+                        self.assembler.mark_jump_as_interruptible(handler_exit);
+                    }
                     if let Some(start) = ordinary_exit_start {
                         // The nested exit drops ordinary try owners, but a manager entered
                         // inside those tries remains active across the handler continuation.

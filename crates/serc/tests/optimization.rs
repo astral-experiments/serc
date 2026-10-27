@@ -35,6 +35,19 @@ fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
 }
 
 #[test]
+fn folded_loop_break_keeps_its_check_after_handler_cleanup() {
+    let source = r"def recover():
+    try:
+        attempt()
+    except ValueError:
+        while True:
+            break
+    finish()
+";
+    assert_matches_cpython(source, "handler_loop_break.py", &LEVELS);
+}
+
+#[test]
 fn nested_finally_guard_inherits_the_preceding_calls_handler() {
     let source = r"def run(group):
     try:
