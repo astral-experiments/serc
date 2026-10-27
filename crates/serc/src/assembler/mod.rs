@@ -17085,6 +17085,25 @@ impl Assembler {
             }
         }
 
+        // A deferred constant in a handler type refers to the same source instruction
+        // as its patch. Preserve that identity only while the entire record matches.
+        if let Some(provenance) = self.exception_owner_provenance.as_mut_if_present() {
+            for origin in &mut provenance.handler_dispatch_arrays {
+                for item in &mut origin.items {
+                    if let Item::Instruction(instruction) = item
+                        && instruction.opcode == LOAD_CONST
+                        && let Operand::Deferred(id) = instruction.operand()
+                        && let Some(patch) = self.operand_patches.get(id.index())
+                        && let Some(argument) = patch.argument
+                        && let Some(Item::Instruction(live)) = items.get(patch.item_index as usize)
+                        && live == instruction
+                    {
+                        instruction.set_operand(Operand::Value(argument));
+                    }
+                }
+            }
+        }
+
         // Each patch belongs to one deferred instruction. Resolved witnesses
         // cannot match a later deferred operand, so the index stays valid.
         let mut original_uniform_fold_indices = None;
@@ -17388,26 +17407,30 @@ impl Assembler {
             load.set_operand(Operand::Value(*remapped));
             true
         });
+        let remap_items = |items: &mut [Item]| {
+            for item in items {
+                let Item::Instruction(instruction) = item else {
+                    continue;
+                };
+                if instruction.opcode != LOAD_CONST {
+                    continue;
+                }
+                let Some(index) = instruction.value_argument() else {
+                    return false;
+                };
+                let Some(Some(remapped)) = index_map.get(index as usize) else {
+                    return false;
+                };
+                instruction.set_operand(Operand::Value(*remapped));
+            }
+            true
+        };
         provenance
             .saved_named_handler_none_prefixes
-            .retain_mut(|origin| {
-                for item in &mut origin.items {
-                    let Item::Instruction(instruction) = item else {
-                        continue;
-                    };
-                    if instruction.opcode != LOAD_CONST {
-                        continue;
-                    }
-                    let Some(index) = instruction.value_argument() else {
-                        return false;
-                    };
-                    let Some(Some(remapped)) = index_map.get(index as usize) else {
-                        return false;
-                    };
-                    instruction.set_operand(Operand::Value(*remapped));
-                }
-                true
-            });
+            .retain_mut(|origin| remap_items(&mut origin.items));
+        provenance
+            .handler_dispatch_arrays
+            .retain_mut(|origin| remap_items(&mut origin.items));
         provenance
             .original_normal_finally_arrays
             .retain_mut(|origin| {

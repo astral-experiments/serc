@@ -15,6 +15,16 @@ use serc::{
 };
 
 #[test]
+fn handler_dispatch_keeps_resolved_constant_operands() {
+    for fallback in ["()", "None"] {
+        let source = format!(
+            "def sample():\n    try:\n        work()\n        pair = (2, 1)\n    except ValueError:\n        reject()\n    except lookup(kinds, 'kind', {fallback}):\n        accept()\n"
+        );
+        assert_matches_cpython(&source, "handler_dispatch_constants.py", &LEVELS);
+    }
+}
+
+#[test]
 fn nested_conversion_handlers_keep_shared_cleanup() {
     let source = r"def sample(items):
     for item in items:
