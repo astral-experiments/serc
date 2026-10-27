@@ -9152,6 +9152,25 @@ fn repeated_try_predecessor_keeps_the_finalizer_pop_unlocated() {
 }
 
 #[test]
+fn repeated_manager_guard_keeps_normal_exit_unlocated() {
+    let source = r"def run(manager, first, second, ready):
+    with manager:
+        if first:
+            pass
+        elif second:
+            assert second
+        if ready:
+            raise ValueError
+";
+    assert_matches_cpython_versions(
+        source,
+        "manager_guard_exit.py",
+        &LEVELS,
+        &[PythonVersion::Py312],
+    );
+}
+
+#[test]
 fn repeated_finalizer_predecessor_keeps_the_manager_pop_unlocated() {
     let source = r"def run(manager, ready):
     with manager:

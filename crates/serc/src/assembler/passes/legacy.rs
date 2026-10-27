@@ -1987,7 +1987,11 @@ impl OptimizationPipeline {
                     matches!(item, Item::Label(label)
                     if self.exception_owner_provenance.original_manager_pop_blocks.contains(label)
                         || self.exception_regions.iter().any(|region| {
-                            !region.is_scope_fallback && !region.preserve_lasti && region.end == *label
+                            !region.is_scope_fallback && region.end == *label
+                                && (!region.preserve_lasti
+                                    || label_group(region.target)
+                                        .and_then(|handler| group_instructions(handler).nth(1))
+                                        .is_some_and(|instruction| instruction.opcode == crate::target::opcodes::WITH_EXCEPT_START))
                         }))
                 })
             {
