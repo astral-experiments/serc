@@ -2868,8 +2868,7 @@ impl OptimizationPipeline {
                     && block
                         .items()
                         .iter()
-                        .filter_map(Item::as_instruction)
-                        .next()
+                        .find_map(Item::as_instruction)
                         .is_some_and(|op| {
                             op.opcode == NOP && op.fusion_policy.is_converted_pop_block()
                         })
