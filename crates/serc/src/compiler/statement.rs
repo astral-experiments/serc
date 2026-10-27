@@ -48394,6 +48394,15 @@ fn suite_contains_orphan_cold_cleanup(body: &[Stmt], return_copies_terminal_with
             if self.found || matches!(statement, Stmt::TypeAlias(_)) {
                 return;
             }
+            // A raise leaves the manager's normal exit unreachable. When the handler
+            // moves cold, that empty block stays between the try and its continuation.
+            if let Stmt::With(manager) = statement
+                && !manager.is_async
+                && matches!(manager.body.last(), Some(Stmt::Raise(_)))
+            {
+                self.found = true;
+                return;
+            }
             // Copying the enclosing terminal manager leaves the same empty exit
             // as a manager authored directly in this handler.
             if self.return_copies_terminal_with && matches!(statement, Stmt::Return(_)) {
