@@ -2668,6 +2668,19 @@ impl Compiler<'_> {
                 }
                 self.record_folded_value(value)?;
             }
+            if self.context.python_version == PythonVersion::Py314
+                && boolean
+                    .values
+                    .first()
+                    .is_some_and(|first| first.range() != origin.range())
+            {
+                // Folding a nondecisive short-circuit jump leaves the selected operand
+                // in its own block. Pending operands must remain owned across that edge.
+                let selected = self.assembler.label();
+                self.assembler
+                    .record_borrow_analysis_block_boundary(selected);
+                self.assembler.mark(selected);
+            }
             let expression_location = self.source_location(expression.range());
             let origin_location = self.source_location(origin.range());
             let folded_location = double_negated_ellipsis(origin)
