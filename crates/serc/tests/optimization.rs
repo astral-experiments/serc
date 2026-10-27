@@ -5879,6 +5879,16 @@ fn terminal_recovery_scopes_preserve_normal_exits() {
 }
 
 #[test]
+fn raising_handler_manager_keeps_the_normal_exit_owned() {
+    for body in ["raise error", "if value:\n                    raise error"] {
+        let source = format!(
+            "def run(value, ready, manager):\n    try:\n        prepare()\n    except ValueError as error:\n        if ready:\n            with manager:\n                {body}\n    consume(value)\n"
+        );
+        assert_matches_cpython(&source, "manager_exit.py", &LEVELS);
+    }
+}
+
+#[test]
 fn terminal_recovery_body_stops_borrowed_continuation() {
     for prefix in ["", "            resource.prepare()\n"] {
         for terminal in ["return", "return resource", "raise Error(resource)"] {
