@@ -33863,6 +33863,15 @@ impl<'source> Compiler<'source> {
                         end,
                         exception_policy,
                     )?;
+                    if self.context.python_version == crate::PythonVersion::Py314
+                        && handler.name.is_none()
+                    {
+                        self.assembler.record_unnamed_handler_borrow_exit(
+                            body_end,
+                            next_handler,
+                            handler_exit,
+                        );
+                    }
                     if let Some(start) = ordinary_exit_start {
                         // The nested exit drops ordinary try owners, but a manager entered
                         // inside those tries remains active across the handler continuation.

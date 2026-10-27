@@ -2009,6 +2009,17 @@ fn matches_cpython_partial_terminal_match_handler_borrow_entries() {
 }
 
 #[test]
+fn unnamed_handler_cleanup_stops_borrow_fallthrough() {
+    for source in [
+        "def run(value, flag):\n    try:\n        step()\n    except E:\n        match flag:\n            case 1 | 2:\n                raise A()\n            case 3:\n                raise B()\n            case _:\n                raise\n    if enabled():\n        consume(value)\n",
+        "def run(value):\n    try:\n        prepare()\n        try:\n            result = step()\n        except E:\n            return None\n        return result\n    except F as error:\n        raise G() from error\n    finally:\n        obj.attr = value\n        finish(value)\n",
+        "async def run(value, flag):\n    try:\n        await step()\n    except A:\n        if flag:\n            return\n    finally:\n        if value:\n            try:\n                await value.close()\n            except F:\n                raise\n            except G:\n                pass\n",
+    ] {
+        common::assert_matches_cpython_marshal(source, "unnamed_handler_cleanup.py");
+    }
+}
+
+#[test]
 fn named_handler_cleanup_stops_borrow_fallthrough() {
     for source in [
         "def run(value, items):\n    for item in items:\n        try:\n            value = step(item)\n        except ValueError as error:\n            match error.info:\n                case key if key == item:\n                    continue\n                case _:\n                    raise\n        consume(value)\n        return value\n",

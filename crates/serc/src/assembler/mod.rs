@@ -9039,6 +9039,37 @@ impl Assembler {
         }
     }
 
+    /// Captures an unnamed handler's normal exit after a path that cannot fall through.
+    /// CPython still has an unlocated POP_BLOCK before the emitted POP_EXCEPT and jump.
+    pub(crate) fn record_unnamed_handler_borrow_exit(
+        &mut self,
+        entry: Label,
+        next: Label,
+        emitted: EmittedJump,
+    ) {
+        let index = usize::try_from(emitted.instruction().item_index)
+            .expect("emitted instruction index should fit in usize");
+        let items = self.linear_items();
+        let Some((Item::Instruction(pop), prefix)) = items[..index].split_last() else {
+            return;
+        };
+        if pop.opcode == POP_EXCEPT
+            && trailing_labels(prefix).any(|label| label == entry)
+            && prefix
+                .iter()
+                .rev()
+                .find_map(Item::as_instruction)
+                .is_some_and(|op| ends_scope(op.opcode) || is_unconditional_jump(op.opcode))
+            && let Some(target) = items[index]
+                .as_instruction()
+                .and_then(Instruction::forward_target)
+        {
+            self.exception_owner_provenance
+                .unnamed_handler_borrow_exits
+                .push((entry, target, next));
+        }
+    }
+
     /// Records the original two-slot normal exit of an ordinary try without an else suite.
     pub(crate) fn record_normal_try_exit(
         &mut self,
