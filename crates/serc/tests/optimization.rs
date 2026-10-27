@@ -9501,8 +9501,13 @@ fn managed_mixed_erased_iterator_guard_preserves_shared_backedge() {
 }
 
 #[test]
-fn handler_exits_copy_a_local_return_from_the_finalizer() {
-    for body in ["raise error", "value = request()"] {
+fn handler_exits_copy_a_short_return_from_the_finalizer() {
+    for (body, returned) in [
+        ("raise error", "value"),
+        ("value = request()", "value"),
+        ("value = request()", "value.field"),
+        ("value = request()", "value.field.next"),
+    ] {
         let source = format!(
             "def resolve(error, value):
     try:
@@ -9512,7 +9517,7 @@ fn handler_exits_copy_a_local_return_from_the_finalizer() {
     except TypeError:
         value = recover()
     finally:
-        return value
+        return {returned}
 "
         );
         assert_matches_cpython(&source, "handler_finalizer_return.py", &LEVELS);
