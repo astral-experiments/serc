@@ -315,7 +315,7 @@ pub(super) fn remove_none_comparison_boolean_conversions<'a>(
 }
 
 /// Counts the original target instructions before graph normalization splits inline labels.
-fn targets_small_scope_exit(graph: &BlockGraph, target: Label) -> bool {
+pub(super) fn targets_small_scope_exit(graph: &BlockGraph, target: Label) -> bool {
     let Some(target_block) = graph.label_block(target) else {
         return false;
     };
