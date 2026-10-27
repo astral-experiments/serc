@@ -52007,18 +52007,26 @@ pub(super) fn nested_if_exit_location(
     if early_condition_truthiness(&statement.test).is_some() {
         return None;
     }
-    // A final else can end at a while condition's shared false-edge join.
-    // Preserve that empty continuation just as for a nested partial if.
-    if allow_recursive_fallthrough
-        && let Some(clause) = statement.elif_else_clauses.last()
+    // A final else can end at the while condition's original false edge.
+    // Breaks jump past that exit. Multiple false edges leave it unlocated.
+    if let Some(clause) = statement.elif_else_clauses.last()
         && clause.test.is_none()
-        && matches!(clause.body.last(), Some(Stmt::While(tail))
-            if tail.orelse.is_empty()
-                && condition_has_only_runtime_tests(&tail.test)
-                && !matches!(tail.test.as_ref(), Expr::Compare(_))
-                && condition_jump_target_count(&tail.test, false) > 1)
+        && let Some(Stmt::While(tail)) = clause.body.last()
+        && tail.orelse.is_empty()
+        && condition_has_only_runtime_tests(&tail.test)
     {
-        return Some(NestedIfExitLocation::Unlocated);
+        if allow_recursive_fallthrough
+            && !matches!(tail.test.as_ref(), Expr::Compare(_))
+            && condition_jump_target_count(&tail.test, false) > 1
+        {
+            return Some(NestedIfExitLocation::Unlocated);
+        }
+        if suite_contains_loop_break(&tail.body)
+            && !suite_contains_loop_break_with_finally(&tail.body)
+            && original_condition_has_unique_jump_target(&tail.test, false)
+        {
+            return Some(NestedIfExitLocation::Located(&tail.test));
+        }
     }
     // A terminating inner if leaves its false edge as the final else arm's live
     // fallthrough. Its test owns a surviving jump and any cleanup copied onto it.
