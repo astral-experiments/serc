@@ -7939,7 +7939,7 @@ impl Assembler {
         let Some((_, method)) = records.next() else {
             return;
         };
-        if method.opcode != LOAD_ATTR || !method.value_argument().is_some_and(|arg| arg & 1 == 1) {
+        if method.opcode != LOAD_ATTR || method.value_argument().is_none_or(|arg| arg & 1 == 0) {
             return;
         }
         let Some((_, mut load)) = records.next_if(|(_, part)| part.opcode == LOAD_FAST) else {
