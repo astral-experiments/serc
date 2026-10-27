@@ -11703,7 +11703,7 @@ impl Assembler {
         instruction.jump_policy.preserve_explicit_nop();
     }
 
-    /// Excludes a copied finalizer's truth marker when it reuses an unowned POP_BLOCK.
+    /// Excludes a copied finalizer's truth marker when it reuses an unowned `POP_BLOCK`.
     pub(crate) fn exclude_nested_awaited_finally_marker(
         &mut self,
         entry: usize,
