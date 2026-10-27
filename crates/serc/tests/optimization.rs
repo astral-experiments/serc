@@ -19066,3 +19066,29 @@ fn nested_conditional_arms_donate_implicit_return_locations() {
 ";
     assert_matches_cpython(source, "nested_implicit_returns.py", &LEVELS);
 }
+
+#[test]
+fn fused_list_preserves_the_finally_none_guard_handler() {
+    let source = r"async def check(manager, inner, scope, bar, one, two, third, good):
+    try:
+        with manager:
+            with inner:
+                try:
+                    async with scope:
+                        await get()
+                    assert good
+                    bar.check(k=one, m=config.kind, values=set())
+                finally:
+                    bar.ping()
+                    items = [one, two]
+                    if third is not None:
+                        items.append(third)
+                    for obj in items:
+                        touch(obj)
+                    async with scope:
+                        await get()
+    finally:
+        pass
+";
+    assert_matches_cpython(source, "finalizer_list_guard.py", &LEVELS);
+}

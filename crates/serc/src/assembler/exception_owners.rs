@@ -10308,6 +10308,51 @@ impl LayoutAssembler {
                             ExceptionOwnerDecision::override_with_region(None),
                         );
                     }
+                    // Fusing the two list inputs shifts the following jump left by
+                    // one cell. Its original slot becomes the None guard's marker.
+                    if instruction.opcode == NOT_TAKEN
+                        && owner_history_exact
+                        && tail.insertions == 0
+                        && tail.late_removals == 0
+                        && tail.post_compaction_fusions == 1
+                        && let Some(fusion) = instruction_index.checked_sub(5)
+                        && fusion >= original_array_start
+                        && let [pair, list, store, load, guard] =
+                            &indexed_instructions[fusion..instruction_index]
+                        && matches!(
+                            pair.opcode,
+                            LOAD_FAST_LOAD_FAST | LOAD_FAST_BORROW_LOAD_FAST_BORROW
+                        )
+                        && list.opcode == crate::target::opcodes::BUILD_LIST
+                        && list.value_argument() == Some(2)
+                        && store.opcode == crate::target::opcodes::STORE_FAST
+                        && matches!(
+                            load.opcode,
+                            crate::target::opcodes::LOAD_FAST
+                                | crate::target::opcodes::LOAD_FAST_BORROW
+                                | crate::target::opcodes::LOAD_FAST_CHECK
+                        )
+                        && matches!(guard.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+                        && guard.forward_target().is_some()
+                        && guard.local_policy.hidden_exception_owner_slots() == 3
+                        && !jump_targets.iter().any(|label| {
+                            label_positions.get(label).is_some_and(|position| {
+                                fusion < *position && *position <= instruction_index
+                            })
+                        })
+                        && let Some(region) = self.uniform_exception_owner(
+                            fusion,
+                            instruction_index,
+                            &label_positions,
+                        )
+                        && self.exception_regions[region].preserve_lasti
+                        && !self.exception_regions[region].is_scope_fallback
+                    {
+                        owners.insert(
+                            instruction_index,
+                            ExceptionOwnerDecision::override_with_region(Some(region)),
+                        );
+                    }
                     if instruction.opcode == NOT_TAKEN {
                         if instruction.exception_policy().exclusion()
                             == super::ExceptionExclusion::None
