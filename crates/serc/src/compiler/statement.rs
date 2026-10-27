@@ -39856,6 +39856,21 @@ impl<'source> Compiler<'source> {
             Ok(())
             }),
         )?;
+        if self.context.python_version >= crate::PythonVersion::Py314
+            && !statement.is_star
+            && !statement.handlers.is_empty()
+            && statement.orelse.is_empty()
+            && matches!(statement.finalbody.as_slice(), [Stmt::Return(_)])
+            && suite_has_nonsuspending_linear_fallthrough(&statement.body)
+            && statement.handlers.iter().all(|handler| {
+                handler
+                    .as_except_handler()
+                    .is_some_and(|handler| suite_terminates_before_constant_folding(&handler.body))
+            })
+        {
+            self.assembler
+                .preserve_copied_finally_return_pop(normal_finally_pop_block);
+        }
         if let Some(normal_exit) = name_return_borrow_exit {
             self.assembler
                 .mark_noncopyable_finally_borrow_barrier(normal_exit, normal_finally_pop_block);

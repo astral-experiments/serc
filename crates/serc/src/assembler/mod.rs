@@ -12487,6 +12487,20 @@ impl Assembler {
         }
     }
 
+    /// Keeps the normal POP_BLOCK unlocated when its return fits in the copied exit.
+    pub(crate) fn preserve_copied_finally_return_pop(&mut self, ordinal: usize) {
+        if self.is_small_linear_scope_exit_since(ordinal)
+            && let Some(pop) = self.instruction_at_mut(ordinal)
+            && pop.opcode == NOP
+            && pop.fusion_policy.is_converted_pop_block()
+            && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
+        {
+            // The normal jump and its copied POP_BLOCK inherit the preceding line
+            // in the same block. NOP compaction removes both before the return.
+            pop.no_location_policy.preserve_location();
+        }
+    }
+
     /// Records a local or attribute test following a normal finalizer's `POP_BLOCK`.
     pub(crate) fn record_normal_finally_none_prefix(&mut self, ordinal: usize) {
         let mut instructions = self
