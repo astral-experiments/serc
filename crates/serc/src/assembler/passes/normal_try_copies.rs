@@ -3062,7 +3062,7 @@ impl OptimizationPipeline {
                         .is_some_and(|edge| edge.opcode == JUMP_FORWARD && target(edge) == Some(to))
                 })
         };
-        let mut shared = FxHashSet::default();
+        let mut shared = Vec::new();
         let mut cold_joins = FxHashSet::default();
         let mut early_copies = Vec::new();
         for &(normal_label, join_label) in exits {
@@ -3088,7 +3088,7 @@ impl OptimizationPipeline {
                                 .is_some_and(|op| op.location == exit.location)
                     })
                 {
-                    shared.insert(next);
+                    shared.push(next);
                 }
                 continue;
             }
@@ -3125,7 +3125,7 @@ impl OptimizationPipeline {
             // The original POP_BLOCK/JUMP or an unlocated handler cleanup was copied
             // before this four-slot return. Its old jump remains beside the guard.
             if guard && (copied_normal || copied_cleanup) {
-                shared.insert(join);
+                shared.push(join);
                 if !copied_normal
                     && !exits
                         .iter()
