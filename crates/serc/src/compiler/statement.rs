@@ -11131,22 +11131,36 @@ impl<'source> Compiler<'source> {
                     // This manager was entered inside every ordinary try still active
                     // at the return. Its completed await cleanup comes first; those
                     // surrounding tries then contribute their own original NULL POPs.
-                    let copied_return_unwinds_inner_async_manager = self.unit.flags
-                        & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                        == CO_COROUTINE
+                    let bare_async_generator = self.context.python_version
+                        == crate::PythonVersion::Py314
+                        && self.unit.flags & CO_ASYNC_GENERATOR != 0
+                        && statement.value.is_none();
+                    let managers = &self.control.withs.active_with_exits;
+                    let copied_return_unwinds_inner_async_manager = (bare_async_generator
+                        || self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                            == CO_COROUTINE)
                         && !return_is_overridden
                         && context_index == 0
                         && finally_context.with_depth == 0
                         && next_with == 0
                         && self.control.loops.contexts.is_empty()
                         && self.control.finally.active_copied_finally_bodies == 0
-                        && matches!(with_unwind_starts.as_slice(), [unwind] if unwind.index == 0)
-                        && matches!(self.control.withs.active_with_exits.as_slice(), [manager]
-                                if manager.is_async
-                                    && manager.exception_region_depth
-                                        == self.control.exceptions.active_exception_region_exclusions.len()
-                                    && manager.loop_depth == 0
-                                    && manager.normal_finally_depth == 0);
+                        && (managers.len() == 1 || (bare_async_generator && managers.len() == 2))
+                        && with_unwind_starts
+                            .iter()
+                            .map(|unwind| unwind.index)
+                            .eq((0..managers.len()).rev())
+                        && managers.iter().all(|manager| {
+                            manager.is_async
+                                && manager.exception_region_depth
+                                    == self
+                                        .control
+                                        .exceptions
+                                        .active_exception_region_exclusions
+                                        .len()
+                                && manager.loop_depth == 0
+                                && manager.normal_finally_depth == 0
+                        });
                     // A while-only exit carries no iterator cleanup between the
                     // ordinary try POP and the finalizer POP. A value return carries
                     // its result across the same POP pair without iterator cleanup.
@@ -11335,7 +11349,12 @@ impl<'source> Compiler<'source> {
                             || copied_return_unwinds_inner_async_manager)
                         && (self.control.loops.contexts.is_empty()
                             || (copied_return_keeps_outer_loop && ordinary_try_count == 1)
-                            || (copied_return_unwinds_while_only && ordinary_try_count == 1)
+                            || (copied_return_unwinds_while_only
+                                && (ordinary_try_count == 1
+                                    || (ordinary_try_count == 2
+                                        && self.context.python_version
+                                            == crate::PythonVersion::Py314
+                                        && statement.value.is_none())))
                             || (copied_return_unwinds_value_while_tries
                                 && (1..=2).contains(&ordinary_try_count))
                             || (copied_return_unwinds_inner_async_iterator
