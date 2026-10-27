@@ -15037,6 +15037,42 @@ fn erased_loop_branch_before_condition_keeps_protected_join() {
 }
 
 #[test]
+fn erased_handler_guards_keep_their_shared_cleanup_unlocated() {
+    let sources = [
+        r"def inspect(items, flag):
+    for item in items:
+        try:
+            try:
+                use(item)
+            except ValueError:
+                if flag:
+                    assert item
+                if check(item) is False:
+                    return False
+        except RuntimeError:
+            raise
+    return True
+",
+        r"def recover(flag, value):
+    with manage():
+        try:
+            use(value)
+        except ValueError as error:
+            if flag:
+                if check(value):
+                    assert value
+                value = retry()
+            else:
+                raise RuntimeError() from error
+        finish(value)
+",
+    ];
+    for source in sources {
+        assert_matches_cpython(source, "erased_handler_exit.py", &LEVELS);
+    }
+}
+
+#[test]
 fn erased_try_else_keeps_the_fallthrough_line_after_branch_exit_copies() {
     for source in [
         r"def sample(flag, value):
