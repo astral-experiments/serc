@@ -1239,6 +1239,7 @@ pub(super) struct CopiedCleanupReturnNonePrefix {
     pub(super) cleanup: Vec<Instruction>,
     pub(super) manager: bool,
     pub(super) handler: bool,
+    pub(super) manager_iterators: usize,
     // A try unwinds before or after the iterator, according to their nesting.
     pub(super) iterator_try_pop_slot: Option<usize>,
     pub(super) pop: Instruction,
@@ -6198,7 +6199,8 @@ impl LayoutAssembler {
         let origin = matching.next()?;
         if matching.next().is_some()
             || positions.get(&origin.entry) != Some(&array)
-            || !provenance.source_boundaries.contains(&origin.entry)
+            || !(provenance.source_boundaries.contains(&origin.entry)
+                || (origin.manager_iterators > 0 && jump_targets.contains(&origin.entry)))
             || !provenance.block_boundaries.contains(&origin.entry)
             || provenance
                 .retired_normal_try_copy_labels
@@ -6226,7 +6228,7 @@ impl LayoutAssembler {
             return None;
         }
         let removed = if origin.manager {
-            0
+            usize::from(origin.manager_iterators > 0)
         } else {
             1 + usize::from(origin.handler)
         };
@@ -6290,7 +6292,12 @@ impl LayoutAssembler {
         // Pinned codegen unwinds one manager POP before its exit call. A named
         // handler contributes two POPs before POP_EXCEPT/name clearing; an ordinary
         // try contributes one POP before the finalizer. None of those cells is owned.
-        let source = match (origin.manager, origin.handler, slot) {
+        // Iterator POPs precede the manager POP and exit call in the original array.
+        let source = match (
+            origin.manager,
+            origin.handler,
+            slot.checked_sub(origin.manager_iterators)?,
+        ) {
             (false, false, 3) if origin.iterator_try_pop_slot.is_some() => None,
             (false, false, 1 | 2) if origin.iterator_try_pop_slot == Some(slot) => None,
             (false, false, 1 | 2) if origin.iterator_try_pop_slot.is_some() => Some(start),
@@ -6298,12 +6305,12 @@ impl LayoutAssembler {
             (false, false, 2) | (false, true, 1 | 4) => None,
             (false, true, 2..=3) => Some(start + slot - 2),
             (true, false, 1 | 7 | 8) | (true, true, 1 | 7 | 8 | 13) => None,
-            (true, _, 2..=6) => Some(start + slot - 1),
+            (true, _, 2..=6) => Some(start + slot - 1 - removed),
             (true, true, 9..=12) => Some(start + slot - 3),
             _ => return None,
         };
         let protected_start = if origin.manager {
-            start + if origin.handler { 6 } else { 1 }
+            start + origin.manager_iterators + if origin.handler { 6 } else { 1 } - removed
         } else {
             start
         };
