@@ -11544,12 +11544,10 @@ impl<'source> Compiler<'source> {
                     // sole false edge enters this outer POP_BLOCK before any cleanup call
                     // supplies a different line. Require the original records, not just
                     // the physical adjacency of an arbitrary conditional and finalizer.
-                    let copied_guard_exit_location = if preserve_tos
-                        && !return_is_overridden
+                    let copied_guard_exit_location = if !return_is_overridden
                         && handler_count == 0
                         && self.control.exceptions.active_exception_group_handlers == 0
                         && self.control.withs.active_with_exits.is_empty()
-                        && self.control.loops.contexts.is_empty()
                         && self.control.finally.active_copied_finally_bodies == 0
                         && self.control.finally.active_normal_finally_bodies == 0
                         && self.control.finally.active_finally_end_blocks == 0
@@ -11565,13 +11563,34 @@ impl<'source> Compiler<'source> {
                                     return None;
                                 };
                                 let location = self.source_location(guard.test.range());
-                                (inner.loop_depth == finally_context.loop_depth
+                                // Whiles contribute no iterator pop between the guard and
+                                // the outer POP_BLOCK. On 3.12 a bare return takes the
+                                // guard's line after crossing such a loop or an ordinary try.
+                                let loops = self
+                                    .control
+                                    .loops
+                                    .contexts
+                                    .get(finally_context.loop_depth..inner.loop_depth)?;
+                                let crossed_try = inner.exception_region_depth
+                                    == finally_context.exception_region_depth + 2;
+                                let preserve_guard = preserve_tos
+                                    || self.context.python_version >= crate::PythonVersion::Py314
+                                    || (self.context.python_version == crate::PythonVersion::Py312
+                                        && (!loops.is_empty() || crossed_try));
+                                (preserve_guard
+                                    && loops.iter().all(|context| {
+                                        context.iterator_cleanup == IteratorCleanup::None
+                                    })
                                     && inner.with_depth == finally_context.with_depth
                                     && inner.handler_depth == finally_context.handler_depth
-                                    && inner.exception_region_depth
+                                    && (inner.exception_region_depth
                                         == finally_context.exception_region_depth + 1
+                                        || crossed_try)
                                     && guard.elif_else_clauses.is_empty()
-                                    && matches!(guard.test.as_ref(), Expr::Name(_))
+                                    && matches!(
+                                        guard.test.as_ref(),
+                                        Expr::Name(_) | Expr::Attribute(_)
+                                    )
                                     && raise.exc.is_some()
                                     && raise.cause.is_none()
                                     && self.assembler.original_raising_guard_has_false_donor(

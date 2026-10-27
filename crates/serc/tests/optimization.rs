@@ -9880,6 +9880,24 @@ COMPANION    finally:
 }
 
 #[test]
+fn a_raising_finalizer_guard_locates_the_next_cleanup_on_return() {
+    let source = r"def run(state, items):
+    try:
+        while state.active:
+            try:
+                if state.done:
+                    return
+            finally:
+                if state.failed:
+                    raise ValueError()
+    finally:
+        for item in items:
+            release(item)
+";
+    assert_matches_cpython(source, "guarded_finalizer.py", &LEVELS);
+}
+
+#[test]
 fn raising_finalizer_guard_shares_the_following_cleanup_line() {
     for kind in ["def", "async def"] {
         for condition in ["error", "error is not None"] {
