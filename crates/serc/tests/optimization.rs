@@ -15592,6 +15592,28 @@ fn nested_named_cleanups_share_the_fallthrough_line() {
 }
 
 #[test]
+fn assertion_edges_locate_normal_exception_cleanup() {
+    let source = r"def check(value, retry):
+    try:
+        use(value)
+    except LookupError as error:
+        if retry:
+            raise error
+        else:
+            assert not value
+
+def reject(value):
+    try:
+        use(value)
+    except ValueError as error:
+        if value:
+            assert False, error
+    finish()
+";
+    assert_matches_cpython(source, "handler_assertion_edges.py", &LEVELS);
+}
+
+#[test]
 fn elided_handler_assertion_preserves_shared_false_cleanup() {
     for (condition, suffix) in [
         ("config.recover and not stopped", "assert False"),

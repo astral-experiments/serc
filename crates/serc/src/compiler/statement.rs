@@ -32940,11 +32940,29 @@ impl<'source> Compiler<'source> {
             } else {
                 handler.body.last()
             };
-            let handler_cleanup_fallthrough = handler_cleanup_tail.and_then(|tail| match tail {
-                Stmt::If(tail) => {
-                    handler_cleanup_fallthrough_test(tail).or(guarded_raise_finally_test)
-                }
-                _ => None,
+            // A terminating true arm leaves only the else suite to reach cleanup.
+            let final_handler_else = if let Some(Stmt::If(tail)) = handler_cleanup_tail
+                && let [otherwise] = tail.elif_else_clauses.as_slice()
+                && otherwise.test.is_none()
+                && !otherwise.body.is_empty()
+                && suite_terminates_before_constant_folding(&tail.body)
+            {
+                Some((tail.test.as_ref(), otherwise.body.as_slice()))
+            } else {
+                None
+            };
+            let handler_cleanup_fallthrough = if let Some(Stmt::If(tail)) = handler_cleanup_tail {
+                handler_cleanup_fallthrough_test(tail).or(guarded_raise_finally_test)
+            } else {
+                None
+            }
+            .or_else(|| {
+                let (test, body) = final_handler_else?;
+                (self.context.python_version >= crate::PythonVersion::Py314
+                    && body
+                        .iter()
+                        .all(|part| self.context.is_elided_statement(part)))
+                .then_some(test)
             });
             // An emitted unconditional edge into an empty original array precedes this
             // handler's artificial POP_BLOCK/POP_EXCEPT/jump cleanup. CPython copies that
@@ -33514,7 +33532,10 @@ impl<'source> Compiler<'source> {
                         || (condition_has_only_runtime_tests(&statement.test)
                             && original_condition_has_unique_jump_target(&statement.test, false)
                             && unique_condition_jump_target(&statement.test, false).is_some()))
-                    && let Some(range) = unary_not_condition_exit_range(&statement.test)
+                    && let Some(range) =
+                        unary_not_condition_exit_range(&statement.test).or_else(|| {
+                            unique_condition_jump_target(&statement.test, false).map(Ranged::range)
+                        })
                 {
                     // The assertion always raises. Only the guard's false edge
                     // reaches normal cleanup and can supply its source location.
@@ -33546,7 +33567,12 @@ impl<'source> Compiler<'source> {
                 } else if handler_ends_with_multi_success_assert {
                     // Multiple assertion success edges share an initially unlocated cleanup.
                     self.assembler.set_location(SourceLocation::NONE);
-                } else if let Some(range) = suite_assert_success_fallthrough_range(&handler.body) {
+                } else if let Some(range) = suite_assert_success_fallthrough_range(&handler.body)
+                    .or_else(|| {
+                        final_handler_else
+                            .and_then(|(_, body)| suite_assert_success_fallthrough_range(body))
+                    })
+                {
                     // Only the successful assertion edge reaches normal handler cleanup.
                     self.assembler.set_location(self.source_location(range));
                 } else if let Some(range) = suite_unary_not_fallthrough_range(&handler.body) {
