@@ -12535,8 +12535,9 @@ impl LayoutAssembler {
                                 );
                             }
                         }
-                        // Before the captured authored-return slot, an appended marker can
-                        // reuse the uniformly protected prefix. The retained POP remains NULL.
+                        // The authored return NOP and the uniformly protected suffix before
+                        // it retain the try owner. Earlier instructions in the same array can
+                        // precede the try and need not share it.
                         if owner_history_exact
                             && tail.insertions == 0
                             && tail.late_removals == 0
@@ -12554,10 +12555,12 @@ impl LayoutAssembler {
                             && let Some((array, pop, slot, region)) = early_return_nop_slot
                             && original_array_start == array
                             && pop < instruction_index
-                            && instruction_index < slot
-                            && self.uniform_exception_owner(array, pop, &label_positions)
+                            && instruction_index <= slot
+                            && let Some(prefix) = pop.checked_sub((slot - instruction_index).max(1))
+                            && prefix >= array
+                            && self.uniform_exception_owner(prefix, pop, &label_positions)
                                 == Some(region)
-                            && indexed_instructions[array..pop].iter().all(|instruction| {
+                            && indexed_instructions[prefix..pop].iter().all(|instruction| {
                                 instruction.exception_policy().exclusion()
                                     == super::ExceptionExclusion::None
                                     && instruction.exception_policy().owner()
