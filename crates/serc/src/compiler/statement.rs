@@ -10375,8 +10375,7 @@ impl<'source> Compiler<'source> {
                             && self.control.finally.active_finally_end_blocks == 0
                             && self.control.finally.active_normal_finally_bodies == 0
                             && self.control.finally.active_copied_finally_bodies == 0;
-                        if (preserve_named_handler_pop_slots
-                            && preserves_enclosing_try_pop_slots)
+                        if (preserve_named_handler_pop_slots && preserves_enclosing_try_pop_slots)
                             || preserve_legacy_inner_try_pop_slots
                         {
                             // Ordinary tries entered inside this handler unwind before its
@@ -10653,8 +10652,7 @@ impl<'source> Compiler<'source> {
                             self.assembler.record_named_handler_pop_pair(start);
                         }
                         if preserve_named_handler_pop_slots
-                            && (protected_pop_except.is_some()
-                                || preserves_enclosing_try_pop_slots)
+                            && (protected_pop_except.is_some() || preserves_enclosing_try_pop_slots)
                         {
                             // The three name-clearing records share this exact outer owner;
                             // a later finally condition may reuse their stale array slots.
