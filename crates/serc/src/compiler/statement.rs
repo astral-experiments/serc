@@ -29454,6 +29454,21 @@ impl<'source> Compiler<'source> {
                 // finally POP_BLOCK with the same line to absorb its redundant NOP.
                 self.assembler.defer_jump_removal(normal_exit);
             }
+            if self.context.python_version >= crate::PythonVersion::Py314
+                && !statement.is_star
+                && statement.orelse.is_empty()
+                && matches!(statement.body.last(), Some(Stmt::While(tail))
+                    if early_condition_truthiness(&tail.test).is_none()
+                        && suite_contains_loop_break(&tail.body)
+                        && matches!(tail.orelse.last(), Some(Stmt::Assign(_))))
+            {
+                // The break threads past this normal try exit. The else store
+                // remains its sole line donor when the handler blocks move.
+                self.assembler
+                    .preserve_redundant_jump_nop_after_threading(normal_exit);
+                self.assembler
+                    .mark_retained_nop_borrow_fallthrough_if_unblocked(normal_exit);
+            }
             if chained_assertion_exit_location.is_some() || retained_runtime_while_exit {
                 // A unique runtime loop exit keeps its condition's line through return
                 // copying or cold relocation. Preserve any explicit borrowing barrier.
