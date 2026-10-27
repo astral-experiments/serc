@@ -413,8 +413,9 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) normal_try_exits: Vec<(Label, Label)>,
     pub(super) borrow_normal_try_exits: Vec<(Label, Instruction)>,
     pub(super) initial_borrow_normal_try_exits: Vec<NormalTryBorrowExit>,
-    // Handler labels locate the emptied original exits through cold-block relocation.
-    pub(super) copied_borrow_exit_handlers: Vec<Label>,
+    pub(super) cold_handler_borrow_jumps: Vec<(Label, Label)>,
+    // The following cold blocks locate emptied originals through relocation.
+    pub(super) copied_borrow_exit_anchors: Vec<Label>,
     pub(super) retired_normal_try_exits: Vec<RetiredNormalTryExit>,
     // Sole authored break, retired ordinary-try bridge, and intact normal-finally array.
     pub(super) normal_try_break_pop_owners: Vec<NormalTryBreakPopOwner>,
@@ -540,6 +541,7 @@ impl ExceptionOwnerProvenance {
         enum Exit<'a> {
             NormalTry(Label),
             Comprehension(&'a [Instruction]),
+            HandlerJump(Label),
         }
         let mut entries = self
             .borrow_normal_try_exits
@@ -560,6 +562,24 @@ impl ExceptionOwnerProvenance {
                 });
                 if let Some(restore) = restore.filter(|restore| restore.len() == 2) {
                     entries.insert(block, (Exit::Comprehension(restore), false));
+                }
+            }
+        }
+        if !self.cold_handler_borrow_jumps.is_empty() {
+            for &(entry, target) in &self.cold_handler_borrow_jumps {
+                if let Some(block) = graph.label_block(entry) {
+                    // A lone handler jump can be unreachable from the outset. Every
+                    // remaining unconditional predecessor copies the unlocated jump.
+                    entries
+                        .entry(block)
+                        .or_insert((Exit::HandlerJump(target), true));
+                }
+            }
+            for region in regions {
+                if let Some(block) = graph.label_block(region.target)
+                    && matches!(entries.get(&block), Some((Exit::HandlerJump(_), _)))
+                {
+                    entries.remove(&block);
                 }
             }
         }
@@ -596,51 +616,60 @@ impl ExceptionOwnerProvenance {
             let Some(previous) = graph[previous].last_instruction() else {
                 continue;
             };
-            let Some(first) = graph[following]
+            let first = graph[following]
                 .items()
                 .iter()
-                .find_map(Item::as_instruction)
-            else {
-                continue;
+                .find_map(Item::as_instruction);
+            let single_jump = || {
+                let (Item::Instruction(jump), labels) = graph[block].items().split_last()? else {
+                    return None;
+                };
+                (jump.opcode == JUMP_FORWARD
+                    && labels.iter().all(|item| matches!(item, Item::Label(_))))
+                .then_some(jump)
             };
-            if previous.opcode != RERAISE {
-                continue;
-            }
-            let handler_labels = match exit {
-                // Only unconditional jumps can enter these blocks. The preceding error
-                // cleanup ends in RERAISE, and its successor is the next cold handler.
+            let handler = |labels: &FxHashSet<Label>| {
+                graph[following].items().iter().find_map(|item| match item {
+                    Item::Label(label) if labels.contains(label) => Some(*label),
+                    _ => None,
+                })
+            };
+            let anchor = match exit {
                 Exit::NormalTry(target) => {
-                    let Some((Item::Instruction(jump), labels)) = graph[block].items().split_last()
-                    else {
-                        continue;
-                    };
-                    if jump.opcode != JUMP_FORWARD
-                        || jump.forward_target() != Some(*target)
-                        || jump.location != SourceLocation::NONE
-                        || !labels.iter().all(|item| matches!(item, Item::Label(_)))
+                    if previous.opcode != RERAISE
                         || previous.value_argument() != Some(1)
-                        || first.opcode != PUSH_EXC_INFO
+                        || !first.is_some_and(|op| op.opcode == PUSH_EXC_INFO)
+                        || !single_jump().is_some_and(|jump| {
+                            jump.forward_target() == Some(*target)
+                                && jump.location == SourceLocation::NONE
+                        })
                     {
                         continue;
                     }
-                    &handlers
+                    handler(&handlers)
                 }
                 Exit::Comprehension(restore) => {
-                    if previous.value_argument() != Some(0)
-                        || first.opcode != COPY
-                        || first.value_argument() != Some(3)
+                    if previous.opcode != RERAISE
+                        || previous.value_argument() != Some(0)
+                        || !first
+                            .is_some_and(|op| op.opcode == COPY && op.value_argument() == Some(3))
                         || !copyable_comprehension_reraise(graph[block].items(), restore)
                     {
                         continue;
                     }
-                    &cleanup_handlers
+                    handler(&cleanup_handlers)
+                }
+                Exit::HandlerJump(target) => {
+                    if !super::ends_scope(previous.opcode)
+                        || single_jump().and_then(Instruction::forward_target) != Some(*target)
+                    {
+                        continue;
+                    }
+                    graph[following].first_label()
                 }
             };
-            if let Some(handler) = graph[following].items().iter().find_map(|item| match item {
-                Item::Label(label) if handler_labels.contains(label) => Some(*label),
-                _ => None,
-            }) {
-                self.copied_borrow_exit_handlers.push(handler);
+            if let Some(anchor) = anchor {
+                self.copied_borrow_exit_anchors.push(anchor);
             }
         }
     }

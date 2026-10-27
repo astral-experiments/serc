@@ -2009,6 +2009,30 @@ fn matches_cpython_partial_terminal_match_handler_borrow_entries() {
 }
 
 #[test]
+fn unlocated_handler_jump_stops_borrow_fallthrough() {
+    for body in [
+        "if flag:\n    try:\n        step()\n    except OtherError:\n        pass\n    else:\n        return",
+        "if flag:\n    if mode:\n        with context:\n            step()\n    else:\n        fallback()\nelse:\n    fallback()",
+        "if flag:\n    if mode:\n        step()\n    else:\n        raise\nelse:\n    fallback()",
+    ] {
+        let protected = format!(
+            "try:\n    before()\nexcept ValueError:\n{}\n    recover()",
+            indent_finally_borrow_case(body)
+        );
+        for suite in [
+            protected.clone(),
+            format!("if flag:\n{}", indent_finally_borrow_case(&protected)),
+        ] {
+            let source = format!(
+                "def run(value, flag, mode, context):\n{}\n    consume(value)\n",
+                indent_finally_borrow_case(&suite)
+            );
+            common::assert_matches_cpython_marshal(&source, "unlocated_handler_jump.py");
+        }
+    }
+}
+
+#[test]
 fn copied_comprehension_restore_stops_borrow_fallthrough() {
     for cleanup in [
         "result = [work(x) for x in items]",

@@ -17025,6 +17025,11 @@ impl<'source> Compiler<'source> {
                         }
                         branch_exit
                     };
+                    if self.context.python_version == crate::PythonVersion::Py314
+                        && self.control.in_exception_handler()
+                    {
+                        self.assembler.record_unlocated_handler_jump(branch_exit);
+                    }
                     if discarded_if_exit
                         && !direct_try_body_exit
                         && self.assembler.last_instruction_location() == Some(SourceLocation::NONE)
@@ -30281,6 +30286,12 @@ impl<'source> Compiler<'source> {
                     exception_policy,
                 )?
             };
+            if self.context.python_version == crate::PythonVersion::Py314
+                && self.control.in_exception_handler()
+                && !statement.orelse.is_empty()
+            {
+                self.assembler.record_unlocated_handler_jump(normal_exit);
+            }
             // Break edges bypass the loop's else suite. After threading those
             // edges, the try's normal jump retains the physical else fallthrough's line.
             if self.context.python_version >= crate::PythonVersion::Py314
