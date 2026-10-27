@@ -2362,3 +2362,16 @@ fn terminal_deletion_preserves_original_return_boundary() {
         common::assert_matches_cpython_marshal(&source, "terminal_deletion_return.py");
     }
 }
+
+#[test]
+fn borrows_locals_after_a_conditional_jumps_to_a_finally_pass() {
+    for arm in ["use(first)", "if True:\n    return\nuse(first)"] {
+        let source = format!(
+            "def choose(ready, first, second):\n    try:\n        if ready:\n{}        else:\n            use(second)\n    except Error as err:\n        recover(err)\n    finally:\n        pass\n    return first, second\n",
+            indent_finally_borrow_case(&indent_finally_borrow_case(&indent_finally_borrow_case(
+                arm
+            )))
+        );
+        common::assert_matches_cpython_marshal(&source, "conditional_finally_pass.py");
+    }
+}
