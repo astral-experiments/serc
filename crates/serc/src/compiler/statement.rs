@@ -38131,6 +38131,43 @@ impl<'source> Compiler<'source> {
                             && context.finally_end_depth == 0
                             && context.exception_region_depth == 0))
                     && managed_guarded_raise_has_finally_route(statement)));
+        // Typed, normally completing handlers move entirely behind the normal finally.
+        // The last instruction in the protected or else suite and the first instruction
+        // in cleanup then have a direct fallthrough after the redundant jump disappears.
+        let populated_handler_fallthrough = self.context.python_version
+            == crate::PythonVersion::Py314
+            && !statement.is_star
+            && !self.control.in_exception_handler()
+            && self.control.finally.active_copied_finally_bodies == 0
+            && !statement.handlers.is_empty()
+            && statement.handlers.iter().all(|handler| {
+                handler.as_except_handler().is_some_and(|handler| {
+                    handler.type_.as_deref().is_some_and(|kind| {
+                        !expression_contains_inline_branch(kind)
+                            && !expression_suspends_current_scope(kind)
+                    }) && handler.body.iter().all(|part| {
+                        let statement = std::slice::from_ref(part);
+                        matches!(part, Stmt::Pass(_))
+                            || suite_has_nonsuspending_conditional_work(statement)
+                            || suite_has_linear_reraise_guards(statement)
+                    })
+                })
+            })
+            && (statement.orelse.is_empty()
+                || suite_has_nonsuspending_linear_fallthrough(&statement.orelse))
+            && statement
+                .orelse
+                .last()
+                .or_else(|| statement.body.last())
+                .is_some_and(|tail| {
+                    suite_has_nonsuspending_linear_fallthrough(std::slice::from_ref(tail))
+                })
+            && statement.finalbody.first().is_some_and(|entry| {
+                self.suite_has_nonempty_borrow_entry(std::slice::from_ref(entry))
+                    || matches!(entry, Stmt::If(guard)
+                        if condition_has_linear_runtime_leaves(&guard.test)
+                            && !expression_suspends_current_scope(&guard.test))
+            });
         let normal_finally_is_borrow_reachable = (simple_fallthrough_handlers_reach_finally
             || compound_fallthrough_handlers_reach_finally
             || runtime_while_handlers_reach_finally)
@@ -38166,7 +38203,8 @@ impl<'source> Compiler<'source> {
             || generator_else_break_loop_range.is_some()
             || runtime_while_else_break_reaches_finally
             || loop_guarded_recovery_reaches_finally
-            || managed_iterator_cleanup_entry;
+            || managed_iterator_cleanup_entry
+            || populated_handler_fallthrough;
         // A runtime loop's terminal break can enter populated normal cleanup
         // alongside an iterator recovery. Preserve the existing removed-edge veto.
         let runtime_while_recovery_break = self.context.python_version
