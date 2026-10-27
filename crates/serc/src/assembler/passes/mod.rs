@@ -1580,24 +1580,37 @@ impl LayoutAssembler {
         // These surviving jumps read original END_SEND or comprehension header
         // labels. Later labels for empty or duplicated blocks do not size them.
         let mut short_source_jumps = rustc_hash::FxHashMap::default();
-        if !native_jump_widths
-            && !uniform_jump_widths
-            && self
-                .exception_owner_provenance
-                .legacy_source_jump_labels_fit
-        {
-            short_source_jumps.extend(
-                self.exception_owner_provenance
-                    .ordinary_await_ends
-                    .iter()
-                    .filter_map(|origin| origin.bridge),
-            );
-            short_source_jumps.extend(
-                self.exception_owner_provenance
-                    .legacy_comprehension_backedges
-                    .iter()
-                    .copied(),
-            );
+        let origins = &self.exception_owner_provenance;
+        let all_source_labels_fit = origins.legacy_source_jump_labels_fit;
+        let short_await_labels = &origins.legacy_short_await_labels;
+        if !native_jump_widths && !uniform_jump_widths {
+            if all_source_labels_fit {
+                short_source_jumps.extend(origins.legacy_comprehension_backedges.iter().copied());
+            }
+            if all_source_labels_fit || !short_await_labels.is_empty() {
+                short_source_jumps.extend(
+                    origins
+                        .ordinary_await_ends
+                        .iter()
+                        .filter(|origin| {
+                            all_source_labels_fit || short_await_labels.contains(&origin.entry)
+                        })
+                        .filter_map(|origin| origin.bridge),
+                );
+                short_source_jumps.extend(
+                    origins
+                        .async_with_setups
+                        .iter()
+                        .filter(|origin| {
+                            all_source_labels_fit
+                                || origin
+                                    .send
+                                    .jump_target()
+                                    .is_some_and(|end| short_await_labels.contains(&end))
+                        })
+                        .filter_map(|origin| origin.bridge),
+                );
+            }
         }
         let mut expected_jump = None;
         let mut extended_args = Vec::with_capacity(instruction_count);
@@ -1630,14 +1643,14 @@ impl LayoutAssembler {
                     .legacy_initial_jump_width()
                     .expect("all native jumps are certified")
             } else if short_source_jump
-                || (self
-                    .exception_owner_provenance
-                    .legacy_source_jump_labels_fit
-                    && matches!(
-                        instruction.opcode,
-                        crate::target::opcodes::SEND
-                            | crate::target::opcodes::JUMP_BACKWARD_NO_INTERRUPT
-                    ))
+                || (matches!(
+                    instruction.opcode,
+                    crate::target::opcodes::SEND
+                        | crate::target::opcodes::JUMP_BACKWARD_NO_INTERRUPT
+                ) && (all_source_labels_fit
+                    || instruction
+                        .jump_target()
+                        .is_some_and(|target| short_await_labels.contains(&target))))
             {
                 // Python 3.12 emits SEND and JUMP_NO_INTERRUPT only in its
                 // yield-from loop. Their END_SEND and SEND targets are nonempty

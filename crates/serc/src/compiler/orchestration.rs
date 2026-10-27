@@ -4,8 +4,7 @@ use std::rc::Rc;
 
 use ruff_python_ast::token::Tokens;
 use ruff_python_ast::{Expr, Stmt, Suite};
-use ruff_text_size::Ranged;
-use ruff_text_size::TextRange;
+use ruff_text_size::{Ranged, TextRange, TextSize};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{
@@ -258,6 +257,7 @@ impl<'source> Compiler<'source> {
                 control: ControlFlowState::default(),
                 assembler,
                 native_label_plan: None,
+                legacy_short_label_prefix: TextSize::default(),
             },
         )
     }
@@ -639,7 +639,8 @@ impl<'source> Compiler<'source> {
     ) -> Result<Box<CodeObject>, CompileError> {
         self.assembler.reserve_items(body.len().saturating_mul(16));
         if self.context.python_version == PythonVersion::Py312 {
-            super::legacy_native_seed_bound::record(&mut self.assembler, body);
+            self.legacy_short_label_prefix =
+                super::legacy_native_seed_bound::record(&mut self.assembler, body);
             self.native_label_plan = super::legacy_native_labels::NativeLabelPlan::module(
                 body,
                 self.unit.flags & CO_FUTURE_ANNOTATIONS != 0,
@@ -865,7 +866,8 @@ impl<'source> Compiler<'source> {
     ) -> Result<Box<CodeObject>, CompileError> {
         self.assembler.reserve_items(body.len().saturating_mul(16));
         if self.context.python_version == PythonVersion::Py312 {
-            super::legacy_native_seed_bound::record(&mut self.assembler, body);
+            self.legacy_short_label_prefix =
+                super::legacy_native_seed_bound::record(&mut self.assembler, body);
             self.native_label_plan = super::legacy_native_labels::NativeLabelPlan::function(
                 body,
                 self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) != 0,

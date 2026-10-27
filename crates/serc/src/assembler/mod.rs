@@ -1078,6 +1078,13 @@ impl Assembler {
             .legacy_source_jump_labels_fit = true;
     }
 
+    /// Records the nonempty `SEND` and `END_SEND` labels of a source-bounded suspension.
+    pub(crate) fn record_legacy_short_await_labels(&mut self, send: Label, end: Label) {
+        self.exception_owner_provenance
+            .legacy_short_await_labels
+            .extend([send, end]);
+    }
+
     /// Captures the authored jump to a comprehension's nonempty `FOR_ITER` header.
     pub(crate) fn record_legacy_comprehension_backedge(&mut self, entry: Label) {
         if self

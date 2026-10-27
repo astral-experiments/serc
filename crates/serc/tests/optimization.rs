@@ -9073,6 +9073,26 @@ fn completed_manager_work_preserves_retained_loop_owners() {
 }
 
 #[test]
+fn python312_await_cleanup_in_a_bounded_source_prefix() {
+    for operator in ["and", "or"] {
+        let prefix = format!("    if active {operator} state:\n        visit(state)\n").repeat(160);
+        let dead_tail = "    if state:\n        visit(state)\n".repeat(270);
+        for stores in [124, 125, 126] {
+            let suffix = "    result = active\n".repeat(stores);
+            let source = format!(
+                "async def execute(active, visit, state):\n    state.current: int = 0\n{prefix}    await visit(state)\n{suffix}    return\n{dead_tail}"
+            );
+            assert_matches_cpython_versions(
+                &source,
+                "await_prefix_width.py",
+                &[OptimizationLevel::Zero],
+                &[PythonVersion::Py312],
+            );
+        }
+    }
+}
+
+#[test]
 fn python312_await_cleanup_uses_the_source_label_width() {
     for branches in [125, 260] {
         for stores in [124, 125, 126] {
