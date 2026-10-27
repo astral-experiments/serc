@@ -4119,6 +4119,28 @@ fn erased_loop_exit_stays_inside_managed_finally() {
 }
 
 #[test]
+fn enclosing_managers_preserve_the_original_pop_slots_on_a_copied_guard() {
+    for (function, managers) in [("def", "with lock"), ("async def", "async with lock, lock")] {
+        let source = format!(
+            r"{function} run(lock, item, ready):
+    {managers}:
+        try:
+            if ready:
+                pass
+            observe(item)
+            return item
+        except LookupError as error:
+            recover()
+        finally:
+            if item is not None:
+                finish()
+"
+        );
+        assert_matches_cpython(&source, "retained_manager_guard.py", &LEVELS);
+    }
+}
+
+#[test]
 fn iterator_returns_unwind_inner_try_before_copied_none_guard() {
     for call in ["work(item if enabled else value)", "await work(item)"] {
         let source = format!(

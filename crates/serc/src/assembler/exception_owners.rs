@@ -14953,6 +14953,11 @@ impl LayoutAssembler {
         }
         // Earlier return and handler POPs can compact into the last cleanup record.
         let mut cleanup = origin.cleanup;
+        if cleanup.opcode == crate::target::opcodes::LOAD_FAST
+            && instructions[previous].opcode == crate::target::opcodes::LOAD_FAST_BORROW
+        {
+            cleanup.opcode = crate::target::opcodes::LOAD_FAST_BORROW;
+        }
         cleanup.local_policy.add_hidden_exception_owner_slots(
             instructions[previous]
                 .local_policy
