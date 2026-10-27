@@ -6737,7 +6737,44 @@ impl OptimizationPipeline {
                     })
                 })
                 .flatten();
+            // After exception cleanup, a detached join can have a single incoming
+            // branch assignment. Its jump donates the line of the NOP left beside
+            // the copied return, which also discards the loop iterator.
+            let loop_return_join_location = if self.python_version == crate::PythonVersion::Py314
+                && !planned_copy
+                && inline_small_exit
+                && source_location.line < 0
+                && target_position == target_chain_end
+                && remaining_predecessors[source.index()] == 1
+                && let [Item::Label(_), Item::Instruction(source_jump)] = graph[source].items()
+                && source_jump.opcode == JUMP_FORWARD
+                && let [Item::Label(_), Item::Instruction(load), Item::Instruction(swap),
+                    Item::Instruction(pop), Item::Instruction(ret)] = graph[target].items()
+                && load.opcode == LOAD_FAST
+                && swap.opcode == crate::target::opcodes::SWAP
+                && swap.value_argument() == Some(2)
+                && pop.opcode == POP_TOP
+                && ret.opcode == RETURN_VALUE
+                && source_position.checked_sub(1).is_some_and(|position| {
+                    graph[order[position]].items().iter().filter_map(Item::as_instruction)
+                        .map(|record| (record.opcode, record.value_argument()))
+                        .eq([(crate::target::opcodes::COPY, Some(3)), (POP_EXCEPT, Some(0)), (RERAISE, Some(1))])
+                })
+                && let [predecessor] = jump_sources[source.index()].as_slice()
+                && let [.., Item::Instruction(store), Item::Instruction(jump)] = graph[*predecessor].items()
+                && jump.opcode == JUMP_FORWARD
+                && jump.location.line >= 0
+                && store.opcode == STORE_ATTR
+                && store.location == jump.location
+                && jump.forward_target().and_then(|target| graph.label_block(target)) == Some(source)
+            {
+                Some(jump.location)
+            } else {
+                None
+            };
+            let source_location = loop_return_join_location.unwrap_or(source_location);
             let preserve_inlined_jump_nop = planned_copy
+                || loop_return_join_location.is_some()
                 || deferred_match_donor.is_some()
                 || (inline_small_exit
                     && (preserve_unlocated_join_nop

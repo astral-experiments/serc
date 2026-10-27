@@ -19088,3 +19088,25 @@ fn nested_conditional_arms_donate_implicit_return_locations() {
 ";
     assert_matches_cpython(source, "nested_implicit_returns.py", &LEVELS);
 }
+
+#[test]
+fn loop_return_join_uses_the_surviving_assignment_line() {
+    let source = r"async def collect(items, ready, enabled, result):
+    for item in items:
+        if ready:
+            try:
+                check(item)
+            except Error:
+                recover()
+            else:
+                if enabled:
+                    result.value = item
+                else:
+                    result.default = item
+        elif enabled:
+            result.value = item
+        return result
+    return result
+";
+    assert_matches_cpython(source, "loop_return_assignment_line.py", &LEVELS);
+}
