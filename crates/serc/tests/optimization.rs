@@ -15,6 +15,21 @@ use serc::{
 };
 
 #[test]
+fn local_fusion_keeps_retained_try_setup_unowned() {
+    let source = r"def sample(items, flag, a, b, c, d):
+    with acquire():
+        for item in items:
+            x = one(a, b)
+            y = two(a, b, c, d)
+            try:
+                z = a if flag is None else b
+            except Error:
+                recover()
+";
+    assert_matches_cpython(source, "fused_try_setup.py", &LEVELS);
+}
+
+#[test]
 fn nested_conversion_handlers_keep_shared_cleanup() {
     let source = r"def sample(items):
     for item in items:

@@ -8592,6 +8592,35 @@ impl LayoutAssembler {
                                 );
                             }
                         }
+                        // Local fusion is the last compaction. When its stale suffix
+                        // begins exactly at the retained SETUP, the append slot is that
+                        // unprotected record, even with an enclosing handler on both sides.
+                        if instruction.exception_policy().exclusion()
+                            == super::ExceptionExclusion::None
+                            && owners
+                                .get(instruction_index)
+                                .is_none_or(|owner| !owner.is_definitive())
+                            && owner_history_exact
+                            && tail.insertions == 0
+                            && tail.late_removals == 0
+                            && tail.post_compaction_fusions > 0
+                            && let Some((start, setup_tail, _)) = protected_suffix
+                            && setup_tail.post_compaction_fusions == instruction_index - start + 1
+                            && let Some(nop_index) = start.checked_sub(1)
+                            && original_array_start <= nop_index
+                            && retained_setup_nops.contains(&nop_index)
+                            && let Some(&nop) = indexed_instructions.get(nop_index)
+                            && nop.opcode == NOP
+                            && nop.exception_policy() == super::ExceptionPolicy::EXCLUDE_ALWAYS
+                            && !nop.fusion_policy.is_converted_pop_block()
+                            && nop.local_policy.hidden_exception_owner_slots() == 0
+                            && nop.pre_fold_extra_instructions() == 0
+                        {
+                            owners.insert(
+                                instruction_index,
+                                ExceptionOwnerDecision::Definitive(ExceptionOwner::Absent),
+                            );
+                        }
                         // A retained SETUP may follow an owned source record and one erased
                         // outer POP. An exact append slot can still belong to that earlier
                         // handler, even though it falls before the new protected suffix.
