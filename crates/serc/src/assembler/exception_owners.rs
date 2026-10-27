@@ -10232,7 +10232,8 @@ impl LayoutAssembler {
                     // test. After three early removals, the appended marker reuses
                     // that new jump even when sibling guards have identical records.
                     if instruction.opcode == NOT_TAKEN
-                        && instruction.exception_policy().owner() == NormalizedExceptionOwner::Dynamic
+                        && instruction.exception_policy().owner()
+                            == NormalizedExceptionOwner::Dynamic
                         && owner_history_exact
                         && tail.early_removals == 3
                         && tail.insertions == 0
@@ -10255,9 +10256,12 @@ impl LayoutAssembler {
                         && convert.opcode == crate::target::opcodes::TO_BOOL
                         && [copy, convert, jump].iter().all(|record| {
                             record.location == instruction.location
-                                && record.exception_policy() == super::ExceptionPolicy::AlwaysUnchanged
+                                && record.exception_policy()
+                                    == super::ExceptionPolicy::AlwaysUnchanged
                         })
-                        && self.exception_owner_provenance.threaded_condition_origins
+                        && self
+                            .exception_owner_provenance
+                            .threaded_condition_origins
                             .contains(&(**jump, *instruction))
                     {
                         owners.insert(
