@@ -36006,6 +36006,31 @@ impl<'source> Compiler<'source> {
                     && matches!(branch.body.as_slice(), [Stmt::Pass(pass)]
                     if self.source_location(pass.range).line
                         != self.source_location(branch.range).line));
+        // END_SEND resumes the managed arm before its exit call. The alternative
+        // delegation keeps that exit jump nonempty when handlers move cold.
+        let managed_delegation_reaches_finally = self.context.python_version
+            == crate::PythonVersion::Py314
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_GENERATOR
+            && !statement.is_star
+            && statement.orelse.is_empty()
+            && !statement.handlers.is_empty()
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && !self.control.in_exception_handler()
+            && self.control.finally.is_inactive_for_return_unwind()
+            && suite_has_nonsuspending_linear_fallthrough(&statement.finalbody)
+            && matches!(statement.body.split_last(), Some((Stmt::If(branch), leading))
+                if suite_has_normal_fallthrough(leading)
+                    && condition_has_linear_runtime_leaves(&branch.test)
+                    && !expression_suspends_current_scope(&branch.test)
+                    && matches!(branch.elif_else_clauses.as_slice(), [otherwise]
+                        if otherwise.test.is_none() && suite_ends_in_linear_delegation(&otherwise.body))
+                    && matches!(branch.body.split_last(), Some((Stmt::With(manager), prefix))
+                        if !manager.is_async && manager.items.len() == 1
+                            && !expression_contains_inline_branch(&manager.items[0].context_expr)
+                            && !expression_suspends_current_scope(&manager.items[0].context_expr)
+                            && (prefix.is_empty() || suite_has_nonsuspending_linear_fallthrough(prefix))
+                            && suite_ends_in_linear_delegation(&manager.body)));
         // A live linear arm before the final else keeps a reachable jump directly
         // into normal cleanup after handlers move cold. Folded assertions can leave
         // that jump behind an empty block, so a merely nonterminal arm is insufficient.
@@ -38138,6 +38163,7 @@ impl<'source> Compiler<'source> {
             || managed_runtime_while_return_reaches_finally
             || runtime_retry_break_reaches_finally
             || conditional_body_reaches_finally
+            || managed_delegation_reaches_finally
             || coroutine_conditional_store_reaches_finally
             || coroutine_await_recovery_reaches_finally
             || coroutine_guarded_nested_cleanup_entry
@@ -47089,6 +47115,15 @@ fn suite_has_nonsuspending_linear_fallthrough(body: &[Stmt]) -> bool {
     suite_has_linear_borrow_fallthrough(body)
         && !suite_contains_yield_with_headers(body, true, true)
         && !suite_contains_suspending_expression(body)
+}
+
+/// A delegated iterator resumes in `END_SEND` after a linear prefix.
+fn suite_ends_in_linear_delegation(body: &[Stmt]) -> bool {
+    matches!(body.split_last(), Some((Stmt::Expr(tail), prefix))
+        if (prefix.is_empty() || suite_has_nonsuspending_linear_fallthrough(prefix))
+            && matches!(tail.value.as_ref(), Expr::YieldFrom(delegation)
+                if !expression_contains_inline_branch(&delegation.value)
+                    && !expression_suspends_current_scope(&delegation.value)))
 }
 
 /// Certifies a populated named-handler exit into guarded, named linear recovery.

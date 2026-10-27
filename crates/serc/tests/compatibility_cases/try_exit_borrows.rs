@@ -2362,3 +2362,9 @@ fn terminal_deletion_preserves_original_return_boundary() {
         common::assert_matches_cpython_marshal(&source, "terminal_deletion_return.py");
     }
 }
+
+#[test]
+fn borrows_after_a_managed_generator_arm_jumps_over_delegation() {
+    let source = "def stream(owner, enabled, ready, manager):\n    try:\n        if enabled and ready:\n            with manager:\n                yield from read(owner)\n        else:\n            yield from read(owner)\n    except Error:\n        raise\n    finally:\n        owner.state = finish()\n";
+    common::assert_matches_cpython_marshal(source, "managed_generator_arm.py");
+}
