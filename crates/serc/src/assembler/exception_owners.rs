@@ -55,6 +55,26 @@ fn copyable_comprehension_reraise(items: &[Item], original: &[Instruction]) -> b
         && instructions.next().is_none()
 }
 
+/// A small local return can be copied into the warm try exit before dead handlers empty.
+fn copyable_local_return<'a>(mut ops: impl Iterator<Item = &'a Instruction>) -> bool {
+    use crate::target::opcodes::{LOAD_FAST, RETURN_VALUE};
+
+    let Some(load) = ops.next().filter(|op| op.opcode == LOAD_FAST) else {
+        return false;
+    };
+    let mut slots = 1 + usize::from(load.pre_fold_extra_instructions());
+    for op in ops {
+        slots += 1 + usize::from(op.pre_fold_extra_instructions());
+        if slots > 4 {
+            return false;
+        }
+        if op.opcode != NOP {
+            return op.opcode == RETURN_VALUE;
+        }
+    }
+    false
+}
+
 /// Whether the normal and exceptional handler exits clear the same fast local.
 fn is_named_handler_exit<'a>(
     mut normal: impl Iterator<Item = &'a Instruction>,
@@ -606,6 +626,25 @@ impl ExceptionOwnerProvenance {
         let mut named_exit_splits = FxHashMap::default();
         if !self.named_handler_cleanup_targets.is_empty() {
             let order = graph.order();
+            let normal_targets: FxHashSet<_> = self
+                .borrow_normal_try_exits
+                .iter()
+                .filter_map(|(_, jump)| graph.label_block(jump.forward_target()?))
+                .collect();
+            let copied_returns: FxHashSet<_> = order
+                .iter()
+                .enumerate()
+                .filter(|(_, block)| normal_targets.contains(block))
+                .filter(|(index, _)| {
+                    copyable_local_return(
+                        order[*index..]
+                            .iter()
+                            .flat_map(|block| graph[*block].items())
+                            .filter_map(Item::as_instruction),
+                    )
+                })
+                .map(|(_, block)| *block)
+                .collect();
             for (position, pair) in order.windows(2).enumerate() {
                 let [normal, exceptional] = *pair else {
                     unreachable!()
@@ -624,6 +663,16 @@ impl ExceptionOwnerProvenance {
                 else {
                     continue;
                 };
+                // A copied return is already in the warm predecessor, ahead of
+                // the empty handler. Its local must remain reachable there.
+                if graph[normal]
+                    .last_instruction()
+                    .and_then(Instruction::forward_target)
+                    .and_then(|label| graph.label_block(label))
+                    .is_some_and(|block| copied_returns.contains(&block))
+                {
+                    continue;
+                }
                 let records = graph[normal]
                     .items()
                     .iter()
