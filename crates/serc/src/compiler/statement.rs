@@ -18296,10 +18296,33 @@ impl<'source> Compiler<'source> {
         preserve_tos: bool,
     ) -> Result<(), CompileError> {
         for index in (from_depth..to_depth).rev() {
+            // An enclosing manager or finalizer keeps the shared iterator exit
+            // too large to copy. Its unlocated POP has no unique predecessor.
+            let shared_iterator_discard = !preserve_tos
+                && self.context.python_version == crate::PythonVersion::Py314
+                && self.control.loops.contexts[index].iterator_cleanup == IteratorCleanup::Sync
+                && (self.control.loops.contexts[index].with_depth > 0
+                    || self
+                        .control
+                        .finally
+                        .active_loop_finally_contexts
+                        .iter()
+                        .any(|finally| finally.loop_depth <= index)
+                    || !self
+                        .control
+                        .finally
+                        .active_pass_finally_locations
+                        .is_empty())
+                && self.assembler.location() == SourceLocation::NONE
+                && self.assembler.at_original_unconditional_join()
+                && !self.assembler.at_reraising_handler_exit();
             self.emit_iterator_cleanup(
                 self.control.loops.contexts[index].iterator_cleanup,
                 preserve_tos,
             )?;
+            if shared_iterator_discard {
+                self.assembler.preserve_last_no_location();
+            }
         }
         Ok(())
     }
