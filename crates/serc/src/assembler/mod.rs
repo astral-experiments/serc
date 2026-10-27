@@ -17331,7 +17331,7 @@ impl Assembler {
                 following_iterator: false,
                 assignment_pop,
                 continued_call: None,
-                continued_attribute_none: None,
+                continued_guard: None,
             });
     }
 
@@ -17485,7 +17485,7 @@ impl Assembler {
         }
     }
 
-    /// Captures a direct named-handler continue and its first copied call or attribute None test.
+    /// Captures a direct named-handler continue and its first copied finalizer guard.
     pub(crate) fn record_copied_continue_handler_cleanup(&mut self, continue_item: usize) {
         use crate::target::opcodes::CALL;
 
@@ -17513,14 +17513,25 @@ impl Assembler {
             && matches!(records[6].1.operand(), Operand::Value(argument) if argument & 1 == 0)
             && matches!(records[7].1.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
             && records[7].1.local_policy.hidden_exception_owner_slots() == 3;
-        let marker_at = if attribute_none { 8 } else { 11 };
+        let truth_test = (matches!(
+            records[5].1.opcode,
+            LOAD_FAST | crate::target::opcodes::LOAD_DEREF
+        ) || (records[5].1.opcode == LOAD_GLOBAL
+            && records[5]
+                .1
+                .value_argument()
+                .is_some_and(|arg| arg & 1 == 0)))
+            && records[6].1.opcode == TO_BOOL
+            && matches!(records[7].1.opcode, POP_JUMP_IF_TRUE | POP_JUMP_IF_FALSE);
+        let short_guard = attribute_none || truth_test;
+        let marker_at = if short_guard { 8 } else { 11 };
         if records.len() <= marker_at {
             return;
         }
         let condition = &records[5..marker_at];
         let last = condition.last().expect("nonempty copied condition").1;
         let marker = records[marker_at].1;
-        let call = if attribute_none {
+        let call = if short_guard {
             None
         } else {
             let call: [Instruction; 6] = std::array::from_fn(|index| records[index + 5].1);
@@ -17636,7 +17647,7 @@ impl Assembler {
             if let Some(call) = call {
                 origin.continued_call = Some((call, marker));
             } else {
-                origin.continued_attribute_none =
+                origin.continued_guard =
                     Some((std::array::from_fn(|index| records[index + 5].1), marker));
             }
         }

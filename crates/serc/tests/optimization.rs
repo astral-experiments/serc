@@ -15,6 +15,29 @@ use serc::{
 };
 
 #[test]
+fn continued_handler_truth_tests_reuse_the_finalizer_pop() {
+    let source = r"async def retry(value, ready):
+    while ready:
+        try:
+            step(value)
+        except LookupError as cause:
+            if value:
+                await value.report()
+                continue
+        finally:
+            if value:
+                pass
+            finish(value)
+";
+    assert_matches_cpython_versions(
+        source,
+        "continued_truth.py",
+        &LEVELS,
+        &VERSIONS.map(|(version, _, _)| version),
+    );
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
