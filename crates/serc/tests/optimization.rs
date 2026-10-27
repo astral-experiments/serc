@@ -7377,6 +7377,22 @@ fn nested_tries_own_copied_finalizer_handler_cleanup() {
 }
 
 #[test]
+fn erased_handler_keeps_its_manager_exit_location() {
+    let source = r"with manager:
+    try:
+        raise Other()
+    except Error as err:
+        assert check(err)
+";
+    assert_matches_cpython_versions(
+        source,
+        "erased_handler_manager_exit.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn try_else_manager_returns_preserve_conditional_finalizer_entry() {
     let source = r"async def sample(manager, work, pending):
     try:

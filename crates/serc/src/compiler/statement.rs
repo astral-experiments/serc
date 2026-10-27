@@ -42584,11 +42584,16 @@ fn with_body_handler_exit_location(compiler: &Compiler<'_>, body: &[Stmt]) -> Op
         return None;
     }
 
-    let tail = handler
+    let Some(tail) = handler
         .body
         .iter()
         .rev()
-        .find(|statement| is_live(statement))?;
+        .find(|statement| is_live(statement))
+    else {
+        // With no live handler body, the dispatch instruction supplies the line
+        // for its restore and the following manager POP_BLOCK.
+        return Some(handler.range);
+    };
     let tail = match tail {
         Stmt::Try(inner)
             if compiler.context.python_version >= crate::PythonVersion::Py314
