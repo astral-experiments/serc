@@ -18946,7 +18946,11 @@ impl<'source> Compiler<'source> {
                                         )
                                     },
                                 )
-                                && copied_finally_has_guarded_pass_cleanup(context.body)))
+                                && (copied_finally_has_guarded_pass_cleanup(context.body)
+                                    || copied_finally_has_guarded_linear_cleanup(
+                                        context.body,
+                                        false,
+                                    ))))
                         && matches!(context.body.last(), Some(Stmt::If(tail))
                             if tail.elif_else_clauses.is_empty()
                                 && (!suite_contains_loop_break(&tail.body)
@@ -48789,7 +48793,14 @@ fn copied_finally_has_guarded_linear_cleanup(body: &[Stmt], captured_none_prefix
         statement.elif_else_clauses.is_empty()
             && condition_has_only_runtime_tests(&statement.test)
             && !expression_suspends_current_scope(&statement.test)
-            && linear_or_empty(leading)
+            // An open guard completes before the nested try. Its false edge
+            // and body both enter the cleanup without intercepting the continue.
+            && (linear_or_empty(leading)
+                || matches!(leading.split_last(), Some((Stmt::If(guard), prefix))
+                    if linear_or_empty(prefix) && guard.elif_else_clauses.is_empty()
+                        && condition_has_only_runtime_tests(&guard.test)
+                        && !expression_suspends_current_scope(&guard.test)
+                        && suite_has_linear_borrow_fallthrough(&guard.body)))
             && !cleanup.is_star
             && cleanup.orelse.is_empty()
             && (cleanup.handlers.is_empty() != cleanup.finalbody.is_empty())

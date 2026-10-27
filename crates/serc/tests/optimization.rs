@@ -190,6 +190,25 @@ assert events == [], events
 }
 
 #[test]
+fn guarded_continue_keeps_the_backedges_before_nested_cleanup() {
+    let source = "def sample(items, stop, left, right, flag):
+    for item in items:
+        try:
+            if stop:
+                continue
+        finally:
+            if left and right:
+                if flag:
+                    prepare()
+                try:
+                    use(item)
+                finally:
+                    finish()
+";
+    assert_matches_cpython(source, "guarded_continue_cleanup.py", &LEVELS);
+}
+
+#[test]
 fn guarded_finally_arms_keep_their_manager_exit_location() {
     for body in ["work(item)", "yield item"] {
         for condition in ["ready", "not ready", "ready is not None"] {
