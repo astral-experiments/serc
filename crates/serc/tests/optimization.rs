@@ -19066,3 +19066,19 @@ fn nested_conditional_arms_donate_implicit_return_locations() {
 ";
     assert_matches_cpython(source, "nested_implicit_returns.py", &LEVELS);
 }
+
+#[test]
+fn copied_manager_exit_discard_owns_the_finally_guard() {
+    let source = r"def run(flag, state):
+    try:
+        with open_0(), open_1(), open_2():
+            if flag:
+                return
+    except KeyError:
+        recover()
+    finally:
+        if state is None:
+            finish()
+";
+    assert_matches_cpython(source, "manager_exit_guard.py", &LEVELS);
+}

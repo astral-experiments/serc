@@ -10309,6 +10309,63 @@ impl LayoutAssembler {
                         );
                     }
                     if instruction.opcode == NOT_TAKEN {
+                        // Each manager contributes a POP_BLOCK before its five live exit
+                        // records. A marker at the last original discard inherits its handler.
+                        if owner_history_exact
+                            && tail.insertions == 0
+                            && tail.late_removals == 0
+                            && tail.post_compaction_fusions == 0
+                            && let [authored, exits @ .., load, guard] =
+                                &indexed_instructions[original_array_start..instruction_index]
+                            && authored.opcode == NOP
+                            && authored.location.line >= 0
+                            && !authored.fusion_policy.is_converted_pop_block()
+                            && matches!(
+                                load.opcode,
+                                crate::target::opcodes::LOAD_FAST
+                                    | crate::target::opcodes::LOAD_FAST_BORROW
+                                    | crate::target::opcodes::LOAD_FAST_CHECK
+                            )
+                            && load.local_policy.hidden_exception_owner_slots() == 1
+                            && matches!(guard.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+                            && guard.local_policy.hidden_exception_owner_slots() == 3
+                            && tail.early_removals
+                                == usize::from(load.local_policy.hidden_exception_owner_slots())
+                                    + usize::from(guard.local_policy.hidden_exception_owner_slots())
+                            && let (managers, []) = exits.as_chunks::<5>()
+                            && instruction_index - original_array_start == managers.len() * 6
+                            && managers.iter().all(|[one, two, three, call, pop]| {
+                                one.opcode == LOAD_CONST
+                                    && two.opcode == LOAD_CONST
+                                    && three.opcode == LOAD_CONST
+                                    && one.operand() == two.operand()
+                                    && two.operand() == three.operand()
+                                    && call.opcode == crate::target::opcodes::CALL
+                                    && call.value_argument() == Some(3)
+                                    && pop.opcode == POP_TOP
+                                    && [two, three, call, pop]
+                                        .iter()
+                                        .all(|i| i.location == one.location)
+                            })
+                            && !jump_targets.iter().any(|label| {
+                                label_positions.get(label).is_some_and(|position| {
+                                    original_array_start < *position
+                                        && *position <= instruction_index
+                                })
+                            })
+                            && let Some(region) = self.uniform_exception_owner(
+                                instruction_index - 4,
+                                instruction_index - 2,
+                                &label_positions,
+                            )
+                            && !self.exception_regions[region].preserve_lasti
+                            && !self.exception_regions[region].is_scope_fallback
+                        {
+                            owners.insert(
+                                instruction_index,
+                                ExceptionOwnerDecision::override_with_region(Some(region)),
+                            );
+                        }
                         if instruction.exception_policy().exclusion()
                             == super::ExceptionExclusion::None
                             && let Some((index, region)) = pending_normal_none_owner.take()
