@@ -42619,7 +42619,7 @@ impl<'source> Compiler<'source> {
         });
         let body_noop = body_noop.or_else(|| {
             (remaining.is_empty() && self.context.python_version >= crate::PythonVersion::Py314)
-                .then(|| with_body_guard_exit_location(body))
+                .then(|| with_body_guard_exit_location(self, body))
                 .flatten()
                 .map(WithBodyExitNoop::RetainedConvertedPopBlock)
         });
@@ -44672,9 +44672,8 @@ fn with_body_ends_in_terminal_try(body: &[Stmt]) -> bool {
         })
 }
 
-/// Finds the only false edge that reaches a manager's normal exit.
-/// Each taken branch leaves the manager before its original `POP_BLOCK`.
-fn with_body_guard_exit_location(mut body: &[Stmt]) -> Option<TextRange> {
+/// Finds the sole conditional path that reaches a manager's normal `POP_BLOCK`.
+fn with_body_guard_exit_location(compiler: &Compiler<'_>, mut body: &[Stmt]) -> Option<TextRange> {
     while let Some(Stmt::If(branch)) = body.last() {
         let mut tests = std::iter::once(branch.test.as_ref()).chain(
             branch
@@ -44697,7 +44696,23 @@ fn with_body_guard_exit_location(mut body: &[Stmt]) -> Option<TextRange> {
             if continuing.next().is_some() {
                 return None;
             }
-            continue;
+            let tail = body.last()?;
+            if matches!(tail, Stmt::If(_)) {
+                continue;
+            }
+            return match tail {
+                Stmt::Expr(expression)
+                    if matches!(expression.value.as_ref(), Expr::Call(_) | Expr::Await(_)) =>
+                {
+                    Some(expression.value.range())
+                }
+                Stmt::Assign(_) => Some(implicit_return_range(compiler, tail)),
+                Stmt::AugAssign(assignment) => Some(super::source::last_store_target_range(
+                    compiler,
+                    &assignment.target,
+                )),
+                _ => None,
+            };
         }
         let test = tests.next_back()?;
         if continuing.next().is_some() || !original_condition_has_unique_jump_target(test, false) {
