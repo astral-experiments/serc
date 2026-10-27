@@ -7267,10 +7267,15 @@ impl OptimizationPipeline {
                 && source_location.line < 0
                 && target_position == target_chain_end
                 && remaining_predecessors[source.index()] == 1
-                && matches!(graph[source].items(), [Item::Label(_), Item::Instruction(jump)]
-                    if jump.opcode == JUMP_FORWARD);
+                && graph[source]
+                    .last_instruction()
+                    .is_some_and(|jump| jump.opcode == JUMP_FORWARD);
             let assignment_return_join_location = if detached_return_join
                 && self.python_version == crate::PythonVersion::Py314
+                && matches!(
+                    graph[source].items(),
+                    [Item::Label(_), Item::Instruction(_)]
+                )
                 && let [
                     Item::Label(_),
                     Item::Instruction(load),
@@ -7311,6 +7316,12 @@ impl OptimizationPipeline {
             } else if detached_return_join
                 && self.python_version >= crate::PythonVersion::Py314
                 && inline_unprotected_return
+                && graph[source]
+                    .items()
+                    .iter()
+                    .filter_map(Item::as_instruction)
+                    .count()
+                    == 1
                 && super::normal_try_copies::original_local_tuple_return(graph[target].items())
                     .is_some()
                 && self
