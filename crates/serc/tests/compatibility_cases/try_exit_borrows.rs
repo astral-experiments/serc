@@ -2362,3 +2362,9 @@ fn terminal_deletion_preserves_original_return_boundary() {
         common::assert_matches_cpython_marshal(&source, "terminal_deletion_return.py");
     }
 }
+
+#[test]
+fn borrows_a_runtime_while_finalizer_with_local_breaks() {
+    let source = "def read(key, items, flag):\n    try:\n        while flag:\n            try:\n                item = next(items)\n            except End:\n                break\n            use(item)\n    except Error as exc:\n        save(exc)\n    finally:\n        if key is not None:\n            use(key)\n        while flag:\n            try:\n                close()\n                break\n            except Retry:\n                pass\n";
+    common::assert_matches_cpython_marshal(source, "cleanup_local_break.py");
+}
