@@ -7563,9 +7563,15 @@ impl Assembler {
     }
 
     /// Records the first erased ordinary-try POP before a return's remaining unwind.
-    pub(crate) fn record_name_return_pop_boundary(&mut self, boundary: Label, pop_count: usize) {
+    pub(crate) fn record_name_return_pop_boundary(
+        &mut self,
+        boundary: Label,
+        pop_count: usize,
+        location: SourceLocation,
+    ) {
         if self.python_version <= crate::PythonVersion::Py313 {
-            self.legacy_return_pop_blocks.insert(boundary, pop_count);
+            self.legacy_return_pop_blocks
+                .insert(boundary, (pop_count, location));
         }
         if !self.deferred_name_return_borrow_exits.is_empty() {
             self.name_return_pop_boundaries.insert(boundary);

@@ -31,7 +31,7 @@ impl Assembler {
     /// Restores erased return `POP_BLOCK` records until each legacy target's native removal phase.
     pub(super) fn restore_legacy_return_pop_blocks(
         graph: &mut BlockGraph,
-        boundaries: &FxHashMap<Label, usize>,
+        boundaries: &FxHashMap<Label, (usize, SourceLocation)>,
     ) {
         if boundaries.is_empty() {
             return;
@@ -43,13 +43,9 @@ impl Assembler {
                 match item {
                     Item::Instruction(instruction) => depth = instruction.depth_after(),
                     Item::Label(label) => {
-                        if let Some(&count) = boundaries.get(label) {
-                            let mut marker = Instruction::synthetic(
-                                NOP,
-                                Operand::Value(0),
-                                SourceLocation::NONE,
-                                depth,
-                            );
+                        if let Some(&(count, location)) = boundaries.get(label) {
+                            let mut marker =
+                                Instruction::synthetic(NOP, Operand::Value(0), location, depth);
                             marker.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
                             marker.fusion_policy.mark_converted_pop_block();
                             insertions.push((ItemPosition::new(block, offset + 1), marker, count));

@@ -1714,7 +1714,7 @@ pub(crate) struct Assembler {
     /// Exact materialized POP records after return-unwind region boundaries.
     pub(super) name_return_materialized_pops: Vec<super::exception_owners::OriginalPopBlockSpan>,
     /// Ordinary-return `POP_BLOCK` records needed by the legacy CFG copy phases.
-    pub(super) legacy_return_pop_blocks: FxHashMap<Label, usize>,
+    pub(super) legacy_return_pop_blocks: FxHashMap<Label, (usize, SourceLocation)>,
     /// Iterator-region aliases immediately following an ordinary-return POP boundary.
     pub(super) name_return_iterator_region_aliases: FxHashMap<Label, Label>,
     /// Disconnected loop exits and the normal entries that remain reachable.
