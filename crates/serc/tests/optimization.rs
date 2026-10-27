@@ -13259,6 +13259,28 @@ fn python312_terminal_stores_share_chained_condition_failures() {
 }
 
 #[test]
+fn manager_exit_uses_the_sole_false_operand_of_a_return_guard() {
+    for guard in ["first and second", "'ready' and second", "first or second"] {
+        let source = format!(
+            r"def guarded(manager, first, second):
+    with manager:
+        if {guard}:
+            return first
+
+def recovered(manager, first, second):
+    with manager:
+        try:
+            return second
+        except LookupError as error:
+            if {guard}:
+                return first
+"
+        );
+        assert_matches_cpython(&source, "guarded_manager_exit.py", &LEVELS);
+    }
+}
+
+#[test]
 fn manager_exit_inherits_its_only_continuing_branch() {
     let source = r"def gather(resource, flag, retry, alternate, value):
     with resource:
