@@ -5378,12 +5378,78 @@ impl Assembler {
                     }
                 }
                 Item::Instruction(instruction) => {
-                    if instructions.len() == 8 {
+                    if instructions.len() == 10 {
                         return None;
                     }
                     instructions.push(*instruction);
                 }
             }
+        }
+        // Removing the unprotected POP_BLOCK and folding PUSH_NULL into a global
+        // call leave its following truth marker inside the protected suffix.
+        if self.python_version == crate::PythonVersion::Py314
+            && truth
+            && let [
+                pop,
+                global,
+                arguments @ ..,
+                call,
+                discard,
+                load,
+                convert,
+                condition,
+            ] = instructions.as_slice()
+            && pop.opcode == NOP
+            && pop.location == SourceLocation::NONE
+            && pop.fusion_policy.is_converted_pop_block()
+            && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
+            && let Some(depth) = pop.depth_after()
+            && global.opcode == LOAD_GLOBAL
+            && global.value_argument().is_some_and(|name| name & 1 != 0)
+            && global.depth_after() == depth.checked_add(2)
+            && call.opcode == CALL
+            && matches!(call.value_argument(), Some(1 | 2))
+            && call.depth_after() == depth.checked_add(1)
+            && discard.opcode == POP_TOP
+            && discard.depth_after() == Some(depth)
+            && load.opcode == LOAD_FAST
+            && convert.opcode == TO_BOOL
+            && load.depth_after() == depth.checked_add(1)
+            && convert.depth_after() == load.depth_after()
+            && condition.depth_after() == Some(depth)
+            && condition.forward_target().is_some()
+            && convert.location == condition.location
+            && global.location.line >= 0
+            && global.location.end_line < load.location.line
+            && arguments
+                .iter()
+                .try_fold(0_u32, |count, arg| match arg.opcode {
+                    LOAD_FAST => count.checked_add(1),
+                    LOAD_ATTR
+                        if count > 0 && arg.value_argument().is_some_and(|name| name & 1 == 0) =>
+                    {
+                        Some(count)
+                    }
+                    _ => None,
+                })
+                == call.value_argument()
+            && prefix[prefix
+                .iter()
+                .rposition(|item| matches!(item, Item::Label(_)))?
+                + 1..]
+                .iter()
+                .copied()
+                .eq(instructions[1..].iter().copied().map(Item::Instruction))
+            && with_exclusions.iter().flatten().any(|(start, end)| {
+                leading_labels.contains(start)
+                    && labels.contains(end)
+                    && !leading_labels.contains(end)
+            })
+            && provenance
+                .original_primitive_condition_boundaries
+                .contains(condition)
+        {
+            return Some(true);
         }
         // The comparison folds into its original TO_BOOL record. In this complete
         // original array, removing that NOP and the normal POP leaves the appended

@@ -19066,3 +19066,26 @@ fn nested_conditional_arms_donate_implicit_return_locations() {
 ";
     assert_matches_cpython(source, "nested_implicit_returns.py", &LEVELS);
 }
+
+#[test]
+fn normal_finalizer_call_keeps_its_following_truth_marker() {
+    let source = r"def sample(value, flag):
+    with acquire():
+        try:
+            assert ready()
+        finally:
+            touch(value)
+            if not flag:
+                clean()
+";
+    for (index, source) in [source.to_owned(), source.replace("if not flag", "if flag")]
+        .iter()
+        .enumerate()
+    {
+        assert_matches_cpython(
+            source,
+            &format!("normal_finalizer_call_guard_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
