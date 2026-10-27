@@ -5389,8 +5389,16 @@ impl Assembler {
         // call leave its following truth marker inside the protected suffix.
         if self.python_version == crate::PythonVersion::Py314
             && truth
-            && let [pop, global, arguments @ .., call, discard, load, convert, condition] =
-                instructions.as_slice()
+            && let [
+                pop,
+                global,
+                arguments @ ..,
+                call,
+                discard,
+                load,
+                convert,
+                condition,
+            ] = instructions.as_slice()
             && pop.opcode == NOP
             && pop.location == SourceLocation::NONE
             && pop.fusion_policy.is_converted_pop_block()
@@ -5413,14 +5421,22 @@ impl Assembler {
             && convert.location == condition.location
             && global.location.line >= 0
             && global.location.end_line < load.location.line
-            && arguments.iter().try_fold(0_u32, |count, arg| match arg.opcode {
-                LOAD_FAST => count.checked_add(1),
-                LOAD_ATTR if count > 0 && arg.value_argument().is_some_and(|name| name & 1 == 0) => {
-                    Some(count)
-                }
-                _ => None,
-            }) == call.value_argument()
-            && prefix[prefix.iter().rposition(|item| matches!(item, Item::Label(_)))? + 1..]
+            && arguments
+                .iter()
+                .try_fold(0_u32, |count, arg| match arg.opcode {
+                    LOAD_FAST => count.checked_add(1),
+                    LOAD_ATTR
+                        if count > 0 && arg.value_argument().is_some_and(|name| name & 1 == 0) =>
+                    {
+                        Some(count)
+                    }
+                    _ => None,
+                })
+                == call.value_argument()
+            && prefix[prefix
+                .iter()
+                .rposition(|item| matches!(item, Item::Label(_)))?
+                + 1..]
                 .iter()
                 .copied()
                 .eq(instructions[1..].iter().copied().map(Item::Instruction))
@@ -5429,7 +5445,9 @@ impl Assembler {
                     && labels.contains(end)
                     && !leading_labels.contains(end)
             })
-            && provenance.original_primitive_condition_boundaries.contains(condition)
+            && provenance
+                .original_primitive_condition_boundaries
+                .contains(condition)
         {
             return Some(true);
         }
