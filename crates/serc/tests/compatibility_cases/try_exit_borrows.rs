@@ -2362,3 +2362,13 @@ fn terminal_deletion_preserves_original_return_boundary() {
         common::assert_matches_cpython_marshal(&source, "terminal_deletion_return.py");
     }
 }
+
+#[test]
+fn borrows_after_a_guarded_recovery_in_a_protected_body() {
+    for prefix in ["", "async "] {
+        let source = format!(
+            "{prefix}def resolve(key, retry):\n    try:\n        value = None\n        try:\n            value = parse(key)\n        except Error:\n            if retry:\n                try:\n                    value = parse(key)\n                except Error as exc:\n                    log(exc)\n        if value is not None:\n            save(value)\n    except Error:\n        report(key)\n",
+        );
+        common::assert_matches_cpython_marshal(&source, "protected_guarded_recovery.py");
+    }
+}
