@@ -6,8 +6,8 @@ use std::hash::{Hash, Hasher};
 use hashbrown::HashTable;
 use ruff_python_ast::visitor::{Visitor, walk_expr, walk_pattern, walk_stmt};
 use ruff_python_ast::{
-    BoolOp, Expr, ExprBinOp, ExprContext, ExprStringLiteral, ExprUnaryOp, FStringPartRef,
-    InterpolatedStringElement, Number, Operator, Pattern, Singleton, Stmt, UnaryOp,
+    BoolOp, Expr, ExprBinOp, ExprContext, ExprUnaryOp, FStringPartRef, InterpolatedStringElement,
+    Number, Operator, Pattern, Singleton, Stmt, UnaryOp,
 };
 use ruff_text_size::Ranged;
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
@@ -1910,16 +1910,13 @@ pub(super) enum PercentFormatPart<'a> {
     },
 }
 
-pub(super) fn optimized_percent_format(
-    expression: &ExprBinOp,
-    decode_literal: impl FnOnce(&ExprStringLiteral) -> Constant,
-) -> Option<Vec<PercentFormatPart<'_>>> {
+pub(super) fn optimized_percent_format<'a>(
+    expression: &'a ExprBinOp,
+    compiler: &Compiler<'_>,
+) -> Option<Vec<PercentFormatPart<'a>>> {
     if expression.op != Operator::Mod {
         return None;
     }
-    let Expr::StringLiteral(format) = expression.left.as_ref() else {
-        return None;
-    };
     let Expr::Tuple(arguments) = expression.right.as_ref() else {
         return None;
     };
@@ -1933,10 +1930,19 @@ pub(super) fn optimized_percent_format(
 
     // Percent-format syntax is ASCII, so parsing bytes preserves surrogate-pass UTF-8 in
     // literal fragments without changing the supported conversions or width/precision limits.
-    let format = match decode_literal(format) {
+    let format = match expression.left.as_ref() {
+        Expr::StringLiteral(literal) => compiler.string_literal_constant(literal),
+        // Through 3.13, the AST optimizer visits both operands before expanding
+        // percent formatting. Newer targets fold these strings after preprocessing.
+        left if compiler.context.python_version <= PythonVersion::Py313 => {
+            compiler.source_aware_fold_constant(left)?
+        }
+        _ => return None,
+    };
+    let format = match format {
         Constant::String(value) => value.into_bytes(),
         Constant::SurrogateString(value) => value,
-        _ => unreachable!("string literal decoding returns a string constant"),
+        _ => return None,
     };
     let mut position = 0;
     let mut argument_index = 0;

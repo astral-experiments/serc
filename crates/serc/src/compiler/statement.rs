@@ -6767,7 +6767,7 @@ impl<'source> Compiler<'source> {
                     self.assembler.set_location(SourceLocation::NONE);
                 } else {
                     let discarded_value = folded_boolean_value.unwrap_or(expression.value.as_ref());
-                    if matches!(discarded_value, Expr::BinOp(binary) if optimized_percent_format(binary, |literal| self.string_literal_constant(literal)).is_some())
+                    if matches!(discarded_value, Expr::BinOp(binary) if optimized_percent_format(binary, self).is_some())
                         && let Some(location) = self.assembler.last_instruction_location()
                     {
                         self.assembler.set_location(location);

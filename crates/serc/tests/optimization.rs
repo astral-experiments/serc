@@ -15,6 +15,15 @@ use serc::{
 };
 
 #[test]
+fn percent_formatting_uses_strings_folded_by_the_ast_optimizer() {
+    let source = r#"def format_values(x, y):
+    ("left %s " + "right %r") % (x, y)
+    return ("%s" * 2) % (x, y)
+"#;
+    assert_matches_cpython(source, "folded_formats.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:

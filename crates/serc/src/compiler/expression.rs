@@ -3272,9 +3272,7 @@ impl Compiler<'_> {
             // percent formatting, so it no longer has the required Tuple AST node.
             return Ok(SpecializedLowering::NotApplicable);
         }
-        let Some(parts) =
-            optimized_percent_format(expression, |literal| self.string_literal_constant(literal))
-        else {
+        let Some(parts) = optimized_percent_format(expression, self) else {
             return Ok(SpecializedLowering::NotApplicable);
         };
 
