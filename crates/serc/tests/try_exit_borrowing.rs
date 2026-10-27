@@ -2,6 +2,19 @@
 mod common;
 
 #[test]
+fn a_located_guard_exit_reaches_a_populated_finalizer() {
+    for cleanup in [
+        "try:\n            consume(value)\n        except Other:\n            pass",
+        "while ready:\n            consume(value)",
+    ] {
+        let source = format!(
+            "def close(value, ready):\n    try:\n        if ready:\n            return\n    except Error:\n        pass\n    finally:\n        {cleanup}\n    return value\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "located_guard_cleanup.py");
+    }
+}
+
+#[test]
 fn conditional_reraise_keeps_the_normal_finalizer_entry() {
     for alternative in ["", "        else:\n            handle(value)\n"] {
         let source = format!(

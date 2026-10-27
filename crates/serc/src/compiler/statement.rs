@@ -35218,18 +35218,7 @@ impl<'source> Compiler<'source> {
             ) || matches!(effective_body_tail, Some(Stmt::Assign(assignment))
                 if matches!(assignment.targets.as_slice(), [Expr::Name(_) | Expr::Attribute(_)])))
             && self.suite_has_nonempty_borrow_entry(&statement.finalbody)
-            && statement.handlers.iter().all(|handler| {
-                handler.as_except_handler().is_some_and(|handler| {
-                    handler.type_.is_some()
-                        && suite_has_plain_recovery_fallthrough(&handler.body, false)
-                        // A chained comparison has a separate operand-cleanup
-                        // block before the handler's ordinary false edge.
-                        && !suite_any_statement(&handler.body, |part| {
-                            matches!(part, Stmt::If(guard)
-                                if expression_contains_chained_comparison(&guard.test))
-                        })
-                })
-            });
+            && handlers_have_plain_recovery_fallthrough(statement);
         let compound_fallthrough_handlers_reach_finally = !statement.is_star
             // A leading runtime while starts a new array after the emptied handler join.
             && (self.context.python_version != crate::PythonVersion::Py314
@@ -39188,8 +39177,16 @@ impl<'source> Compiler<'source> {
         {
             self.assembler.admit_retained_compound_finally_entry(
                 protected_end,
-                self.source_location(test.range()),
+                Some(self.source_location(test.range())),
             );
+        } else if self.context.python_version == crate::PythonVersion::Py314
+            && !statement.is_star
+            && statement.orelse.is_empty()
+            && self.suite_has_nonempty_borrow_entry(&statement.finalbody)
+            && handlers_have_plain_recovery_fallthrough(statement)
+        {
+            self.assembler
+                .admit_retained_compound_finally_entry(protected_end, None);
         }
         if terminal
             && pass_finally_location.is_some()
@@ -47787,6 +47784,23 @@ fn nested_guarded_recovery_leaves_empty_borrow_exit(statement: &ruff_python_ast:
                                         && suite_has_linear_borrow_fallthrough(&cleanup.finalbody))
                         })))
         })
+        })
+}
+
+/// Requires each cold epilogue to retain its normal predecessor.
+fn handlers_have_plain_recovery_fallthrough(statement: &ruff_python_ast::StmtTry) -> bool {
+    !statement.handlers.is_empty()
+        && statement.handlers.iter().all(|handler| {
+            handler.as_except_handler().is_some_and(|handler| {
+                handler.type_.is_some()
+                    && suite_has_plain_recovery_fallthrough(&handler.body, false)
+                    // A chained comparison has a separate operand-cleanup block
+                    // before the handler's ordinary false edge.
+                    && !suite_any_statement(&handler.body, |part| {
+                        matches!(part, Stmt::If(guard)
+                            if expression_contains_chained_comparison(&guard.test))
+                    })
+            })
         })
 }
 

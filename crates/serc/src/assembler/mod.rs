@@ -6847,11 +6847,18 @@ impl Assembler {
     pub(crate) fn admit_retained_compound_finally_entry(
         &mut self,
         entry: Label,
-        location: SourceLocation,
+        expected_location: Option<SourceLocation>,
     ) {
+        if expected_location.is_none()
+            && (self.borrow_finally_entries.get(&entry) != Some(&None)
+                || !self.borrow_unreachable_blocks.contains(&entry)
+                || !self.borrow_jump_entry_labels.contains(&entry))
+        {
+            return;
+        }
         let items = self.linear_items();
         let aliases = trailing_labels(items).collect::<Vec<_>>();
-        if !aliases.contains(&entry) || location.line < 0 {
+        if !aliases.contains(&entry) {
             return;
         }
         let mut origins = self
@@ -6886,14 +6893,41 @@ impl Assembler {
         let Some(Item::Instruction(jump)) = items.get(jump_index) else {
             return;
         };
+        let location = jump.location;
+        if location.line < 0 || expected_location.is_some_and(|expected| expected != location) {
+            return;
+        }
         let mut original =
             Instruction::new(JUMP_FORWARD, Operand::Forward(target), location, Some(0));
-        original.jump_policy.mark_original_empty_join();
-        original.jump_policy.retain_redundant_nop_after_threading();
         original.jump_policy.prevent_small_exit_inlining();
-        original
-            .no_location_policy
-            .set_borrow_fallthrough(BorrowFallthrough::RetainedNopReachable);
+        if expected_location.is_none()
+            && jump.jump_policy.retained_nop() == ir::RetainedJumpNop::DirectTarget
+        {
+            // The stopped physical predecessor cannot enter this jump-only array.
+            // Its single incoming conditional keeps the located NOP reachable
+            // when the normal jump and finalizer become adjacent.
+            let mut incoming = items.iter().filter_map(|item| match item {
+                Item::Instruction(instruction)
+                    if matches!(instruction.operand(), Operand::Forward(label) | Operand::Backward(label)
+                        if source_aliases.contains(&label)) => Some(instruction),
+                _ => None,
+            });
+            if !matches!(items[..start].last(), Some(Item::Instruction(previous))
+                if crate::target::is_unconditional_jump(previous.opcode)
+                    || matches!(previous.opcode, RETURN_VALUE | RAISE_VARARGS | RERAISE))
+                || !matches!((incoming.next(), incoming.next()), (Some(condition), None)
+                    if crate::target::is_conditional_jump(condition.opcode))
+            {
+                return;
+            }
+            original.jump_policy.retain_nop_for_direct_target();
+        } else {
+            original.jump_policy.mark_original_empty_join();
+            original.jump_policy.retain_redundant_nop_after_threading();
+            original
+                .no_location_policy
+                .set_borrow_fallthrough(BorrowFallthrough::RetainedNopReachable);
+        }
         if *jump != original
             || !matches!(items.get(jump_index + 1), Some(Item::Label(_)))
             || !source_aliases.contains(&source)
