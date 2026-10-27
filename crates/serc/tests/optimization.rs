@@ -1959,6 +1959,34 @@ fn compound_handler_loop_exits_keep_separate_cleanup_copies() {
 }
 
 #[test]
+fn a_nested_return_guard_keeps_shared_fallthrough_unlocated() {
+    let source = r"def choose(obj, value):
+    if obj:
+        if value:
+            if ready():
+                pass
+            else:
+                value = create()
+                if ready() and 0 < value < 40:
+                    return value
+        else:
+            return value
+    return 512
+";
+    for test in [
+        "ready() and 0 < value < 40",
+        "ready() and check(value)",
+        "value",
+    ] {
+        assert_matches_cpython(
+            &source.replace("ready() and 0 < value < 40", test),
+            "nested_guard_fallthrough.py",
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn nested_recovery_reaches_a_separate_tuple_return() {
     let source = "def sample(flag, left, right):
     if flag:

@@ -52027,7 +52027,16 @@ pub(super) fn nested_if_exit_location(
         && let Some(Stmt::If(tail)) = clause.body.last()
         && let Some(tail_exit) = nested_if_exit_location(tail, allow_recursive_fallthrough)
         && match tail_exit {
-            NestedIfExitLocation::Unlocated => allow_recursive_fallthrough,
+            NestedIfExitLocation::Unlocated => {
+                // Each false edge of the final return guard still reaches this join.
+                // Its successful return cannot donate a line to their continuation.
+                allow_recursive_fallthrough
+                    || (tail.elif_else_clauses.is_empty()
+                        && matches!(tail.body.last(), Some(Stmt::Return(_)))
+                        && matches!(tail.test.as_ref(), Expr::BoolOp(_))
+                        && condition_jump_target_count(&tail.test, false) > 1
+                        && !suite_terminates(&statement.body))
+            }
             NestedIfExitLocation::Located(_) => {
                 !suite_terminates(&statement.body)
                     && statement
