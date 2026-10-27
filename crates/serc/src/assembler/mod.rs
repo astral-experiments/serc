@@ -7219,6 +7219,15 @@ impl Assembler {
 
     /// Keeps the empty backedge after an async loop's terminal break in the borrow walk.
     pub(crate) fn mark_terminal_async_break_borrow_boundary(&mut self, header: Label, exit: Label) {
+        self.mark_terminal_loop_break_borrow_boundary(header, exit, true);
+    }
+
+    fn mark_terminal_loop_break_borrow_boundary(
+        &mut self,
+        header: Label,
+        exit: Label,
+        has_iterator: bool,
+    ) {
         let mut tail = self
             .linear_items_mut()
             .iter_mut()
@@ -7231,14 +7240,27 @@ impl Assembler {
             && jump.fusion_policy.is_authored_break()
             && jump.forward_target() == Some(exit)
             && backedge.is_none_or(|edge| edge.location.line < 0 || edge.location == jump.location)
-            && tail.next().is_some_and(|discard| {
-                discard.opcode == POP_TOP && discard.location == jump.location
-            })
+            && (!has_iterator
+                || tail.next().is_some_and(|discard| {
+                    discard.opcode == POP_TOP && discard.location == jump.location
+                }))
         {
-            // The borrow barrier follows the removed jump onto the iterator discard.
+            // Removing the jump transfers its barrier to the preceding instruction.
             // A live jump still reaches its target or a copied terminal exit.
             jump.no_location_policy
                 .set_borrow_fallthrough(BorrowFallthrough::Barrier);
+        }
+    }
+
+    /// Binds a try-else fallthrough to the terminal break at its folded while exit.
+    pub(crate) fn mark_trailing_folded_while_break(&mut self) {
+        if let Some(&(header, exit, _)) = self
+            .folded_predecessor_sources
+            .iter()
+            .rev()
+            .find(|(_, exit, _)| trailing_labels(self.linear_items()).any(|label| label == *exit))
+        {
+            self.mark_terminal_loop_break_borrow_boundary(header, exit, false);
         }
     }
 
