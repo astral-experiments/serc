@@ -27268,7 +27268,19 @@ impl<'source> Compiler<'source> {
             });
             self.assembler
                 .set_location(location.unwrap_or(SourceLocation::NONE));
-            self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
+            // When the value-match exit copies a return, the POP_BLOCK and the
+            // replaced jump acquire the same pattern line. CPython keeps the
+            // jump's NOP, which belongs to the surrounding coroutine handler.
+            let policy = if ordinary_match_pop
+                && named_coroutine_handler
+                && matches!(statement.body.last(), Some(Stmt::Match(matched))
+                    if matched.cases.last().is_some_and(|case| matches!(case.pattern, Pattern::MatchValue(_))))
+            {
+                ExceptionPolicy::default()
+            } else {
+                ExceptionPolicy::EXCLUDE_ALWAYS
+            };
+            self.emit_with_exception_policy(NOP, 0, 0, policy)?;
             self.assembler.mark_last_as_converted_pop_block();
             if sole_fallthrough_pop_location.is_some() {
                 self.assembler.record_original_fallthrough_pop_block();
