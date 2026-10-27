@@ -38818,12 +38818,32 @@ impl<'source> Compiler<'source> {
                 .active_exception_region_exclusions
                 .len()
                 == 1;
+        // In 3.12 the authored Pass and its normal skip jump follow the inner
+        // POP_BLOCK. Both still belong to the single enclosing try or handler.
+        let legacy_pass_owner = self.context.python_version == crate::PythonVersion::Py312
+            && pass_finally_location.is_some()
+            && !statement.is_star
+            && statement.handlers.is_empty()
+            && statement.orelse.is_empty()
+            && self.control.exceptions.active_exception_group_handlers == 0
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.finally.active_finally_try_bodies == 0
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .len()
+                == 1;
         let pass_exit_exception_depth = pass_exit_enclosing_finally_depth
             .or(pass_exit_generator_owner.then_some(0))
             .or(pass_exit_try_body_owner.then_some(1))
             .or(pass_exit_legacy_finally_owner.then_some(1))
             .or(pass_exit_legacy_normal_finally_owner.then_some(1))
-            .or(pass_exit_legacy_terminal_try_body_owner.then_some(1));
+            .or(pass_exit_legacy_terminal_try_body_owner.then_some(1))
+            .or(legacy_pass_owner.then_some(1));
         let overriding_return = matches!(statement.finalbody.last(), Some(Stmt::Return(_)));
         if overriding_return
             && self.control.withs.active_with_region_exclusions.is_empty()

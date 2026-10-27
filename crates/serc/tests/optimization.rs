@@ -20037,6 +20037,33 @@ print(json.dumps(rows))
 }
 
 #[test]
+fn legacy_pass_finalizer_retains_its_enclosing_try_and_handler() {
+    let source = r"def guarded(values):
+    for value in values:
+        try:
+            if selected(value):
+                try:
+                    work(value)
+                finally:
+                    pass
+        except KeyError:
+            pass
+
+def handled(value):
+    while ready():
+        try:
+            handle(value)
+        except KeyError:
+            try:
+                work(value)
+            finally:
+                pass
+    done()
+";
+    assert_matches_cpython(source, "guarded_pass_finalizer.py", &LEVELS);
+}
+
+#[test]
 fn legacy_nested_finally_pass_keeps_outer_owner() {
     const SOURCE: &str = "def f(work, cleanup, after):\n    try:\n        try:\n            work()\n        finally:\n            pass\n        after()\n    finally:\n        cleanup()\n";
     const TERMINAL: &str = "def f(work, cleanup):\n    try:\n        try:\n            work()\n        finally:\n            pass\n    finally:\n        cleanup()\n";
