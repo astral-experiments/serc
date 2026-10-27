@@ -921,7 +921,16 @@ impl Compiler<'_> {
                     && self.control.withs.active_with_region_exclusions.is_empty()
                     && !self.control.in_exception_handler()
                     && self.control.finally.is_inactive_for_return_unwind();
-                let unlocated_subject_exit = elided_case_body || unlocated_pattern_exit;
+                // The OR success block pops the matched alternative, then the copied
+                // subject. At a loop tail an erased body leaves the second pop with
+                // no following line, including when an intervening try exit is copied.
+                let unlocated_subject_exit = elided_case_body
+                    || unlocated_pattern_exit
+                    || (erased_subject
+                        && case.guard.is_none()
+                        && matches!(case.pattern, Pattern::MatchOr(_))
+                        && self.control.in_loop()
+                        && !match_has_following);
                 if copied_subject {
                     let location = if self.context.python_version <= PythonVersion::Py313 {
                         self.source_location(case.pattern.range())

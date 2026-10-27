@@ -15918,6 +15918,25 @@ fn erased_match_capture_body_drops_redundant_success_nop() {
 }
 
 #[test]
+fn erased_or_pattern_in_a_protected_loop_keeps_its_subject_pop_unlocated() {
+    let source = r"def scan(items, flag):
+    for value in items:
+        try:
+            match value:
+                case (
+                    1
+                    | 2
+                ):
+                    assert flag
+                case captured if flag:
+                    pass
+        except ValueError:
+            pass
+";
+    assert_matches_cpython(source, "erased_or_loop.py", &LEVELS);
+}
+
+#[test]
 fn erased_match_cases_keep_unlocated_loop_exits() {
     let source = r"def f(items):
     for item in items:
