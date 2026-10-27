@@ -29485,13 +29485,25 @@ impl<'source> Compiler<'source> {
                     _ => None,
                 })
                 .flatten()
-                .or_else(|| {
-                    // A try's while-else exit retains its existing cleanup donor rules.
-                    // Only a final for-else condition adds a newly certified donor here.
-                    let Some(Stmt::For(_)) = normal_exit_suite.last() else {
-                        return None;
-                    };
-                    loop_false_fallthrough_range(normal_exit_suite)
+                .or_else(|| match normal_exit_suite.last()? {
+                    Stmt::While(loop_statement)
+                        if !statement.orelse.is_empty()
+                            && self.context.python_version >= crate::PythonVersion::Py314
+                            && self.control.withs.active_with_exits.is_empty()
+                            && loop_statement.orelse.is_empty()
+                            && !suite_contains_loop_break(&loop_statement.body)
+                            && early_condition_truthiness(&loop_statement.test).is_none()
+                            && original_condition_has_unique_jump_target(
+                                &loop_statement.test,
+                                false,
+                            ) =>
+                    {
+                        // The loop's false edge alone reaches the try-else exit.
+                        // A surrounding manager supplies its own cleanup location.
+                        Some(while_condition_exit_range(&loop_statement.test))
+                    }
+                    Stmt::For(_) => loop_false_fallthrough_range(normal_exit_suite),
+                    _ => None,
                 });
             let nested_else_while_exit_location = if !statement.is_star
                 && statement.orelse.is_empty()
