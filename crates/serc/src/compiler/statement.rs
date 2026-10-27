@@ -12223,6 +12223,33 @@ impl<'source> Compiler<'source> {
                     {
                         self.assembler.preserve_last_no_location();
                     }
+                    // A conditional expression finishes in its own join. The ordinary
+                    // try and enclosing finally each contribute a POP_BLOCK to that
+                    // array before the copied guard. Only one return NOP survives.
+                    if self.context.python_version == crate::PythonVersion::Py314
+                        && preserve_tos
+                        && starts_jump_target
+                        && context_index == 0
+                        && return_finally_contexts.len() == 1
+                        && handler_count == 0
+                        && finally_context.try_body_depth == 0
+                        && finally_context.exception_region_depth == 0
+                        && self.control.exceptions.active_try_marker_slots.len() == 1
+                        && self
+                            .control
+                            .exceptions
+                            .active_exception_region_exclusions
+                            .len()
+                            == 2
+                        && self.control.loops.contexts.is_empty()
+                        && matches!(self.control.withs.active_with_exits.as_slice(), [manager] if !manager.is_async && manager.loop_depth == 0 && manager.exception_region_depth == 0)
+                        && finally_context.with_depth == 1
+                        && next_with == 1
+                        && matches!(statement.value.as_deref(), Some(Expr::If(choice)) if jump_constant_truthiness(&choice.test).is_none())
+                        && matches!(finally_context.body.first(),Some(Stmt::If(guard)) if matches!(guard.test.as_ref(),Expr::Name(_)))
+                    {
+                        self.assembler.add_last_hidden_exception_owner_slots(1);
+                    }
                     self.assembler.record_name_return_materialized_pop();
                     // A copied inner finally remains protected by the next outer finally. The
                     // outermost copy runs after every protected region has been unwound.
