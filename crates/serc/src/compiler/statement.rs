@@ -18115,7 +18115,14 @@ impl<'source> Compiler<'source> {
                     if self.context.python_version >= crate::PythonVersion::Py314
                         && let Some(tail) = body.last()
                         && (matches!(tail, Stmt::Expr(expr) if is_literal_constant(&expr.value))
-                            || (matches!(tail, Stmt::Pass(_)) && !pass_only_body))
+                            || matches!(
+                                body,
+                                [
+                                    ..,
+                                    Stmt::Expr(_) | Stmt::Assign(_) | Stmt::AugAssign(_),
+                                    Stmt::Pass(_)
+                                ]
+                            ))
                     {
                         self.assembler.preserve_distinct_noop_exit(
                             branch_exit,
