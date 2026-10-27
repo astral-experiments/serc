@@ -52241,6 +52241,15 @@ fn suite_has_shared_terminal_condition_exit(body: &[Stmt]) -> bool {
                 && !suite_contains_loop_break(&statement.body)
                 && condition_jump_target_count(&statement.test, false) > 1
         }
+        Some(Stmt::For(iterator))
+            if !iterator.is_async && !suite_contains_loop_break(&iterator.body) =>
+        {
+            // The else arms jump to one unlocated return. Each copied exit
+            // inherits its own fallthrough line before the final arm reaches it.
+            matches!(iterator.orelse.last(), Some(Stmt::If(guard))
+                if guard.elif_else_clauses.last().is_some_and(|clause| clause.test.is_none())
+                    && if_suites(guard).any(|arm| !suite_terminates_before_constant_folding(arm)))
+        }
         _ => false,
     }
 }

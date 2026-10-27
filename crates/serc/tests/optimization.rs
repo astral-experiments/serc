@@ -8856,6 +8856,23 @@ fn managed_while_else_preserves_nested_branch_exits() {
 }
 
 #[test]
+fn loop_else_branches_locate_each_copy_of_an_implicit_return() {
+    let source = r"def choose(values, early, ready):
+    if early:
+        prepare()
+    else:
+        for value in values:
+            work(value)
+        else:
+            if ready:
+                yield first()
+            else:
+                yield second()
+";
+    assert_matches_cpython(source, "loop_else_branch_returns.py", &LEVELS);
+}
+
+#[test]
 fn coroutine_for_else_return_keeps_shared_branch_exit() {
     let source = r"async def sample(items, step, flag, left, right, third, work):
     for item in items:
