@@ -5488,7 +5488,9 @@ impl<'source> Compiler<'source> {
                                                     },
                                                     retained_chained_comparison_exit,
                                                     |compiler| {
-                                                        compiler.compile_statement_if_condition(test, next)
+                                                        compiler.compile_statement_if_condition(
+                                                            test, next,
+                                                        )
                                                     },
                                                 )
                                             },
@@ -15207,7 +15209,11 @@ impl<'source> Compiler<'source> {
     }
 
     /// Captures a taken constant that skips the statement's original true arm.
-    fn compile_statement_if_condition(&mut self, test: &Expr, next: Label) -> Result<(), CompileError> {
+    fn compile_statement_if_condition(
+        &mut self,
+        test: &Expr,
+        next: Label,
+    ) -> Result<(), CompileError> {
         let start = self.assembler.item_count();
         self.compile_jump_if(test, false, next)?;
         if self.context.python_version == crate::PythonVersion::Py314 {

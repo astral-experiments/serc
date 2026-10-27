@@ -7287,7 +7287,10 @@ impl Assembler {
 
     /// Records a taken constant at the entry of an authored if condition.
     pub(crate) fn record_taken_if_borrow_jump(&mut self, start: usize, target: Label) {
-        let Some(jump) = self.linear_items()[start..].iter().find_map(Item::as_instruction) else {
+        let Some(jump) = self.linear_items()[start..]
+            .iter()
+            .find_map(Item::as_instruction)
+        else {
             return;
         };
         if jump.forward_target() == Some(target)
@@ -7295,7 +7298,9 @@ impl Assembler {
             && jump.no_location_policy.borrow_fallthrough() == BorrowFallthrough::BarrierIfRemoved
         {
             let original = *jump;
-            self.exception_owner_provenance.taken_constant_borrow_jumps.insert(original);
+            self.exception_owner_provenance
+                .taken_constant_borrow_jumps
+                .insert(original);
         }
     }
 
