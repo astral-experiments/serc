@@ -6455,6 +6455,35 @@ fn iterator_handler_returns_preserve_conditional_finalizer_entry() {
 }
 
 #[test]
+fn copied_assignment_preserves_the_outer_finalizer_pop() {
+    let source = r"async def run(obj, flag):
+    def receiver():
+        return obj
+    try:
+        while flag:
+            try:
+                await obj.ready()
+                obj.record(flag, None)
+                return
+            except ValueError as error:
+                recover()
+            finally:
+                flag = None
+    except LookupError as error:
+        recover()
+    finally:
+        if obj.first is not None or obj.other:
+            close()
+";
+    assert_matches_cpython_versions(
+        source,
+        "assignment_finally.py",
+        &LEVELS,
+        &[PythonVersion::Py314],
+    );
+}
+
+#[test]
 fn inner_try_return_preserves_the_named_cleanup_owner() {
     let source = r"async def run(value, flag, active):
     try:

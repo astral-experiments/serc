@@ -275,6 +275,7 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) continued_handler_try_prefixes: Vec<OriginalPopBlockSpan>,
     pub(super) copied_handler_finally_pops: Vec<OriginalPopBlockSpan>,
     pub(super) copied_method_cleanup_pop_spans: Vec<OriginalPopBlockSpan>,
+    pub(super) copied_assignment_finally_guards: Vec<[Instruction; 7]>,
     pub(super) iterator_return_pop_spans: Vec<(Instruction, OriginalPopBlockSpan)>,
     pub(super) fused_manager_owners: Vec<(Instruction, Instruction, super::ExceptionRegion)>,
     pub(super) handler_dispatch_arrays: Vec<HandlerDispatchArray>,
@@ -593,6 +594,11 @@ impl ExceptionOwnerProvenance {
             .chain(&self.copied_finally_none_prefixes)
             .map(|origin| &origin.2)
             .chain(
+                self.copied_assignment_finally_guards
+                    .iter()
+                    .map(|prefix| &prefix[5]),
+            )
+            .chain(
                 self.normal_finally_method_none_prefixes
                     .iter()
                     .map(|prefix| &prefix[4]),
@@ -801,6 +807,11 @@ impl ExceptionOwnerProvenance {
             visit(&mut record.0);
             visit(&mut record.1);
             visit(&mut record.2);
+        }
+        for prefix in &mut self.copied_assignment_finally_guards {
+            for instruction in prefix {
+                visit(instruction);
+            }
         }
         for prefix in &mut self.normal_finally_method_none_prefixes {
             for instruction in prefix.iter_mut() {
@@ -5708,9 +5719,7 @@ impl LayoutAssembler {
                 origin.items.last() == Some(&Item::Instruction(*instructions[marker]))
                     && positions.get(&origin.entry) == Some(&array)
             });
-        let Some(origin) = matching.next() else {
-            return None;
-        };
+        let origin = matching.next()?;
         if matching.next().is_some()
             || !provenance.source_boundaries.contains(&origin.entry)
             || !provenance.block_boundaries.contains(&origin.entry)
@@ -5774,9 +5783,7 @@ impl LayoutAssembler {
                         // Only the captured finalizer POP is erased from this live prefix.
                         continue;
                     }
-                    let Some(actual) = instructions.get(live) else {
-                        return None;
-                    };
+                    let actual = instructions.get(live)?;
                     if offset == origin.unwind_offset + 6 {
                         expected.local_policy.add_hidden_exception_owner_slots(1);
                     }
@@ -9555,6 +9562,43 @@ impl LayoutAssembler {
                                 ExceptionOwnerDecision::override_with_region(source_region),
                             );
                         }
+                    }
+                    // One earlier fold selects the first outer POP; with none the
+                    // marker lands on the second. Both array slots are unowned.
+                    if instruction.opcode == NOT_TAKEN
+                        && instruction.exception_policy() == super::ExceptionPolicy::NonePresent
+                        && owner_history_exact
+                        && (5..=6).contains(&tail.early_removals)
+                        && tail.insertions == 0
+                        && tail.late_removals == 0
+                        && tail.post_compaction_fusions == 0
+                        && owners
+                            .get(instruction_index)
+                            .is_none_or(|owner| !owner.is_definitive())
+                        && original_array_start + 6 <= instruction_index
+                        && provenance
+                            .copied_assignment_finally_guards
+                            .iter()
+                            .any(|prefix| {
+                                indexed_instructions[instruction_index - 6..=instruction_index]
+                                    .iter()
+                                    .zip(prefix)
+                                    .all(|(actual, expected)| {
+                                        let mut expected = *expected;
+                                        if expected.opcode == crate::target::opcodes::LOAD_FAST
+                                            && actual.opcode
+                                                == crate::target::opcodes::LOAD_FAST_BORROW
+                                        {
+                                            expected.opcode = actual.opcode;
+                                        }
+                                        **actual == expected
+                                    })
+                            })
+                    {
+                        owners.insert(
+                            instruction_index,
+                            ExceptionOwnerDecision::override_with_region(None),
+                        );
                     }
                     // A bare return through two unnamed handlers retains both POP_EXCEPTs.
                     // Its late marker reuses the second POP_EXCEPT's original array cell.
