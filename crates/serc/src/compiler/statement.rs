@@ -2500,13 +2500,39 @@ impl<'source> Compiler<'source> {
                 && body[index + 1..]
                     .iter()
                     .all(|part| self.context.is_elided_statement(part));
+            // Erased assertions leave the generator's false edge and the end of
+            // its taken arm as separate implicit returns.
+            let terminal_generator_if_before_elided = has_elided_tail
+                && final_expression_becomes_return
+                && self.context.python_version >= crate::PythonVersion::Py313
+                && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == CO_GENERATOR
+                && self.control.statements.in_terminal_if_branch_suite
+                && !inherited_statement_has_following
+                && self.control.loops.contexts.is_empty()
+                && self.control.withs.active_with_exits.is_empty()
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty()
+                && !self.control.in_exception_handler()
+                && self.control.finally.is_inactive_for_return_unwind()
+                && matches!(statement, Stmt::If(branch)
+                    if branch.elif_else_clauses.is_empty()
+                        && condition_has_linear_runtime_leaves(&branch.test)
+                        && !expression_suspends_current_scope(&branch.test)
+                        && matches!(branch.body.as_slice(), [Stmt::Pass(_) | Stmt::Return(_) | Stmt::Expr(_)]))
+                && body[index + 1..]
+                    .iter()
+                    .all(|part| self.context.is_elided_statement(part));
             let terminal_if_before_elided = terminal_before_elided_assertions
                 || terminal_expression_if_before_elided
                 || terminal_nested_before_elided
                 || protected_terminal_if_before_elided
                 || unprotected_if_before_elided
                 || linear_protected_if_before_elided
-                || finally_if_before_elided;
+                || finally_if_before_elided
+                || terminal_generator_if_before_elided;
             // An assignment with an inlined comprehension becomes terminal when
             // only removed assertions follow it; retain its target's return span.
             let terminal_assignment_before_elided = has_elided_tail

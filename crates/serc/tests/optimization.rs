@@ -18587,6 +18587,20 @@ async def run(record, select, ready):
 }
 
 #[test]
+fn a_generator_keeps_each_terminal_guard_exit_before_erased_assertions() {
+    let source = r"def visit(enabled, ready, value):
+    if enabled:
+        yield value
+        if ready:
+            yield value
+        assert ready
+    else:
+        finish()
+";
+    assert_matches_cpython(source, "generator_guard_footer.py", &LEVELS);
+}
+
+#[test]
 fn erased_loop_branches_preserve_terminal_returns() {
     let source = r"
 def run(data, items, consume, flag):
