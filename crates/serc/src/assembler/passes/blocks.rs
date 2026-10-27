@@ -8244,6 +8244,17 @@ impl OptimizationPipeline {
                 if target_terminal_opcode
                     .is_some_and(|opcode| ends_scope(opcode) || opcode == JUMP_BACKWARD)
                     || target_has_artificial_eval_break
+                    // A Boolean value discard can acquire its operand's line only after
+                    // further exit copying. Keep the following handler pop attached to it.
+                    || (target_terminal_opcode == Some(JUMP_FORWARD)
+                        && graph[source].items().iter().rev().filter_map(Item::as_instruction)
+                            .nth(1).is_some_and(|instruction| {
+                                instruction.opcode == POP_TOP
+                                    && instruction.no_location_policy.copy_inherits_shared_predecessor()
+                            })
+                        && copied.iter().filter_map(Item::as_instruction)
+                            .map(|instruction| instruction.opcode)
+                            .eq([POP_EXCEPT, JUMP_FORWARD]))
                 {
                     copied_exit_or_eval_entry_labels.insert(copied_label);
                     // A later copy of this array must also cross copied interior

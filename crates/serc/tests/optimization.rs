@@ -96,6 +96,21 @@ fn reraising_cleanup_leaves_one_iterator_discard_predecessor() {
 }
 
 #[test]
+fn copied_handler_cleanup_inherits_each_boolean_operand_location() {
+    let source = r"def scan(items, enabled):
+    for item in items:
+        try:
+            consume(item)
+        except LookupError:
+            if enabled:
+                item and report(item)
+            else:
+                raise
+";
+    assert_matches_cpython(source, "boolean_handler_cleanup.py", &LEVELS);
+}
+
+#[test]
 fn post_try_fusion_survives_the_removed_fallthrough_jump() {
     let source = r"import checks
 
