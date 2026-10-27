@@ -4398,6 +4398,33 @@ fn continue_from_nested_handlers_keeps_the_finalizer_setup_unowned() {
 }
 
 #[test]
+fn a_named_handler_still_owns_the_finally_copied_on_its_return() {
+    let source = r"def choose(value):
+    try:
+        return read(value)
+    except ValueError as first:
+        try:
+            try:
+                return retry(first)
+            except RuntimeError as second:
+                try:
+                    return fallback(second)
+                finally:
+                    release(second)
+        finally:
+            reset(value)
+";
+    assert_matches_cpython(source, "named_handler_finalizer.py", &LEVELS);
+    assert_matches_cpython(
+        &source
+            .replace(" as first", "")
+            .replace("retry(first)", "retry(value)"),
+        "unnamed_outer_handler_finalizer.py",
+        &LEVELS,
+    );
+}
+
+#[test]
 fn named_handler_return_keeps_the_nested_finalizer_setup_unowned() {
     let source = r"def sample(items, flag, value):
     with lock():
