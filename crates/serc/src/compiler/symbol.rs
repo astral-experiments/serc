@@ -111,6 +111,37 @@ impl ReraiseStackState {
     }
 }
 
+/// Whether lowering this definition or a nested definition can assemble annotation locals.
+fn definition_contains_annotation_scope(statement: &Stmt) -> bool {
+    struct AnnotationScope(bool);
+    impl<'ast> Visitor<'ast> for AnnotationScope {
+        fn visit_stmt(&mut self, statement: &'ast Stmt) {
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_stmt(statement));
+            }
+            if matches!(statement, Stmt::TypeAlias(_)) {
+                self.0 = true;
+            } else if !self.0 {
+                walk_stmt(self, statement);
+            }
+        }
+
+        fn visit_annotation(&mut self, _annotation: &'ast Expr) {
+            self.0 = true;
+        }
+
+        fn visit_type_params(&mut self, _params: &'ast ruff_python_ast::TypeParams) {
+            self.0 = true;
+        }
+
+        fn visit_expr(&mut self, _expression: &'ast Expr) {}
+    }
+
+    let mut annotations = AnnotationScope(false);
+    annotations.visit_stmt(statement);
+    annotations.0
+}
+
 impl Compiler<'_> {
     fn name_id(&self, name: &str) -> Option<NameId> {
         self.context.scopes.names.get(name)
@@ -1044,10 +1075,12 @@ impl Compiler<'_> {
         }
 
         impl<'ast> Collector<'_, '_, 'ast> {
-            /// Modern annotation scopes intern their locals even when their definition is discarded.
-            fn needs_discarded_definition(&self) -> bool {
+            /// Discarded annotation scopes intern their locals before the code is removed.
+            fn needs_discarded_definition(&self, statement: &Stmt) -> bool {
                 self.record_string_origins
-                    && (self.build_discarded || self.python_version >= PythonVersion::Py314)
+                    && (self.build_discarded
+                        || self.python_version >= PythonVersion::Py314
+                            && definition_contains_annotation_scope(statement))
             }
 
             fn legacy_folded_constant(&self, expression: &Expr) -> Option<Constant> {
@@ -1366,7 +1399,7 @@ impl Compiler<'_> {
                         return;
                     }
                     Stmt::FunctionDef(definition) => {
-                        let build = self.needs_discarded_definition();
+                        let build = self.needs_discarded_definition(statement);
                         if build {
                             self.flush_origins();
                             self.actions.push(SkippedAction::Statement(statement));
@@ -1464,7 +1497,7 @@ impl Compiler<'_> {
                         return;
                     }
                     Stmt::ClassDef(definition) => {
-                        let build = self.needs_discarded_definition();
+                        let build = self.needs_discarded_definition(statement);
                         if build {
                             self.flush_origins();
                             self.actions.push(SkippedAction::Statement(statement));
@@ -1514,7 +1547,7 @@ impl Compiler<'_> {
                         self.constants.push(Constant::None);
                         return;
                     }
-                    Stmt::TypeAlias(alias) if self.needs_discarded_definition() => {
+                    Stmt::TypeAlias(alias) if self.needs_discarded_definition(statement) => {
                         self.flush_origins();
                         self.actions.push(SkippedAction::Statement(statement));
                         if let Expr::Name(name) = alias.name.as_ref() {

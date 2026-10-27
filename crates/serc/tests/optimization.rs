@@ -20,6 +20,8 @@ fn annotation_locals_intern_matching_constant_tuple_slots() {
         "def annotated(value: int): pass\ndef literal(): return '.format'\n",
         "def literal(): return ('x.format'[1:],)\nif False:\n    def annotated(value: int): pass\n",
         "seed = None\nif False:\n    type Answer = int\ndef literal(): return '.format'\n",
+        "seed = None\nif False:\n    def outer():\n        def inner() -> int: pass\ndef literal(): return '.format'\n",
+        "seed = None\nif False:\n    def generic[T: int](): pass\ndef literal(): return '.format'\n",
         "class C:\n    def annotated(value: int): pass\ndef literal(): return ('.format', '__classdict__')\n",
     ] {
         assert_matches_cpython(source, "annotation_locals.py", &LEVELS);
