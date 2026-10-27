@@ -13370,7 +13370,7 @@ impl LayoutAssembler {
             })
         {
             return None;
-        };
+        }
         let region = self.uniform_exception_owner(source - 1, source + 1, positions)?;
         (!self.exception_regions[region].is_scope_fallback
             && !self.exception_regions[region].preserve_lasti)
