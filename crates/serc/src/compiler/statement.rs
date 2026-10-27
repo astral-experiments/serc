@@ -37245,6 +37245,31 @@ impl<'source> Compiler<'source> {
                 || statement.finalbody.first().is_some_and(|entry| {
                     suite_has_nonsuspending_linear_fallthrough(std::slice::from_ref(entry))
                 }));
+        // The false paths of nested reraise guards converge on POP_EXCEPT.
+        // Moving that recovery cold leaves a completed protected operation
+        // adjacent to normal cleanup, including inside a loop or manager.
+        let nested_reraise_reaches_finally = self.context.python_version
+            == crate::PythonVersion::Py314
+            && synchronous_recovery
+            && !statement.is_star
+            && statement.orelse.is_empty()
+            && !self.control.in_exception_handler()
+            && self.control.finally.is_inactive_for_return_unwind()
+            && suite_has_nonsuspending_linear_fallthrough(&statement.body)
+            && suite_has_nonsuspending_linear_fallthrough(&statement.finalbody)
+            && matches!(statement.handlers.as_slice(), [handler]
+            if handler.as_except_handler().is_some_and(|handler| {
+                matches!(handler.type_.as_deref(), Some(Expr::Name(_)))
+                    && handler.name.is_some()
+                    && matches!(handler.body.split_last(), Some((Stmt::If(guard), prefix))
+                        if (prefix.is_empty()
+                            || suite_has_nonsuspending_linear_fallthrough(prefix)
+                            || suite_has_linear_reraise_guards(prefix))
+                            && guard.elif_else_clauses.is_empty()
+                            && condition_has_linear_runtime_leaves(&guard.test)
+                            && !expression_suspends_current_scope(&guard.test)
+                            && suite_has_linear_reraise_guards(&guard.body))
+            }));
         let conditional_handler_reaches_finally = !statement.is_star
             && (statement.orelse.is_empty()
                 || linear_else_returning_recovery
@@ -38153,6 +38178,7 @@ impl<'source> Compiler<'source> {
             || dispatcher_break_reaches_finally
             || inner_try_break_loop_range.is_some()
             || conditional_handler_reaches_finally
+            || nested_reraise_reaches_finally
             || nested_fallthrough_handler_reaches_finally
             || managed_recovery_reaches_finally
             || managed_coroutine_recovery_reaches_finally
