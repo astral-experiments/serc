@@ -2,6 +2,16 @@
 mod common;
 
 #[test]
+fn nested_bare_dispatch_separates_the_normal_successor() {
+    for handler in ["except:", "except Other:"] {
+        let source = format!(
+            "def recover(value):\n    try:\n        work(value)\n    except Error:\n        try:\n            clean(value)\n        {handler}\n            pass\n        log(value)\n    consume(value)\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "nested_bare_dispatch.py");
+    }
+}
+
+#[test]
 fn nested_recovery_blocks_later_conditional_borrow_entry() {
     for inner in ["if other:\n                    use(value)", "use(value)"] {
         let source = format!(
