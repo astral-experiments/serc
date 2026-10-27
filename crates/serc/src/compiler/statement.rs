@@ -33863,8 +33863,11 @@ impl<'source> Compiler<'source> {
                         end,
                         exception_policy,
                     )?;
+                    // A final authored Pass gives the cleanup a located NOP in
+                    // CPython's original array, so incoming jumps cannot copy it.
                     if self.context.python_version == crate::PythonVersion::Py314
                         && handler.name.is_none()
+                        && !matches!(handler.body.last(), Some(Stmt::Pass(_)))
                     {
                         self.assembler.record_unnamed_handler_borrow_exit(
                             body_end,
