@@ -15,6 +15,26 @@ use serc::{
 };
 
 #[test]
+fn nested_finally_guard_inherits_the_preceding_calls_handler() {
+    let source = r"def run(group):
+    try:
+        prepare()
+    except ValueError:
+        recover()
+    finally:
+        try:
+            pass
+        finally:
+            try:
+                stop(group)
+            finally:
+                if active is not None:
+                    finish()
+";
+    assert_matches_cpython(source, "nested_finally_call.py", &LEVELS);
+}
+
+#[test]
 fn nested_conversion_handlers_keep_shared_cleanup() {
     let source = r"def sample(items):
     for item in items:
