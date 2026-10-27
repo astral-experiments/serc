@@ -8485,9 +8485,12 @@ impl Compiler<'_> {
         if folded_prefix {
             // CPython folds the leading constant load and its boolean jump, but retains the
             // jump as a source-position NOP when the next operand starts on another line.
-            // A discarded nondecisive operand still ended its original block with
-            // a value-preserving jump. Its nested successor starts a fresh array.
-            let empty_folded_block = after_folded_operand || self.assembler.at_empty_borrow_block();
+            if after_folded_operand {
+                // The outer jump's POP_TOP starts this block. It survives as a NOP
+                // if the two folded groups begin on different lines.
+                self.assembler.mark_last_nop_borrow_barrier_if_removed();
+            }
+            let empty_folded_block = self.assembler.at_empty_borrow_block();
             self.emit(NOP, 0, 0)?;
             if empty_folded_block {
                 // Removing the sole folded value test empties its original array.
@@ -8519,7 +8522,9 @@ impl Compiler<'_> {
                     inner,
                     Some((expression.op, location)),
                     inner.op == expression.op,
-                    self.context.python_version == PythonVersion::Py314 && folded_prefix && operand_index == 0,
+                    self.context.python_version == PythonVersion::Py314
+                        && folded_prefix
+                        && operand_index == 0,
                     &jump_lines,
                 )?;
             } else {
@@ -8935,7 +8940,9 @@ impl Compiler<'_> {
                 inner,
                 continuation,
                 false,
-                self.context.python_version == PythonVersion::Py314 && folded_prefix && leading.is_empty(),
+                self.context.python_version == PythonVersion::Py314
+                    && folded_prefix
+                    && leading.is_empty(),
                 threaded_lines,
             )?;
         } else {

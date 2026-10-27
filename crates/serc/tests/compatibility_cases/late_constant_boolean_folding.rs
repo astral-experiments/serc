@@ -39,3 +39,19 @@ fn matches_cpython_discarded_tuple_negation_folding() {
         common::assert_matches_cpython_marshal(&source, "discarded_tuple_negation.py");
     }
 }
+
+#[test]
+fn folded_nested_value_tests_keep_the_discarded_operand_boundary() {
+    for expression in [
+        "False or (True and key)",
+        "False or\n                    (True and key)",
+        "False or (True and\n                           key)",
+        "False or (other and key)",
+        "other or (True and key)",
+    ] {
+        let source = format!(
+            "def choose(item, key, other):\n    before()\n    if item.tag == ({expression}):\n        use(item)\n    return item\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "nested_folded_values.py");
+    }
+}
