@@ -5168,6 +5168,7 @@ impl OptimizationPipeline {
         self.graph
             .normalize_blocks_if_needed(&self.preserved_block_boundaries);
         self.prepare_conditional_discard_try_exits();
+        let first_copy_label = self.next_label;
         let graph = &mut self.graph;
         let active_internal_labels = self
             .exception_owner_provenance
@@ -9563,7 +9564,101 @@ impl OptimizationPipeline {
                 .collect();
             propagate_normal_try_pop_continuations(graph, &original_pop_ranges, &handler_entries);
         }
+        if self.next_label > first_copy_label && self.exception_regions.len() > 1 {
+            self.restore_copied_handler_cleanup_locations(Label::from_u32(first_copy_label));
+        }
         Ok(copied_entry_labels)
+    }
+
+    /// Carries the inner handler's line through an exception-table split in a copied cleanup.
+    fn restore_copied_handler_cleanup_locations(&mut self, first_copy: Label) {
+        let graph = &self.graph;
+        let entries = std::cell::OnceCell::new();
+        let is_entry = |label: &Label| {
+            entries
+                .get_or_init(|| {
+                    let mut entries = self.preserved_block_boundaries.clone();
+                    entries.extend(&self.exception_owner_provenance.source_boundaries);
+                    entries.extend(&self.exception_owner_provenance.block_boundaries);
+                    entries.extend(
+                        self.exception_owner_provenance
+                            .setups
+                            .iter()
+                            .map(|(setup, _)| *setup),
+                    );
+                    entries.extend(self.exception_regions.iter().map(|region| region.target));
+                    entries.extend(
+                        graph
+                            .iter_items()
+                            .filter_map(Item::as_instruction)
+                            .filter_map(Instruction::jump_target),
+                    );
+                    entries
+                })
+                .contains(label)
+        };
+        let mut locations = Vec::new();
+        for blocks in graph.order().windows(2) {
+            let [source, target] = *blocks else {
+                unreachable!()
+            };
+            let items = graph[target].items();
+            let Some(start) = items
+                .iter()
+                .position(|item| matches!(item, Item::Instruction(_)))
+            else {
+                continue;
+            };
+            let (labels, body) = items.split_at(start);
+            let [Item::Instruction(outer), rest @ ..] = body else {
+                continue;
+            };
+            if outer.opcode != POP_EXCEPT
+                || outer.location.line >= 0
+                || outer.no_location_policy.preserves_location()
+                || !labels
+                    .iter()
+                    .any(|item| matches!(item, Item::Label(label) if label.index() >= first_copy.index()))
+            {
+                continue;
+            }
+            let src = graph[source].items();
+            let Some(first) = src
+                .iter()
+                .position(|item| matches!(item, Item::Instruction(_)))
+            else {
+                continue;
+            };
+            let location = if let ([Item::Instruction(inner)], [Item::Instruction(jump)]) =
+                (&src[first..], rest)
+            {
+                if inner.opcode != POP_EXCEPT
+                    || inner.location.line < 0
+                    || !is_unconditional_jump(jump.opcode)
+                    || jump.location.line >= 0
+                    || jump.no_location_policy.preserves_location()
+                {
+                    continue;
+                }
+                // An inner handler can end and an outer handler start at the same offset.
+                let split = labels.iter().any(|item| {
+                    matches!(item, Item::Label(label)
+                    if self.exception_regions.iter().any(|region| region.end == *label))
+                });
+                let independent_entry = labels
+                    .iter()
+                    .any(|item| matches!(item, Item::Label(label) if is_entry(label)));
+                (split && !independent_entry).then_some(inner.location)
+            } else {
+                named_handler_cleanup_exit_location(src, items, &self.exception_regions, is_entry)
+            };
+            if let Some(location) = location {
+                locations.push((ItemPosition::new(target, start), location));
+            }
+        }
+        for (position, location) in locations {
+            self.graph.instruction_mut(position).unwrap().location = location;
+        }
     }
 }
 
