@@ -37629,12 +37629,14 @@ impl<'source> Compiler<'source> {
         // Natural for-loop exhaustion retains its original END_FOR/POP_ITER array.
         // That live normal edge reaches linear or guarded cleanup independently
         // of handlers and earlier copied returns. Breaks, loop-body returns and
-        // else suites can introduce a separate exit array.
+        // else suites can introduce a separate exit array. On 3.14 a yield in
+        // the body does not sever the iterator's normal exhaustion edge.
         let for_exhaustion_reaches_finally = !statement.is_star
             && statement.orelse.is_empty()
             && !statement.handlers.is_empty()
             && matches!(self.unit.scope, Scope::Function { .. })
-            && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+            && (self.context.python_version == crate::PythonVersion::Py314
+                || self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0)
             && !self.control.in_exception_handler()
             && self.control.finally.active_copied_finally_bodies == 0
             && self.control.finally.active_normal_finally_bodies == 0
