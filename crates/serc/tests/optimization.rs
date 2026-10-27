@@ -11551,6 +11551,38 @@ fn method_iterator_preserves_original_footer_location() {
 }
 
 #[test]
+fn match_case_method_arguments_preserve_the_truth_marker_slot() {
+    let source = r"async def read(kind, client, left, right, flag):
+    match kind:
+        case Kind.single:
+            try:
+                await client.fetch(
+                    first=left,
+                    second=right,
+                    value=right.value if flag else None,
+                )
+            except Error:
+                recover()
+        case _:
+            finish()
+";
+    for source in [
+        source.to_owned(),
+        source.replace(
+            "first=left,\n                    second=right",
+            "first=left, second=right",
+        ),
+    ] {
+        assert_matches_cpython_versions(
+            &source,
+            "match_case_method_arguments.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn linear_for_method_arguments_preserve_original_footer_location() {
     for arguments in [
         "argument",

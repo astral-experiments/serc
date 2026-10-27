@@ -923,6 +923,10 @@ impl Compiler<'_> {
                         self.assembler.use_next_location_for_last_instruction();
                     }
                 }
+                let value_case_try = (self.context.python_version == PythonVersion::Py314
+                    && case.guard.is_none() && matches!(&case.pattern, Pattern::MatchValue(_))
+                    && matches!(case.body.first(), Some(Stmt::Try(suite)) if !suite.handlers.is_empty()))
+                    .then(|| self.assembler.item_count());
                 let body_previous_location = self.assembler.last_instruction_location();
                 let body_start = self.assembler.instruction_count();
                 let terminal_body = self.terminal_match_case_body(&case.body, !terminal);
@@ -1015,6 +1019,9 @@ impl Compiler<'_> {
                     )?;
                     false
                 };
+                if let Some(start) = value_case_try {
+                    self.assembler.exclude_uncompacted_case_method_marker(start);
+                }
                 if self.context.python_version <= PythonVersion::Py313
                     && self.assembler.instruction_count() == body_start
                     && let [Stmt::Pass(pass)] = case.body.as_slice()

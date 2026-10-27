@@ -7866,6 +7866,111 @@ impl Assembler {
         }
     }
 
+    /// Excludes a truth marker appended to an uncompacted method-call prefix in a value case.
+    pub(crate) fn exclude_uncompacted_case_method_marker(&mut self, start: usize) {
+        use crate::target::opcodes::{LOAD_ATTR, TO_BOOL};
+
+        let items = self.linear_items();
+        let [
+            Item::Label(begin),
+            Item::Instruction(setup),
+            Item::Label(end),
+            Item::Label(entry),
+            rest @ ..,
+        ] = &items[start..]
+        else {
+            return;
+        };
+        let mut preceding = &items[..start];
+        if let [earlier @ .., Item::Instruction(discard)] = preceding
+            && discard.opcode == POP_TOP
+        {
+            if !discard.fusion_policy.location_from_next() || discard.location != setup.location {
+                return;
+            }
+            preceding = earlier;
+        }
+        let [
+            ..,
+            Item::Instruction(compare),
+            Item::Instruction(failure),
+            Item::Instruction(success),
+        ] = preceding
+        else {
+            return;
+        };
+        if compare.opcode != crate::target::opcodes::COMPARE_OP
+            || failure.opcode != POP_JUMP_IF_FALSE
+            || failure.forward_target().is_none()
+            || success.opcode != NOT_TAKEN
+            || success.location != failure.location
+            || compare.location != failure.location
+        {
+            return;
+        }
+        let provenance = &self.exception_owner_provenance;
+        if setup.opcode != NOP
+            || setup.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
+            || !provenance.setup_nop_ranges.contains(&(*begin, *end))
+            || !provenance.setups.contains(&(*entry, Some(setup.location)))
+            || !provenance.ordinary_try_setups.contains_key(entry)
+        {
+            return;
+        }
+        // The match conditional starts a fresh success array. Its subject discard,
+        // when present, takes its line from the following setup only after NOP removal.
+        let mut records = rest
+            .iter()
+            .map_while(Item::as_instruction)
+            .enumerate()
+            .peekable();
+        let Some((_, receiver)) = records.next() else {
+            return;
+        };
+        if receiver.opcode != LOAD_FAST || receiver.location.line == setup.location.line {
+            return;
+        }
+        while records
+            .next_if(|(_, part)| {
+                part.opcode == LOAD_ATTR && part.value_argument().is_some_and(|arg| arg & 1 == 0)
+            })
+            .is_some()
+        {}
+        let Some((_, method)) = records.next() else {
+            return;
+        };
+        if method.opcode != LOAD_ATTR || !method.value_argument().is_some_and(|arg| arg & 1 == 1) {
+            return;
+        }
+        let Some((_, mut load)) = records.next_if(|(_, part)| part.opcode == LOAD_FAST) else {
+            return;
+        };
+        while let Some((_, next)) = records.next_if(|(_, part)| part.opcode == LOAD_FAST) {
+            // Same-line local loads can fuse before the marker slot is chosen.
+            if load.location.line == next.location.line {
+                return;
+            }
+            load = next;
+        }
+        let (Some((_, truth)), Some((_, jump)), Some((offset, marker))) =
+            (records.next(), records.next(), records.next())
+        else {
+            return;
+        };
+        if truth.opcode == TO_BOOL
+            && matches!(jump.opcode, POP_JUMP_IF_TRUE | POP_JUMP_IF_FALSE)
+            && jump.forward_target().is_some()
+            && marker.opcode == NOT_TAKEN
+            && marker.exception_policy() == ExceptionPolicy::NoneDynamicCondition
+            && [truth.location, jump.location, marker.location]
+                .iter()
+                .all(|location| *location == load.location)
+            && let Item::Instruction(marker) = &mut self.linear_items_mut()[start + 4 + offset]
+        {
+            marker.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
+        }
+    }
+
     /// Marks the fallthrough created by backward conditional normalization as a fresh block.
     pub(crate) fn mark_last_condition_fallthrough_fresh(&mut self) {
         let instruction =
