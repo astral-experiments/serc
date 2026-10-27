@@ -9604,8 +9604,7 @@ impl<'source> Compiler<'source> {
                     == crate::PythonVersion::Py314
                     && preserve_tos
                     && !return_is_overridden
-                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                        == CO_COROUTINE
+                    && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
                     && self.control.exceptions.active_exception_group_handlers == 0
                     && self.control.finally.active_finally_end_blocks == 0
                     && self.control.finally.active_normal_finally_bodies == 0
@@ -11665,7 +11664,7 @@ impl<'source> Compiler<'source> {
                         });
                     // An unnamed handler restores its exception state before one or
                     // two enclosing sync managers and the sole outer finally unwind.
-                    let copied_unnamed_handler_manager_pop = (matches!(self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR), 0 | CO_COROUTINE)
+                    let copied_unnamed_handler_manager_pop = (self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
                         && !preserve_tos
                         && !return_is_overridden
                         && context_index == 0

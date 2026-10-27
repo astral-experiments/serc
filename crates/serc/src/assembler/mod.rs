@@ -12223,7 +12223,10 @@ impl Assembler {
                 || record.no_location_policy.borrow_fallthrough() != BorrowFallthrough::Reachable
                 || record.jump_policy.borrow_empty_block()
                 || record.opcode == NOP
-                || record.value_argument().is_none()
+                || (record.value_argument().is_none()
+                    && !(inner_try_pop
+                        && record.opcode == LOAD_CONST
+                        && matches!(record.operand(), Operand::Deferred(_))))
                 || ends_scope(record.opcode)
         }) {
             return;
@@ -17165,6 +17168,17 @@ impl Assembler {
                 let origin = origins.next().map(|(index, _)| index);
                 origin.filter(|_| origins.next().is_none())
             };
+            // Resolve the same deferred constant in any captured name-cleanup prefix.
+            for origin in &mut self
+                .exception_owner_provenance
+                .saved_named_handler_none_prefixes
+            {
+                for saved in origin.items.iter_mut().filter_map(Item::as_instruction_mut) {
+                    if *saved == *instruction {
+                        saved.set_operand(Operand::Value(argument));
+                    }
+                }
+            }
             instruction.set_operand(Operand::Value(argument));
             if let Some(index) = membership_origin {
                 // The checked operand patch belongs to this one original LOAD_CONST.

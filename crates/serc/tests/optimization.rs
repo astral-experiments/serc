@@ -7792,6 +7792,31 @@ fn guarded_recovery_preserves_populated_normal_cleanup_entries() {
 }
 
 #[test]
+fn saved_return_in_named_handler_replays_inner_try_slots() {
+    let source = r"def sample(value, guard):
+    try:
+        try:
+            work()
+        except OSError as error:
+            try:
+                if value:
+                    item = build(**vars(value))
+                    item.active = True
+                    return combine(check(item))
+                return DEFAULT
+            except ValueError:
+                pass
+    finally:
+        if guard is not None:
+            guard.close()
+";
+    for result in ["item", "combine(item)", "combine(check(item))"] {
+        let source = source.replace("combine(check(item))", result);
+        assert_matches_cpython(&source, "named_inner_try_return.py", &LEVELS);
+    }
+}
+
+#[test]
 fn named_handler_returns_preserve_outer_finalizer_owners() {
     let source = r"def named_nested(choice, item, owner, operation, cleanup, recover):
     value = None
