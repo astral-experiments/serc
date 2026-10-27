@@ -1375,7 +1375,7 @@ pub(super) struct SavedNamedHandlerNonePrefix {
 }
 
 /// A captured named-handler break, retaining its original condition across exact retargets.
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 pub(super) struct CopiedNamedBreakTruthPrefix {
     pub(super) entry: Label,
     pub(super) items: Vec<Item>,

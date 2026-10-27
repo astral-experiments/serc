@@ -11205,14 +11205,19 @@ impl Assembler {
         {
             return;
         }
-        let items = items[start..=*marker_at].to_vec();
-        self.exception_owner_provenance
-            .copied_named_break_truth_prefixes
-            .push(exception_owners::CopiedNamedBreakTruthPrefix {
-                entry,
-                items,
-                original_condition: *condition,
-            });
+        let prefix = exception_owners::CopiedNamedBreakTruthPrefix {
+            entry,
+            items: items[start..=*marker_at].to_vec(),
+            original_condition: *condition,
+        };
+        let prefixes = &mut self
+            .exception_owner_provenance
+            .copied_named_break_truth_prefixes;
+        // The handler unwind and its enclosing iterator can observe the same exit.
+        // Keep distinct original arrays visible to the ownership ambiguity check.
+        if !prefixes.contains(&prefix) {
+            prefixes.push(prefix);
+        }
     }
 
     /// Records the ordinary break's two ended regions before its copied truth array.
