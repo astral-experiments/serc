@@ -9426,6 +9426,14 @@ impl<'source> Compiler<'source> {
                 // An ordinary try surrounding a handler chain and finalizer still owns
                 // the copied finalizer after the handler and finally collectors unwind.
                 // Track those boundaries separately without changing handler POP slots.
+                // While loops add no iterator slot when restoring the handler or
+                // copying the finalizer, including in a suspended generator.
+                let stack_neutral_loops = self
+                    .control
+                    .loops
+                    .contexts
+                    .iter()
+                    .all(|context| context.iterator_cleanup == IteratorCleanup::None);
                 let tracks_outer_try_handler_finally_unwinds = self
                     .control
                     .withs
@@ -9446,10 +9454,10 @@ impl<'source> Compiler<'source> {
                             self.control.finally.active_return_finally_contexts.as_slice(),
                         ),
                         ([handler, nested @ ..], [finally])
-                            if ((handler.name.is_none() && self.control.loops.contexts.is_empty())
+                            if ((handler.name.is_none() && stack_neutral_loops)
                                 // Restoring a handler does not exit the enclosing try or
                                 // discard an older iterator before the copied finalizer.
-                                || (self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+                                || ((self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0 || stack_neutral_loops)
                                     && handler.finally_end_depth == 0
                                     && handler.with_depth == 0
                                     && finally.with_depth == 0
