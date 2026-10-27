@@ -45,3 +45,20 @@ fn matches_cpython_terminal_while_linear_handler_cleanup_control() {
         "terminal_while_linear_handler_cleanup_control.py",
     );
 }
+
+#[test]
+fn preserves_unmatched_try_else_loop_backedges() {
+    let source = r"async def drain(first, second):
+    while True:
+        try:
+            read()
+        except Error:
+            break
+        else:
+            if first:
+                await consume()
+            elif second:
+                await finish()
+";
+    common::assert_matches_cpython_marshal(source, "try_else_loop_backedge.py");
+}

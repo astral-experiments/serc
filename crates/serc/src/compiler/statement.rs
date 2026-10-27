@@ -46447,10 +46447,13 @@ fn try_else_requires_loop_tail_inlining(statement: &ruff_python_ast::StmtTry) ->
         && suite_has_normal_fallthrough(&statement.body)
         && matches!(statement.orelse.last(), Some(Stmt::If(tail))
             if condition_has_only_runtime_tests(&tail.test)
-                && tail
-                    .elif_else_clauses
-                    .iter()
-                    .all(|clause| clause.test.is_none())
+                && (tail.elif_else_clauses.iter().all(|clause| clause.test.is_none())
+                    // The final failed elif reaches the backedge directly. A
+                    // chained comparison has its own operand cleanup on that edge.
+                    || (condition_has_linear_runtime_leaves(&tail.test)
+                        && tail.elif_else_clauses.iter().all(|clause| {
+                            clause.test.as_ref().is_some_and(condition_has_linear_runtime_leaves)
+                        })))
                 && if_has_multiple_normal_exit_targets(tail))
 }
 
