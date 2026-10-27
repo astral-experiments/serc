@@ -39860,6 +39860,17 @@ impl<'source> Compiler<'source> {
             self.assembler
                 .mark_noncopyable_finally_borrow_barrier(normal_exit, normal_finally_pop_block);
         }
+        if self.context.python_version == crate::PythonVersion::Py314
+            && statement.handlers.is_empty()
+            && statement.orelse.is_empty()
+            && let Some(Stmt::While(cleanup)) = statement.finalbody.first()
+            && early_condition_truthiness(&cleanup.test) != Some(false)
+        {
+            self.assembler.record_empty_finally_loop_entry(
+                normal_finally_pop_block,
+                self.source_location(cleanup.test.range()),
+            );
+        }
         self.assembler
             .record_normal_finally_none_prefix(normal_finally_pop_block);
         self.assembler
