@@ -9828,8 +9828,17 @@ impl<'source> Compiler<'source> {
                             && name.is_none()
                             && return_finally_contexts.len() == 1
                             && with_depth < self.control.withs.active_with_exits.len();
+                        // Returning through an inner unnamed handler still pops the
+                        // outer named handler's name-cleanup and exception blocks.
+                        let nested_named_handler_pops = self.context.python_version
+                            == crate::PythonVersion::Py314
+                            && handler_index == 0
+                            && preserve_tos
+                            && tracks_outer_try_handler_finally_unwinds
+                            && matches!(self.control.exceptions.active_exception_handlers.as_slice(),
+                                [_, inner] if inner.name.is_none());
                         let preserve_named_handler_pop_slots = name.is_some()
-                            && handler_count == 1
+                            && (handler_count == 1 || nested_named_handler_pops)
                             && next_finally > 0
                             // Keep the handler's two NULL POP cells distinct from the later
                             // finally POP. A tracked outer try still owns the copied body.

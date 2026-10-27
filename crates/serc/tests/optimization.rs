@@ -18047,6 +18047,27 @@ fn nested_leaf_returns_preserve_repeated_scope_footer() {
 }
 
 #[test]
+fn nested_handler_return_keeps_the_outer_named_handler_pop_slots() {
+    let source = r"def sample(flag, item):
+    try:
+        try:
+            try:
+                read()
+            except Error as error:
+                try:
+                    recover(error)
+                except Retry:
+                    return flag
+        finally:
+            if not flag and item.poll() is None:
+                cleanup(item)
+    except Stop:
+        finish()
+";
+    assert_matches_cpython(source, "nested_named_handler_return.py", &LEVELS);
+}
+
+#[test]
 fn normal_finalizer_none_marker_reuses_original_local_load_owner() {
     let source = r"async def f(outer, inner):
     async with outer:
