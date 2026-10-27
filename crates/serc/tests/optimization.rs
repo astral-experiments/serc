@@ -4119,6 +4119,31 @@ fn erased_loop_exit_stays_inside_managed_finally() {
 }
 
 #[test]
+fn legacy_returns_discard_the_iterator_after_a_guarded_finalizer() {
+    for result in ["item", "1"] {
+        let source = format!(
+            "def select(items):
+    for item in items:
+        try:
+            try:
+                return {result}
+            finally:
+                if item:
+                    clean(item)
+        except ValueError:
+            continue
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "finally_iterator_discard.py",
+            &LEVELS,
+            &[PythonVersion::Py312, PythonVersion::Py313],
+        );
+    }
+}
+
+#[test]
 fn iterator_returns_unwind_inner_try_before_copied_none_guard() {
     for call in ["work(item if enabled else value)", "await work(item)"] {
         let source = format!(

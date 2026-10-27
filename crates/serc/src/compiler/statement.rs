@@ -14352,6 +14352,20 @@ impl<'source> Compiler<'source> {
                     [..next_with]
                     .last()
                     .map_or(0, |inner| inner.loop_depth.min(protected_iterator_start));
+                // In 3.12 and 3.13, ordinary try blocks end before an older iterator's
+                // discard once the return has finished all intervening cleanup.
+                let legacy_finalizers_unwound = self.context.python_version
+                    <= crate::PythonVersion::Py313
+                    && handler_count == 0
+                    && next_with == 0
+                    && self.control.finally.active_finally_end_blocks == 0
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_copied_finally_bodies == 0
+                    && self
+                        .control
+                        .finally
+                        .preserved_return_value_contexts
+                        .is_empty();
                 self.emit_return_loop_iterator_cleanup(
                     deferred_outer_iterator_depth,
                     protected_iterator_start,
@@ -14361,7 +14375,8 @@ impl<'source> Compiler<'source> {
                         || (tracks_handler_iterator_region_unwinds && unwinds_return_finally)
                         || (tracks_finally_region_unwinds
                             && (copied_finally_iterator_location.is_some()
-                                || copied_finally_iterator_region_unwind))
+                                || copied_finally_iterator_region_unwind
+                                || legacy_finalizers_unwound))
                     {
                         // After the copied finally, inner tries end before older iterators.
                         // Each iterator's saved depth retains tries that enclose the loop.
