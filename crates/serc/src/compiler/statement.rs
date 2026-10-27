@@ -37909,6 +37909,8 @@ impl<'source> Compiler<'source> {
             self.assembler
                 .exclude_normalized_exception_owner_at(normal_finally_pop_block);
         }
+        self.assembler
+            .use_folded_finally_operand_owner(normal_finally_pop_block);
         if terminal && !finalbody_emitted_fallthrough && !suite_terminates(&statement.finalbody) {
             if (self.context.python_version == crate::PythonVersion::Py312
                 && statement.finalbody.last().is_some_and(|statement| {

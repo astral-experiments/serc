@@ -13643,6 +13643,43 @@ impl Assembler {
             });
     }
 
+    /// Restores the enclosing handler when a folded operand takes the normal `POP_BLOCK`'s line.
+    pub(crate) fn use_folded_finally_operand_owner(&mut self, ordinal: usize) {
+        if self.python_version < crate::PythonVersion::Py314 {
+            return;
+        }
+        let Some((pop_index, pop)) = self.indexed_instruction_at(ordinal) else {
+            return;
+        };
+        if pop.opcode != NOP || !pop.fusion_policy.is_converted_pop_block() {
+            return;
+        }
+        let Some((next_index, fold)) = self.indexed_instruction_at(ordinal + 1) else {
+            return;
+        };
+        let slots = fold.local_policy.hidden_exception_owner_slots();
+        if matches!(
+            fold.opcode,
+            LOAD_CONST | crate::target::opcodes::LOAD_SMALL_INT
+        ) && fold.exception_policy() == ExceptionPolicy::default()
+            && (fold.jump_policy.has_original_uniform_fold()
+                || self
+                    .exception_owner_provenance
+                    .uniform_fold_owner_slots
+                    .contains(&(fold.location, fold.opcode, slots)))
+            && self
+                .last_block_boundary(&self.linear_items()[pop_index + 1..next_index])
+                .is_none()
+        {
+            // CPython erases the operand's location during folding. NOP compaction
+            // transfers the POP_BLOCK's line into that operand, which keeps its handler.
+            let Item::Instruction(pop) = &mut self.linear_items_mut()[pop_index] else {
+                unreachable!()
+            };
+            pop.set_exception_policy(ExceptionPolicy::default());
+        }
+    }
+
     /// Captures the unchanged first array of an ordinary normal-finally entry.
     pub(crate) fn record_original_normal_finally_array(&mut self, ordinal: usize) {
         let items = self.linear_items();

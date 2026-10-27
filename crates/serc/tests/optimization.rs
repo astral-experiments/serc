@@ -3272,6 +3272,30 @@ fn surviving_break_reaches_cleanup_inside_nested_managers() {
 }
 
 #[test]
+fn folded_finally_operands_keep_their_enclosing_handler() {
+    let source = r"async def drain(ready, items):
+    try:
+        assert ready
+    finally:
+        for item in (1, 2, 3):
+            items.append(item)
+
+async def poll(active, result):
+    try:
+        while active():
+            tick()
+    finally:
+        result[0] = -1
+";
+    assert_matches_cpython_versions(
+        source,
+        "folded_finally_operands.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn guarded_recovery_inside_normal_finally_keeps_its_continuation() {
     for coroutine in ["", "async "] {
         for manager in [false, true] {
