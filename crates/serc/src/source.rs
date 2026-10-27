@@ -235,12 +235,15 @@ fn decode_legacy(encoding: SourceEncoding, bytes: &[u8]) -> Option<Cow<'_, str>>
     }
 }
 
+/// The number of source bytes and any CPython replacement for the web mapping.
+type MultibyteCharacter = (usize, Option<char>);
+
 /// Decode the common mappings in runs. Each character is first checked against
 /// CPython's repertoire, which omits web extensions and maps some bytes differently.
 fn decode_multibyte<'a>(
     bytes: &'a [u8],
     encoding: &'static Encoding,
-    character: fn(&[u8], usize) -> Option<(usize, Option<char>)>,
+    character: fn(&[u8], usize) -> Option<MultibyteCharacter>,
 ) -> Option<Cow<'a, str>> {
     let mut output = None;
     let mut segment_start = 0;
@@ -268,7 +271,7 @@ fn decode_multibyte<'a>(
     }
 }
 
-fn big5_character(bytes: &[u8], index: usize) -> Option<(usize, Option<char>)> {
+fn big5_character(bytes: &[u8], index: usize) -> Option<MultibyteCharacter> {
     let lead = bytes[index];
     if lead.is_ascii() {
         return Some((1, None));
@@ -322,7 +325,7 @@ fn big5_override(pair: u16) -> Option<char> {
     char::from_u32(codepoint + u32::from(pair - first))
 }
 
-fn euc_jp_character(bytes: &[u8], index: usize) -> Option<(usize, Option<char>)> {
+fn euc_jp_character(bytes: &[u8], index: usize) -> Option<MultibyteCharacter> {
     let length = euc_jp_character_len(bytes, index)?;
     let sequence = &bytes[index..index + length];
     if length == 2 && euc_jp_web_extension(sequence[0], sequence[1]) {
