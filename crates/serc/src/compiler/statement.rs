@@ -10394,23 +10394,35 @@ impl<'source> Compiler<'source> {
                             self.assembler.mark_last_as_converted_pop_block();
                         }
                         if preserve_tos {
-                            // Handler unwinding restores the saved value before popping
-                            // its cleanup block. That block still protects the SWAP.
-                            let start = self.assembler.label();
-                            self.assembler.mark(start);
+                            // SWAP precedes the handler's POP_BLOCK. A lone unnamed
+                            // handler already covers it with its body region.
+                            let cleanup_start = (name.is_some()
+                                || self
+                                    .control
+                                    .exceptions
+                                    .active_exception_region_exclusions
+                                    .len()
+                                    > 1)
+                            .then(|| {
+                                let start = self.assembler.label();
+                                self.assembler.mark(start);
+                                start
+                            });
                             self.emit(SWAP, 2, 0)?;
                             if shared_manager_return_cleanup {
                                 self.assembler.preserve_last_no_location();
                             }
-                            let end = self.assembler.label();
-                            self.assembler.mark(end);
-                            self.assembler.add_exception_region(
-                                start,
-                                end,
-                                common_cleanup,
-                                common_cleanup_depth,
-                                true,
-                            );
+                            if let Some(start) = cleanup_start {
+                                let end = self.assembler.label();
+                                self.assembler.mark(end);
+                                self.assembler.add_exception_region(
+                                    start,
+                                    end,
+                                    common_cleanup,
+                                    common_cleanup_depth,
+                                    true,
+                                );
+                            }
                             if let Some((target, start)) = protected_outer_pop_except_start
                                 && target == handler_index
                             {
