@@ -26,6 +26,18 @@ fn a_final_else_shares_its_boolean_discard() {
 }
 
 #[test]
+fn protected_boolean_discards_use_their_copied_operand_lines() {
+    let source = r"def check(items, enabled, emit):
+    for item in items:
+        try:
+            enabled and emit(item)
+        except ValueError as error:
+            enabled and emit(error)
+";
+    assert_matches_cpython(source, "protected_boolean_calls.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
