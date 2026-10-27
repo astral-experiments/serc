@@ -1030,6 +1030,7 @@ impl Compiler<'_> {
             folded_expressions: Vec<&'ast Expr>,
             has_untracked_collection: bool,
             reorder_try_suites: bool,
+            inside_return_finally: bool,
             register_literals: bool,
             register_folds: bool,
             string_origin_constants: Vec<(Constant, bool)>,
@@ -1258,6 +1259,15 @@ impl Compiler<'_> {
                 }
 
                 match statement {
+                    Stmt::Return(return_)
+                        if self.register_literals
+                            && self.python_version < PythonVersion::Py315
+                            && !self.inside_return_finally
+                            && return_.value.is_none() =>
+                    {
+                        self.constants.push(Constant::None);
+                        return;
+                    }
                     Stmt::Expr(expression)
                         if literal_constant(&expression.value).is_some()
                             || self.legacy_folded_constant(&expression.value).is_some() =>
@@ -1346,6 +1356,14 @@ impl Compiler<'_> {
                         self.visit_expr(&statement.target);
                         self.visit_body(&statement.body);
                         self.visit_body(&statement.orelse);
+                        return;
+                    }
+                    Stmt::Try(try_) if !self.reorder_try_suites && !try_.finalbody.is_empty() => {
+                        // A return loads None after its copied finalizer. Its AST position
+                        // alone cannot order that load against the finalizer's constants.
+                        let outer = std::mem::replace(&mut self.inside_return_finally, true);
+                        walk_stmt(self, statement);
+                        self.inside_return_finally = outer;
                         return;
                     }
                     Stmt::Try(statement) if self.reorder_try_suites && !statement.is_star => {
@@ -1939,6 +1957,7 @@ impl Compiler<'_> {
         unwind_exits.visit_body(body);
         let mut collector = Collector {
             reorder_try_suites: !unwind_exits.0,
+            inside_return_finally: !self.control.finally.is_inactive_for_return_unwind(),
             register_literals,
             register_folds,
             build_discarded: self.context.requires_discarded_builders()
