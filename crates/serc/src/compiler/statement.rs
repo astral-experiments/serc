@@ -49001,6 +49001,7 @@ fn handlers_have_live_guarded_recovery_cleanup(
         suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement))
             || (unowned_recovery
                 && (matches!(statement, Stmt::Import(_) | Stmt::ImportFrom(_))
+                    || suite_has_nonsuspending_conditional_work(std::slice::from_ref(statement))
                     || suite_has_linear_reraise_guards(std::slice::from_ref(statement))
                     || statement_is_runtime_none_return_guard(statement)
                     || matches!(statement, Stmt::Expr(work)
