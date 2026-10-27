@@ -2616,6 +2616,24 @@ fn guarded_recovery_preserves_loop_cleanup_entry() {
 }
 
 #[test]
+fn protected_assignment_locates_a_shared_tuple_return() {
+    let source = r"def choose(enabled, test, left, right):
+    if enabled:
+        try:
+            if test:
+                left = first()
+            else:
+                right = second()
+        except ValueError:
+            right = recover()
+    else:
+        left = fallback()
+    return left, right
+";
+    assert_matches_cpython(source, "protected_assignment_return.py", &LEVELS);
+}
+
+#[test]
 fn protected_while_break_copies_following_local_return() {
     let source = r"async def collect(ready, limit, done, count):
     try:

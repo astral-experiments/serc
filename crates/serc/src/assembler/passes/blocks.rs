@@ -7260,17 +7260,22 @@ impl OptimizationPipeline {
                     })
                 })
                 .flatten();
-            // After exception cleanup, a detached join can have a single incoming
-            // branch assignment. Its jump donates the line of the NOP left beside
-            // the copied return, which also discards the loop iterator.
-            let loop_return_join_location = if self.python_version == crate::PythonVersion::Py314
-                && !planned_copy
+            // After exception cleanup a detached join can have a single incoming
+            // assignment. Keep its line on the NOP left by copying a return.
+            let detached_return_join = !planned_copy
                 && inline_small_exit
                 && source_location.line < 0
                 && target_position == target_chain_end
                 && remaining_predecessors[source.index()] == 1
-                && let [Item::Label(_), Item::Instruction(source_jump)] = graph[source].items()
-                && source_jump.opcode == JUMP_FORWARD
+                && graph[source]
+                    .last_instruction()
+                    .is_some_and(|jump| jump.opcode == JUMP_FORWARD);
+            let assignment_return_join_location = if detached_return_join
+                && self.python_version == crate::PythonVersion::Py314
+                && matches!(
+                    graph[source].items(),
+                    [Item::Label(_), Item::Instruction(_)]
+                )
                 && let [
                     Item::Label(_),
                     Item::Instruction(load),
@@ -7308,12 +7313,51 @@ impl OptimizationPipeline {
                     == Some(source)
             {
                 Some(jump.location)
+            } else if detached_return_join
+                && self.python_version >= crate::PythonVersion::Py314
+                && inline_unprotected_return
+                && graph[source]
+                    .items()
+                    .iter()
+                    .filter_map(Item::as_instruction)
+                    .count()
+                    == 1
+                && super::normal_try_copies::original_local_tuple_return(graph[target].items())
+                    .is_some()
+                && self
+                    .exception_owner_provenance
+                    .normal_try_exits
+                    .iter()
+                    .any(|(_, join)| graph.label_block(*join) == Some(source))
+                && let [predecessor] = jump_sources[source.index()].as_slice()
+                && !drop_blocks[predecessor.index()]
+                && !inline_copies.contains_key(predecessor)
+                && remaining_predecessors[predecessor.index()] == 1
+                && let Some(jump) = graph[*predecessor].last_instruction()
+                && jump.opcode == JUMP_FORWARD
+                && jump.location.line >= 0
+                && jump.pre_fold_extra_instructions() == 1
+                && jump
+                    .forward_target()
+                    .and_then(|label| graph.label_block(label))
+                    == Some(source)
+                && let Some(previous) = positions[predecessor.index()]
+                    .checked_sub(1)
+                    .map(|position| order[position])
+                && block_has_fallthrough(graph[previous].items())
+                && let Some(store) = graph[previous].last_instruction()
+                && store.opcode == crate::target::opcodes::STORE_FAST
+                && store.location == jump.location
+            {
+                // The four-slot tuple return fits once. The assignment arm has
+                // copied the normal try exit and still jumps into this copy.
+                Some(jump.location)
             } else {
                 None
             };
-            let source_location = loop_return_join_location.unwrap_or(source_location);
+            let source_location = assignment_return_join_location.unwrap_or(source_location);
             let preserve_inlined_jump_nop = planned_copy
-                || loop_return_join_location.is_some()
+                || assignment_return_join_location.is_some()
                 || deferred_match_donor.is_some()
                 || (inline_small_exit
                     && (preserve_unlocated_join_nop
