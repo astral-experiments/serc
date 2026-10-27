@@ -14191,8 +14191,15 @@ impl Assembler {
         pop_item: usize,
         ordinary_pops: usize,
         nested_named_handler: bool,
+        retained_manager_guard: bool,
     ) {
-        self.record_copied_guard_cleanup(pop_item, ordinary_pops, nested_named_handler, None);
+        self.record_copied_guard_cleanup(
+            pop_item,
+            ordinary_pops,
+            nested_named_handler,
+            retained_manager_guard,
+            None,
+        );
     }
 
     /// Captures a copied return guard and its optional manager exit call.
@@ -14201,6 +14208,7 @@ impl Assembler {
         pop_item: usize,
         ordinary_pops: usize,
         nested_named_handler: bool,
+        retained_manager_guard: bool,
         manager_call: Option<Instruction>,
     ) {
         let items = self.linear_items();
@@ -14236,7 +14244,13 @@ impl Assembler {
                 return;
             }
             2
-        } else if matches!(cleanup.opcode, POP_EXCEPT | POP_TOP) {
+        } else if matches!(cleanup.opcode, POP_EXCEPT | POP_TOP)
+            || (retained_manager_guard
+                && matches!(
+                    cleanup.opcode,
+                    LOAD_FAST | LOAD_GLOBAL | crate::target::opcodes::LOAD_DEREF
+                ))
+        {
             ordinary_pops
         } else {
             return;
@@ -14264,7 +14278,10 @@ impl Assembler {
             return;
         };
         if !(matches!(load.opcode, LOAD_FAST | crate::target::opcodes::LOAD_DEREF)
-            || (manager_call.is_some() && load.opcode == LOAD_GLOBAL))
+            || (load.opcode == LOAD_GLOBAL
+                && (manager_call.is_some()
+                    || (retained_manager_guard
+                        && load.value_argument().is_some_and(|arg| arg & 1 == 0)))))
             || load.local_policy.hidden_exception_owner_slots() != 0
             || marker.opcode != NOT_TAKEN
             || condition.forward_target().is_none()
@@ -14462,7 +14479,7 @@ impl Assembler {
             && !named_handler
         {
             // The manager POP precedes all seven records of the saved-return unwind.
-            self.record_copied_guard_cleanup(pop_item, 1, false, Some(cleanup[5]));
+            self.record_copied_guard_cleanup(pop_item, 1, false, false, Some(cleanup[5]));
             return;
         }
         let (to_bool, condition) = if condition.opcode == TO_BOOL {

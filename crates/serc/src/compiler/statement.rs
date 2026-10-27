@@ -12779,10 +12779,27 @@ impl<'source> Compiler<'source> {
                                     && handler.try_body_depth == ordinary_pops
                                     && handler.exception_region_depth == handler.try_body_depth + 1
                             });
+                    // The manager remains active when the return leaves an ordinary try
+                    // directly, or after discarding the handler or its iterator.
+                    let retained_manager_guard = self.unit.flags
+                        & (CO_GENERATOR | CO_ASYNC_GENERATOR)
+                        == 0
+                        && finally_context.with_depth > 0
+                        && self.control.withs.active_with_exits.iter().all(|manager| {
+                            manager.exception_region_depth == 0 && manager.normal_finally_depth == 0
+                        })
+                        && (direct_cleanup
+                            || (preserve_tos
+                                && matches!(statement.value.as_deref(), Some(Expr::Name(_)))
+                                && handler_count == 0
+                                && ordinary_pops == 1
+                                && self.control.loops.contexts.is_empty()));
                     let return_guard_pops = (self.context.python_version
                         == crate::PythonVersion::Py314
-                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                            == CO_COROUTINE
+                        && (retained_manager_guard
+                            || self.unit.flags
+                                & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                                == CO_COROUTINE)
                         && !return_is_overridden
                         && context_index == 0
                         && return_finally_contexts.len() == 1
@@ -12805,7 +12822,7 @@ impl<'source> Compiler<'source> {
                             .active_exception_region_exclusions
                             .len()
                             == 1 + handler_count + ordinary_pops
-                        && (direct_cleanup || nested_named_handler)
+                        && (direct_cleanup || nested_named_handler || retained_manager_guard)
                         && iterators.next().is_none()
                         && iterator.is_none_or(|context| {
                             context.iterator_cleanup == IteratorCleanup::Sync
@@ -12817,6 +12834,7 @@ impl<'source> Compiler<'source> {
                             self.assembler.item_count(),
                             ordinary_pops,
                             nested_named_handler,
+                            retained_manager_guard,
                         )
                     });
                     let copied_handler_none_pop = (preserve_tos
@@ -13505,12 +13523,18 @@ impl<'source> Compiler<'source> {
                         },
                     );
                     if result.is_ok()
-                        && let Some((pop, ordinary_pops, nested_named_handler)) = return_guard_pops
+                        && let Some((
+                            pop,
+                            ordinary_pops,
+                            nested_named_handler,
+                            retained_manager_guard,
+                        )) = return_guard_pops
                     {
                         self.assembler.record_copied_return_guard(
                             pop,
                             ordinary_pops,
                             nested_named_handler,
+                            retained_manager_guard,
                         );
                     }
                     if result.is_ok() && (preserve_tos || nested_handler_exit) {
