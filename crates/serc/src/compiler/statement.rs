@@ -27031,6 +27031,16 @@ impl<'source> Compiler<'source> {
         })
     }
 
+    /// Retains the jump's inherited `pass` line when a small exit is copied over it.
+    fn preserve_normal_pass_exit(&mut self, body: &[Stmt], exit: EmittedJump) {
+        if self.context.python_version >= crate::PythonVersion::Py314
+            && let Some(Stmt::Pass(pass)) = body.last()
+            && self.assembler.last_instruction_location() == Some(self.source_location(pass.range))
+        {
+            self.assembler.preserve_authored_pass_jump_nop(exit);
+        }
+    }
+
     fn compile_try_except(
         &mut self,
         statement: &ruff_python_ast::StmtTry,
@@ -31694,6 +31704,9 @@ impl<'source> Compiler<'source> {
                 // source array and target after copying and cold-block movement.
                 self.assembler
                     .record_populated_try_else_borrow_exit(normal_exit);
+            }
+            if !statement.is_star {
+                self.preserve_normal_pass_exit(normal_exit_suite, normal_exit);
             }
             // A generator's enclosing-finally exit also needs its already captured
             // two-handler return prefix. Bind that certificate to the same finalizer;
@@ -41412,6 +41425,7 @@ impl<'source> Compiler<'source> {
                         .mark_retained_nop_borrow_fallthrough(normal_exit);
                 }
             }
+            self.preserve_normal_pass_exit(&statement.finalbody, normal_exit);
             if let Some(exit_exclusion_start) = exit_exclusion_start {
                 let exit_exclusion_end = self.assembler.label();
                 self.assembler.mark(exit_exclusion_end);
