@@ -4146,6 +4146,37 @@ fn iterator_returns_unwind_inner_try_before_copied_none_guard() {
 }
 
 #[test]
+fn generator_iterator_return_keeps_the_copied_none_guard_unprotected() {
+    for (declaration, exit) in [
+        ("def", "return"),
+        ("def", "return 1"),
+        ("async def", "return"),
+    ] {
+        let source = format!(
+            "{declaration} consume(items, pool, finished):
+    try:
+        for item in items:
+            yield item
+            if finished:
+                {exit}
+    except ValueError:
+        pass
+    finally:
+        if pool is not None:
+            pool.close()
+    finish()
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "generator_iterator_guard.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn guarded_finalizers_copy_nested_iterator_return_exits() {
     let body = r"for row in rows:
     for item in row:

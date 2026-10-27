@@ -11827,13 +11827,18 @@ impl<'source> Compiler<'source> {
                                 && loop_context.finally_end_depth == 0
                                 && loop_context.exception_region_depth
                                     == self.control.exceptions.active_exception_region_exclusions.len());
-                    // A coroutine's inner iterator has already emitted its
+                    // The inner iterator has already emitted its
                     // POP_TOP (and SWAP for a value return). The surrounding ordinary
                     // try still contributes a NULL POP before the copied finalizer.
                     // An outer while contributes no iterator cell to that prefix.
-                    let copied_return_unwinds_inner_iterator = self.unit.flags
+                    let generator_constant_return = self.context.python_version
+                        == crate::PythonVersion::Py314
+                        && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) != 0
+                        && !preserve_tos;
+                    let copied_return_unwinds_inner_iterator = (self.unit.flags
                         & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                         == CO_COROUTINE
+                        || generator_constant_return)
                         && !return_is_overridden
                         && context_index == 0
                         && finally_context.loop_depth <= 1
@@ -12148,7 +12153,9 @@ impl<'source> Compiler<'source> {
                                 || copied_return_keeps_outer_loop
                                 || copied_return_unwinds_while_only
                                 || (copied_return_unwinds_inner_iterator
-                                    && (preserve_tos || statement.value.is_none())))
+                                    && (preserve_tos
+                                        || statement.value.is_none()
+                                        || generator_constant_return)))
                         {
                             copied_return_none_pop_pair =
                                 Some((self.assembler.item_count(), ordinary_try_count == 2));
