@@ -2919,6 +2919,13 @@ impl<'source> Compiler<'source> {
                     || self.control.finally.active_finally_end_blocks > 0
                     || protected_async_with_pass
                     || protected_sync_with_join_pass
+                    // A following statement keeps the authored pass inside the
+                    // iterator's original body, before any manager cleanup begins.
+                    || (index + 1 < body.len()
+                        && self.control.loops.contexts.last().is_some_and(|context| {
+                            context.with_depth > 0
+                                && context.with_depth == self.control.withs.active_with_exits.len()
+                        }))
                     || optimized_sync_with_pass_tail
                     || (self.context.python_version >= crate::PythonVersion::Py314
                         && split_finally_pass_prefix)
@@ -2928,8 +2935,10 @@ impl<'source> Compiler<'source> {
                                 && previous.line != self.source_location(statement.range).line,
                         ))
                     // A direct synchronous manager tail transfers its authored
-                    // Pass location to the following converted POP_BLOCK.
-                    || (self.context.python_version <= crate::PythonVersion::Py313
+                    // Pass location to the following converted POP_BLOCK. On newer
+                    // targets the completed iterator still precedes this line event.
+                    || ((self.context.python_version <= crate::PythonVersion::Py313
+                            || matches!(body.get(index.wrapping_sub(1)), Some(Stmt::For(_))))
                         && body.len() > 1
                         && self.control.withs.active_with_exits.last().is_some_and(|manager| {
                             !manager.is_async
