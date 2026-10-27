@@ -1449,7 +1449,8 @@ impl Compiler<'_> {
                             }
                         }
                         if (self.context.python_version == PythonVersion::Py314
-                            || self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0)
+                            || self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                                == 0)
                             && has_default
                             && index + 1 == matched_cases
                             && case.guard.is_none()
