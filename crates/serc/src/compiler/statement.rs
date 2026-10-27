@@ -6868,9 +6868,8 @@ impl<'source> Compiler<'source> {
                 // handler also clears its bound exception after POP_EXCEPT.
                 let copied_handler_is_named = (matches!(context.iterator_cleanup, IteratorCleanup::None | IteratorCleanup::Sync)
                     && self.control.withs.active_with_exits.is_empty()
-                    && self.control.exceptions.active_try_marker_slots.is_empty()
                     && self.control.exceptions.active_exception_group_handlers == 0
-                    && self.control.finally.active_finally_try_bodies == 1
+                    && self.control.finally.active_finally_try_bodies == self.control.finally.active_loop_finally_contexts.len()
                     && self.control.finally.active_finally_end_blocks == 0
                     && self.control.finally.active_normal_finally_bodies == 0
                     && self.control.finally.active_copied_finally_bodies == 0
@@ -6880,14 +6879,19 @@ impl<'source> Compiler<'source> {
                     && self.control.finally.active_pass_finally_locations.is_empty()
                     && matches!(self.control.exceptions.active_exception_handlers.as_slice(), [handler]
                         if ((handler.name.is_some()
+                            && self.control.exceptions.active_try_marker_slots.is_empty()
+                            && self.control.finally.active_loop_finally_contexts.len() == 1
                             && matches!(self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR), 0 | CO_COROUTINE))
-                            || (handler.name.is_none() && self.context.python_version == crate::PythonVersion::Py314))
+                            || (handler.name.is_none() && self.context.python_version == crate::PythonVersion::Py314
+                                && handler.try_body_depth == self.control.exceptions.active_try_marker_slots.len()))
                             && handler.with_depth == 0
                             && handler.loop_depth == self.control.loops.contexts.len()
                             && self.control.exceptions.active_exception_region_exclusions.len()
                                 == handler.exception_region_depth + 1
-                            && matches!(self.control.finally.active_loop_finally_contexts.as_slice(), [finally]
-                                if finally.handler_depth == 0
+                            && self.control.finally.active_loop_finally_contexts.split_last().is_some_and(|(finally, older)|
+                                older.iter().all(|outer| outer.loop_depth < handler.loop_depth)
+                                    && finally.try_body_depth == handler.try_body_depth
+                                    && finally.handler_depth == 0
                                     && finally.with_depth == 0
                                     && finally.loop_depth == handler.loop_depth
                                     && finally.exception_region_depth + 1 == handler.exception_region_depth
@@ -20230,16 +20234,20 @@ impl<'source> Compiler<'source> {
                         self.control.exceptions.active_exception_region_exclusions[index].len(),
                     ));
                 }
-                if let (Some(origin), Some(start)) =
+                let handler_finally_pop = if let (Some(origin), Some(start)) =
                     (emitted_handler_pop_item, copied_handler_start)
                 {
                     self.assembler
                         .record_copied_handler_cleanup(start, copy_start, origin, false);
                     // This region-end label certifies the finalizer's separate NULL POP.
                     // Compaction transfers it to the guard load, after the handler cleanup.
+                    let pop = self.assembler.item_count();
                     self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
                     self.assembler.mark_last_as_converted_pop_block();
-                }
+                    Some(pop)
+                } else {
+                    None
+                };
                 if matches!(
                     self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR),
                     CO_GENERATOR | CO_ASYNC_GENERATOR
@@ -20594,6 +20602,12 @@ impl<'source> Compiler<'source> {
                         )
                     },
                 );
+                if result.is_ok()
+                    && let Some(pop) = handler_finally_pop
+                {
+                    self.assembler
+                        .record_copied_return_guard(pop, 0, false, false);
+                }
                 // Only a straight-line finalizer can donate a location to the
                 // artificial iterator discard after its exception unwind.
                 let linear_finalizer = match context.body {
