@@ -8564,6 +8564,33 @@ fn a_finalizer_guard_keeps_the_following_local_load_owned() {
 }
 
 #[test]
+fn nested_for_else_conditions_keep_their_forward_exit() {
+    let source = r"def find(rows, enabled):
+    for row in rows:
+        if row:
+            if row.first:
+                return row
+            elif enabled and row.second:
+                return row
+        else:
+            break
+    else:
+        return enabled
+
+async def record(events, enabled):
+    async for event in events:
+        if event:
+            if enabled:
+                store(event)
+        else:
+            continue
+    else:
+        yield None
+";
+    assert_matches_cpython(source, "nested_for_else_conditions.py", &LEVELS);
+}
+
+#[test]
 fn comparison_arms_keep_their_fallthrough_before_a_for_else_backedge() {
     let source = r"def contains(items, enabled, low, high):
     for item in items:
