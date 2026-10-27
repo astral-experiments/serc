@@ -54,3 +54,56 @@ fn manager_iterator_continue_blocks_cleanup_loop_borrowing() {
         common::assert_matches_cpython_marshal(&source, "manager_continue_finally.py");
     }
 }
+
+#[test]
+fn borrowed_loads_follow_original_try_exits() {
+    let source = r"def after_else(value, first, second):
+    try:
+        read()
+    except ValueError:
+        pass
+    else:
+        if first:
+            if second:
+                return 0
+            else:
+                return 1
+    report(value)
+
+def after_finally(items, value):
+    try:
+        read()
+    finally:
+        for item in items:
+            try:
+                process(item)
+            except ValueError:
+                continue
+            record(item)
+    report(value)
+
+def after_recovery(value, retry, stop):
+    try:
+        value = read()
+    except ValueError:
+        while retry:
+            if stop:
+                break
+            else:
+                record()
+        value = fallback()
+    report(value)
+
+def in_manager(manager, value, stop):
+    with manager:
+        try:
+            value = read()
+        except ValueError as error:
+            if stop:
+                raise
+            record(error)
+        finally:
+            report(value)
+";
+    common::assert_matches_cpython_marshal(source, "borrowed_try_exits.py");
+}
