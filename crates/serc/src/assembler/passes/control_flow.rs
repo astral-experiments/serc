@@ -3324,9 +3324,12 @@ impl OptimizationPipeline {
                         .filter_map(|(entry, origin)| (*origin == original_jump).then_some(*entry)),
                 );
             }
+            // A normal try exit can be copied after the unlocated arm jump.
+            // Both the break and a guarded try exit keep their own source line.
+            let direct_copy_chain =
+                threaded_jump_count == 1 || (threaded_jump_count == 2 && threaded_normal_try_exit);
             if authored_break_copy_nop
-                && (threaded_jump_count == 1
-                    || (threaded_jump_count == 2 && threaded_normal_try_exit))
+                && direct_copy_chain
                 && (threaded_normal_try_exit
                     || folded_loop_return_heads.contains(&original_target)
                     || (unlocated_return_join_heads.contains(&original_target)
@@ -3348,7 +3351,7 @@ impl OptimizationPipeline {
                 instruction.jump_policy.retain_nop_for_direct_target();
             }
             if transparent_normal_try_tails.contains(&source_index)
-                && threaded_jump_count == 1
+                && direct_copy_chain
                 && matches!(operand, Operand::Forward(_))
                 && !instruction.jump_policy.is_interruptible()
             {
