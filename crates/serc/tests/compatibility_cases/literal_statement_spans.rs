@@ -1,6 +1,18 @@
 use crate::common;
 
 #[test]
+fn parenthesized_return_constants_use_the_first_line_of_the_value() {
+    for body in [
+        "return (42\n)",
+        "return ('first'\n        'second'\n)",
+        "return (\n    42\n)",
+        "return (\n    'first'\n    'second')",
+    ] {
+        assert_scope_matches("def f():\n", body, "parenthesized_return.py");
+    }
+}
+
+#[test]
 fn matches_cpython_parenthesized_docstring_spans() {
     for header in ["", "class Example:\n", "def f():\n"] {
         for body in [

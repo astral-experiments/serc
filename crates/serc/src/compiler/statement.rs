@@ -14712,12 +14712,9 @@ impl<'source> Compiler<'source> {
                             self.emit_preprocessed_constant(value, constant)?;
                         } else if return_spans_lines {
                             let value_location = self.source_location(value.range());
-                            // Parentheses outside the literal's line span preserve the return
-                            // statement location on RETURN_VALUE. Otherwise, both the constant
-                            // and return use the literal's range.
-                            let location = if value_location.line == return_location.line
-                                && value_location.end_line == return_location.end_line
-                            {
+                            // A constant beginning on the return line supplies its full span,
+                            // including when the closing parenthesis is on a later line.
+                            let location = if value_location.line == return_location.line {
                                 value_location
                             } else {
                                 return_location
