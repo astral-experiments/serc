@@ -316,7 +316,7 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) normal_finally_truth_prefixes: Vec<[Instruction; 4]>,
     pub(super) copied_return_none_prefixes: Vec<CopiedReturnNonePrefix>,
     pub(super) copied_break_none_nops: Vec<(Vec<Label>, [Instruction; 4])>,
-    pub(super) copied_bare_handler_none_prefixes: Vec<(Label, Label, [Instruction; 10])>,
+    pub(super) copied_bare_handler_none_prefixes: Vec<(Label, Label, Vec<Instruction>)>,
     pub(super) copied_iterator_attribute_none_prefixes: Vec<[Instruction; 4]>,
     pub(super) copied_cleanup_return_none_prefixes: Vec<CopiedCleanupReturnNonePrefix>,
     pub(super) copied_return_pop_prefixes: Vec<CopiedReturnPopPrefix>,
@@ -660,7 +660,7 @@ impl ExceptionOwnerProvenance {
             .chain(
                 self.copied_bare_handler_none_prefixes
                     .iter()
-                    .map(|origin| &origin.2[8]),
+                    .map(|origin| &origin.2[origin.2.len() - 2]),
             )
             .chain(
                 self.copied_iterator_attribute_none_prefixes
@@ -9533,12 +9533,12 @@ impl LayoutAssembler {
                             );
                         }
                     }
-                    // A bare return through two unnamed handlers retains both POP_EXCEPTs.
-                    // Its late marker reuses the second POP_EXCEPT's original array cell.
+                    // A bare return through nested handlers retains both POP_EXCEPTs.
+                    // If the outer handler clears a name, the marker reuses its STORE_FAST.
                     if instruction.opcode == NOT_TAKEN
                         && owner_history_exact
                         && pop_slot_epoch_known
-                        && tail.early_removals == 7
+                        && matches!(tail.early_removals, 6 | 7)
                         && tail.insertions == 0
                         && tail.late_removals == 0
                         && tail.post_compaction_fusions == 0
@@ -9548,6 +9548,7 @@ impl LayoutAssembler {
                         && let Some(region) = self.copied_bare_handler_none_owner(
                             instruction_index,
                             original_array_start,
+                            tail.early_removals,
                             &indexed_instructions,
                             &label_positions,
                             &jump_targets,
@@ -12271,16 +12272,19 @@ impl LayoutAssembler {
         result
     }
 
-    /// Replays the complete original bare-return array through two unnamed handlers.
+    /// Replays the complete original bare-return array through two exception handlers.
     fn copied_bare_handler_none_owner(
         &self,
         marker: usize,
         array: usize,
+        removed: usize,
         instructions: &[&Instruction],
         positions: &OwnerLabelPositions,
         targets: &FxHashSet<Label>,
     ) -> Option<usize> {
-        if marker.checked_sub(array) != Some(5)
+        let named = removed == 6;
+        let load_offset = if named { 6 } else { 3 };
+        if marker.checked_sub(array) != Some(load_offset + 2)
             || targets.iter().any(|label| {
                 positions
                     .get(label)
@@ -12294,15 +12298,28 @@ impl LayoutAssembler {
             .copied_bare_handler_none_prefixes
             .iter()
             .filter(|(entry, _, records)| {
-                if positions.get(entry) != Some(&array) || *instructions[marker] != records[9] {
+                if positions.get(entry) != Some(&array)
+                    || records.len() != if named { 12 } else { 10 }
+                    || records.last() != Some(instructions[marker])
+                {
                     return false;
                 }
                 let mut inner = records[3];
                 inner.local_policy.add_hidden_exception_owner_slots(2);
-                let mut outer = records[5];
-                outer.local_policy.add_hidden_exception_owner_slots(1);
-                let mut load = records[7];
-                let actual_load = instructions[array + 3];
+                let mut outer = records[if named { 4 } else { 5 }];
+                if named {
+                    if !records[5..8]
+                        .iter()
+                        .zip(&instructions[array + 3..array + 6])
+                        .all(|(saved, live)| saved == *live)
+                    {
+                        return false;
+                    }
+                } else {
+                    outer.local_policy.add_hidden_exception_owner_slots(1);
+                }
+                let mut load = records[records.len() - 3];
+                let actual_load = instructions[array + load_offset];
                 if !matches!(
                     actual_load.opcode,
                     crate::target::opcodes::LOAD_FAST | crate::target::opcodes::LOAD_FAST_BORROW
@@ -12316,17 +12333,33 @@ impl LayoutAssembler {
                     false,
                 );
                 load.local_policy.add_hidden_exception_owner_slots(1);
+                let mut condition = records[records.len() - 2];
+                if named && condition != *instructions[marker - 1] {
+                    // Exit copying may redirect the forward edge after the marker.
+                    // The entire fallthrough array still has the same source records.
+                    let Some(target) = instructions[marker - 1].forward_target() else {
+                        return false;
+                    };
+                    if positions
+                        .get(&target)
+                        .is_none_or(|position| *position <= marker)
+                    {
+                        return false;
+                    }
+                    condition.set_operand(Operand::Forward(target));
+                }
                 *instructions[array] == records[0]
                     && *instructions[array + 1] == inner
                     && *instructions[array + 2] == outer
                     && *actual_load == load
-                    && *instructions[array + 4] == records[8]
+                    && *instructions[marker - 1] == condition
             });
         let (_, finally_handler, _) = matching.next()?;
         if matching.next().is_some() {
             return None;
         }
-        let region = self.uniform_exception_owner(array + 2, array + 3, positions)?;
+        let slot = array + if named { 4 } else { 2 };
+        let region = self.uniform_exception_owner(slot, slot + 1, positions)?;
         let owner = &self.exception_regions[region];
         (!owner.is_scope_fallback && !owner.preserve_lasti && owner.target == *finally_handler)
             .then_some(region)

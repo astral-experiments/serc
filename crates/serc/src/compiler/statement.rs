@@ -11805,10 +11805,19 @@ impl<'source> Compiler<'source> {
                                         == self.source_location(statement.range).line)
                         })
                         .map(|(pop_item, _, _)| pop_item);
-                    let copied_bare_handler_none = self.unit.flags
-                        & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                        == CO_GENERATOR
-                        && !preserve_tos
+                    let named_outer_handler = self
+                        .control
+                        .exceptions
+                        .active_exception_handlers
+                        .first()
+                        .is_some_and(|handler| handler.name.is_some());
+                    let copied_bare_handler_none = (if named_outer_handler {
+                        self.context.python_version == crate::PythonVersion::Py314
+                            && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+                    } else {
+                        self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                            == CO_GENERATOR
+                    }) && !preserve_tos
                         && !return_is_overridden
                         && !starts_jump_target
                         && context_index == 0
@@ -11839,7 +11848,7 @@ impl<'source> Compiler<'source> {
                             .iter()
                             .enumerate()
                             .all(|(index, handler)| {
-                                handler.name.is_none()
+                                (handler.name.is_none() || (index == 0 && named_outer_handler))
                                     && handler.with_depth == 0
                                     && handler.loop_depth == 0
                                     && handler.finally_end_depth == 0
@@ -12399,6 +12408,7 @@ impl<'source> Compiler<'source> {
                         self.assembler.record_copied_bare_handler_none_prefix(
                             copied_handler_return_item,
                             finally_context.handler,
+                            named_outer_handler,
                         );
                     }
                     if result.is_ok()
