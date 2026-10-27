@@ -85,6 +85,19 @@ fn matches_cpython_names_in_unreachable_try_suites() {
 }
 
 #[test]
+fn unreachable_try_suites_keep_codegen_order_without_a_pending_finalizer() {
+    for suite in [
+        "except HandlerError:\n            return handle()\n        else:\n            finish()",
+        "except HandlerError:\n            handle()\n        else:\n            finish()\n        finally:\n            return close()",
+    ] {
+        let source = format!(
+            "def f():\n    if False:\n        try:\n            work()\n        {suite}\n    return tail()\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "unreachable_try_without_unwind.py");
+    }
+}
+
+#[test]
 fn preserves_unreachable_try_admissions_with_finally_unwinds() {
     for exit in [
         "return body_name('reused')",

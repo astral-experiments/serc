@@ -1003,18 +1003,34 @@ impl Compiler<'_> {
         }
 
         #[derive(Default)]
-        struct UnwindExitDetector(bool);
+        struct UnwindExitDetector {
+            has_pending_finalizer: bool,
+            found: bool,
+        }
 
         impl<'ast> Visitor<'ast> for UnwindExitDetector {
             fn visit_stmt(&mut self, statement: &'ast Stmt) {
-                if self.0 || matches!(statement, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
+                if self.found || matches!(statement, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
                     return;
                 }
-                if matches!(
-                    statement,
-                    Stmt::Return(_) | Stmt::Break(_) | Stmt::Continue(_)
-                ) {
-                    self.0 = true;
+                if self.has_pending_finalizer
+                    && matches!(
+                        statement,
+                        Stmt::Return(_) | Stmt::Break(_) | Stmt::Continue(_)
+                    )
+                {
+                    self.found = true;
+                } else if let Stmt::Try(statement) = statement
+                    && !statement.finalbody.is_empty()
+                {
+                    let enclosing = std::mem::replace(&mut self.has_pending_finalizer, true);
+                    self.visit_body(&statement.body);
+                    for handler in &statement.handlers {
+                        self.visit_except_handler(handler);
+                    }
+                    self.visit_body(&statement.orelse);
+                    self.has_pending_finalizer = enclosing;
+                    self.visit_body(&statement.finalbody);
                 } else {
                     walk_stmt(self, statement);
                 }
@@ -1932,13 +1948,12 @@ impl Compiler<'_> {
             }
         }
 
-        // Returns and loop exits can compile an enclosing finalizer before later
-        // suites. Preserve the existing admission traversal until those copies are
-        // replayed; raises do not inline finalizers during code generation.
+        // An exit can compile a pending finalizer before the next suite. Exits
+        // elsewhere leave the ordinary try body's name-admission order intact.
         let mut unwind_exits = UnwindExitDetector::default();
         unwind_exits.visit_body(body);
         let mut collector = Collector {
-            reorder_try_suites: !unwind_exits.0,
+            reorder_try_suites: !unwind_exits.found,
             register_literals,
             register_folds,
             build_discarded: self.context.requires_discarded_builders()
