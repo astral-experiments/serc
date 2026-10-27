@@ -16815,6 +16815,20 @@ fn elided_non_ascii_identifier_preserves_discarded_builders() {
 }
 
 #[test]
+fn swapped_tuple_stores_keep_the_original_loop_backedge_column() {
+    // High local indexes keep the two stores separate through superinstruction fusion.
+    let extra = (0..16)
+        .map(|index| format!(", arg{index}"))
+        .collect::<String>();
+    for prefix in ["", "            saved = [entry for entry in items]\n"] {
+        let source = format!(
+            "def visit(items, ready{extra}):\n    for item in items:\n        if ready:\n{prefix}            first, last = before(item), after(item)\n        assert ready\n    return ready\n"
+        );
+        assert_matches_cpython(&source, "case.py", &LEVELS);
+    }
+}
+
+#[test]
 fn comprehension_branches_preserve_backedge_store_locations() {
     let source = "def check_groups(groups, flag):\n    for group in groups:\n        if flag:\n            selected = [item for item in group if ready(item)]\n            assert selected\n        else:\n            selected = [item for item in group if item.active]\n            assert selected\n        assert len(selected) == 1\n";
     for source in [

@@ -2037,14 +2037,39 @@ impl ReversedStoreExits {
                 && matches!(target.strip_prefix(prefix), Some([Item::Label(entry), ..])
                 if copied_entries.contains(entry))
         });
-        if (target != origin.target.as_slice() && !copied_successor)
-            || !source.ends_with(&origin.swapped_source)
-        {
+        let offset = source.len().checked_sub(origin.swapped_source.len())?;
+        let mut actual = &source[offset..];
+        let mut expected = origin.swapped_source.as_slice();
+        // Independent static exchanges can also restore comprehension locals
+        // earlier in this block. They preserve this captured tail's donor.
+        while !expected.is_empty() {
+            if actual[0] == expected[0] {
+                actual = &actual[1..];
+                expected = &expected[1..];
+            } else if let [
+                Item::Instruction(swap),
+                Item::Instruction(first),
+                Item::Instruction(last),
+                ..,
+            ] = expected
+                && swap.opcode == SWAP
+                && swap.value_argument() == Some(2)
+                && first.opcode == STORE_FAST
+                && last.opcode == STORE_FAST
+                && static_swap_tail_location(&actual[..3], &[*swap, *first, *last]).is_some()
+            {
+                actual = &actual[3..];
+                expected = &expected[3..];
+            } else {
+                return None;
+            }
+        }
+        if target != origin.target.as_slice() && !copied_successor {
             return None;
         }
         // Exit copying can prepend fresh aliases, but cannot replace an original
         // boundary, insert an instruction, or alter any captured source record.
-        let aliases = &source[..source.len() - origin.swapped_source.len()];
+        let aliases = &source[..offset];
         aliases
             .iter()
             .all(|item| {
@@ -4755,7 +4780,27 @@ impl OptimizationPipeline {
                     .last_chunk::<5>()
                     .and_then(|tail| super::super::constant_pair_stores(tail))
             } else {
-                super::super::constant_pair_store_tail(source)
+                super::super::constant_pair_store_tail(source).or_else(|| {
+                    // A call can produce the final tuple element before the same exchange.
+                    let [
+                        ..,
+                        Item::Instruction(call),
+                        Item::Instruction(swap),
+                        Item::Instruction(first),
+                        Item::Instruction(last),
+                    ] = source
+                    else {
+                        return None;
+                    };
+                    (call.opcode == CALL
+                        && swap.opcode == SWAP
+                        && swap.value_argument() == Some(2)
+                        && [first, last].into_iter().all(|store| {
+                            store.opcode == STORE_FAST && store.location.line == swap.location.line
+                        })
+                        && first.operand() != last.operand())
+                    .then_some([*swap, *first, *last])
+                })
             };
             if let Some([swap, first, last]) = pair {
                 let mut swapped_source = source.to_vec();
