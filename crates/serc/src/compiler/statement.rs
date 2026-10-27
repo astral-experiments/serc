@@ -19032,6 +19032,24 @@ impl<'source> Compiler<'source> {
         }
     }
 
+    /// Runtime conditional arms both reach the body join before the enclosing loop backedge.
+    fn non_final_loop_test_needs_owned_loads(&self, test: &Expr) -> bool {
+        let Expr::If(conditional) = test else {
+            return false;
+        };
+        self.context.python_version != crate::PythonVersion::Py314
+            || [
+                conditional.test.as_ref(),
+                conditional.body.as_ref(),
+                conditional.orelse.as_ref(),
+            ]
+            .into_iter()
+            .any(|part| {
+                !condition_has_linear_runtime_leaves(part)
+                    || expression_suspends_current_scope(part)
+            })
+    }
+
     pub(super) fn compile_with_strict_owned_loads<T>(
         &mut self,
         strict: bool,
@@ -22870,7 +22888,7 @@ impl<'source> Compiler<'source> {
                 )?;
                 let body_start = self.assembler.instruction_count();
                 let nested_tail = self.compile_with_strict_owned_loads(
-                    matches!(statement.test.as_ref(), Expr::If(_)),
+                    self.non_final_loop_test_needs_owned_loads(&statement.test),
                     |compiler| {
                         compiler.compile_non_final_branch_loop_tail_suite(
                             body,
@@ -23171,7 +23189,7 @@ impl<'source> Compiler<'source> {
                     self.compile_jump_if(test, false, fallback)?;
                     let body_start = self.assembler.instruction_count();
                     let nested_tail = self.compile_with_strict_owned_loads(
-                        matches!(test, Expr::If(_)),
+                        self.non_final_loop_test_needs_owned_loads(test),
                         |compiler| {
                             compiler.compile_non_final_branch_loop_tail_suite(body, restart, false)
                         },
