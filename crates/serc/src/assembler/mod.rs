@@ -1843,13 +1843,6 @@ impl Assembler {
         instruction
     }
 
-    /// Identifies a rotation emitted while collecting pattern captures.
-    pub(crate) fn mark_pattern_capture_swap(&mut self, emitted: EmittedInstruction) {
-        let swap = self.emitted_instruction_mut(emitted, "recording a pattern capture rotation");
-        debug_assert_eq!(swap.opcode, SWAP);
-        swap.pattern_capture_swap = true;
-    }
-
     fn emitted_instruction_mut(
         &mut self,
         emitted: EmittedInstruction,
@@ -18370,6 +18363,16 @@ impl Assembler {
             Some(depth_after),
             exception_policy,
         )
+    }
+
+    /// Rotates pattern captures at a fixed stack depth, keeping their origin through assembly.
+    pub(crate) fn emit_pattern_capture_rotation(&mut self, count: u32, depth_after: u32) {
+        for argument in (2..=count).rev() {
+            let mut swap =
+                Instruction::value_with_depth(SWAP, argument, self.location, depth_after);
+            swap.pattern_capture_swap = true;
+            self.push_linear_item(Item::Instruction(swap));
+        }
     }
 
     pub(crate) fn emit_value_with_depth_discard(

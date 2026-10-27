@@ -2037,11 +2037,12 @@ impl Compiler<'_> {
         Ok(())
     }
 
-    fn rotate_match_stack(&mut self, mut count: usize) -> Result<(), CompileError> {
-        while count > 1 {
-            let swap = self.emit_instruction(SWAP, to_u32(count, "pattern capture rotation")?)?;
-            self.assembler.mark_pattern_capture_swap(swap);
-            count -= 1;
+    fn rotate_match_stack(&mut self, count: usize) -> Result<(), CompileError> {
+        if count > 1 {
+            let count = to_u32(count, "pattern capture rotation")?;
+            self.apply_compiler_stack_effect(SWAP, count, 0)?;
+            self.assembler
+                .emit_pattern_capture_rotation(count, self.control.stack.depth.cast_unsigned());
         }
         Ok(())
     }
