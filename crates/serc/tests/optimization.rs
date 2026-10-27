@@ -26017,3 +26017,28 @@ def shared(manager, first, second):
 ";
     assert_matches_cpython(source, "guard_manager_cleanup.py", &LEVELS);
 }
+
+#[test]
+fn nested_conditional_call_locates_the_manager_exit() {
+    let source = r"def check(manager, first, second, value):
+    with manager:
+        if first:
+            return value
+        else:
+            prepare()
+            if second:
+                return value
+            else:
+                visit(value)
+    return value
+
+async def poll(manager, ready, value):
+    while ready():
+        with manager:
+            if value:
+                await visit(value)
+            else:
+                break
+";
+    assert_matches_cpython(source, "nested_manager_call.py", &LEVELS);
+}
