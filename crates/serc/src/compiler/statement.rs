@@ -66,6 +66,8 @@ struct LoopContext {
     continue_label: Label,
     break_label: Label,
     iterator_cleanup: IteratorCleanup,
+    // The final AST statement whose normal exit reaches a synchronous FOR_ITER.
+    iterator_body_tail: Option<TextRange>,
     has_orelse: bool,
     prevent_break_exit_inlining: bool,
     with_depth: usize,
@@ -1077,6 +1079,7 @@ impl<'source> Compiler<'source> {
             continue_label,
             break_label,
             iterator_cleanup,
+            iterator_body_tail: None,
             has_orelse: false,
             prevent_break_exit_inlining: iterator_cleanup != IteratorCleanup::None
                 && self.control.statements.context.followed_by_tuple_return,
@@ -25757,6 +25760,7 @@ impl<'source> Compiler<'source> {
         {
             context.break_target_keeps_exception_owner = true;
         }
+        context.iterator_body_tail = statement.body.last().map(Ranged::range);
         context.has_orelse = !statement.orelse.is_empty();
         let body_start = self.assembler.instruction_count();
         let first_iterator_loop_assertion = first_iterator_loop_assertion(&statement.body);
@@ -40372,7 +40376,17 @@ impl<'source> Compiler<'source> {
             let preserve_manager_jump = pass_finally_leaves_manager
                 && (self.context.python_version <= crate::PythonVersion::Py313
                     || separate_manager_pop);
+            // The normal exit of a pass finalizer at the iterator's tail threads
+            // to FOR_ITER. Its surviving backedge keeps the surrounding handler.
+            let pass_exits_to_iterator = self.context.python_version == crate::PythonVersion::Py312
+                && self
+                    .control
+                    .loops
+                    .contexts
+                    .last()
+                    .is_some_and(|context| context.iterator_body_tail == Some(statement.range));
             let exception_policy = if !original_nested_pass_exit
+                && !pass_exits_to_iterator
                 && pass_exit_exception_depth.is_none()
                 && pass_finally_location.is_some()
                 && !preserve_manager_jump

@@ -23671,6 +23671,21 @@ fn nested_pass_exit_successors_match_cpython() {
 }
 
 #[test]
+fn a_pass_finalizer_at_an_iterator_tail_keeps_its_enclosing_handler() {
+    let source = r"def scan(items):
+    try:
+        prepare()
+    finally:
+        for item in items:
+            try:
+                visit(item)
+            finally:
+                pass
+";
+    assert_matches_cpython(source, "pass_finalizer_backedge.py", &LEVELS);
+}
+
+#[test]
 fn nonterminal_pass_finally_preserves_handler_for_all_targets() {
     for (function, trailer) in [
         ("def", ""),
