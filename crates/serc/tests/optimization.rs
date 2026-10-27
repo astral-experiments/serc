@@ -23686,6 +23686,23 @@ fn nonterminal_pass_finally_preserves_handler_for_all_targets() {
 }
 
 #[test]
+fn pass_finalizer_keeps_the_normal_try_exit_after_a_terminal_handler() {
+    let source = r"def check(value):
+    try:
+        inspect(value)
+    except ValueError:
+        raise
+    finally:
+        pass
+    return value
+";
+    for handler in ["raise", "recover(value)"] {
+        let source = source.replace("raise", handler);
+        assert_matches_cpython(&source, "terminal_handler_pass_finalizer.py", &LEVELS);
+    }
+}
+
+#[test]
 fn optimized_with_assertion_join_before_noncall_matches_cpython() {
     for successor in [
         "",

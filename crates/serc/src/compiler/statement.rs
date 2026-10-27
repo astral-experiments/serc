@@ -39510,17 +39510,28 @@ impl<'source> Compiler<'source> {
                     .push((start, end));
             }
         }
-        // A sole original assertion-success predecessor can locate POP_BLOCK even
-        // when the finally body is only Pass. Shared entries still stay unlocated.
+        let handlers_terminate_before_folding = || {
+            statement.handlers.iter().all(|handler| {
+                handler
+                    .as_except_handler()
+                    .is_some_and(|handler| suite_terminates_before_constant_folding(&handler.body))
+            })
+        };
         let single_assertion_success_predecessor = statement.orelse.is_empty()
             && matches!(statement.body.last(), Some(Stmt::Assert(assertion))
                 if early_condition_truthiness(&assertion.test).is_none()
                     && original_condition_has_unique_jump_target(&assertion.test, true))
-            && statement.handlers.iter().all(|handler| {
-                handler
-                    .as_except_handler()
-                    .is_some_and(|handler| suite_terminates_before_constant_folding(&handler.body))
-            });
+            && handlers_terminate_before_folding();
+        // A sole normal try exit supplies the converted POP_BLOCK's line. A
+        // following Pass in the finalizer can retain a second source line.
+        let sole_normal_pass_finally_entry = self.context.python_version
+            >= crate::PythonVersion::Py314
+            && pass_finally_location.is_some()
+            && !statement.is_star
+            && !statement.handlers.is_empty()
+            && statement.orelse.is_empty()
+            && !suite_terminates_before_constant_folding(&statement.body)
+            && handlers_terminate_before_folding();
         // 3.12 keeps this original POP_BLOCK through both exit-copy passes.
         // After copying, an omitted else NOP can donate its line to this
         // ownerless slot before pseudo-op conversion removes redundant NOPs.
@@ -39528,6 +39539,7 @@ impl<'source> Compiler<'source> {
             || statement.handlers.is_empty()
             || !noop_finally_body
             || single_assertion_success_predecessor
+            || sole_normal_pass_finally_entry
             || (self.context.python_version >= crate::PythonVersion::Py314
                 && suite_terminates_before_constant_folding(&statement.orelse))
         {
