@@ -38322,6 +38322,29 @@ impl<'source> Compiler<'source> {
                 if condition_has_only_runtime_tests(&cleanup.test)
                     && !expression_contains_inline_branch(&cleanup.test)
                     && !expression_suspends_current_scope(&cleanup.test));
+        // A break from the terminal loop can bypass the removed POP_BLOCK. The
+        // ordinary fallthrough stays blocked and only a surviving jump may use
+        // the original nonempty cleanup entry.
+        let terminal_while_cleanup_break = self.context.python_version
+            == crate::PythonVersion::Py314
+            && matches!(statement.body.last(), Some(Stmt::While(loop_))
+            if loop_.orelse.is_empty()
+                && early_condition_truthiness(&loop_.test) != Some(false)
+                && suite_contains_loop_break(&loop_.body)
+                // Multiple false exits can share an empty POP_BLOCK. A break
+                // at the end of the body becomes a line NOP before that same
+                // barrier; only an earlier independent break can bypass it.
+                && (original_condition_has_unique_jump_target(&loop_.test, false)
+                    || suite_contains_borrow_reachable_conditional_loop_break(&loop_.body)
+                    || loop_.body.split_last().is_some_and(|(_, prefix)| {
+                        suite_contains_borrow_reachable_conditional_loop_break(prefix)
+                    })))
+            && statement.finalbody.first().is_some_and(|entry| {
+                self.suite_has_nonempty_borrow_entry(std::slice::from_ref(entry))
+                    || matches!(entry, Stmt::If(guard)
+                        if condition_has_linear_runtime_leaves(&guard.test)
+                            && !expression_suspends_current_scope(&guard.test))
+            });
         let loop_break_reaches_finally = !statement.handlers.is_empty()
             && !normal_finally_is_borrow_reachable
             && !statement.is_star
@@ -38334,10 +38357,12 @@ impl<'source> Compiler<'source> {
             && (self.suite_has_nonempty_borrow_entry(&statement.finalbody)
                 || coroutine_conditional_cleanup_entry
                 || runtime_while_iterator_cleanup_break
-                || runtime_guarded_cleanup_break)
+                || runtime_guarded_cleanup_break
+                || terminal_while_cleanup_break)
             && (runtime_while_recovery_break
                 || runtime_while_iterator_cleanup_break
                 || runtime_guarded_cleanup_break
+                || terminal_while_cleanup_break
                 || (self.context.python_version == crate::PythonVersion::Py314
                     && runtime_coroutine_break_context
                     && matches!(statement.finalbody.first(), Some(Stmt::Try(_)))

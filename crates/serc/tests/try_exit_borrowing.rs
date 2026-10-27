@@ -107,3 +107,21 @@ def in_manager(manager, value, stop):
 ";
     common::assert_matches_cpython_marshal(source, "borrowed_try_exits.py");
 }
+
+#[test]
+fn surviving_while_breaks_enter_the_normal_finally() {
+    let source = "\
+def run(value, ready, stopped):
+    try:
+        while ready():
+            if stopped():
+                break
+            advance(value)
+    except OSError:
+        raise
+    finally:
+        if value.ready:
+            value.close()
+";
+    common::assert_matches_cpython_marshal(source, "while_break_finally.py");
+}
