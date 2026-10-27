@@ -12281,6 +12281,13 @@ impl Assembler {
             .mark_location_from_next();
     }
 
+    /// Records where a manager's normal and suppressed paths rejoin an exceptional finalizer.
+    pub(crate) fn record_exceptional_finally_manager_exit(&mut self, entry: Label, cleanup: Label) {
+        self.exception_owner_provenance
+            .exceptional_finally_manager_exits
+            .push((entry, cleanup));
+    }
+
     /// Records the source range carried by a manager's normal and suppressed exits.
     pub(crate) fn record_with_context_location(&mut self, location: SourceLocation) {
         self.exception_owner_provenance

@@ -42906,6 +42906,16 @@ impl<'source> Compiler<'source> {
             end,
         );
         self.assembler.mark(end);
+        if self.context.python_version == crate::PythonVersion::Py314
+            && self
+                .control
+                .finally
+                .exceptional_finally_continuation_depths
+                .is_some()
+        {
+            self.assembler
+                .record_exceptional_finally_manager_exit(end, cleanup);
+        }
         self.set_depth(base_depth);
         for name in newly_initialized_targets {
             let name = self.required_name_id(&name);
