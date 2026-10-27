@@ -3,7 +3,7 @@ use std::error::Error;
 use std::fmt;
 use std::str::Utf8Error;
 
-use encoding_rs::{EUC_JP, ISO_8859_15, KOI8_R, WINDOWS_1251};
+use encoding_rs::{EUC_JP, ISO_8859_15, KOI8_R, WINDOWS_1251, WINDOWS_1252};
 
 const UTF8_BOM: &[u8] = b"\xef\xbb\xbf";
 
@@ -65,6 +65,7 @@ enum SourceEncoding {
     EucJp,
     Koi8R,
     Windows1251,
+    Windows1252,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -82,6 +83,7 @@ pub(crate) enum SourceCodec {
     EucJp,
     Koi8R,
     Windows1251,
+    Windows1252,
 }
 
 pub(crate) struct DecodedSource<'a> {
@@ -94,7 +96,7 @@ pub(crate) struct DecodedSource<'a> {
 ///
 /// Serc accepts UTF-8 source, including a single UTF-8 BOM and CPython-compatible UTF-8
 /// encoding cookies on the first or second physical line. ASCII, Latin-1, Latin-9, EUC-JP, KOI8-R, and
-/// Windows 1251 cookies are also decoded with CPython-compatible aliases and strict mappings.
+/// Windows 1251 and 1252 cookies are also decoded with CPython-compatible aliases and strict mappings.
 /// Newlines are normalized to `\n`. The returned value borrows `bytes` for unchanged UTF-8 source.
 pub fn decode_source(bytes: &[u8]) -> Result<Cow<'_, str>, SourceDecodeError> {
     Ok(decode_source_with_codec(bytes)?.source)
@@ -144,7 +146,8 @@ pub(crate) fn decode_source_with_codec(
         SourceEncoding::Iso885915
         | SourceEncoding::EucJp
         | SourceEncoding::Koi8R
-        | SourceEncoding::Windows1251 => {
+        | SourceEncoding::Windows1251
+        | SourceEncoding::Windows1252 => {
             let encoding_name = declared.expect("legacy source encoding has a cookie");
             decode_legacy(encoding, bytes)
                 .ok_or_else(|| SourceDecodeError::InvalidEncoding(encoding_name.to_string()))?
@@ -181,7 +184,8 @@ fn codec_registry_effects(
         SourceEncoding::Iso885915
         | SourceEncoding::EucJp
         | SourceEncoding::Koi8R
-        | SourceEncoding::Windows1251 => false,
+        | SourceEncoding::Windows1251
+        | SourceEncoding::Windows1252 => false,
     };
     if fast_path {
         return (None, None);
@@ -196,6 +200,7 @@ fn codec_registry_effects(
         SourceEncoding::EucJp => Some(SourceCodec::EucJp),
         SourceEncoding::Koi8R => Some(SourceCodec::Koi8R),
         SourceEncoding::Windows1251 => Some(SourceCodec::Windows1251),
+        SourceEncoding::Windows1252 => Some(SourceCodec::Windows1252),
     };
     (codec, Some(normalized))
 }
@@ -210,7 +215,16 @@ fn decode_legacy(encoding: SourceEncoding, bytes: &[u8]) -> Option<Cow<'_, str>>
         SourceEncoding::Windows1251 if !bytes.contains(&0x98) => {
             WINDOWS_1251.decode_without_bom_handling_and_without_replacement(bytes)
         }
-        SourceEncoding::Windows1251 => None,
+        // The web decoder maps these undefined bytes to C1 controls, while
+        // CPython's strict Windows-1252 charmap rejects them.
+        SourceEncoding::Windows1252
+            if !bytes
+                .iter()
+                .any(|byte| matches!(byte, 0x81 | 0x8d | 0x8f | 0x90 | 0x9d)) =>
+        {
+            WINDOWS_1252.decode_without_bom_handling_and_without_replacement(bytes)
+        }
+        SourceEncoding::Windows1251 | SourceEncoding::Windows1252 => None,
         SourceEncoding::Utf8(_) | SourceEncoding::Ascii | SourceEncoding::Latin1 => unreachable!(),
     }
 }
@@ -325,6 +339,7 @@ fn classify_source_encoding(name: &str) -> Option<SourceEncoding> {
         "euc_jp" | "eucjp" | "ujis" | "u_jis" => Some(SourceEncoding::EucJp),
         "koi8_r" | "cskoi8r" => Some(SourceEncoding::Koi8R),
         "windows_1251" | "cp1251" | "1251" => Some(SourceEncoding::Windows1251),
+        "windows_1252" | "cp1252" | "1252" => Some(SourceEncoding::Windows1252),
         _ => None,
     };
     encoding.or_else(|| classify_dotted_codec_alias(&normalized))
@@ -340,6 +355,7 @@ fn classify_dotted_codec_alias(name: &str) -> Option<SourceEncoding> {
         "iso8859_15" | "iso_8859_15" => Some(SourceEncoding::Iso885915),
         "u_jis" => Some(SourceEncoding::EucJp),
         "windows_1251" => Some(SourceEncoding::Windows1251),
+        "windows_1252" => Some(SourceEncoding::Windows1252),
         _ => None,
     }
 }
@@ -656,6 +672,14 @@ mod tests {
 
     #[test]
     fn rejects_invalid_source_bytes() {
+        for undefined in [0x81, 0x8d, 0x8f, 0x90, 0x9d] {
+            let mut source = b"# coding: cp1252\n# ".to_vec();
+            source.push(undefined);
+            assert_eq!(
+                decode_source(&source),
+                Err(SourceDecodeError::InvalidEncoding("cp1252".to_string()))
+            );
+        }
         assert_eq!(
             decode_source(b"\xef\xbb\xbf\xef\xbb\xbfpass\n"),
             Err(SourceDecodeError::MultipleUtf8Boms)
@@ -838,7 +862,15 @@ mod tests {
                 "{encoding}"
             );
         }
+        for encoding in ["1252", "cp1252", "windows-1252", "windows.1252"] {
+            assert_eq!(
+                classify_source_encoding(encoding),
+                Some(SourceEncoding::Windows1252),
+                "{encoding}"
+            );
+        }
         for encoding in [
+            "cp.1252",
             "latin.1",
             "iso-latin--1",
             "iso__latin_1",

@@ -27,6 +27,7 @@ pub(crate) fn source_codec_strings(
                 SourceCodec::EucJp => $module::EUC_JP,
                 SourceCodec::Koi8R => $module::KOI8_R,
                 SourceCodec::Windows1251 => $module::CP1251,
+                SourceCodec::Windows1252 => $module::CP1252,
             }
         };
     }

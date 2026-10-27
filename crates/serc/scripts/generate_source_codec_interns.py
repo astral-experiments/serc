@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import generate_cpython_bootstrap as bootstrap
 import generate_cpython_target as target
 
-MODULES = ("ascii", "latin_1", "cp1251", "iso8859_15", "koi8_r", "euc_jp")
+MODULES = ("ascii", "latin_1", "cp1251", "cp1252", "iso8859_15", "koi8_r", "euc_jp")
 PROOF_INPUTS = (
     "Objects/codeobject.c",
     "Objects/dictobject.c",

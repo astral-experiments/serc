@@ -698,7 +698,8 @@ sys.stdout.buffer.write(marshal.dumps(code))
 
     #[test]
     fn matches_cpython_marshal_for_supported_source_encodings() {
-        let cases: [(&str, &[u8]); 9] = [
+        let cases: [(&str, &[u8]); 10] = [
+            ("windows_1252.py", b"# coding: windows-1252\nvalue = '\x80\x93\xe9\x94'\n"),
             ("latin_1.py", b"# coding: latin-1\nvalue = '\xe9'\n"),
             ("euc_jp.py", b"# coding: euc-jp\nvalue = '\xa1\xc1'\n"),
             ("koi8_r.py", b"# coding: koi8-r\nvalue = '\xe1'\n"),
@@ -789,6 +790,7 @@ sys.stdout.buffer.write(marshal.dumps(code))
                 ("utf-8", "encoding_table"),
                 ("cp1251", "encoding_table"),
                 ("cp1251", "Codec.encode"),
+                ("cp1252", "encoding_table"),
                 ("iso-8859-15", "decoding_table"),
                 ("koi8-r", "encoding_table"),
                 ("euc-jp", "__map_jisx0208"),
