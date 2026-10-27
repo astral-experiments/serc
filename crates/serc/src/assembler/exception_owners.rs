@@ -5708,9 +5708,7 @@ impl LayoutAssembler {
                 origin.items.last() == Some(&Item::Instruction(*instructions[marker]))
                     && positions.get(&origin.entry) == Some(&array)
             });
-        let Some(origin) = matching.next() else {
-            return None;
-        };
+        let origin = matching.next()?;
         if matching.next().is_some()
             || !provenance.source_boundaries.contains(&origin.entry)
             || !provenance.block_boundaries.contains(&origin.entry)
@@ -5774,9 +5772,7 @@ impl LayoutAssembler {
                         // Only the captured finalizer POP is erased from this live prefix.
                         continue;
                     }
-                    let Some(actual) = instructions.get(live) else {
-                        return None;
-                    };
+                    let actual = instructions.get(live)?;
                     if offset == origin.unwind_offset + 6 {
                         expected.local_policy.add_hidden_exception_owner_slots(1);
                     }
