@@ -6306,7 +6306,7 @@ impl<'source> Compiler<'source> {
         // CPython's conditional-expression join is a jump target. Its redundant-pair
         // optimizer therefore does not remove a constant else value with this POP_TOP.
         let end = self.assembler.label();
-        if self.context.python_version == crate::PythonVersion::Py314 {
+        if self.context.python_version >= crate::PythonVersion::Py314 {
             // Only the jumping true arm receives a copy of the discard. The false
             // arm carries its result across the original block boundary.
             self.assembler.record_borrow_analysis_block_boundary(end);

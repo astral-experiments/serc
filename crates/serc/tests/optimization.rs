@@ -5846,6 +5846,22 @@ fn terminal_recovery_scopes_preserve_normal_exits() {
 }
 
 #[test]
+fn terminal_conditional_discards_borrow_only_the_jumping_arm() {
+    for expression in [
+        "call(value) if flag else value",
+        "value if flag else call(value)",
+    ] {
+        let source = format!("def f(value, flag):\n    {expression}\n");
+        assert_matches_cpython_versions(
+            &source,
+            "terminal_conditional_discard.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn terminal_recovery_body_stops_borrowed_continuation() {
     for prefix in ["", "            resource.prepare()\n"] {
         for terminal in ["return", "return resource", "raise Error(resource)"] {
