@@ -30401,6 +30401,11 @@ impl<'source> Compiler<'source> {
                     .map(|range| self.source_location(range));
                 self.assembler
                     .record_normal_try_exit(try_end, end, wildcard_call_location);
+                if self.context.python_version == crate::PythonVersion::Py314 && !handlers_terminate
+                {
+                    self.assembler
+                        .record_try_result_cleanup(end, common_cleanup);
+                }
                 if !statement.is_star
                     && let Some(range) = normal_try_class_pattern_failure_exit(&statement.body)
                 {

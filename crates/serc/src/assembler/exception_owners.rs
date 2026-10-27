@@ -414,6 +414,7 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) borrow_normal_try_exits: Vec<(Label, Instruction)>,
     pub(super) initial_borrow_normal_try_exits: Vec<NormalTryBorrowExit>,
     pub(super) cold_handler_borrow_jumps: Vec<(Label, Label)>,
+    pub(super) try_result_cleanups: FxHashMap<Label, Label>,
     // The following cold blocks locate emptied originals through relocation.
     pub(super) copied_borrow_exit_anchors: Vec<Label>,
     pub(super) retired_normal_try_exits: Vec<RetiredNormalTryExit>,
@@ -536,12 +537,15 @@ impl ExceptionOwnerProvenance {
         graph: &super::block_graph::BlockGraph,
         regions: &[super::ExceptionRegion],
     ) {
-        use crate::target::opcodes::{COPY, JUMP_FORWARD, PUSH_EXC_INFO, RERAISE};
+        use crate::target::opcodes::{
+            COPY, JUMP_FORWARD, POP_EXCEPT, PUSH_EXC_INFO, RAISE_VARARGS, RERAISE, RETURN_VALUE,
+        };
 
         enum Exit<'a> {
             NormalTry(Label),
             Comprehension(&'a [Instruction]),
             HandlerJump(Label),
+            TryResult(BasicBlockId),
         }
         let mut entries = self
             .borrow_normal_try_exits
@@ -554,6 +558,35 @@ impl ExceptionOwnerProvenance {
                 ))
             })
             .collect::<FxHashMap<_, _>>();
+        if !self.try_result_cleanups.is_empty() {
+            let mut previous = None;
+            for op in graph.iter_items().filter_map(Item::as_instruction) {
+                if previous == Some(POP_EXCEPT)
+                    && op.opcode == JUMP_FORWARD
+                    && let Some(target) = op.forward_target()
+                    && let Some(cleanup) = self.try_result_cleanups.get(&target)
+                    && let Some(cleanup) = graph.label_block(*cleanup)
+                    && let Some(block) = graph.label_block(target)
+                    && graph[block]
+                        .last_instruction()
+                        .is_some_and(|end| matches!(end.opcode, RAISE_VARARGS | RETURN_VALUE))
+                {
+                    let items = graph[block].items();
+                    if let Some(start) = items
+                        .iter()
+                        .position(|item| item.as_instruction().is_some())
+                        && super::Assembler::is_small_linear_scope_exit(&items[start..])
+                    {
+                        // Both the normal protected exit and a handled exit jump to
+                        // this value. The original cleanup identifies its predecessor.
+                        entries
+                            .entry(block)
+                            .or_insert((Exit::TryResult(cleanup), false));
+                    }
+                }
+                previous = Some(op.opcode);
+            }
+        }
         if !self.original_comprehension_normal_restores.is_empty() {
             for (block, body) in graph.iter() {
                 let restore = body.items().iter().find_map(|item| match item {
@@ -565,22 +598,23 @@ impl ExceptionOwnerProvenance {
                 }
             }
         }
-        if !self.cold_handler_borrow_jumps.is_empty() {
-            for &(entry, target) in &self.cold_handler_borrow_jumps {
-                if let Some(block) = graph.label_block(entry) {
-                    // A lone handler jump can be unreachable from the outset. Every
-                    // remaining unconditional predecessor copies the unlocated jump.
-                    entries
-                        .entry(block)
-                        .or_insert((Exit::HandlerJump(target), true));
-                }
+        for &(entry, target) in &self.cold_handler_borrow_jumps {
+            if let Some(block) = graph.label_block(entry) {
+                // A lone handler jump can be unreachable from the outset. Every
+                // remaining unconditional predecessor copies the unlocated jump.
+                entries
+                    .entry(block)
+                    .or_insert((Exit::HandlerJump(target), true));
             }
-            for region in regions {
-                if let Some(block) = graph.label_block(region.target)
-                    && matches!(entries.get(&block), Some((Exit::HandlerJump(_), _)))
-                {
-                    entries.remove(&block);
-                }
+        }
+        for region in regions {
+            if let Some(block) = graph.label_block(region.target)
+                && matches!(
+                    entries.get(&block),
+                    Some((Exit::HandlerJump(_) | Exit::TryResult(_), _))
+                )
+            {
+                entries.remove(&block);
             }
         }
         if entries.is_empty() {
@@ -607,13 +641,13 @@ impl ExceptionOwnerProvenance {
                 regions.iter().map(|region| region.target).collect()
             };
         for blocks in graph.order().windows(3) {
-            let [previous, block, following] = *blocks else {
+            let [previous_block, block, following] = *blocks else {
                 unreachable!()
             };
             let Some((exit, true)) = entries.get(&block) else {
                 continue;
             };
-            let Some(previous) = graph[previous].last_instruction() else {
+            let Some(previous) = graph[previous_block].last_instruction() else {
                 continue;
             };
             let first = graph[following]
@@ -662,6 +696,15 @@ impl ExceptionOwnerProvenance {
                 Exit::HandlerJump(target) => {
                     if !super::ends_scope(previous.opcode)
                         || single_jump().and_then(Instruction::forward_target) != Some(*target)
+                    {
+                        continue;
+                    }
+                    graph[following].first_label()
+                }
+                Exit::TryResult(cleanup) => {
+                    if *cleanup != previous_block
+                        || previous.opcode != RERAISE
+                        || previous.value_argument() != Some(1)
                     {
                         continue;
                     }

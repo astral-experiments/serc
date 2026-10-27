@@ -2401,3 +2401,43 @@ fn terminal_deletion_preserves_original_return_boundary() {
         common::assert_matches_cpython_marshal(&source, "terminal_deletion_return.py");
     }
 }
+
+#[test]
+fn matches_cpython_borrows_after_copied_try_continuations() {
+    for raised in ["value", "value.a.b", "value.a.b.c"] {
+        let source = format!(
+            r"def f(value, flag):
+    try:
+        first()
+    except Root as error:
+        if flag:
+            try:
+                second()
+            except Other:
+                pass
+            raise {raised}
+    consume(value)
+"
+        );
+        common::assert_matches_cpython_marshal(&source, "small_try_raise.py");
+    }
+    common::assert_matches_cpython_marshal(
+        r"def f(value, flag):
+    try:
+        try:
+            first()
+        except Root:
+            if flag:
+                return None
+            consume(value)
+        finish(value)
+    finally:
+        try:
+            if flag:
+                second()
+        except Other:
+            pass
+",
+        "small_try_return.py",
+    );
+}

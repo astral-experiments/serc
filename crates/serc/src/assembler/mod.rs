@@ -5013,8 +5013,13 @@ impl Assembler {
         let Some(start) = self.instruction_item_index(instruction_offset) else {
             return false;
         };
+        Self::is_small_linear_scope_exit(&items[start..])
+    }
+
+    /// Checks the native four-slot copy limit for a straight-line scope exit.
+    fn is_small_linear_scope_exit(items: &[Item]) -> bool {
         let mut count = 0;
-        for item in &items[start..] {
+        for item in items {
             let Item::Instruction(instruction) = item else {
                 return false;
             };
@@ -9036,6 +9041,18 @@ impl Assembler {
             self.exception_owner_provenance
                 .cold_handler_borrow_jumps
                 .push((entry, target));
+        }
+    }
+
+    /// Binds the common error cleanup to the certified ordinary exit of this try.
+    pub(crate) fn record_try_result_cleanup(&mut self, target: Label, cleanup: Label) {
+        let origins = &mut self.exception_owner_provenance;
+        if origins
+            .borrow_normal_try_exits
+            .last()
+            .is_some_and(|(_, jump)| jump.forward_target() == Some(target))
+        {
+            origins.try_result_cleanups.insert(target, cleanup);
         }
     }
 
