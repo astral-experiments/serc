@@ -8954,10 +8954,13 @@ impl Compiler<'_> {
         let exclude_normal_finally_not_taken_from_with =
             self.control.finally.active_normal_finally_bodies > 0
                 && !self.control.withs.active_with_region_exclusions.is_empty()
-                && !self
-                    .control
-                    .withs
-                    .include_simple_normal_finally_not_taken_from_with
+                && match self.control.withs.normal_finally_with_markers {
+                    super::statement::NormalFinallyWithMarkers::Exclude => true,
+                    super::statement::NormalFinallyWithMarkers::Include => false,
+                    super::statement::NormalFinallyWithMarkers::Condition(location) => {
+                        self.assembler.location() != location
+                    }
+                }
                 && !self.control.manager_entered_in_current_normal_finally();
         if self.control.withs.force_terminal_with_marker_ownerless {
             // A fresh terminal marker has no owner, while early compaction reuses a slot
