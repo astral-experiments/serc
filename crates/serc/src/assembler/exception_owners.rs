@@ -328,6 +328,8 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) saved_named_handler_none_prefixes: Vec<SavedNamedHandlerNonePrefix>,
     pub(super) copied_manager_return_none_prefixes: Vec<CopiedManagerReturnNonePrefix>,
     pub(super) retained_manager_return_none_prefixes: Vec<RetainedManagerReturnNonePrefix>,
+    // Original manager POPs omitted before a copied finally enters a nested setup.
+    pub(super) nested_finally_manager_returns: FxHashMap<Label, usize>,
     pub(super) copied_manager_return_compactions: Vec<CopiedManagerReturnCompaction>,
     pub(super) uncompacted_conditional_arrays: Vec<UncompactedConditionalArray>,
     pub(super) original_primitive_condition_boundaries: Vec<Instruction>,
@@ -4891,7 +4893,7 @@ impl LayoutAssembler {
     ) -> FxHashSet<usize> {
         let instructions: Vec<_> = self.items.iter().filter_map(Item::as_instruction).collect();
         let label_positions = OwnerLabelPositions::from_hashed(self.items.len(), label_positions);
-        self.retained_setup_nops_with_instructions(&label_positions, &instructions)
+        self.retained_setup_nops_with_instructions(&label_positions, &instructions, 0)
     }
 
     /// Identifies SETUP records that still occupy their authored one-instruction ranges.
@@ -4899,6 +4901,7 @@ impl LayoutAssembler {
         &self,
         label_positions: &OwnerLabelPositions,
         instructions: &[&Instruction],
+        transferred_pops: u16,
     ) -> FxHashSet<usize> {
         if self.exception_owner_provenance.setup_nop_ranges.is_empty() {
             return FxHashSet::default();
@@ -4919,7 +4922,7 @@ impl LayoutAssembler {
                 (end == start + 1
                     && instruction.opcode == NOP
                     && setup_locations.contains(&(end, instruction.location))
-                    && instruction.local_policy.hidden_exception_owner_slots() == 0
+                    && instruction.local_policy.hidden_exception_owner_slots() == transferred_pops
                     && instruction.pre_fold_extra_instructions() == 0)
                     .then_some(start)
             })
@@ -6679,7 +6682,16 @@ impl LayoutAssembler {
             .exception_owner_provenance
             .original_for_target_prefix_positions(&self.items, &unique_labels);
         let retained_setup_nops =
-            self.retained_setup_nops_with_instructions(&label_positions, &indexed_instructions);
+            self.retained_setup_nops_with_instructions(&label_positions, &indexed_instructions, 0);
+        let manager_return_setups = if self
+            .exception_owner_provenance
+            .nested_finally_manager_returns
+            .is_empty()
+        {
+            FxHashSet::default()
+        } else {
+            self.retained_setup_nops_with_instructions(&label_positions, &indexed_instructions, 1)
+        };
         // An original entry prefix with no SETUP, region, or policy owner can
         // supply only NULL records, including its certified early-folded slots.
         let null_original_entry_prefix =
@@ -10227,6 +10239,23 @@ impl LayoutAssembler {
                     {
                         pending_threaded_null_append = Some(instruction_index + 1);
                     }
+                    if instruction.opcode == NOT_TAKEN
+                        && instruction.exception_policy() == super::ExceptionPolicy::NonePresent
+                        && owner_history_exact
+                        && let Some(region) = self.nested_finally_manager_return_owner(
+                            instruction_index,
+                            original_array_start,
+                            tail,
+                            &indexed_instructions,
+                            &label_positions,
+                            &manager_return_setups,
+                        )
+                    {
+                        owners.insert(
+                            instruction_index,
+                            ExceptionOwnerDecision::override_with_region(Some(region)),
+                        );
+                    }
                     if threaded_null_append == Some(instruction_index) {
                         owners.insert(
                             instruction_index,
@@ -12375,6 +12404,87 @@ impl LayoutAssembler {
             }
         });
         exact && seen_send && seen_bridge == origin.bridge.is_some()
+    }
+
+    /// Finds a copied nested guard's original append slot inside a synchronous manager exit.
+    fn nested_finally_manager_return_owner(
+        &self,
+        marker: usize,
+        array_start: usize,
+        tail: ExceptionOwnerTail,
+        instructions: &[&Instruction],
+        positions: &OwnerLabelPositions,
+        setups_with_pop: &FxHashSet<usize>,
+    ) -> Option<usize> {
+        use crate::target::opcodes::{CALL, LOAD_DEREF, LOAD_FAST, LOAD_FAST_BORROW, SWAP};
+
+        let setup = marker.checked_sub(3)?;
+        if !setups_with_pop.contains(&setup)
+            || tail.insertions != 0
+            || tail.late_removals != 0
+            || tail.post_compaction_fusions != 0
+            || !matches!(
+                instructions[setup + 1].opcode,
+                LOAD_FAST | LOAD_FAST_BORROW | LOAD_DEREF
+            )
+            || !matches!(
+                instructions[setup + 2].opcode,
+                POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE
+            )
+            || instructions[setup + 2]
+                .local_policy
+                .hidden_exception_owner_slots()
+                != 3
+        {
+            return None;
+        }
+        let cleanup = setup.checked_sub(5)?;
+        let [one, two, three, call, pop] = &instructions[cleanup..setup] else {
+            return None;
+        };
+        if [one, two, three]
+            .iter()
+            .any(|load| load.opcode != LOAD_CONST || load.operand() != one.operand())
+            || call.opcode != CALL
+            || call.value_argument() != Some(3)
+            || pop.opcode != POP_TOP
+            || instructions[cleanup..setup].iter().any(|record| {
+                record.location != pop.location
+                    || record.exception_policy() != super::ExceptionPolicy::NoneUnchanged
+                    || record.local_policy.hidden_exception_owner_slots() != 0
+                    || record.pre_fold_extra_instructions() != 0
+            })
+        {
+            return None;
+        }
+        let try_pops = self
+            .exception_owner_provenance
+            .nested_finally_manager_returns
+            .iter()
+            .find_map(|(entry, try_pops)| {
+                let entry = *positions.get(entry)?;
+                (entry >= array_start
+                    && match (*try_pops, instructions.get(entry..cleanup)?) {
+                        (0, []) => true,
+                        (1, [first, second]) => {
+                            first.opcode == SWAP
+                                && first.value_argument() == Some(3)
+                                && second.opcode == SWAP
+                                && second.value_argument() == Some(2)
+                        }
+                        _ => false,
+                    })
+                .then_some(*try_pops)
+            })?;
+        // Seven records separate the exit from the original append slot: POP_BLOCK,
+        // SETUP_FINALLY, and the five records of the unoptimized None test. Include
+        // the manager's own POP_BLOCK and the ordinary try POP omitted before its exit.
+        let removed = tail.early_removals + 1 + try_pops;
+        if !(8..=12).contains(&removed) {
+            return None;
+        }
+        let region = self.uniform_exception_owner(cleanup, setup, positions)?;
+        (!self.exception_regions[region].is_scope_fallback).then_some(region)
     }
 
     /// Recovers the owned record immediately before an authenticated POP/SETUP pair.

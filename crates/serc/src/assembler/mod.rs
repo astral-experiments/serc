@@ -13152,6 +13152,13 @@ impl Assembler {
             });
     }
 
+    /// Records the omitted POPs before a manager unwinds into a nested finally guard.
+    pub(crate) fn record_nested_finally_manager_return(&mut self, entry: Label, try_pops: usize) {
+        self.exception_owner_provenance
+            .nested_finally_manager_returns
+            .insert(entry, try_pops);
+    }
+
     /// Captures the actual manager unwind and first None test of its copied finally.
     pub(crate) fn record_copied_manager_return_compaction(
         &mut self,

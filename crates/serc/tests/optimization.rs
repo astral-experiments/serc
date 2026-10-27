@@ -1440,6 +1440,36 @@ fn async_iterator_recovery_keeps_cleanup_cold() {
 }
 
 #[test]
+fn managed_returns_into_nested_finally_keep_the_guard_owner() {
+    for body in [
+        "if check():\n                used(used(value))\n                return 0",
+        "if check():\n                used(used(used(value)))\n                return 0",
+        "try:\n                try:\n                    work()\n                except Error:\n                    return used(value)\n            except OtherError:\n                raise",
+    ] {
+        let source = format!(
+            r"def sample(flag, value):
+    def read_flag(): return flag
+    try:
+        with acquire():
+            {body}
+    finally:
+        try:
+            if flag is not None and flag.next() is None:
+                finish()
+        finally:
+            clear()
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "managed_return_into_finally.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn guarded_manager_cleanup_retains_raise_recovery() {
     for work in ["resource.run()", "result = resource.run()"] {
         for exit in ["raise", "return"] {
