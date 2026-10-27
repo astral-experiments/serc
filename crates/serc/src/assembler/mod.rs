@@ -13239,7 +13239,7 @@ impl Assembler {
             });
     }
 
-    /// Captures a constant coroutine return through one iterator or sync manager.
+    /// Captures a constant return through an iterator or synchronous manager.
     pub(crate) fn record_copied_cleanup_return_none_prefix(
         &mut self,
         return_item: usize,
@@ -13261,6 +13261,12 @@ impl Assembler {
                 Item::Label(_) => None,
             })
             .collect::<Vec<_>>();
+        let managed_iterator = manager
+            && handler
+            && cleanup
+                .last()
+                .is_some_and(|record| record.opcode == POP_TOP);
+        let iterator_depth = u32::from(managed_iterator);
         let expected: &[crate::target::Opcode] = match (manager, handler) {
             (false, false) => &[NOP, POP_TOP],
             (false, true) => &[NOP, NOP, POP_EXCEPT, POP_TOP],
@@ -13278,15 +13284,16 @@ impl Assembler {
                 DELETE_FAST,
             ],
         };
-        if cleanup
+        if cleanup.iter().map(|record| record.opcode).ne(expected
             .iter()
-            .map(|record| record.opcode)
-            .ne(expected.iter().copied())
+            .copied()
+            .chain(managed_iterator.then_some(POP_TOP)))
             || prefix.first() != Some(&Item::Instruction(cleanup[0]))
             || cleanup[0].fusion_policy.is_converted_pop_block()
             || cleanup[0].location.line < 0
             || cleanup[0].value_argument() != Some(0)
-            || cleanup[0].depth_after() != Some(u32::from(manager) + 1 + u32::from(handler))
+            || cleanup[0].depth_after()
+                != Some(u32::from(manager) + 1 + u32::from(handler) + iterator_depth)
             || cleanup.iter().enumerate().any(|(index, record)| {
                 record.local_policy.hidden_exception_owner_slots() != 0
                     || record.pre_fold_extra_instructions() != 0
@@ -13308,17 +13315,20 @@ impl Assembler {
                 || cleanup[2].operand() != cleanup[3].operand()
                 || cleanup[4].value_argument() != Some(3)
                 || cleanup[5].value_argument() != Some(0)
-                || cleanup[5].depth_after() != Some(u32::from(handler))
+                || cleanup[5].depth_after() != Some(u32::from(handler) + iterator_depth)
+                || (managed_iterator
+                    && (cleanup[10].depth_after() != Some(0)
+                        || cleanup[10].value_argument() != Some(0)))
                 || cleanup[1..]
                     .iter()
                     .any(|record| record.location != cleanup[1].location)
                 || (handler
                     && (cleanup[6].value_argument() != Some(0)
-                        || cleanup[6].depth_after() != Some(0)
-                        || cleanup[7].depth_after() != Some(1)
+                        || cleanup[6].depth_after() != Some(iterator_depth)
+                        || cleanup[7].depth_after() != Some(iterator_depth + 1)
                         || cleanup[8].operand() != cleanup[9].operand()
-                        || cleanup[8].depth_after() != Some(0)
-                        || cleanup[9].depth_after() != Some(0)))
+                        || cleanup[8].depth_after() != Some(iterator_depth)
+                        || cleanup[9].depth_after() != Some(iterator_depth)))
             {
                 return;
             }
@@ -13352,7 +13362,10 @@ impl Assembler {
             || pop.depth_after() != Some(0)
             || (manager && pop.location.line >= 0)
             || (!manager && pop.location != cleanup[0].location)
-            || load.opcode != LOAD_FAST
+            || !(load.opcode == LOAD_FAST
+                || (managed_iterator
+                    && load.opcode == crate::target::opcodes::LOAD_GLOBAL
+                    && load.value_argument().is_some_and(|arg| arg & 1 == 0)))
             || load.exception_policy() != ExceptionPolicy::NoneUnchanged
             || !matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
             || condition.forward_target().is_none()
@@ -13388,6 +13401,7 @@ impl Assembler {
                 cleanup,
                 manager,
                 handler,
+                managed_iterator,
                 iterator_try_pop_slot,
                 pop: *pop,
                 load: *load,

@@ -13087,6 +13087,48 @@ impl<'source> Compiler<'source> {
                             }
                             _ => None,
                         }).flatten();
+                    // A manager inside a named handler unwinds before the handler and its
+                    // enclosing iterator. The iterator's POP remains in the original array.
+                    let managed_iterator_pop = (self.context.python_version
+                        == crate::PythonVersion::Py314
+                        && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+                        && !preserve_tos
+                        && !return_is_overridden
+                        && return_finally_contexts.len() == 1
+                        && finally_context.exception_region_depth == 0
+                        && finally_context.handler_depth == 0
+                        && finally_context.with_depth == 0
+                        && finally_context.loop_depth == 0
+                        && next_handler == 0
+                        && next_with == 0
+                        && next_loop == 1
+                        && self.control.exceptions.active_exception_group_handlers == 0
+                        && self.control.finally.active_finally_end_blocks == 0
+                        && self.control.finally.active_normal_finally_bodies == 0
+                        && self.control.finally.active_copied_finally_bodies == 0
+                        && self.control.finally.preserved_return_value_contexts.is_empty()
+                        && self.control.exceptions.active_try_marker_slots.len() == 1
+                        && self
+                            .control
+                            .exceptions
+                            .active_exception_region_exclusions
+                            .len()
+                            == 3
+                        && with_unwind_starts.iter().map(|unwind| unwind.index).eq([0])
+                        && matches!((
+                            self.control.withs.active_with_exits.as_slice(),
+                            self.control.loops.contexts.as_slice(),
+                            self.control.exceptions.active_exception_handlers.as_slice(),
+                        ), ([manager], [iterator], [handler])
+                            if !manager.is_async && manager.loop_depth == 1
+                                && manager.normal_finally_depth == 0 && manager.exception_region_depth == 3
+                                && iterator.iterator_cleanup == IteratorCleanup::Sync
+                                && iterator.with_depth == 0 && iterator.finally_end_depth == 0
+                                && iterator.exception_region_depth == 2
+                                && handler.name.is_some() && handler.with_depth == 0 && handler.loop_depth == 1
+                                && handler.finally_end_depth == 0 && handler.try_body_depth == 1
+                                && handler.exception_region_depth == 2))
+                        .then(|| (self.assembler.item_count(), true, true, None));
                     // A named handler's saved value remains live while this first try
                     // in the copied finalizer emits its own SETUP and truth condition.
                     let named_handler_try_pop = (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
@@ -13551,7 +13593,7 @@ impl<'source> Compiler<'source> {
                     }
                     if result.is_ok()
                         && let Some((pop_item, manager, handler, iterator_try_pop_slot)) =
-                            copied_cleanup_none_pop
+                            copied_cleanup_none_pop.or(managed_iterator_pop)
                     {
                         self.assembler.record_copied_cleanup_return_none_prefix(
                             copied_handler_return_item,
