@@ -11091,6 +11091,34 @@ fn managed_handler_returns_retain_outer_recovery_cleanup() {
 }
 
 #[test]
+fn returning_through_interleaved_handlers_and_finalizers_keeps_their_owners() {
+    for loop_header in ["while ready", "for item in items"] {
+        let source = format!(
+            r"def run(items, ready):
+    try:
+        {loop_header}:
+            try:
+                work()
+            except ValueError as outer:
+                try:
+                    start()
+                except KeyError as inner:
+                    return
+                finally:
+                    if ready:
+                        close()
+    except RuntimeError:
+        recover()
+    finally:
+        if ready:
+            finish()
+"
+        );
+        assert_matches_cpython(&source, "interleaved_cleanup.py", &LEVELS);
+    }
+}
+
+#[test]
 fn enclosing_tries_own_handler_returns_before_finalizers() {
     let body = r"try:
     try:

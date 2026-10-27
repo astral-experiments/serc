@@ -9527,6 +9527,35 @@ impl<'source> Compiler<'source> {
                                 && inner.try_body_depth
                                     == self.control.exceptions.active_try_marker_slots.len()
                     );
+                // A return may leave a handler, run an inner finally in an older
+                // handler, then restore that older handler inside an ordinary try.
+                let interleaved_handlers_and_finalizers = !return_is_overridden
+                    && self.control.withs.active_with_exits.is_empty()
+                    && self.control.exceptions.active_exception_group_handlers == 0
+                    && self.control.finally.active_finally_end_blocks == 0
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_copied_finally_bodies == 0
+                    && self.control.loops.contexts.iter().all(|context| {
+                        context.iterator_cleanup == IteratorCleanup::None
+                            || (context.iterator_cleanup == IteratorCleanup::Sync
+                                && context.exception_region_depth == 2
+                                && context.with_depth == 0
+                                && context.finally_end_depth == 0)
+                    })
+                    && matches!((
+                        self.control.exceptions.active_exception_handlers.as_slice(),
+                        self.control.finally.active_return_finally_contexts.as_slice(),
+                    ), ([older, newer], [outer, inner])
+                        if outer.handler_depth == 0 && inner.handler_depth == 1
+                            && outer.try_body_depth == 0 && outer.exception_region_depth == 0
+                            && older.exception_region_depth == 2 && inner.exception_region_depth == 3
+                            && newer.exception_region_depth == 4
+                            && older.try_body_depth == 1 && inner.try_body_depth == 1 && newer.try_body_depth == 1
+                            && self.control.exceptions.active_try_marker_slots.len() == 1
+                            && self.control.exceptions.active_exception_region_exclusions.len() == 5
+                            && older.loop_depth == inner.loop_depth && inner.loop_depth == newer.loop_depth
+                            && !suite_contains_abrupt_control_flow(inner.body) && !suite_contains_yield(inner.body)
+                            && !suite_contains_abrupt_control_flow(outer.body) && !suite_contains_yield(outer.body));
                 // A named-handler return can copy an inner finally while an ordinary
                 // try between the two finalizers is still active. A synchronous iterator
                 // entered in that try remains live until after the inner copy; its POP
@@ -10603,18 +10632,20 @@ impl<'source> Compiler<'source> {
                         let tracked_outer_try_owns_pop_except =
                             tracks_handler_outer_try_iterator_unwinds
                                 || (tracks_two_named_handlers_before_finally && handler_index == 0);
-                        let protected_pop_except = (protects_outer_handler
-                            || live_manager_handler_try_owner
-                            || (!return_is_overridden
-                                && !preserves_enclosing_try_return_owner
-                                && !enclosing_try_owns_pop_except
-                                && !tracked_outer_try_owns_pop_except
-                                && self
-                                    .control
-                                    .finally
-                                    .active_return_finally_contexts
-                                    .iter()
-                                    .any(|context| context.with_depth == with_depth)))
+                        // Each handler's next enclosing scope already protects POP_EXCEPT.
+                        let protected_pop_except = (!interleaved_handlers_and_finalizers
+                            && (protects_outer_handler
+                                || live_manager_handler_try_owner
+                                || (!return_is_overridden
+                                    && !preserves_enclosing_try_return_owner
+                                    && !enclosing_try_owns_pop_except
+                                    && !tracked_outer_try_owns_pop_except
+                                    && self
+                                        .control
+                                        .finally
+                                        .active_return_finally_contexts
+                                        .iter()
+                                        .any(|context| context.with_depth == with_depth))))
                         .then(|| {
                             let start = self.assembler.label();
                             self.assembler.mark(start);
@@ -14116,8 +14147,14 @@ impl<'source> Compiler<'source> {
                                         starts.len() == self.control.exceptions.active_exception_region_exclusions.len()
                                             && starts[..finally_context.exception_region_depth].iter().all(Option::is_none)
                                             && starts[finally_context.exception_region_depth..].iter().all(Option::is_some)));
+                        // The inner finalizer runs before the older handler's POP_EXCEPT.
+                        let retained_interleaved_handler_owns_copy =
+                            interleaved_handlers_and_finalizers
+                                && context_index == 1
+                                && next_handler == 1;
                         if !retained_manager_owns_copy
                             && !retained_try_owns_copy
+                            && !retained_interleaved_handler_owns_copy
                             && !retained_named_handler_owns_copy
                             && !retained_handler_owns_linear_copy
                         {
