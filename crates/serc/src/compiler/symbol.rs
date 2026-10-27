@@ -942,7 +942,7 @@ impl Compiler<'_> {
         &mut self,
         body: &[Stmt],
         register_literals: bool,
-        first_expression: Option<&Expr>,
+        first_expression: Option<(usize, &Expr)>,
     ) -> Result<(), CompileError> {
         self.pre_register_suite_names_with_folds(
             body,
@@ -989,7 +989,7 @@ impl Compiler<'_> {
         body: &[Stmt],
         register_literals: bool,
         register_folds: bool,
-        first_expression: Option<&Expr>,
+        first_expression: Option<(usize, &Expr)>,
         expression_only: Option<&Expr>,
     ) -> Result<(), CompileError> {
         // Run cache admissions and real child builders in source order. Each child action owns
@@ -1956,7 +1956,9 @@ impl Compiler<'_> {
         };
         if let Some(expression) = expression_only {
             collector.visit_expr(expression);
-        } else if let Some(expression) = first_expression {
+        } else if let Some((index, expression)) = first_expression {
+            collector.visit_body(&body[..index]);
+            collector.flush_origins();
             // Compile this whole expression once: its first constant may come from a
             // lambda default, or from a generator child before its outer iterable.
             collector
@@ -1964,9 +1966,9 @@ impl Compiler<'_> {
                 .push(SkippedAction::FirstExpression(expression));
             let record_string_origins = collector.record_string_origins;
             collector.record_string_origins = false;
-            collector.visit_stmt(&body[0]);
+            collector.visit_stmt(&body[index]);
             collector.record_string_origins = record_string_origins;
-            collector.visit_body(&body[1..]);
+            collector.visit_body(&body[index + 1..]);
         } else {
             collector.visit_body(body);
         }

@@ -31,10 +31,10 @@ use crate::target::operands::{
 };
 
 use super::constant::{
-    FirstConstant, first_expression_constant, first_literal_constant, first_suite_constant,
-    first_suite_literal_constant, fold_constant, fold_constant_for_version, folded_bool_operand,
-    folded_constant_owner_slots, is_literal_constant, is_small_literal_tuple_element,
-    literal_constant, optimized_percent_format, two_element_slice_optimization,
+    FirstConstant, first_literal_constant, first_suite_constant, fold_constant,
+    fold_constant_for_version, folded_bool_operand, folded_constant_owner_slots,
+    is_literal_constant, is_small_literal_tuple_element, literal_constant,
+    optimized_percent_format, two_element_slice_optimization,
 };
 use super::expression::{
     binary_operator, comparison_operator, early_condition_truthiness, expression_contains_yield,
@@ -3783,21 +3783,23 @@ impl<'source> Compiler<'source> {
                 // Its constant compaction always retains slot zero. A child-producing first
                 // expression needs its real builder to admit code and defaults in order; other
                 // unreachable tails keep the first constant that code generation would load.
-                let first_expression = if self.output.constants.is_empty()
-                    && let Some(Stmt::Expr(expression)) = unreachable.first()
-                    && matches!(
-                        first_expression_constant(self, &expression.value),
-                        Some(FirstConstant::NestedScope)
-                    ) {
-                    Some(expression.value.as_ref())
-                } else {
-                    None
-                };
-                if self.output.constants.is_empty()
-                    && first_expression.is_none()
-                    && let Some(constant) = first_suite_literal_constant(self, unreachable)
-                {
-                    self.add_constant(constant)?;
+                let mut first_expression = None;
+                if self.output.constants.is_empty() {
+                    match first_suite_constant(self, unreachable) {
+                        Some(FirstConstant::Literal(constant)) => {
+                            self.add_constant(constant)?;
+                        }
+                        Some(FirstConstant::NestedScope(index)) => {
+                            let expression = match &unreachable[index] {
+                                Stmt::Expr(statement) => Some(statement.value.as_ref()),
+                                Stmt::Return(statement) => statement.value.as_deref(),
+                                Stmt::Assign(statement) => Some(statement.value.as_ref()),
+                                _ => None,
+                            };
+                            first_expression = expression.map(|expression| (index, expression));
+                        }
+                        None => {}
+                    }
                 }
                 // A literal first visited in dead code can be reused by a later reachable
                 // branch. Reserve its original position before constant compaction removes
