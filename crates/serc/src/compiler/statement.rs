@@ -22824,12 +22824,18 @@ impl<'source> Compiler<'source> {
                 }
                 return Ok(LoopBackedge::Emitted);
             }
-            // CPython keeps a non-final branch's nested condition body before the fallback
-            // backedge even when that body exits the enclosing loop or function.
+            // A synchronous for/else keeps the non-final arm's forward exit even
+            // under a handler. The condition falls through to its body before
+            // the fallback backedge, including when that body exits the loop.
+            let sync_for_else = self.control.loops.contexts.last().is_some_and(|context| {
+                context.has_orelse && context.iterator_cleanup == IteratorCleanup::Sync
+            });
             if copied_loop_branch_exit
                 || (non_final_branch
                     && !split_short_circuit
-                    && (!self.has_active_control_flow_region() || protected_try_normal_exit)
+                    && (!self.has_active_control_flow_region()
+                        || protected_try_normal_exit
+                        || sync_for_else)
                     && condition_jump_target_count(&statement.test, false) == 1
                     && (condition_jump_target_count(&statement.test, true) == 1
                         || matches!(statement.test.as_ref(), Expr::UnaryOp(unary)
@@ -22837,8 +22843,7 @@ impl<'source> Compiler<'source> {
                                 Expr::Compare(comparison) if comparison.ops.len() > 1))
                         // The successful comparisons enter the same arm. Its
                         // fallthrough precedes the fallback backedge of a for/else.
-                        || (self.control.loops.contexts.last().is_some_and(|context|
-                                context.has_orelse && context.iterator_cleanup == IteratorCleanup::Sync)
+                        || (sync_for_else
                             && matches!(statement.test.as_ref(), Expr::BoolOp(boolean)
                                 if boolean.op == BoolOp::Or && boolean.values.iter().all(|part|
                                     matches!(part, Expr::Compare(comparison) if comparison.ops.len() == 1))))

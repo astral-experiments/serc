@@ -15,6 +15,21 @@ use serc::{
 };
 
 #[test]
+fn protected_for_else_keeps_the_inner_condition_fallthrough() {
+    let source = r"def scan(values, selected):
+    for value in values:
+        if selected(value):
+            if ready(value):
+                break
+        else:
+            break
+    else:
+        yield value
+";
+    assert_matches_cpython(source, "scan.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
