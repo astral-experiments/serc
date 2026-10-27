@@ -7327,6 +7327,38 @@ impl OptimizationPipeline {
                                     .jump_policy
                                     .retains_nop_for(instruction.operand())
                             }))));
+            // A branch computing a return value can copy its small finalizer.
+            // CPython keeps the copy in the operand's original instruction array,
+            // where a return marker on that same line is redundant.
+            if inline_small_exit
+                && target_chain_end == target_position
+                && !preserve_inlined_jump_nop
+                && graph[source]
+                    .last_instruction()
+                    .is_some_and(|jump| jump.location == SourceLocation::NONE)
+                && graph[target]
+                    .last_instruction()
+                    .is_some_and(|op| op.opcode == RETURN_VALUE)
+                && let Some(marker) = copied.iter_mut().find_map(Item::as_instruction_mut)
+                && marker.opcode == NOP
+                && marker.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
+                && marker.depth_after() == Some(1)
+                && !marker.fusion_policy.is_converted_pop_block()
+                && marker.location.line >= 0
+                && graph[source]
+                    .items()
+                    .iter()
+                    .rev()
+                    .filter_map(Item::as_instruction)
+                    .nth(1)
+                    .is_some_and(|operand| {
+                        operand.location.line == marker.location.line
+                            && operand.depth_after() == Some(1)
+                    })
+            {
+                marker.location = SourceLocation::NONE;
+                marker.no_location_policy.preserve_location();
+            }
             let copied_label = Label::from_u32(self.next_label);
             self.next_label += 1;
             if !self.borrow_finally_jump_sources.is_empty() {
