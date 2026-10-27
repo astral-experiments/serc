@@ -2009,6 +2009,47 @@ fn matches_cpython_partial_terminal_match_handler_borrow_entries() {
 }
 
 #[test]
+fn terminal_try_arm_stops_borrow_fallthrough() {
+    for arm in [
+        "return result",
+        "if flag:\n                    return result\n                step()",
+    ] {
+        let source = format!(
+            r"def run(value, flag):
+    try:
+        result = decode(value)
+    except Error:
+        if flag:
+            try:
+                {arm}
+            except Other:
+                pass
+        result = value
+    return finish(result)
+"
+        );
+        common::assert_matches_cpython_marshal(&source, "terminal_try_return.py");
+    }
+    for arm in ["break", "step()"] {
+        let source = format!(
+            r"def run(value):
+    index = 0
+    while True:
+        try:
+            if ready(index):
+                index += 1
+            else:
+                {arm}
+        except Error:
+            break
+    return finish(index)
+"
+        );
+        common::assert_matches_cpython_marshal(&source, "terminal_try_break.py");
+    }
+}
+
+#[test]
 fn unlocated_handler_jump_stops_borrow_fallthrough() {
     for body in [
         "if flag:\n    try:\n        step()\n    except OtherError:\n        pass\n    else:\n        return",
