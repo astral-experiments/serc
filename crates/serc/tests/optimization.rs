@@ -10074,6 +10074,31 @@ fn erased_suffix_preserves_with_pop_block() {
 }
 
 #[test]
+fn nested_terminating_try_preserves_manager_handler_location() {
+    let source = r"def run(manager):
+    with manager:
+        try:
+            try:
+                raise ValueError
+            except ValueError:
+                raise TypeError
+        except TypeError as error:
+            report(error)
+";
+    for source in [
+        source.to_owned(),
+        source.replace("raise TypeError", "work()"),
+    ] {
+        assert_matches_cpython_versions(
+            &source,
+            "nested_handler_manager.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn erased_coroutine_handler_assertions_preserve_manager_pop_block() {
     for work in ["worker()", "await worker()"] {
         for exit in ["raise Failure('expected')", "return 42"] {
