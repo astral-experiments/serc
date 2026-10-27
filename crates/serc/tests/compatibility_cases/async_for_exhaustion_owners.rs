@@ -121,3 +121,13 @@ fn preserves_async_iterator_break_locations_through_finally() {
         }
     }
 }
+
+#[test]
+fn matches_final_async_case_exhaustion_into_cleanup() {
+    for context in ["with manager:", "async with manager:"] {
+        let source = format!(
+            "async def stream(rows, manager, key):\n    {context}\n        match key:\n            case 1:\n                async for item in rows:\n                    yield item\n            case 2:\n                async for item in rows:\n                    yield item\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "final_async_case_exhaustion.py");
+    }
+}
