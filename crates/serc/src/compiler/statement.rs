@@ -6047,6 +6047,19 @@ impl<'source> Compiler<'source> {
         has_siblings: bool,
     ) -> Result<(), CompileError> {
         if is_final_else
+            && self.context.python_version >= crate::PythonVersion::Py314
+            && matches!(body.last(), Some(Stmt::Expr(expression)) if matches!(expression.value.as_ref(), Expr::BoolOp(_)))
+        {
+            // The short-circuit and final value share one discard. The implicit
+            // return starts in the enclosing if's next block, so neither edge
+            // copies the discard and return together.
+            self.compile_suite_inner(body, false)?;
+            let implicit_return = self.assembler.label();
+            self.assembler.preserve_block_boundary(implicit_return);
+            self.assembler.mark(implicit_return);
+            return Ok(());
+        }
+        if is_final_else
             && matches!(body, [Stmt::Expr(expression)] if is_literal_constant(&expression.value))
         {
             // Keep the constant's original NOP in its fallthrough block, separate from the

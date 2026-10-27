@@ -15,6 +15,17 @@ use serc::{
 };
 
 #[test]
+fn a_final_else_shares_its_boolean_discard() {
+    let source = r"def record(value, first, enabled):
+    if first:
+        enabled and visit(value)
+    else:
+        enabled and finish(value)
+";
+    assert_matches_cpython(source, "record.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
