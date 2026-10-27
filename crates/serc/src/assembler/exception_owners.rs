@@ -10308,6 +10308,44 @@ impl LayoutAssembler {
                             ExceptionOwnerDecision::override_with_region(None),
                         );
                     }
+                    // Once the setup disappears, a shortened None test can reuse a
+                    // protected slot in the original manager block.
+                    if instruction.opcode == NOT_TAKEN
+                        && owner_history_exact
+                        && tail.insertions == 0
+                        && tail.late_removals == 1
+                        && tail.post_compaction_fusions == 0
+                        && let [setup, load, guard] =
+                            &indexed_instructions[original_array_start..instruction_index]
+                        && setup.opcode == NOP
+                        && setup.local_policy.hidden_exception_owner_slots() == 1
+                        && matches!(
+                            load.opcode,
+                            crate::target::opcodes::LOAD_FAST
+                                | crate::target::opcodes::LOAD_FAST_BORROW
+                                | crate::target::opcodes::LOAD_FAST_CHECK
+                        )
+                        && load.local_policy.hidden_exception_owner_slots() == 0
+                        && matches!(guard.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+                        && guard.forward_target().is_some()
+                        && guard.local_policy.hidden_exception_owner_slots() == 3
+                        && load.location.line == guard.location.line
+                        && tail.early_removals
+                            == usize::from(setup.local_policy.hidden_exception_owner_slots())
+                                + usize::from(guard.local_policy.hidden_exception_owner_slots())
+                        && let Some(region) = self.uniform_exception_owner(
+                            original_array_start + 1,
+                            instruction_index,
+                            &label_positions,
+                        )
+                        && self.exception_regions[region].preserve_lasti
+                        && !self.exception_regions[region].is_scope_fallback
+                    {
+                        owners.insert(
+                            instruction_index,
+                            ExceptionOwnerDecision::override_with_region(Some(region)),
+                        );
+                    }
                     if instruction.opcode == NOT_TAKEN {
                         if instruction.exception_policy().exclusion()
                             == super::ExceptionExclusion::None
