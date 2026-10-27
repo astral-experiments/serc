@@ -4229,6 +4229,29 @@ impl<'source> Compiler<'source> {
                         clause.test.as_ref().is_none_or(condition_has_only_runtime_tests)
                     })
         );
+        // A conditional at the end of a completed branch or try-else suite
+        // leaves two normal predecessors for its enclosing arm's loop exit.
+        let shared_nested_tail = matches!(statement.body.last(), Some(Stmt::If(tail))
+        if self.context.python_version >= crate::PythonVersion::Py314
+            && tail.elif_else_clauses.last().is_some_and(|clause| clause.test.is_some())
+            && condition_has_linear_runtime_leaves(&tail.test)
+            && tail.elif_else_clauses.iter().all(|clause| {
+                clause.test.as_ref().is_some_and(condition_has_linear_runtime_leaves)
+            })
+            && if_suites(tail).take(tail.elif_else_clauses.len()).any(|body| {
+                let normal = match body.last() {
+                    Some(Stmt::If(nested)) => nested.elif_else_clauses.last()
+                        .filter(|clause| clause.test.is_none()).map(|clause| clause.body.as_slice()),
+                    Some(Stmt::Try(nested)) if !nested.is_star && nested.finalbody.is_empty() => {
+                        Some(nested.orelse.as_slice())
+                    }
+                    _ => None,
+                };
+                matches!(normal.and_then(<[_]>::last), Some(Stmt::If(guard))
+                    if guard.elif_else_clauses.is_empty()
+                        && condition_has_linear_runtime_leaves(&guard.test)
+                        && !suite_terminates_before_constant_folding(&guard.body))
+            }));
         if self.context.python_version <= crate::PythonVersion::Py313
             && let Some(body_entry) = body_entry
         {
@@ -4244,7 +4267,10 @@ impl<'source> Compiler<'source> {
                 self.assembler.prevent_jump_threading_target(backedge);
                 self.assembler.record_last_original_loop_backedge();
             }
-        } else if normalize_final_condition || complete_tail_has_no_fallthrough {
+        } else if normalize_final_condition
+            || complete_tail_has_no_fallthrough
+            || shared_nested_tail
+        {
             // CPython normalizes a backward conditional jump by reversing it around an explicit
             // backedge. A final `if` keeps that layout when its body does work before breaking.
             // A terminating final else leaves no fallthrough into the original common
