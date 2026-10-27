@@ -15,6 +15,32 @@ use serc::{
 };
 
 #[test]
+fn handler_breaks_keep_the_copied_finalizer_pop() {
+    let source = r"def stream(items, marker):
+    try:
+        while True:
+            try:
+                value = next(items)
+            except StopIteration:
+                break
+            finally:
+                if marker is not None:
+                    notify(marker)
+            yield value
+    except LookupError:
+        recover()
+    finally:
+        finish()
+";
+    assert_matches_cpython_versions(
+        source,
+        "handler_break_guard.py",
+        &LEVELS,
+        &VERSIONS.map(|(version, _, _)| version),
+    );
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
