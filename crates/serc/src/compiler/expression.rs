@@ -8423,7 +8423,7 @@ impl Compiler<'_> {
             self.assembler.mark(end);
             Ok(())
         } else {
-            self.compile_bool_expression_at(expression, continuation, false, &[])
+            self.compile_bool_expression_at(expression, continuation, false, false, &[])
         }
     }
 
@@ -8432,6 +8432,7 @@ impl Compiler<'_> {
         expression: &ruff_python_ast::ExprBoolOp,
         continuation: Option<(BoolOp, SourceLocation)>,
         nested_leading_group: bool,
+        after_folded_operand: bool,
         threaded_lines: &[SourceLocation],
     ) -> Result<(), CompileError> {
         // Threading a value-preserving boolean jump into an enclosing test gives it that
@@ -8484,6 +8485,11 @@ impl Compiler<'_> {
         if folded_prefix {
             // CPython folds the leading constant load and its boolean jump, but retains the
             // jump as a source-position NOP when the next operand starts on another line.
+            if after_folded_operand {
+                // The outer jump's POP_TOP starts this block. It survives as a NOP
+                // if the two folded groups begin on different lines.
+                self.assembler.mark_last_nop_borrow_barrier_if_removed();
+            }
             let empty_folded_block = self.assembler.at_empty_borrow_block();
             self.emit(NOP, 0, 0)?;
             if empty_folded_block {
@@ -8516,6 +8522,9 @@ impl Compiler<'_> {
                     inner,
                     Some((expression.op, location)),
                     inner.op == expression.op,
+                    self.context.python_version == PythonVersion::Py314
+                        && folded_prefix
+                        && operand_index == 0,
                     &jump_lines,
                 )?;
             } else {
@@ -8927,7 +8936,15 @@ impl Compiler<'_> {
             && (inner.op == expression.op
                 || folded_bool_operand(last, self.context.python_version).is_none())
         {
-            self.compile_bool_expression_at(inner, continuation, false, threaded_lines)?;
+            self.compile_bool_expression_at(
+                inner,
+                continuation,
+                false,
+                self.context.python_version == PythonVersion::Py314
+                    && folded_prefix
+                    && leading.is_empty(),
+                threaded_lines,
+            )?;
         } else {
             self.compile_expression_with_boolean_continuation(last, continuation)?;
         }
