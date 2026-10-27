@@ -35,6 +35,26 @@ fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
 }
 
 #[test]
+fn folding_keeps_the_shared_exit_after_a_partial_guard_unlocated() {
+    for (kind, branch) in [
+        ("def", "if True:\n   if guard:\n    work()"),
+        (
+            "def",
+            "if True:\n   if guard:\n    work()\n  else:\n   unused()",
+        ),
+        (
+            "async def",
+            "if first:\n   pass\n  elif second:\n   if guard:\n    work(guard)\n  else:\n   assert False",
+        ),
+    ] {
+        let source = format!(
+            "{kind} dispatch(outer, first, second, guard):\n if outer:\n  {branch}\n else:\n  fallback()\n finish()\n"
+        );
+        assert_matches_cpython(&source, "shared_guard_exit.py", &LEVELS);
+    }
+}
+
+#[test]
 fn nested_finally_guard_inherits_the_preceding_calls_handler() {
     let source = r"def run(group):
     try:

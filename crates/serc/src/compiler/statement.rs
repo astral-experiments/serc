@@ -15353,6 +15353,13 @@ impl<'source> Compiler<'source> {
                     let end = self.assembler.label();
                     let exit = self.emit_jump_forward_instruction(JUMP_FORWARD, end)?;
                     self.assembler.mark_folded_condition_exit(exit);
+                    if self.context.python_version >= crate::PythonVersion::Py314
+                        && ends_in_shared_partial_if(&statement.body)
+                    {
+                        // Both paths through the guard reach the folded branch's exit.
+                        // Only a jump that survives threading keeps this missing position.
+                        self.assembler.defer_shared_jump_no_location(exit);
+                    }
                     if let Some(Stmt::If(nested)) = statement.body.last()
                         && nested.elif_else_clauses.last().is_some_and(|clause| {
                             clause.test.is_none()
@@ -17066,7 +17073,14 @@ impl<'source> Compiler<'source> {
                         // as the simple constant-true branch with an else suite.
                         self.assembler.mark_folded_condition_exit(branch_exit);
                     }
-                    if protected_shared_join {
+                    // An empty else can disappear during threading. Both paths from
+                    // the final guard still meet at the last populated arm's jump.
+                    let erased_else_shared_join = self.context.python_version
+                        >= crate::PythonVersion::Py314
+                        && branch_index + 2 == branch_count
+                        && has_declaration_only_else
+                        && ends_in_shared_partial_if(body);
+                    if protected_shared_join || erased_else_shared_join {
                         self.assembler.preserve_shared_jump_no_location(branch_exit);
                     } else if inherited_shared_if_exit {
                         self.assembler.defer_shared_jump_no_location(branch_exit);
@@ -52000,12 +52014,23 @@ fn false_yield_shared_try_exit(statement: &ruff_python_ast::StmtTry) -> Option<T
     .then_some(tail.test.range())
 }
 
+/// A partial guard whose live paths share the continuation cannot donate a position to it.
+fn ends_in_shared_partial_if(body: &[Stmt]) -> bool {
+    matches!(body.last(), Some(Stmt::If(guard))
+        if guard.elif_else_clauses.is_empty()
+            && matches!(nested_if_exit_location(guard, false), Some(NestedIfExitLocation::Unlocated)))
+}
+
 pub(super) fn nested_if_exit_location(
     statement: &ruff_python_ast::StmtIf,
     allow_recursive_fallthrough: bool,
 ) -> Option<NestedIfExitLocation<'_>> {
-    if early_condition_truthiness(&statement.test).is_some() {
-        return None;
+    if let Some(truth) = early_condition_truthiness(&statement.test) {
+        // Folding a true condition leaves its body's shared fallthrough intact.
+        return (truth
+            && allow_recursive_fallthrough
+            && ends_in_shared_partial_if(&statement.body))
+        .then_some(NestedIfExitLocation::Unlocated);
     }
     // A final else can end at a while condition's shared false-edge join.
     // Preserve that empty continuation just as for a nested partial if.
