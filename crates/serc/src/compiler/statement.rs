@@ -3503,6 +3503,7 @@ impl<'source> Compiler<'source> {
                     (previous_statement, statement),
                     (Some(Stmt::If(_)), Stmt::Assert(assertion))
                         if early_condition_truthiness(&assertion.test) == Some(false)
+                            && !self.assertion_retains_test_line(assertion)
                 );
                 let preceded_by_branch_join = previous_statement.is_some_and(|statement| {
                     matches!(statement, Stmt::If(previous) if if_normal_exit_count(previous) > 1)
@@ -5632,7 +5633,7 @@ impl<'source> Compiler<'source> {
             } else {
                 let body_start = self.assembler.instruction_count();
                 let ((), emitted_fallthrough) = self.compile_with_strict_owned_loads(
-                    suite_is_constant_false_assertion(body),
+                    self.suite_is_constant_false_assertion(body),
                     |compiler| {
                         compiler.with_control_override(
                             |control| &mut control.statements.split_terminal_assert_success,
@@ -18343,10 +18344,9 @@ impl<'source> Compiler<'source> {
                 self.set_depth(base_depth);
             } else {
                 let body_start = self.assembler.instruction_count();
-                // CPython emits a constant-false assertion in a final `else` suite in a
-                // separate failure block that its borrowed-load traversal never visits.
+                // The failure block stays unreachable when folding empties the test block.
                 self.compile_with_strict_owned_loads(
-                    suite_is_constant_false_assertion(body),
+                    self.suite_is_constant_false_assertion(body),
                     |compiler| {
                         compiler.with_control_override(
                             |control| &mut control.exceptions.direct_try_if_exit,
@@ -26595,6 +26595,19 @@ impl<'source> Compiler<'source> {
             }
         }
         Ok(())
+    }
+
+    /// A folded test on its own line survives as a NOP before loading `AssertionError`.
+    fn assertion_retains_test_line(&self, assertion: &ruff_python_ast::StmtAssert) -> bool {
+        self.context.python_version == crate::PythonVersion::Py314
+            && self.line_number(u32::from(assertion.range.start()))
+                != self.line_number(u32::from(assertion.test.range().start()))
+    }
+
+    fn suite_is_constant_false_assertion(&self, body: &[Stmt]) -> bool {
+        matches!(body, [Stmt::Assert(assertion)]
+            if jump_constant_truthiness(&assertion.test) == Some(false)
+                && !self.assertion_retains_test_line(assertion))
     }
 
     fn compile_assert(
@@ -44272,15 +44285,6 @@ fn suite_contains_direct_return_handler_try(body: &[Stmt]) -> bool {
         }
         _ => false,
     })
-}
-
-fn suite_is_constant_false_assertion(body: &[Stmt]) -> bool {
-    body.len() == 1
-        && matches!(
-            body.first(),
-            Some(Stmt::Assert(assertion))
-                if jump_constant_truthiness(&assertion.test) == Some(false)
-        )
 }
 
 fn if_contains_copied_nested_handler_exit(

@@ -109,3 +109,19 @@ fn folded_assertion_empties_only_an_unmarked_match_fallback() {
         common::assert_matches_cpython_marshal(&source, "same_line_assertion.py");
     }
 }
+
+#[test]
+fn retained_assertion_lines_keep_branch_targets_reachable() {
+    for body in [
+        "if flag:\n    return value\nelse:\n    ASSERT",
+        "if flag:\n    consume(value)\nelse:\n    ASSERT",
+        "if flag:\n    return value\nASSERT",
+    ] {
+        for assertion in [
+            "assert False, message(value)",
+            "assert (\n    False\n), message(value)",
+        ] {
+            check(body, assertion, "def", false);
+        }
+    }
+}
