@@ -2365,6 +2365,18 @@ fn terminal_deletion_preserves_original_return_boundary() {
 
 #[test]
 fn borrows_cleanup_locals_after_nested_reraise_guards() {
-    let source = "def save(item, enabled):\n    try:\n        item.save()\n    except Error as error:\n        if enabled:\n            if fatal(error):\n                raise\n    finally:\n        item.close()\n";
-    common::assert_matches_cpython_marshal(source, "nested_reraise_cleanup.py");
+    let protected = "try:\n    item.save()\nexcept Error as error:\n    if enabled:\n        if fatal(error):\n            raise\nfinally:\n    item.close()\n";
+    for body in [
+        protected.to_owned(),
+        format!(
+            "try:\n{}finally:\n    done(item)\n",
+            indent_finally_borrow_case(protected)
+        ),
+    ] {
+        let source = format!(
+            "def save(item, enabled):\n{}",
+            indent_finally_borrow_case(&body)
+        );
+        common::assert_matches_cpython_marshal(&source, "nested_reraise_cleanup.py");
+    }
 }

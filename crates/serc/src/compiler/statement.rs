@@ -37254,7 +37254,9 @@ impl<'source> Compiler<'source> {
             && !statement.is_star
             && statement.orelse.is_empty()
             && !self.control.in_exception_handler()
-            && self.control.finally.is_inactive_for_return_unwind()
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
             && suite_has_nonsuspending_linear_fallthrough(&statement.body)
             && suite_has_nonsuspending_linear_fallthrough(&statement.finalbody)
             && matches!(statement.handlers.as_slice(), [handler]
