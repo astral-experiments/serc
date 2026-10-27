@@ -25948,6 +25948,38 @@ fn erased_assertions_keep_the_finally_call_argument_guard_protected() {
 }
 
 #[test]
+fn copied_boolean_pattern_subjects_keep_their_fresh_branch_markers() {
+    let source = r"async def choose(value):
+    match value:
+        case True:
+            return 1
+        case False:
+            return 2
+        case None:
+            return 3
+
+
+def visit():
+    try:
+        read()
+    except LookupError as error:
+        match error:
+            case False:
+                first()
+            case True:
+                second()
+            case None:
+                third()
+";
+    assert_matches_cpython_versions(
+        source,
+        "copied_boolean_patterns.py",
+        &LEVELS,
+        &VERSIONS.map(|(version, _, _)| version),
+    );
+}
+
+#[test]
 fn nested_finalizer_guard_recovers_the_earlier_call_handler() {
     for count in [7, 8, 9] {
         let calls = "        step(value)\n".repeat(count);
