@@ -28,3 +28,13 @@ fn discarded_literal_slices_keep_their_codegen_constant_order() {
         }
     }
 }
+
+#[test]
+fn discarded_dynamic_slices_admit_their_missing_bounds() {
+    for slice in ["start:", ":stop", "::step"] {
+        let source = format!(
+            "def run(values, flag, start, stop, step):\n    if flag:\n        raise ValueError('early')\n        consume(values[{slice}])\n    consume('later')\n    return None\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "discarded_dynamic_slice.py");
+    }
+}

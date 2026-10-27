@@ -1663,10 +1663,18 @@ impl Compiler<'_> {
                     self.has_untracked_collection = true;
                 }
                 if let Expr::Slice(slice) = expression
-                    && self.legacy_compiler.is_some()
+                    && self.legacy_compiler.is_none()
+                    && let Some(constant) = constant_slice(slice)
                 {
-                    // Legacy targets load each bound before building the slice. Reused
-                    // bounds keep this admission even when the surrounding code is removed.
+                    // CPython constructs literal slices before flowgraph folding.
+                    self.record_interpolated_constant(constant);
+                    return;
+                }
+                if let Expr::Slice(slice) = expression
+                    && self.python_version < PythonVersion::Py315
+                {
+                    // Missing bounds load None before BUILD_SLICE or BINARY_SLICE.
+                    // A later use keeps that index even if the slice is discarded.
                     for bound in [&slice.lower, &slice.upper] {
                         if let Some(bound) = bound {
                             self.visit_expr(bound);
@@ -1676,19 +1684,6 @@ impl Compiler<'_> {
                     }
                     if let Some(step) = &slice.step {
                         self.visit_expr(step);
-                    }
-                    return;
-                }
-                if let Expr::Slice(slice) = expression
-                    && let Some(constant) = constant_slice(slice)
-                {
-                    // CPython constructs literal slices during code generation, before
-                    // flowgraph folds and before constants in later discarded statements.
-                    if self.record_string_origins {
-                        self.string_origin_constants.push((constant.clone(), false));
-                    }
-                    if self.register_literals {
-                        self.constants.push(constant);
                     }
                     return;
                 }
