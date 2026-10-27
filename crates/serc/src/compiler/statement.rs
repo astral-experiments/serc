@@ -47117,7 +47117,7 @@ fn suite_has_nonsuspending_linear_fallthrough(body: &[Stmt]) -> bool {
         && !suite_contains_suspending_expression(body)
 }
 
-/// A delegated iterator resumes its original END_SEND array after a linear prefix.
+/// A delegated iterator resumes in `END_SEND` after a linear prefix.
 fn suite_ends_in_linear_delegation(body: &[Stmt]) -> bool {
     matches!(body.split_last(), Some((Stmt::Expr(tail), prefix))
         if (prefix.is_empty() || suite_has_nonsuspending_linear_fallthrough(prefix))
