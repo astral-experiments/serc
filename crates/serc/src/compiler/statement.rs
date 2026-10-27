@@ -27058,14 +27058,24 @@ impl<'source> Compiler<'source> {
         if statement.handlers.is_empty() {
             return Err(unsupported("try statement without handlers"));
         }
-        // Every normal exit can copy a directly reached local return in the finalizer.
-        let can_copy_local_finally_return = self.control.finally.active_overriding_finally_returns
-            > 0
-            && (self.context.python_version >= crate::PythonVersion::Py314
-                || statement.handlers.len() == 1)
+        // The normal POP_BLOCK and returned expression must fit in four original slots.
+        let finalizer_value = match statement.finalbody.as_slice() {
+            [Stmt::Return(returned)] => returned.value.as_deref(),
+            _ => None,
+        };
+        let can_copy_finally_return = self.control.finally.active_overriding_finally_returns > 0
             && statement.orelse.is_empty()
-            && matches!(statement.finalbody.as_slice(), [Stmt::Return(returned)]
-                if matches!(returned.value.as_deref(), Some(Expr::Name(_))));
+            && match finalizer_value {
+                Some(Expr::Name(_)) => {
+                    self.context.python_version >= crate::PythonVersion::Py314
+                        || statement.handlers.len() == 1
+                }
+                Some(Expr::Attribute(attribute)) => {
+                    self.context.python_version >= crate::PythonVersion::Py314
+                        && matches!(attribute.value.as_ref(), Expr::Name(_))
+                }
+                _ => false,
+            };
         let body_has_elided_assertion = statement.body.iter().any(|body| {
             matches!(
                 self.context.optimized_locations.get(&body.range()),
@@ -31494,7 +31504,7 @@ impl<'source> Compiler<'source> {
                     exclusions.push((exit_exclusion_start, exit_exclusion_end));
                 }
             }
-            if self.control.exceptions.prevent_try_exit_inlining && !can_copy_local_finally_return {
+            if self.control.exceptions.prevent_try_exit_inlining && !can_copy_finally_return {
                 self.assembler.prevent_jump_inlining(normal_exit);
             }
             if normal_exit_absorbed_by_manager_pop {
@@ -33920,7 +33930,7 @@ impl<'source> Compiler<'source> {
                                 .make_no_location_copy_interruptible(handler_exit);
                         }
                     }
-                    let return_is_overridden = can_copy_local_finally_return
+                    let return_is_overridden = can_copy_finally_return
                         || (self.control.finally.active_overriding_finally_returns > 0
                             && matches!(handler.body.last(), Some(Stmt::Return(_))));
                     // The bare raise follows the manager and its recovery in one
