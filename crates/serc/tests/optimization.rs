@@ -11961,6 +11961,26 @@ fn shared_finally_guard_after_handler_cleanup_keeps_manager_owner() {
 }
 
 #[test]
+fn break_keeps_its_line_before_a_small_attribute_return() {
+    for tail in ["obj.finish()", "Outcome.done", "obj.finish(value)"] {
+        let source = format!(
+            "def finish(enabled, active, obj, value):
+    if enabled:
+        while active:
+            if done():
+                obj.last = value
+                break
+            step()
+    else:
+        reset()
+    return {tail}
+"
+        );
+        assert_matches_cpython(&source, "break_attribute_return.py", &LEVELS);
+    }
+}
+
+#[test]
 fn breaks_keep_their_line_before_a_shared_return() {
     for source in [
         r"def choose(flag, value):
