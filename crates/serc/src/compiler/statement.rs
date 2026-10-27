@@ -28769,11 +28769,15 @@ impl<'source> Compiler<'source> {
             && self.control.collected_exception_depth() == 0
             && self.control.finally.active_finally_try_bodies == 0;
         // The successful arms copy the small return before line propagation.
-        // The wildcard's physical fallthrough then owns the original POP's line.
+        // A conditional in the wildcard leaves an extra join before the match end.
+        // Its physical fallthrough then supplies the original POP's line.
         let copied_wildcard_fallthrough = local_return
             && matches!(statement.body.last(), Some(Stmt::Match(matched))
                 if matched.cases.last().is_some_and(|case|
-                    case.guard.is_none() && is_wildcard_pattern(&case.pattern)))
+                    case.guard.is_none() && is_wildcard_pattern(&case.pattern)
+                        && matches!(case.body.last(), Some(Stmt::If(branch))
+                            if early_condition_truthiness(&branch.test).is_none()
+                                && branch.elif_else_clauses.last().is_some_and(|clause| clause.test.is_none()))))
             && self.assembler.at_original_match_join()
             && self
                 .assembler
