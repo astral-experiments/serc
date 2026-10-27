@@ -6046,7 +6046,9 @@ impl<'source> Compiler<'source> {
         is_final_else: bool,
         has_siblings: bool,
     ) -> Result<(), CompileError> {
-        if is_final_else
+        let falls_through_to_return =
+            is_final_else || !self.control.statements.terminal_if_branch_has_forward_exit;
+        if falls_through_to_return
             && self.context.python_version >= crate::PythonVersion::Py314
             && matches!(body.last(), Some(Stmt::Expr(expression)) if matches!(expression.value.as_ref(), Expr::BoolOp(_)))
         {
@@ -6072,11 +6074,9 @@ impl<'source> Compiler<'source> {
         // to the implicit return. Earlier tested arms have a jump over a sibling
         // and can copy the store and return into both expression branches.
         // An attribute store also joins because its copied tail exceeds four slots.
-        let joins_at_name_store =
-            is_final_else || !self.control.statements.terminal_if_branch_has_forward_exit;
         let assignment = body.last().and_then(|statement| match statement {
             Stmt::Assign(assignment)
-                if (joins_at_name_store
+                if (falls_through_to_return
                     && matches!(assignment.targets.as_slice(), [Expr::Name(_)]))
                     || matches!(assignment.targets.as_slice(), [Expr::Attribute(attribute)]
                         if matches!(attribute.value.as_ref(), Expr::Name(_))) =>

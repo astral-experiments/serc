@@ -15,12 +15,16 @@ use serc::{
 };
 
 #[test]
-fn a_final_else_shares_its_boolean_discard() {
+fn the_last_conditional_arm_shares_its_boolean_discard() {
     let source = r"def record(value, first, enabled):
     if first:
         enabled and visit(value)
     else:
         enabled and finish(value)
+
+def record_if_ready(value, ready, logger):
+    if ready:
+        logger.enabled and logger.record(value)
 ";
     assert_matches_cpython(source, "record.py", &LEVELS);
 }
