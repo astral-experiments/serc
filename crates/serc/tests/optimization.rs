@@ -13222,6 +13222,24 @@ fn constant_return_keeps_the_try_pop_before_a_managed_finally_guard() {
 }
 
 #[test]
+fn a_terminal_try_keeps_its_original_break_until_the_return_is_copied() {
+    for body in [
+        "async with manager:\n                use(ready)",
+        "if ready:\n                async with manager:\n                    use(ready)\n            else:\n                use(ready)",
+    ] {
+        let source = format!(
+            "async def run(ready, manager, use):\n    while True:\n        try:\n            {body}\n        except ValueError as error:\n            pass\n        break\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "shared_break.py",
+            &LEVELS,
+            &[PythonVersion::Py312, PythonVersion::Py313],
+        );
+    }
+}
+
+#[test]
 fn python313_cold_break_before_an_erased_while_test_keeps_its_line() {
     let source = r"def drain(ready):
     try:
