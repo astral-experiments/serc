@@ -11519,6 +11519,27 @@ fn nested_handler_iterator_returns_end_inner_try_ownership() {
 }
 
 #[test]
+fn handler_returns_keep_each_enclosing_try_protected() {
+    for (scope, prefix) in [("def", ""), ("async def", ""), ("def", "    yield key\n")] {
+        let source = format!(
+            r"{scope} read(key):
+{prefix}    try:
+        try:
+            try:
+                fetch(key)
+            except KeyError as error:
+                return 1
+        except ValueError:
+            recover()
+    except OSError:
+        release()
+"
+        );
+        assert_matches_cpython(&source, "handler_return_under_tries.py", &LEVELS);
+    }
+}
+
+#[test]
 fn nested_handler_returns_keep_enclosing_try_owner_inside_while() {
     let source = r"def sample(flag):
     try:

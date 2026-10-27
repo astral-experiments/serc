@@ -3903,27 +3903,28 @@ impl<'source> Compiler<'source> {
         }
     }
 
-    /// Certifies one ordinary try around contiguous handler cleanup, with no interleaved scope.
-    fn plain_handler_chain_has_outer_try(&self) -> bool {
+    /// Counts the ordinary tries surrounding a contiguous handler chain.
+    fn plain_handler_chain_outer_try_depth(&self) -> Option<usize> {
         let exceptions = &self.control.exceptions;
         let finally = &self.control.finally;
         let handlers = &exceptions.active_exception_handlers;
         let try_depth = exceptions.active_try_marker_slots.len();
-        self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
-            && !handlers.is_empty()
-            && matches!(try_depth, 1 | 2)
+        let outer_depth = handlers.first()?.try_body_depth;
+        (outer_depth > 0
+            && (try_depth == outer_depth || try_depth == outer_depth + 1)
             && exceptions.active_exception_region_exclusions.len() == handlers.len() + try_depth
             && exceptions.active_exception_group_handlers == 0
             && self.control.withs.active_with_exits.is_empty()
             && self.control.loops.contexts.is_empty()
             && finally.is_inactive_for_return_unwind()
             && handlers.iter().enumerate().all(|(index, handler)| {
-                handler.try_body_depth == 1
-                    && handler.exception_region_depth == index + 1
+                handler.try_body_depth == outer_depth
+                    && handler.exception_region_depth == index + outer_depth
                     && handler.with_depth == 0
                     && handler.loop_depth == 0
                     && handler.finally_end_depth == 0
-            })
+            }))
+        .then_some(outer_depth)
     }
 
     pub(super) fn emit_deferred_implicit_return(&mut self) -> Result<(), CompileError> {
@@ -3958,8 +3959,9 @@ impl<'source> Compiler<'source> {
             .control
             .exceptions
             .unwind_exception_handlers_for_implicit_return;
-        let preserve_outer_try_owner =
-            exclude_from_all_exception_regions && self.plain_handler_chain_has_outer_try();
+        let outer_try_depth = exclude_from_all_exception_regions
+            .then(|| self.plain_handler_chain_outer_try_depth())
+            .flatten();
         let exclusion_start =
             self.begin_implicit_return_exception_exclusion(exclude_from_all_exception_regions);
         if self
@@ -3997,12 +3999,12 @@ impl<'source> Compiler<'source> {
                 }
             }
         }
-        // Handler POP_EXCEPT and name clearing still belong to the older ordinary try.
-        // The implicit None and RETURN_VALUE leave that try after the cleanup completes.
-        let outer_try_exclusion_start = preserve_outer_try_owner.then(|| {
+        // Handler cleanup stays in each surrounding ordinary try. The implicit return
+        // leaves them together after POP_EXCEPT and any name clearing.
+        let outer_try_exclusion_start = outer_try_depth.map(|depth| {
             let start = self.assembler.label();
             self.assembler.mark(start);
-            start
+            (depth, start)
         });
         self.emit_deferred_constant_before_return(Constant::None)?;
         self.emit(RETURN_VALUE, 0, -1)?;
@@ -4048,7 +4050,7 @@ impl<'source> Compiler<'source> {
         &mut self,
         exclusion_start: Option<Label>,
         exclude_from_all_exception_regions: bool,
-        outer_try_exclusion_start: Option<Label>,
+        outer_try_exclusion_start: Option<(usize, Label)>,
     ) {
         let Some(exclusion_start) = exclusion_start else {
             return;
@@ -4064,8 +4066,8 @@ impl<'source> Compiler<'source> {
                 .enumerate()
             {
                 let start = outer_try_exclusion_start
-                    .filter(|_| index == 0)
-                    .unwrap_or(exclusion_start);
+                    .filter(|(depth, _)| index < *depth)
+                    .map_or(exclusion_start, |(_, start)| start);
                 exclusions.push((start, exclusion_end));
             }
         } else if let Some(depth) = self
@@ -9215,12 +9217,13 @@ impl<'source> Compiler<'source> {
                         .active_return_finally_contexts
                         .is_empty()
                     && self.control.finally.active_finally_end_blocks == 0;
-                // A newer try inside the handler ends first. The older ordinary try
-                // still owns the complete handler cleanup, including deeper handler chains.
-                let preserve_outer_handler_try_owner = !return_is_overridden
+                // Tries entered inside these handlers end first. The surrounding tries
+                // still own the complete handler cleanup.
+                let outer_handler_try_depth = (!return_is_overridden
                     && !preserve_nested_handler_return_owner
-                    && !tracks_two_handlers_inside_ordinary_try
-                    && self.plain_handler_chain_has_outer_try();
+                    && !tracks_two_handlers_inside_ordinary_try)
+                    .then(|| self.plain_handler_chain_outer_try_depth())
+                    .flatten();
                 let mut protected_outer_pop_except_start = None;
                 let mut preserves_managed_handler_try_pops = false;
                 let mut emitted_named_handler_pops = false;
@@ -14342,12 +14345,12 @@ impl<'source> Compiler<'source> {
                     .unwrap_or(next_loop);
                 self.emit_loop_iterator_cleanup(protected_iterator_start, next_loop, preserve_tos)?;
                 let nested_handler_return_owner_end = (preserve_nested_handler_return_owner
-                    || preserve_outer_handler_try_owner)
-                    .then(|| {
-                        let end = self.assembler.label();
-                        self.assembler.mark(end);
-                        end
-                    });
+                    || outer_handler_try_depth.is_some())
+                .then(|| {
+                    let end = self.assembler.label();
+                    self.assembler.mark(end);
+                    end
+                });
                 let mut deferred_outer_iterator_depth = self.control.withs.active_with_exits
                     [..next_with]
                     .last()
@@ -14921,7 +14924,8 @@ impl<'source> Compiler<'source> {
                                         .filter(|_| {
                                             (preserve_nested_handler_return_owner
                                                 && index + 1 < region_count)
-                                                || (preserve_outer_handler_try_owner && index == 0)
+                                                || outer_handler_try_depth
+                                                    .is_some_and(|depth| index < depth)
                                         })
                                         .unwrap_or(exclusion_start)
                                 },
