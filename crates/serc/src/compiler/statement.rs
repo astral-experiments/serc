@@ -27880,13 +27880,10 @@ impl<'source> Compiler<'source> {
                 && !managed_await_store_entry
                 && !nested_pass_call_entry
                 && !nested_conditional_pass_entry
-                && !nested_for_break_entry)
+                && !nested_for_break_entry
+                && !threaded_finally_pass_entry)
         {
-            if threaded_finally_pass_entry {
-                self.assembler.prevent_borrow_fallthrough_reachability(end);
-            } else {
-                self.assembler.prevent_borrow_reachability(end);
-            }
+            self.assembler.prevent_borrow_reachability(end);
         }
 
         if emit_statement_nop {
