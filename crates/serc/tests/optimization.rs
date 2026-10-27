@@ -2616,6 +2616,23 @@ fn guarded_recovery_preserves_loop_cleanup_entry() {
 }
 
 #[test]
+fn paired_while_exhaustion_edges_keep_their_own_return_locations() {
+    let source = r"def consume(flag, left, right, value):
+    try:
+        if flag:
+            while left < value:
+                left += 1
+        else:
+            while right < value:
+                right += 1
+    except LookupError:
+        raise
+    return value
+";
+    assert_matches_cpython(source, "while_exhaustion_return.py", &LEVELS);
+}
+
+#[test]
 fn protected_while_break_copies_following_local_return() {
     let source = r"async def collect(ready, limit, done, count):
     try:

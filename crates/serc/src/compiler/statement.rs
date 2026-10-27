@@ -18180,10 +18180,17 @@ impl<'source> Compiler<'source> {
                         // an else suite would supply its own preceding line instead.
                         // A while loop also has an empty condition-failure block. Its
                         // inlined branch jump has no preceding line event to replace it.
-                        if matches!(body.last(), Some(Stmt::For(_))) {
-                            // The break target or async exhaustion continuation starts
-                            // an empty array. Its copied jump retains a separate NOP
-                            // even when the preceding iterator has the same line.
+                        let single_exhaustion_edge = self.context.python_version
+                            >= crate::PythonVersion::Py314
+                            && matches!(body.last(), Some(Stmt::While(loop_statement))
+                                    if loop_statement.orelse.is_empty()
+                                        && !suite_contains_loop_break(&loop_statement.body)
+                                        && early_condition_truthiness(&loop_statement.test).is_none()
+                                        && original_condition_has_unique_jump_target(&loop_statement.test, false));
+                        if matches!(body.last(), Some(Stmt::For(_))) || single_exhaustion_edge {
+                            // Record the original empty array before its jump threads
+                            // through a shared exit. A copied return then inherits
+                            // this edge's line rather than the other arm's line.
                             self.assembler
                                 .preserve_empty_join_inlined_jump_nop(branch_exit);
                         } else {
