@@ -528,10 +528,17 @@ impl OptimizationPipeline {
                             load.no_location_policy.preserve_location();
                         }
                         if let Some((marker_position, marker_location)) = copied_jump_marker {
-                            // Folding can consume a unary result, but the replaced join's
-                            // marker still belongs to its original source operand.
+                            // Both exits from an inlined all/any call already report
+                            // its source line while discarding the iterator.
+                            let iterator_exit = self.graph[marker_position.block()].items()
+                                [..marker_position.offset()].last().is_some_and(|item| {
+                                    matches!(item, Item::Instruction(pop) if pop.opcode == crate::target::opcodes::POP_ITER
+                                        && pop.location.line == marker_location.line)
+                                });
                             let marker = self.graph.instruction_mut(marker_position).unwrap();
-                            marker.location = if marker_location.line == instruction.location.line {
+                            marker.location = if iterator_exit
+                                || marker_location.line == instruction.location.line
+                            {
                                 SourceLocation::NONE
                             } else {
                                 marker_location
