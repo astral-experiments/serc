@@ -8731,6 +8731,33 @@ fn while_break_keeps_fallthrough_else_exception_owner() {
 }
 
 #[test]
+fn protected_loop_else_pass_keeps_the_exhaustion_line_and_owner() {
+    let source = r"def release(value, ready):
+    try:
+        while ready:
+            if stop():
+                break
+        else:
+            pass
+    finally:
+        finish(value)
+    return value
+
+async def consume(value, items, skip):
+    try:
+        for value in items:
+            if skip:
+                continue
+        else:
+            pass
+    except ValueError:
+        recover(value)
+    return value
+";
+    assert_matches_cpython(source, "loop_else_pass.py", &LEVELS);
+}
+
+#[test]
 fn while_else_store_locates_the_normal_try_exit() {
     for value in ["item", "item if flag else other"] {
         let source = format!(
