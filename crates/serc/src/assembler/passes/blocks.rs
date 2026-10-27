@@ -7786,6 +7786,21 @@ impl OptimizationPipeline {
                         .saturating_add(jump_extra),
                 );
             }
+            if inline_small_exit
+                && target_terminal_opcode == Some(RETURN_VALUE)
+                && let Some(jump) = graph[source].last_instruction()
+                && jump.fusion_policy.is_authored_break()
+                && let Some(target) = jump.forward_target()
+                && let Some(slots) = self
+                    .exception_owner_provenance
+                    .while_break_unwind_slots
+                    .get(&(target, jump.location))
+                && let Some(marker) = copied.iter_mut().find_map(Item::as_instruction_mut)
+            {
+                // The original break NOP and POP_BLOCKs remain in the copied array
+                // until NOP removal. Count them when considering another return copy.
+                marker.add_pre_fold_extra_instructions(*slots);
+            }
             if let Some(instruction) = copied.iter_mut().find_map(Item::as_instruction_mut)
                 && instruction
                     .no_location_policy

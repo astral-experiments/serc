@@ -7347,16 +7347,6 @@ impl<'source> Compiler<'source> {
                         self.assembler.prevent_jump_threading_target(break_jump);
                     }
                     self.assembler.mark_jump_as_authored_break(break_jump);
-                    if self.context.python_version >= crate::PythonVersion::Py314
-                        && context.iterator_cleanup == IteratorCleanup::None
-                        && has_no_emitted_cleanup
-                        && ordinary_try_pops > 0
-                    {
-                        // A copied while break still occupies its authored NOP,
-                        // the unwound POP_BLOCKs, and the replaced jump.
-                        self.assembler
-                            .add_last_original_block_slots(1 + ordinary_try_pops);
-                    }
                     self.assembler.record_copied_finally_break_head(
                         break_jump,
                         context.break_label,
@@ -7468,6 +7458,14 @@ impl<'source> Compiler<'source> {
                         // exceptional-finally cleanup. Copy the unlocated continuation before
                         // its break target receives the final return.
                         self.assembler.allow_last_no_location_block_inlining();
+                    }
+                    if self.context.python_version >= crate::PythonVersion::Py314
+                        && context.iterator_cleanup == IteratorCleanup::None
+                        && has_no_emitted_cleanup
+                        && ordinary_try_pops > 0
+                    {
+                        self.assembler
+                            .record_while_break_unwind(break_jump, ordinary_try_pops);
                     }
                     if let Some(jump_exclusion_start) = jump_exclusion_start {
                         let jump_exclusion_end = self.assembler.label();

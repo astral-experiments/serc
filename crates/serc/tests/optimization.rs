@@ -7895,6 +7895,16 @@ fn protected_while_break_counts_its_unwind_before_copying_the_return() {
         except LookupError:
             retry(value)
     return value
+
+def managed(manager, value):
+    while True:
+        try:
+            with manager:
+                visit(value)
+            break
+        except LookupError:
+            retry(value)
+    return value
 ";
     assert_matches_cpython(source, "protected_break_copy.py", &LEVELS);
 }

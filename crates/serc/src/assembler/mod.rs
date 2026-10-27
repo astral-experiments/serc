@@ -11944,6 +11944,19 @@ impl Assembler {
             .mark_authored_break();
     }
 
+    /// Records the omitted unwind slots for an authored while break that copies a return.
+    pub(crate) fn record_while_break_unwind(&mut self, emitted: EmittedJump, pops: usize) {
+        let jump = self.emitted_jump_mut(emitted, "recording a while break unwind");
+        let target = jump
+            .forward_target()
+            .expect("while break must jump forward");
+        let origin = (target, jump.location);
+        let slots = u8::try_from(pops).unwrap_or(u8::MAX).saturating_add(1);
+        self.exception_owner_provenance
+            .while_break_unwind_slots
+            .insert(origin, slots);
+    }
+
     /// Marks a backedge synthesized by late conditional normalization.
     pub(crate) fn mark_normalized_conditional_backedge(&mut self, emitted: EmittedJump) {
         self.emitted_jump_mut(emitted, "marking a normalized conditional backedge")

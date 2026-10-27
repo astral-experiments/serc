@@ -273,6 +273,8 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) legacy_comprehension_backedges: Vec<(Label, Instruction)>,
     // Authored SEND, completion entry, and END_SEND before any cleanup or copying.
     pub(super) ordinary_await_ends: Vec<OrdinaryAwaitEnd>,
+    // Omitted break NOP and ordinary-try POP_BLOCKs used only when copying a return.
+    pub(super) while_break_unwind_slots: FxHashMap<(Label, SourceLocation), u8>,
     // Empty runtime-while anchor, shared exit, and exact terminal authored break.
     pub(super) empty_while_break_anchors: Vec<(Label, Label, Instruction)>,
     // Case-success jumps whose intervening original failure blocks were erased.
