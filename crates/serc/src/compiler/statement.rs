@@ -42241,6 +42241,7 @@ impl<'source> Compiler<'source> {
                 // A folded infinite loop still has an original normal false exit.
                 && suite_terminates_before_constant_folding(&statement.body)
                 && condition_jump_target_count(&statement.test, false) == 1
+                && original_condition_has_unique_jump_target(&statement.test, false)
             {
                 // CPython drops a converted `POP_BLOCK` marker fed by multiple normal
                 // fallthroughs. A sole predecessor supplies the marker's visible location.
@@ -44731,7 +44732,9 @@ fn with_body_handler_exit_location(compiler: &Compiler<'_>, body: &[Stmt]) -> Op
     match tail {
         Stmt::Assert(statement) => Some(statement.test.range()),
         Stmt::If(statement) => {
-            terminating_if_fallthrough_test(statement).map(synthetic_condition_exit_range)
+            let test = terminating_if_fallthrough_test(statement)
+                .filter(|test| original_condition_has_unique_jump_target(test, false))?;
+            unique_condition_jump_target(test, false).map(Ranged::range)
         }
         // The final store locates the handler's artificial cleanup and the manager exit.
         statement @ Stmt::Assign(_) => Some(implicit_return_range(compiler, statement)),
