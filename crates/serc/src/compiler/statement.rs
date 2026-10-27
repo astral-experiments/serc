@@ -18304,7 +18304,19 @@ impl<'source> Compiler<'source> {
                         let relocate_try_else_exit = branch_index == 0
                             && self.control.exceptions.relocated_try_else_exit
                                 == Some(statement.range);
+                        // An erased final else shares the following block's entry.
+                        // Threading the other arms past it leaves this jump in its own array.
+                        let falls_through_erased_else = self.context.python_version
+                            >= crate::PythonVersion::Py314
+                            && branch_index + 2 == branch_count
+                            && has_declaration_only_else
+                            && body_has_original_empty_block
+                            && nested
+                                .elif_else_clauses
+                                .last()
+                                .is_some_and(|clause| clause.test.is_none());
                         if relocate_try_else_exit
+                            || falls_through_erased_else
                             || (branch_index == 0
                                 && body.len() == 1
                                 && statement.elif_else_clauses.len() >= 2
