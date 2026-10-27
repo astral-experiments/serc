@@ -15,6 +15,16 @@ use serc::{
 };
 
 #[test]
+fn handler_branches_keep_their_jump_when_a_tuple_return_enlarges_the_cleanup() {
+    for handler in ["except ValueError:", "except ValueError as exc:"] {
+        let source = format!(
+            "def f(x, y):\n    try:\n        read()\n    {handler}\n        if x:\n            if y:\n                first()\n            else:\n                second()\n        else:\n            third()\n    return x, y\n"
+        );
+        assert_matches_cpython(&source, "handler_return_copy.py", &LEVELS);
+    }
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:

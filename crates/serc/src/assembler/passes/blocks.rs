@@ -701,6 +701,25 @@ fn block_is_local_raise(items: &[Item], original_nop_targets: &FxHashSet<Label>)
         && instructions.next().is_none()
 }
 
+/// Checks the original four-slot limit before a handler cleanup absorbs a located return.
+fn is_short_cleanup_return(graph: &BlockGraph, target: Label) -> bool {
+    let Some(block) = graph.label_block(target) else {
+        return false;
+    };
+    graph[block]
+        .last_instruction()
+        .is_some_and(|exit| exit.opcode == RETURN_VALUE)
+        && super::control_flow::targets_small_scope_exit(graph, target)
+        && graph[block]
+            .items()
+            .iter()
+            .filter_map(Item::as_instruction)
+            .all(|instruction| {
+                (instruction.opcode == NOP || instruction.location.line >= 0)
+                    && instruction.local_policy.hidden_exception_owner_slots() == 0
+            })
+}
+
 /// Recognizes a named-handler cleanup followed by a short, located value return.
 fn named_cleanup_has_short_return(graph: &BlockGraph, target: BasicBlockId) -> bool {
     let cleanup = graph[target]
@@ -727,38 +746,7 @@ fn named_cleanup_has_short_return(graph: &BlockGraph, target: BasicBlockId) -> b
     let Some(label) = jump.forward_target() else {
         return false;
     };
-    let Some(successor) = graph.label_block(label) else {
-        return false;
-    };
-    let mut returned = graph[successor]
-        .items()
-        .iter()
-        .filter_map(Item::as_instruction);
-    let Some(mut value) = returned.next() else {
-        return false;
-    };
-    if value.opcode == NOP {
-        if value.pre_fold_extra_instructions() != 0
-            || value.local_policy.hidden_exception_owner_slots() != 0
-        {
-            return false;
-        }
-        let Some(next) = returned.next() else {
-            return false;
-        };
-        value = next;
-    }
-    let Some(exit) = returned.next() else {
-        return false;
-    };
-    matches!(value.opcode, LOAD_FAST | LOAD_CONST)
-        && exit.opcode == RETURN_VALUE
-        && returned.next().is_none()
-        && [value, exit].iter().all(|instruction| {
-            instruction.location.line >= 0
-                && instruction.pre_fold_extra_instructions() == 0
-                && instruction.local_policy.hidden_exception_owner_slots() == 0
-        })
+    is_short_cleanup_return(graph, label)
 }
 
 /// Authenticates a shared unlocated jump after exactly one original jump was threaded.
@@ -837,24 +825,7 @@ fn unnamed_cleanup_has_short_return(
                 if instruction.local_policy.hidden_exception_owner_slots() != 0)
         });
     }
-    let entry_len = returned
-        .iter()
-        .take_while(|item| matches!(item, Item::Label(_)))
-        .count();
-    let [Item::Instruction(value), Item::Instruction(exit)] = &returned[entry_len..] else {
-        return false;
-    };
-    // A bare global load occupies one original slot. The low-bit NULL form
-    // also represents PUSH_NULL and cannot use this two-record certificate.
-    (matches!(value.opcode, LOAD_FAST | LOAD_CONST)
-        || (value.opcode == LOAD_GLOBAL
-            && matches!(value.operand(), Operand::Value(argument) if argument & 1 == 0)))
-        && exit.opcode == RETURN_VALUE
-        && [value, exit].iter().all(|instruction| {
-            instruction.location.line >= 0
-                && instruction.pre_fold_extra_instructions() == 0
-                && instruction.local_policy.hidden_exception_owner_slots() == 0
-        })
+    is_short_cleanup_return(graph, label)
 }
 
 // Every restored POP_BLOCK is outside ordinary handlers but inside the scope fallback.
