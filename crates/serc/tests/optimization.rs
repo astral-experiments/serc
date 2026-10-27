@@ -2952,6 +2952,27 @@ fn manager_exit_copies_local_raise_with_constant_cause() {
 }
 
 #[test]
+fn handler_returns_protect_pop_except_with_the_intervening_finally() {
+    for (outer, value) in [("KeyError", "1"), ("KeyError as error", "recover(error)")] {
+        let source = format!(
+            r"def read(key):
+    try:
+        first(key)
+    except {outer}:
+        try:
+            second(key)
+        except ValueError:
+            return {value}
+        finally:
+            release(key)
+    return key
+"
+        );
+        assert_matches_cpython(&source, "handler_return_before_finally.py", &LEVELS);
+    }
+}
+
+#[test]
 fn conditional_assignment_copies_protected_raise() {
     let source = "def sample(ready, fallback):\n    error = make_error() if ready else fallback\n    try:\n        raise error\n    except Problem as caught:\n        report(caught)\n";
     assert_matches_cpython(source, "assigned_protected_raise.py", &LEVELS);

@@ -10689,16 +10689,6 @@ impl<'source> Compiler<'source> {
                                 .and_then(|index| return_finally_contexts.get(index))
                                 .filter(|context| {
                                     handler_index > 0
-                                        && (name.is_some()
-                                            || (preserve_tos
-                                                && handler_count == 2
-                                                && handler_index == 1
-                                                && self
-                                                    .control
-                                                    .exceptions
-                                                    .active_exception_handlers[0]
-                                                    .name
-                                                    .is_none()))
                                         && context.handler_depth == handler_index
                                         && context.with_depth == with_depth
                                         && context.loop_depth == loop_depth
