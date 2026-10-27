@@ -38014,7 +38014,10 @@ impl<'source> Compiler<'source> {
                                             if raise.exc.as_deref().is_none_or(|value| matches!(value, Expr::Name(_)))
                                                 && raise.cause.as_deref().is_none_or(|value| matches!(value, Expr::Name(_))))
                                             || matches!(guard.body.as_slice(), [Stmt::Return(return_)]
-                                                if return_.value.as_deref().is_none_or(|value| matches!(value, Expr::Name(_))))))
+                                                if return_.value.as_deref().is_none_or(|value| {
+                                                    matches!(value, Expr::Name(_)) || (self.context.python_version == crate::PythonVersion::Py314
+                                                        && self.return_value_is_constant(value))
+                                                }))))
                         }) || (coroutine_while_nested_cleanup
                             && suite_has_linear_reraise_guards(&handler.body)))
                 })}))

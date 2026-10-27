@@ -107,3 +107,13 @@ def in_manager(manager, value, stop):
 ";
     common::assert_matches_cpython_marshal(source, "borrowed_try_exits.py");
 }
+
+#[test]
+fn guarded_constant_return_reaches_normal_finally() {
+    for handler in ["if flag:\n            return True", "return True"] {
+        let source = format!(
+            "def f(value, flag):\n    try:\n        work()\n    except Error as error:\n        {handler}\n    finally:\n        value.close()\n    return False\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "guarded_constant_return.py");
+    }
+}
