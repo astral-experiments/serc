@@ -5322,9 +5322,16 @@ impl Assembler {
         // store. The following marker reuses the protected condition cell.
         if self.python_version == crate::PythonVersion::Py314
             && truth
-            && let [.., Item::Label(entry), Item::Instruction(result), Item::Label(barrier),
-                Item::Instruction(restore), Item::Instruction(load), Item::Instruction(convert),
-                Item::Instruction(condition)] = items
+            && let [
+                ..,
+                Item::Label(entry),
+                Item::Instruction(result),
+                Item::Label(barrier),
+                Item::Instruction(restore),
+                Item::Instruction(load),
+                Item::Instruction(convert),
+                Item::Instruction(condition),
+            ] = items
             && provenance.fusion_boundaries.contains(barrier)
             && result.opcode == STORE_FAST
             && !result.local_policy.may_store_null()
@@ -5340,12 +5347,17 @@ impl Assembler {
             && result.depth_after() == load.depth_after()
             && restore.depth_after() == condition.depth_after()
             && convert.depth_after() == load.depth_after()
-            && provenance.original_primitive_condition_boundaries.contains(condition)
-            && provenance.original_comprehension_normal_exits.iter().any(|(target, jump)| {
-                target == entry
-                    && jump.opcode == JUMP_FORWARD
-                    && jump.forward_target() == Some(*entry)
-            })
+            && provenance
+                .original_primitive_condition_boundaries
+                .contains(condition)
+            && provenance
+                .original_comprehension_normal_exits
+                .iter()
+                .any(|(target, jump)| {
+                    target == entry
+                        && jump.opcode == JUMP_FORWARD
+                        && jump.forward_target() == Some(*entry)
+                })
         {
             return Some(true);
         }
