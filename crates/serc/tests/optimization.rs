@@ -8564,6 +8564,31 @@ fn a_finalizer_guard_keeps_the_following_local_load_owned() {
 }
 
 #[test]
+fn erased_loop_else_guards_keep_the_false_backedge() {
+    let source = r"async def dispatch(events, manager):
+    async with manager:
+        async for event in events:
+            if event:
+                try:
+                    process(event)
+                except ValueError as error:
+                    report(error)
+            else:
+                assert event is None
+
+def consume(rows, manager):
+    with manager:
+        for row in rows:
+            if row:
+                if row.ready:
+                    process(row)
+            else:
+                assert row is None
+";
+    assert_matches_cpython(source, "erased_loop_else.py", &LEVELS);
+}
+
+#[test]
 fn nested_for_else_conditions_keep_their_forward_exit() {
     let source = r"def find(rows, enabled):
     for row in rows:
