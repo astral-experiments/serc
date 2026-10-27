@@ -2383,3 +2383,19 @@ fn borrows_locals_after_a_conditional_jumps_to_a_finally_pass() {
         common::assert_matches_cpython_marshal(&source, "conditional_finally_pass.py");
     }
 }
+
+#[test]
+fn borrows_after_nested_handler_exits_jump_to_a_finally_pass() {
+    let mut body = "if ready:\n    use(first)\nelse:\n    use(second)\n".to_owned();
+    for _ in 0..2 {
+        body = format!(
+            "try:\n{}except Inner as error:\n    recover(error)\n",
+            indent_finally_borrow_case(&body)
+        );
+        let source = format!(
+            "def choose(ready, first, second):\n    try:\n{}    except Error:\n        pass\n    finally:\n        pass\n    return first, second\n",
+            indent_finally_borrow_case(&indent_finally_borrow_case(&body))
+        );
+        common::assert_matches_cpython_marshal(&source, "nested_handler_finally_pass.py");
+    }
+}

@@ -308,6 +308,8 @@ struct TryCompileOptions {
     exclude_terminal_body_not_taken: bool,
     // Only the owning finally producer can certify this original else-exit NOP.
     retained_else_break_exit: bool,
+    // A surviving conditional jump bypasses this nested handler join.
+    threaded_finally_pass_entry: bool,
     loop_tail: Option<(Label, bool)>,
     // Only normal success enters else; handler exits keep their ordinary cleanup path.
     else_loop_tail: Option<Label>,
@@ -321,6 +323,7 @@ impl TryCompileOptions {
         emit_statement_nop: true,
         exclude_terminal_body_not_taken: false,
         retained_else_break_exit: false,
+        threaded_finally_pass_entry: false,
         loop_tail: None,
         else_loop_tail: None,
         else_match_tail: None,
@@ -338,6 +341,7 @@ impl TryCompileOptions {
         emit_statement_nop: false,
         exclude_terminal_body_not_taken: false,
         retained_else_break_exit: false,
+        threaded_finally_pass_entry: false,
         loop_tail: None,
         else_loop_tail: None,
         else_match_tail: None,
@@ -27048,6 +27052,7 @@ impl<'source> Compiler<'source> {
             emit_statement_nop,
             exclude_terminal_body_not_taken,
             retained_else_break_exit,
+            threaded_finally_pass_entry,
             loop_tail,
             else_loop_tail,
             else_match_tail,
@@ -27877,7 +27882,11 @@ impl<'source> Compiler<'source> {
                 && !nested_conditional_pass_entry
                 && !nested_for_break_entry)
         {
-            self.assembler.prevent_borrow_reachability(end);
+            if threaded_finally_pass_entry {
+                self.assembler.prevent_borrow_fallthrough_reachability(end);
+            } else {
+                self.assembler.prevent_borrow_reachability(end);
+            }
         }
 
         if emit_statement_nop {
@@ -36018,14 +36027,19 @@ impl<'source> Compiler<'source> {
             && !self.control.in_exception_handler()
             && self.control.finally.is_inactive_for_return_unwind()
             && matches!(statement.finalbody.as_slice(), [Stmt::Pass(_)])
-            // The first arm retains a nonempty jump directly to the located pass after
-            // handlers move cold. The other arm may still fall into an empty try exit.
-            && matches!(statement.body.split_last(), Some((Stmt::If(branch), leading))
-                if suite_has_normal_fallthrough(leading)
-                    && condition_has_linear_runtime_leaves(&branch.test)
-                    && !expression_suspends_current_scope(&branch.test)
-                    && branch.elif_else_clauses.last().is_some_and(|clause| clause.test.is_none())
-                    && suite_has_nonsuspending_linear_fallthrough(&branch.body));
+            // A populated conditional arm can jump directly to the located pass after
+            // handlers move cold. The fallthrough arm can still meet an empty try exit.
+            && statement.body.split_last().is_some_and(|(last, leading)| {
+                suite_has_normal_fallthrough(leading)
+                    && match last {
+                        Stmt::If(branch) => condition_has_linear_runtime_leaves(&branch.test)
+                            && !expression_suspends_current_scope(&branch.test)
+                            && branch.elif_else_clauses.last().is_some_and(|clause| clause.test.is_none())
+                            && suite_has_nonsuspending_linear_fallthrough(&branch.body),
+                        Stmt::Try(nested) => nested_try_has_finally_pass_jump(nested),
+                        _ => false,
+                    }
+            });
         // A live linear arm before the final else keeps a reachable jump directly
         // into normal cleanup after handlers move cold. Folded assertions can leave
         // that jump behind an empty block, so a merely nonterminal arm is insufficient.
@@ -39162,6 +39176,7 @@ impl<'source> Compiler<'source> {
                                         && matches!(statement.orelse.last(), Some(Stmt::If(tail)) if tail.elif_else_clauses.is_empty()),
                                     retained_else_break_exit:
                                         terminal_else_break_bypasses_empty_exit,
+                                    threaded_finally_pass_entry: protected_arm_reaches_finally_pass,
                                     ..TryCompileOptions::NESTED_HANDLER
                                 },
                             )
@@ -45497,6 +45512,44 @@ fn suite_ends_in_manager_terminal_match(body: &[Stmt]) -> bool {
                         && (prefix.is_empty() || suite_has_linear_borrow_fallthrough(prefix))
                 })
         })
+}
+
+/// Finds a live arm jump threaded through successive handler exits to a finalizer pass.
+fn nested_try_has_finally_pass_jump(mut nested: &ruff_python_ast::StmtTry) -> bool {
+    while !nested.is_star && nested.orelse.is_empty() && nested.finalbody.is_empty() {
+        let Some((last, leading)) = nested.body.split_last() else {
+            return false;
+        };
+        if !suite_has_normal_fallthrough(leading) {
+            return false;
+        }
+        match last {
+            Stmt::Try(inner) => nested = inner,
+            Stmt::If(branch) => {
+                return condition_has_linear_runtime_leaves(&branch.test)
+                    && !expression_suspends_current_scope(&branch.test)
+                    && branch
+                        .elif_else_clauses
+                        .last()
+                        .is_some_and(|clause| clause.test.is_none())
+                    && branch.body.split_last().is_some_and(|(tail, prefix)| {
+                        suite_has_nonsuspending_linear_fallthrough(std::slice::from_ref(tail))
+                            && !suite_any_statement(prefix, |stmt| {
+                                matches!(
+                                    stmt,
+                                    Stmt::Return(_)
+                                        | Stmt::Raise(_)
+                                        | Stmt::Break(_)
+                                        | Stmt::Continue(_)
+                                )
+                            })
+                            && suite_has_normal_fallthrough(prefix)
+                    });
+            }
+            _ => return false,
+        }
+    }
+    false
 }
 
 fn suite_ends_in_retained_try_exit_join(body: &[Stmt]) -> bool {
