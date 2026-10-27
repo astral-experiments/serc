@@ -253,6 +253,8 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) legacy_protocol_await_setups: Vec<LegacyProtocolAwaitSetup>,
     // Authored ordinary-try SETUP and its original handler, independently of split ranges.
     pub(super) ordinary_try_setups: FxHashMap<Label, Label>,
+    // Handler of a retained try/finally SETUP whose body starts with a conditional.
+    pub(super) guarded_finally_setups: FxHashMap<Label, Label>,
     // Original SETUP and exact depth-zero fragment start, end and handler.
     pub(super) ordinary_try_region_origins: Vec<(Label, Label, Label, Label)>,
     // Authored name-clearing exception handlers, independent of overlapping outer regions.
@@ -12514,7 +12516,10 @@ impl LayoutAssembler {
         }) {
             return None;
         }
-        let handler = provenance.ordinary_try_setups.get(&setup)?;
+        let handler = provenance
+            .ordinary_try_setups
+            .get(&setup)
+            .or_else(|| provenance.guarded_finally_setups.get(&setup))?;
         let inner = self.uniform_exception_owner(setup_start, marker + 1, positions)?;
         if self.exception_regions[inner].is_scope_fallback
             || self.exception_regions[inner].target != *handler

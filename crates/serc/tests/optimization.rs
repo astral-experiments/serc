@@ -1440,6 +1440,25 @@ fn async_iterator_recovery_keeps_cleanup_cold() {
 }
 
 #[test]
+fn nested_finally_guard_reuses_the_outer_call_slot() {
+    for (body, close) in [
+        ("use(value)", "stream.close()"),
+        ("use(use(use(value)))", "stream.close()"),
+        ("return use(use(value))", "close(stream)"),
+    ] {
+        let source = format!(
+            "def sample(stream, flag, value):\n    try:\n        {body}\n    finally:\n        try:\n            {close}\n        finally:\n            try:\n                if flag is not None:\n                    release()\n            finally:\n                done()\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "nested_finally_guard.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn guarded_manager_cleanup_retains_raise_recovery() {
     for work in ["resource.run()", "result = resource.run()"] {
         for exit in ["raise", "return"] {
