@@ -14192,6 +14192,97 @@ impl Assembler {
             });
     }
 
+    /// Retains an unowned `POP_BLOCK` slot on the truth test after a named-handler return.
+    pub(crate) fn exclude_returned_named_handler_guard_slot(&mut self, start: usize, pop: usize) {
+        use crate::target::opcodes::{BUILD_STRING, CALL, CALL_KW, LOAD_DEREF};
+
+        let items = self.linear_items();
+        if items[..start]
+            .iter()
+            .rev()
+            .find_map(Item::as_instruction)
+            .is_none_or(|previous| previous.opcode != NOT_TAKEN)
+        {
+            return;
+        }
+        let prefix: Vec<_> = items[start..pop]
+            .iter()
+            .filter_map(Item::as_instruction)
+            .collect();
+        let [
+            callee,
+            arguments @ ..,
+            call,
+            swap,
+            restore,
+            none,
+            store,
+            delete,
+        ] = prefix.as_slice()
+        else {
+            return;
+        };
+        if callee.opcode != LOAD_GLOBAL
+            || callee.value_argument().is_none_or(|arg| arg & 1 == 0)
+            || !matches!(call.opcode, CALL | CALL_KW)
+            || swap.opcode != SWAP
+            || swap.value_argument() != Some(2)
+            || restore.opcode != POP_EXCEPT
+            || none.opcode != LOAD_CONST
+            || store.opcode != STORE_FAST
+            || delete.opcode != DELETE_FAST
+            || store.operand() != delete.operand()
+            || prefix.iter().any(|part| {
+                part.pre_fold_extra_instructions() != 0
+                    || part.local_policy.hidden_exception_owner_slots() != 0
+            })
+            || !arguments.iter().all(|part| {
+                matches!(
+                    part.opcode,
+                    LOAD_CONST
+                        | LOAD_SMALL_INT
+                        | LOAD_FAST
+                        | LOAD_DEREF
+                        | FORMAT_SIMPLE
+                        | BUILD_STRING
+                )
+            })
+            || arguments.windows(2).any(|pair| {
+                pair[0].opcode == LOAD_FAST
+                    && pair[1].opcode == LOAD_FAST
+                    && pair[0].location.line == pair[1].location.line
+            })
+        {
+            return;
+        }
+        let mut guard = self.linear_items_mut()[pop..]
+            .iter_mut()
+            .filter_map(Item::as_instruction_mut);
+        let [Some(pop), Some(load), Some(truth), Some(jump), Some(marker)] =
+            std::array::from_fn(|_| guard.next())
+        else {
+            return;
+        };
+        // The global call folds PUSH_NULL. The named handler drops both POP_BLOCKs
+        // around SWAP and POP_EXCEPT, then the finalizer drops its own POP_BLOCK.
+        // Four removed cells place the three-instruction truth test's marker on
+        // that last, unowned POP_BLOCK.
+        if pop.opcode == NOP
+            && pop.fusion_policy.is_converted_pop_block()
+            && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
+            && load.opcode == LOAD_FAST
+            && truth.opcode == TO_BOOL
+            && matches!(jump.opcode, POP_JUMP_IF_TRUE | POP_JUMP_IF_FALSE)
+            && jump.forward_target().is_some()
+            && marker.opcode == NOT_TAKEN
+            && [truth.location, jump.location, marker.location]
+                .iter()
+                .all(|loc| *loc == load.location)
+        {
+            marker.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
+        }
+    }
+
     /// Records the final POP and the first local test of the copied finally suite.
     pub(crate) fn record_copied_return_guard(
         &mut self,
