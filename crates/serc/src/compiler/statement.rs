@@ -5448,12 +5448,12 @@ impl<'source> Compiler<'source> {
                         && self.assembler.current_block_has_dynamic_exception_owner());
                 // The final comparison's fallthrough jump becomes a located NOP when
                 // CPython copies a small terminal return or raise onto that edge.
-                let retained_chained_comparison_exit =
-                    (matches!(body, [Stmt::Return(_) | Stmt::Raise(_)])
-                        || (branch_index < statement.elif_else_clauses.len()
-                            && matches!(body, [Stmt::Pass(_)])))
-                    .then(|| final_chained_comparison_jump(test))
-                    .flatten();
+                let retained_chained_comparison_exit = (self
+                    .chained_comparison_exit_can_inline(body)
+                    || (branch_index < statement.elif_else_clauses.len()
+                        && matches!(body, [Stmt::Pass(_)])))
+                .then(|| final_chained_comparison_jump(test))
+                .flatten();
                 self.with_control_override(
                     |control| &mut control.conditions.exclude_terminal_if_not_taken,
                     exclude_not_taken,
@@ -6083,6 +6083,16 @@ impl<'source> Compiler<'source> {
                 )
             },
         )
+    }
+
+    /// A line-only prefix still lets the assembler copy a short terminal arm
+    /// onto the successful comparison edge, subject to its four-record limit.
+    fn chained_comparison_exit_can_inline(&self, body: &[Stmt]) -> bool {
+        matches!(body.split_last(), Some((Stmt::Return(_) | Stmt::Raise(_), prefix))
+            if prefix.is_empty()
+                || (self.context.python_version >= crate::PythonVersion::Py314
+                    && prefix.iter().all(|part| matches!(part, Stmt::Pass(_))
+                        || matches!(part, Stmt::Expr(expression) if is_literal_constant(&expression.value)))))
     }
 
     fn compile_terminal_if_chained_compare(
@@ -16229,7 +16239,7 @@ impl<'source> Compiler<'source> {
                         if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
                             && is_literal_constant(&assignment.value));
                 let retained_chained_comparison_exit =
-                    (matches!(body, [Stmt::Return(_) | Stmt::Raise(_)])
+                    (self.chained_comparison_exit_can_inline(body)
                         || terminal_break_return
                         || literal_store)
                         .then(|| {

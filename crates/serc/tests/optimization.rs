@@ -7883,6 +7883,23 @@ fn recovery_finalizer_preserves_local_return_borrow_boundary() {
 }
 
 #[test]
+fn chained_comparison_copies_a_return_after_a_line_only_statement() {
+    let source = r#"def classify(value):
+    if value is None:
+        return True
+    elif 10 <= value < 20:
+        "accepted"
+        return True
+    elif 20 <= value < 30:
+        pass
+        pass
+        return False
+    return value
+"#;
+    assert_matches_cpython(source, "chained_comparison_returns.py", &LEVELS);
+}
+
+#[test]
 fn chained_comparison_copies_a_store_and_bare_raise() {
     let source = r"def classify(value):
     try:
