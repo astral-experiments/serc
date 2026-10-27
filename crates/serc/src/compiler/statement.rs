@@ -36276,6 +36276,9 @@ impl<'source> Compiler<'source> {
                 if suite_has_normal_fallthrough(prefix)
                     && guard.elif_else_clauses.is_empty()
                     && condition_has_linear_runtime_leaves(&guard.test)
+                    // A short-circuit guard has a second empty condition block before
+                    // the manager exit and therefore needs a separate entry proof.
+                    && !expression_contains_inline_branch(&guard.test)
                     && !expression_suspends_current_scope(&guard.test)
                     && matches!(guard.body.as_slice(), [Stmt::With(manager)]
                         if !manager.is_async && manager.items.len() == 1
