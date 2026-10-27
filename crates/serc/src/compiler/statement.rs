@@ -41484,8 +41484,15 @@ impl<'source> Compiler<'source> {
                     // or an abrupt arm can leave the POP itself in its place.
                     let conditional_manager_jump = matches!(statement.finalbody.last(), Some(Stmt::If(tail))
                         if condition_has_only_runtime_tests(&tail.test)
-                            && tail.elif_else_clauses.iter().all(|clause| clause.test.as_ref().is_none_or(condition_has_only_runtime_tests)))
-                        && !suite_contains_abrupt_control_flow(&statement.finalbody);
+                            && tail.elif_else_clauses.iter().all(|clause| clause.test.as_ref().is_none_or(condition_has_only_runtime_tests))
+                            && (!suite_contains_abrupt_control_flow(&statement.finalbody)
+                                // A conditional reraise can leave both the try's normal exit
+                                // and its handled exit jumping to this empty guard join.
+                                || (empty_unlocated_manager_tail && tail.elif_else_clauses.is_empty()
+                                    && matches!(tail.body.last(), Some(Stmt::Try(recovery))
+                                        if !recovery.is_star && recovery.orelse.is_empty()
+                                            && recovery.finalbody.is_empty()
+                                            && try_normal_exit_predecessors(recovery) > 1))));
                     if !conditional_manager_jump
                         && !original_sync_conditional_manager_jump
                         && !original_async_generator_conditional_manager_jump

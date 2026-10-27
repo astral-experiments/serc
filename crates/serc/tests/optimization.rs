@@ -11937,6 +11937,25 @@ fn copied_iterator_break_uses_each_finalizer_guard_exit() {
 }
 
 #[test]
+fn a_handlers_conditional_reraise_keeps_the_manager_on_the_finally_join() {
+    let source = r"def run(manager, value, enabled):
+    with manager:
+        try:
+            work(value)
+        finally:
+            if enabled:
+                try:
+                    release(value)
+                except ValueError:
+                    if retry(value):
+                        report(value)
+                    else:
+                        raise
+";
+    assert_matches_cpython(source, "guarded_recovery.py", &LEVELS);
+}
+
+#[test]
 fn shared_finally_guard_after_handler_cleanup_keeps_manager_owner() {
     let source = r"def sample(manager, flag):
     with manager as item:
