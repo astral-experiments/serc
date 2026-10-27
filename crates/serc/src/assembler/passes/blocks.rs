@@ -6738,7 +6738,21 @@ impl OptimizationPipeline {
                     .is_some_and(|i| !block_has_fallthrough(graph[order[i]].items()))
                 && graph[source].last_instruction().is_some_and(|jump| {
                     if source_location.line < 0 {
-                        jump.no_location_policy.preserves_location()
+                        // A finished try can enter this original conditional join.
+                        // Its still-live guard supplies the copied tuple's first line.
+                        let guarded_try_tuple = jump.jump_policy.is_original_empty_join()
+                            && jump.jump_policy.retained_nop()
+                                == super::super::ir::RetainedJumpNop::DirectTarget
+                            && super::normal_try_copies::original_local_tuple_return(
+                                graph[target].items(),
+                            )
+                            .is_some()
+                            && self
+                                .exception_owner_provenance
+                                .normal_try_exits
+                                .iter()
+                                .any(|(_, join)| graph.label_block(*join) == Some(source));
+                        (jump.no_location_policy.preserves_location() || guarded_try_tuple)
                             && jump.pre_fold_extra_instructions() == 0
                             && graph[source].items().iter().any(|item| {
                                 matches!(item, Item::Label(label)

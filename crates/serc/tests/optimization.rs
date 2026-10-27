@@ -1959,6 +1959,31 @@ fn compound_handler_loop_exits_keep_separate_cleanup_copies() {
 }
 
 #[test]
+fn a_guard_locates_the_tuple_return_after_a_try_exit() {
+    let source = r"def choose(active, left, right):
+    if active:
+        if ready():
+            prepare()
+        else:
+            if right:
+                try:
+                    use(right)
+                except LookupError:
+                    raise ValueError
+    else:
+        prepare()
+    return left, right
+";
+    for tail in ["left, right", "left, right, active"] {
+        assert_matches_cpython(
+            &source.replace("return left, right", &format!("return {tail}")),
+            "guarded_try_tuple_return.py",
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn nested_recovery_reaches_a_separate_tuple_return() {
     let source = "def sample(flag, left, right):
     if flag:
