@@ -9795,6 +9795,21 @@ fn three_handler_returns_preserve_each_outer_cleanup_owner() {
 }
 
 #[test]
+fn return_from_a_nested_handler_keeps_an_intervening_manager() {
+    let source = r"def read(key):
+    try:
+        return fetch(key)
+    except LookupError:
+        with lock():
+            try:
+                return fetch(key)
+            except ValueError:
+                return recover(key)
+";
+    assert_matches_cpython(source, "handler_return_inside_manager.py", &LEVELS);
+}
+
+#[test]
 fn three_handler_returns_preserve_owners_before_iterator_cleanup() {
     let source = r"def sample(values):
     for value in values:

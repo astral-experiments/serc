@@ -10579,12 +10579,12 @@ impl<'source> Compiler<'source> {
                             self.assembler.mark_last_as_converted_pop_block();
                         }
                         let protects_outer_handler = handler_index > 0
+                            && with_depth
+                                == self.control.exceptions.active_exception_handlers
+                                    [handler_index - 1]
+                                    .with_depth
                             && !tracks_interleaved_unnamed_handler_unwind
-                            && ((name.is_some()
-                                && with_depth
-                                    == self.control.exceptions.active_exception_handlers
-                                        [handler_index - 1]
-                                        .with_depth)
+                            && (name.is_some()
                                 || self.control.exceptions.active_exception_handlers
                                     [handler_index]
                                     .protect_outer_return_pop
