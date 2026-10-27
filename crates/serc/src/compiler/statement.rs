@@ -36021,8 +36021,7 @@ impl<'source> Compiler<'source> {
             if matches!(conditional.body.split_last(), Some((Stmt::If(guard), leading))
                 if (leading.is_empty() || suite_has_nonsuspending_linear_fallthrough(leading))
                     && guard.elif_else_clauses.is_empty()
-                    && (condition_has_completed_call_leaves(&guard.test, self.context.python_version)
-                        || (managed_guard_context && condition_has_linear_runtime_leaves(&guard.test)))
+                    && condition_has_completed_call_leaves(&guard.test, self.context.python_version)
                     && !expression_suspends_current_scope(&guard.test)
                     && original_condition_has_unique_jump_target(&guard.test, false)
                     && suite_has_nonsuspending_linear_fallthrough(&guard.body)));
