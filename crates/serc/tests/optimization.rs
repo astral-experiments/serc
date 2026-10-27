@@ -15,6 +15,21 @@ use serc::{
 };
 
 #[test]
+fn conditional_return_counts_both_try_pops_before_the_finalizer_guard() {
+    let source = r"def select(manager, flag, value, other, active):
+    with manager:
+        try:
+            return value if flag else other
+        except LookupError:
+            pass
+        finally:
+            if active:
+                finish()
+";
+    assert_matches_cpython(source, "conditional_return_finalizer_guard.py", &LEVELS);
+}
+
+#[test]
 fn nested_conversion_handlers_keep_shared_cleanup() {
     let source = r"def sample(items):
     for item in items:
