@@ -7309,6 +7309,22 @@ fn handler_return_keeps_outer_finalizer_owner_through_iterator_cleanup() {
 }
 
 #[test]
+fn restored_handler_exits_its_manager_before_discarding_the_iterator() {
+    let source = r"async def visit(items):
+    try:
+        async for item in items:
+            with item:
+                try:
+                    await work(item)
+                except ValueError:
+                    return
+    finally:
+        await finish()
+";
+    assert_matches_cpython(source, "restored_handler_iterator.py", &LEVELS);
+}
+
+#[test]
 fn return_retires_inner_try_before_iterator_after_finalizer_and_manager() {
     let source = r"async def sample(items, manager, ready):
     for item in items:

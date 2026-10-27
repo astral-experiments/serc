@@ -11056,13 +11056,18 @@ impl<'source> Compiler<'source> {
                                                     <= manager.exception_region_depth
                                         })
                             });
-                    // These managers were all entered after the remaining loops. Their
-                    // exit callables must be removed before the surrounding iterators.
-                    // Keep the separate handler and copied-finally unwind paths unchanged.
+                    // A handler entered inside these managers has already restored
+                    // its exception state by the time we reach this finalizer.
+                    let restored_inner_handler = next_handler == 0
+                        && matches!(self.control.exceptions.active_exception_handlers.as_slice(),
+                            [handler] if handler.with_depth == next_with
+                                && handler.loop_depth == next_loop
+                                && handler.finally_end_depth == 0);
+                    // Exit callables entered after the remaining loops sit above their iterators.
                     let can_unwind_inner_managers_first = (preserve_tos
                         || none_return_unwinds_inner_managers
                         || interleaved_sync_manager_return)
-                        && handler_count == 0
+                        && (handler_count == 0 || restored_inner_handler)
                         && !nested_call_finally_return
                         && self.control.finally.active_finally_end_blocks == 0
                         && self.control.finally.active_normal_finally_bodies == 0
