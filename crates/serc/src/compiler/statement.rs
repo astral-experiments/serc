@@ -37386,9 +37386,33 @@ impl<'source> Compiler<'source> {
             && matches!(statement.body.as_slice(), [Stmt::If(branch)]
                 if if_has_folded_pass_arms(branch))
             && self.assembler.at_empty_borrow_block();
+        // The assignment outlives the comprehension's temporary local restores.
+        // An erased cleanup leaves its target as the donor for the normal exit.
+        let comprehension_store_location = if self.context.python_version
+            >= crate::PythonVersion::Py314
+            && statement.handlers.is_empty()
+            && statement.orelse.is_empty()
+            && statement
+                .finalbody
+                .iter()
+                .all(|part| self.context.is_elided_statement(part))
+            && let Some(Stmt::Assign(assignment)) = statement
+                .body
+                .iter()
+                .rfind(|part| !self.context.is_elided_statement(part))
+            && let [Expr::Name(target)] = assignment.targets.as_slice()
+            && matches!(
+                assignment.value.as_ref(),
+                Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_)
+            ) {
+            Some(self.source_location(target.range))
+        } else {
+            None
+        };
         self.assembler.set_location(
             sole_else_pop_location
                 .or(handler_else_pop_location)
+                .or(comprehension_store_location)
                 .unwrap_or(SourceLocation::NONE),
         );
         // CPython converts POP_BLOCK to a NOP without assigning it an exception owner,
