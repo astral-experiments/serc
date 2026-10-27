@@ -727,6 +727,26 @@ fn terminal_while_else_keeps_its_handler_break_position() {
 }
 
 #[test]
+fn discarded_constant_fstrings_leave_a_slot_for_the_next_condition() {
+    let source = r#"def check(value):
+    "documentation"
+    PREFIX
+    try:
+        if value:
+            return value
+    except ValueError:
+        recover()
+"#;
+    for prefix in ["f'constant'", "'second string'"] {
+        assert_matches_cpython(
+            &source.replace("PREFIX", prefix),
+            "discarded_fstring.py",
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn handler_dispatch_keeps_resolved_constant_operands() {
     for fallback in ["()", "None"] {
         let source = format!(

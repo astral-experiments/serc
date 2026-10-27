@@ -3146,6 +3146,13 @@ impl<'source> Compiler<'source> {
                             // but CPython still counts it during the earlier exit-copy pass.
                             self.assembler.add_last_original_block_slots(1);
                         }
+                    } else if self.context.python_version == crate::PythonVersion::Py314
+                        && matches!(expression.value.as_ref(), Expr::FString(_))
+                    {
+                        // A discarded constant f-string starts as LOAD_CONST and POP_TOP.
+                        // Their replacement NOP leaves one slot for a later branch marker.
+                        self.emit(NOP, 0, 0)?;
+                        self.assembler.add_last_hidden_exception_owner_slots(1);
                     } else if self.context.python_version <= crate::PythonVersion::Py313 {
                         // Native constant statements stay in the current CFG block.
                         // Artificial marker labels would interrupt line inheritance
