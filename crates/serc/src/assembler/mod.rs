@@ -12487,7 +12487,7 @@ impl Assembler {
         }
     }
 
-    /// Keeps the normal POP_BLOCK unlocated when its return fits in the copied exit.
+    /// Keeps the normal `POP_BLOCK` unlocated when its return fits in the copied exit.
     pub(crate) fn preserve_copied_finally_return_pop(&mut self, ordinal: usize) {
         if self.is_small_linear_scope_exit_since(ordinal)
             && let Some(pop) = self.instruction_at_mut(ordinal)
