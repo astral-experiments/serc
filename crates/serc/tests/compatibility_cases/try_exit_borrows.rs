@@ -2365,12 +2365,20 @@ fn terminal_deletion_preserves_original_return_boundary() {
 
 #[test]
 fn borrows_locals_after_a_conditional_jumps_to_a_finally_pass() {
-    for arm in ["use(first)", "if True:\n    return\nuse(first)"] {
+    for (arm, otherwise, tail) in [
+        ("use(first)", "use(second)", "return first, second"),
+        (
+            "if True:\n    return\nuse(first)",
+            "pass",
+            "use(first)\nreturn first",
+        ),
+    ] {
         let source = format!(
-            "def choose(ready, first, second):\n    try:\n        if ready:\n{}        else:\n            use(second)\n    except Error as err:\n        recover(err)\n    finally:\n        pass\n    return first, second\n",
+            "def choose(ready, first, second):\n    try:\n        if ready:\n{}        else:\n            {otherwise}\n    except Error as err:\n        recover(err)\n    finally:\n        pass\n{}",
             indent_finally_borrow_case(&indent_finally_borrow_case(&indent_finally_borrow_case(
                 arm
-            )))
+            ))),
+            indent_finally_borrow_case(tail)
         );
         common::assert_matches_cpython_marshal(&source, "conditional_finally_pass.py");
     }
