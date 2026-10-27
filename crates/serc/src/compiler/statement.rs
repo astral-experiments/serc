@@ -41188,8 +41188,6 @@ impl<'source> Compiler<'source> {
                 && pass_finally_location == self.assembler.last_instruction_location()
                 && statement.handlers.is_empty()
                 && statement.orelse.is_empty()
-                && (folded_pass_finally_exit
-                    || suite_has_linear_borrow_fallthrough(&statement.body))
                 && self
                     .assembler
                     .instruction_location_at(normal_finally_pop_block)
@@ -41197,8 +41195,8 @@ impl<'source> Compiler<'source> {
                 && !pass_finally_leaves_manager
                 && exception_policy == ExceptionPolicy::default()
             {
-                // A populated linear body leaves the original POP_BLOCK unlocated;
-                // folded or shared joins can carry a separate donor into that slot.
+                // An unlocated original POP_BLOCK contributes no separate line before
+                // the finalizer, including where conditional or loop exits meet.
                 // Early NOP compaction moves this authored Pass onto the normal
                 // exit, whose line native small-exit copying retains before appending
                 // a differently located return.

@@ -25977,3 +25977,24 @@ fn short_circuit_value_after_manager_entries_uses_the_prior_handler() {
 ";
     assert_matches_cpython(source, "manager_value_guard.py", &LEVELS);
 }
+
+#[test]
+fn a_pass_finalizer_keeps_its_line_after_a_conditional() {
+    let source = r"def verify(flag, value):
+    try:
+        if flag:
+            inspect(value)
+    finally:
+        pass
+    return value
+
+def iterate(values):
+    try:
+        for value in values:
+            inspect(value)
+    finally:
+        pass
+    return values
+";
+    assert_matches_cpython(source, "pass_finalizer.py", &LEVELS);
+}
