@@ -4415,18 +4415,16 @@ impl<'source> Compiler<'source> {
         };
         if self.context.python_version >= crate::PythonVersion::Py314
             && early_condition_truthiness(&statement.test) != Some(false)
-            && suite_has_linear_borrow_fallthrough(&statement.orelse)
             && !suite_contains_nested_exception_cleanup(&statement.body)
-            && let Some((_, prefix)) = statement.body.split_last()
-            && prefix.iter().any(|statement| {
-                matches!(statement, Stmt::If(statement)
-                    if statement.elif_else_clauses.is_empty()
-                        && matches!(statement.body.as_slice(), [Stmt::Break(_)])
-                        && final_chained_comparison_jump(&statement.test).is_some())
-            })
+            && suite_contains_loop_break(&statement.body)
+            && (suite_has_linear_borrow_fallthrough(&statement.orelse)
+                || suite_terminates(&statement.orelse)
+                || matches!(statement.orelse.last(), Some(Stmt::For(iterator))
+                    if !iterator.is_async && iterator.orelse.is_empty()
+                        && !suite_contains_loop_break(&iterator.body)))
         {
-            // The while's success edge is copied before the outer conditional footer.
-            // Its authored break and the linear else each donate their own return span.
+            // Each break copies the original unlocated scope exit before its line
+            // is resolved. The exhaustion path supplies its own return location.
             return true;
         }
         let Some(Stmt::If(tail)) = statement.orelse.last() else {
@@ -29129,7 +29127,9 @@ impl<'source> Compiler<'source> {
                 // Exhaustion exits in the while-else suite. Only breaks reach the implicit
                 // return, so each copy inherits its own edge's location.
                 self.assembler.set_location(SourceLocation::NONE);
-            } else if self.terminal_for_break_exit_inherits_predecessor(normal_exit_suite) {
+            } else if self.terminal_for_break_exit_inherits_predecessor(normal_exit_suite)
+                || self.terminal_while_else_break_exit_inherits_predecessor(normal_exit_suite)
+            {
                 // The try's terminal footer is shared by loop exhaustion and break
                 // edges, including loops in its else suite. Copies inherit each
                 // predecessor's own authored location.

@@ -7883,6 +7883,32 @@ fn recovery_finalizer_preserves_local_return_borrow_boundary() {
 }
 
 #[test]
+fn terminal_while_else_gives_each_break_its_implicit_return_line() {
+    let source = r"def poll(enabled, ready, done, value):
+    if enabled:
+        while ready:
+            if done:
+                break
+            check(value)
+        else:
+            finish(value)
+
+def wait(ready, done, value):
+    try:
+        while ready():
+            if done():
+                break
+            visit(value)
+        else:
+            raise LookupError
+    except LookupError:
+        recover(value)
+        raise
+";
+    assert_matches_cpython(source, "while_else_scope_exit.py", &LEVELS);
+}
+
+#[test]
 fn chained_comparison_copies_a_store_and_bare_raise() {
     let source = r"def classify(value):
     try:
