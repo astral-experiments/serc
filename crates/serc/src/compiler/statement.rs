@@ -39288,6 +39288,33 @@ impl<'source> Compiler<'source> {
                     self.assembler.mark(start);
                     start
                 });
+        let while_else_pop_location = if statement.handlers.is_empty()
+            && statement.orelse.is_empty()
+            && let Some(Stmt::While(tail)) = statement.body.last()
+            && early_condition_truthiness(&tail.test).is_none()
+            && !suite_contains_loop_break(&tail.body)
+        {
+            match tail.orelse.last() {
+                Some(Stmt::Pass(pass)) => Some(self.source_location(pass.range)),
+                Some(_)
+                    if self.context.python_version == crate::PythonVersion::Py312
+                        && suite_has_linear_borrow_fallthrough(&tail.orelse) =>
+                {
+                    self.assembler.last_instruction_location()
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if self.context.python_version == crate::PythonVersion::Py312
+            && while_else_pop_location.is_some()
+        {
+            // 3.12 starts an instruction array at the loop's break label even
+            // when the only incoming edge falls through from the else suite.
+            self.assembler
+                .record_exception_owner_block_boundary(protected_end);
+        }
         let sole_else_pop_location = (statement.handlers.is_empty()
             && statement.orelse.is_empty()
             && suite_ends_in_sole_else_fallthrough(&statement.body))
@@ -39346,6 +39373,7 @@ impl<'source> Compiler<'source> {
         };
         self.assembler.set_location(
             sole_else_pop_location
+                .or(while_else_pop_location)
                 .or(handler_else_pop_location)
                 .or(comprehension_store_location)
                 .unwrap_or(SourceLocation::NONE),

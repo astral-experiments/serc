@@ -19119,6 +19119,29 @@ fn finally_guarded_loop_recovery_preserves_borrow_boundary() {
 }
 
 #[test]
+fn loop_else_fallthrough_locates_the_normal_finalizer() {
+    let source = r"def drain(values):
+    try:
+        while ready():
+            work()
+        else:
+            del values[:]
+    finally:
+        finish()
+
+async def wait():
+    try:
+        while ready():
+            await step()
+        else:
+            pass
+    finally:
+        finish()
+";
+    assert_matches_cpython(source, "loop_else_finalizer.py", &LEVELS);
+}
+
+#[test]
 fn while_else_keeps_finally_borrowing_after_elided_assertions() {
     for condition in ["condition()", "condition() or count < 3"] {
         for following in ["", "    return obj\n"] {
