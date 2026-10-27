@@ -15,6 +15,31 @@ use serc::{
 };
 
 #[test]
+fn copied_try_with_handlers_retains_both_setup_slots() {
+    let source = r"def sample(owner, flag):
+    while active():
+        try:
+            work()
+        finally:
+            with owner.first, owner.second():
+                try:
+                    if flag is None:
+                        good()
+                except Error as e:
+                    reject(e)
+                finally:
+                    close()
+";
+    for condition in ["flag is None", "flag"] {
+        assert_matches_cpython(
+            &source.replace("flag is None", condition),
+            "copied_try_setup.py",
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn local_fusion_keeps_retained_try_setup_unowned() {
     let source = r"def sample(items, flag, a, b, c, d):
     with acquire():
