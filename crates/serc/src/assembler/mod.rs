@@ -15139,7 +15139,7 @@ impl Assembler {
             || store.opcode != STORE_FAST
             || !matches!(load.opcode, LOAD_FAST | crate::target::opcodes::LOAD_DEREF)
             || attr.opcode != LOAD_ATTR
-            || !attr.value_argument().is_some_and(|arg| arg & 1 == 0)
+            || attr.value_argument().is_none_or(|arg| arg & 1 != 0)
             || !matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
             || condition.forward_target().is_none()
             || marker.opcode != NOT_TAKEN
