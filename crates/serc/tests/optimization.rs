@@ -4754,6 +4754,25 @@ fn finalizer_copies_named_handler_cleanup_onto_elif_exits() {
 }
 
 #[test]
+fn folded_loop_exhaustion_forwards_the_original_finalizer_edge() {
+    let source = "def drain(ready):
+    try:
+        try:
+            while True:
+                if ready:
+                    break
+                pass
+        except KeyError:
+            raise
+    except ValueError:
+        raise
+    finally:
+        finish()
+";
+    assert_matches_cpython(source, "folded_loop_finalizer.py", &LEVELS);
+}
+
+#[test]
 fn nested_handler_raise_keeps_empty_outer_exit() {
     for scope in ["def", "async def"] {
         for binding in ["", " as parse_error"] {

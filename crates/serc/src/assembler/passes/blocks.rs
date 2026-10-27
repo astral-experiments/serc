@@ -4065,7 +4065,17 @@ impl OptimizationPipeline {
                 if let Some(jump) = instructions.next()
                     && instructions.next().is_none()
                     && jump.opcode == JUMP_FORWARD
-                    && jump.location == SourceLocation::NONE
+                    // A folded loop's exhaustion edge can retain the last iteration's
+                    // location on a normal try exit. The original jump still forwarded
+                    // this predecessor before the finalizer inherited any lines.
+                    && (jump.location == SourceLocation::NONE
+                        || (self.python_version >= crate::PythonVersion::Py314
+                            && items.iter().any(|item| matches!(item,
+                                Item::Label(label) if self.folded_loop_exit_anchors.contains(label)))
+                            && self.exception_owner_provenance.normal_try_exits.iter().any(
+                                |(entry, target)| jump.forward_target() == Some(*target)
+                                    && items.contains(&Item::Label(*entry)),
+                            )))
                     && jump.pre_fold_extra_instructions() == 0
                     && jump.local_policy.hidden_exception_owner_slots() == 0
                     && jump.jump_policy.allows_threading_target()
