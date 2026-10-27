@@ -10308,6 +10308,24 @@ impl LayoutAssembler {
                             ExceptionOwnerDecision::override_with_region(None),
                         );
                     }
+                    if instruction.opcode == NOT_TAKEN
+                        && owner_history_exact
+                        && tail.insertions == 0
+                        && tail.late_removals == 0
+                        && let Some(region) = self.copied_return_discard_owner(
+                            instruction_index,
+                            original_array_start,
+                            tail,
+                            &indexed_instructions,
+                            &label_positions,
+                            &jump_targets,
+                        )
+                    {
+                        owners.insert(
+                            instruction_index,
+                            ExceptionOwnerDecision::override_with_region(Some(region)),
+                        );
+                    }
                     if instruction.opcode == NOT_TAKEN {
                         if instruction.exception_policy().exclusion()
                             == super::ExceptionExclusion::None
@@ -13291,6 +13309,71 @@ impl LayoutAssembler {
             && !owner.preserve_lasti
             && owner.target == handler
             && outer_setup_matches)
+            .then_some(region)
+    }
+
+    /// Projects the call discard before a copied return onto a subsequent None guard.
+    fn copied_return_discard_owner(
+        &self,
+        marker: usize,
+        array: usize,
+        tail: ExceptionOwnerTail,
+        instructions: &[&Instruction],
+        positions: &OwnerLabelPositions,
+        jump_targets: &FxHashSet<Label>,
+    ) -> Option<usize> {
+        use crate::target::opcodes::{
+            BINARY_OP, CALL, CALL_KW, LOAD_FAST, LOAD_FAST_BORROW, LOAD_FAST_CHECK, LOAD_SMALL_INT,
+            STORE_FAST,
+        };
+        let [prefix @ .., load, guard] = &instructions[array..marker] else {
+            return None;
+        };
+        if !matches!(load.opcode, LOAD_FAST | LOAD_FAST_BORROW | LOAD_FAST_CHECK)
+            || load.local_policy.hidden_exception_owner_slots() != 0
+            || !matches!(guard.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+            || guard.local_policy.hidden_exception_owner_slots() != 3
+        {
+            return None;
+        }
+        let back = prefix
+            .iter()
+            .rposition(|i| i.opcode == NOP && i.local_policy.hidden_exception_owner_slots() == 2)?;
+        let [.., call, discard] = &prefix[..back] else {
+            return None;
+        };
+        if !matches!(call.opcode, CALL | CALL_KW)
+            || discard.opcode != POP_TOP
+            || discard.location != call.location
+            || !matches!(&prefix[back+1..], [nop] if nop.opcode == NOP)
+                && !matches!(&prefix[back+1..],[base, factor, op, store] if base.opcode == LOAD_GLOBAL
+                    && matches!(factor.opcode, LOAD_SMALL_INT | LOAD_CONST) && op.opcode == BINARY_OP && store.opcode == STORE_FAST)
+        {
+            return None;
+        }
+        let source = array + back - 1;
+        let mut suffix = ExceptionOwnerTail::default();
+        for index in source + 1..marker {
+            suffix.instruction(instructions[index], Some(instructions[index - 1]));
+        }
+        let shift = if tail.post_compaction_fusions == 0 {
+            tail.early_removals.checked_sub(suffix.early_removals)?
+        } else {
+            tail.post_compaction_fusions
+                .checked_sub(suffix.post_compaction_fusions)?
+        };
+        if marker - source != shift
+            || jump_targets.iter().any(|label| {
+                positions
+                    .get(label)
+                    .is_some_and(|position| source < *position && *position <= marker)
+            })
+        {
+            return None;
+        }
+        let region = self.uniform_exception_owner(source - 1, source + 1, positions)?;
+        (!self.exception_regions[region].is_scope_fallback
+            && !self.exception_regions[region].preserve_lasti)
             .then_some(region)
     }
 
