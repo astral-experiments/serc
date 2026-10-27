@@ -15,6 +15,23 @@ use serc::{
 };
 
 #[test]
+fn guarded_handler_return_keeps_the_normal_finalizer_reachable_for_borrowing() {
+    let source = r"def check(client):
+    try:
+        client.check()
+    except ValueError as error:
+        if error.code == 401:
+            return False
+    except OSError:
+        report()
+    finally:
+        client.restore()
+    return True
+";
+    assert_matches_cpython(source, "guarded_handler_return.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:

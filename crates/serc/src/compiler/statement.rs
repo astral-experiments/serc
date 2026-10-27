@@ -35215,7 +35215,15 @@ impl<'source> Compiler<'source> {
             && statement.handlers.iter().all(|handler| {
                 handler.as_except_handler().is_some_and(|handler| {
                     handler.type_.is_some()
-                        && !suite_contains_abrupt_control_flow(&handler.body)
+                        && (!suite_contains_abrupt_control_flow(&handler.body)
+                            // A conditional return leaves a live false edge through
+                            // the handler cleanup to the normal finalizer.
+                            || (self.context.python_version == crate::PythonVersion::Py314
+                                && statement.orelse.is_empty()
+                                && suite_has_nonsuspending_linear_fallthrough(&statement.body)
+                                && !suite_contains_abrupt_control_flow(&statement.finalbody)
+                                && matches!(handler.body.last(), Some(Stmt::If(_)))
+                                && suite_has_linear_guarded_return(&handler.body, false)))
                         // A folded false assertion has no normal handler exit.
                         && !matches!(handler.body.last(), Some(Stmt::Assert(assertion))
                             if early_condition_truthiness(&assertion.test) == Some(false))
@@ -36965,13 +36973,13 @@ impl<'source> Compiler<'source> {
                         !expression_contains_inline_branch(type_)
                             && !expression_suspends_current_scope(type_)
                     }) && (suite_has_linear_borrow_fallthrough(&handler.body)
-                        || suite_has_linear_bare_return_recovery(&handler.body))
+                        || suite_has_linear_guarded_return(&handler.body, true))
                 })
             })
             && statement.handlers.iter().any(|handler| {
                 handler
                     .as_except_handler()
-                    .is_some_and(|handler| suite_has_linear_bare_return_recovery(&handler.body))
+                    .is_some_and(|handler| suite_has_linear_guarded_return(&handler.body, true))
             });
         // A guarded recovery retains a live POP_EXCEPT route into normal cleanup.
         // A plain companion containing work or only pass statements does not remove
@@ -49174,9 +49182,9 @@ fn statement_is_runtime_none_return_guard(statement: &Stmt) -> bool {
                 if returned.value.as_deref().is_none_or(|value| matches!(value, Expr::NoneLiteral(_)))))
 }
 
-// A bare-return guard leaves a normal recovery exit. The return's
+// A guarded return leaves a normal recovery exit. The return's
 // separately copied cleanup does not consume that original normal exit.
-fn suite_has_linear_bare_return_recovery(body: &[Stmt]) -> bool {
+fn suite_has_linear_guarded_return(body: &[Stmt], require_bare: bool) -> bool {
     let linear = |body: &[Stmt]| body.is_empty() || suite_has_linear_borrow_fallthrough(body);
     body.iter().enumerate().any(|(index, part)| {
         linear(&body[..index])
@@ -49188,7 +49196,10 @@ fn suite_has_linear_bare_return_recovery(body: &[Stmt]) -> bool {
                 && !expression_suspends_current_scope(&guard.test)
                 && guard.body.split_last().is_some_and(|(last, prefix)| {
                     linear(prefix)
-                        && matches!(last, Stmt::Return(return_) if return_.value.is_none())
+                        && matches!(last, Stmt::Return(return_)
+                            if return_.value.as_deref().is_none_or(|value| !require_bare
+                                && !expression_contains_inline_branch(value)
+                                && !expression_suspends_current_scope(value)))
                 }))
     })
 }
