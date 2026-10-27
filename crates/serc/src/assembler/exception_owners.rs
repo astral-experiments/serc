@@ -9485,19 +9485,32 @@ impl LayoutAssembler {
                     // slot counts do not affect its surviving records or SETUP positions.
                     // The appended marker reuses its pre-compaction physical slot, which
                     // can be an erased NULL SETUP or an earlier manager-entry instruction.
+                    // Value-jump continuation labels leave the late SETUP array intact.
+                    // Use its separate source history for COPY / TO_BOOL truth tests.
+                    let value_guard = instruction.opcode == NOT_TAKEN
+                        && instruction.exception_policy().owner() == NormalizedExceptionOwner::Dynamic
+                        && owner_history_exact && value_jump_setup_history_known
+                        && tail.insertions == 0 && tail.post_compaction_fusions == 0
+                        && instruction_index.checked_sub(3).is_some_and(|start| start >= original_array_start
+                            && matches!(&indexed_instructions[start..instruction_index], [copy, truth, guard]
+                                if copy.opcode == crate::target::opcodes::COPY && copy.value_argument() == Some(1)
+                                    && truth.opcode == crate::target::opcodes::TO_BOOL
+                                    && matches!(guard.opcode, crate::target::opcodes::POP_JUMP_IF_FALSE | crate::target::opcodes::POP_JUMP_IF_TRUE)
+                                    && guard.forward_target().is_some() && copy.location == guard.location));
                     if instruction.opcode == NOT_TAKEN
-                        && late_setup_history_known
+                        && (late_setup_history_known || value_guard)
                         && late_setup_positions.len() == tail.late_removals
                         && instruction.exception_policy().exclusion()
                             == super::ExceptionExclusion::None
-                        && matches!(
-                            instruction.exception_policy().owner(),
-                            NormalizedExceptionOwner::Absent
-                                | NormalizedExceptionOwner::Present
-                                | NormalizedExceptionOwner::OverridePresent
-                                | NormalizedExceptionOwner::DynamicCondition
-                                | NormalizedExceptionOwner::DynamicConditionStrict
-                        )
+                        && (value_guard
+                            || matches!(
+                                instruction.exception_policy().owner(),
+                                NormalizedExceptionOwner::Absent
+                                    | NormalizedExceptionOwner::Present
+                                    | NormalizedExceptionOwner::OverridePresent
+                                    | NormalizedExceptionOwner::DynamicCondition
+                                    | NormalizedExceptionOwner::DynamicConditionStrict
+                            ))
                         && uniform_with_suffix
                             .is_some_and(|start| tail.late_removals > instruction_index - start)
                     {

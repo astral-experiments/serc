@@ -19066,3 +19066,13 @@ fn nested_conditional_arms_donate_implicit_return_locations() {
 ";
     assert_matches_cpython(source, "nested_implicit_returns.py", &LEVELS);
 }
+
+#[test]
+fn short_circuit_value_after_manager_entries_uses_the_prior_handler() {
+    let source = r"def check(manager, value, size):
+    with manager, manager, manager, manager, manager, manager:
+        result = value or [False] * size
+        return result
+";
+    assert_matches_cpython(source, "manager_value_guard.py", &LEVELS);
+}
