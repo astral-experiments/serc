@@ -32989,7 +32989,7 @@ impl<'source> Compiler<'source> {
             std::mem::take(&mut self.control.finally.preserve_next_finally_exit_nop);
         let capture_manager_pop =
             std::mem::take(&mut self.control.finally.capture_next_finally_manager_pop);
-        let erased_try_truth = self.context.python_version == crate::PythonVersion::Py314
+        let erased_try_guard = self.context.python_version == crate::PythonVersion::Py314
             && statement.handlers.is_empty()
             && statement.orelse.is_empty()
             && !statement.body.is_empty()
@@ -32997,9 +32997,15 @@ impl<'source> Compiler<'source> {
                 .body
                 .iter()
                 .all(|part| self.context.is_elided_statement(part))
-            && matches!(statement.finalbody.first(), Some(Stmt::If(branch)) if
-                        matches!(branch.test.as_ref(), Expr::Attribute(_) | Expr::Call(_))
-                        || matches!(branch.test.as_ref(), Expr::UnaryOp(unary) if unary.op == UnaryOp::Not && matches!(unary.operand.as_ref(),Expr::Call(_) | Expr::Attribute(_))));
+            && match statement.finalbody.first() {
+                Some(Stmt::If(branch)) => {
+                    matches!(branch.test.as_ref(), Expr::Attribute(_) | Expr::Call(_))
+                        || matches!(branch.test.as_ref(), Expr::UnaryOp(unary) if unary.op == UnaryOp::Not && matches!(unary.operand.as_ref(), Expr::Call(_) | Expr::Attribute(_)))
+                }
+                Some(Stmt::Expr(expr)) => matches!(expr.value.as_ref(), Expr::Call(call) if
+                    matches!(call.arguments.args.as_ref(), [Expr::If(value)] if matches!(value.test.as_ref(), Expr::Name(_)))),
+                _ => false,
+            };
         let mut captured_manager_pop = None;
         let drop_expression_if_exit_nop = preserve_exit_nop
             && statement.handlers.is_empty()
@@ -37725,7 +37731,7 @@ impl<'source> Compiler<'source> {
                     }
                 }
             } else {
-                let include_simple_normal_finally_not_taken_from_with = erased_try_truth || matches!(
+                let include_simple_normal_finally_not_taken_from_with = erased_try_guard || matches!(
                     statement.finalbody.as_slice(),
                     [Stmt::If(tail)]
                         if tail.elif_else_clauses.is_empty()
