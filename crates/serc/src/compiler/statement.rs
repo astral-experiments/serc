@@ -30237,6 +30237,16 @@ impl<'source> Compiler<'source> {
                 // front-end omitted body or else NOP already donates its location above.
                 self.assembler.set_location(SourceLocation::NONE);
             }
+            let shared_manager_return = self.context.python_version >= crate::PythonVersion::Py314
+                && !statement.is_star
+                && statement.orelse.is_empty()
+                && statement.finalbody.is_empty()
+                && self.control.statements.context.followed_by_literal_return
+                && matches!(normal_exit_suite.last(), Some(Stmt::If(guard))
+                    if guard.elif_else_clauses.is_empty()
+                        && early_condition_truthiness(&guard.test).is_none()
+                        && matches!(guard.body.last(), Some(Stmt::Try(_)))
+                        && with_body_has_terminal_manager_suppression(&guard.body));
             let guarded_recovery_exit = match normal_exit_suite.last() {
                 Some(Stmt::If(guard))
                     if self.context.python_version >= crate::PythonVersion::Py314
@@ -30256,7 +30266,9 @@ impl<'source> Compiler<'source> {
                 }
                 _ => None,
             };
-            if let Some(location) = wildcard_before_try.or(guarded_recovery_exit) {
+            if shared_manager_return {
+                self.assembler.set_location(SourceLocation::NONE);
+            } else if let Some(location) = wildcard_before_try.or(guarded_recovery_exit) {
                 self.assembler.set_location(location);
             }
             let normal_exit = if (match_body_pop_block
@@ -31240,7 +31252,14 @@ impl<'source> Compiler<'source> {
                 self.assembler
                     .mark_retained_nop_borrow_fallthrough_if_unblocked(normal_exit);
             }
-            if guarded_recovery_exit.is_some() {
+            if shared_manager_return {
+                // Suppression reaches the exit after the return has been copied here. Its
+                // POP_BLOCK and replaced jump put the block above the four-slot copy limit.
+                self.assembler.prevent_jump_threading_target(normal_exit);
+                self.assembler.prevent_jump_inlining(normal_exit);
+                self.assembler
+                    .preserve_no_location(normal_exit.instruction());
+            } else if guarded_recovery_exit.is_some() {
                 self.assembler
                     .preserve_redundant_jump_nop_after_threading(normal_exit);
                 self.assembler
