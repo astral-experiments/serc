@@ -12061,12 +12061,6 @@ impl Assembler {
             .allow_unconditional_block_inlining();
     }
 
-    pub(crate) fn make_no_location_copy_interruptible(&mut self, emitted: EmittedJump) {
-        self.emitted_jump_mut(emitted, "making a no-location copy interruptible")
-            .no_location_policy
-            .make_first_copy_interruptible();
-    }
-
     /// Preserves an original JUMP's eval-breaker check if block ordering makes it backward.
     pub(crate) fn mark_jump_as_interruptible(&mut self, emitted: EmittedJump) {
         self.emitted_jump_mut(emitted, "marking an interruptible jump")

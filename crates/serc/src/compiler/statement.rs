@@ -33914,10 +33914,6 @@ impl<'source> Compiler<'source> {
                             self.assembler.allow_last_unconditional_block_inlining();
                         }
                         self.assembler.record_borrow_handler_cleanup(body_end);
-                        if handler_ends_with_nonterminal_with {
-                            self.assembler
-                                .make_no_location_copy_interruptible(handler_exit);
-                        }
                     }
                     let return_is_overridden = self
                         .control

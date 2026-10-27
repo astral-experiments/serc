@@ -242,7 +242,6 @@ struct NoLocationBlockPolicy(u8);
 
 impl NoLocationBlockPolicy {
     const ALLOW_INLINING: u8 = 1 << 0;
-    const FIRST_COPY_INTERRUPTIBLE: u8 = 1 << 1;
     const ARTIFICIAL_EVAL_BREAK: u8 = 1 << 2;
     const COPY_INHERITS_SHARED_PREDECESSOR: u8 = 1 << 3;
     const COPY_SPLIT_RETURN_EXIT: u8 = 1 << 4;
@@ -287,13 +286,6 @@ impl NoLocationPolicy {
             .contains(NoLocationBlockPolicy::ALLOW_INLINING)
     }
 
-    /// Whether a copied forward exit becomes an interruptible backward jump after cold-block
-    /// ordering. The original cleanup edge remains non-interruptible.
-    pub(super) const fn first_copy_is_interruptible_backward(self) -> bool {
-        self.block_policy
-            .contains(NoLocationBlockPolicy::FIRST_COPY_INTERRUPTIBLE)
-    }
-
     /// Whether this eval-break instruction was emitted with CPython's `NO_LOCATION`.
     pub(super) const fn is_artificial_eval_break(self) -> bool {
         self.block_policy
@@ -321,12 +313,6 @@ impl NoLocationPolicy {
     pub(super) fn prevent_block_inlining(&mut self) {
         self.block_policy
             .remove(NoLocationBlockPolicy::ALLOW_INLINING);
-    }
-
-    pub(super) fn make_first_copy_interruptible(&mut self) {
-        debug_assert!(self.allows_block_inlining());
-        self.block_policy
-            .insert(NoLocationBlockPolicy::FIRST_COPY_INTERRUPTIBLE);
     }
 
     pub(super) fn mark_artificial_eval_break(&mut self) {
