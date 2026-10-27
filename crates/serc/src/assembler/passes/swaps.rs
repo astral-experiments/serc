@@ -763,6 +763,18 @@ impl OptimizationPipeline {
                     && last_store.is_none()
                     && !capture_cleanup_swaps.contains(&positions[index])
                 {
+                    // An unprotected exchange on one physical line cannot change a line
+                    // event or the number of compacted slots belonging to a handler.
+                    let line = swap.location.line;
+                    let single_line = self.exception_regions.is_empty()
+                        && line >= 0
+                        && [
+                            swap.location,
+                            first_instruction.location,
+                            last_instruction.location,
+                        ]
+                        .iter()
+                        .all(|loc| loc.line == line && loc.end_line == line);
                     // A complete conditional-fallthrough capture rotation proves both pop
                     // records are identical and its compacted-slot count is known at emission.
                     let rotation = index
@@ -771,7 +783,7 @@ impl OptimizationPipeline {
                         .map(|positions| {
                             std::array::from_fn::<_, 6, _>(|index| *graph.item(positions[index]))
                         });
-                    if !rotation.as_ref().is_some_and(|rotation| {
+                    if !single_line && !rotation.as_ref().is_some_and(|rotation| {
                         matches!(rotation[0], Item::Instruction(marker) if marker.opcode == NOT_TAKEN)
                             && single_capture_cleanup_vacancies(rotation).is_some()
                     }) {
