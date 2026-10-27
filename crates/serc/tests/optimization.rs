@@ -15037,6 +15037,20 @@ fn erased_loop_branch_before_condition_keeps_protected_join() {
 }
 
 #[test]
+fn an_erased_try_else_suffix_keeps_each_conditional_return() {
+    for (test, body) in [
+        ("flag", "value = update(value)"),
+        ("any(value)", "use(value)"),
+        ("any(item for item in value)", "assert flag"),
+    ] {
+        let source = format!(
+            "def choose(flag, value):\n    try:\n        work()\n    except IndexError:\n        pass\n    else:\n        if {test}:\n            {body}\n        assert value\n"
+        );
+        assert_matches_cpython(&source, "terminal_try_else_condition.py", &LEVELS);
+    }
+}
+
+#[test]
 fn erased_try_else_keeps_the_fallthrough_line_after_branch_exit_copies() {
     for source in [
         r"def sample(flag, value):
