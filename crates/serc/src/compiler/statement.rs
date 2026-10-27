@@ -22431,7 +22431,16 @@ impl<'source> Compiler<'source> {
             && self.control.finally.active_normal_finally_bodies == 0
             && self.control.finally.active_copied_finally_bodies == 0
             && self.control.finally.active_finally_end_blocks == 0
-            && self.control.finally.active_overriding_finally_returns == 0
+            && self.control.finally.active_overriding_finally_returns == 0;
+        // An erased else at the loop header's cleanup depth leaves a separate
+        // false edge to that header, regardless of the protected body shape.
+        let optimized_empty_else = (optimized_empty_else
+            || (eligible_else
+                && mode == LoopTailMode::default()
+                && self
+                    .control
+                    .loop_at_current_cleanup_depth()
+                    .is_some_and(|context| context.continue_label == restart)))
             // Outside a direct loop exit, a suspended scope's final chained
             // condition can own a backedge inside its implicit exception wrapper.
             && (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
@@ -22442,15 +22451,6 @@ impl<'source> Compiler<'source> {
                             !expression_contains_chained_comparison(test)
                         })
                     })));
-        // An erased else at the loop header's cleanup depth leaves a separate
-        // false edge to that header, regardless of the protected body shape.
-        let optimized_empty_else = optimized_empty_else
-            || (eligible_else
-                && mode == LoopTailMode::default()
-                && self
-                    .control
-                    .loop_at_current_cleanup_depth()
-                    .is_some_and(|context| context.continue_label == restart));
         if statement.elif_else_clauses.is_empty()
             || original_optimized_empty_else
             || (optimized_empty_else && statement.elif_else_clauses.len() == 1)
