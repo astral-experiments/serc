@@ -26,6 +26,36 @@ thread_local! {
     static VERIFY_COMPLETE_OWNER_REPLAY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Whether the straight-line continuation of a manager fits the small-exit copy limit.
+fn copyable_manager_reraise(items: &[Item]) -> bool {
+    use crate::target::opcodes::RERAISE;
+
+    let Some((Item::Instruction(reraise), prefix)) = items.split_last() else {
+        return false;
+    };
+    if reraise.opcode != RERAISE || reraise.value_argument() != Some(0) {
+        return false;
+    }
+    let mut width = 1;
+    for item in prefix {
+        match item {
+            Item::Label(_) if width == 1 => {}
+            Item::Instruction(op)
+                if op.jump_target().is_none()
+                    && !super::ends_scope(op.opcode)
+                    && op.local_policy.hidden_exception_owner_slots() == 0 =>
+            {
+                width += op.pre_fusion_width();
+                if width > 4 {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
 /// Whether a one-local restore, result consumer and reraise fit CPython's four-slot exit.
 fn copyable_comprehension_reraise(items: &[Item], original: &[Instruction]) -> bool {
     use crate::target::opcodes::{POP_TOP, RERAISE, STORE_FAST, SWAP};
@@ -396,6 +426,7 @@ pub(super) struct ExceptionOwnerProvenance {
     // Authored normal exits and their immediate, fully emitted restore records.
     pub(super) original_comprehension_normal_exits: Vec<(Label, Instruction)>,
     pub(super) original_comprehension_normal_restores: FxHashMap<Label, Vec<Instruction>>,
+    pub(super) exceptional_finally_manager_exits: Vec<(Label, Label)>,
     // Exact NOPs emitted for authored Pass statements, before graph rewrites.
     pub(super) original_pass_nops: Vec<Instruction>,
     // Original simple For target stores, before their tracing NOP is compacted.
@@ -540,6 +571,7 @@ impl ExceptionOwnerProvenance {
         enum Exit<'a> {
             NormalTry(Label),
             Comprehension(&'a [Instruction]),
+            Manager(BasicBlockId),
         }
         let mut entries = self
             .borrow_normal_try_exits
@@ -563,8 +595,27 @@ impl ExceptionOwnerProvenance {
                 }
             }
         }
+        for &(entry, cleanup) in &self.exceptional_finally_manager_exits {
+            if let Some(block) = graph.label_block(entry)
+                && let Some(cleanup) = graph.label_block(cleanup)
+                && copyable_manager_reraise(graph[block].items())
+            {
+                entries
+                    .entry(block)
+                    .or_insert((Exit::Manager(cleanup), false));
+            }
+        }
         if entries.is_empty() {
             return;
+        }
+        if !self.exceptional_finally_manager_exits.is_empty() {
+            for region in regions {
+                if let Some(block) = graph.label_block(region.target)
+                    && matches!(entries.get(&block), Some((Exit::Manager(_), _)))
+                {
+                    entries.remove(&block);
+                }
+            }
         }
         for instruction in graph.iter_items().filter_map(Item::as_instruction) {
             if let Some(block) = instruction
@@ -581,19 +632,21 @@ impl ExceptionOwnerProvenance {
         }
         let handlers: FxHashSet<_> = self.ordinary_try_setups.values().copied().collect();
         let cleanup_handlers: FxHashSet<_> =
-            if self.original_comprehension_normal_restores.is_empty() {
+            if self.original_comprehension_normal_restores.is_empty()
+                && self.exceptional_finally_manager_exits.is_empty()
+            {
                 FxHashSet::default()
             } else {
                 regions.iter().map(|region| region.target).collect()
             };
         for blocks in graph.order().windows(3) {
-            let [previous, block, following] = *blocks else {
+            let [previous_block, block, following] = *blocks else {
                 unreachable!()
             };
             let Some((exit, true)) = entries.get(&block) else {
                 continue;
             };
-            let Some(previous) = graph[previous].last_instruction() else {
+            let Some(previous) = graph[previous_block].last_instruction() else {
                 continue;
             };
             let Some(first) = graph[following]
@@ -624,6 +677,16 @@ impl ExceptionOwnerProvenance {
                         continue;
                     }
                     &handlers
+                }
+                Exit::Manager(cleanup) => {
+                    if *cleanup != previous_block
+                        || previous.value_argument() != Some(1)
+                        || first.opcode != COPY
+                        || first.value_argument() != Some(3)
+                    {
+                        continue;
+                    }
+                    &cleanup_handlers
                 }
                 Exit::Comprehension(restore) => {
                     if previous.value_argument() != Some(0)
