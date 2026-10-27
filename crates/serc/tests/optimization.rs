@@ -8564,6 +8564,21 @@ fn a_finalizer_guard_keeps_the_following_local_load_owned() {
 }
 
 #[test]
+fn erased_assertion_after_nested_condition_preserves_the_loop_backedge() {
+    let source = r"def validate(rows, enabled, check):
+    for row in rows:
+        if enabled:
+            process(row)
+        else:
+            if check:
+                if row.ready:
+                    row = normalize(row)
+            assert row
+";
+    assert_matches_cpython(source, "conditional_before_erased_assert.py", &LEVELS);
+}
+
+#[test]
 fn erased_loop_else_guards_keep_the_false_backedge() {
     let source = r"async def dispatch(events, manager):
     async with manager:
