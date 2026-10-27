@@ -31145,7 +31145,9 @@ impl<'source> Compiler<'source> {
                         || coroutine_asserted_else_exit
                         || ordinary_asserted_else_exit)
                 {
-                    if pass_only_handlers {
+                    // A bare handler has no failed type check. Its unreachable RERAISE
+                    // block remains between this located jump NOP and the continuation.
+                    if pass_only_handlers && !has_bare_handler {
                         self.assembler
                             .mark_retained_nop_borrow_fallthrough(normal_exit);
                     } else {

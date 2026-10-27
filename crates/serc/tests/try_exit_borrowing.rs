@@ -107,3 +107,13 @@ def in_manager(manager, value, stop):
 ";
     common::assert_matches_cpython_marshal(source, "borrowed_try_exits.py");
 }
+
+#[test]
+fn a_located_try_else_exit_keeps_the_bare_handler_boundary() {
+    for handler in ["except:", "except Error:"] {
+        let source = format!(
+            "def f(value, flag):\n    try:\n        work(value)\n    {handler}\n        pass\n    else:\n        if flag:\n            return value\n    consume(value)\n    return value\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "bare_handler_boundary.py");
+    }
+}
