@@ -607,6 +607,9 @@ impl FreshSingletonCertificate {
             [] => {}
             [unpack] if unpack.opcode == crate::target::opcodes::UNPACK_SEQUENCE => {}
             [copy] if copied_subject(copy) => {}
+            [unpack, copy]
+                if unpack.opcode == crate::target::opcodes::UNPACK_SEQUENCE
+                    && copied_subject(copy) => {}
             [subject, copy]
                 if copied_subject(copy)
                     && (matches!(
@@ -631,26 +634,7 @@ impl FreshSingletonCertificate {
             .regions
             .iter()
             .copied()
-            .filter(|region| {
-                !region.is_scope_fallback
-                    && region.depth > 0
-                    && view.regions.iter().any(|original| {
-                        if !view
-                            .provenance
-                            .synchronous_with_setups
-                            .contains(&original.start)
-                        {
-                            return false;
-                        }
-                        // Source exclusions retain the original setup range in priority.
-                        // Match that origin and every owner field; only the split's
-                        // physical endpoints may differ from the registered manager.
-                        let mut same_origin = *region;
-                        same_origin.start = original.start;
-                        same_origin.end = original.end;
-                        same_manager_region(&same_origin, original)
-                    })
-            })
+            .filter(|region| view.is_synchronous_manager_region(region))
             .collect::<Vec<_>>();
         let (owner, removed, handler_target) = if let Some((owner, removed)) =
             view.uniform_owned_interval(start, condition, false, Some(&manager_regions), false)
@@ -1182,6 +1166,25 @@ impl View<'_> {
         self.uniform_owned_interval(start, condition, observed_local_fusion, None, false)
     }
 
+    /// Recognizes an original synchronous manager or a split of that same range.
+    fn is_synchronous_manager_region(&self, region: &ExceptionRegion) -> bool {
+        !region.is_scope_fallback
+            && region.depth > 0
+            && self.regions.iter().any(|original| {
+                self.provenance
+                    .synchronous_with_setups
+                    .contains(&original.start)
+                    && same_manager_region(
+                        &ExceptionRegion {
+                            start: original.start,
+                            end: original.end,
+                            ..*region
+                        },
+                        original,
+                    )
+            })
+    }
+
     /// Proves a literal singleton array under one source-authored handler target.
     /// No owner is copied: the marker is appended beyond every original live cell.
     fn fresh_handler_singleton_regions(
@@ -1284,10 +1287,19 @@ impl View<'_> {
                     .contains(&region.target)
         };
         // In a named handler, the cleanup owns the pattern even when an outer try
-        // also covers it. Only use an ordinary try to identify a pattern outside one.
+        // also covers it. Otherwise the pattern may belong to the enclosing try.
         let in_named_handler = regions.iter().any(is_named_cleanup);
+        // A generator's fallback also covers the manager, but neither populates
+        // the fresh slot at the end of this unchanged pattern array.
+        let in_fallback = regions.len() == 2
+            && regions.iter().any(|region| {
+                region.is_scope_fallback && region.depth == 0 && region.preserve_lasti
+            });
         let mut handlers = regions.iter().filter(|region| {
             is_named_cleanup(region)
+                || (pattern_fallthrough
+                    && in_fallback
+                    && self.is_synchronous_manager_region(region))
                 || (!in_named_handler
                     && pattern_fallthrough
                     && !region.is_scope_fallback
@@ -1296,6 +1308,7 @@ impl View<'_> {
                         .provenance
                         .ordinary_try_setups
                         .values()
+                        .chain(self.provenance.guarded_finally_setups.values())
                         .any(|target| *target == region.target))
         });
         let target = handlers.next()?.target;

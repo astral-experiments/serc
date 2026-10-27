@@ -25948,6 +25948,36 @@ fn erased_assertions_keep_the_finally_call_argument_guard_protected() {
 }
 
 #[test]
+fn unpacked_boolean_patterns_leave_their_branch_markers_unprotected() {
+    let source = r#"async def visit(value, guard, enabled):
+    with guard:
+        if enabled:
+            match value:
+                case Entry(ready=True) | {"ready": True} | [False | None, _]:
+                    observe(value)
+                case _:
+                    pass
+    return value
+
+
+def cleanup(value, enabled):
+    try:
+        if enabled:
+            match value:
+                case Entry(ready=True) | Entry(done=False):
+                    observe(value)
+    finally:
+        finish()
+"#;
+    assert_matches_cpython_versions(
+        source,
+        "unpacked_boolean_patterns.py",
+        &LEVELS,
+        &VERSIONS.map(|(version, _, _)| version),
+    );
+}
+
+#[test]
 fn copied_boolean_pattern_subjects_keep_their_fresh_branch_markers() {
     let source = r"async def choose(value):
     match value:
