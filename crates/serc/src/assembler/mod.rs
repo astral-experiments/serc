@@ -1899,6 +1899,11 @@ impl Assembler {
 
     /// Whether the current original control-flow block has no emitted instructions.
     pub(crate) fn at_empty_borrow_block(&self) -> bool {
+        self.at_empty_borrow_block_without_nops(None)
+    }
+
+    /// Whether only redundant NOPs on a folded condition's own line precede it.
+    pub(crate) fn at_empty_borrow_block_without_nops(&self, nop_line: Option<i32>) -> bool {
         for item in self.linear_items().iter().rev() {
             match item {
                 Item::Label(label) => {
@@ -1910,6 +1915,8 @@ impl Assembler {
                     {
                         return self.instruction_count() > 0;
                     }
+                }
+                Item::Instruction(op) if op.opcode == NOP && Some(op.location.line) == nop_line => {
                 }
                 Item::Instruction(instruction) => {
                     return instruction.opcode == NOT_TAKEN
