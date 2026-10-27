@@ -2378,7 +2378,7 @@ fn returning_else_keeps_live_cleanup_entry() {
 
 #[test]
 fn finalizer_copies_named_handler_cleanup_onto_elif_exits() {
-    let source = r#"def sample(primary, secondary, enabled, value):
+    let source = r"def sample(primary, secondary, enabled, value):
     try:
         start()
     finally:
@@ -2389,7 +2389,7 @@ fn finalizer_copies_named_handler_cleanup_onto_elif_exits() {
                 first = error
             elif secondary:
                 other = error
-"#;
+";
     assert_matches_cpython(source, "finalizer_handler_elif.py", &LEVELS);
 }
 
