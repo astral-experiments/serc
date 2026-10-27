@@ -25711,6 +25711,11 @@ impl<'source> Compiler<'source> {
         self.assembler
             .set_location(self.source_location(statement.iter.range()));
         self.emit(GET_ITER, 0, self.iterator_extra_slots())?;
+        let short_body = self
+            .legacy_short_label_prefix
+            .for_starts
+            .contains(&statement.range.start())
+            .then(|| self.assembler.item_count());
         self.assembler.mark(start);
         self.emit_jump_forward(FOR_ITER, cleanup, 1)?;
         // FOR_ITER ends CPython's original iterator block. Its fallthrough array
@@ -25726,7 +25731,8 @@ impl<'source> Compiler<'source> {
         self.compile_store_target(&statement.target)?;
         self.consume_unreferenced_native_for_body(statement.range);
         self.bind_native_source_label(NativeRole::ForStart(statement.range), start);
-        self.assembler.record_legacy_for_header(start);
+        self.assembler
+            .record_legacy_for_header(start, short_body.is_some());
         self.bind_native_source_label(NativeRole::ForCleanup(statement.range), cleanup);
         self.bind_native_source_label(NativeRole::ForEnd(statement.range), end);
         self.assembler.record_for_target_owner_prefix(body);
@@ -25880,6 +25886,10 @@ impl<'source> Compiler<'source> {
 
         self.assembler
             .record_exception_owner_block_boundary(cleanup);
+        if let Some(since) = short_body {
+            self.assembler
+                .record_legacy_short_loop_tests(since, self.source_location(statement.range));
+        }
         self.assembler.mark(cleanup);
         self.set_depth(base_depth + self.iterator_slots() + 1);
         self.assembler

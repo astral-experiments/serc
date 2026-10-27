@@ -1725,19 +1725,19 @@ impl LayoutAssembler {
                 instruction
                     .legacy_initial_jump_width()
                     .expect("all native jumps are certified")
-            } else if self
-                .exception_owner_provenance
-                .legacy_original_jump_operands_fit
-                && (crate::target::is_conditional_jump(instruction.opcode)
-                    || instruction.opcode == crate::target::opcodes::FOR_ITER
-                    || (instruction.opcode == crate::target::opcodes::JUMP_FORWARD
-                        && instruction.location.line >= 0)
-                    || (instruction.opcode == crate::target::opcodes::JUMP_BACKWARD
-                        && instruction.jump_target().is_some_and(|target| {
-                            self.exception_owner_provenance
-                                .legacy_for_headers
-                                .contains(&target)
-                        })))
+            } else if (crate::target::is_conditional_jump(instruction.opcode)
+                || instruction.opcode == crate::target::opcodes::FOR_ITER)
+                && (origins.legacy_original_jump_operands_fit
+                    || origins
+                        .legacy_short_loop_tests
+                        .contains(&instruction.location))
+                || (origins.legacy_original_jump_operands_fit
+                    && instruction.opcode == crate::target::opcodes::JUMP_FORWARD
+                    && instruction.location.line >= 0)
+                || (instruction.opcode == crate::target::opcodes::JUMP_BACKWARD
+                    && instruction
+                        .jump_target()
+                        .is_some_and(|target| origins.legacy_for_headers.contains(&target)))
             {
                 // Threading and conditional inversion preserve the original operand.
                 // A forward cold bridge has no line donor. A normalized loop

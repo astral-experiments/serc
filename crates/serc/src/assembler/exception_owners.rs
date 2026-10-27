@@ -269,6 +269,8 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) legacy_original_jump_operands_fit: bool,
     // FOR_ITER starts these nonempty labeled blocks before jump normalization.
     pub(super) legacy_for_headers: FxHashSet<Label>,
+    // Original located truth tests and FOR_ITERs in a source-bounded loop.
+    pub(super) legacy_short_loop_tests: FxHashSet<SourceLocation>,
     // Authored and normalized backedges to a nonempty 3.12 comprehension header.
     pub(super) legacy_comprehension_backedges: Vec<(Label, Instruction)>,
     // Authored SEND, completion entry, and END_SEND before any cleanup or copying.

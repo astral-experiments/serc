@@ -25513,6 +25513,34 @@ fn python312_labeled_handler_successors_preserve_loop_jump_widths() {
 }
 
 #[test]
+fn python312_bounded_for_tests_preserve_backedge_widths() {
+    for guards_before in [false, true] {
+        for padding in [123, 124, 125] {
+            let guards = "    if active:\n        value = ready\n".repeat(258);
+            let mut source =
+                String::from("def run(items, active, ready, state):\n    state.value: int = 0\n");
+            source.push_str(&"    value = active\n".repeat(141));
+            if guards_before {
+                source.push_str(&guards);
+            }
+            source.push_str("    for item in items:\n");
+            source.push_str(&"        value = active\n".repeat(padding));
+            source.push_str("        if active:\n            check(item)\n");
+            if !guards_before {
+                source.push_str(&guards);
+            }
+            source.push_str("    return value\n");
+            assert_matches_cpython_versions(
+                &source,
+                "bounded_for_widths.py",
+                &LEVELS,
+                &[PythonVersion::Py312],
+            );
+        }
+    }
+}
+
+#[test]
 fn python312_runtime_guards_preserve_loop_jump_widths() {
     for padding in [119, 120, 121] {
         let mut source = String::from("def run(items, ready, state):\n    state.value: int = 0\n");

@@ -3416,7 +3416,7 @@ impl Compiler<'_> {
             use super::legacy_native_labels::NativeRole;
             if let NativeRole::AwaitExit(range) | NativeRole::WithAwaitExit(range, _) = exit_role
                 && self.context.python_version == PythonVersion::Py312
-                && range.end() <= self.legacy_short_label_prefix
+                && range.end() <= self.legacy_short_label_prefix.suspension_end
             {
                 self.assembler.record_legacy_short_await_labels(send, end);
             }

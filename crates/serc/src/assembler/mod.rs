@@ -1091,11 +1091,32 @@ impl Assembler {
             .legacy_original_jump_operands_fit = true;
     }
 
+    /// Saves original test positions through later threading and inversion of the opcode.
+    pub(crate) fn record_legacy_short_loop_tests(&mut self, since: usize, span: SourceLocation) {
+        let UnoptimizedCode::Linear(items) = &self.code else {
+            unreachable!("loop bodies are still emitted linearly")
+        };
+        self.exception_owner_provenance
+            .legacy_short_loop_tests
+            .extend(items[since..].iter().filter_map(|item| {
+                let Item::Instruction(instruction) = item else {
+                    return None;
+                };
+                let loc = instruction.location;
+                ((instruction.opcode == crate::target::opcodes::FOR_ITER
+                    || crate::target::is_conditional_jump(instruction.opcode))
+                    && (span.line, span.column) <= (loc.line, loc.column)
+                    && (loc.end_line, loc.end_column) <= (span.end_line, span.end_column))
+                    .then_some(loc)
+            }));
+    }
+
     /// Records a nonempty source header for original and normalized 3.12 backedges.
-    pub(crate) fn record_legacy_for_header(&mut self, start: Label) {
-        if self
-            .exception_owner_provenance
-            .legacy_original_jump_operands_fit
+    pub(crate) fn record_legacy_for_header(&mut self, start: Label, prefix_fits: bool) {
+        if prefix_fits
+            || self
+                .exception_owner_provenance
+                .legacy_original_jump_operands_fit
         {
             self.exception_owner_provenance
                 .legacy_for_headers

@@ -24,14 +24,21 @@ use ruff_python_ast::{
 };
 use ruff_text_size::{Ranged, TextSize};
 
-/// Certifies one-byte labels and returns the bounded source prefix when the whole unit exceeds it.
-pub(super) fn record(assembler: &mut crate::assembler::Assembler, body: &[Stmt]) -> TextSize {
-    let (counter, prefix) = function_budget(body);
-    if let Some(counter) = counter {
+/// Source labels that remain bounded when later code exceeds the one-byte budget.
+#[derive(Debug, Default)]
+pub(super) struct SourcePrefix {
+    pub(super) suspension_end: TextSize,
+    pub(super) for_starts: Vec<TextSize>,
+}
+
+/// Certifies one-byte labels for the whole unit or individual source targets.
+pub(super) fn record(assembler: &mut crate::assembler::Assembler, body: &[Stmt]) -> SourcePrefix {
+    let (counter, complete) = function_budget(body);
+    if complete {
         let counts = counter.counts;
         if counts.max_label() < 256 {
             assembler.certify_legacy_uniform_jump_seed();
-            return TextSize::default();
+            return SourcePrefix::default();
         }
         if let Ok(max_label) = u8::try_from(counts.max_original_label()) {
             assembler.set_legacy_exit_copy_budget(u8::MAX - max_label);
@@ -40,11 +47,11 @@ pub(super) fn record(assembler: &mut crate::assembler::Assembler, body: &[Stmt])
             assembler.certify_legacy_source_jump_labels();
             if counts.labels.saturating_add(counter.foldable_tests) < 256 {
                 assembler.certify_legacy_original_jump_operands();
+                return SourcePrefix::default();
             }
-            return TextSize::default();
         }
     }
-    prefix
+    counter.prefix
 }
 
 #[cfg(test)]
@@ -112,6 +119,8 @@ enum Frame<'ast> {
 struct Counter<'ast> {
     counts: Counts,
     foldable_tests: u32,
+    prefix: SourcePrefix,
+    in_finalbody: bool,
     frames: Vec<Frame<'ast>>,
     has_await: bool,
     in_annotation: bool,
@@ -119,27 +128,27 @@ struct Counter<'ast> {
 
 #[cfg(test)]
 fn function_counts(body: &[Stmt]) -> Option<Counts> {
-    function_budget(body).0.map(|counter| counter.counts)
+    let (counter, complete) = function_budget(body);
+    complete.then_some(counter.counts)
 }
 
 /// Retains complete statements whose source labels fit even if a later statement
 /// exceeds the bound. A statement includes any copies emitted by unwinding its body.
-fn function_budget(body: &[Stmt]) -> (Option<Counter<'_>>, TextSize) {
+fn function_budget(body: &[Stmt]) -> (Counter<'_>, bool) {
     let mut counter = Counter::default();
     // Function start, optional StopIteration handler, its RETURN/RERAISE, and
     // the implicit footer. This also overcounts modules: their prologue adds no
     // labels or jumps, and their footer adds only one scope exit.
     counter.counts.add(2, 0, 3);
-    let mut prefix = TextSize::default();
     for statement in body {
         if counter.counts.labels >= 256 || counter.statement(statement).is_none() {
-            return (None, prefix);
+            return (counter, false);
         }
         if counter.counts.labels < 256 {
-            prefix = statement.range().end();
+            counter.prefix.suspension_end = statement.range().end();
         }
     }
-    (Some(counter), prefix)
+    (counter, true)
 }
 
 fn count(length: usize) -> u32 {
@@ -244,8 +253,19 @@ impl<'ast> Counter<'ast> {
                 self.expression(&statement.iter)?;
                 self.expression(&statement.target)?;
                 self.frames.push(Frame::Loop);
+                let foldable_tests = self.foldable_tests;
                 self.suite(&statement.body)?;
                 self.frames.pop();
+                // Threading can retain a label from within the loop instead of
+                // its FOR_ITER label. Without a folded test, empty-block repair
+                // cannot assign any of these jumps a fresh, later label.
+                if !statement.is_async
+                    && !self.in_finalbody
+                    && self.counts.labels < 256
+                    && self.foldable_tests == foldable_tests
+                {
+                    self.prefix.for_starts.push(statement.range.start());
+                }
                 self.suite(&statement.orelse)?;
             }
             Stmt::With(statement) => {
@@ -289,10 +309,10 @@ impl<'ast> Counter<'ast> {
                         self.try_except(statement)?;
                     }
                     self.frames.pop();
-                    self.suite(&statement.finalbody)?;
+                    self.finalbody(&statement.finalbody)?;
                     // FINALLY_END only pops stack values on unwind, so it adds
                     // no projected frame or label/jump/exit budget.
-                    self.suite(&statement.finalbody)?;
+                    self.finalbody(&statement.finalbody)?;
                 }
             }
             Stmt::Match(statement) => {
@@ -371,6 +391,14 @@ impl<'ast> Counter<'ast> {
         Some(())
     }
 
+    /// A copied loop can receive different labels on each visit to its finalizer.
+    fn finalbody(&mut self, body: &'ast [Stmt]) -> Option<()> {
+        let previous = std::mem::replace(&mut self.in_finalbody, true);
+        let result = self.suite(body);
+        self.in_finalbody = previous;
+        result
+    }
+
     /// Mirrors native pop/cleanup/recurse/restore, including unreachable copies.
     fn unwind(&mut self, stop_at_loop: bool) -> Option<()> {
         if self.counts.labels >= 256 {
@@ -390,7 +418,8 @@ impl<'ast> Counter<'ast> {
                 // Its own frame is already removed. A return in the copied suite
                 // may unwind outer frames, after which this original unwind must
                 // still visit those outer frames again, just as native codegen does.
-                self.suite(body).and_then(|()| self.unwind(stop_at_loop))
+                self.finalbody(body)
+                    .and_then(|()| self.unwind(stop_at_loop))
             }
             Frame::ExceptStarBarrier => None,
         };
@@ -719,8 +748,26 @@ mod tests {
         let parsed = parse_module(
             "if flag: pass\nif (value := flag): pass\nif __debug__: pass\nif True: pass\nvalue = False and flag\n",
         ).unwrap();
-        let counter = super::function_budget(parsed.suite()).0.unwrap();
+        let counter = super::function_budget(parsed.suite()).0;
         assert_eq!(counter.foldable_tests, 3);
+    }
+
+    #[test]
+    fn a_partial_loop_budget_excludes_folded_tests_and_finalizer_copies() {
+        let source = format!(
+            "if flag:\n    for first in items:\n        if flag: visit(first)\n    for second in items:\n        if __debug__: visit(second)\n    try: work()\n    finally:\n        for third in items: visit(third)\n{}",
+            "    if flag: visit(flag)\n".repeat(256)
+        );
+        let parsed = parse_module(&source).unwrap();
+        let Stmt::If(branch) = &parsed.suite()[0] else {
+            panic!("expected a conditional");
+        };
+        let Stmt::For(first) = &branch.body[0] else {
+            panic!("expected a loop");
+        };
+        let (counter, complete) = super::function_budget(parsed.suite());
+        assert!(!complete);
+        assert_eq!(counter.prefix.for_starts, [first.range.start()]);
     }
 
     fn counts(source: &str) -> Option<Counts> {
