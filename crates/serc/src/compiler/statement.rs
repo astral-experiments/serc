@@ -10405,10 +10405,20 @@ impl<'source> Compiler<'source> {
                                 self.assembler.mark_last_as_converted_pop_block();
                             }
                         }
-                        if (captures_async_manager_handler_return
+                        let captures_interleaved_handler_return = self.context.python_version
+                            == crate::PythonVersion::Py314
+                            && preserve_tos
+                            && !return_is_overridden
+                            && handler_count == 2
+                            && handler_index == 1
+                            && name.is_some()
+                            && matches!(return_finally_contexts.as_slice(), [outer, inner]
+                                if outer.handler_depth == 1 && inner.handler_depth == 2);
+                        if (((captures_async_manager_handler_return
                             || captures_inner_try_handler_return)
+                            && handler_index == 0)
+                            || captures_interleaved_handler_return)
                             && !preserve_named_handler_pop_slots
-                            && handler_index == 0
                             && next_finally == 1
                             && next_with == self.control.withs.active_with_exits.len()
                             && next_loop == 0
@@ -13162,7 +13172,7 @@ impl<'source> Compiler<'source> {
                     let saved_named_handler_none_pop = saved_named_handler_return_start
                         .filter(|_| {
                             context_index == 0
-                                && next_handler == 0
+                                && next_handler == finally_context.handler_depth
                                 && next_with == self.control.withs.active_with_exits.len()
                                 && next_loop == 0
                         })
