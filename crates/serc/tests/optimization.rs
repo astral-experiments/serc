@@ -21568,6 +21568,14 @@ fn erased_module_comprehension_cells_precede_synthetic_annotations() {
 }
 
 #[test]
+fn nested_class_captures_the_enclosing_conditional_annotation_cell() {
+    let body = "class Outer:\n    class Inner:\n        if enabled:\n            value: Kind\n";
+    for future in ["", "from __future__ import annotations\n"] {
+        assert_matches_cpython(&format!("{future}{body}"), "nested_annotation.py", &LEVELS);
+    }
+}
+
+#[test]
 fn debug_annotations_preserve_postponed_source_spelling() {
     let source =
         "value: __debug__ = 1\ndef function(arg: __debug__) -> tuple[__debug__]:\n    return arg\n";

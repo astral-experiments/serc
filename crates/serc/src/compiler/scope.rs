@@ -1743,6 +1743,14 @@ impl ClassPlan {
             .filter(|name| is_nonlocal(name) || (!is_global(name) && !is_bound(name)))
             .collect::<BTreeSet<_>>();
         required.extend(locals.nonlocals.iter().cloned());
+        // A conditional annotation implicitly uses this name in the class body.
+        // A nested class can both create its own cell and capture the enclosing one.
+        if has_conditional_annotations
+            && !is_global("__conditional_annotations__")
+            && !is_bound("__conditional_annotations__")
+        {
+            required.insert("__conditional_annotations__".to_string());
+        }
         let body_requires_classdict = required.contains("__classdict__");
         let body_requires_conditional_annotations =
             required.contains("__conditional_annotations__");
