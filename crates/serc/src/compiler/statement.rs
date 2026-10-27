@@ -5250,7 +5250,15 @@ impl<'source> Compiler<'source> {
                 }
             }
             if !emitted_fallthrough {
-                if let Some(location) = self.assembler.last_instruction_location() {
+                if let Some(last @ Stmt::Assert(assertion)) = body.last()
+                    && !self.context.is_elided_statement(last)
+                    && condition_has_only_runtime_tests(&assertion.test)
+                    && let Some(range) = suite_assert_success_fallthrough_range(body)
+                {
+                    // The successful condition edge locates the copied return. The
+                    // last emitted instruction belongs to the assertion's raising edge.
+                    self.assembler.set_location(self.source_location(range));
+                } else if let Some(location) = self.assembler.last_instruction_location() {
                     self.assembler.set_location(location);
                 }
                 self.emit_deferred_implicit_return()?;

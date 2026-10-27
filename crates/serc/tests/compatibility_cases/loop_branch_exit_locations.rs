@@ -25,6 +25,23 @@ fn matches_cpython_shared_assertion_handler_cleanup_locations() {
 }
 
 #[test]
+fn folded_terminal_assertion_returns_inherit_the_success_operand() {
+    for scope in ["def", "async def"] {
+        for condition in [
+            "not items",
+            "not not items",
+            "flag and items",
+            "not (flag or items)",
+        ] {
+            let source = format!(
+                "{scope} values(items, flag):\n    for value in items:\n        yield value\n    if __debug__:\n        assert {condition}, 'pending'\n"
+            );
+            common::assert_matches_cpython_marshal(&source, "folded_assertion_return.py");
+        }
+    }
+}
+
+#[test]
 fn matches_cpython_folded_assertion_handler_cleanup_locations() {
     for function in ["def", "async def"] {
         for handler in ["Error", "Error as error"] {
