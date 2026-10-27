@@ -6821,11 +6821,16 @@ impl<'source> Compiler<'source> {
                         && matches!(expression.value.as_ref(), Expr::BoolOp(_))
                         && (self.control.finally.active_normal_finally_bodies > 0
                             || self.control.finally.active_copied_finally_bodies > 0
-                            || self.control.finally.active_finally_end_blocks > 0)
+                            || self.control.finally.active_finally_end_blocks > 0
+                            || self.control.in_exception_handler()
+                            || !self
+                                .control
+                                .exceptions
+                                .active_exception_region_exclusions
+                                .is_empty())
                     {
-                        // A finalizer's discard joins the return/reraise cleanup.
-                        // Its private exit copies inherit each Boolean value's donor;
-                        // only the original shared POP_TOP remains unlocated.
+                        // Copies of a protected discard inherit their own Boolean
+                        // operand's line. The original shared POP_TOP stays unlocated.
                         self.assembler
                             .make_last_no_location_copy_inherit_shared_predecessor();
                     }
