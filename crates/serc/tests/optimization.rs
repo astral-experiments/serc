@@ -2952,6 +2952,24 @@ fn manager_exit_copies_local_raise_with_constant_cause() {
 }
 
 #[test]
+fn consecutive_handler_returns_keep_the_nearest_exception_cleanup() {
+    let source = r"def scan(items):
+    for item in items:
+        try:
+            first(item)
+        except LookupError as error:
+            try:
+                second(error)
+            except ValueError:
+                try:
+                    third(item)
+                except TypeError:
+                    return False
+";
+    assert_matches_cpython(source, "consecutive_handler_return.py", &LEVELS);
+}
+
+#[test]
 fn conditional_assignment_copies_protected_raise() {
     let source = "def sample(ready, fallback):\n    error = make_error() if ready else fallback\n    try:\n        raise error\n    except Problem as caught:\n        report(caught)\n";
     assert_matches_cpython(source, "assigned_protected_raise.py", &LEVELS);

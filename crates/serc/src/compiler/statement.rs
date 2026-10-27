@@ -32216,20 +32216,25 @@ impl<'source> Compiler<'source> {
                 // Popping an unnamed handler exposes the immediately enclosing handler.
                 // The intervening scope stack, not the handler's source statement shape,
                 // determines the owner of that first POP_EXCEPT.
-                let direct_outer_handler = matches!(
-                    self.control.exceptions.active_exception_handlers.as_slice(),
-                    [outer]
-                        if outer.try_body_depth == self.control.exceptions.active_try_marker_slots.len()
+                let direct_outer_handler = self
+                    .control
+                    .exceptions
+                    .active_exception_handlers
+                    .last()
+                    .is_some_and(|outer| {
+                        outer.try_body_depth
+                            == self.control.exceptions.active_try_marker_slots.len()
                             && outer.with_depth == self.control.withs.active_with_exits.len()
                             && outer.loop_depth == self.control.loops.contexts.len()
-                ) && (self.control.finally.active_finally_try_bodies == 0
-                    // An older finalizer does not separate these unnamed handlers.
-                    || (self.control.exceptions.active_exception_handlers[0].name.is_none()
-                        && self.control.finally.active_copied_finally_bodies == 0
-                        && self.control.finally.active_loop_finally_contexts.len()
-                            == self.control.finally.active_finally_try_bodies
-                        && self.control.finally.active_loop_finally_contexts.iter()
-                            .all(|context| context.handler_depth == 0)))
+                            && (self.control.finally.active_finally_try_bodies == 0
+                                // A finalizer entered before both handlers does not separate them.
+                                || (outer.name.is_none()
+                                    && self.control.finally.active_copied_finally_bodies == 0
+                                    && self.control.finally.active_loop_finally_contexts.len()
+                                        == self.control.finally.active_finally_try_bodies
+                                    && self.control.finally.active_loop_finally_contexts.iter()
+                                        .all(|context| context.handler_depth == 0)))
+                    })
                     && self.control.finally.active_normal_finally_bodies == 0
                     && self.control.finally.active_finally_end_blocks == 0
                     && self
@@ -32238,52 +32243,6 @@ impl<'source> Compiler<'source> {
                         .active_pass_finally_locations
                         .is_empty()
                     && self.control.finally.active_overriding_finally_returns == 0;
-                // An unnamed return nested directly inside two named handlers exposes
-                // the nearer handler's name cleanup. Saved depths exclude another scope
-                // between these collectors; only the innermost POP_EXCEPT needs ownership.
-                let boolean_handler_return = self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR)
-                    == 0
-                    && (self.control.loops.contexts.is_empty()
-                        || matches!(self.control.loops.contexts.as_slice(), [iterator]
-                            if iterator.iterator_cleanup == IteratorCleanup::Sync
-                                && iterator.with_depth == 0
-                                && iterator.finally_end_depth == 0
-                                && iterator.exception_region_depth == 0))
-                    && matches!(handler.body.split_last(), Some((Stmt::Return(statement), leading))
-                    if matches!(statement.value.as_deref(), Some(Expr::BooleanLiteral(_)))
-                        && leading.iter().all(|statement| {
-                            matches!(statement, Stmt::Expr(expression)
-                                if matches!(expression.value.as_ref(), Expr::Call(_))
-                                    && !expression_contains_inline_branch(&expression.value)
-                                    && !expression_suspends_current_scope(&expression.value))
-                        }));
-                let returns_through_two_named_handlers =
-                    ((self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
-                        && self.control.loops.contexts.is_empty()
-                        && matches!(handler.body.as_slice(), [Stmt::Return(statement)]
-                            if matches!(statement.value.as_deref(), Some(Expr::Tuple(_)))))
-                        || boolean_handler_return)
-                        && handler_name.is_none()
-                        && self.control.exceptions.active_exception_group_handlers == 0
-                        && self.control.exceptions.active_try_marker_slots.is_empty()
-                        && self.control.withs.active_with_exits.is_empty()
-                        && self.control.finally.is_inactive_for_return_unwind()
-                        && matches!(
-                            self.control.exceptions.active_exception_handlers.as_slice(),
-                            [outer, middle]
-                                if outer.name.is_some()
-                                    && middle.name.is_some()
-                                    && outer.try_body_depth == 0
-                                    && middle.try_body_depth == 0
-                                    && outer.exception_region_depth == 0
-                                    && middle.exception_region_depth == 1
-                                    && outer.with_depth == 0
-                                    && middle.with_depth == 0
-                                    && outer.loop_depth == self.control.loops.contexts.len()
-                                    && middle.loop_depth == outer.loop_depth
-                                    && outer.finally_end_depth == 0
-                                    && middle.finally_end_depth == 0
-                        );
                 let context = ExceptionHandlerContext {
                     name: handler_name,
                     first: handler_index == 0,
@@ -32302,7 +32261,6 @@ impl<'source> Compiler<'source> {
                     ownerless_optimized_boolean_generator_test:
                         handler_ownerless_optimized_boolean_generator_test(&handler.body),
                     protect_outer_return_pop: nested_handler_tail_if_with_terminal_handlers
-                        || returns_through_two_named_handlers
                         || (handler_name.is_none() && direct_outer_handler)
                         || (handler_name.is_none()
                             && (suite_terminates(&statement.body)
