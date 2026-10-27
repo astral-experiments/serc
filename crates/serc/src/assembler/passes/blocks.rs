@@ -6778,7 +6778,9 @@ impl OptimizationPipeline {
                     == 1
                 && graph[source].last_instruction().is_some_and(|jump| {
                     (retain_guard_nop || !jump.no_location_policy.preserves_location())
-                        && jump.exception_policy() == ExceptionPolicy::default()
+                        && (jump.exception_policy() == ExceptionPolicy::default()
+                            || (guarded_return_join
+                                && jump.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS))
                 }) {
                 let mut incoming = jump_sources[source.index()]
                     .iter()
