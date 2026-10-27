@@ -40241,13 +40241,15 @@ impl<'source> Compiler<'source> {
             {
                 // CPython drops a converted `POP_BLOCK` marker fed by multiple normal
                 // fallthroughs. A sole predecessor supplies the marker's visible location.
-                body_noop = Some(if self.context.python_version == crate::PythonVersion::Py312 {
-                    // Reachability can charge this edge twice after an assertion
-                    // disappears. Let the CFG decide whether its line transfers.
-                    WithBodyExitNoop::ConvertedPopBlock
-                } else {
-                    WithBodyExitNoop::Located(condition_fallthrough_range(&statement.test))
-                });
+                body_noop = Some(
+                    if self.context.python_version == crate::PythonVersion::Py312 {
+                        // Reachability can charge this edge twice after an assertion
+                        // disappears. Let the CFG decide whether its line transfers.
+                        WithBodyExitNoop::ConvertedPopBlock
+                    } else {
+                        WithBodyExitNoop::Located(condition_fallthrough_range(&statement.test))
+                    },
+                );
             } else if terminal_branching
                 && let Some(Stmt::If(statement)) = terminal_body.last()
                 && let Some(test) = terminating_if_fallthrough_test(statement)
