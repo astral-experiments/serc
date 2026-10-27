@@ -1503,18 +1503,12 @@ impl FunctionPlan {
         );
         plan.inlined_comprehension_cellvars
             .extend(comprehension_fast_cellvars);
-        if !plan.local_aliases.is_empty() {
-            plan.cell_sort_names = plan
-                .locals
-                .iter()
-                .copied()
-                .map(|name| {
-                    (
-                        name,
-                        mangle_name(names.resolve(name), private_name).into_owned(),
-                    )
-                })
-                .collect();
+        if private_name.is_some() && plan.cellvars.len() > 1 {
+            for &name in &plan.cellvars {
+                if let Cow::Owned(spelling) = mangle_name(names.resolve(name), private_name) {
+                    plan.cell_sort_names.insert(name, spelling);
+                }
+            }
         }
         plan
     }
