@@ -9073,6 +9073,45 @@ fn completed_manager_work_preserves_retained_loop_owners() {
 }
 
 #[test]
+fn manager_exit_inherits_its_only_continuing_branch() {
+    let source = r"def gather(resource, flag, retry, alternate, value):
+    with resource:
+        if flag:
+            if retry:
+                return value
+        elif alternate:
+            return None
+        else:
+            return value
+
+def update(resource, ready, counter):
+    with resource:
+        if ready:
+            counter.total += 1
+        else:
+            return counter
+
+
+def select(resource, outer, inner):
+    with resource:
+        if outer:
+            if inner:
+                use_left()
+            else:
+                use_right()
+        else:
+            return None
+    finish()
+";
+    assert_matches_cpython_versions(
+        source,
+        "manager_branches.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn protected_conditional_store_preserves_erased_else_backedge() {
     let protected = r"def collect(batches, left, right, cleanup, sink):
     try:

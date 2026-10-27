@@ -25,7 +25,7 @@ use crate::code_object::Constant;
 use crate::target::code_flags::{
     CO_ASYNC_GENERATOR, CO_COROUTINE, CO_FUTURE_ANNOTATIONS, CO_GENERATOR,
 };
-use crate::target::opcodes::STORE_FAST;
+use crate::target::opcodes::{RERAISE, STORE_FAST};
 use crate::target::operands::{
     BinaryIntrinsic, BinaryOperation, CommonConstant, ResumeLocation, SpecialMethod, UnaryIntrinsic,
 };
@@ -40457,12 +40457,12 @@ impl<'source> Compiler<'source> {
                         return None;
                     }
                     let (range, removed_slots) = with_body_continue_exit_donor(body)?;
-                    self.assembler
-                        .original_manager_has_unique_branch_donor(
-                            protected_end,
-                            self.source_location(range),
-                            removed_slots,
-                        )
+                    let (_, location) = self.assembler.original_manager_branch_donor(
+                        protected_end,
+                        &[JUMP_BACKWARD],
+                        removed_slots,
+                    )?;
+                    (location == self.source_location(range))
                         .then_some(WithBodyExitNoop::RetainedConvertedPopBlock(range))
                 })
                 .or_else(|| {
@@ -40550,6 +40550,26 @@ impl<'source> Compiler<'source> {
                 .or(body_noop),
             _ => body_noop,
         };
+        let body_noop = body_noop.or_else(|| {
+            let tail = body.last()?;
+            let Stmt::If(branch) = tail else {
+                return None;
+            };
+            if self.context.python_version < crate::PythonVersion::Py314
+                || !remaining.is_empty()
+                || branch.elif_else_clauses.last().is_none_or(|clause| clause.test.is_some())
+                // A suspension can resume in another block before reaching the jump.
+                || suite_contains_suspending_expression(std::slice::from_ref(tail))
+            {
+                return None;
+            }
+            let (entry, location) = self.assembler.original_manager_branch_donor(
+                protected_end,
+                &[RETURN_VALUE, RAISE_VARARGS, RERAISE],
+                0,
+            )?;
+            Some(WithBodyExitNoop::RetainedManagerPopBlock(location, entry))
+        });
         let body_noop = body_noop.or_else(|| {
             // Both legacy targets resolve the original POP_BLOCK's location
             // before NOP cleanup. A structured body can leave one continuing
@@ -42892,6 +42912,14 @@ fn with_body_conditional_exit_location(
         fallthrough.last()
     };
     match fallthrough_tail? {
+        Stmt::AugAssign(assignment)
+            if compiler.context.python_version >= crate::PythonVersion::Py314 =>
+        {
+            Some(super::source::last_store_target_range(
+                compiler,
+                &assignment.target,
+            ))
+        }
         statement @ (Stmt::Expr(_) | Stmt::Assign(_) | Stmt::Pass(_)) => {
             Some(implicit_return_range(compiler, statement))
         }
@@ -43045,7 +43073,7 @@ fn with_chained_manager_exit_location(
             {
                 manager.items[0].context_expr.range()
             }
-            fallthrough @ (Stmt::Expr(_) | Stmt::Assign(_) | Stmt::Delete(_))
+            fallthrough @ (Stmt::Expr(_) | Stmt::Assign(_) | Stmt::Delete(_) | Stmt::Pass(_))
                 if condition_has_only_runtime_tests(&statement.test)
                     && statement.elif_else_clauses.iter().all(|clause| {
                         clause
@@ -43055,7 +43083,9 @@ fn with_chained_manager_exit_location(
                     })
                     && (matches!(fallthrough, Stmt::Expr(expression)
                         if matches!(expression.value.as_ref(), Expr::Call(_)))
-                        || matches!(fallthrough, Stmt::Assign(_) | Stmt::Delete(_))) =>
+                        || matches!(fallthrough, Stmt::Assign(_) | Stmt::Delete(_))
+                        || (compiler.context.python_version >= crate::PythonVersion::Py314
+                            && matches!(fallthrough, Stmt::Pass(_)))) =>
             {
                 if let Stmt::Delete(deletion) = fallthrough {
                     deletion
