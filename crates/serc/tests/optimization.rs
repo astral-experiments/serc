@@ -19079,3 +19079,15 @@ fn erased_assertion_keeps_the_manager_on_a_finally_truth_guard() {
 ";
     assert_matches_cpython(source, "erased_assertion_truth_guard.py", &LEVELS);
 }
+
+#[test]
+fn erased_assertions_keep_the_finally_call_argument_guard_protected() {
+    let source = r"def check(manager, handle, data, ok):
+    with manager:
+        try:
+            assert ok
+        finally:
+            handle.set(data[0] if data else right())
+";
+    assert_matches_cpython(source, "finalizer_call_argument.py", &LEVELS);
+}
