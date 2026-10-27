@@ -3499,9 +3499,13 @@ impl OptimizationPipeline {
             }
         }
         self.borrow_threaded_jump_entries =
-            Self::snapshot_threaded_borrow_entries(&self.graph, &threaded_borrow_origins);
+            Self::snapshot_threaded_borrow_entries(&self.graph, &threaded_borrow_origins, None);
         self.borrow_authored_finally_break_origins.snapshots =
-            Self::snapshot_threaded_borrow_entries(&self.graph, &threaded_authored_finally_breaks);
+            Self::snapshot_threaded_borrow_entries(
+                &self.graph,
+                &threaded_authored_finally_breaks,
+                Some(&self.exception_owner_provenance.block_boundaries),
+            );
         changed
     }
 
