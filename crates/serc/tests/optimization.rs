@@ -5203,6 +5203,32 @@ fn recovery_finalizer_preserves_local_return_borrow_boundary() {
 }
 
 #[test]
+fn copied_finalizer_guard_reuses_the_original_pop_slot() {
+    let source = r"async def sample(flag, value):
+    try:
+        try:
+            with manager:
+                return await value
+        finally:
+            cleanup()
+    finally:
+        if flag:
+            finish()
+";
+    for source in [
+        source.to_owned(),
+        source.replace("cleanup()", "owner.clean(value)"),
+    ] {
+        assert_matches_cpython_versions(
+            &source,
+            "copied_awaited_finally_guard.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn chained_comparison_try_exit_preserves_borrow_fallthrough() {
     let source = r"def sample(items, action, guard, recover):
     for item in items:

@@ -12130,6 +12130,40 @@ impl<'source> Compiler<'source> {
                                 && next_loop == 0
                         })
                         .map(|start| (start, self.assembler.item_count()));
+                    let nested_awaited_return = (context_index == 0
+                        && self.context.python_version == crate::PythonVersion::Py314
+                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                            == CO_COROUTINE
+                        && preserve_tos
+                        && !return_is_overridden
+                        && matches!(statement.value.as_deref(), Some(Expr::Await(_)))
+                        && handler_count == 0
+                        && self.control.exceptions.active_exception_group_handlers == 0
+                        && self.control.loops.contexts.is_empty()
+                        && self.control.finally.active_finally_end_blocks == 0
+                        && self.control.finally.active_normal_finally_bodies == 0
+                        && self.control.finally.active_copied_finally_bodies == 0
+                        && self.control.withs.active_with_exits.len() <= 1
+                        && self
+                            .control
+                            .withs
+                            .active_with_exits
+                            .iter()
+                            .all(|manager| !manager.is_async)
+                        && matches!(return_finally_contexts.as_slice(), [outer, inner]
+                            if outer.exception_region_depth == 0 && outer.with_depth == 0
+                                && inner.with_depth == 0 && inner.exception_region_depth > 0))
+                    .then(|| {
+                        (
+                            self.assembler.item_count(),
+                            self.control
+                                .exceptions
+                                .active_exception_region_exclusions
+                                .len()
+                                + self.control.withs.active_with_exits.len(),
+                            return_finally_contexts[1].exception_region_depth,
+                        )
+                    });
                     let copied_finally_pop_instruction = self.assembler.instruction_count();
                     self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
                     if !starts_jump_target
@@ -12336,6 +12370,12 @@ impl<'source> Compiler<'source> {
                     if result.is_ok() && preserve_tos {
                         self.assembler
                             .record_copied_finally_none_prefix(copied_finally_pop_instruction);
+                    }
+                    if result.is_ok()
+                        && let Some((entry, removed, final_pops)) = nested_awaited_return
+                    {
+                        self.assembler
+                            .exclude_nested_awaited_finally_marker(entry, removed, final_pops);
                     }
                     if result.is_ok()
                         && let Some(pop_item) = named_handler_try_pop
