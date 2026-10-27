@@ -19066,3 +19066,26 @@ fn nested_conditional_arms_donate_implicit_return_locations() {
 ";
     assert_matches_cpython(source, "nested_implicit_returns.py", &LEVELS);
 }
+
+#[test]
+fn copied_return_guard_reuses_original_call_discard() {
+    let source = r"def handle_result(state):
+    handle = state
+    try:
+        if ready:
+            pass
+        report(label, value=read(data), status=state)
+        report(label, value=read(data), status=state)
+        report('end', flush=True)
+        return
+    except ValueError:
+        recover()
+    finally:
+        try:
+            if handle is None:
+                finish()
+        finally:
+            pass
+";
+    assert_matches_cpython(source, "copied_discard_guard.py", &LEVELS);
+}
