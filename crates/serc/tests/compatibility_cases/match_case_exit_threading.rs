@@ -519,3 +519,39 @@ fn matches_cpython_final_assertion_success_continuations() {
         }
     }
 }
+
+#[test]
+fn final_capture_pass_borrows_after_a_terminating_case() {
+    for action in ["continue", "return"] {
+        let source = format!(
+            "def visit(items, key):\n    for item in items:\n        match item:\n            case None:\n                {action}\n            case captured:\n                pass\n        use(captured, key)\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "final_capture_pass.py");
+    }
+}
+
+#[test]
+fn nested_capture_pass_keeps_the_enclosing_case_exit() {
+    let source = "def visit(item, key):\n    match key:\n        case outer:\n            match item:\n                case None:\n                    return key\n                case captured:\n                    pass\n    consume(item, key)\n";
+    common::assert_matches_cpython_marshal(source, "nested_capture_pass.py");
+}
+
+#[test]
+fn final_capture_pass_reaches_a_separately_lowered_loop_tail() {
+    let source = r#"def visit(groups, key, gate):
+    for group in groups:
+        for item in group:
+            match item:
+                case None:
+                    continue
+                case previous if previous is key:
+                    continue
+                case captured:
+                    pass
+            if store(captured, key):
+                consume(item, captured)
+        if gate:
+            finish(group)
+"#;
+    common::assert_matches_cpython_marshal(source, "capture_before_loop_tail.py");
+}

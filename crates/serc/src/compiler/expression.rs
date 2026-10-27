@@ -1421,16 +1421,24 @@ impl Compiler<'_> {
                             } else {
                                 self.assembler.preserve_inlined_jump_nop(success_exit);
                             }
-                            // CPython keeps this retained success-exit NOP on the physical
-                            // fallthrough for irrefutable explicit-global captures. Refutable
-                            // and local captures keep the ordinary borrowed-load barrier.
+                            // The capture store and the pass both occupy the success block.
+                            // A final irrefutable local capture reached from an earlier case
+                            // can still fall through when its jump becomes a line NOP.
                             if context.fail_pop.is_empty()
                                 && !context.stores.is_empty()
-                                && matches!(
+                                && (matches!(
                                     &self.unit.scope,
                                     Scope::Function { globals, .. }
                                         if context.stores.iter().all(|name| globals.contains(*name))
-                                )
+                                ) || self.context.python_version == PythonVersion::Py314
+                                    && (match_has_following
+                                        || self.control.loops.split_loop_tail_prefix_end
+                                            == Some(statement.range))
+                                    && index > 0
+                                    && case.guard.is_none()
+                                    && matches!(&case.pattern, Pattern::MatchAs(capture)
+                                        if capture.pattern.is_none() && capture.name.is_some())
+                                    && matches!(case.body.as_slice(), [Stmt::Pass(_)]))
                             {
                                 self.assembler
                                     .mark_retained_nop_borrow_fallthrough(success_exit);

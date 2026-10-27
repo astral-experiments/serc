@@ -626,7 +626,7 @@ pub(super) struct LoopState {
     // The final source statement compiled before a split loop-tail `if`, if any.
     synthesized_loop_tail_predecessor: Option<TextRange>,
     // This statement is followed by a loop tail compiled separately from its prefix.
-    split_loop_tail_prefix_end: Option<TextRange>,
+    pub(super) split_loop_tail_prefix_end: Option<TextRange>,
     // The last non-elided prefix statement before a separately compiled runtime conditional.
     split_loop_tail_conditional_predecessor: Option<TextRange>,
     // This exact case-tail iterator reaches a sibling after the enclosing match.
