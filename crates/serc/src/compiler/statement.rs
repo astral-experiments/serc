@@ -6459,6 +6459,16 @@ impl<'source> Compiler<'source> {
             }
             self.emit(NOP, 0, 0)?;
         }
+        if self.context.python_version == crate::PythonVersion::Py312
+            && !preserve_fallthrough_join_nop
+            && expression_contains_inline_branch(&expression.orelse)
+        {
+            // The false arm falls through to the original shared store. A jump
+            // inside its value can copy only the instructions before this join.
+            let join = self.assembler.label();
+            self.assembler.record_exception_owner_block_boundary(join);
+            self.assembler.mark(join);
+        }
         self.compile_assignment_targets(&assignment.targets)?;
         self.assembler
             .set_location(self.source_location(assignment.targets[0].range()));
