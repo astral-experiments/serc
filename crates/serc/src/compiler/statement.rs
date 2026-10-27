@@ -27058,6 +27058,14 @@ impl<'source> Compiler<'source> {
         if statement.handlers.is_empty() {
             return Err(unsupported("try statement without handlers"));
         }
+        // Every normal exit can copy a directly reached local return in the finalizer.
+        let can_copy_local_finally_return = self.control.finally.active_overriding_finally_returns
+            > 0
+            && (self.context.python_version >= crate::PythonVersion::Py314
+                || statement.handlers.len() == 1)
+            && statement.orelse.is_empty()
+            && matches!(statement.finalbody.as_slice(), [Stmt::Return(returned)]
+                if matches!(returned.value.as_deref(), Some(Expr::Name(_))));
         let body_has_elided_assertion = statement.body.iter().any(|body| {
             matches!(
                 self.context.optimized_locations.get(&body.range()),
@@ -31486,14 +31494,7 @@ impl<'source> Compiler<'source> {
                     exclusions.push((exit_exclusion_start, exit_exclusion_end));
                 }
             }
-            // Admit the direct body/handler join into this try's own local return.
-            // Else suites and multiple handlers retain their existing exit barriers.
-            let return_is_overridden = self.control.finally.active_overriding_finally_returns > 0
-                && statement.handlers.len() == 1
-                && statement.orelse.is_empty()
-                && matches!(statement.finalbody.as_slice(), [Stmt::Return(returned)]
-                    if matches!(returned.value.as_deref(), Some(Expr::Name(_))));
-            if self.control.exceptions.prevent_try_exit_inlining && !return_is_overridden {
+            if self.control.exceptions.prevent_try_exit_inlining && !can_copy_local_finally_return {
                 self.assembler.prevent_jump_inlining(normal_exit);
             }
             if normal_exit_absorbed_by_manager_pop {
@@ -33919,18 +33920,9 @@ impl<'source> Compiler<'source> {
                                 .make_no_location_copy_interruptible(handler_exit);
                         }
                     }
-                    let return_is_overridden = self
-                        .control
-                        .finally
-                        .active_overriding_finally_returns
-                        > 0
-                        && (matches!(handler.body.last(), Some(Stmt::Return(_)))
-                                // The sole handler can share this direct local-return join.
-                                // Keep the authored-return admission above independent.
-                                || (statement.handlers.len() == 1
-                                    && statement.orelse.is_empty()
-                                    && matches!(statement.finalbody.as_slice(), [Stmt::Return(returned)]
-                                        if matches!(returned.value.as_deref(), Some(Expr::Name(_))))));
+                    let return_is_overridden = can_copy_local_finally_return
+                        || (self.control.finally.active_overriding_finally_returns > 0
+                            && matches!(handler.body.last(), Some(Stmt::Return(_))));
                     // The bare raise follows the manager and its recovery in one
                     // ordinary finally suite. The recovered path can copy that exit.
                     let manager_reraise = self.context.python_version

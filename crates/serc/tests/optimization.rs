@@ -9501,6 +9501,25 @@ fn managed_mixed_erased_iterator_guard_preserves_shared_backedge() {
 }
 
 #[test]
+fn handler_exits_copy_a_local_return_from_the_finalizer() {
+    for body in ["raise error", "value = request()"] {
+        let source = format!(
+            "def resolve(error, value):
+    try:
+        {body}
+    except ValueError as caught:
+        value = convert(caught)
+    except TypeError:
+        value = recover()
+    finally:
+        return value
+"
+        );
+        assert_matches_cpython(&source, "handler_finalizer_return.py", &LEVELS);
+    }
+}
+
+#[test]
 fn guarded_finalizer_copies_the_handler_value_return() {
     let source = r"def sample(ready, flag, value):
     try:
