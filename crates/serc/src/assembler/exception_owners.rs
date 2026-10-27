@@ -8379,13 +8379,18 @@ impl LayoutAssembler {
                                 && let Some(call) = start.checked_sub(3)
                                 && call >= original_array_start
                                 && retained_setup_nops.contains(&(start - 1))
-                                && self.exception_owner_provenance.ordinary_try_setups
+                                && self
+                                    .exception_owner_provenance
+                                    .ordinary_try_setups
                                     .contains_key(&setup_label)
                                 && indexed_instructions[call].opcode == crate::target::opcodes::CALL
                                 && indexed_instructions[call + 1].opcode == POP_TOP
-                                && indexed_instructions[call + 1].local_policy
-                                    .hidden_exception_owner_slots() == 0
-                                && self.uniform_exception_owner(call + 1, call + 2, &label_positions)
+                                && indexed_instructions[call + 1]
+                                    .local_policy
+                                    .hidden_exception_owner_slots()
+                                    == 0
+                                && self
+                                    .uniform_exception_owner(call + 1, call + 2, &label_positions)
                                     .is_none()
                             {
                                 proven_unprotected_slot = true;
