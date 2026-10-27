@@ -14904,6 +14904,67 @@ impl Assembler {
         }
     }
 
+    /// Keeps an empty normal `POP_BLOCK` between a guard and a finalizer's loop header.
+    pub(crate) fn record_empty_finally_loop_entry(
+        &mut self,
+        ordinal: usize,
+        header: SourceLocation,
+    ) {
+        let Some((index, pop)) = self.indexed_instruction_at(ordinal) else {
+            return;
+        };
+        let items = self.linear_items();
+        let before = &items[..index];
+        let [Item::Label(loop_header), Item::Instruction(test), ..] = &items[index + 1..] else {
+            return;
+        };
+        let boundaries = &self.exception_owner_provenance.source_boundaries;
+        if pop.opcode != NOP
+            || pop.location != SourceLocation::NONE
+            || !pop.fusion_policy.is_converted_pop_block()
+            || pop.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
+            || !boundaries.contains(loop_header)
+            || !matches!(
+                test.opcode,
+                NOP | LOAD_FAST | LOAD_GLOBAL | crate::target::opcodes::LOAD_DEREF
+            )
+            || test.location != header
+        {
+            return;
+        }
+        // The fallthrough and conditional jump give POP_BLOCK two predecessors.
+        // Its location stays empty, and converting it to NOP removes the whole array.
+        let Some(previous) = before.iter().rev().find_map(Item::as_instruction) else {
+            return;
+        };
+        if previous.location.line < 0
+            || ends_scope(previous.opcode)
+            || is_unconditional_jump(previous.opcode)
+        {
+            return;
+        }
+        let entry = {
+            let mut entries = trailing_labels(before).filter(|label| boundaries.contains(label));
+            let (Some(entry), None) = (entries.next(), entries.next()) else {
+                return;
+            };
+            entry
+        };
+        if before
+            .iter()
+            .rev()
+            .filter_map(Item::as_instruction)
+            .any(|jump| {
+                is_conditional_jump(jump.opcode)
+                    && jump.forward_target() == Some(entry)
+                    && jump.location.line >= 0
+                    && !jump.jump_policy.borrow_empty_block()
+            })
+        {
+            self.prevent_borrow_reachability(entry);
+        }
+    }
+
     /// Captures the unchanged first array of an ordinary normal-finally entry.
     pub(crate) fn record_original_normal_finally_array(&mut self, ordinal: usize) {
         let items = self.linear_items();

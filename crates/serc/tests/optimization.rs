@@ -2528,6 +2528,20 @@ fn ordinary_loop_breaks_reach_structured_finalizers() {
 }
 
 #[test]
+fn removed_try_exit_stops_borrowing_before_a_cleanup_loop() {
+    for (body, test) in [
+        ("await prepare(value)", "ready"),
+        ("await prepare(value)", "True"),
+        ("raise Error(value)", "ready"),
+    ] {
+        let source = format!(
+            "async def run(value, ready):\n    try:\n        if ready:\n            {body}\n    finally:\n        while {test}:\n            consume(value)\n"
+        );
+        assert_matches_cpython(&source, "finalizer_loop.py", &LEVELS);
+    }
+}
+
+#[test]
 fn runtime_while_recovery_keeps_finalizer_borrow_entry() {
     for named in [false, true] {
         for nested in [false, true] {
