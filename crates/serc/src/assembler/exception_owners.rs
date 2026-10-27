@@ -10309,6 +10309,53 @@ impl LayoutAssembler {
                         );
                     }
                     if instruction.opcode == NOT_TAKEN {
+                        // After POP_EXCEPT, the copied finalizer can end in an arithmetic
+                        // store. The old binary-operation cell owns the outer guard's
+                        // marker when the guard's erased cells leave it at that index.
+                        if instruction.exception_policy().exclusion()
+                            == super::ExceptionExclusion::None
+                            && owner_history_exact
+                            && pop_slot_epoch_known
+                            && tail.late_removals == 0
+                            && tail.insertions == 0
+                            && tail.post_compaction_fusions == 0
+                            && let Some(source) = instruction_index.checked_sub(4)
+                            && source >= original_array_start
+                            && let [arithmetic, store, load, guard] =
+                                &indexed_instructions[source..instruction_index]
+                            && arithmetic.opcode == crate::target::opcodes::BINARY_OP
+                            && store.opcode == crate::target::opcodes::STORE_FAST
+                            && matches!(
+                                load.opcode,
+                                crate::target::opcodes::LOAD_FAST
+                                    | crate::target::opcodes::LOAD_FAST_BORROW
+                            )
+                            && load.local_policy.hidden_exception_owner_slots() == 1
+                            && matches!(guard.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+                            && guard.local_policy.hidden_exception_owner_slots() == 3
+                            && tail.early_removals
+                                == instruction_index - source
+                                    + usize::from(load.local_policy.hidden_exception_owner_slots())
+                                    + usize::from(guard.local_policy.hidden_exception_owner_slots())
+                            && indexed_instructions[original_array_start..source]
+                                .iter()
+                                .any(|i| {
+                                    i.opcode == crate::target::opcodes::POP_EXCEPT
+                                        && i.local_policy.hidden_exception_owner_slots() == 2
+                                })
+                            && !jump_targets.iter().any(|label| {
+                                label_positions.get(label).is_some_and(|position| {
+                                    source < *position && *position <= instruction_index
+                                })
+                            })
+                            && let Some(region) =
+                                self.uniform_exception_owner(source, source + 2, &label_positions)
+                        {
+                            owners.insert(
+                                instruction_index,
+                                ExceptionOwnerDecision::override_with_region(Some(region)),
+                            );
+                        }
                         if instruction.exception_policy().exclusion()
                             == super::ExceptionExclusion::None
                             && let Some((index, region)) = pending_normal_none_owner.take()

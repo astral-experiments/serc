@@ -19066,3 +19066,21 @@ fn nested_conditional_arms_donate_implicit_return_locations() {
 ";
     assert_matches_cpython(source, "nested_implicit_returns.py", &LEVELS);
 }
+
+#[test]
+fn arithmetic_store_in_copied_finally_owns_outer_none_guard() {
+    let source = r"def measure(state, start):
+    try:
+        try:
+            work()
+        except ValueError:
+            state = 3
+            return None
+        finally:
+            elapsed = (clock() - start) * 10
+    finally:
+        if state is not None:
+            observe(state)
+";
+    assert_matches_cpython(source, "copied_arithmetic_finally.py", &LEVELS);
+}
