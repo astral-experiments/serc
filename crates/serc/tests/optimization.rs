@@ -11318,7 +11318,7 @@ fn completed_comprehension_preserves_nested_branch_join() {
 
 #[test]
 fn nested_branches_share_a_copied_four_slot_return() {
-    let source = r#"def sample(outer, choose, extra, switch, data, value):
+    let source = r"def sample(outer, choose, extra, switch, data, value):
     if outer:
         first()
     elif choose:
@@ -11334,7 +11334,7 @@ fn nested_branches_share_a_copied_four_slot_return() {
     else:
         raise RuntimeError
     return {}, {}
-"#;
+";
     assert_matches_cpython(source, "nested_tuple_return.py", &LEVELS);
 }
 
