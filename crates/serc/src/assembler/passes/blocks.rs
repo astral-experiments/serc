@@ -5169,7 +5169,7 @@ impl OptimizationPipeline {
             .normalize_blocks_if_needed(&self.preserved_block_boundaries);
         self.prepare_conditional_discard_try_exits();
         let graph = &mut self.graph;
-        let active_internal_labels = self
+        let mut active_internal_labels = self
             .exception_owner_provenance
             .normal_try_copy_internal_labels
             .iter()
@@ -5181,7 +5181,12 @@ impl OptimizationPipeline {
                     .contains(label)
             })
             .collect::<Vec<_>>();
-        if !active_internal_labels.is_empty() {
+        let deferred_returns = &self
+            .exception_owner_provenance
+            .deferred_finalizer_return_boundaries;
+        let mut deferred_labels = FxHashSet::default();
+        let mut deferred_pops = FxHashSet::default();
+        if !active_internal_labels.is_empty() || !deferred_returns.is_empty() {
             let mut forbidden_entries = self.preserved_block_boundaries.clone();
             forbidden_entries.extend(self.exception_regions.iter().map(|region| region.target));
             forbidden_entries.extend(
@@ -5198,12 +5203,29 @@ impl OptimizationPipeline {
             graph
                 .join_continuation_blocks(&active_internal_labels, &forbidden_entries)
                 .expect("certified original cleanup array continuations");
+            // These region labels split a single native FINALLY_END/return array.
+            // Leave any genuine CFG entry in its own block.
+            for &[pop, exit] in deferred_returns {
+                let boundaries = [pop, exit];
+                if graph
+                    .join_continuation_blocks(&boundaries, &forbidden_entries)
+                    .is_ok()
+                {
+                    deferred_pops.insert(pop);
+                    deferred_labels.extend(boundaries);
+                    active_internal_labels.extend(boundaries);
+                }
+            }
         }
         if graph.len() < 2 {
             return Ok(Vec::new());
         }
 
         let order = graph.order().to_vec();
+        let deferred_blocks = deferred_labels
+            .iter()
+            .filter_map(|label| graph.label_block(*label))
+            .collect::<FxHashSet<_>>();
         let analysis = exit_block_analysis(
             graph,
             &order,
@@ -5272,6 +5294,14 @@ impl OptimizationPipeline {
                 .iter()
                 .map(|(_, label)| *label)
                 .collect::<Vec<_>>();
+            if !deferred_blocks.is_empty() {
+                propagate_planned_array_locations(
+                    graph,
+                    &order,
+                    &deferred_blocks,
+                    &deferred_labels,
+                );
+            }
             restore_shared_pop_block_locations(graph, &self.exception_regions, &heads);
             restore_retained_pop_block_locations(
                 graph,
@@ -7530,9 +7560,16 @@ impl OptimizationPipeline {
                         return None;
                     }
                     let start = copied_labels.get(&region.start).copied().or_else(|| {
-                        (target_chain_end > target_position
+                        // The region can end at POP_EXCEPT inside the freshly joined
+                        // target block. Its prefix still protects the preceding swaps.
+                        let prefix_reaches_deferred_pop = deferred_pops.contains(&region.end)
+                            && graph
+                                .label_block(region.start)
+                                .is_some_and(|block| positions[block.index()] < target_position);
+                        ((target_chain_end > target_position
                             && region_memberships[index].contains(&positions[target.index()]))
-                        .then_some(copied_label)
+                            || prefix_reaches_deferred_pop)
+                            .then_some(copied_label)
                     })?;
                     let end = *copied_labels.get(&region.end)?;
                     if inherited_conditional_exclusions.iter().any(
@@ -7838,7 +7875,7 @@ impl OptimizationPipeline {
                     })
                     .collect::<FxHashMap<_, _>>()
             };
-            let copied_inline_entry_labels = copied_labels
+            let mut copied_inline_entry_labels = copied_labels
                 .iter()
                 .filter_map(|(original, copied)| {
                     copied_exit_or_eval_entry_labels
@@ -7846,6 +7883,11 @@ impl OptimizationPipeline {
                         .then_some(*copied)
                 })
                 .collect::<FxHashSet<_>>();
+            copied_inline_entry_labels.extend(
+                deferred_labels
+                    .iter()
+                    .filter_map(|label| copied_labels.get(label).copied()),
+            );
             if inherit_copied_locations && !planned_copy {
                 // Exception boundaries split the IR into blocks after CPython has already treated
                 // the synthetic cleanup as one source-less exit. Every copied split therefore
@@ -9384,6 +9426,9 @@ impl OptimizationPipeline {
         // replaced jump only after copying. Carry that donation through its
         // original array before NOP compaction, just as for the copied arrays.
         propagate_planned_array_locations(graph, &order, &planned_blocks, &planned_inline_labels);
+        if !deferred_blocks.is_empty() {
+            propagate_planned_array_locations(graph, &order, &deferred_blocks, &deferred_labels);
+        }
 
         let jump_target = |item: &Item| match item {
             Item::Instruction(instruction) => match instruction.operand() {

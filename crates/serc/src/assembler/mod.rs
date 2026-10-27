@@ -11959,6 +11959,13 @@ impl Assembler {
         instruction.no_location_policy.allow_block_inlining();
     }
 
+    /// Records the range-only labels within an original `FINALLY_END` return block.
+    pub(crate) fn record_deferred_finalizer_return(&mut self, start: Label, end: Label) {
+        self.exception_owner_provenance
+            .deferred_finalizer_return_boundaries
+            .push([start, end]);
+    }
+
     /// Allows an unlocated terminal cleanup to be copied onto its predecessor edges.
     pub(crate) fn allow_last_no_location_block_inlining(&mut self) {
         self.required_last_instruction_mut("allowing an unlocated terminal block to be inlined")
