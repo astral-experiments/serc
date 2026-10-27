@@ -2654,6 +2654,25 @@ fn break_keeps_its_line_when_a_loop_arm_copies_a_try_return() {
 }
 
 #[test]
+fn nested_try_return_keeps_its_guard_location_after_copying() {
+    let source = r"def choose(enabled, test, value):
+    try:
+        if enabled:
+            try:
+                if test is not None:
+                    return process(test)
+            except LookupError:
+                pass
+        else:
+            step()
+    except ValueError:
+        pass
+    return value
+";
+    assert_matches_cpython(source, "guarded_nested_try_return.py", &LEVELS);
+}
+
+#[test]
 fn protected_while_break_copies_following_local_return() {
     let source = r"async def collect(ready, limit, done, count):
     try:
