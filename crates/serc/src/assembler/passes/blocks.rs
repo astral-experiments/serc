@@ -5873,16 +5873,18 @@ impl OptimizationPipeline {
                         && graph[target].items() == target_items
                 },
             );
-            // An emitted POP_BLOCK/JUMP can replace a retained case-success jump before
-            // its guard is visited. Keep that shared exit available for the guard's copy.
+            // An emitted POP_BLOCK/JUMP can replace the shared case exit before its
+            // guards are visited. A chain of guards with no else has an unlocated
+            // case exit; each guard supplies the location of its own copy.
             let emitted_shared_match_exit = !planned_copy
                 && self.python_version >= crate::PythonVersion::Py314
                 && remaining_predecessors[source.index()] > 1
                 && matches!(graph[source].items(), [labels @ .., Item::Instruction(jump)]
                     if labels.iter().all(|item| matches!(item, Item::Label(_)))
                         && jump.opcode == JUMP_FORWARD
-                        && jump.jump_policy.is_original_match_success()
-                        && jump.jump_policy.always_retains_nop()
+                        && (jump.location == SourceLocation::NONE
+                            || (jump.jump_policy.is_original_match_success()
+                                && jump.jump_policy.always_retains_nop()))
                         && jump.exception_policy() == ExceptionPolicy::default()
                         && self.exception_owner_provenance.original_match_join_boundaries.contains(&target_label))
                 && matches!(graph[target].items(), [labels @ .., Item::Instruction(pop), Item::Instruction(exit)]

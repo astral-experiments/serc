@@ -63,6 +63,29 @@ fn protected_value_match_with_multiple_handlers_locates_its_failure() {
 }
 
 #[test]
+fn nested_guards_keep_their_case_exit_locations() {
+    let source = r"async def dispatch(value, enabled, ready):
+    try:
+        match value:
+            case Kind.first:
+                if enabled:
+                    if ready:
+                        consume(value)
+            case Kind.last:
+                finish(value)
+    except LookupError as error:
+        report(error)
+    resume()
+";
+    assert_matches_cpython_versions(
+        source,
+        "nested_guarded_case_exit.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn nested_conversion_handlers_keep_shared_cleanup() {
     let source = r"def sample(items):
     for item in items:
