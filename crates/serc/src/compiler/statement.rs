@@ -15180,7 +15180,13 @@ impl<'source> Compiler<'source> {
             self.context.is_elided_statement(statement)
                 || match statement {
                     Stmt::If(branch) => {
-                        condition_has_linear_runtime_leaves(&branch.test)
+                        // An eager comprehension restores its locals before the
+                        // membership test can branch to the loop's break.
+                        (condition_has_linear_runtime_leaves(&branch.test)
+                            || matches!(branch.test.as_ref(), Expr::Compare(test)
+                                if matches!(test.ops.as_ref(), [CmpOp::In | CmpOp::NotIn])
+                                    && matches!(test.operands.as_ref(), [left, Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_)]
+                                        if linear_expression(left))))
                             && !expression_suspends_current_scope(&branch.test)
                             && self.supports_elided_for_join_body(&branch.body)
                             && branch.elif_else_clauses.iter().all(|clause| {
@@ -18180,7 +18186,15 @@ impl<'source> Compiler<'source> {
                         // an else suite would supply its own preceding line instead.
                         // A while loop also has an empty condition-failure block. Its
                         // inlined branch jump has no preceding line event to replace it.
-                        if matches!(body.last(), Some(Stmt::For(_))) {
+                        if self.context.python_version >= crate::PythonVersion::Py314
+                            && matches!(body.last(), Some(Stmt::For(for_loop))
+                                if !for_loop.is_async && suite_has_linear_borrow_fallthrough(&for_loop.orelse))
+                        {
+                            // Breaks thread through the empty loop end. The else
+                            // suite's physical fallthrough still owns its jump slot.
+                            self.assembler
+                                .preserve_redundant_jump_nop_after_threading(branch_exit);
+                        } else if matches!(body.last(), Some(Stmt::For(_))) {
                             // The break target or async exhaustion continuation starts
                             // an empty array. Its copied jump retains a separate NOP
                             // even when the preceding iterator has the same line.

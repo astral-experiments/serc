@@ -16147,6 +16147,42 @@ fn erased_suffix_preserves_assertion_only_nested_join() {
 }
 
 #[test]
+fn loop_exhaustion_keeps_its_line_before_a_copied_return() {
+    let guarded = r"def sample(values, ready):
+    answer = None
+    if ready:
+        for value in values:
+            if value in [item.name for item in values]:
+                break
+        assert answer
+    else:
+        answer = values[0]
+    return answer
+";
+    let otherwise = r"def sample(values, key, other):
+    try:
+        answer = None
+        if key is not None:
+            if values:
+                for value in values:
+                    if value == key:
+                        break
+                else:
+                    report(reason=other)
+            else:
+                report(other)
+        else:
+            report(key)
+        return answer
+    except Error as error:
+        pass
+";
+    for source in [guarded, otherwise] {
+        assert_matches_cpython(source, "loop_exhaustion_return.py", &LEVELS);
+    }
+}
+
+#[test]
 fn erased_else_after_breaking_for_preserves_branch_join() {
     for tail in ["finish()", "value = None", "return None"] {
         let source = format!(
