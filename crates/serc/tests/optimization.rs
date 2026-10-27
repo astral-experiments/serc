@@ -25977,3 +25977,22 @@ fn short_circuit_value_after_manager_entries_uses_the_prior_handler() {
 ";
     assert_matches_cpython(source, "manager_value_guard.py", &LEVELS);
 }
+
+#[test]
+fn wildcard_fallthrough_locates_the_normal_try_exit() {
+    let source = r"def check(kind, first, second):
+    try:
+        match kind:
+            case 1:
+                result = first
+            case _:
+                result = second
+    except ValueError:
+        raise
+    observe(result)
+";
+    for tail in ["result = second", "observe(second)", "pass"] {
+        let source = source.replace("result = second", tail);
+        assert_matches_cpython(&source, "wildcard_try_exit.py", &LEVELS);
+    }
+}
