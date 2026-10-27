@@ -25396,6 +25396,24 @@ fn nested_conditional_jump_uses_its_last_instruction_position() {
 }
 
 #[test]
+fn trailing_literal_keeps_the_original_implicit_return_copy_budget() {
+    let source = r#"if enabled:
+    if value is not None:
+        value = 1
+else:
+    value = None
+result = value
+"description"
+"#;
+    assert_matches_cpython_versions(
+        source,
+        "literal_return_target.py",
+        &LEVELS,
+        &[PythonVersion::Py312],
+    );
+}
+
+#[test]
 fn nested_conditional_arms_donate_implicit_return_locations() {
     let source = r"def sample(first, second, third, items):
     if first:
