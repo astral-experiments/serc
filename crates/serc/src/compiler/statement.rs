@@ -42626,15 +42626,24 @@ impl<'source> Compiler<'source> {
             // original POP_BLOCK. Let location resolution decide whether it survives.
             (self.context.python_version <= crate::PythonVersion::Py313
                 || (remaining.is_empty()
-                    && body.last().is_some_and(|part| match part {
-                        Stmt::Try(statement) => {
-                            cleanup_join.is_some()
-                                && !statement.is_star
-                                && statement.finalbody.is_empty()
-                        }
-                        Stmt::With(_) => cleanup_join.is_some(),
-                        Stmt::If(branch) => manager_condition_has_one_fallthrough(branch),
-                        _ => false,
+                    && body.last().is_some_and(|part| {
+                        let inner = match part {
+                            Stmt::If(branch) => {
+                                return manager_condition_has_one_fallthrough(branch);
+                            }
+                            Stmt::Try(statement)
+                                if cleanup_join.is_some()
+                                    && !statement.is_star
+                                    && statement.finalbody.is_empty() =>
+                            {
+                                &statement.body
+                            }
+                            Stmt::With(manager) if cleanup_join.is_some() => &manager.body,
+                            _ => return false,
+                        };
+                        // Line resolution still sees the normal edge of a loop
+                        // that becomes infinite only after constant folding.
+                        !suite_terminates(inner) || suite_terminates_before_constant_folding(inner)
                     })))
             .then_some(WithBodyExitNoop::ConvertedPopBlock)
         });
