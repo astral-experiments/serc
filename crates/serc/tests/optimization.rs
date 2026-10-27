@@ -2251,6 +2251,41 @@ fn iterator_returns_unwind_inner_try_before_copied_none_guard() {
 }
 
 #[test]
+fn guarded_finalizers_copy_nested_iterator_return_exits() {
+    let body = r"for row in rows:
+    for item in row:
+        try:
+            return item
+        finally:
+            if enabled:
+                try:
+                    close(item)
+                except ValueError:
+                    raise
+";
+    let indent = |body: &str| {
+        let mut indented = String::new();
+        for line in body.lines() {
+            writeln!(indented, "    {line}").unwrap();
+        }
+        indented
+    };
+    for suite in [
+        body.to_owned(),
+        body.replace("return item", "return"),
+        format!("try:\n{}except KeyError:\n    recover()\n", indent(body)),
+    ] {
+        let source = format!("def pick(rows, enabled):\n{}", indent(&suite));
+        assert_matches_cpython_versions(
+            &source,
+            "nested_iterator_returns.py",
+            &LEVELS,
+            &[PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn iterator_returns_unwind_the_iterator_before_the_outer_try() {
     for header in ["for item in items:", "async for item in items:"] {
         let source = format!(

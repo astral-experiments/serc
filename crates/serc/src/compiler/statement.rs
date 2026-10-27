@@ -13583,9 +13583,26 @@ impl<'source> Compiler<'source> {
                                                         && matches!(call.func.as_ref(), Expr::Attribute(attribute)
                                                             if matches!(attribute.value.as_ref(), Expr::Name(_))))))
                         );
+                    // A guarded finalizer leaves an artificial exit that discards each
+                    // enclosing iterator and its index. These returns can exceed four
+                    // instructions and still inline before the cold handler moves.
+                    let loops = &self.control.loops.contexts;
+                    let iterator_return = self.context.python_version
+                        == crate::PythonVersion::Py315
+                        && loops.len() > 1
+                        && loops.iter().all(|loop_| {
+                            loop_.iterator_cleanup == IteratorCleanup::Sync
+                                && loop_.exception_region_depth == 0
+                                && loop_.finally_end_depth == 0
+                        })
+                        && self.control.withs.active_with_exits.is_empty()
+                        && matches!(self.control.finally.active_return_finally_contexts.as_slice(), [context]
+                            if context.loop_depth == loops.len()
+                                && matches!(context.body.last(), Some(Stmt::If(branch)) if branch.elif_else_clauses.is_empty()));
                     // Pass finalizers use the same established no-location route.
                     if unwinds_return_finally
                         && (conditional_handler_cleanup
+                            || iterator_return
                             || self
                                 .control
                                 .finally
