@@ -12,6 +12,29 @@ use super::super::{
 use super::normal_try_copy_plan::{OriginalNode, OriginalTail, PrefixSlot, plan_normal_try_copies};
 use crate::target::opcodes::{JUMP_BACKWARD, JUMP_FORWARD, NOP, POP_EXCEPT};
 
+/// Exposes the owned discard at the end of a try or handler as a copyable range.
+fn split_discard_owner_regions(
+    regions: &mut Vec<ExceptionRegion>,
+    starts: &FxHashMap<Label, Label>,
+) {
+    if starts.is_empty() {
+        return;
+    }
+    for region in std::mem::take(regions) {
+        if let Some(&start) = starts.get(&region.end)
+            && region.start != start
+        {
+            regions.push(ExceptionRegion {
+                end: start,
+                ..region
+            });
+            regions.push(ExceptionRegion { start, ..region });
+        } else {
+            regions.push(region);
+        }
+    }
+}
+
 /// Checks whether restored owners retain priority when a jump's exclusion is cleared.
 ///
 /// Unknown ranges or priorities are rejected. Existing regions win ties, so a tied
@@ -122,9 +145,9 @@ pub(super) fn original_local_tuple_return(items: &[Item]) -> Option<[bool; 4]> {
     .then_some([true; 4])
 }
 
-/// Recognizes the four original slots of an explicit local subscript return.
+/// Recognizes the four original slots of a subscript return indexed by a local.
 fn original_local_subscript_return(items: &[Item]) -> Option<OriginalTail> {
-    use crate::target::opcodes::{BINARY_OP, LOAD_FAST, RETURN_VALUE};
+    use crate::target::opcodes::{BINARY_OP, LOAD_DEREF, LOAD_FAST, RETURN_VALUE};
     use crate::target::operands::BinaryOperation;
 
     let head = items
@@ -140,7 +163,7 @@ fn original_local_subscript_return(items: &[Item]) -> Option<OriginalTail> {
     else {
         return None;
     };
-    (value.opcode == LOAD_FAST
+    (matches!(value.opcode, LOAD_FAST | LOAD_DEREF)
         && value.value_argument().is_some()
         && index.opcode == LOAD_FAST
         && index.value_argument().is_some()
@@ -1837,16 +1860,28 @@ impl OptimizationPipeline {
                     end.as_u32(),
                     block,
                     owners.clone(),
+                    (jump.location.line < 0 && empty_setup_donor && !shared_reraise)
+                        .then(|| (start, target, instructions[start_offset - 1].location)),
                 ));
             }
         }
-        selected.sort_by_key(|(offset, start, end, _, _)| (*offset, *start, *end));
-        for (_, _, _, block, owners) in selected {
-            self.graph
+        selected.sort_by_key(|(offset, start, end, _, _, _)| (*offset, *start, *end));
+        for (_, _, _, block, owners, setup_exit) in selected {
+            let jump = self
+                .graph
                 .instructions_mut(block)
                 .next_back()
-                .expect("original normal jump")
-                .set_exception_policy(super::super::ExceptionPolicy::default());
+                .expect("original normal jump");
+            jump.set_exception_policy(super::super::ExceptionPolicy::default());
+            if let Some((entry, target, location)) = setup_exit {
+                // A retained NOP on the setup line represents the ownerless setup.
+                // A surviving jump or a copied exit still has the surrounding owner.
+                let mut expected = *jump;
+                expected.location = location;
+                self.exception_owner_provenance
+                    .ownerless_compound_try_nops
+                    .push((entry, target, expected));
+            }
             self.exception_regions.extend(owners);
         }
     }
@@ -2674,7 +2709,80 @@ impl OptimizationPipeline {
         prefixes
     }
 
-    /// Keep the join where CPython copies a four-slot return after a shared try exit.
+    /// Finds the sole nested recovery whose name cleanup jumps to this tuple return.
+    fn nested_recovery_tuple_donor(
+        &self,
+        normal: BasicBlockId,
+        join: BasicBlockId,
+        tail: BasicBlockId,
+    ) -> Option<SourceLocation> {
+        use crate::target::opcodes::{DELETE_FAST, LOAD_CONST, STORE_FAST};
+
+        let graph = &self.graph;
+        original_local_tuple_return(graph[tail].items())?;
+        let jump_target = |jump: &Instruction| graph.label_block(jump.forward_target()?);
+        let normal_jump = graph[normal].last_instruction()?;
+        if normal_jump.location.line < 0
+            || normal_jump.opcode != JUMP_FORWARD
+            || jump_target(normal_jump) != Some(join)
+        {
+            return None;
+        }
+        let sole_predecessor_except = |target, excluded| {
+            let mut sources = graph.iter().filter_map(|(source, block)| {
+                (Some(source) != excluded
+                    && block.last_instruction().and_then(jump_target) == Some(target))
+                .then_some(source)
+            });
+            let source = sources.next()?;
+            sources.next().is_none().then_some(source)
+        };
+        let cleanup = sole_predecessor_except(join, Some(normal))?;
+        let recovered = sole_predecessor_except(cleanup, None)?;
+        if graph.order().windows(2).any(|pair| {
+            (pair[1] == cleanup || pair[1] == join)
+                && super::super::block_has_fallthrough(graph[pair[0]].items())
+        }) || !self
+            .exception_owner_provenance
+            .normal_try_exits
+            .iter()
+            .any(|&(entry, end)| {
+                graph.label_block(entry) == Some(recovered)
+                    && graph.label_block(end) == Some(cleanup)
+            })
+        {
+            return None;
+        }
+        let items = graph[cleanup].items();
+        let first = items
+            .iter()
+            .position(|item| matches!(item, Item::Instruction(_)))?;
+        let [
+            Item::Instruction(pop),
+            Item::Instruction(none),
+            Item::Instruction(store),
+            Item::Instruction(delete),
+            Item::Instruction(jump),
+        ] = &items[first..]
+        else {
+            return None;
+        };
+        let donor = graph[recovered].last_instruction()?;
+        (pop.opcode == POP_EXCEPT
+            && none.opcode == LOAD_CONST
+            && store.opcode == STORE_FAST
+            && delete.opcode == DELETE_FAST
+            && jump.opcode == JUMP_FORWARD
+            && store.operand() == delete.operand()
+            && [pop, none, store, delete, jump]
+                .iter()
+                .all(|op| op.location == SourceLocation::NONE)
+            && donor.opcode == JUMP_FORWARD
+            && donor.location.line >= 0)
+            .then_some(donor.location)
+    }
+
+    /// Keeps original jumps until their shared try exit can copy its return.
     fn preserve_shared_try_return_joins(&mut self) {
         use crate::target::opcodes::RETURN_VALUE;
 
@@ -2690,6 +2798,7 @@ impl OptimizationPipeline {
             }
             graph.label_block(jump.forward_target()?)
         };
+        let mut local_return_cleanups = FxHashSet::default();
         let mut joins = Vec::new();
         for &(entry_label, join_label) in &self.exception_owner_provenance.normal_try_exits {
             let Some((entry, join)) = graph
@@ -2698,8 +2807,15 @@ impl OptimizationPipeline {
             else {
                 continue;
             };
-            if unlocated_jump(entry) != Some(join) {
-                continue;
+            let mut cleanup = graph[entry].items().iter().filter_map(Item::as_instruction);
+            if original_local_return(graph[join].items())
+                && matches!((cleanup.next(), cleanup.next()), (Some(jump), None)
+                    if jump.opcode == JUMP_FORWARD
+                        && jump.forward_target() == Some(join_label)
+                        && jump.pre_fusion_width() == 1
+                        && jump.local_policy.hidden_exception_owner_slots() == 0)
+            {
+                local_return_cleanups.insert(entry);
             }
             let Some(tail) = unlocated_jump(join) else {
                 continue;
@@ -2718,6 +2834,13 @@ impl OptimizationPipeline {
             {
                 continue;
             }
+            if unlocated_jump(entry) != Some(join) {
+                if let Some(donor) = self.nested_recovery_tuple_donor(entry, join, tail) {
+                    let tail_label = graph[tail].first_label().expect("original return target");
+                    joins.push((join, Some((entry, tail_label, donor))));
+                }
+                continue;
+            }
             // The two earlier jumps first copy the normal POP_BLOCK/JUMP array. By
             // the time the join copies the return, its old jump is a fifth (NOP)
             // slot. Later copies through the join therefore exceed CPython's limit.
@@ -2734,16 +2857,177 @@ impl OptimizationPipeline {
                     })
                 });
             if incoming.nth(1).is_some() {
-                joins.push(join);
+                joins.push((join, None));
             }
         }
-        for join in joins {
-            self.graph
+        // The original POP_BLOCK, skip jump and two-slot local return fit in one
+        // four-slot copy. Keep an adjacent authored break until it can copy them;
+        // the loop condition continues to target the original cleanup.
+        if !local_return_cleanups.is_empty() {
+            for pos in 1..self.graph.order().len() {
+                let entry = self.graph.block_at(pos);
+                let source = self.graph.block_at(pos - 1);
+                if local_return_cleanups.contains(&entry)
+                    && self.graph[source].last_instruction().is_some_and(|jump| {
+                        jump.opcode == JUMP_FORWARD
+                            && jump.fusion_policy.is_authored_break()
+                            && jump
+                                .forward_target()
+                                .and_then(|label| self.graph.label_block(label))
+                                == Some(entry)
+                    })
+                {
+                    self.graph
+                        .instructions_mut(source)
+                        .next_back()
+                        .expect("adjacent authored break")
+                        .jump_policy
+                        .defer_removal();
+                }
+            }
+        }
+        for (join, normal_copy) in joins {
+            if let Some((normal, tail, _)) = normal_copy {
+                // The normal try exit copies the original, one-slot bridge first.
+                self.graph
+                    .instructions_mut(normal)
+                    .next_back()
+                    .unwrap()
+                    .set_operand(Operand::Forward(tail));
+            }
+            let jump = self
+                .graph
                 .instructions_mut(join)
                 .next_back()
-                .expect("singleton try join")
-                .jump_policy
-                .prevent_threading_target();
+                .expect("singleton try join");
+            jump.jump_policy.prevent_threading_target();
+            if let Some((_, _, donor)) = normal_copy {
+                // The recovery reaches the bridge after it copies the tuple return.
+                // Its old jump remains as the fifth slot, with the recovery's line.
+                jump.location = donor;
+                jump.jump_policy.retain_nop();
+            }
+        }
+    }
+
+    /// Preserves both original return copies where recovery arms leave a nested condition.
+    fn preserve_nested_recovery_returns(&mut self) {
+        use crate::target::opcodes::POP_TOP;
+        if self.python_version < crate::PythonVersion::Py314
+            || self.exception_regions.is_empty()
+            || !self.graph.features().has_forward_conditional()
+        {
+            return;
+        }
+        let graph = &self.graph;
+        let original_join = |block: BasicBlockId| {
+            let (Item::Instruction(jump), labels) = graph[block].items().split_last()? else {
+                return None;
+            };
+            (jump.opcode == JUMP_FORWARD
+                && jump.jump_policy.is_original_empty_join()
+                && jump.jump_policy.inline_small_exit()
+                && !jump.jump_policy.defers_redundant_removal()
+                && jump.pre_fold_extra_instructions() == 0
+                && jump.depth_after() == Some(0)
+                && labels.iter().all(|item| matches!(item, Item::Label(_))))
+            .then_some(jump)
+        };
+        let jump_target = |jump: &Instruction| graph.label_block(jump.forward_target()?);
+        let copies = graph
+            .iter()
+            .filter_map(|(cleanup, block)| {
+                let [labels @ .., Item::Instruction(pop), Item::Instruction(edge)] = block.items()
+                else {
+                    return None;
+                };
+                if pop.opcode != POP_EXCEPT
+                    || edge.opcode != JUMP_FORWARD
+                    || edge.depth_after() != Some(0)
+                    || !labels.iter().all(|item| matches!(item, Item::Label(_)))
+                {
+                    return None;
+                }
+                let first = jump_target(edge)?;
+                let inner = original_join(first)?;
+                let second = jump_target(inner)?;
+                let outer = original_join(second)?;
+                let tail = jump_target(outer)?;
+                if !matches!(
+                    original_computed_return(graph[tail].items()),
+                    Some(OriginalTail::ComputedReturn { width: 4 })
+                ) {
+                    return None;
+                }
+                let mut inputs = graph.iter().filter_map(|(id, block)| {
+                    let jump = block.last_instruction()?;
+                    (jump_target(jump) == Some(first)).then_some((id, jump))
+                });
+                let (_, guard) = inputs.next()?;
+                let (normal, success) = inputs.next()?;
+                let (handler, _) = inputs.next()?;
+                if inputs.next().is_some()
+                    || handler != cleanup
+                    || !super::super::is_conditional_jump(guard.opcode)
+                    || guard.location != inner.location
+                    || success.opcode != JUMP_FORWARD
+                    || [edge, success].iter().any(|jump| {
+                        jump.pre_fold_extra_instructions() != 0
+                            || !jump.jump_policy.inline_small_exit()
+                            || jump.jump_policy.is_interruptible()
+                    })
+                    || graph.iter().any(|(id, block)| {
+                        id != first
+                            && block
+                                .last_instruction()
+                                .and_then(Instruction::jump_target)
+                                .and_then(|label| graph.label_block(label))
+                                == Some(second)
+                    })
+                    || !graph.order().windows(2).any(|pair| {
+                        pair[1] == second
+                            && graph[pair[0]].last_instruction().is_some_and(|op| {
+                                op.opcode == POP_TOP && op.location == outer.location
+                            })
+                    })
+                {
+                    return None;
+                }
+                Some((
+                    normal,
+                    cleanup,
+                    first,
+                    second,
+                    inner.operand(),
+                    outer.operand(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        for (normal, cleanup, first, second, outer_target, returned) in copies {
+            // The warm exit and POP_EXCEPT first copy the inner join's jump. The
+            // guard still reaches that join, where the return gets a separate copy.
+            for source in [normal, cleanup] {
+                self.graph
+                    .instructions_mut(source)
+                    .next_back()
+                    .expect("recovery exit")
+                    .retarget(outer_target);
+            }
+            self.graph
+                .instructions_mut(first)
+                .next_back()
+                .expect("inner join")
+                .set_operand(returned);
+            // The outer join already received the return from its fallthrough.
+            // After that pass the old jump is a fifth slot, and its copies stop.
+            let jump = self
+                .graph
+                .instructions_mut(second)
+                .next_back()
+                .expect("outer join");
+            jump.jump_policy.prevent_threading_target();
+            jump.location = SourceLocation::NONE;
+            jump.no_location_policy.preserve_location();
         }
     }
 
@@ -2755,12 +3039,15 @@ impl OptimizationPipeline {
     pub(in crate::assembler) fn prepare_normal_try_copy_plan(&mut self) {
         // Prefix restoration and every selected cleanup require a forward jump and
         // a recorded normal exit or discard owner that can certify a cleanup crossing.
-        if !self.graph.features().has_forward_jump()
-            || (self.exception_owner_provenance.normal_try_exits.is_empty()
-                && self
-                    .exception_owner_provenance
-                    .normal_try_jump_owners
-                    .is_empty())
+        if !self.graph.features().has_forward_jump() {
+            return;
+        }
+        self.preserve_nested_recovery_returns();
+        if self.exception_owner_provenance.normal_try_exits.is_empty()
+            && self
+                .exception_owner_provenance
+                .normal_try_jump_owners
+                .is_empty()
         {
             return;
         }
@@ -2864,23 +3151,7 @@ impl OptimizationPipeline {
                     // region fragment, so copying its labels carries that owner
                     // while POP_BLOCK and POP_EXCEPT remain outside the handler.
                     // Keep the original priority and all other owner fields.
-                    if !handler_owner_starts.is_empty() {
-                        let regions = std::mem::take(&mut self.exception_regions);
-                        for region in regions {
-                            if let Some(&start) = handler_owner_starts.get(&region.end)
-                                && region.start != start
-                            {
-                                self.exception_regions.push(ExceptionRegion {
-                                    end: start,
-                                    ..region
-                                });
-                                self.exception_regions
-                                    .push(ExceptionRegion { start, ..region });
-                            } else {
-                                self.exception_regions.push(region);
-                            }
-                        }
-                    }
+                    split_discard_owner_regions(&mut self.exception_regions, &handler_owner_starts);
                     self.exception_owner_provenance
                         .normal_try_copy_internal_labels
                         .extend(internal);
@@ -2899,6 +3170,101 @@ impl OptimizationPipeline {
             &FxHashSet::default(),
             &FxHashMap::default(),
         );
+    }
+
+    /// Rejoins a value discard with its ordinary try exit before exit copying.
+    pub(in crate::assembler) fn prepare_conditional_discard_try_exits(&mut self) {
+        use crate::assembler::ir::BorrowFallthrough;
+        use crate::target::opcodes::POP_TOP;
+
+        let recorded = &self.exception_owner_provenance.normal_try_exits;
+        if self.python_version < crate::PythonVersion::Py314 || recorded.is_empty() {
+            return;
+        }
+        let mut candidates = Vec::new();
+        for pair in self.graph.order().windows(2) {
+            let (
+                [Item::Label(join), Item::Instruction(pop)],
+                [Item::Label(end), Item::Instruction(jump)],
+            ) = (self.graph[pair[0]].items(), self.graph[pair[1]].items())
+            else {
+                continue;
+            };
+            let Some(target) = jump.forward_target() else {
+                continue;
+            };
+            // Borrow analysis can turn this fallthrough into a barrier. It still
+            // contributes one original unlocated jump after POP_TOP and POP_BLOCK.
+            let mut expected = Instruction::new(
+                JUMP_FORWARD,
+                Operand::Forward(target),
+                SourceLocation::NONE,
+                Some(0),
+            );
+            if jump.no_location_policy.borrow_fallthrough() == BorrowFallthrough::Barrier {
+                expected
+                    .no_location_policy
+                    .set_borrow_fallthrough(BorrowFallthrough::Barrier);
+            }
+            if *jump == expected
+                && *pop
+                    == Instruction::new(POP_TOP, Operand::Value(0), SourceLocation::NONE, Some(0))
+                && recorded.contains(&(*end, target))
+                && self.preserved_block_boundaries.contains(join)
+                && self
+                    .exception_owner_provenance
+                    .source_boundaries
+                    .contains(join)
+                && self.original_discard_label_is_intact(*join)
+                && self.original_discard_label_is_intact(*end)
+                && !self.preserved_block_boundaries.contains(end)
+                && !self
+                    .exception_owner_provenance
+                    .block_boundaries
+                    .contains(end)
+                && !self
+                    .exception_owner_provenance
+                    .normal_try_copy_internal_labels
+                    .contains(end)
+                && self.exception_regions.iter().any(|region| {
+                    region.end == *end
+                        && region.depth == 0
+                        && !region.preserve_lasti
+                        && !region.is_scope_fallback
+                })
+            {
+                candidates.push((*join, *end, pair[1]));
+            }
+        }
+        if candidates.is_empty() {
+            return;
+        }
+        // A value arm may jump to the discard. No control-flow edge may enter
+        // between it and the ordinary try exit, which is only a range boundary.
+        let mut incoming = FxHashMap::<Label, bool>::default();
+        for instruction in self.graph.iter_items().filter_map(Item::as_instruction) {
+            if let Operand::Forward(target) | Operand::Backward(target) = instruction.operand() {
+                *incoming.entry(target).or_default() |= instruction.opcode == JUMP_FORWARD
+                    && instruction.depth_after() == Some(1)
+                    && instruction.pre_fold_extra_instructions() == 0;
+            }
+        }
+        let mut starts = FxHashMap::default();
+        for (join, end, exit) in candidates {
+            if incoming.get(&join) != Some(&true) || incoming.contains_key(&end) {
+                continue;
+            }
+            self.graph
+                .instructions_mut(exit)
+                .next()
+                .expect("ordinary try exit")
+                .allow_unconditional_block_inlining();
+            self.exception_owner_provenance
+                .normal_try_copy_internal_labels
+                .push(end);
+            starts.insert(end, join);
+        }
+        split_discard_owner_regions(&mut self.exception_regions, &starts);
     }
 
     /// Checks that a discard-exit label has no borrowing, folding, or omitted-NOP provenance.
@@ -3600,8 +3966,8 @@ impl OptimizationPipeline {
                 let Some(target) = graph.label_block(label) else {
                     continue;
                 };
-                let Some(tail @ OriginalTail::LocalTupleReturn { .. }) =
-                    original_return_tail(label)
+                let Some(tail) =
+                    original_return_tail(label).filter(OriginalTail::is_four_slot_value_return)
                 else {
                     continue;
                 };
@@ -3698,7 +4064,7 @@ impl OptimizationPipeline {
                     .contains(&label)
                 || (!exits.contains_key(&target)
                     && !guarded_handler_joins.contains_key(&target)
-                    && !matches!(returns.get(&target), Some(OriginalTail::LocalTupleReturn { .. })))
+                    && !matches!(returns.get(&target), Some(OriginalTail::LocalTupleReturn { .. } | OriginalTail::ConstantReturn { .. })))
                 || positions[&block] >= positions[&target]
                 || !items[..head_len].iter().any(|item| {
                     matches!(item, Item::Label(label)
@@ -3951,7 +4317,7 @@ impl OptimizationPipeline {
             && (exits.is_empty()
                 || !returns
                     .values()
-                    .any(|tail| matches!(tail, OriginalTail::LocalTupleReturn { .. })))
+                    .any(OriginalTail::is_four_slot_value_return))
         {
             return;
         }
@@ -3967,7 +4333,7 @@ impl OptimizationPipeline {
             .collect::<FxHashSet<_>>();
         // A private normal exit is part of its preceding runtime array. It can
         // still enter original unlocated joins whose copy rounds determine the
-        // size of a later tuple exit, without becoming a standalone POP_BLOCK target.
+        // size of a later four-slot return, without becoming a standalone POP_BLOCK target.
         let private_join_schedule = entry_returns.is_empty();
         if private_join_schedule {
             let mut private_joins = Vec::new();
@@ -4043,10 +4409,10 @@ impl OptimizationPipeline {
                         break;
                     }
                     current = target;
-                    if matches!(
-                        returns.get(&current),
-                        Some(OriginalTail::LocalTupleReturn { .. })
-                    ) {
+                    if returns
+                        .get(&current)
+                        .is_some_and(OriginalTail::is_four_slot_value_return)
+                    {
                         entry_returns.insert(current);
                         break;
                     }
@@ -4089,15 +4455,13 @@ impl OptimizationPipeline {
             .any(|block| !original_jump_targets.contains(block))
         {
             // A private normal exit belongs to its preceding runtime array. For
-            // an intact constant or local tuple tail, keep its jump as an ordinary
+            // an intact constant or four-slot value return, keep its jump as an ordinary
             // scheduled source; no predecessor can copy its omitted POP_BLOCK or
             // depend on its width. Only independently entered cleanup targets
             // receive restored arrays.
             if !entry_returns.iter().all(|block| {
-                matches!(
-                    returns[block],
-                    OriginalTail::ConstantReturn { .. } | OriginalTail::LocalTupleReturn { .. }
-                )
+                matches!(returns[block], OriginalTail::ConstantReturn { .. })
+                    || returns[block].is_four_slot_value_return()
             })
                 || selected
                     .iter()
@@ -4225,7 +4589,7 @@ impl OptimizationPipeline {
         }
         // Widths of private range fragments need not reconstruct the preceding
         // runtime array: no jump can enter them. Every actual copy target remains
-        // a certified singleton join or the intact four-slot tuple return.
+        // a certified singleton join or an intact four-slot value return.
         if private_join_schedule
             && sources.iter().any(|block| {
                 !selected_joins.contains(block) && original_jump_targets.contains(block)

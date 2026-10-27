@@ -2206,7 +2206,7 @@ pub(super) fn synthetic_condition_exit_range(expression: &Expr) -> ruff_text_siz
     unary_not_condition_exit_range(expression).unwrap_or(expression.range())
 }
 
-fn last_store_target_range(
+pub(super) fn last_store_target_range(
     compiler: &Compiler<'_>,
     expression: &Expr,
 ) -> ruff_text_size::TextRange {

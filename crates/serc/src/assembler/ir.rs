@@ -737,6 +737,13 @@ impl JumpPolicy {
         self.0 |= Self::ORIGINAL_SHARED_EMPTY_JOIN;
     }
 
+    /// Retains the authored marker only while its jump still targets the original exit.
+    pub(super) fn limit_nop_retention_to_direct_target(&mut self) {
+        if self.always_retains_nop() {
+            self.0 = (self.0 & !Self::RETAINED_NOP_MASK) | Self::RETAINED_NOP_DIRECT_TARGET;
+        }
+    }
+
     fn clear_direct_target_retention(&mut self) {
         if matches!(self.retained_nop(), RetainedJumpNop::DirectTarget)
             && self.0 & Self::RETAIN_NOP_AFTER_RETARGETING == 0
@@ -1685,8 +1692,8 @@ pub(crate) struct Assembler {
     pub(super) original_fallthrough_location: Option<(EmittedInstruction, SourceLocation)>,
     /// Source-authored match end awaiting its first emitted instruction.
     pub(super) original_match_join: Option<Label>,
-    /// Synchronous for-else end labels and their producer stack depth.
-    pub(super) original_sync_for_else_ends: FxHashMap<Label, u32>,
+    /// Original joins whose iterator discard has no location when shared.
+    pub(super) iterator_discard_joins: Vec<Label>,
     /// Keeps this large state in place as the assembler changes optimization phases.
     pub(super) exception_owner_provenance: LazyExceptionOwnerProvenance,
     /// Authored Pass records do not require the full owner state during emission.
@@ -1956,7 +1963,7 @@ impl Default for Assembler {
             exception_regions: Vec::new(),
             original_fallthrough_location: None,
             original_match_join: None,
-            original_sync_for_else_ends: FxHashMap::default(),
+            iterator_discard_joins: Vec::new(),
             exception_owner_provenance: LazyExceptionOwnerProvenance::default(),
             original_pass_nops: Vec::new(),
             preserved_block_boundaries: FxHashSet::default(),

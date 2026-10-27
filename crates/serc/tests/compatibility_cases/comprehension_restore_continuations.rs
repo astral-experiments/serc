@@ -95,3 +95,9 @@ fn preserves_real_boundaries_after_comprehension_restoration() {
         assert_restore_owner(statement, prelude_calls, join, condition);
     }
 }
+
+#[test]
+fn fresh_try_after_comprehension_leaves_monitoring_marker_unprotected() {
+    let source = "async def collect(owner, values):\n    owner.result = [format(value) for value in values]\n    try:\n        if active:\n            pass\n    except ValueError as error:\n        pass\n";
+    common::assert_matches_cpython_marshal(source, "comprehension_then_try.py");
+}

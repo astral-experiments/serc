@@ -155,14 +155,15 @@ impl OptimizationPipeline {
         Ok(())
     }
 
-    /// Removes unused legacy constants without changing their admission order.
-    pub(super) fn prune_legacy_constants(&mut self, constants: &mut dyn ConstantTable) {
-        if !matches!(
+    /// Removes unused legacy constants and returns the new index of each retained constant.
+    pub(super) fn prune_legacy_constants(
+        &mut self,
+        constants: &mut dyn ConstantTable,
+    ) -> Vec<Option<u32>> {
+        debug_assert!(matches!(
             self.python_version,
             PythonVersion::Py312 | PythonVersion::Py313
-        ) {
-            return;
-        }
+        ));
         let mut used = vec![false; constants.len()];
         if let Some(first) = used.first_mut() {
             // Slot zero can hold a docstring even when no instruction loads it.
@@ -184,6 +185,7 @@ impl OptimizationPipeline {
                 instruction.set_operand(Operand::Value(indices[index as usize].unwrap()));
             }
         });
+        indices
     }
 }
 

@@ -34,6 +34,16 @@ pub(super) enum OriginalTail {
     },
 }
 
+impl OriginalTail {
+    /// A completely located value return that occupied four original instructions.
+    pub(super) fn is_four_slot_value_return(&self) -> bool {
+        matches!(
+            self,
+            Self::LocalTupleReturn { .. } | Self::ComputedReturn { width: 4 }
+        )
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct OriginalNode {
     pub(super) id: BasicBlockId,

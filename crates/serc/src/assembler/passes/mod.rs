@@ -241,7 +241,7 @@ impl Assembler {
         let mut exception_owner_provenance = self.exception_owner_provenance.into_box();
         debug_assert_eq!(exception_owner_provenance.original_pass_nops.len(), 0);
         exception_owner_provenance.original_pass_nops = self.original_pass_nops;
-        let (mut graph, initial_reachable) = match self.code {
+        let (mut graph, mut initial_reachable) = match self.code {
             UnoptimizedCode::Linear(items) => (
                 BlockGraph::from_items(items, &rustc_hash::FxHashSet::default()),
                 None,
@@ -256,6 +256,33 @@ impl Assembler {
                 (graph, Some(reachable))
             }
         };
+        // A dead handler tail cannot share a discard with the normal exit. Let a
+        // sole live predecessor donate its position, including to cold copies.
+        if !self.iterator_discard_joins.is_empty() {
+            let reachable = initial_reachable
+                .get_or_insert_with(|| graph.reachable_blocks(&self.exception_regions));
+            let mut incoming = vec![0u32; graph.len()];
+            for (source, block) in graph.iter() {
+                if reachable[source.index()]
+                    && let Some(target) = block
+                        .successors()
+                        .1
+                        .and_then(|label| graph.label_block(label))
+                {
+                    incoming[target.index()] += 1;
+                }
+            }
+            for join in self.iterator_discard_joins {
+                if let Some(block) = graph.label_block(join)
+                    && incoming[block.index()] > 1
+                    && let Some(discard) = graph.instructions_mut(block).next()
+                    && discard.opcode == crate::target::opcodes::POP_TOP
+                    && discard.location == SourceLocation::NONE
+                {
+                    discard.no_location_policy.preserve_location();
+                }
+            }
+        }
         if self.python_version <= crate::PythonVersion::Py313
             && let Some(index) = self.deferred_none_constant_index
         {
@@ -290,16 +317,15 @@ impl Assembler {
                 continue;
             }
             // A folded successful arm can thread through an original unlocated
-            // branch exit. The remaining runtime None-test then owns that exit's line.
-            // Keep return arrays and every protected or multiply entered join separate.
+            // branch exit. The remaining runtime test then owns that exit's line.
+            // A folded success jump in a protected assertion also loses its owner.
             let folded_join = (|| {
                 use crate::target::opcodes::{
-                    JUMP_FORWARD, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE, RAISE_VARARGS,
+                    JUMP_FORWARD, POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE,
+                    POP_JUMP_IF_TRUE, RAISE_VARARGS,
                 };
 
-                if !self.exception_regions.is_empty() {
-                    return None;
-                }
+                let protected = !self.exception_regions.is_empty();
                 let (Item::Instruction(bridge), labels) = graph[target].items().split_last()?
                 else {
                     return None;
@@ -338,6 +364,35 @@ impl Assembler {
                 {
                     return None;
                 }
+                if protected {
+                    let position = |label| {
+                        let block = graph.label_block(label)?;
+                        order.iter().position(|candidate| *candidate == block)
+                    };
+                    if !self.exception_regions.iter().any(|region| {
+                        !region.is_scope_fallback
+                            && position(region.start).is_some_and(|start| start <= source_position)
+                            && position(region.end).is_some_and(|end| target_position < end)
+                    }) {
+                        return None;
+                    }
+                    let mut failure = graph[order[target_position - 1]]
+                        .items()
+                        .iter()
+                        .rev()
+                        .filter_map(Item::as_instruction);
+                    let raise = failure.next()?;
+                    let error = failure.next()?;
+                    if raise.value_argument() != Some(1)
+                        || error.opcode != crate::target::opcodes::LOAD_COMMON_CONSTANT
+                        || error.value_argument()
+                            != Some(
+                                crate::target::operands::CommonConstant::ASSERTIONERROR.argument(),
+                            )
+                    {
+                        return None;
+                    }
+                }
                 let mut incoming = graph
                     .iter()
                     .flat_map(|(block, array)| {
@@ -363,7 +418,12 @@ impl Assembler {
                 } else {
                     return None;
                 };
-                if !matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+                let is_condition = if protected {
+                    matches!(condition.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE)
+                } else {
+                    matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+                };
+                if !is_condition
                     || condition.forward_target().is_none()
                     || condition.location.line < 0
                     || condition.location.line != original.location.line
@@ -380,14 +440,17 @@ impl Assembler {
                 {
                     return None;
                 }
-                Some(bridge.operand())
+                Some((bridge.operand(), protected))
             })();
-            if let Some(destination) = folded_join {
-                graph
+            if let Some((destination, protected)) = folded_join {
+                let folded = graph
                     .instructions_mut(source)
                     .next()
-                    .expect("exact folded arm")
-                    .retarget(destination);
+                    .expect("exact folded arm");
+                folded.retarget(destination);
+                if protected {
+                    folded.set_exception_policy(super::ExceptionPolicy::EXCLUDE_ALWAYS);
+                }
                 graph
                     .instructions_mut(target)
                     .next()
@@ -612,6 +675,7 @@ impl OptimizationPipeline {
         }
         let local_nop_donors = self.capture_local_nop_donors();
         let reversed_store_exits = self.capture_reversed_store_exits();
+        self.preserve_manager_branch_return_joins();
         self.preserve_shared_original_manager_pop_locations();
         self.record_shared_unlocated_jump_entries();
         let mut original_owners = FusionOwnerCertificates::capture_original_owners(&self);
@@ -769,6 +833,25 @@ impl OptimizationPipeline {
         // Exit duplication changes this surviving conditional's target, not its
         // original array or the normal-finally comparison cells recorded within it.
         for (before, after) in &copied_exit_owner_retargets {
+            // Duplicating the exit retargets the surviving guard. Preserve that exact
+            // substitution only for a unique captured and live instruction.
+            let mut returns = self
+                .exception_owner_provenance
+                .copied_return_guards
+                .iter_mut()
+                .filter(|origin| origin.condition == *before);
+            if let Some(origin) = returns.next()
+                && returns.next().is_none()
+                && self
+                    .graph
+                    .iter_items()
+                    .filter(|item| matches!(item, Item::Instruction(record) if record == after))
+                    .count()
+                    == 1
+            {
+                origin.condition = *after;
+            }
+
             if self
                 .exception_owner_provenance
                 .copied_handler_cleanups
@@ -911,7 +994,7 @@ impl OptimizationPipeline {
                     records[3] = *after;
                 }
             }
-            for (_, records) in &mut self
+            for (_, records, _) in &mut self
                 .exception_owner_provenance
                 .copied_handler_return_none_prefixes
             {
@@ -1577,12 +1660,55 @@ impl LayoutAssembler {
             });
         }
 
+        // These surviving jumps read original END_SEND or comprehension header
+        // labels. Later labels for empty or duplicated blocks do not size them.
+        let mut short_source_jumps = rustc_hash::FxHashMap::default();
+        let origins = &self.exception_owner_provenance;
+        let all_source_labels_fit = origins.legacy_source_jump_labels_fit;
+        let short_await_labels = &origins.legacy_short_await_labels;
+        if !native_jump_widths && !uniform_jump_widths {
+            if all_source_labels_fit {
+                short_source_jumps.extend(origins.legacy_comprehension_backedges.iter().copied());
+            }
+            if all_source_labels_fit || !short_await_labels.is_empty() {
+                short_source_jumps.extend(
+                    origins
+                        .ordinary_await_ends
+                        .iter()
+                        .filter(|origin| {
+                            all_source_labels_fit || short_await_labels.contains(&origin.entry)
+                        })
+                        .filter_map(|origin| origin.bridge),
+                );
+                short_source_jumps.extend(
+                    origins
+                        .async_with_setups
+                        .iter()
+                        .filter(|origin| {
+                            all_source_labels_fit
+                                || origin
+                                    .send
+                                    .jump_target()
+                                    .is_some_and(|end| short_await_labels.contains(&end))
+                        })
+                        .filter_map(|origin| origin.bridge),
+                );
+            }
+        }
+        let mut expected_jump = None;
         let mut extended_args = Vec::with_capacity(instruction_count);
         let mut resolved_arguments = Vec::with_capacity(instruction_count);
         for item in &self.items {
-            let Item::Instruction(instruction) = item else {
-                continue;
+            let instruction = match item {
+                Item::Instruction(instruction) => instruction,
+                Item::Label(label) => {
+                    if let Some(jump) = short_source_jumps.get(label) {
+                        expected_jump = Some(jump);
+                    }
+                    continue;
+                }
             };
+            let short_source_jump = expected_jump.take() == Some(instruction);
             let argument = match self.encoded_operand(instruction)? {
                 Operand::Value(argument) => argument,
                 Operand::Forward(label) | Operand::Backward(label) => initial_jump_arguments
@@ -1599,6 +1725,38 @@ impl LayoutAssembler {
                 instruction
                     .legacy_initial_jump_width()
                     .expect("all native jumps are certified")
+            } else if self
+                .exception_owner_provenance
+                .legacy_original_jump_operands_fit
+                && (crate::target::is_conditional_jump(instruction.opcode)
+                    || instruction.opcode == crate::target::opcodes::FOR_ITER
+                    || (instruction.opcode == crate::target::opcodes::JUMP_FORWARD
+                        && instruction.location.line >= 0)
+                    || (instruction.opcode == crate::target::opcodes::JUMP_BACKWARD
+                        && instruction.jump_target().is_some_and(|target| {
+                            self.exception_owner_provenance
+                                .legacy_for_headers
+                                .contains(&target)
+                        })))
+            {
+                // Threading and conditional inversion preserve the original operand.
+                // A forward cold bridge has no line donor. A normalized loop
+                // backedge uses its nonempty FOR_ITER header's source label.
+                0
+            } else if short_source_jump
+                || (matches!(
+                    instruction.opcode,
+                    crate::target::opcodes::SEND
+                        | crate::target::opcodes::JUMP_BACKWARD_NO_INTERRUPT
+                ) && (all_source_labels_fit
+                    || instruction
+                        .jump_target()
+                        .is_some_and(|target| short_await_labels.contains(&target))))
+            {
+                // Python 3.12 emits SEND and JUMP_NO_INTERRUPT only in its
+                // yield-from loop. Their END_SEND and SEND targets are nonempty
+                // source blocks, so empty-block repair cannot replace the operands.
+                0
             } else {
                 extended_arg_count(argument)
             };
@@ -1737,6 +1895,50 @@ mod uniform_jump_seed_tests {
             removed_max_depth: None,
             next_label: 1,
             has_next_location: false,
+        }
+    }
+
+    #[test]
+    fn partial_comprehension_seed_requires_its_original_backedge() {
+        let version = PythonVersion::Py312;
+        for (bounded, surviving) in [(true, true), (true, false), (false, true)] {
+            let mut layout = boundary_layout(version, false, None, false);
+            let entry = Label::from_u32(1);
+            layout.next_label = 2;
+            let Some(Item::Instruction(jump)) = layout.items.pop() else {
+                unreachable!()
+            };
+            let mut captured = jump;
+            if !surviving {
+                captured.retarget(Operand::Backward(entry));
+            }
+            layout
+                .items
+                .extend([Item::Label(entry), Item::Instruction(jump)]);
+            layout
+                .exception_owner_provenance
+                .legacy_source_jump_labels_fit = bounded;
+            layout
+                .exception_owner_provenance
+                .legacy_comprehension_backedges
+                .push((entry, captured));
+            let code = layout.finish(1).unwrap().bytecode;
+            let suffix = if bounded && surviving {
+                [
+                    NOP.code_for(version),
+                    0,
+                    JUMP_BACKWARD.code_for(version),
+                    255,
+                ]
+            } else {
+                [
+                    EXTENDED_ARG.code_for(version),
+                    1,
+                    JUMP_BACKWARD.code_for(version),
+                    0,
+                ]
+            };
+            assert!(code.ends_with(&suffix));
         }
     }
 
