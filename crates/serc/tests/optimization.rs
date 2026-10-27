@@ -1981,6 +1981,26 @@ fn nested_recovery_reaches_a_separate_tuple_return() {
 }
 
 #[test]
+fn nested_handlers_share_a_returned_call_without_inheriting_one_handler_line() {
+    let source = "def sample(flag, fallback):
+    if flag:
+        try:
+            value = first()
+        except KeyError:
+            try:
+                value = second()
+            except ValueError:
+                value = fallback
+            except TypeError:
+                value = third()
+    else:
+        value = fallback
+    return value()
+";
+    assert_matches_cpython(source, "nested_handler_call.py", &LEVELS);
+}
+
+#[test]
 fn guarded_loop_try_paths_keep_separate_backedges() {
     let source = "def sample(items, selected, guard):
     try:

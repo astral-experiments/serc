@@ -2709,17 +2709,15 @@ impl OptimizationPipeline {
         prefixes
     }
 
-    /// Finds the sole nested recovery whose handler cleanup jumps to this tuple return.
-    fn nested_recovery_tuple_donor(
+    /// Finds the inherited location of a return reached through nested handler cleanup.
+    fn nested_recovery_return_location(
         &self,
         normal: BasicBlockId,
         join: BasicBlockId,
-        tail: BasicBlockId,
     ) -> Option<SourceLocation> {
         use crate::target::opcodes::{DELETE_FAST, LOAD_CONST, STORE_FAST};
 
         let graph = &self.graph;
-        original_local_tuple_return(graph[tail].items())?;
         let jump_target = |jump: &Instruction| graph.label_block(jump.forward_target()?);
         let normal_jump = graph[normal].last_instruction()?;
         if normal_jump.location.line < 0
@@ -2728,30 +2726,43 @@ impl OptimizationPipeline {
         {
             return None;
         }
-        let sole_predecessor_except = |target, excluded| {
-            let mut sources = graph.iter().filter_map(|(source, block)| {
-                (Some(source) != excluded
-                    && block.last_instruction().and_then(jump_target) == Some(target))
-                .then_some(source)
-            });
-            let source = sources.next()?;
-            sources.next().is_none().then_some(source)
+        let inputs = |target| {
+            graph.iter().filter_map(move |(source, block)| {
+                let jump = block.last_instruction()?;
+                (jump_target(jump) == Some(target)).then_some((source, jump))
+            })
         };
-        let cleanup = sole_predecessor_except(join, Some(normal))?;
-        let recovered = sole_predecessor_except(cleanup, None)?;
-        if graph.order().windows(2).any(|pair| {
-            (pair[1] == cleanup || pair[1] == join)
-                && super::super::block_has_fallthrough(graph[pair[0]].items())
-        }) || !self
-            .exception_owner_provenance
-            .normal_try_exits
-            .iter()
-            .any(|&(entry, end)| {
-                graph.label_block(entry) == Some(recovered)
-                    && graph.label_block(end) == Some(cleanup)
+        let mut entries = inputs(join).filter(|(source, _)| *source != normal);
+        let (cleanup, _) = entries.next()?;
+        if entries.next().is_some()
+            || graph.order().windows(2).any(|pair| {
+                (pair[1] == cleanup || pair[1] == join)
+                    && super::super::block_has_fallthrough(graph[pair[0]].items())
             })
         {
             return None;
+        }
+        let mut entries = inputs(cleanup);
+        let (recovered, first) = entries.next()?;
+        if first.opcode != JUMP_FORWARD
+            || first.location.line < 0
+            || !self
+                .exception_owner_provenance
+                .normal_try_exits
+                .iter()
+                .any(|&(entry, end)| {
+                    graph.label_block(entry) == Some(recovered)
+                        && graph.label_block(end) == Some(cleanup)
+                })
+        {
+            return None;
+        }
+        let mut location = first.location;
+        for (_, caught) in entries {
+            if caught.opcode != JUMP_FORWARD || caught.location.line < 0 {
+                return None;
+            }
+            location = SourceLocation::NONE;
         }
         let items = graph[cleanup].items();
         let first = items
@@ -2779,17 +2790,14 @@ impl OptimizationPipeline {
             }
             _ => false,
         };
-        let donor = graph[recovered].last_instruction()?;
         (pop.opcode == POP_EXCEPT
             && valid_name_cleanup
             && jump.opcode == JUMP_FORWARD
             && items[first..]
                 .iter()
                 .filter_map(Item::as_instruction)
-                .all(|op| op.location == SourceLocation::NONE)
-            && donor.opcode == JUMP_FORWARD
-            && donor.location.line >= 0)
-            .then_some(donor.location)
+                .all(|op| op.location == SourceLocation::NONE))
+        .then_some(location)
     }
 
     /// Keeps original jumps until their shared try exit can copy its return.
@@ -2845,7 +2853,7 @@ impl OptimizationPipeline {
                 continue;
             }
             if unlocated_jump(entry) != Some(join) {
-                if let Some(donor) = self.nested_recovery_tuple_donor(entry, join, tail) {
+                if let Some(donor) = self.nested_recovery_return_location(entry, join) {
                     let tail_label = graph[tail].first_label().expect("original return target");
                     joins.push((join, Some((entry, tail_label, donor))));
                 }
@@ -2912,10 +2920,14 @@ impl OptimizationPipeline {
                 .expect("singleton try join");
             jump.jump_policy.prevent_threading_target();
             if let Some((_, _, donor)) = normal_copy {
-                // The recovery reaches the bridge after it copies the tuple return.
-                // Its old jump remains as the fifth slot, with the recovery's line.
+                // The old jump is a fifth slot after the bridge copies its return.
+                // Only a unique incoming recovery can give that slot a source line.
                 jump.location = donor;
-                jump.jump_policy.retain_nop();
+                if donor == SourceLocation::NONE {
+                    jump.no_location_policy.preserve_location();
+                } else {
+                    jump.jump_policy.retain_nop();
+                }
             }
         }
     }
