@@ -19066,3 +19066,29 @@ fn nested_conditional_arms_donate_implicit_return_locations() {
 ";
     assert_matches_cpython(source, "nested_implicit_returns.py", &LEVELS);
 }
+
+#[test]
+fn specialized_comparison_keeps_its_try_else_guard_handler() {
+    let source = r"async def check(manager, obj, count, last):
+    async with manager:
+        try:
+            await start()
+        except ValueError:
+            raise
+        except Exception as error:
+            raise
+        finally:
+            try:
+                item = api.get(obj)
+            except LookupError:
+                missing()
+            else:
+                if (
+                    item.size == count
+                    and ready(item) != last
+                ):
+                    pass
+        await done()
+";
+    assert_matches_cpython(source, "managed_try_else_comparison.py", &LEVELS);
+}
