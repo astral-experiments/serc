@@ -31114,6 +31114,19 @@ impl<'source> Compiler<'source> {
                             && matches!(guard.body.as_slice(), [Stmt::Break(_)])
                             && expression_suspends_current_scope(&guard.test)
                             && original_condition_has_unique_jump_target(&guard.test, false));
+                // A runtime guard's sole false edge keeps the original else jump
+                // populated. Loops in the relocated handlers do not cross that edge.
+                let guarded_loop_successor = self.context.python_version
+                    == crate::PythonVersion::Py314
+                    && borrow_exit_has_source_successor
+                    && self.control.in_loop()
+                    && statement.finalbody.is_empty()
+                    && matches!(statement.orelse.last(), Some(Stmt::If(guard))
+                        if guard.elif_else_clauses.is_empty()
+                            && condition_has_linear_runtime_leaves(&guard.test)
+                            && original_condition_has_unique_jump_target(&guard.test, false)
+                            && !expression_suspends_current_scope(&guard.test)
+                            && suite_terminates_before_constant_folding(&guard.body));
                 // Recovery handlers keep this located normal exit connected to the following
                 // suite. Cold cleanup or an unlocated join can leave an empty block in between.
                 if (pass_only_handlers
@@ -31127,11 +31140,15 @@ impl<'source> Compiler<'source> {
                             handler.as_except_handler().is_some_and(|handler| {
                                 !suite_terminates(&handler.body)
                                     && (!suite_contains_loop(&handler.body)
-                                        || coroutine_awaited_else_break)
-                                    && !handler
+                                        || coroutine_awaited_else_break
+                                        || guarded_loop_successor)
+                                    && (!handler
                                         .body
                                         .last()
                                         .is_some_and(statement_threads_through_empty_join)
+                                        || (guarded_loop_successor
+                                            && matches!(handler.body.last(), Some(Stmt::If(branch))
+                                                if if_suites(branch).any(suite_contains_loop))))
                                     && !handler.body.iter().any(|statement| {
                                         matches!(statement, Stmt::Assert(assertion)
                                             if early_condition_truthiness(&assertion.test)
