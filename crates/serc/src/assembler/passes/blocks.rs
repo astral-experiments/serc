@@ -8345,17 +8345,23 @@ impl OptimizationPipeline {
                             || (!membership.contains(&positions[source.index()])
                                 && !membership.contains(&positions[target.index()]))
                     });
-            // A newly copied, unprotected straight-line exit has no native block boundary at
-            // this seam. Admit its local pair through the same predicate used by the fuser;
-            // the following operation does not determine whether CPython combines the loads.
-            // Keep all existing copying paths unchanged, and decline protected participating
-            // blocks or copies with an interior label or branch that could observe the entry offset.
-            let inline_unprotected_local_pair = inline_small_exit
+            // The copied entry has no native block boundary. A raise with a local cause
+            // can also join its predecessor inside a handler when both loads have the
+            // same exception coverage and the copy introduces no boundary of its own.
+            let copied_raise_with_cause = matches!(
+                copied.as_slice(),
+                [labels @ .., Item::Instruction(_), Item::Instruction(raise)]
+                    if raise.opcode == RAISE_VARARGS && raise.value_argument() == Some(2)
+                        && labels.iter().all(|item| matches!(item, Item::Label(_)))
+            );
+            let inline_local_pair = inline_small_exit
                 && !exception_boundary_blocks[source.index()]
                 && !exception_boundary_blocks[target.index()]
                 && region_memberships.iter().all(|membership| {
-                    !membership.contains(&positions[source.index()])
-                        && !membership.contains(&positions[target.index()])
+                    let source_protected = membership.contains(&source_position);
+                    let target_protected = membership.contains(&target_position);
+                    source_protected == target_protected
+                        && (!source_protected || copied_raise_with_cause)
                 })
                 && copied_exception_regions.is_empty()
                 && copied_region_exclusions.iter().all(Vec::is_empty)
@@ -8565,10 +8571,7 @@ impl OptimizationPipeline {
                 // the original owner. Retain those labels just like original region ends.
                 exception_boundary_blocks[source.index()] = true;
             }
-            if inline_borrowed_tuple_exit
-                || inline_unprotected_local_pair
-                || inline_keyword_return_pair
-            {
+            if inline_borrowed_tuple_exit || inline_local_pair || inline_keyword_return_pair {
                 let first_instruction = copied
                     .iter()
                     .position(|item| matches!(item, Item::Instruction(_)))
