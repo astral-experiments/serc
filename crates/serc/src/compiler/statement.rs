@@ -14940,8 +14940,16 @@ impl<'source> Compiler<'source> {
                             && context.finally_end_depth == 0
                             && context.exception_region_depth == 0
                     });
+                // A literal store followed by a copied bare raise still fits the
+                // four original slots available to the successful comparison edge.
+                let literal_store = self.context.python_version >= crate::PythonVersion::Py314
+                    && matches!(body, [Stmt::Assign(assignment)]
+                        if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                            && is_literal_constant(&assignment.value));
                 let retained_chained_comparison_exit =
-                    (matches!(body, [Stmt::Return(_) | Stmt::Raise(_)]) || terminal_break_return)
+                    (matches!(body, [Stmt::Return(_) | Stmt::Raise(_)])
+                        || terminal_break_return
+                        || literal_store)
                         .then(|| {
                             final_chained_comparison_jump(test).or_else(|| {
                                 (self.control.statements.context.has_following

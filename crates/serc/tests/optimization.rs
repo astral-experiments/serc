@@ -5203,6 +5203,26 @@ fn recovery_finalizer_preserves_local_return_borrow_boundary() {
 }
 
 #[test]
+fn chained_comparison_copies_a_store_and_bare_raise() {
+    let source = r"def classify(value):
+    try:
+        work()
+    except ValueError:
+        if value is not None and 0 < value < 7:
+            category = 'low'
+        elif value:
+            category = 'high'
+        raise
+";
+    assert_matches_cpython_versions(
+        source,
+        "chained_comparison_reraise.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn chained_comparison_try_exit_preserves_borrow_fallthrough() {
     let source = r"def sample(items, action, guard, recover):
     for item in items:
