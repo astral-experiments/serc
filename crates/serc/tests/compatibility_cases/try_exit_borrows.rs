@@ -2362,3 +2362,13 @@ fn terminal_deletion_preserves_original_return_boundary() {
         common::assert_matches_cpython_marshal(&source, "terminal_deletion_return.py");
     }
 }
+
+#[test]
+fn borrows_on_synchronous_iterator_fallthrough_in_an_async_generator() {
+    for alternative in ["for", "async for"] {
+        let source = format!(
+            "async def stream(rows, asynchronous):\n    try:\n        if asynchronous:\n            async for row in rows:\n                yield row\n        else:\n            {alternative} row in rows:\n                yield row\n    except Error as error:\n        yield error\n    finally:\n        close(rows)\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "generator_iterator_fallthrough.py");
+    }
+}
