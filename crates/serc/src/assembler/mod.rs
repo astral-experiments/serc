@@ -16186,6 +16186,20 @@ impl Assembler {
         })
     }
 
+    /// Stops borrowed-local traversal at an original NOP that donated its line to a jump.
+    pub(crate) fn record_compacted_nop_borrow_entry(&mut self, removed: &RemovedNop) {
+        let Some((entry, after)) = removed.exclusion else {
+            return;
+        };
+        let boundaries = &self.exception_owner_provenance.source_boundaries;
+        // A NOP between two source block heads was the only instruction in the first
+        // block. CPython removes it after propagating its line into the second block.
+        if removed.location.line >= 0 && boundaries.contains(&entry) && boundaries.contains(&after)
+        {
+            self.prevent_borrow_reachability(entry);
+        }
+    }
+
     /// Identifies range splits that only exclude an authored SETUP NOP.
     pub(crate) fn record_setup_nop_boundaries(&mut self, start: Label, end: Label) {
         // Capture the original fallthrough before CFG threading can invert its

@@ -3257,6 +3257,24 @@ fn awaited_branch_keeps_nested_cleanup_reachable() {
 }
 
 #[test]
+fn compacted_pass_preserves_its_borrow_boundary() {
+    let source = r"def select(value, first, second, third):
+    if first:
+        if second:
+            pass
+        else:
+            pass
+    elif third:
+        pass
+    return value.attr
+";
+    for tail in ["pass", "consume(value)\n            pass"] {
+        let source = source.replace("pass\n    elif third", &format!("{tail}\n    elif third"));
+        assert_matches_cpython(&source, "compacted_pass.py", &LEVELS);
+    }
+}
+
+#[test]
 fn nested_else_conditional_retains_borrowed_continuation() {
     for handler in ["Error", "Error as error"] {
         for arm in ["result = build(value)", "consume(value)"] {
