@@ -35,6 +35,25 @@ fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
 }
 
 #[test]
+fn nested_cleanup_keeps_the_enclosing_guards_exit_location() {
+    let source = r"def run(outer, ready, value):
+    if outer:
+        if not ready:
+            try:
+                use(value)
+            finally:
+                try:
+                    close(value)
+                except LookupError:
+                    pass
+    else:
+        raise ValueError
+    finish(value)
+";
+    assert_matches_cpython(source, "nested_guard_cleanup.py", &LEVELS);
+}
+
+#[test]
 fn nested_finally_guard_inherits_the_preceding_calls_handler() {
     let source = r"def run(group):
     try:

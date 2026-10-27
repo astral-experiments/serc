@@ -51883,6 +51883,9 @@ fn suite_has_nonsuspending_raise_work(body: &[Stmt]) -> bool {
 fn suite_has_unconditional_cleanup_exit(body: &[Stmt]) -> bool {
     match body.last() {
         Some(Stmt::Try(statement)) => {
+            if statement.finalbody.is_empty() {
+                return true;
+            }
             // A direct return makes the normal finalizer exit unreachable. Its copied
             // cleanup returns separately, leaving only the surrounding condition's
             // false edge at the original join.
@@ -51907,7 +51910,31 @@ fn suite_has_unconditional_cleanup_exit(body: &[Stmt]) -> bool {
                 && suite_terminates_before_constant_folding(&statement.body)
                 && !suite_contains_yield_with_headers(&statement.body, true, true)
                 && suite_has_nonsuspending_raise_work(&statement.body);
-            statement.finalbody.is_empty()
+            let linear = |body: &[Stmt]| {
+                suite_has_nonsuspending_linear_fallthrough(body)
+                    || body.iter().all(|part| match part {
+                        Stmt::Pass(_) => true,
+                        Stmt::Expr(expr) => fold_constant(&expr.value).is_some(),
+                        _ => false,
+                    })
+            };
+            // The normal end of a straight finalizer jumps past the enclosing guard's exit.
+            // An ordinary recovery in the finalizer can complete through the same jump.
+            let normal_cleanup = statement.handlers.is_empty()
+                && statement.orelse.is_empty()
+                && linear(&statement.body)
+                && (linear(&statement.finalbody)
+                    || matches!(statement.finalbody.as_slice(), [Stmt::Try(recovery)]
+                    if !recovery.is_star && recovery.finalbody.is_empty()
+                        && recovery.orelse.is_empty() && linear(&recovery.body)
+                        && recovery.handlers.iter().all(|handler|
+                            handler.as_except_handler().is_some_and(|h| {
+                                h.type_.as_deref().is_none_or(|ty|
+                                    !expression_contains_inline_branch(ty)
+                                        && !expression_suspends_current_scope(ty))
+                                    && linear(&h.body)
+                            }))));
+            normal_cleanup
                 // A terminal condition in the protected body can leave an empty
                 // original join before cleanup. Linear finalizer work alone does
                 // not certify the enclosing condition's sole predecessor.
