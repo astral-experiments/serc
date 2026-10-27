@@ -19067,6 +19067,17 @@ impl<'source> Compiler<'source> {
         true
     }
 
+    /// Prepares a value join that exits directly to the loop's interruptible backedge.
+    fn prepare_copied_loop_discard(&mut self, body: &[Stmt]) -> bool {
+        if self.context.python_version < crate::PythonVersion::Py314 {
+            return false;
+        }
+        self.prepare_loop_tail_boolean_discard(body)
+            || matches!(body.last(), Some(Stmt::Expr(expression))
+                if matches!(expression.value.as_ref(), Expr::If(_))
+                    && self.assembler.last_instruction_location() == Some(SourceLocation::NONE))
+    }
+
     fn compile_loop_tail_suite(
         &mut self,
         body: &[Stmt],
@@ -21393,6 +21404,7 @@ impl<'source> Compiler<'source> {
         if !inline_try_tail {
             self.set_branch_end_location(body, body_start);
         }
+        let value_discard = self.prepare_copied_loop_discard(body);
         let backedge = self.emit_jump_backward_instruction(JUMP_BACKWARD, restart)?;
         if self.context.python_version >= crate::PythonVersion::Py314
             && (matches!(body, [Stmt::Pass(_)])
@@ -21411,17 +21423,10 @@ impl<'source> Compiler<'source> {
             self.assembler
                 .prepare_no_location_block_for_inlining(backedge);
         }
-        if body
-            .last()
-            .is_some_and(try_has_conditional_shared_loop_exit)
-            || (self.context.python_version >= crate::PythonVersion::Py314
-                && matches!(body.last(), Some(Stmt::Expr(statement))
-                    if matches!(statement.value.as_ref(), Expr::If(conditional)
-                        if condition_has_linear_runtime_leaves(&conditional.test)
-                            && original_condition_has_unique_jump_target(&conditional.test, true)
-                            && original_condition_has_unique_jump_target(&conditional.test, false)
-                            && [conditional.body.as_ref(), conditional.orelse.as_ref()].into_iter().all(|arm|
-                                !expression_contains_inline_branch(arm) && !expression_suspends_current_scope(arm)))))
+        if value_discard
+            || body
+                .last()
+                .is_some_and(try_has_conditional_shared_loop_exit)
         {
             // A conditional result reaches a shared POP_TOP before the backedge.
             // Each arm supplies the location of its own discard and jump.
@@ -23979,7 +23984,13 @@ impl<'source> Compiler<'source> {
                     self.assembler
                         .set_location(self.source_location(statement.range()));
                 }
+                let value_discard = self.prepare_copied_loop_discard(body);
                 let backedge = self.emit_loop_tail_backedge(restart, try_body_normal_exit)?;
+                if value_discard && branch_index + 1 < branch_count {
+                    // The earlier arm jumps to the backedge. The last arm's discard
+                    // falls through to it and keeps its original shared block.
+                    self.assembler.mark_as_artificial_eval_break(backedge);
+                }
                 if shared_match_failure || copied_erased_branch_exit {
                     // Native copies the common backedge into this arm's forward exit:
                     // [unlocated NOP, unlocated JUMP]. Preserve that original array so
@@ -26154,7 +26165,11 @@ impl<'source> Compiler<'source> {
                 self.assembler
                     .set_location(self.source_location(statement.range()));
             }
+            let value_discard = self.prepare_copied_loop_discard(&statement.body);
             let backedge = self.emit_jump_backward_instruction(JUMP_BACKWARD, start)?;
+            if value_discard {
+                self.assembler.mark_as_artificial_eval_break(backedge);
+            }
             if unlocated_original_backedge {
                 self.assembler
                     .prepare_no_location_block_for_inlining(backedge);
