@@ -1448,7 +1448,8 @@ impl Compiler<'_> {
                                 );
                             }
                         }
-                        if self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                        if (self.context.python_version == PythonVersion::Py314
+                            || self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0)
                             && has_default
                             && index + 1 == matched_cases
                             && case.guard.is_none()
@@ -1551,7 +1552,9 @@ impl Compiler<'_> {
             if let Some(success_offset) = or_default_success_exit
                 && case.guard.is_none()
                 && matches!(case.body.as_slice(), [Stmt::Return(return_)]
-                    if return_.value.as_deref().is_none_or(|value| matches!(value, Expr::NoneLiteral(_))))
+                    if return_.value.as_deref().is_none_or(|value| matches!(value, Expr::NoneLiteral(_)))
+                        || self.context.python_version == PythonVersion::Py314
+                            && self.assembler.is_small_linear_scope_exit_since(default_start))
                 && self
                     .assembler
                     .pre_fusion_instruction_count_since(default_start)
