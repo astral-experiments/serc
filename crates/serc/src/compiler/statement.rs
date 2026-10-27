@@ -6824,7 +6824,7 @@ impl<'source> Compiler<'source> {
             Stmt::If(statement) => self.compile_if(statement)?,
             Stmt::While(statement) => self.compile_while(statement)?,
             Stmt::For(statement) if statement.is_async => self.compile_async_for(statement)?,
-            Stmt::For(statement) => self.compile_for(statement)?,
+            Stmt::For(statement) => self.compile_for(statement, None)?,
             Stmt::Break(statement) => {
                 // Loop-control cleanup runs after CPython unwinds the active exception block.
                 let unreachable_depth = self.control.stack.depth;
@@ -19545,6 +19545,20 @@ impl<'source> Compiler<'source> {
                 )?;
                 self.compile_loop_tail_if(statement, restart, split_short_circuit, mode, leading)
             }
+            Some((Stmt::For(iterator), leading))
+                if self.context.python_version >= crate::PythonVersion::Py314
+                    && !mode.non_final_branch
+                    && !iterator.is_async
+                    && self.control.in_loop_tail_without_nested_cleanup()
+                    && matches!(iterator.orelse.last(), Some(Stmt::Try(tail))
+                        if try_else_requires_loop_tail_inlining(tail)
+                            && !try_requires_loop_tail_inlining(tail)) =>
+            {
+                self.compile_loop_tail_prefix(leading)?;
+                self.compile_for(iterator, Some(restart))?;
+                // An authored inner break still reaches the shared outer backedge.
+                Ok(LoopBackedge::Required)
+            }
             Some((Stmt::While(statement), leading))
                 if statement.orelse.is_empty()
                     && early_condition_truthiness(&statement.test).is_none()
@@ -25695,7 +25709,11 @@ impl<'source> Compiler<'source> {
         }
     }
 
-    fn compile_for(&mut self, statement: &ruff_python_ast::StmtFor) -> Result<(), CompileError> {
+    fn compile_for(
+        &mut self,
+        statement: &ruff_python_ast::StmtFor,
+        exhaustion_restart: Option<Label>,
+    ) -> Result<(), CompileError> {
         use super::legacy_native_labels::NativeRole;
 
         let base_depth = self.control.stack.depth;
@@ -25890,7 +25908,12 @@ impl<'source> Compiler<'source> {
             self.symbols.initialized_locals.remove(name);
         }
         let orelse_start = self.assembler.instruction_count();
-        self.compile_suite(&statement.orelse)?;
+        if let Some(restart) = exhaustion_restart {
+            // The exhausted iterator is off the stack before its else suite runs.
+            self.compile_loop_tail_suite(&statement.orelse, restart, false)?;
+        } else {
+            self.compile_suite(&statement.orelse)?;
+        }
         if self.assembler.instruction_count() == orelse_start
             && let [Stmt::Pass(statement)] = statement.orelse.as_slice()
             && self

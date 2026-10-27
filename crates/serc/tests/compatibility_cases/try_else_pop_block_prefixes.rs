@@ -277,3 +277,11 @@ fn excludes_retained_conditional_pop_blocks_from_enclosing_tries() {
         assert_matches_cpython_marshal(&source, "conditional_pop_block_enclosing_owner.py");
     }
 }
+
+#[test]
+fn matches_try_else_loop_exits_after_iterator_exhaustion() {
+    assert_matches_cpython_marshal(
+        "def entries(rows):\n    while True:\n        for item in rows:\n            if item:\n                break\n        else:\n            try:\n                item = read()\n            except Empty:\n                return\n            else:\n                if item is not None:\n                    yield item\n",
+        "try_else_after_iterator_exhaustion.py",
+    );
+}
