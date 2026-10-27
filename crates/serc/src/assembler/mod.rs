@@ -14280,8 +14280,7 @@ impl Assembler {
         if !(matches!(load.opcode, LOAD_FAST | crate::target::opcodes::LOAD_DEREF)
             || (load.opcode == LOAD_GLOBAL
                 && (manager_call.is_some()
-                    || (retained_manager_guard
-                        && load.value_argument().is_some_and(|arg| arg & 1 == 0)))))
+                    || load.value_argument().is_some_and(|arg| arg & 1 == 0))))
             || load.local_policy.hidden_exception_owner_slots() != 0
             || marker.opcode != NOT_TAKEN
             || condition.forward_target().is_none()
@@ -14289,7 +14288,10 @@ impl Assembler {
             || !(matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
                 && operands.is_empty()
                 || matches!(condition.opcode, POP_JUMP_IF_TRUE | POP_JUMP_IF_FALSE)
-                    && (matches!(operands, [to_bool] if to_bool.opcode==TO_BOOL)
+                    && (matches!(operands, [to_bool] if to_bool.opcode == TO_BOOL)
+                        || matches!(operands, [attribute, to_bool] if attribute.opcode == LOAD_ATTR
+                            && attribute.value_argument().is_some_and(|arg| arg & 1 == 0)
+                            && to_bool.opcode == TO_BOOL)
                         || matches!(operands, [value, compare] if matches!(value.opcode, LOAD_CONST | crate::target::opcodes::LOAD_SMALL_INT)
                             && compare.opcode==COMPARE_OP && compare.value_argument().is_some_and(|arg| arg & 16!=0))))
         {
