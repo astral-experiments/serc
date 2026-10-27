@@ -14166,8 +14166,8 @@ impl<'source> Compiler<'source> {
                     {
                         copied_finally_return_location = self.assembler.last_instruction_location();
                     }
-                    if (preserve_tos || self.context.python_version >= crate::PythonVersion::Py314)
-                        && handler_count == 0
+                    let mut resumed_unwind_location = SourceLocation::NONE;
+                    if handler_count == 0
                         && return_finally_contexts.len() == 1
                         && self.control.withs.active_with_exits.is_empty()
                         && self.control.finally.active_finally_end_blocks == 0
@@ -14228,8 +14228,13 @@ impl<'source> Compiler<'source> {
                                     copied_finally_iterator_location =
                                         Some((self.assembler.item_count(), iterators));
                                 } else {
+                                    // The finalizer call is protected, but each iterator is
+                                    // discarded after exiting tries entered inside that loop.
+                                    copied_finally_iterator_region_unwind = true;
                                     copied_finally_return_location =
                                         self.assembler.last_instruction_location();
+                                    resumed_unwind_location = copied_finally_return_location
+                                        .unwrap_or(SourceLocation::NONE);
                                 }
                             } else if preserve_tos
                                 && matches!(finally_context.body.last(), Some(Stmt::If(tail))
@@ -14285,8 +14290,9 @@ impl<'source> Compiler<'source> {
                     }
                     // The copied finally body has its own source locations. CPython makes
                     // the resumed unwind artificial so each incoming branch can supply its
-                    // location when the shared return block is duplicated.
-                    self.assembler.set_location(SourceLocation::NONE);
+                    // location when the shared return block is duplicated. A straight-line
+                    // iterator discard after a call retains that call's location across POP_BLOCK.
+                    self.assembler.set_location(resumed_unwind_location);
                     if self.context.python_version <= crate::PythonVersion::Py313
                         && context_index == 0
                         && finally_context.try_body_depth > 0

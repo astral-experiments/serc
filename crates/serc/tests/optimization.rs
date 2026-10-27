@@ -640,6 +640,22 @@ fn nested_iterator_return_carries_the_cleanup_call_line() {
 }
 
 #[test]
+fn constant_return_discards_iterators_at_their_enclosing_try_depth() {
+    let source = r"def search(groups):
+    for group in groups:
+        try:
+            for item in group:
+                try:
+                    return 1
+                finally:
+                    close(item)
+        except ValueError:
+            pass
+";
+    assert_matches_cpython(source, "iterator_cleanup_owners.py", &LEVELS);
+}
+
+#[test]
 fn erased_assertions_keep_the_last_ternary_predicate_line() {
     let source = r"async def sample(first, last, selector, ready):
     if ready:
