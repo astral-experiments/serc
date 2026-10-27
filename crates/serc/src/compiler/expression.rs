@@ -1763,8 +1763,11 @@ impl Compiler<'_> {
                 // The final case crosses an empty pattern failure; cleanup predecessors
                 // also need the original empty-join slot after threading. Record it before
                 // small-return copying, while keeping a surviving case JUMP interruptible.
-                self.assembler
-                    .preserve_redundant_jump_nop_after_threading(success_exit);
+                self.assembler.preserve_match_case_join_nop_after_threading(
+                    success_exit,
+                    false_exit,
+                    condition_start,
+                );
             }
             if unique_false_edge.is_some()
                 && !cleanup_exit

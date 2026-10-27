@@ -8670,6 +8670,48 @@ impl Assembler {
         }
     }
 
+    /// Keeps the original case-exit slot after an inner branch has copied its jump.
+    pub(crate) fn preserve_match_case_join_nop_after_threading(
+        &mut self,
+        emitted: EmittedJump,
+        false_exit: Label,
+        condition_start: usize,
+    ) {
+        self.preserve_redundant_jump_nop_after_threading(emitted);
+        if self.python_version < crate::PythonVersion::Py314 {
+            return;
+        }
+        let index = usize::try_from(emitted.instruction().item_index).expect("instruction index");
+        let [
+            prefix @ ..,
+            Item::Instruction(last),
+            Item::Label(inner),
+            Item::Label(outer),
+        ] = &self.linear_items()[condition_start..index]
+        else {
+            return;
+        };
+        let fallthrough = matches!(
+            last.opcode,
+            STORE_FAST | crate::target::opcodes::STORE_ATTR | crate::target::opcodes::STORE_SUBSCR
+        ) || (last.opcode == POP_TOP
+            && matches!(prefix.last(), Some(Item::Instruction(call))
+                if call.opcode == crate::target::opcodes::CALL && call.location == last.location));
+        if *outer == false_exit
+            && inner != outer
+            && fallthrough
+            && last.location.line >= 0
+            && prefix.iter().rev().any(|item| {
+                matches!(item, Item::Instruction(jump)
+                if jump.opcode == JUMP_FORWARD && jump.forward_target() == Some(*inner))
+            })
+        {
+            self.emitted_jump_mut(emitted, "retaining the shared case-exit slot")
+                .jump_policy
+                .retain_redundant_nop_after_threading();
+        }
+    }
+
     /// Defers a normal exit whose preceding call already supplies its line event.
     pub(crate) fn defer_redundant_same_line_call_exit(&mut self, emitted: EmittedJump) -> bool {
         let index = usize::try_from(emitted.instruction().item_index)
