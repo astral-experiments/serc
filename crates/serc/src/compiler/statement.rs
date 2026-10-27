@@ -23662,12 +23662,23 @@ impl<'source> Compiler<'source> {
                             && !expression_contains_inline_branch(part)
                             && !expression_suspends_current_scope(part)
                     };
+                    let false_fallback = matches!(conditional.orelse.as_ref(),
+                        Expr::BooleanLiteral(value) if !value.value);
+                    if self.context.python_version == crate::PythonVersion::Py314
+                        && false_fallback
+                        && runtime_leaf(&conditional.test)
+                        && !expression_suspends_current_scope(&conditional.body)
+                        && (condition_has_linear_runtime_leaves(&conditional.body)
+                            || eager_comprehension_call_reaches_condition(&conditional.body))
+                    {
+                        // The false fallback skips the body. A completed runtime test
+                        // in the selected arm retains its own jump into that body.
+                        return false;
+                    }
                     self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) != 0
                         || !runtime_leaf(&conditional.test)
                         || !runtime_leaf(&conditional.body)
-                        || !(runtime_leaf(&conditional.orelse)
-                            || matches!(conditional.orelse.as_ref(), Expr::BooleanLiteral(value)
-                                if !value.value))
+                        || !(runtime_leaf(&conditional.orelse) || false_fallback)
                 }),
                 |compiler| {
                     compiler.compile_loop_tail_suite_inner(
@@ -51338,6 +51349,25 @@ fn condition_has_linear_runtime_leaves(expression: &Expr) -> bool {
                 && !expression_contains_inline_branch(expression)
         }
     }
+}
+
+/// Iterator exhaustion restores the eager comprehension before the enclosing call branches.
+fn eager_comprehension_call_reaches_condition(expression: &Expr) -> bool {
+    let Expr::Call(call) = expression else {
+        return false;
+    };
+    let [argument] = call.arguments.args.as_ref() else {
+        return false;
+    };
+    let Some((iterators, _, _)) = super::comprehension_parts(argument) else {
+        return false;
+    };
+    call.arguments.keywords.is_empty()
+        && !expression_contains_inline_branch(&call.func)
+        && iterators.iter().all(|iterator| !iterator.is_async)
+        && iterators
+            .first()
+            .is_some_and(|outer| !expression_contains_inline_branch(&outer.iter))
 }
 
 /// Certifies tests whose specialized and fallback call paths merge before branching.
