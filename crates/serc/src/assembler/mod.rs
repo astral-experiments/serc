@@ -8645,9 +8645,10 @@ impl Assembler {
         let index = usize::try_from(emitted.instruction().item_index)
             .expect("emitted instruction index should fit in usize");
         let items = &self.linear_items()[..index];
-        let iterator_cleanup = items
+        let last = items
             .iter()
-            .rposition(|item| matches!(item, Item::Instruction(_)))
+            .rposition(|item| matches!(item, Item::Instruction(_)));
+        let iterator_cleanup = last
             .and_then(|end| items.get(end.checked_sub(1)?..=end))
             .is_some_and(|tail| {
                 matches!(tail, [Item::Instruction(end), Item::Instruction(pop)]
@@ -8656,12 +8657,29 @@ impl Assembler {
                         && end.location.line >= 0
                         && end.location == pop.location)
             });
+        // The value arms share their unlocated POP_TOP. When the other incoming
+        // jump copies this empty exit, its remaining fallthrough has no line to donate.
+        let unlocated_discard = self.python_version >= crate::PythonVersion::Py314
+            && matches!(self.linear_items()[index], Item::Instruction(jump) if jump.location == SourceLocation::NONE)
+            && last.is_some_and(|discard| {
+                let prefix = &items[..discard];
+                matches!(&items[discard], Item::Instruction(pop)
+                    if pop.opcode == POP_TOP && pop.location == SourceLocation::NONE)
+                    && block_has_fallthrough(prefix)
+                    && trailing_labels(prefix).any(|label| {
+                        prefix.iter().rev().any(|item| {
+                            matches!(item, Item::Instruction(jump)
+                                if (jump.opcode == JUMP_FORWARD || is_conditional_jump(jump.opcode))
+                                    && jump.forward_target() == Some(label))
+                        })
+                    })
+            });
         let retain_slot = self.record_original_empty_join(emitted);
         let jump = self.emitted_jump_mut(emitted, "retaining a redundant jump NOP after threading");
         // END_FOR and POP_ITER belong to the iterator's original cleanup array.
         // Its following shared case/condition exit still owns a separate jump
         // slot. Keep the requested late NOP after incoming branches thread past it.
-        if retain_slot || iterator_cleanup {
+        if (retain_slot && !unlocated_discard) || iterator_cleanup {
             jump.jump_policy.retain_redundant_nop_after_threading();
         } else {
             // Keep threading and copy order without inventing a second line slot
