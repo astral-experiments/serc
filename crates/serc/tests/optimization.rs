@@ -10085,7 +10085,10 @@ fn nested_terminating_try_preserves_manager_handler_location() {
         except TypeError as error:
             report(error)
 ";
-    for source in [source.to_owned(), source.replace("raise TypeError", "work()")] {
+    for source in [
+        source.to_owned(),
+        source.replace("raise TypeError", "work()"),
+    ] {
         assert_matches_cpython_versions(
             &source,
             "nested_handler_manager.py",

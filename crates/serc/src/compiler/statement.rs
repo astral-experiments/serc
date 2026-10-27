@@ -42562,10 +42562,9 @@ fn with_body_handler_exit_location(compiler: &Compiler<'_>, body: &[Stmt]) -> Op
         return None;
     };
     let direct_exit = suite_terminates(&statement.body)
-        && statement
-            .body
-            .iter()
-            .any(|statement| matches!(statement, Stmt::Return(_) | Stmt::Raise(_) | Stmt::Break(_)));
+        && statement.body.iter().any(|statement| {
+            matches!(statement, Stmt::Return(_) | Stmt::Raise(_) | Stmt::Break(_))
+        });
     let nested_exit = compiler.context.python_version >= crate::PythonVersion::Py314
         && with_body_ends_in_terminal_try(&statement.body);
     if statement.is_star || !statement.finalbody.is_empty() || !(direct_exit || nested_exit) {
