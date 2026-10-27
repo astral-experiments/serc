@@ -8466,6 +8466,19 @@ fn erased_assertion_keeps_both_exits_from_a_nested_else_guard() {
 }
 
 #[test]
+fn terminal_named_handler_cleanup_uses_the_guard_that_fell_through() {
+    let source = r"def recover(error, retry):
+    try:
+        work()
+    except OSError as caught:
+        if retry(caught):
+            if error is None:
+                raise
+";
+    assert_matches_cpython(source, "guarded_handler_cleanup.py", &LEVELS);
+}
+
+#[test]
 fn a_named_handler_return_inherits_its_inner_cleanup_position() {
     let source = r"def recover(value, state):
     try:
