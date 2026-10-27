@@ -189,6 +189,42 @@ fn threaded_boolean_value_keeps_intermediate_jump_lines() {
 }
 
 #[test]
+fn uncompacted_source_calls_leave_the_following_truth_marker_unprotected() {
+    let source = r"def choose(value, enabled):
+    try:
+        while enabled:
+            try:
+                while True:
+                    found = value.find(1)
+                    if found or enabled:
+                        return value
+                    break
+            except ValueError:
+                pass
+    except LookupError:
+        pass
+
+
+async def wait(value, manager):
+    while True:
+        with manager:
+            try:
+                read()
+            except KeyError:
+                continue
+            value.close()
+            if available:
+                return value
+";
+    assert_matches_cpython_versions(
+        source,
+        "source_call_truth.py",
+        &LEVELS,
+        &VERSIONS.map(|(version, _, _)| version),
+    );
+}
+
+#[test]
 fn conditional_fallthrough_in_a_finally_suite_uses_a_fresh_marker() {
     for source in [
         r"def sample(items):

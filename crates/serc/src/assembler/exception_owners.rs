@@ -3601,6 +3601,7 @@ impl ExceptionOwnerProvenance {
                                     LOAD_FAST
                                         | LOAD_DEREF
                                         | LOAD_NAME
+                                        | LOAD_GLOBAL
                                         | LOAD_ATTR
                                         | CALL
                                         | CALL_KW
@@ -3756,27 +3757,26 @@ impl ExceptionOwnerProvenance {
         // Retained SETUPs need an authored NOP proof. A certified comprehension
         // restore followed by a non-swappable operation establishes its array head,
         // including a condition reached without crossing a new SETUP.
-        // A local truth test at an original source boundary retains its load,
-        // optional attribute access or method call, conversion, and branch.
-        // No instruction is removed before the marker is appended.
-        let fresh_local_test = source_head
-            && matches!(body, [receiver, access @ .., truth]
-            if receiver.opcode == crate::target::opcodes::LOAD_FAST
-                && truth.opcode == TO_BOOL
-                && match access {
-                    [] => true,
-                    [attribute] => attribute.opcode == LOAD_ATTR
-                        && attribute.value_argument().is_some_and(|value| value & 1 == 0),
-                    [method, arguments @ .., call] => method.opcode == LOAD_ATTR
-                        && method.value_argument().is_some_and(|value| value & 1 == 1)
-                        && call.opcode == CALL
-                        && match arguments {
-                            [] => call.value_argument() == Some(0),
-                            [argument] => call.value_argument() == Some(1)
-                                && matches!(argument.opcode, crate::target::opcodes::LOAD_FAST | LOAD_CONST | LOAD_SMALL_INT),
-                            _ => false,
-                        },
-                })
+        // A source array with only uncompacted loads, stores and calls appends its
+        // truth marker after the live records. Local pairs and folded globals were
+        // checked above. An authored SETUP would contribute a separate cell.
+        let fresh_source_test = source_head
+            && body.iter().all(|record| {
+                matches!(
+                    record.opcode,
+                    LOAD_FAST
+                        | LOAD_DEREF
+                        | LOAD_GLOBAL
+                        | LOAD_ATTR
+                        | LOAD_CONST
+                        | LOAD_SMALL_INT
+                        | STORE_FAST
+                        | CALL
+                        | CALL_KW
+                        | POP_TOP
+                        | TO_BOOL
+                )
+            })
             && self.setups.iter().all(|(label, _)| !labels.contains(label));
         let simple_finally_guard = source_head
             && leading_labels.iter().any(|label| {
@@ -3785,7 +3785,7 @@ impl ExceptionOwnerProvenance {
             && matches!(body, [load, conversion] if matches!(load.opcode, LOAD_FAST | LOAD_DEREF)
                 && conversion.opcode == TO_BOOL && load.location == conversion.location && load.location == condition.location)
             && indexes().has_unique_forward_jump(all, *condition);
-        (setup_count > 0 || comprehension_restore_count > 0 || fresh_local_test || simple_finally_guard)
+        (setup_count > 0 || comprehension_restore_count > 0 || fresh_source_test || simple_finally_guard)
             // With no folds, the append is fresh. Certified membership/global
             // folds may instead leave the retained SETUP in that exact array cell.
             && (folded_slots == 0 || null_setup_cells.contains(&(instructions.len() - 1)))
