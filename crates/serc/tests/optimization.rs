@@ -19066,3 +19066,24 @@ fn nested_conditional_arms_donate_implicit_return_locations() {
 ";
     assert_matches_cpython(source, "nested_implicit_returns.py", &LEVELS);
 }
+
+#[test]
+fn nested_finalizer_guard_recovers_the_earlier_call_handler() {
+    for count in [7, 8, 9] {
+        let calls = "        step(value)\n".repeat(count);
+        let source = format!(
+            "def check(state, value, worker):
+    try:
+{calls}        notify({{}})
+    finally:
+        state.close()
+        try:
+            if worker is not None:
+                worker.finish()
+        finally:
+            finish()
+"
+        );
+        assert_matches_cpython(&source, "nested_finalizer_calls.py", &LEVELS);
+    }
+}
