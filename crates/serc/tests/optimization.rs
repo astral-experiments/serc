@@ -4754,6 +4754,23 @@ fn finalizer_copies_named_handler_cleanup_onto_elif_exits() {
 }
 
 #[test]
+fn nested_loop_exit_reuses_the_normal_finalizer_line() {
+    let source = "def drain(active, pending):
+    try:
+        try:
+            while active or pending:
+                pass
+        except KeyError:
+            raise
+    except ValueError:
+        raise
+    finally:
+        finish()
+";
+    assert_matches_cpython(source, "nested_loop_finalizer.py", &LEVELS);
+}
+
+#[test]
 fn nested_handler_raise_keeps_empty_outer_exit() {
     for scope in ["def", "async def"] {
         for binding in ["", " as parse_error"] {

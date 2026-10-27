@@ -5839,7 +5839,7 @@ impl OptimizationPipeline {
                     // entry to a finally suite. The try jump retires against that same-line
                     // ownerless record even if its collapsed representation retained a NOP.
                     let absorbed_normal_try_exit = finalize_borrow_empty_blocks
-                        && instruction.pre_fold_extra_instructions() == 0
+                        && instruction.pre_fold_extra_instructions() <= 1
                         && !instruction.fusion_policy.is_authored_break()
                         && next.is_some_and(|next| {
                             let Item::Instruction(pop) = graph.item(next) else {
@@ -5853,6 +5853,19 @@ impl OptimizationPipeline {
                                 return false;
                             }
                             let entry_labels = &graph[block].items()[..offset];
+                            if instruction.pre_fold_extra_instructions() == 1 {
+                                // Copying an outer try exit adds its original POP_BLOCK slot to
+                                // the inner jump. Its surviving target now owns the line event.
+                                return self.exception_owner_provenance.normal_try_exits.iter().any(|(entry, end)| {
+                                    entry_labels.iter().rev().take_while(|item| matches!(item, Item::Label(_)))
+                                        .any(|item| *item == Item::Label(*entry))
+                                        && graph.label_block(*end).is_some_and(|bridge| {
+                                            self.exception_owner_provenance.compound_try_owner_exits.iter()
+                                                .any(|(outer_entry, outer_target)| *outer_target == target
+                                                    && graph.label_block(*outer_entry) == Some(bridge))
+                                        })
+                                });
+                            }
                             self.exception_owner_provenance.normal_try_exits.iter()
                                 .chain(&self.exception_owner_provenance.compound_try_owner_exits)
                                 .chain(&self.exception_owner_provenance.guarded_try_else_exits)
