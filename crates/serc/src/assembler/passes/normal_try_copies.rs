@@ -145,8 +145,8 @@ pub(super) fn original_local_tuple_return(items: &[Item]) -> Option<[bool; 4]> {
     .then_some([true; 4])
 }
 
-/// Recognizes the four original slots of a subscript return indexed by a local.
-fn original_local_subscript_return(items: &[Item]) -> Option<OriginalTail> {
+/// Recognizes the four original slots of a binary return with a local right operand.
+fn original_local_binary_return(items: &[Item]) -> Option<OriginalTail> {
     use crate::target::opcodes::{BINARY_OP, LOAD_DEREF, LOAD_FAST, RETURN_VALUE};
     use crate::target::operands::BinaryOperation;
 
@@ -156,8 +156,8 @@ fn original_local_subscript_return(items: &[Item]) -> Option<OriginalTail> {
         .count();
     let [
         Item::Instruction(value),
-        Item::Instruction(index),
-        Item::Instruction(subscript),
+        Item::Instruction(right),
+        Item::Instruction(binary),
         Item::Instruction(ret),
     ] = &items[head..]
     else {
@@ -165,13 +165,16 @@ fn original_local_subscript_return(items: &[Item]) -> Option<OriginalTail> {
     };
     (matches!(value.opcode, LOAD_FAST | LOAD_DEREF)
         && value.value_argument().is_some()
-        && index.opcode == LOAD_FAST
-        && index.value_argument().is_some()
-        && subscript.opcode == BINARY_OP
-        && subscript.operand() == Operand::Value(BinaryOperation::SUBSCR.argument())
+        && right.opcode == LOAD_FAST
+        && right.value_argument().is_some()
+        && binary.opcode == BINARY_OP
+        && binary.value_argument().is_some_and(|operation| {
+            operation < BinaryOperation::INPLACE_ADD.argument()
+                || operation == BinaryOperation::SUBSCR.argument()
+        })
         && ret.opcode == RETURN_VALUE
         && ret.value_argument() == Some(0)
-        && [value, index, subscript, ret]
+        && [value, right, binary, ret]
             .into_iter()
             .zip([1, 2, 1, 0])
             .all(|(instruction, depth)| {
@@ -289,7 +292,7 @@ impl OptimizationPipeline {
         // and authenticating every block before discovering that there is nothing to copy.
         if !graph.iter().any(|(_, block)| {
             original_local_tuple_return(block.items()).is_some()
-                || original_local_subscript_return(block.items()).is_some()
+                || original_local_binary_return(block.items()).is_some()
         }) {
             return;
         }
@@ -999,7 +1002,7 @@ impl OptimizationPipeline {
             }
             if let Some(tail) = original_local_tuple_return(graph[block].items())
                 .map(|located| OriginalTail::LocalTupleReturn { located })
-                .or_else(|| original_local_subscript_return(graph[block].items()))
+                .or_else(|| original_local_binary_return(graph[block].items()))
             {
                 returns.insert(block, tail);
             }
@@ -3739,7 +3742,7 @@ impl OptimizationPipeline {
             let items = graph[block].items();
             let tail = original_local_tuple_return(items)
                 .map(|located| OriginalTail::LocalTupleReturn { located })
-                .or_else(|| original_local_subscript_return(items))
+                .or_else(|| original_local_binary_return(items))
                 .or_else(|| original_computed_return(items))
                 .or_else(|| {
                     handler_continuations
