@@ -26166,6 +26166,10 @@ impl<'source> Compiler<'source> {
             }
         }
 
+        if self.context.python_version == crate::PythonVersion::Py314 && has_break {
+            self.assembler
+                .mark_terminal_async_break_borrow_boundary(start, end);
+        }
         self.assembler.add_exception_region(
             yielded,
             yielded_end,
