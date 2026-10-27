@@ -27175,21 +27175,27 @@ impl<'source> Compiler<'source> {
                 }));
         // The normal exit is an unlocated POP_BLOCK and jump. Copying it into
         // the located case successes leaves the value-pattern failure as its only donor.
-        let coroutine_value_match_pop = self.context.python_version >= crate::PythonVersion::Py314
-            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+        // A directly copied return can retain the surrounding exception owner on its
+        // marker. Other handlers can share the unlocated exit on a live continuation.
+        let copy_value_match_exit = (self.control.statements.context.has_following
+            && !self.control.statements.context.followed_by_return_or_raise)
+            || (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                == CO_COROUTINE
+                && matches!(statement.handlers.as_slice(), [handler]
+                    if handler.as_except_handler().is_some_and(|handler| handler.name.is_some())));
+        let value_match_pop = self.context.python_version >= crate::PythonVersion::Py314
+            && copy_value_match_exit
             && !statement.is_star
             && statement.orelse.is_empty()
             && statement.finalbody.is_empty()
             && self.control.stack.depth == 0
-            && matches!(statement.handlers.as_slice(), [handler]
-                if handler.as_except_handler().is_some_and(|handler| handler.name.is_some()))
             && matches!(statement.body.last(), Some(Stmt::Match(matched))
                 if matched.cases.last().is_some_and(|case| case.guard.is_none()
                     && matches!(case.pattern, Pattern::MatchValue(_))))
             && self
                 .assembler
                 .has_located_match_success_before_try_end(try_end);
-        let copied_match_pop_block = compound_match_pop_block || coroutine_value_match_pop;
+        let copied_match_pop_block = compound_match_pop_block || value_match_pop;
         // A discarded false arm still jumps to this original POP_BLOCK before
         // 3.13 compacts NOPs. Materialize it so jump threading sees that first
         // record, instead of threading straight through the normal-exit jump.

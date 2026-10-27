@@ -30,6 +30,39 @@ fn protected_value_match_preserves_case_and_failure_exits() {
 }
 
 #[test]
+fn protected_value_match_with_multiple_handlers_locates_its_failure() {
+    let source = r"async def choose(item, flag):
+    try:
+        match item:
+            case Tags.A:
+                note()
+            case Tags.B:
+                pass
+    except Error:
+        pass
+    except More:
+        pass
+    consume(item)
+";
+    let versions = [PythonVersion::Py314, PythonVersion::Py315];
+    assert_matches_cpython_versions(source, "match_handlers.py", &LEVELS, &versions);
+
+    // A live assertion reaches the success jump through its own conditional edge.
+    let guarded = source
+        .replace(
+            "case Tags.B:\n                pass",
+            "case Tags.B:\n                assert flag",
+        )
+        .replace("consume(item)", "return item");
+    assert_matches_cpython_versions(
+        &guarded,
+        "match_assert.py",
+        &[OptimizationLevel::Zero],
+        &versions,
+    );
+}
+
+#[test]
 fn nested_conversion_handlers_keep_shared_cleanup() {
     let source = r"def sample(items):
     for item in items:
