@@ -2264,9 +2264,11 @@ fn guarded_finalizers_copy_nested_iterator_return_exits() {
                     raise
 ";
     let indent = |body: &str| {
-        body.lines()
-            .map(|line| format!("    {line}\n"))
-            .collect::<String>()
+        let mut indented = String::new();
+        for line in body.lines() {
+            writeln!(indented, "    {line}").unwrap();
+        }
+        indented
     };
     for suite in [
         body.to_owned(),
