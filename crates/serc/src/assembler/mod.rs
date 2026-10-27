@@ -6132,6 +6132,38 @@ impl Assembler {
             {
                 (*plain, *pop, true)
             }
+            // Folding PUSH_NULL into the callee shortens this guarded call by one
+            // record. Its branch marker reuses the manager-owned conditional slot.
+            [plain, pop, callee, arguments @ .., call, convert, condition]
+                if self.python_version == crate::PythonVersion::Py314
+                    && truth
+                    && callee.opcode == LOAD_GLOBAL
+                    && callee.value_argument().is_some_and(|name| name & 1 != 0)
+                    && call.opcode == CALL
+                    && arguments.iter().try_fold(0_u32, |count, argument| {
+                        match argument.opcode {
+                            LOAD_FAST | LOAD_DEREF | LOAD_CONST | LOAD_SMALL_INT => {
+                                count.checked_add(1)
+                            }
+                            LOAD_ATTR
+                                if count > 0
+                                    && argument
+                                        .value_argument()
+                                        .is_some_and(|arg| arg & 1 == 0) =>
+                            {
+                                Some(count)
+                            }
+                            _ => None,
+                        }
+                    }) == call.value_argument()
+                    && convert.opcode == TO_BOOL
+                    && condition.forward_target().is_some()
+                    && condition.location.line >= 0
+                    && call.location == condition.location
+                    && convert.location == condition.location =>
+            {
+                (*plain, *pop, true)
+            }
             [plain, pop, load, convert, condition]
                 if truth
                     && matches!(load.opcode, LOAD_FAST | LOAD_DEREF)
@@ -6165,7 +6197,7 @@ impl Assembler {
             || instructions.iter().enumerate().any(|(index, instruction)| {
                 instruction.pre_fold_extra_instructions() != 0
                     || instruction.local_policy.hidden_exception_owner_slots()
-                        != if owns_slot && index + 1 == instructions.len() {
+                        != if !truth && owns_slot && index + 1 == instructions.len() {
                             3
                         } else {
                             0

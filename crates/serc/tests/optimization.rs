@@ -25834,6 +25834,25 @@ fn erased_assertion_keeps_the_manager_on_a_finally_truth_guard() {
 }
 
 #[test]
+fn loop_exit_keeps_the_manager_on_a_finalizer_call_condition() {
+    let source = r"async def collect(manager, item):
+    async with manager:
+        try:
+            while item:
+                item = await take()
+        finally:
+            if not ready(item):
+                close()
+";
+    assert_matches_cpython_versions(
+        source,
+        "managed_call_guard.py",
+        &LEVELS,
+        &[PythonVersion::Py314],
+    );
+}
+
+#[test]
 fn erased_try_setup_preserves_the_outer_manager_on_a_none_guard() {
     let source = r"async def run(resource, flag):
     with manager():
