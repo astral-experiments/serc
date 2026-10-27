@@ -2328,6 +2328,14 @@ impl<'source> Compiler<'source> {
                 && body[index + 1..]
                     .iter()
                     .all(|statement| self.context.is_elided_statement(statement));
+            let erased_chained_comparison_arm = |test: &Expr, arm: &[Stmt]| {
+                condition_has_only_runtime_tests(test)
+                    && final_chained_comparison_jump(test).is_some()
+                    && !expression_suspends_current_scope(test)
+                    && arm
+                        .iter()
+                        .all(|part| self.context.is_elided_statement(part))
+            };
             // Removing trailing assertions makes this conditional the function's
             // terminal statement. Keep exit copies from comprehension assignments
             // and the cleanup and success edges of an erased chained comparison.
@@ -2352,12 +2360,14 @@ impl<'source> Compiler<'source> {
                     .iter()
                     .all(|statement| self.context.is_elided_statement(statement))
                 && matches!(statement, Stmt::If(conditional)
-                if (condition_has_only_runtime_tests(&conditional.test)
-                    && final_chained_comparison_jump(&conditional.test).is_some()
-                    && !expression_suspends_current_scope(&conditional.test)
-                    && conditional.body.iter().all(|part| self.context.is_elided_statement(part))
+                if (erased_chained_comparison_arm(&conditional.test, &conditional.body)
                     && conditional.elif_else_clauses.iter().all(|clause| clause.test.is_none()
                         && clause.body.iter().all(|part| self.context.is_elided_statement(part))))
+                    || conditional.elif_else_clauses.iter().any(|clause| {
+                        clause.test.as_ref().is_some_and(|test| {
+                            erased_chained_comparison_arm(test, &clause.body)
+                        })
+                    })
                     || (((plain_function_suite
                     || (self.unit.flags & CO_COROUTINE != 0
                         && self.coroutine_branches_have_linear_return_donors(conditional)))
