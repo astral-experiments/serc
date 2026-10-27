@@ -1350,6 +1350,21 @@ impl Compiler<'_> {
                                         && location.line
                                             == self.source_location(case.pattern.range()).line)
                             });
+                        // A guard or pattern failure gives the empty case-success jump
+                        // its own edge. At a loop tail it can thread to the backedge.
+                        let empty_case_loops = (matches!(case.body.as_slice(), [Stmt::Pass(_)])
+                            || body_is_elided)
+                            && self.control.falls_through_to_loop_backedge()
+                            && match &case.guard {
+                                Some(guard) => {
+                                    self.context.python_version >= PythonVersion::Py314
+                                        && early_condition_truthiness(guard).is_none()
+                                }
+                                None => {
+                                    (has_default && matches!(case.pattern, Pattern::MatchValue(_)))
+                                        || !context.fail_pop.is_empty()
+                                }
+                            };
                         if irrefutable_true_guard {
                             self.assembler.preserve_inlined_jump_nop(success_exit);
                         } else if authored_pass_exit && case.body.len() > 1 {
@@ -1360,16 +1375,7 @@ impl Compiler<'_> {
                             && !previous_instruction_covers_branch
                             && !erased_subject_fallthrough
                             && !matches!(self.unit.scope, Scope::Class { .. })
-                            // A pass or erased body still owns its case-success JUMP.
-                            // With original failure cleanup at a loop tail, it must thread
-                            // to the backedge instead of retaining a removed-jump NOP.
-                            && !(case.guard.is_none()
-                                && (matches!(case.body.as_slice(), [Stmt::Pass(_)])
-                                    || body_is_elided)
-                                && self.control.falls_through_to_loop_backedge()
-                                && ((has_default
-                                    && matches!(case.pattern, Pattern::MatchValue(_)))
-                                    || !context.fail_pop.is_empty()))
+                            && !empty_case_loops
                         {
                             if (erased_final_value_case
                                 || (authored_pass_exit
