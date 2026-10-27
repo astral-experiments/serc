@@ -19375,6 +19375,16 @@ fn discarded_star_imports_match_cpython() {
 }
 
 #[test]
+fn conditional_raise_fuses_the_exception_and_cause_inside_a_handler() {
+    for fallback in ["ValueError()", "other if ready else ValueError()"] {
+        let source = format!(
+            "def report(flag, ready, other):\n    try:\n        work()\n    except OSError as error:\n        raise (error if flag else {fallback}) from error\n"
+        );
+        assert_matches_cpython(&source, "conditional_raise_with_cause.py", &LEVELS);
+    }
+}
+
+#[test]
 fn unprotected_conditional_returns_fuse_local_pairs_after_handlers() {
     for handler in [
         "except Exception:\n        recover()",
