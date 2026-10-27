@@ -4510,7 +4510,8 @@ impl<'source> Compiler<'source> {
     ) -> Result<(), CompileError> {
         // The legacy optimizer copies small exits and then resolves their locations.
         // On newer targets, erasing a statement after a nested if/else exposes the
-        // same shared footer. Preserve its edges until locations are assigned.
+        // same shared footer when a nested test or arm still branches into it.
+        // An empty pair of arms after a single test has no exit to copy.
         if self.supports_elided_terminal_if()
             && self
                 .control
@@ -4521,7 +4522,9 @@ impl<'source> Compiler<'source> {
                 || if_suites(statement).any(|arm| {
                     arm.last().is_some_and(|part| self.context.is_elided_statement(part))
                         && matches!(arm.iter().rfind(|part| !self.context.is_elided_statement(part)),
-                            Some(Stmt::If(nested)) if nested.elif_else_clauses.last().is_some_and(|clause| clause.test.is_none()))
+                            Some(Stmt::If(nested)) if nested.elif_else_clauses.last().is_some_and(|clause| clause.test.is_none())
+                                && (expression_contains_inline_branch(&nested.test)
+                                    || if_suites(nested).flatten().any(|part| !self.context.is_elided_statement(part))))
                 }))
         {
             self.compile_if(statement)?;
