@@ -9040,7 +9040,7 @@ impl Assembler {
     }
 
     /// Captures an unnamed handler's normal exit after a path that cannot fall through.
-    /// CPython still has an unlocated POP_BLOCK before the emitted POP_EXCEPT and jump.
+    /// CPython still has an unlocated `POP_BLOCK` before the emitted `POP_EXCEPT` and jump.
     pub(crate) fn record_unnamed_handler_borrow_exit(
         &mut self,
         entry: Label,
