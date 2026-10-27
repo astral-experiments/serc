@@ -10227,6 +10227,44 @@ impl LayoutAssembler {
                     {
                         pending_threaded_null_append = Some(instruction_index + 1);
                     }
+                    // Same-polarity threading appends a new ownerless jump. Its old
+                    // NOP can survive between a comparison and the outer Boolean
+                    // test. After three early removals, the appended marker reuses
+                    // that new jump even when sibling guards have identical records.
+                    if instruction.opcode == NOT_TAKEN
+                        && instruction.exception_policy().owner() == NormalizedExceptionOwner::Dynamic
+                        && owner_history_exact
+                        && tail.early_removals == 3
+                        && tail.insertions == 0
+                        && tail.late_removals == 0
+                        && tail.post_compaction_fusions == 0
+                        && let Some(start) = instruction_index.checked_sub(5)
+                        && start >= original_array_start
+                        && let [comparison, nop, copy, convert, jump] =
+                            &indexed_instructions[start..instruction_index]
+                        && comparison.opcode == COMPARE_OP
+                        && nop.opcode == NOP
+                        && !nop.fusion_policy.is_converted_pop_block()
+                        && instruction.location.line >= 0
+                        && instruction.location.line < nop.location.line
+                        && nop.location.line < comparison.location.line
+                        && comparison.location.end_line <= nop.location.end_line
+                        && nop.location.end_line <= instruction.location.end_line
+                        && copy.opcode == crate::target::opcodes::COPY
+                        && copy.value_argument() == Some(1)
+                        && convert.opcode == crate::target::opcodes::TO_BOOL
+                        && [copy, convert, jump].iter().all(|record| {
+                            record.location == instruction.location
+                                && record.exception_policy() == super::ExceptionPolicy::AlwaysUnchanged
+                        })
+                        && self.exception_owner_provenance.threaded_condition_origins
+                            .contains(&(**jump, *instruction))
+                    {
+                        owners.insert(
+                            instruction_index,
+                            ExceptionOwnerDecision::override_with_region(None),
+                        );
+                    }
                     if threaded_null_append == Some(instruction_index) {
                         owners.insert(
                             instruction_index,

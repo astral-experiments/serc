@@ -19066,3 +19066,23 @@ fn nested_conditional_arms_donate_implicit_return_locations() {
 ";
     assert_matches_cpython(source, "nested_implicit_returns.py", &LEVELS);
 }
+
+#[test]
+fn threaded_boolean_siblings_reuse_an_ownerless_jump() {
+    let source = r"def sample(first, items, last):
+    try:
+        result = (
+            first
+            and (check(items)
+                and len(set(items)) == len(items)
+                and last)
+            and finish()
+        )
+    except Error:
+        recover()
+    return result
+";
+    for expression in [source.to_owned(), source.replace("and ", "or ")] {
+        assert_matches_cpython(&expression, "threaded_boolean_siblings.py", &LEVELS);
+    }
+}
