@@ -11080,7 +11080,7 @@ impl Assembler {
     }
 
     /// Captures a named break's clear-name array and the first copied truth marker.
-    fn record_copied_named_break_truth_prefix(&mut self, unwind_start: usize) {
+    pub(crate) fn record_copied_named_break_truth_prefix(&mut self, unwind_start: usize) {
         let items = self.linear_items();
         let Some(break_item) = items[..unwind_start]
             .iter()

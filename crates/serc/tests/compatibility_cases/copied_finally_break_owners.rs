@@ -26,3 +26,11 @@ fn matches_cpython_single_finally_pop_before_copied_break_condition() {
         }
     }
 }
+
+#[test]
+fn matches_named_generator_handler_break_and_continue_slots() {
+    common::assert_matches_cpython_marshal(
+        "def entries(rows, manager, ready, done):\n    for item in rows:\n        with manager:\n            try:\n                use(item)\n            except Error as error:\n                yield item\n                if ready:\n                    continue\n                break\n            finally:\n                if done:\n                    use(item)\n",
+        "named_generator_loop_exits.py",
+    );
+}

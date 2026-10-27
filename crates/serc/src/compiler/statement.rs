@@ -20066,6 +20066,14 @@ impl<'source> Compiler<'source> {
             WithAwait::Continue(range) => FinallyCopy::Continue(range),
             _ => unreachable!("loop control has a break or continue origin"),
         };
+        let named_generator_exit = (self.context.python_version == crate::PythonVersion::Py314
+            && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) != 0
+            && matches!(self.control.exceptions.active_exception_handlers.as_slice(), [handler]
+                if handler.name.is_some() && handler.loop_depth == self.control.loops.contexts.len())
+            && matches!(self.control.finally.active_loop_finally_contexts.as_slice(), [cleanup]
+                if cleanup.handler_depth == 0 && cleanup.loop_depth == self.control.loops.contexts.len()
+                    && cleanup.with_depth == self.control.withs.active_with_exits.len()))
+            .then(|| self.assembler.item_count());
         let captured_none_prefix = continue_target.is_some()
             && matches!(self.control.finally.active_loop_finally_contexts.as_slice(), [context]
                 if self.assembler.ends_with_recorded_finally_nop_pair(context.handler));
@@ -20688,6 +20696,9 @@ impl<'source> Compiler<'source> {
                         self.control.exceptions.active_exception_region_exclusions[index].len(),
                     ));
                 }
+            }
+            if let Some(start) = named_generator_exit {
+                self.assembler.record_copied_named_break_truth_prefix(start);
             }
             Ok(LoopControlUnwind {
                 with_unwinds: with_unwind_starts,
