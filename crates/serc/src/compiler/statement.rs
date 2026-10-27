@@ -34511,6 +34511,10 @@ impl<'source> Compiler<'source> {
                 None
             };
 
+            let branch_start = self.assembler.item_count();
+            let ends_in_while_break = self.context.python_version >= crate::PythonVersion::Py313
+                && matches!(body.last(), Some(Stmt::While(tail)) if tail.orelse.is_empty()
+                    && early_condition_truthiness(&tail.test).is_none() && suite_contains_loop_break(&tail.body));
             let action_location = if matches!(body, [Stmt::Return(statement)] if statement.value.is_none())
             {
                 // An authored return clears the exception name during its own lowering.
@@ -34597,7 +34601,17 @@ impl<'source> Compiler<'source> {
                     } else {
                         self.assembler.at_original_shared_handler_join()
                     };
-            let inline_join_cleanup = inline_join_cleanup || complete_conditional_cleanup;
+            let while_cleanup = ends_in_while_break
+                && (self.context.python_version == crate::PythonVersion::Py313
+                    || self.assembler.defer_original_while_break_cleanup_edges());
+            if while_cleanup && self.context.python_version >= crate::PythonVersion::Py314 {
+                // A normalized conditional's replacement and backward branch have no
+                // exception owner in the original loop or in a copied handler arm.
+                self.assembler.exclude_handler_loop_backedges(branch_start);
+            }
+            let inline_join_cleanup =
+                inline_join_cleanup || complete_conditional_cleanup || while_cleanup;
+
             // A nested runtime conditional's normal edges also reach one original
             // artificial cleanup. Assign each copied exit its own predecessor's location.
             let shared_conditional_cleanup = matches!(

@@ -3989,6 +3989,25 @@ fn folded_while_breaks_copy_unnamed_handler_cleanup() {
 }
 
 #[test]
+fn a_named_handler_copies_a_branch_loops_hidden_return() {
+    for prefix in ["", "async "] {
+        let source = format!(
+            "{prefix}def run(ready, items, check):\n    try:\n        check(ready)\n    except LookupError as error:\n        if check(error):\n            check(ready)\n        else:\n            while ready:\n                active = [item for item in items if check(item) and check(ready)]\n                if not active:\n                    break\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "guarded_handler_loop.py",
+            &LEVELS,
+            &[
+                PythonVersion::Py313,
+                PythonVersion::Py314,
+                PythonVersion::Py315,
+            ],
+        );
+    }
+}
+
+#[test]
 fn named_handler_none_while_break_copies_cleanup() {
     for prefix in ["", "async "] {
         for condition in ["value", "value is None", "value is not None"] {
