@@ -5813,6 +5813,11 @@ impl OptimizationPipeline {
                         continue;
                     }
 
+                    // A loop backedge cannot fall through to a break in the next block,
+                    // even when the break and its guard share a source line.
+                    let break_starts_block = self.python_version >= crate::PythonVersion::Py314
+                        && instruction.fusion_policy.is_authored_break()
+                        && previous == previous_at_block_entry;
                     let previous_line = previous.and_then(|previous| {
                         let Item::Instruction(instruction) = *graph.item(previous) else {
                             unreachable!();
@@ -5826,6 +5831,11 @@ impl OptimizationPipeline {
                             && !instruction.jump_policy.preserves_explicit_nop();
                         // A raising predecessor cannot supply another path's line.
                         (!matches!(instruction.opcode, RAISE_VARARGS | RERAISE)
+                            && !(break_starts_block
+                                && matches!(
+                                    instruction.opcode,
+                                    JUMP_BACKWARD | JUMP_BACKWARD_NO_INTERRUPT
+                                ))
                             && !removable_empty_block_nop)
                             .then_some(instruction.location.line)
                     });
