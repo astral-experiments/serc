@@ -19068,4 +19068,43 @@ fn nested_conditional_arms_donate_implicit_return_locations() {
         assert third
 ";
     assert_matches_cpython(source, "nested_implicit_returns.py", &LEVELS);
+    assert_matches_cpython_versions(
+        "async def pick(outer, inner):\n    if outer:\n        pass\n    else:\n        if inner:\n            value = inner\n        else:\n            value = await outer\n        assert value\n",
+        "nested_assignment_returns.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+    let erased_arms = r"def pick(outer, inner, values):
+    if outer:
+        if inner:
+            selected = [value for value in values]
+    else:
+        if inner:
+            assert outer
+        else:
+            assert inner
+        assert values
+";
+    assert_matches_cpython_versions(
+        erased_arms,
+        "erased_nested_assignment_returns.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+    let short_circuit = r"async def pick(outer, inner, other):
+    if outer:
+        assert other
+    else:
+        if inner and other:
+            assert inner
+        else:
+            assert other
+        assert outer
+";
+    assert_matches_cpython_versions(
+        short_circuit,
+        "erased_nested_condition_returns.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
 }

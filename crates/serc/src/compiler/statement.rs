@@ -4508,16 +4508,24 @@ impl<'source> Compiler<'source> {
         statement: &ruff_python_ast::StmtIf,
         preserve_protected_folded_nop: bool,
     ) -> Result<(), CompileError> {
-        // The legacy optimizer copies small exits and resolves the locations of
-        // shared returns. Keep the conditional's original join through both passes,
-        // including when an erased branch queues the same edge twice in 3.12.
-        if self.context.python_version <= crate::PythonVersion::Py313
-            && self.supports_elided_terminal_if()
+        // The legacy optimizer copies small exits and then resolves their locations.
+        // On newer targets, erasing a statement after a nested if/else exposes the
+        // same shared footer when a nested test or arm still branches into it.
+        // An empty pair of arms after a single test has no exit to copy.
+        if self.supports_elided_terminal_if()
             && self
                 .control
                 .exceptions
                 .active_exception_region_exclusions
                 .is_empty()
+            && (self.context.python_version <= crate::PythonVersion::Py313
+                || if_suites(statement).any(|arm| {
+                    arm.last().is_some_and(|part| self.context.is_elided_statement(part))
+                        && matches!(arm.iter().rfind(|part| !self.context.is_elided_statement(part)),
+                            Some(Stmt::If(nested)) if nested.elif_else_clauses.last().is_some_and(|clause| clause.test.is_none())
+                                && (expression_contains_inline_branch(&nested.test)
+                                    || if_suites(nested).flatten().any(|part| !self.context.is_elided_statement(part))))
+                }))
         {
             self.compile_if(statement)?;
             self.assembler.record_current_original_scope_exit();
