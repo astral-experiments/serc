@@ -16933,6 +16933,16 @@ fn coroutine_erased_else_preserves_shared_return_locations() {
 }
 
 #[test]
+fn a_format_prefix_keeps_the_folded_guard_at_its_original_join() {
+    for action in ["check(value)", "return value"] {
+        let source = format!(
+            "def render(value):\n    if __debug__:\n        {action}\n    return 'item %s' % (str(value),)\n"
+        );
+        assert_matches_cpython(&source, "guarded_format.py", &LEVELS);
+    }
+}
+
+#[test]
 fn erased_assertions_inside_terminal_call_suite_preserve_footer() {
     for prefix in [
         "    if a:\n        assert a\n",
