@@ -15,6 +15,22 @@ use serc::{
 };
 
 #[test]
+fn returning_from_an_async_iterator_keeps_its_slot_under_three_managers() {
+    let source = r"async def stream(items, ready, owner):
+    async with manager(), manager(), manager():
+        try:
+            async for item in items:
+                notify(item)
+                return
+        finally:
+            if owner.flag is not None:
+                close()
+    yield None
+";
+    assert_matches_cpython(source, "case.py", &LEVELS);
+}
+
+#[test]
 fn nested_conversion_handlers_keep_shared_cleanup() {
     let source = r"def sample(items):
     for item in items:
