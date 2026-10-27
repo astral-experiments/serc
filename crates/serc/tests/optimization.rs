@@ -15635,6 +15635,21 @@ fn elided_handler_assertion_preserves_conditional_cleanup() {
 }
 
 #[test]
+fn copied_handler_returns_locate_while_break_and_exhaustion_separately() {
+    let source = r"def seek(items, value, index, limit):
+    try:
+        prepare()
+    except TypeError:
+        while index < limit:
+            if items[index] == value or items[index] > value:
+                break
+            index += 1
+    return index
+";
+    assert_matches_cpython(source, "handler_while_break_return.py", &LEVELS);
+}
+
+#[test]
 fn elided_handler_assertion_preserves_while_break_cleanup() {
     for suffix in ["assert found", "pass", "after()"] {
         let source = format!(

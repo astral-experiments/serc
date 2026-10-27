@@ -32524,6 +32524,14 @@ impl<'source> Compiler<'source> {
                                 && suite_contains_loop_break(&loop_.body)
                                 && !suite_contains_loop_break_with_finally(&loop_.body)))
                 && self.assembler.at_original_authored_break_join();
+            // Exit copying gives the handler's POP_EXCEPT the span of the break or
+            // of the loop condition, depending on which edge entered the cleanup.
+            let copied_while_break_return = self.context.python_version
+                >= crate::PythonVersion::Py314
+                && handler.name.is_none()
+                && (terminal || cleanup_has_small_return_successor)
+                && handler_ends_in_runtime_while_break(&handler.body)
+                && self.assembler.at_jump_target();
             let handler_ends_with_runtime_while_break_cleanup =
                 handler_has_runtime_while_break_cleanup
                     && handler.name.is_none()
@@ -33473,6 +33481,7 @@ impl<'source> Compiler<'source> {
                 if (self.context.python_version <= crate::PythonVersion::Py313
                     && self.assembler.at_jump_target())
                     || handler_cleanup_from_original_join
+                    || copied_while_break_return
                     || handler_has_shared_while_cleanup
                     || handler_has_shared_normal_finally_cleanup
                     || handler_ends_with_unlocated_bare_raise_branch_cleanup
