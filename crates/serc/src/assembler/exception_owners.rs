@@ -1046,6 +1046,45 @@ fn visit_instructions_mut(items: &mut [Item], visit: &mut impl FnMut(&mut Instru
     }
 }
 
+/// Whether local fusion leaves this protected collection check's source records intact.
+fn is_fused_builtin_guard_block(records: &[&Instruction], location: SourceLocation) -> bool {
+    use crate::target::opcodes::{
+        CALL, COPY, IS_OP, LOAD_ATTR, LOAD_COMMON_CONSTANT, LOAD_DEREF, LOAD_FAST,
+        LOAD_FAST_BORROW, POP_JUMP_IF_FALSE, PUSH_NULL,
+    };
+    let [prefix @ .., load, copy, common, is_op, jump] = records else {
+        return false;
+    };
+    if load.opcode != LOAD_GLOBAL
+        || !load.value_argument().is_some_and(|arg| arg & 1 == 0)
+        || copy.opcode != COPY
+        || copy.value_argument() != Some(1)
+        || common.opcode != LOAD_COMMON_CONSTANT
+        || is_op.opcode != IS_OP
+        || is_op.value_argument() != Some(0)
+        || jump.opcode != POP_JUMP_IF_FALSE
+        || [load, copy, common, is_op, jump]
+            .iter()
+            .any(|record| record.location != location)
+        || records.iter().any(|record| {
+            record.local_policy.hidden_exception_owner_slots() != 0
+                || record.pre_fold_extra_instructions() != 0
+        })
+    {
+        return false;
+    }
+    prefix.is_empty()
+        || (prefix.last().is_some_and(|record| record.opcode == CALL)
+            && prefix.iter().all(|record| {
+                record.location.line == location.line
+                    && (matches!(
+                        record.opcode,
+                        LOAD_ATTR | LOAD_DEREF | LOAD_FAST | LOAD_FAST_BORROW | PUSH_NULL | CALL
+                    ) || record.opcode == LOAD_GLOBAL
+                        && record.value_argument().is_some_and(|name| name & 1 == 0))
+            }))
+}
+
 /// Original try-exit slot absorbed by a normal-finally marker after jump threading.
 #[derive(Debug)]
 pub(super) struct NormalTryBreakPopOwner {
@@ -8270,34 +8309,27 @@ impl LayoutAssembler {
                         if let Some((start, setup_tail, setup_label)) = protected_suffix
                             && tail.late_removals == 0
                         {
-                            // A builtin identity check is already present at the fusion
-                            // pass. Its appended marker can reuse one of these five cells.
+                            // The builtin identity guard and the call producing its left
+                            // operand are already present during local fusion. When all
+                            // fusions precede the setup, their newest tail can reuse
+                            // any of these protected instruction cells.
                             let fused_builtin_guard = instruction.opcode == NOT_TAKEN
                                 && instruction.exception_policy().owner()
                                     == NormalizedExceptionOwner::DynamicConditionStrict
                                 && owner_history_exact
                                 && pop_slot_epoch_known
                                 && tail.insertions == 0
-                                && (1..=5).contains(&tail.post_compaction_fusions)
+                                && tail.post_compaction_fusions > 0
+                                && tail.post_compaction_fusions <= instruction_index.saturating_sub(start)
                                 && tail.post_compaction_fusions
                                     == setup_tail.post_compaction_fusions
                                 && start
                                     .checked_sub(1)
                                     .is_some_and(|i| retained_setup_nops.contains(&i))
-                                && indexed_instructions[start..instruction_index].iter().all(
-                                    |record| {
-                                        record.location == instruction.location
-                                            && record.local_policy.hidden_exception_owner_slots()
-                                                == 0
-                                            && record.pre_fold_extra_instructions() == 0
-                                    },
-                                )
-                                && matches!(&indexed_instructions[start..instruction_index], [load, copy, common, is_op, jump]
-                                    if load.opcode == LOAD_GLOBAL && load.value_argument().is_some_and(|arg| arg & 1 == 0)
-                                        && copy.opcode == crate::target::opcodes::COPY && copy.value_argument() == Some(1)
-                                        && common.opcode == crate::target::opcodes::LOAD_COMMON_CONSTANT
-                                        && is_op.opcode == crate::target::opcodes::IS_OP && is_op.value_argument() == Some(0)
-                                        && jump.opcode == crate::target::opcodes::POP_JUMP_IF_FALSE);
+                                && is_fused_builtin_guard_block(
+                                    &indexed_instructions[start..instruction_index],
+                                    instruction.location,
+                                );
                             has_owner |= fused_builtin_guard;
                             // Local fusion leaves a newer tail than peephole compaction.
                             // Boolean COPY/TO_BOOL expansion consumes that tail first; use
