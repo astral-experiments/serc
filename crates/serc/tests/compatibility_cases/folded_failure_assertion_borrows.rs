@@ -94,3 +94,18 @@ fn keeps_borrowing_through_retained_false_assertion_nops() {
         }
     }
 }
+
+#[test]
+fn folded_assertion_empties_only_an_unmarked_match_fallback() {
+    for body in [
+        "assert False, value",
+        "pass; assert False, value",
+        "saved = value; assert False, value",
+        "\n            assert False, value",
+    ] {
+        let source = format!(
+            "def choose(value):\n    match value:\n        case Keys.first:\n            return 1\n        case Keys.second:\n            return 2\n        case _: {body}\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "same_line_assertion.py");
+    }
+}
