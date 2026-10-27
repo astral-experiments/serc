@@ -19066,3 +19066,16 @@ fn nested_conditional_arms_donate_implicit_return_locations() {
 ";
     assert_matches_cpython(source, "nested_implicit_returns.py", &LEVELS);
 }
+
+#[test]
+fn erased_assertion_keeps_the_manager_on_a_finally_truth_guard() {
+    let source = r"def run(resource, flag):
+    with manager():
+        try:
+            assert flag
+        finally:
+            if resource.status:
+                consume()
+";
+    assert_matches_cpython(source, "erased_assertion_truth_guard.py", &LEVELS);
+}
