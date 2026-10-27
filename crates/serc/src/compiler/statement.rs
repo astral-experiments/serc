@@ -27822,6 +27822,14 @@ impl<'source> Compiler<'source> {
                     if terminating_if_fallthrough_test(nested).is_some()
                         && matches!(nested.body.as_slice(), [Stmt::If(_)]))
                     && direct_try_body_exit_location(&statement.body).is_none();
+            let wildcard_before_try = (self.context.python_version >= crate::PythonVersion::Py314
+                && self.control.statements.context.followed_by_try
+                && !statement.is_star
+                && statement.orelse.is_empty()
+                && statement.finalbody.is_empty())
+            .then(|| normal_try_wildcard_call_exit(&statement.body))
+            .flatten()
+            .map(|range| self.source_location(range));
             let direct_exit_location = (!unlocated_conditional_exit)
                 .then(|| direct_try_body_exit_location(normal_exit_join_suite))
                 .flatten()
@@ -28520,6 +28528,9 @@ impl<'source> Compiler<'source> {
                 // front-end omitted body or else NOP already donates its location above.
                 self.assembler.set_location(SourceLocation::NONE);
             }
+            if let Some(location) = wildcard_before_try {
+                self.assembler.set_location(location);
+            }
             let normal_exit = if (match_body_pop_block
                 || compound_match_pop_block
                 || self.assembler.python_version() == crate::PythonVersion::Py312)
@@ -28556,6 +28567,10 @@ impl<'source> Compiler<'source> {
                 // retains its source boundary, alias and unique-predecessor checks.
                 self.assembler
                     .preserve_empty_join_inlined_jump_nop(normal_exit);
+                self.assembler
+                    .preserve_redundant_jump_nop_after_threading(normal_exit);
+            }
+            if wildcard_before_try.is_some() {
                 self.assembler
                     .preserve_redundant_jump_nop_after_threading(normal_exit);
             }
