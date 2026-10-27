@@ -19070,14 +19070,16 @@ fn nested_conditional_arms_donate_implicit_return_locations() {
 #[test]
 fn folded_signed_tuple_preserves_finally_guard_owner() {
     for number in ["-1", "+2"] {
-        let source = format!("def lookup(ready, resource):
+        let source = format!(
+            "def lookup(ready, resource):
     try:
         if ready:
             return ('value', {number})
     finally:
         if resource is not None:
             close()
-");
+"
+        );
         assert_matches_cpython(&source, "signed_tuple_finally.py", &LEVELS);
     }
 }
