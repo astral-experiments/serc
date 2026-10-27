@@ -2958,6 +2958,27 @@ fn conditional_assignment_copies_protected_raise() {
 }
 
 #[test]
+fn a_managed_handler_chain_retains_the_try_around_its_finally() {
+    let source = r"def read(key):
+    with lock():
+        try:
+            try:
+                primary(key)
+            except KeyError:
+                try:
+                    secondary(key)
+                except ValueError as error:
+                    return 1
+        except OSError:
+            record(key)
+        finally:
+            release(key)
+    return key
+";
+    assert_matches_cpython(source, "managed_handler_chain_return.py", &LEVELS);
+}
+
+#[test]
 fn handler_returns_keep_the_enclosing_try_until_iterator_or_finally_cleanup() {
     let source = r"def scan(items):
     try:
