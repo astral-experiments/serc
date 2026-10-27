@@ -29963,8 +29963,15 @@ impl<'source> Compiler<'source> {
                         .context
                         .followed_by_name_assignment_or_deletion
                     || self.control.statements.context.followed_by_direct_name_if);
+            // The empty try already popped its own handler, but its jump to the
+            // normal finally suite still belongs to that finally's protected region.
+            let handler_finally_entry = self.context.python_version >= crate::PythonVersion::Py314
+                && body_noop_location.is_some()
+                && !statement.finalbody.is_empty()
+                && !self.control.exceptions.active_exception_handlers.is_empty();
             let exception_policy = if !loop_tail_inherits_outer_owner
                 && !direct_nested_pass_exit_in_outer_try
+                && !handler_finally_entry
                 && !coroutine_nested_pass_exit
                 && (exclude_nested_normal_exit
                     || (body_has_elided_assertion
@@ -29990,6 +29997,7 @@ impl<'source> Compiler<'source> {
                 ExceptionPolicy::default()
             };
             let exit_exclusion_start = if !loop_tail_inherits_outer_owner
+                && !handler_finally_entry
                 && !direct_nested_pass_exit_in_outer_try
                 && !self
                     .control
