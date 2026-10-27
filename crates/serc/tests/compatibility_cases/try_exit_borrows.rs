@@ -2362,3 +2362,13 @@ fn terminal_deletion_preserves_original_return_boundary() {
         common::assert_matches_cpython_marshal(&source, "terminal_deletion_return.py");
     }
 }
+
+#[test]
+fn borrows_locals_when_a_yield_resumes_into_guarded_cleanup() {
+    for transfer in ["return", "raise"] {
+        let source = format!(
+            "def values(manager, items, enabled, strict):\n    with manager:\n        for item in items:\n            try:\n                yield item\n            except Error as error:\n                if strict:\n                    {transfer}\n            finally:\n                if enabled:\n                    close(item)\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "resumed_yield_cleanup.py");
+    }
+}
