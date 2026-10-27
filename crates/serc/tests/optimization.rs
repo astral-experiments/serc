@@ -8564,6 +8564,23 @@ fn a_finalizer_guard_keeps_the_following_local_load_owned() {
 }
 
 #[test]
+fn nested_for_else_guard_branches_to_the_outer_loop_header() {
+    let source = r"def scan(rows, skip, enabled):
+    for row in rows:
+        if skip:
+            process(row)
+        else:
+            for value in row:
+                if value:
+                    break
+            else:
+                if enabled or row:
+                    process(row)
+";
+    assert_matches_cpython(source, "nested_for_else_backedge.py", &LEVELS);
+}
+
+#[test]
 fn comparison_arms_keep_their_fallthrough_before_a_for_else_backedge() {
     let source = r"def contains(items, enabled, low, high):
     for item in items:
