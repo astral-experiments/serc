@@ -13643,7 +13643,7 @@ impl Assembler {
             });
     }
 
-    /// Restores the enclosing handler when a folded operand takes the normal POP_BLOCK's line.
+    /// Restores the enclosing handler when a folded operand takes the normal `POP_BLOCK`'s line.
     pub(crate) fn use_folded_finally_operand_owner(&mut self, ordinal: usize) {
         if self.python_version < crate::PythonVersion::Py314 {
             return;
