@@ -5830,13 +5830,13 @@ impl OptimizationPipeline {
                                 == BorrowFallthrough::BarrierIfRemoved
                             && !instruction.jump_policy.preserves_explicit_nop();
                         // A raising predecessor cannot supply another path's line.
-                        (!matches!(instruction.opcode, RAISE_VARARGS | RERAISE)
-                            && !(break_starts_block
+                        (!(matches!(instruction.opcode, RAISE_VARARGS | RERAISE)
+                            || (break_starts_block
                                 && matches!(
                                     instruction.opcode,
                                     JUMP_BACKWARD | JUMP_BACKWARD_NO_INTERRUPT
                                 ))
-                            && !removable_empty_block_nop)
+                            || removable_empty_block_nop))
                             .then_some(instruction.location.line)
                     });
                     let next_line = next.map(|next| {
