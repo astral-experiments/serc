@@ -16817,9 +16817,10 @@ fn elided_non_ascii_identifier_preserves_discarded_builders() {
 #[test]
 fn swapped_tuple_stores_keep_the_original_loop_backedge_column() {
     // High local indexes keep the two stores separate through superinstruction fusion.
-    let extra = (0..16)
-        .map(|index| format!(", arg{index}"))
-        .collect::<String>();
+    let mut extra = String::new();
+    for index in 0..16 {
+        write!(extra, ", arg{index}").unwrap();
+    }
     for prefix in ["", "            saved = [entry for entry in items]\n"] {
         let source = format!(
             "def visit(items, ready{extra}):\n    for item in items:\n        if ready:\n{prefix}            first, last = before(item), after(item)\n        assert ready\n    return ready\n"
