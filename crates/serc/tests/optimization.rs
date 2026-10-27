@@ -3989,6 +3989,27 @@ fn folded_while_breaks_copy_unnamed_handler_cleanup() {
 }
 
 #[test]
+fn terminal_while_break_in_recovery_keeps_normal_borrow_boundary() {
+    let source = r"def run(items, value, ready):
+    try:
+        value, = items
+    except LookupError:
+        for item in items:
+            while True:
+                if ready:
+                    break
+    consume(value)
+";
+    for body in ["break", "consume(item)"] {
+        assert_matches_cpython(
+            &source.replace("break", body),
+            "recovery_while_break.py",
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn named_handler_none_while_break_copies_cleanup() {
     for prefix in ["", "async "] {
         for condition in ["value", "value is None", "value is not None"] {

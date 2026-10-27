@@ -48486,6 +48486,35 @@ fn suite_contains_orphan_cold_cleanup(body: &[Stmt], return_copies_terminal_with
                 }
                 return;
             }
+            // If the final arm breaks, every route back to the test is a jump.
+            // Threading those jumps to the header empties the original loop
+            // backedge. It stays on the normal path when the handler moves cold.
+            if let Stmt::While(loop_) = statement
+                && !expression_suspends_current_scope(&loop_.test)
+                && (early_condition_truthiness(&loop_.test) == Some(true)
+                    || condition_has_linear_runtime_leaves(&loop_.test))
+                && let Some(Stmt::If(tail)) = loop_.body.last()
+                && matches!(
+                    tail.elif_else_clauses
+                        .last()
+                        .map_or(&tail.body, |clause| &clause.body)
+                        .last(),
+                    Some(Stmt::Break(_))
+                )
+                && std::iter::once(tail.test.as_ref())
+                    .chain(
+                        tail.elif_else_clauses
+                            .iter()
+                            .filter_map(|clause| clause.test.as_ref()),
+                    )
+                    .all(|test| {
+                        condition_has_linear_runtime_leaves(test)
+                            && !expression_suspends_current_scope(test)
+                    })
+            {
+                self.found = true;
+                return;
+            }
             // An inner while ending in an unconditional break arm leaves the
             // jump over its later alternative unreachable. A terminal nested
             // while likewise threads its false edge straight to the outer test.
