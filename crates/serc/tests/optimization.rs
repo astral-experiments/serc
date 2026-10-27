@@ -6214,6 +6214,21 @@ fn nested_conditional_stores_preserve_saved_iterator_owners() {
 }
 
 #[test]
+fn protected_assertion_keeps_the_folded_success_jump() {
+    let source = r"def sample(items, ready, enabled, flag):
+    for item in items:
+        try:
+            if ready:
+                assert (flag if enabled else True)
+            elif flag:
+                mark()
+        finally:
+            finish()
+";
+    assert_matches_cpython(source, "protected_assertion_success.py", &LEVELS);
+}
+
+#[test]
 fn managed_iterator_assertions_preserve_conditional_backedges() {
     let indent = |source: &str| {
         let mut result = String::new();

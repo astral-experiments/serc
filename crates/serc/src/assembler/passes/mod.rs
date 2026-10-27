@@ -290,16 +290,15 @@ impl Assembler {
                 continue;
             }
             // A folded successful arm can thread through an original unlocated
-            // branch exit. The remaining runtime None-test then owns that exit's line.
-            // Keep return arrays and every protected or multiply entered join separate.
+            // branch exit. The remaining runtime test then owns that exit's line.
+            // A folded success jump in a protected assertion also loses its owner.
             let folded_join = (|| {
                 use crate::target::opcodes::{
-                    JUMP_FORWARD, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE, RAISE_VARARGS,
+                    JUMP_FORWARD, POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE,
+                    POP_JUMP_IF_TRUE, RAISE_VARARGS,
                 };
 
-                if !self.exception_regions.is_empty() {
-                    return None;
-                }
+                let protected = !self.exception_regions.is_empty();
                 let (Item::Instruction(bridge), labels) = graph[target].items().split_last()?
                 else {
                     return None;
@@ -338,6 +337,35 @@ impl Assembler {
                 {
                     return None;
                 }
+                if protected {
+                    let position = |label| {
+                        let block = graph.label_block(label)?;
+                        order.iter().position(|candidate| *candidate == block)
+                    };
+                    if !self.exception_regions.iter().any(|region| {
+                        !region.is_scope_fallback
+                            && position(region.start).is_some_and(|start| start <= source_position)
+                            && position(region.end).is_some_and(|end| target_position < end)
+                    }) {
+                        return None;
+                    }
+                    let mut failure = graph[order[target_position - 1]]
+                        .items()
+                        .iter()
+                        .rev()
+                        .filter_map(Item::as_instruction);
+                    let raise = failure.next()?;
+                    let error = failure.next()?;
+                    if raise.value_argument() != Some(1)
+                        || error.opcode != crate::target::opcodes::LOAD_COMMON_CONSTANT
+                        || error.value_argument()
+                            != Some(
+                                crate::target::operands::CommonConstant::ASSERTIONERROR.argument(),
+                            )
+                    {
+                        return None;
+                    }
+                }
                 let mut incoming = graph
                     .iter()
                     .flat_map(|(block, array)| {
@@ -363,7 +391,12 @@ impl Assembler {
                 } else {
                     return None;
                 };
-                if !matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+                let is_condition = if protected {
+                    matches!(condition.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE)
+                } else {
+                    matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+                };
+                if !is_condition
                     || condition.forward_target().is_none()
                     || condition.location.line < 0
                     || condition.location.line != original.location.line
@@ -380,14 +413,17 @@ impl Assembler {
                 {
                     return None;
                 }
-                Some(bridge.operand())
+                Some((bridge.operand(), protected))
             })();
-            if let Some(destination) = folded_join {
-                graph
+            if let Some((destination, protected)) = folded_join {
+                let folded = graph
                     .instructions_mut(source)
                     .next()
-                    .expect("exact folded arm")
-                    .retarget(destination);
+                    .expect("exact folded arm");
+                folded.retarget(destination);
+                if protected {
+                    folded.set_exception_policy(super::ExceptionPolicy::EXCLUDE_ALWAYS);
+                }
                 graph
                     .instructions_mut(target)
                     .next()
