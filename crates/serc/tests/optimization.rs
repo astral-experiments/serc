@@ -1959,6 +1959,26 @@ fn compound_handler_loop_exits_keep_separate_cleanup_copies() {
 }
 
 #[test]
+fn nested_handler_cleanup_jumps_to_the_shared_method_return() {
+    let source = r"def choose(flag, value):
+    try:
+        prepare()
+        if flag != value:
+            try:
+                update(value)
+            except ValueError:
+                try:
+                    recover(value)
+                except OSError:
+                    log()
+    except TypeError:
+        return flag.finish()
+    return value.finish()
+";
+    assert_matches_cpython(source, "nested_handler_method_return.py", &LEVELS);
+}
+
+#[test]
 fn nested_recovery_reaches_a_separate_tuple_return() {
     let source = "def sample(flag, left, right):
     if flag:
