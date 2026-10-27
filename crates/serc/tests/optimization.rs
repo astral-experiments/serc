@@ -10032,6 +10032,42 @@ fn erased_loop_branch_before_condition_keeps_protected_join() {
 }
 
 #[test]
+fn erased_try_else_keeps_the_fallthrough_line_after_branch_exit_copies() {
+    for source in [
+        r"def sample(flag, value):
+    with manager:
+        try:
+            if flag:
+                first()
+            else:
+                result = work(value)
+        except Error as err:
+            pass
+        else:
+            assert flag
+",
+        r"def sample(items, flag):
+    try:
+        for item in items:
+            if flag:
+                break
+    except Error as err:
+        pass
+    else:
+        assert flag
+    finish()
+",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "erased_try_else.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn erased_try_else_preserves_manager_borrow_boundary() {
     let source = "async def run():\n    try:\n        async with manager() as resource:\n            await resource.first()\n    except RuntimeError as error:\n        assert error\n    else:\n        assert False\n    async with manager() as resource:\n        await resource.second()\n";
     for (index, source) in [

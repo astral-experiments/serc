@@ -769,6 +769,9 @@ pub(super) struct StatementContext {
     // Whether that successor exits the function by returning or raising. CPython copies these
     // exit blocks before removing assertion-branch jumps, including jumps from later clauses.
     followed_by_return_or_raise: bool,
+    // A try with only erased assertions in its else suite reaches a continuation
+    // other than a return or raise, which could be copied onto its normal exit.
+    erased_try_else_falls_through: bool,
 }
 
 #[derive(Debug, Default)]
@@ -3533,6 +3536,15 @@ impl<'source> Compiler<'source> {
                     match_successor_fills_small_exit_copy_budget,
                     followed_by_small_match_return,
                     followed_by_return_or_raise,
+                    erased_try_else_falls_through: matches!(statement, Stmt::Try(try_statement)
+                        if !try_statement.orelse.is_empty()
+                            && try_statement.orelse.iter().all(|part| self.context.is_elided_statement(part)))
+                        && !matches!(
+                            body[index + 1..]
+                                .iter()
+                                .find(|next| !self.context.is_elided_statement(next)),
+                            Some(Stmt::Return(_) | Stmt::Raise(_))
+                        ),
                     followed_by_try,
                     branch_join_successor: preceded_by_branch_join.then_some(statement.range()),
                 };
@@ -27197,6 +27209,19 @@ impl<'source> Compiler<'source> {
                 || (self.context.python_version == crate::PythonVersion::Py312
                     && (self.assembler.at_empty_borrow_block()
                         || self.assembler.at_original_match_join())));
+        let copied_erased_else = self.context.python_version >= crate::PythonVersion::Py314
+            && !handlers_terminate
+            && self
+                .control
+                .statements
+                .context
+                .erased_try_else_falls_through
+            && !statement.is_star
+            && statement.finalbody.is_empty()
+            && matches!(statement.body.last(), Some(Stmt::For(_) | Stmt::If(_)))
+            && self
+                .assembler
+                .try_exit_has_store_or_iterator_fallthrough(try_end);
         let sole_fallthrough_pop_location = (removed_try_pop_block
             && (suite_ends_in_sole_else_fallthrough(&statement.body)
                 || sequence_failure_location.is_some()))
@@ -28549,6 +28574,15 @@ impl<'source> Compiler<'source> {
                 // The nested SETUP_FINALLY protects the original empty body. An
                 // incoming jump cannot thread past that setup to the normal cleanup.
                 self.assembler.prevent_jump_threading_target(normal_exit);
+            }
+            if copied_erased_else {
+                // Copy the unlocated exit onto the other arms or loop breaks before
+                // the final store or POP_ITER donates its line to the original jump.
+                self.assembler
+                    .preserve_redundant_jump_nop_after_threading(normal_exit);
+                self.assembler
+                    .prepare_no_location_block_for_inlining(normal_exit);
+                self.assembler.allow_last_unconditional_block_inlining();
             }
             if retained_comparison_asserted_else_exit {
                 // Keep the actual jump replacement through eligible return copying
