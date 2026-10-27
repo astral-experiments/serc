@@ -109,3 +109,11 @@ fn keeps_folded_assertion_failure_after_nested_boolean_tests() {
         common::assert_matches_cpython_marshal(&source, "nested_folded_assertion_failure.py");
     }
 }
+
+#[test]
+fn pending_call_inputs_cross_the_folded_operand_boundary() {
+    for argument in ["None or 0", "True and 1", "True or 0"] {
+        let source = format!("def f(value):\n    return consume(value, {argument})\n");
+        common::assert_matches_cpython_marshal(&source, "folded_operand_stack.py");
+    }
+}
