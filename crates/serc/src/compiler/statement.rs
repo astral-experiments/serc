@@ -777,9 +777,9 @@ pub(super) struct StatementContext {
     // Two direct name loads, BUILD_TUPLE, and RETURN_VALUE fill CPython's four-slot
     // copy budget before superinstruction fusion. A copied jump NOP exceeds it.
     pub(super) match_successor_fills_small_exit_copy_budget: bool,
-    // Whether a direct return fits four original records, including any return-line NOP.
-    // This is measured before tuple folding or superinstruction fusion.
-    pub(super) followed_by_small_match_return: bool,
+    // Original return records before tuple folding or local fusion, including a return-line NOP.
+    // Protected exits also consume a record for each POP_BLOCK before RETURN_VALUE.
+    pub(super) following_return_records: Option<u8>,
     // Whether that successor exits the function by returning or raising. CPython copies these
     // exit blocks before removing assertion-branch jumps, including jumps from later clauses.
     followed_by_return_or_raise: bool,
@@ -3366,30 +3366,40 @@ impl<'source> Compiler<'source> {
                             if tuple.elts.len() == 2
                                 && tuple.elts.iter().all(|value| matches!(value, Expr::Name(_))))
                 );
-                let followed_by_small_match_return = matches!(
-                    (statement, body.get(index + 1)),
-                    (Stmt::Match(_), Some(Stmt::Return(returned)))
-                        if returned.value.as_deref().is_none_or(|value| {
+                let following_return_records = match (statement, body.get(index + 1)) {
+                    (Stmt::Match(_) | Stmt::While(_), Some(Stmt::Return(returned))) => {
+                        returned.value.as_deref().map_or(Some(2), |value| {
                             let records = match value {
                                 Expr::Name(_) => 2,
                                 Expr::Attribute(attribute) => match attribute.value.as_ref() {
                                     Expr::Name(_) => 3,
-                                    Expr::Attribute(inner) if matches!(inner.value.as_ref(), Expr::Name(_)) => 4,
-                                    _ => return false,
+                                    Expr::Attribute(inner)
+                                        if matches!(inner.value.as_ref(), Expr::Name(_)) =>
+                                    {
+                                        4
+                                    }
+                                    _ => return None,
                                 },
-                                Expr::Tuple(tuple) if tuple.elts.len() <= 2
-                                    && tuple.elts.iter().all(|element| {
-                                        matches!(element, Expr::Name(_)) || is_literal_constant(element)
-                                    }) => tuple.elts.len() + 2,
+                                Expr::Tuple(tuple)
+                                    if tuple.elts.len() <= 2
+                                        && tuple.elts.iter().all(|element| {
+                                            matches!(element, Expr::Name(_))
+                                                || is_literal_constant(element)
+                                        }) =>
+                                {
+                                    u8::try_from(tuple.elts.len()).ok()? + 2
+                                }
                                 // Constants retain their original value-line NOP before loading.
                                 _ if is_literal_constant(value) => 3,
-                                _ => return false,
+                                _ => return None,
                             };
                             let return_line_nop = self.line_number(u32::from(returned.start()))
                                 != self.line_number(u32::from(value.start()));
-                            records + usize::from(return_line_nop) <= 4
+                            Some(records + u8::from(return_line_nop))
                         })
-                );
+                    }
+                    _ => None,
+                };
                 let followed_by_return_or_raise =
                     matches!(body.get(index + 1), Some(Stmt::Return(_) | Stmt::Raise(_)));
                 let followed_by_try = matches!(body.get(index + 1), Some(Stmt::Try(_)));
@@ -3678,7 +3688,7 @@ impl<'source> Compiler<'source> {
                     followed_by_global_attribute_return,
                     followed_by_tuple_return,
                     match_successor_fills_small_exit_copy_budget,
-                    followed_by_small_match_return,
+                    following_return_records,
                     followed_by_return_or_raise,
                     erased_try_else_falls_through: matches!(statement, Stmt::Try(try_statement)
                         if !try_statement.orelse.is_empty()
@@ -24802,47 +24812,56 @@ impl<'source> Compiler<'source> {
             // even when folding removes the condition's separate false edge.
             self.assembler.record_exception_owner_block_boundary(end);
             self.assembler.mark(end);
-            // Small exit duplication copies a direct name return onto each authored break edge
-            // before redundant break jumps are removed. The copied load therefore remains
-            // visible to CPython's borrowed-load pass for every break layout. One ordinary
-            // try adds only POP_BLOCK to the name load and RETURN_VALUE (plus a return-line
-            // NOP), within the four-record copy limit. Other unwinds can exceed that budget.
-            // A coroutine's stop-iteration wrapper contributes no return-unwind instructions.
-            let copied_direct_return_exit = self.control.statements.context.followed_by_name_return
-                && (self
-                    .control
-                    .exceptions
-                    .active_exception_region_exclusions
-                    .is_empty()
-                    || (self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
-                        && self.control.loops.contexts.is_empty()
-                        && self
-                            .control
-                            .exceptions
-                            .active_exception_region_exclusions
-                            .len()
-                            == 1
-                        && self.control.exceptions.active_pass_only_try_bodies.len() == 1
-                        && self.control.exceptions.active_try_body_start.is_some()
-                        && self.control.exceptions.active_exception_handlers.is_empty()
-                        && self.control.exceptions.active_exception_group_handlers == 0
-                        && self.control.withs.active_with_exits.is_empty()
-                        && self
-                            .control
-                            .finally
-                            .active_return_finally_contexts
-                            .is_empty()
-                        && self.control.finally.active_finally_try_bodies == 0
-                        && self.control.finally.active_normal_finally_bodies == 0
-                        && self.control.finally.active_finally_end_blocks == 0
-                        && self.control.finally.active_copied_finally_bodies == 0
-                        && self.control.finally.active_overriding_finally_returns == 0
-                        && self
-                            .control
-                            .finally
-                            .active_pass_finally_locations
-                            .is_empty()))
-                && self.control.withs.active_with_region_exclusions.is_empty();
+            // Small exit duplication puts the return on each authored break before
+            // eliminating its jump. A protected body contributes one POP_BLOCK and
+            // each enclosing iterator contributes SWAP and POP_TOP. The generator
+            // stop-iteration handler adds no unwind instructions.
+            let protected_depth = self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .len();
+            let copied_direct_return_exit =
+                (self.control.statements.context.followed_by_name_return
+                    || self
+                        .control
+                        .statements
+                        .context
+                        .following_return_records
+                        .is_some_and(|records| {
+                            let iterator_unwinds = self
+                                .control
+                                .loops
+                                .contexts
+                                .iter()
+                                .filter(|context| context.iterator_cleanup != IteratorCleanup::None)
+                                .count();
+                            usize::from(records) + protected_depth + 2 * iterator_unwinds <= 4
+                        }))
+                    && (protected_depth == 0
+                        || (self.control.loops.contexts.is_empty()
+                            && protected_depth == 1
+                            && self.control.exceptions.active_pass_only_try_bodies.len() == 1
+                            && self.control.exceptions.active_try_body_start.is_some()
+                            && self.control.exceptions.active_exception_handlers.is_empty()
+                            && self.control.exceptions.active_exception_group_handlers == 0
+                            && self.control.withs.active_with_exits.is_empty()
+                            && self
+                                .control
+                                .finally
+                                .active_return_finally_contexts
+                                .is_empty()
+                            && self.control.finally.active_finally_try_bodies == 0
+                            && self.control.finally.active_normal_finally_bodies == 0
+                            && self.control.finally.active_finally_end_blocks == 0
+                            && self.control.finally.active_copied_finally_bodies == 0
+                            && self.control.finally.active_overriding_finally_returns == 0
+                            && self
+                                .control
+                                .finally
+                                .active_pass_finally_locations
+                                .is_empty()))
+                    && self.control.withs.active_with_region_exclusions.is_empty();
             let coroutine_terminal_break_exit =
                 self.control.generators.generator_region_start.is_some()
                     && suite_contains_loop_continue(&statement.body)
