@@ -19082,3 +19082,19 @@ fn nested_conditional_arms_donate_implicit_return_locations() {
 ";
     assert_matches_cpython(source, "nested_implicit_returns.py", &LEVELS);
 }
+
+#[test]
+fn collection_guard_reuses_its_left_operand_call_slot() {
+    for count in [6, 10] {
+        let before = "    observe(a, b)\n".repeat(count);
+        let source = format!(
+            "def sample(a, b, seq):
+{before}    try:
+        assert module.read(a) == tuple(x for x in seq)
+    finally:
+        close()
+"
+        );
+        assert_matches_cpython(&source, "collection_guard_after_call.py", &LEVELS);
+    }
+}
