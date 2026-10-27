@@ -538,7 +538,7 @@ fn nested_capture_pass_keeps_the_enclosing_case_exit() {
 
 #[test]
 fn final_capture_pass_reaches_a_separately_lowered_loop_tail() {
-    let source = r#"def visit(groups, key, gate):
+    let source = "def visit(groups, key, gate):
     for group in groups:
         for item in group:
             match item:
@@ -552,6 +552,6 @@ fn final_capture_pass_reaches_a_separately_lowered_loop_tail() {
                 consume(item, captured)
         if gate:
             finish(group)
-"#;
+";
     common::assert_matches_cpython_marshal(source, "capture_before_loop_tail.py");
 }
