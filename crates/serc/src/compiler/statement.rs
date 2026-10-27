@@ -12081,7 +12081,7 @@ impl<'source> Compiler<'source> {
                                 if matches!(guard.test.as_ref(), Expr::Name(_))
                                     && guard.elif_else_clauses.is_empty())))
                         .then(|| self.assembler.item_count());
-                    // Both outer managers remain live; this async iterator alone unwinds
+                    // The outer async managers remain live; this async iterator alone unwinds
                     // before the finalizer, preserving its original owned disposal cell.
                     let copied_outer_manager_iterator_none = self.unit.flags
                         & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
@@ -12092,11 +12092,11 @@ impl<'source> Compiler<'source> {
                         && context_index == 0
                         && handler_count == 0
                         && return_finally_contexts.len() == 1
-                        && finally_context.with_depth == 2
+                        && finally_context.with_depth >= 2
                         && finally_context.loop_depth == 0
                         && finally_context.try_body_depth == 0
                         && finally_context.exception_region_depth == 0
-                        && next_with == 2
+                        && next_with == finally_context.with_depth
                         && next_loop == 1
                         && with_unwind_starts.is_empty()
                         && self.control.exceptions.active_try_marker_slots.is_empty()
@@ -12114,11 +12114,15 @@ impl<'source> Compiler<'source> {
                             .finally
                             .preserved_return_value_contexts
                             .is_empty()
-                        && matches!(self.control.withs.active_with_exits.as_slice(), [outer,inner]
-                            if [outer,inner].iter().all(|manager| manager.is_async && manager.exception_region_depth == 0
-                                && manager.loop_depth == 0 && manager.normal_finally_depth == 0))
+                        && self.control.withs.active_with_exits.len() == next_with
+                        && self.control.withs.active_with_exits.iter().all(|manager| {
+                            manager.is_async
+                                && manager.exception_region_depth == 0
+                                && manager.loop_depth == 0
+                                && manager.normal_finally_depth == 0
+                        })
                         && matches!(self.control.loops.contexts.as_slice(), [iterator]
-                            if iterator.iterator_cleanup == IteratorCleanup::Async && iterator.with_depth == 2
+                            if iterator.iterator_cleanup == IteratorCleanup::Async && iterator.with_depth == next_with
                                 && iterator.finally_end_depth == 0 && iterator.exception_region_depth == 1);
                     let copied_iterator_none_pop =
                         copied_outer_manager_iterator_none.then(|| self.assembler.item_count());
