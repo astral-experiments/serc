@@ -7883,6 +7883,23 @@ fn recovery_finalizer_preserves_local_return_borrow_boundary() {
 }
 
 #[test]
+fn protected_while_break_counts_its_unwind_before_copying_the_return() {
+    let source = r"def select(ready, value):
+    while True:
+        try:
+            if ready:
+                visit(value)
+            else:
+                update(value)
+            break
+        except LookupError:
+            retry(value)
+    return value
+";
+    assert_matches_cpython(source, "protected_break_copy.py", &LEVELS);
+}
+
+#[test]
 fn chained_comparison_copies_a_store_and_bare_raise() {
     let source = r"def classify(value):
     try:

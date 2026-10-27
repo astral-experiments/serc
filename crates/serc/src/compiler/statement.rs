@@ -7047,8 +7047,8 @@ impl<'source> Compiler<'source> {
                     },
                 )?;
                 let marker_end = self.assembler.instruction_count();
-                if self.context.python_version == crate::PythonVersion::Py312
-                    && self.control.withs.active_with_exits.len() == context.with_depth
+                let ordinary_try_pops = if self.control.withs.active_with_exits.len()
+                    == context.with_depth
                     && self
                         .control
                         .exceptions
@@ -7063,14 +7063,16 @@ impl<'source> Compiler<'source> {
                 {
                     // Only ordinary try bodies lie between this break and its loop;
                     // handlers surrounding the loop remain active after the break.
-                    // Native 3.12 keeps their POP_BLOCKs through exit copying and
-                    // NOP cleanup, so the last ownerless POP retains the break line.
-                    let ordinary_try_pops = self
-                        .control
+                    self.control
                         .exceptions
                         .active_exception_region_exclusions
                         .len()
-                        .saturating_sub(context.exception_region_depth);
+                        .saturating_sub(context.exception_region_depth)
+                } else {
+                    0
+                };
+                if self.context.python_version == crate::PythonVersion::Py312 {
+                    // The final physical POP retains the break line after line cleanup.
                     for _ in 0..ordinary_try_pops {
                         self.emit_with_exception_policy(
                             NOP,
@@ -7345,6 +7347,16 @@ impl<'source> Compiler<'source> {
                         self.assembler.prevent_jump_threading_target(break_jump);
                     }
                     self.assembler.mark_jump_as_authored_break(break_jump);
+                    if self.context.python_version >= crate::PythonVersion::Py314
+                        && context.iterator_cleanup == IteratorCleanup::None
+                        && has_no_emitted_cleanup
+                        && ordinary_try_pops > 0
+                    {
+                        // A copied while break still occupies its authored NOP,
+                        // the unwound POP_BLOCKs, and the replaced jump.
+                        self.assembler
+                            .add_last_original_block_slots(1 + ordinary_try_pops);
+                    }
                     self.assembler.record_copied_finally_break_head(
                         break_jump,
                         context.break_label,
