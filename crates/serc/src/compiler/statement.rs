@@ -33593,9 +33593,9 @@ impl<'source> Compiler<'source> {
                     // context expression supplies the cleanup's location after cold ordering.
                     self.assembler.set_location(self.source_location(range));
                 } else if self.context.python_version == crate::PythonVersion::Py312
-                    && (matches!(handler.body.last(), Some(Stmt::Assign(_)))
-                        || matches!(handler.body.last(), Some(Stmt::AnnAssign(assignment))
-                            if assignment.value.is_some()))
+                    && handler.body.iter().rev().find(|part| !self.context.is_elided_statement(part))
+                        .is_some_and(|part| matches!(part, Stmt::Assign(_))
+                            || matches!(part, Stmt::AnnAssign(assignment) if assignment.value.is_some()))
                 {
                     // Static swaps can reorder assignment stores before 3.12 resolves
                     // cleanup locations. Let the final optimized store supply the span.

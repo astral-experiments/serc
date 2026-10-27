@@ -1538,6 +1538,18 @@ fn completed_coroutine_prefixes_keep_comprehension_return_locations() {
 }
 
 #[test]
+fn a_handler_exit_inherits_the_restored_comprehension_local_after_erased_assertions() {
+    let source = r"def collect(values):
+    try:
+        run()
+    except LookupError:
+        result = [convert(item) for item in values]
+        assert result
+";
+    assert_matches_cpython(source, "handler_comprehension_result.py", &LEVELS);
+}
+
+#[test]
 fn erased_assertions_preserve_reordered_assignment_return_locations() {
     for assignment in [
         "first, second = left(), right()",
