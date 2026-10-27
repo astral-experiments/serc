@@ -13222,6 +13222,46 @@ fn constant_return_keeps_the_try_pop_before_a_managed_finally_guard() {
 }
 
 #[test]
+fn a_sole_try_else_exit_locates_the_following_finalizer() {
+    for tail in ["item.done = ready", "ready += 1", "notify()"] {
+        let source = format!(
+            "def finish(ready, item, notify):\n    try:\n        while True:\n            try:\n                if ready:\n                    break\n            except ValueError as error:\n                pass\n    except KeyError:\n        raise\n    else:\n        {tail}\n    finally:\n        if ready:\n            pass\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "else_before_finally.py",
+            &LEVELS,
+            &[
+                PythonVersion::Py313,
+                PythonVersion::Py314,
+                PythonVersion::Py315,
+            ],
+        );
+    }
+}
+
+#[test]
+fn overriding_returns_preserve_the_surviving_else_marker() {
+    for (body, tail) in [
+        ("if ready:\n            work()", "pass"),
+        (
+            "while True:\n            try:\n                if ready:\n                    break\n            except ValueError as error:\n                pass",
+            "item.done = value",
+        ),
+    ] {
+        let source = format!(
+            "def finish(ready, value, item, work):\n    try:\n        {body}\n    except KeyError:\n        raise\n    except IndexError:\n        return value\n    else:\n        {tail}\n    finally:\n        return value\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "else_before_return.py",
+            &LEVELS,
+            &[PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn python313_cold_break_before_an_erased_while_test_keeps_its_line() {
     let source = r"def drain(ready):
     try:

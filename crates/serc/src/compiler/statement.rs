@@ -39293,24 +39293,42 @@ impl<'source> Compiler<'source> {
             && suite_ends_in_sole_else_fallthrough(&statement.body))
         .then(|| self.assembler.original_fallthrough_join_location())
         .flatten();
-        // When all handlers terminate, the normal else exit is the sole donor
-        // for the outer POP_BLOCK. Its unowned slot carries the Pass location
-        // after the now-fallthrough, previously protected jump disappears.
-        let handler_else_pop_location = match statement.orelse.as_slice() {
-            [Stmt::Pass(pass)]
-                if self.context.python_version >= crate::PythonVersion::Py314
-                    && !statement.is_star
-                    && !statement.handlers.is_empty()
-                    && !suite_terminates_before_constant_folding(&statement.body)
-                    && statement.handlers.iter().all(|handler| {
-                        handler.as_except_handler().is_some_and(|handler| {
-                            suite_terminates_before_constant_folding(&handler.body)
-                        })
-                    }) =>
-            {
-                Some(self.source_location(pass.range))
+        // When every handler terminates, only the normal else exit can locate
+        // the outer POP_BLOCK. A linear else tail donates its final instruction.
+        let handler_else_pop_location = if self.context.python_version
+            >= crate::PythonVersion::Py313
+            && !statement.is_star
+            && !statement.orelse.is_empty()
+            && !statement.handlers.is_empty()
+            && !suite_terminates_before_constant_folding(&statement.body)
+            && statement.handlers.iter().all(|handler| {
+                handler.as_except_handler().is_some_and(|handler| {
+                    suite_terminates_before_constant_folding(&handler.body)
+                        // A return inside a handler can share the finalizer's overriding
+                        // return. The normal else exit then has a second predecessor.
+                        && (self.context.python_version < crate::PythonVersion::Py315
+                            || !overriding_return
+                            // An empty else still owns the Pass marker at the join.
+                            || matches!(statement.orelse.as_slice(), [Stmt::Pass(_)])
+                            || !suite_contains_return(&handler.body))
+                })
+            }) {
+            match statement.orelse.last() {
+                Some(tail @ (Stmt::Assign(_) | Stmt::Pass(_))) => {
+                    Some(self.source_location(implicit_return_range(self, tail)))
+                }
+                Some(tail @ Stmt::Expr(expression))
+                    if matches!(expression.value.as_ref(), Expr::Call(_) | Expr::Await(_)) =>
+                {
+                    Some(self.source_location(implicit_return_range(self, tail)))
+                }
+                Some(Stmt::AugAssign(assignment)) => Some(self.source_location(
+                    super::source::last_store_target_range(self, &assignment.target),
+                )),
+                _ => None,
             }
-            _ => None,
+        } else {
+            None
         };
         // Both authored arms reach this original join before constant folding. Its
         // POP_BLOCK has no unique line donor; the finalizer Pass owns the next marker.
