@@ -23653,6 +23653,10 @@ impl<'source> Compiler<'source> {
                     let Expr::If(conditional) = test else {
                         return false;
                     };
+                    // Both runtime arms reach the populated body before any suspension there.
+                    if !self.non_final_loop_test_needs_owned_loads(test) {
+                        return false;
+                    }
                     let runtime_leaf = |part: &Expr| {
                         condition_has_only_runtime_tests(part)
                             && !expression_contains_inline_branch(part)
