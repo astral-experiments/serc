@@ -11563,6 +11563,30 @@ fn nested_handler_returns_keep_enclosing_try_owner_inside_while() {
 }
 
 #[test]
+fn copied_finalizers_finish_before_their_loops_enclosing_tries() {
+    let source = r"def run(item, items, active):
+    try:
+        for item in items:
+            try:
+                try:
+                    work(item)
+                except LookupError:
+                    if active:
+                        return
+                finally:
+                    release(item)
+            except ValueError:
+                recover()
+    except OSError:
+        recover()
+";
+    let while_loop = source.replace("for item in items:", "while active:");
+    for source in [source, &while_loop] {
+        assert_matches_cpython(source, "loop_recovery.py", &LEVELS);
+    }
+}
+
+#[test]
 fn a_handlers_copied_finalizer_stays_inside_the_try_around_its_loop() {
     let source = r"def run(value, ready):
     try:
