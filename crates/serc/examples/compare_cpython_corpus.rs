@@ -2,6 +2,7 @@
 
 use std::any::Any;
 use std::collections::BTreeMap;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::Instant;
@@ -136,6 +137,9 @@ struct Options {
     examples: usize,
     #[arg(long, value_name = "DIR")]
     dump_mismatches: Option<PathBuf>,
+    /// Write the path, outcome, and CPython rejection flag for every input to a new JSONL file.
+    #[arg(long, value_name = "PATH")]
+    outcomes_jsonl: Option<PathBuf>,
 }
 
 impl Options {
@@ -252,6 +256,13 @@ fn main() -> ExitCode {
         }
     };
 
+    if let Some(path) = &options.outcomes_jsonl
+        && let Err(error) = write_outcomes(path, &outcomes)
+    {
+        eprintln!("failed to write {}: {error}", path.display());
+        return ExitCode::FAILURE;
+    }
+
     let mut counts = BTreeMap::<OutcomeKind, usize>::new();
     for outcome in &outcomes {
         *counts.entry(outcome.kind).or_default() += 1;
@@ -356,6 +367,42 @@ fn main() -> ExitCode {
     } else {
         ExitCode::FAILURE
     }
+}
+
+/// Write outcomes in discovery order, preserving non-UTF-8 filenames as native bytes.
+fn write_outcomes(path: &Path, outcomes: &[Outcome]) -> std::io::Result<()> {
+    #[derive(serde::Serialize)]
+    #[serde(untagged)]
+    enum Filename<'a> {
+        Text(&'a str),
+        Bytes(&'a [u8]),
+    }
+
+    #[derive(serde::Serialize)]
+    struct Row<'a> {
+        path: Filename<'a>,
+        outcome: &'static str,
+        cpython_rejected: bool,
+    }
+
+    let file = fs_err::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    let mut writer = BufWriter::new(file);
+    for result in outcomes {
+        let name = result.path.as_os_str();
+        let row = Row {
+            path: name
+                .to_str()
+                .map_or_else(|| Filename::Bytes(name.as_encoded_bytes()), Filename::Text),
+            outcome: result.kind.name(),
+            cpython_rejected: result.oracle_rejected,
+        };
+        serde_json::to_writer(&mut writer, &row)?;
+        writer.write_all(b"\n")?;
+    }
+    writer.flush()
 }
 
 fn validate_outcome_counts(
@@ -767,6 +814,40 @@ mod tests {
                 .into_iter()
                 .chain(args.iter().copied()),
         )
+    }
+
+    #[test]
+    fn jsonl_records_outcomes_without_ambiguity() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("results.jsonl");
+        let make = |path, kind, rejected| super::Outcome {
+            path,
+            kind,
+            detail: String::new(),
+            oracle_rejected: rejected,
+            mismatch_bytes: None,
+        };
+        let rows = [
+            make("quoted\"\n.py".into(), OutcomeKind::Exact, false),
+            make("bad.py".into(), OutcomeKind::MatchedRejection, true),
+        ];
+        super::write_outcomes(&output, &rows).unwrap();
+        let records: Vec<serde_json::Value> = fs::read_to_string(&output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            records,
+            [
+                serde_json::json!({"path": "quoted\"\n.py", "outcome": "exact", "cpython_rejected": false}),
+                serde_json::json!({"path": "bad.py", "outcome": "matched-rejection", "cpython_rejected": true}),
+            ]
+        );
+        assert_eq!(
+            super::write_outcomes(&output, &rows).unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists,
+        );
     }
 
     #[test]
