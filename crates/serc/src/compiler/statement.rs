@@ -5837,7 +5837,8 @@ impl<'source> Compiler<'source> {
             is_final_else || !self.control.statements.terminal_if_branch_has_forward_exit;
         let assignment = body.last().and_then(|statement| match statement {
             Stmt::Assign(assignment)
-                if (joins_at_name_store && matches!(assignment.targets.as_slice(), [Expr::Name(_)]))
+                if (joins_at_name_store
+                    && matches!(assignment.targets.as_slice(), [Expr::Name(_)]))
                     || matches!(assignment.targets.as_slice(), [Expr::Attribute(attribute)]
                         if matches!(attribute.value.as_ref(), Expr::Name(_))) =>
             {
