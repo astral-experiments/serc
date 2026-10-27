@@ -3720,6 +3720,48 @@ fn guarded_recovery_preserves_named_cleanup_entry() {
 }
 
 #[test]
+fn copied_returns_keep_the_remaining_guard_line() {
+    for source in [
+        r"async def parent():
+    async def choose():
+        if active:
+            if ready:
+                try:
+                    pass
+                except Error as err:
+                    pass
+                finally:
+                    pass
+        elif another:
+            pass
+        return first, last
+    first, last = await choose()
+",
+        r"async def run(result, ready, invalid):
+    try:
+        result = await fetch()
+    except Error:
+        raise
+    finally:
+        if ready:
+            try:
+                if invalid:
+                    raise Other()
+            except Other:
+                recover()
+    return result
+",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "guarded_join_return.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn copied_bare_raise_keeps_the_remaining_try_guard_line() {
     let source = r"async def run(flag):
     try:
