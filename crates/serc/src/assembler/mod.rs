@@ -8203,6 +8203,30 @@ impl Assembler {
         }
     }
 
+    /// Records the exact survivor of a literal set folded for a membership test.
+    pub(crate) fn record_literal_membership_fold(&mut self, count: usize) {
+        if count >= 4 {
+            self.record_last_uniform_fold_owner_slots(count);
+            return;
+        }
+        if self.python_version != crate::PythonVersion::Py314 || count == 0 {
+            return;
+        }
+        let record = self.required_last_instruction_mut("recording a folded membership operand");
+        if record.opcode == LOAD_CONST
+            && matches!(record.operand(), Operand::Deferred(_))
+            && record.exception_policy() == ExceptionPolicy::NoneUnchanged
+            && usize::from(record.pre_fold_extra_instructions()) == count
+            && usize::from(record.local_policy.hidden_exception_owner_slots()) == count
+        {
+            record.jump_policy.mark_original_uniform_fold();
+            let original = *record;
+            self.exception_owner_provenance
+                .original_uniform_folds
+                .push(original);
+        }
+    }
+
     /// Certifies contiguous literal-fold records that share their survivor's owner.
     pub(crate) fn record_last_uniform_fold_owner_slots(&mut self, count: usize) {
         if count >= 4 && count < usize::from(LocalPolicy::MAX_HIDDEN_EXCEPTION_OWNER_SLOTS) {

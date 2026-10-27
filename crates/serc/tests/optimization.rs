@@ -3608,6 +3608,26 @@ fn erased_loop_break_keeps_async_manager_finally_boundary() {
 }
 
 #[test]
+fn consecutive_literal_memberships_preserve_the_following_try_setup_slot() {
+    let source = r"def choose(value, enabled):
+    if enabled:
+        first = value in {'a', 'b'}
+        second = value in {'b', 'c'}
+        try:
+            result = first if second else False
+        except KeyError:
+            recover()
+    finish()
+";
+    assert_matches_cpython_versions(
+        source,
+        "folded_memberships.py",
+        &LEVELS,
+        &VERSIONS.map(|(version, _, _)| version),
+    );
+}
+
+#[test]
 fn stored_finalizer_value_keeps_retained_setup_marker_owner() {
     let params = (0..16)
         .map(|n| format!("p{n}"))

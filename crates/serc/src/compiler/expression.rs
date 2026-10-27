@@ -7658,21 +7658,19 @@ impl Compiler<'_> {
                     ));
                 // This membership container folds one literal load per element
                 // into its survivor, with no intervening source or cleanup record.
-                if set.elts.len() >= 4
-                    && set.elts.iter().all(|element| {
-                        matches!(
-                            element,
-                            Expr::NoneLiteral(_)
-                                | Expr::BooleanLiteral(_)
-                                | Expr::NumberLiteral(_)
-                                | Expr::StringLiteral(_)
-                                | Expr::BytesLiteral(_)
-                                | Expr::EllipsisLiteral(_)
-                        )
-                    })
-                {
+                if set.elts.iter().all(|element| {
+                    matches!(
+                        element,
+                        Expr::NoneLiteral(_)
+                            | Expr::BooleanLiteral(_)
+                            | Expr::NumberLiteral(_)
+                            | Expr::StringLiteral(_)
+                            | Expr::BytesLiteral(_)
+                            | Expr::EllipsisLiteral(_)
+                    )
+                }) {
                     self.assembler
-                        .record_last_uniform_fold_owner_slots(set.elts.len());
+                        .record_literal_membership_fold(set.elts.len());
                 }
                 Ok(())
             }
