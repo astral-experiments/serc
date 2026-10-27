@@ -35206,6 +35206,30 @@ impl<'source> Compiler<'source> {
                     })
                     && suite_has_linear_borrow_fallthrough(tail)
                     && !suite_contains_yield(&statement.body));
+        // A conditional re-raise without an else leaves no unreachable jump
+        // after its terminating arm. The guard's false edge still enters the
+        // ordinary handler epilogue when the handlers are moved cold.
+        let guarded_reraise_has_normal_exit = self.context.python_version
+            == crate::PythonVersion::Py314
+            && statement.orelse.is_empty()
+            && (matches!(effective_body_tail,
+                Some(Stmt::Expr(work)) if matches!(work.value.as_ref(),
+                    Expr::Call(_) | Expr::Await(_) | Expr::Yield(_))
+            ) || matches!(effective_body_tail, Some(Stmt::Assign(assignment))
+                if matches!(assignment.targets.as_slice(), [Expr::Name(_) | Expr::Attribute(_)])))
+            && self.suite_has_nonempty_borrow_entry(&statement.finalbody)
+            && statement.handlers.iter().all(|handler| {
+                handler.as_except_handler().is_some_and(|handler| {
+                    handler.type_.is_some()
+                        && suite_has_plain_recovery_fallthrough(&handler.body, false)
+                        // A chained comparison has a separate operand-cleanup
+                        // block before the handler's ordinary false edge.
+                        && !suite_any_statement(&handler.body, |part| {
+                            matches!(part, Stmt::If(guard)
+                                if expression_contains_chained_comparison(&guard.test))
+                        })
+                })
+            });
         let compound_fallthrough_handlers_reach_finally = !statement.is_star
             // A leading runtime while starts a new array after the emptied handler join.
             && (self.context.python_version != crate::PythonVersion::Py314
@@ -35215,7 +35239,8 @@ impl<'source> Compiler<'source> {
             && statement.handlers.iter().all(|handler| {
                 handler.as_except_handler().is_some_and(|handler| {
                     handler.type_.is_some()
-                        && !suite_contains_abrupt_control_flow(&handler.body)
+                        && (guarded_reraise_has_normal_exit
+                            || !suite_contains_abrupt_control_flow(&handler.body))
                         // A folded false assertion has no normal handler exit.
                         && !matches!(handler.body.last(), Some(Stmt::Assert(assertion))
                             if early_condition_truthiness(&assertion.test) == Some(false))
