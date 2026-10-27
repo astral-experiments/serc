@@ -2362,3 +2362,15 @@ fn terminal_deletion_preserves_original_return_boundary() {
         common::assert_matches_cpython_marshal(&source, "terminal_deletion_return.py");
     }
 }
+
+#[test]
+fn borrows_after_an_async_generators_guarded_manager_exit() {
+    let source = "async def stream(item, manager):\n    try:\n        yield item\n    except Error:\n        raise\n    else:\n        if item is not None:\n            with manager:\n                await flush(item)\n    finally:\n        try:\n            if item is not None:\n                await close(item)\n        finally:\n            finish(item)\n";
+    common::assert_matches_cpython_marshal(source, "guarded_manager_else_exit.py");
+}
+
+#[test]
+fn short_circuit_manager_else_keeps_its_separate_borrow_boundary() {
+    let source = "async def stream(item, ready, flag, manager):\n    try:\n        try:\n            yield item\n        except Error:\n            raise\n        else:\n            if ready and flag:\n                with manager as stream:\n                    await flush(stream)\n        finally:\n            try:\n                use(item)\n            finally:\n                finish(item)\n    except Other:\n        raise\n";
+    common::assert_matches_cpython_marshal(source, "guarded_manager_else_exit.py");
+}
