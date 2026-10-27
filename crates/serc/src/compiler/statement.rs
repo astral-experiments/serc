@@ -6155,14 +6155,9 @@ impl<'source> Compiler<'source> {
                 self.assembler
                     .last_instruction_location()
                     .unwrap_or_else(|| self.source_location(last.range()))
-            } else if matches!(last, Stmt::If(_))
-                || matches!(last, Stmt::Try(statement)
-                    if !statement.is_star
-                        && statement.finalbody.is_empty()
-                        && matches!(statement.orelse.last(), Some(Stmt::If(_))))
-            {
-                // Nested branches, including the normal try-else exit, share CPython's
-                // unlocated implicit return. Exit copying assigns each predecessor's location.
+            } else if matches!(last, Stmt::If(_) | Stmt::Try(_)) {
+                // The shared exit has no source position until CPython copies it
+                // onto the branch, exception handler, or finalizer that reaches it.
                 SourceLocation::NONE
             } else if let Stmt::With(manager) = last {
                 // Normal cleanup and exception suppression both finish at the outer

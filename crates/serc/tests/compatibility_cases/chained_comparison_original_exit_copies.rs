@@ -29,3 +29,19 @@ fn matches_cpython_small_chained_comparison_return_bridges() {
         "chained_comparison_copied_subject.py",
     );
 }
+
+#[test]
+fn chained_comparison_try_exits_inherit_their_predecessors_positions() {
+    for handler in [
+        "except Error as err:\n    report(err)\nelse:\n    raise Other()",
+        "except Error:\n    report()",
+        "except* Error as err:\n    report(err)",
+        "finally:\n    cleanup()",
+    ] {
+        let handler = handler.replace('\n', "\n        ");
+        let source = format!(
+            "def f(value):\n    if 0 < value < 10:\n        try:\n            work()\n        {handler}\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "chained_comparison_try_exits.py");
+    }
+}
