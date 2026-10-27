@@ -1960,20 +1960,24 @@ fn compound_handler_loop_exits_keep_separate_cleanup_copies() {
 
 #[test]
 fn nested_recovery_reaches_a_separate_tuple_return() {
-    let source = "def sample(flag, left, right):
+    for (binding, cause) in [(" as error", " from error"), ("", "")] {
+        let source = format!(
+            "def sample(flag, left, right):
     if flag:
         try:
             right = first()
-        except KeyError as error:
+        except KeyError{binding}:
             try:
                 left = second()
             except ValueError:
-                raise RuntimeError from error
+                raise RuntimeError{cause}
     else:
         left = third()
     return left, right
-";
-    assert_matches_cpython(source, "nested_recovery_tuple.py", &LEVELS);
+"
+        );
+        assert_matches_cpython(&source, "nested_recovery_tuple.py", &LEVELS);
+    }
 }
 
 #[test]

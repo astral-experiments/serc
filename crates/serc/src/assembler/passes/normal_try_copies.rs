@@ -2709,7 +2709,7 @@ impl OptimizationPipeline {
         prefixes
     }
 
-    /// Finds the sole nested recovery whose name cleanup jumps to this tuple return.
+    /// Finds the sole nested recovery whose handler cleanup jumps to this tuple return.
     fn nested_recovery_tuple_donor(
         &self,
         normal: BasicBlockId,
@@ -2759,23 +2759,33 @@ impl OptimizationPipeline {
             .position(|item| matches!(item, Item::Instruction(_)))?;
         let [
             Item::Instruction(pop),
-            Item::Instruction(none),
-            Item::Instruction(store),
-            Item::Instruction(delete),
+            name_cleanup @ ..,
             Item::Instruction(jump),
         ] = &items[first..]
         else {
             return None;
         };
+        let valid_name_cleanup = match name_cleanup {
+            [] => true,
+            [
+                Item::Instruction(none),
+                Item::Instruction(store),
+                Item::Instruction(delete),
+            ] => {
+                none.opcode == LOAD_CONST
+                    && store.opcode == STORE_FAST
+                    && delete.opcode == DELETE_FAST
+                    && store.operand() == delete.operand()
+            }
+            _ => false,
+        };
         let donor = graph[recovered].last_instruction()?;
         (pop.opcode == POP_EXCEPT
-            && none.opcode == LOAD_CONST
-            && store.opcode == STORE_FAST
-            && delete.opcode == DELETE_FAST
+            && valid_name_cleanup
             && jump.opcode == JUMP_FORWARD
-            && store.operand() == delete.operand()
-            && [pop, none, store, delete, jump]
+            && items[first..]
                 .iter()
+                .filter_map(Item::as_instruction)
                 .all(|op| op.location == SourceLocation::NONE)
             && donor.opcode == JUMP_FORWARD
             && donor.location.line >= 0)
