@@ -8671,6 +8671,17 @@ impl Compiler<'_> {
                     exclusions.push((exclusion_start, exclusion_end));
                 }
             }
+            // Threading a value-preserving jump into the enclosing Boolean test
+            // replaces the jump with an unowned record. COPY and TO_BOOL use the
+            // first two vacancies before NOT_TAKEN is appended to that array.
+            let fresh_threaded_handler_marker = self.context.python_version
+                == crate::PythonVersion::Py314
+                && named_exception_handler
+                && !exception_group_handler
+                && nested_leading_group
+                && operand_index == 0
+                && original_location.line != location.line
+                && !marker_reuses_exception_owner;
             let exclude_from_all_owners = exclude_exception_type_owner
                 || exclude_inlined_comprehension_owner
                 || exclude_after_coroutine_suspension
@@ -8696,7 +8707,7 @@ impl Compiler<'_> {
                 NOT_TAKEN,
                 0,
                 0,
-                if exclude_from_all_owners {
+                if exclude_from_all_owners || fresh_threaded_handler_marker {
                     ExceptionPolicy::EXCLUDE_ALWAYS
                 } else {
                     ExceptionPolicy::normalized_owner(
@@ -8707,8 +8718,10 @@ impl Compiler<'_> {
                 },
             )?;
 
-            self.assembler
-                .defer_last_boolean_exception_owner(exclusion_start);
+            if !fresh_threaded_handler_marker {
+                self.assembler
+                    .defer_last_boolean_exception_owner(exclusion_start);
+            }
 
             if let Some(marker_start) = marker_start {
                 let marker_end = self.assembler.label();

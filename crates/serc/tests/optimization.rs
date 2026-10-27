@@ -6455,6 +6455,28 @@ fn iterator_handler_returns_preserve_conditional_finalizer_entry() {
 }
 
 #[test]
+fn threaded_handler_booleans_append_an_unowned_marker() {
+    let source = r"def choose(first, second, other):
+    try:
+        work()
+    except Error as error:
+        detail = describe(error)
+        return (
+            first
+            or second
+        ) or other
+";
+    for source in [source.to_owned(), source.replace(" or ", " and ")] {
+        assert_matches_cpython_versions(
+            &source,
+            "threaded_handler_boolean.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn boolean_returns_preserve_enclosing_named_handler_owners() {
     let source = r"def sample(items, flag):
     for value in items:
