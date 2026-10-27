@@ -27183,6 +27183,24 @@ impl<'source> Compiler<'source> {
             && !self.control.in_loop()
             && try_has_named_pair_exception_handler(statement))
             || nested_final_named_assignment_try;
+        // A later statement in this protected region still needs the enclosing handler.
+        let nested_try_precedes_protected_code = nested_in_final_outer_try_statement
+            && self.control.statements.context.same_region_continuation == Some(statement.range);
+        // Leaving an ordinary try can also resume inside an earlier manager.
+        let manager_outside_nested_try = nested_in_final_outer_try_statement
+            && self
+                .control
+                .withs
+                .active_with_exits
+                .last()
+                .is_some_and(|manager| {
+                    manager.exception_region_depth
+                        < self
+                            .control
+                            .exceptions
+                            .active_exception_region_exclusions
+                            .len()
+                });
         let try_start = self.assembler.label();
         let try_end = self.assembler.label();
         let handler_start = self.assembler.label();
@@ -29965,6 +29983,8 @@ impl<'source> Compiler<'source> {
                     || self.control.statements.context.followed_by_direct_name_if);
             let exception_policy = if !loop_tail_inherits_outer_owner
                 && !direct_nested_pass_exit_in_outer_try
+                && !nested_try_precedes_protected_code
+                && !manager_outside_nested_try
                 && !coroutine_nested_pass_exit
                 && (exclude_nested_normal_exit
                     || (body_has_elided_assertion
@@ -29991,6 +30011,7 @@ impl<'source> Compiler<'source> {
             };
             let exit_exclusion_start = if !loop_tail_inherits_outer_owner
                 && !direct_nested_pass_exit_in_outer_try
+                && !nested_try_precedes_protected_code
                 && !self
                     .control
                     .exceptions
@@ -30002,6 +30023,7 @@ impl<'source> Compiler<'source> {
                         && (self.control.finally.active_overriding_finally_returns > 0
                             || (((pass_only_handlers
                                 && self.control.finally.active_finally_try_bodies == 0)
+                                || manager_outside_nested_try
                                 || exception_policy == ExceptionPolicy::EXCLUDE_ALWAYS)
                                 && !self.control.exceptions.prevent_try_exit_inlining))))
             {
@@ -33811,13 +33833,14 @@ impl<'source> Compiler<'source> {
                         >= crate::PythonVersion::Py314
                         && handler_body_has_instructions
                         && nested_in_final_outer_try_statement
+                        && !nested_try_precedes_protected_code
                         && self
                             .control
                             .finally
                             .active_pass_finally_locations
                             .is_empty()
                         && !protected_loop_value_return;
-                    let retain_inner_manager_owner = exclude_nested_handler_exit
+                    let retain_manager_owner = exclude_nested_handler_exit
                         && self
                             .control
                             .withs
@@ -33825,23 +33848,22 @@ impl<'source> Compiler<'source> {
                             .last()
                             .is_some_and(|context| {
                                 context.exception_region_depth
-                                    == self
+                                    <= self
                                         .control
                                         .exceptions
                                         .active_exception_region_exclusions
                                         .len()
                             });
-                    let ordinary_exit_start = retain_inner_manager_owner.then(|| {
+                    let ordinary_exit_start = retain_manager_owner.then(|| {
                         let start = self.assembler.label();
                         self.assembler.mark(start);
                         start
                     });
-                    let exception_policy =
-                        if exclude_nested_handler_exit && !retain_inner_manager_owner {
-                            ExceptionPolicy::EXCLUDE_ALWAYS
-                        } else {
-                            ExceptionPolicy::default()
-                        };
+                    let exception_policy = if exclude_nested_handler_exit && !retain_manager_owner {
+                        ExceptionPolicy::EXCLUDE_ALWAYS
+                    } else {
+                        ExceptionPolicy::default()
+                    };
                     if self.context.python_version == crate::PythonVersion::Py312 {
                         // Native duplicates unlocated exits before propagating handler
                         // locations. A cold handler must not pre-locate a warm return copy.
@@ -33853,8 +33875,8 @@ impl<'source> Compiler<'source> {
                         exception_policy,
                     )?;
                     if let Some(start) = ordinary_exit_start {
-                        // The nested exit drops ordinary try owners, but a manager entered
-                        // inside those tries remains active across the handler continuation.
+                        // The jump leaves ordinary try regions while its enclosing manager
+                        // remains active across the handler continuation.
                         let end = self.assembler.label();
                         self.assembler.mark(end);
                         for exclusions in

@@ -23564,6 +23564,41 @@ fn optimized_with_assertion_join_before_call_matches_cpython() {
 }
 
 #[test]
+fn nested_try_exits_keep_the_owner_of_their_continuation() {
+    let source = r"def before_guard(value, ready, later):
+    try:
+        if ready:
+            try:
+                pass
+            except Exception as error:
+                report(value)
+                release(value)
+            if later:
+                finish()
+    except LookupError:
+        recover()
+
+def inside_manager(value, manager):
+    with manager:
+        try:
+            try:
+                pass
+            except Exception as error:
+                report(value)
+                release(value)
+        except LookupError:
+            recover()
+    finish()
+";
+    assert_matches_cpython_versions(
+        source,
+        "nested_try_continuation.py",
+        &LEVELS,
+        &VERSIONS.map(|(version, _, _)| version),
+    );
+}
+
+#[test]
 fn nested_pass_exit_retains_enclosing_try_owner() {
     const SOURCE: &str = "def f(flag, items):\n    try:\n        try:\n            pass\n        except ValueError:\n            pass\n        work()\n    except Fault:\n        events.append('caught')\n";
     const TRACE: &str = r"
