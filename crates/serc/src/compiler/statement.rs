@@ -14777,6 +14777,13 @@ impl<'source> Compiler<'source> {
                             .set_location(self.source_location(name.range));
                     }
                     self.emit(RETURN_VALUE, 0, -1)?;
+                    if self.context.python_version >= crate::PythonVersion::Py314
+                        && inner_manager_boundary.is_none()
+                        && let (Some(start), Some(end)) =
+                            (deferred_finally_end_start, deferred_outer_unwind_end)
+                    {
+                        self.assembler.record_deferred_finalizer_return(start, end);
+                    }
                     if let Some((cleanup_end, iterators)) = copied_finally_iterator_location {
                         self.assembler
                             .record_copied_finally_iterator_return(cleanup_end, iterators);
@@ -14840,7 +14847,8 @@ impl<'source> Compiler<'source> {
                                 && matches!(context.body.last(), Some(Stmt::If(branch)) if branch.elif_else_clauses.is_empty()));
                     // Pass finalizers use the same established no-location route.
                     if unwinds_return_finally
-                        && (conditional_handler_cleanup
+                        && ((defer_finally_end && inner_manager_boundary.is_none())
+                            || conditional_handler_cleanup
                             || iterator_return
                             || self
                                 .control

@@ -439,6 +439,7 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) normal_try_copy_inline_labels: FxHashSet<Label>,
     // Owner boundaries inside a restored original array are not independent CFG entries.
     pub(super) normal_try_copy_internal_labels: Vec<Label>,
+    pub(super) deferred_finalizer_return_boundaries: Vec<[Label; 2]>,
     pub(super) normal_try_copy_pop_ranges: Vec<(Label, Label)>,
     pub(super) protected_prefix_boundaries: FxHashSet<Label>,
     pub(super) noop_finally_locations: Vec<SourceLocation>,

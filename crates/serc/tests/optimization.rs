@@ -19573,6 +19573,36 @@ print(json.dumps(rows))
 }
 
 #[test]
+fn deferred_finalizer_returns_keep_their_cleanup_range_and_line() {
+    let linear = r"async def run(value, ready):
+    try:
+        prepare()
+    finally:
+        try:
+            if ready:
+                try:
+                    await inspect(value)
+                except ValueError as error:
+                    if ready:
+                        return result(error)
+        finally:
+            await release(value)
+";
+    assert_matches_cpython(linear, "deferred_finalizer.py", &LEVELS);
+
+    let branched = linear.replace(
+        "            await release(value)",
+        "            if ready:\n                release(value)\n            else:\n                recover(value)",
+    );
+    assert_matches_cpython_versions(
+        &branched,
+        "deferred_finalizer.py",
+        &LEVELS,
+        &[PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn returning_through_nested_finally_restores_the_outer_exception_last() {
     let source = r"def run(value):
     try:
