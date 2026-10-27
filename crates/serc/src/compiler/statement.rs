@@ -9701,8 +9701,8 @@ impl<'source> Compiler<'source> {
                         [context] if context.iterator_cleanup == IteratorCleanup::Async
                             && context.exception_region_depth == 3
                             && context.with_depth == 0);
-                // A return pops inner try blocks before discarding an iterator from an
-                // enclosing handler. Preserve each loop's exception depth during that unwind.
+                // A return pops inner tries and handlers before it discards their iterator.
+                // Keep the iterator's own exception depth until the cleanup reaches it.
                 let tracks_handler_iterator_region_unwinds = !return_is_overridden
                     && handler_count > 0
                     && self.control.withs.active_with_exits.is_empty()
@@ -9725,18 +9725,21 @@ impl<'source> Compiler<'source> {
                         .iter()
                         .all(|context| context.handler_depth == 0)
                     && (tracks_async_handler_iterator
-                        || self.control.loops.contexts
-                            [self.control.exceptions.active_exception_handlers[0].loop_depth..]
-                            .iter()
-                            .any(|context| {
+                        || self.control.loops.contexts.iter().enumerate().any(
+                            |(index, context)| {
                                 context.iterator_cleanup != IteratorCleanup::None
+                                    && (index
+                                        >= self.control.exceptions.active_exception_handlers[0]
+                                            .loop_depth
+                                        || context.exception_region_depth > 0)
                                     && context.exception_region_depth
                                         < self
                                             .control
                                             .exceptions
                                             .active_exception_region_exclusions
                                             .len()
-                            }));
+                            },
+                        ));
                 // The outer manager stays active after its retry iterator is
                 // discarded. The ordinary try inside that iterator must already end,
                 // after the named handler has restored its exception state. Literal
@@ -14358,13 +14361,13 @@ impl<'source> Compiler<'source> {
                     preserve_tos,
                     if tracks_iterator_region_unwinds
                         || tracks_handler_enclosing_try_unwinds
-                        || (tracks_handler_iterator_region_unwinds && unwinds_return_finally)
+                        || tracks_handler_iterator_region_unwinds
                         || (tracks_finally_region_unwinds
                             && (copied_finally_iterator_location.is_some()
                                 || copied_finally_iterator_region_unwind))
                     {
-                        // After the copied finally, inner tries end before older iterators.
-                        // Each iterator's saved depth retains tries that enclose the loop.
+                        // Inner tries and handlers end before older iterators. Each
+                        // iterator's saved depth retains the tries that enclose its loop.
                         handler_region_unwind_starts.as_deref_mut()
                     } else {
                         None
