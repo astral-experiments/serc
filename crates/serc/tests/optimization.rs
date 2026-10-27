@@ -18370,6 +18370,30 @@ fn nested_branch_returns_survive_removed_inner_assertions() {
 }
 
 #[test]
+fn normal_finally_pop_keeps_a_trailing_try_body_pass() {
+    let source = r"def process(items):
+    try:
+        for item in items:
+            touch(item)
+        pass
+    finally:
+        close()
+
+
+def poll(ready):
+    while ready():
+        try:
+            while active():
+                step()
+            update()
+            pass
+        finally:
+            close()
+";
+    assert_matches_cpython(source, "normal_finally_pass_line.py", &LEVELS);
+}
+
+#[test]
 fn nested_authored_pass_preserves_returns_before_removed_assertions() {
     for (index, source) in [
         "def f(a, b, c):\n    if a:\n        if b:\n            if c:\n                pass\n        assert a\n",

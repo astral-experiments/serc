@@ -39158,6 +39158,24 @@ impl<'source> Compiler<'source> {
             protected_result?;
         let protected_tail_is_nop = self.assembler.last_instruction_is_nop();
         self.assembler.mark(protected_end);
+        // An omitted trailing Pass donates its line to the normal POP_BLOCK before
+        // NOP compaction. A loop can leave the Pass at the head of its exhaustion join.
+        let body_pass_pop_location = if self.context.python_version >= crate::PythonVersion::Py314
+            && statement.handlers.is_empty()
+            && statement.orelse.is_empty()
+            && let Some(Stmt::Pass(pass)) = statement.body.last()
+        {
+            let location = self.source_location(pass.range);
+            (self
+                .assembler
+                .has_single_omitted_fallthrough_nop_before_label(protected_end, location)
+                || self
+                    .assembler
+                    .has_single_omitted_nop_before_label(protected_end, location))
+            .then_some(location)
+        } else {
+            None
+        };
         if self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
             && let Some(test) = guarded_compound_finally_exit_test(statement)
         {
@@ -39347,6 +39365,7 @@ impl<'source> Compiler<'source> {
         self.assembler.set_location(
             sole_else_pop_location
                 .or(handler_else_pop_location)
+                .or(body_pass_pop_location)
                 .or(comprehension_store_location)
                 .unwrap_or(SourceLocation::NONE),
         );
