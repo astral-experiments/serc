@@ -68,6 +68,35 @@ impl std::ops::Index<&Label> for ThreadLabelOffsets {
     }
 }
 
+/// Whether exhausting an original guarded loop falls through to the normal try exit.
+fn guarded_path_exhausts_iterator(
+    graph: &BlockGraph,
+    path: &[BasicBlockId],
+    reachable: &[bool],
+) -> bool {
+    let Some((&cleanup, body)) = path.split_last() else {
+        return false;
+    };
+    let mut instructions = graph[cleanup]
+        .items()
+        .iter()
+        .filter_map(Item::as_instruction);
+    matches!((instructions.next(), instructions.next(), instructions.next()),
+        (Some(end), Some(pop), None) if end.opcode == crate::target::opcodes::END_FOR
+            && pop.opcode == crate::target::opcodes::POP_ITER)
+        && reachable[cleanup.index()]
+        && body.iter().any(|block| {
+            reachable[block.index()]
+                && graph[*block].last_instruction().is_some_and(|jump| {
+                    jump.opcode == crate::target::opcodes::FOR_ITER
+                        && jump
+                            .forward_target()
+                            .and_then(|label| graph.label_block(label))
+                            == Some(cleanup)
+                })
+        })
+}
+
 // The original pair is tagged before copying passes; physical copies retire that tag.
 // Also reject duplicate tagged pairs so an ambiguous graph cannot certify a donor.
 fn unique_module_annotation_pair(
@@ -4024,17 +4053,8 @@ impl OptimizationPipeline {
                                 })
                             });
                             let path = &order[source_index..target_index];
-                            let iterator_fallthrough = path.last().is_some_and(|cleanup| {
-                                let mut ops = graph[*cleanup].items().iter().filter_map(Item::as_instruction);
-                                matches!((ops.next(),ops.next(),ops.next()), (Some(end),Some(pop),None)
-                                    if end.opcode == crate::target::opcodes::END_FOR
-                                        && pop.opcode == crate::target::opcodes::POP_ITER)
-                                    && path.iter().any(|header| graph[*header].last_instruction().is_some_and(|jump|
-                                        jump.opcode == crate::target::opcodes::FOR_ITER
-                                            && jump.forward_target().and_then(|label| graph.label_block(label)) == Some(*cleanup)))
-                            });
                             recorded_exit
-                                && (iterator_fallthrough || path.iter().enumerate().all(
+                                && (path.iter().enumerate().all(
                                     |(offset, path_block)| {
                                         original_reachable[path_block.index()]
                                             && super::super::block_has_fallthrough(graph[*path_block].items())
@@ -4044,7 +4064,7 @@ impl OptimizationPipeline {
                                                         if instruction.opcode.has_jump())
                                                 }))
                                     },
-                                ))
+                                ) || guarded_path_exhausts_iterator(graph, path, &original_reachable))
                         }))
             })
             .filter_map(|block| {
