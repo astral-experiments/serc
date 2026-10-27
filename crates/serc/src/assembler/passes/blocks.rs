@@ -7729,6 +7729,50 @@ impl OptimizationPipeline {
                     pop.location = donor;
                     pop.fusion_policy.clear_location_from_next();
                 }
+                if self.python_version >= crate::PythonVersion::Py314
+                    && inline_small_exit
+                    && !planned_copy
+                    && target_chain_end == target_position
+                    && let [
+                        Item::Instruction(pop),
+                        Item::Instruction(load),
+                        Item::Instruction(exit),
+                    ] = &mut copied[position..]
+                    && pop.opcode == NOP
+                    && pop.fusion_policy.is_converted_pop_block()
+                    && pop.location == SourceLocation::NONE
+                    && load.opcode == LOAD_FAST
+                    && load.location.line >= 0
+                    && load.location.line != source_location.line
+                    && matches!(
+                        (exit.opcode, exit.value_argument()),
+                        (RAISE_VARARGS, Some(1)) | (RETURN_VALUE, Some(0))
+                    )
+                    && graph[source]
+                        .items()
+                        .iter()
+                        .filter_map(Item::as_instruction)
+                        .nth(1)
+                        .is_none()
+                    && let Some(previous) = source_position.checked_sub(1).map(|i| order[i])
+                    && block_has_fallthrough(graph[previous].items())
+                    && graph[previous]
+                        .last_instruction()
+                        .is_some_and(|op| op.location == source_location)
+                    && self
+                        .exception_owner_provenance
+                        .compound_try_owner_exits
+                        .iter()
+                        .any(|(entry, join)| {
+                            graph.label_block(*entry) == Some(source)
+                                && graph.label_block(*join) == Some(target)
+                        })
+                {
+                    // The original normal jump starts a separate array. Its copy of
+                    // the finalizer POP is the first surviving record on this line,
+                    // even when the preceding physical arm already ends on that line.
+                    pop.jump_policy.preserve_explicit_nop();
+                }
                 let mut marker =
                     Instruction::synthetic(NOP, Operand::Value(0), source_location, None);
                 if copied_return_crosses_empty_join {
