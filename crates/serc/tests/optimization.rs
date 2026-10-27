@@ -5605,6 +5605,25 @@ fn erased_nested_else_preserves_coroutine_loop_exits() {
 }
 
 #[test]
+fn erased_module_loop_guards_keep_each_short_circuit_backedge() {
+    let source = r"for entry in values:
+    if entry is None or accept(entry):
+        assert enabled
+";
+    for source in [
+        source.to_owned(),
+        source.replace("accept(entry)", "available or accept(entry)"),
+    ] {
+        assert_matches_cpython_versions(
+            &source,
+            "module_loop_guard.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn erased_final_else_suffix_preserves_coroutine_loop_exits() {
     let source = r"async def sample(items, selected, prepare, work, verify):
     for item in items:

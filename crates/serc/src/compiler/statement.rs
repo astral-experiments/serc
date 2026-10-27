@@ -21450,8 +21450,30 @@ impl<'source> Compiler<'source> {
                             |control| &mut control.conditions.retained_chained_comparison_exit,
                             retained_exit,
                             |compiler| {
+                                let test = if matches!(compiler.unit.scope, Scope::Module)
+                                    && !non_final_branch
+                                    && body
+                                        .iter()
+                                        .all(|part| compiler.context.is_elided_statement(part))
+                                    && let Expr::BoolOp(boolean) = statement.test.as_ref()
+                                    && boolean.op == BoolOp::Or
+                                    && let Some((last, leading)) = boolean.values.split_last()
+                                {
+                                    // With the assertion removed, each true operand
+                                    // reaches its own copy of the loop backedge.
+                                    for operand in leading {
+                                        let next = compiler.assembler.label();
+                                        compiler.compile_loop_tail_condition_atom(
+                                            operand, false, next, restart, false,
+                                        )?;
+                                        compiler.assembler.mark(next);
+                                    }
+                                    last
+                                } else {
+                                    statement.test.as_ref()
+                                };
                                 compiler.compile_loop_tail_condition(
-                                    &statement.test,
+                                    test,
                                     true,
                                     body_label,
                                     restart,
