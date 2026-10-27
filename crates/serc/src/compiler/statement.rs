@@ -3721,8 +3721,22 @@ impl<'source> Compiler<'source> {
                 if matches!(statement, Stmt::Break(_))
                     && matches!(previous_statement, Some(Stmt::With(_)))
                     && self.control.loops.contexts.last().is_some_and(|context| {
+                        // A terminal protected loop can thread the normal try exit onto
+                        // this break, carrying its source line and the finalizer's handler.
+                        let threads_try_exit = self.context.python_version
+                            >= crate::PythonVersion::Py314
+                            && self.control.finally.active_finally_try_bodies != 0
+                            && context.break_policy == LoopBreakPolicy::Jump
+                            && !context.break_target_keeps_exception_owner
+                            && context.exception_region_depth
+                                == self
+                                    .control
+                                    .exceptions
+                                    .active_exception_region_exclusions
+                                    .len();
                         context.iterator_cleanup == IteratorCleanup::None
                             && !context.break_policy.returns()
+                            && !threads_try_exit
                     })
                 {
                     self.assembler.preserve_last_inlined_jump_nop();
