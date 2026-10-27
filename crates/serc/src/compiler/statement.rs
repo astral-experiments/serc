@@ -18180,9 +18180,9 @@ impl<'source> Compiler<'source> {
                         // an else suite would supply its own preceding line instead.
                         // A while loop also has an empty condition-failure block. Its
                         // inlined branch jump has no preceding line event to replace it.
-                        let single_exhaustion_edge =
-                            self.context.python_version >= crate::PythonVersion::Py314
-                                && matches!(body.last(), Some(Stmt::While(loop_statement))
+                        let single_exhaustion_edge = self.context.python_version
+                            >= crate::PythonVersion::Py314
+                            && matches!(body.last(), Some(Stmt::While(loop_statement))
                                     if loop_statement.orelse.is_empty()
                                         && !suite_contains_loop_break(&loop_statement.body)
                                         && early_condition_truthiness(&loop_statement.test).is_none()
