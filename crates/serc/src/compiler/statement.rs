@@ -3782,8 +3782,7 @@ impl<'source> Compiler<'source> {
                 // CPython visits unreachable statements before the flow graph removes them.
                 // Its constant compaction always retains slot zero. A child-producing first
                 // expression needs its real builder to admit code and defaults in order; other
-                // unreachable tails keep the literal admission used below. A lone
-                // bare Ellipsis expression in a suspension scope is removed before compaction.
+                // unreachable tails keep the first constant that code generation would load.
                 let first_expression = if self.output.constants.is_empty()
                     && let Some(Stmt::Expr(expression)) = unreachable.first()
                     && matches!(
@@ -3797,9 +3796,6 @@ impl<'source> Compiler<'source> {
                 if self.output.constants.is_empty()
                     && first_expression.is_none()
                     && let Some(constant) = first_suite_literal_constant(self, unreachable)
-                    && !(self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) != 0
-                        && matches!(unreachable, [Stmt::Expr(expression)]
-                            if matches!(expression.value.as_ref(), Expr::EllipsisLiteral(_))))
                 {
                     self.add_constant(constant)?;
                 }
