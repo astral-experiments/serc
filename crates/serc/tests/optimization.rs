@@ -15,6 +15,26 @@ use serc::{
 };
 
 #[test]
+fn copied_manager_returns_keep_the_iterators_enclosing_try() {
+    let source = r"async def scan(items, manager, ready):
+    try:
+        for item in items:
+            try:
+                with manager:
+                    if ready:
+                        return await fetch(item)
+            except LookupError:
+                recover()
+            finally:
+                if ready is not None:
+                    close()
+    except OSError:
+        retry()
+";
+    assert_matches_cpython(source, "copied_manager_iterator_try.py", &LEVELS);
+}
+
+#[test]
 fn nested_conversion_handlers_keep_shared_cleanup() {
     let source = r"def sample(items):
     for item in items:

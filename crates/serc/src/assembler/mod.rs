@@ -13269,7 +13269,11 @@ impl Assembler {
             && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
             && pop.local_policy.hidden_exception_owner_slots() == 0
             && pop.pre_fold_extra_instructions() == 0
-            && load.opcode == LOAD_FAST
+            && (load.opcode == LOAD_FAST
+                || (load.opcode == LOAD_GLOBAL
+                    && load
+                        .value_argument()
+                        .is_some_and(|argument| argument & 1 == 0)))
             && load.local_policy.hidden_exception_owner_slots() == 0
             && load.pre_fold_extra_instructions() == 0
             && matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
