@@ -1959,6 +1959,32 @@ fn compound_handler_loop_exits_keep_separate_cleanup_copies() {
 }
 
 #[test]
+fn manager_suppression_reaches_the_shared_guarded_return() {
+    let source = r"def lookup(value):
+    try:
+        prepare()
+        if ready(value):
+            try:
+                with acquire(value) as resource:
+                    return resource.read()
+            except LookupError:
+                return None
+    except TypeError:
+        return None
+    return None
+";
+    for body in [
+        source.to_owned(),
+        source.replace(
+            "with acquire(value) as resource:\n                    return resource.read()",
+            "return acquire(value)",
+        ),
+    ] {
+        assert_matches_cpython(&body, "guarded_manager_return.py", &LEVELS);
+    }
+}
+
+#[test]
 fn nested_recovery_reaches_a_separate_tuple_return() {
     let source = "def sample(flag, left, right):
     if flag:
