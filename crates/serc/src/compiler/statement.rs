@@ -497,6 +497,8 @@ pub(super) struct FinallyState<'ast> {
     // The selected manager body ends with a distinct original `POP_BLOCK`.
     // The direct try consumes this request before compiling nested finalizers.
     capture_next_finally_manager_pop: bool,
+    /// Import whose else-path reaches an erased finalizer before the manager exit.
+    erased_finalizer_import: Option<TextRange>,
     captured_finally_manager_pop: Option<(SourceLocation, Label)>,
     // The delegated normal edge awaits its completed original finally target.
     pending_name_return_borrow_exit: Option<NameReturnBorrowExit>,
@@ -32989,6 +32991,32 @@ impl<'source> Compiler<'source> {
             std::mem::take(&mut self.control.finally.preserve_next_finally_exit_nop);
         let capture_manager_pop =
             std::mem::take(&mut self.control.finally.capture_next_finally_manager_pop);
+        let erased_finalizer_import = if capture_manager_pop
+            && self.context.python_version >= crate::PythonVersion::Py314
+            && !statement.is_star
+            && statement.handlers.is_empty()
+            && statement.orelse.is_empty()
+            && !statement.finalbody.is_empty()
+            && statement
+                .finalbody
+                .iter()
+                .all(|part| self.context.is_elided_statement(part))
+            && let Some(Stmt::If(branch)) = statement.body.last()
+            && early_condition_truthiness(&branch.test).is_none()
+            && !suite_terminates(&branch.body)
+            && let [clause] = branch.elif_else_clauses.as_slice()
+            && clause.test.is_none()
+            && let Some(last) = clause
+                .body
+                .iter()
+                .rev()
+                .find(|part| !self.context.is_elided_statement(part))
+            && matches!(last, Stmt::ImportFrom(_))
+        {
+            Some(last.range())
+        } else {
+            None
+        };
         let mut captured_manager_pop = None;
         let drop_expression_if_exit_nop = preserve_exit_nop
             && statement.handlers.is_empty()
@@ -37089,7 +37117,11 @@ impl<'source> Compiler<'source> {
                                 protected_finally_break_owner,
                                 |compiler| {
                                     compiler.with_try_body_context(statement, |compiler| {
-                                        compiler.compile_suite(&statement.body)
+                                        compiler.with_control_override(
+                                            |control| &mut control.finally.erased_finalizer_import,
+                                            erased_finalizer_import,
+                                            |compiler| compiler.compile_suite(&statement.body),
+                                        )
                                     })
                                 },
                             )
@@ -41401,7 +41433,24 @@ impl<'source> Compiler<'source> {
                 .map_or(alias.name.as_str(), |name| name.as_str());
             self.store_name(bound_name)?;
         }
-        self.emit(POP_TOP, 0, -1)
+        self.emit(POP_TOP, 0, -1)?;
+        if self.control.finally.erased_finalizer_import == Some(statement.range) {
+            let start = self.assembler.label();
+            self.assembler.mark(start);
+            self.emit(NOP, 0, 0)?;
+            self.assembler.preserve_last_nop();
+            let end = self.assembler.label();
+            self.assembler.mark(end);
+            if let Some(exclusions) = self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .last_mut()
+            {
+                exclusions.push((start, end));
+            }
+        }
+        Ok(())
     }
 
     /// Encode the import mode required by the selected target and lexical scope.
