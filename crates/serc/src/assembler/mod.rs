@@ -9686,6 +9686,54 @@ impl Assembler {
     }
 
     /// Records the common backedge emitted after a loop body, before optimization.
+    /// Binds the conditional and body locations copied onto a loop-tail backedge.
+    pub(crate) fn record_threaded_borrow_backedge(&mut self, start: usize, restart: Label) {
+        let items = &self.linear_items()[start..];
+        let mut records = items
+            .iter()
+            .enumerate()
+            .rev()
+            .filter_map(|(i, item)| item.as_instruction().map(|op| (i, op)));
+        let Some((_, body_exit)) = records.next() else {
+            return;
+        };
+        if body_exit.opcode != JUMP_BACKWARD || body_exit.jump_target() != Some(restart) {
+            return;
+        }
+        // With no intervening branch, both exits belong to the same original loop jump.
+        let Some((false_pos, false_exit)) =
+            records.find(|(_, op)| op.jump_target().is_some() || ends_scope(op.opcode))
+        else {
+            return;
+        };
+        if false_exit.opcode != JUMP_BACKWARD
+            || false_exit.jump_target() != Some(restart)
+            || false_exit.location.line < 0
+            || body_exit.location.line < 0
+            || !records.next().is_some_and(|(_, op)| op.opcode == NOT_TAKEN)
+        {
+            return;
+        }
+        let Some((_, condition)) = records.next() else {
+            return;
+        };
+        let Some(entry) = condition.forward_target() else {
+            return;
+        };
+        if crate::target::is_conditional_jump(condition.opcode)
+            && condition.location == false_exit.location
+            && items[false_pos + 1..]
+                .iter()
+                .take_while(|item| matches!(item, Item::Label(_)))
+                .any(|item| *item == Item::Label(entry))
+        {
+            let body_exit = *body_exit;
+            self.exception_owner_provenance
+                .threaded_borrow_backedges
+                .push((entry, body_exit));
+        }
+    }
+
     /// Per-arm backedges emitted by loop-tail lowering do not receive this certificate.
     pub(crate) fn record_last_original_loop_backedge(&mut self) {
         let (last, head) = self

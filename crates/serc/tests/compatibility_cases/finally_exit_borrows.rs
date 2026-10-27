@@ -78,3 +78,33 @@ fn matches_cpython_borrows_after_structured_finally_exits() {
         }
     }
 }
+
+#[test]
+fn matches_cpython_borrows_after_threaded_finalizer_backedges() {
+    for tail in [
+        "if item.active:\n                consume(item)",
+        "if item.active: consume(item)",
+    ] {
+        let source = format!(
+            "def run(value, flag):\n    try:\n        work()\n    finally:\n        while flag:\n            item = next_item()\n            {tail}\n    consume(value)\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "threaded_while_backedge.py");
+    }
+    common::assert_matches_cpython_marshal(
+        r"def run(items, flag, key):
+    for value in items:
+        try:
+            try:
+                work(value)
+            except Error as exc:
+                if flag:
+                    continue
+            consume(value)
+        finally:
+            if check(key):
+                clean(key)
+    consume(key)
+",
+        "threaded_continue_backedge.py",
+    );
+}
