@@ -48453,12 +48453,22 @@ fn suite_contains_orphan_cold_cleanup(body: &[Stmt], return_copies_terminal_with
                                 .iter()
                                 .map(|clause| (clause.test.as_ref(), clause.body.as_slice())),
                         );
-                for (test, body) in branches {
+                for (index, (test, body)) in branches.enumerate() {
                     let truth = test.and_then(early_condition_truthiness);
                     if let Some(test) = test {
                         self.visit_expr(test);
                     }
                     if truth != Some(false) {
+                        // Codegen jumps over the next arm even after a return or
+                        // raise. Its unreachable jump empties and stays behind
+                        // when the live handler blocks move cold.
+                        if truth.is_none()
+                            && index < statement.elif_else_clauses.len()
+                            && suite_terminates_before_constant_folding(body)
+                        {
+                            self.found = true;
+                            return;
+                        }
                         // A managed break leaves this runtime arm's normal join
                         // empty when the async iterator's cold blocks move.
                         if condition_has_linear_runtime_leaves(&statement.test)

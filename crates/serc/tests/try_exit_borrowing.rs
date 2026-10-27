@@ -2,6 +2,16 @@
 mod common;
 
 #[test]
+fn terminal_handler_arm_leaves_its_jump_before_the_normal_successor() {
+    for alternative in ["else:\n                log(value)", "log(value)"] {
+        let source = format!(
+            "def recover(value, first, second):\n    try:\n        work(value)\n    except Error:\n        if first:\n            if second:\n                return value\n            {alternative}\n        log(value)\n    consume(value)\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "terminal_handler_arm.py");
+    }
+}
+
+#[test]
 fn nested_recovery_blocks_later_conditional_borrow_entry() {
     for inner in ["if other:\n                    use(value)", "use(value)"] {
         let source = format!(
