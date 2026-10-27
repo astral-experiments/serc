@@ -7091,12 +7091,40 @@ impl OptimizationPipeline {
             if preserve_unlocated_join_nop {
                 retained_unlocated_join_blocks.insert(source);
             }
+            // A completed handler branch can fall through an empty join into a
+            // bare raise. Copying the raise before threading keeps the original
+            // jump as a NOP on the preceding statement's line.
+            let inline_handler_reraise = inline_small_exit
+                && target_pre_fusion_size == 1
+                && graph[target].last_instruction().is_some_and(|instruction| {
+                    instruction.opcode == RAISE_VARARGS && instruction.value_argument() == Some(0)
+                })
+                && remaining_predecessors[source.index()] == 1
+                && jump_sources[source.index()].is_empty()
+                && source_position.checked_sub(1).is_some_and(|position| {
+                    let previous = order[position];
+                    block_has_fallthrough(graph[previous].items())
+                        && graph[previous]
+                            .last_instruction()
+                            .is_some_and(|op| op.location == source_location)
+                })
+                && region_memberships
+                    .iter()
+                    .enumerate()
+                    .any(|(index, membership)| {
+                        !self.exception_regions[index].is_scope_fallback
+                            && membership.contains(&target_position)
+                    })
+                && region_memberships.iter().all(|membership| {
+                    membership.contains(&source_position) == membership.contains(&target_position)
+                });
             // CPython copies small exits before threading jumps. The compiler's
             // original-empty-join certificate survives retargeting even when the
             // direct-edge line policy is cleared. Current block width alone cannot
             // prove this: earlier folding may have removed original instructions.
             let preserve_threaded_join_nop = (inline_unprotected_return
-                || inline_unprotected_keyword_raise)
+                || inline_unprotected_keyword_raise
+                || inline_handler_reraise)
                 && target_chain_end == target_position
                 && source_location.line >= 0
                 && graph[source].items().iter().any(|item| {

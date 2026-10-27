@@ -4754,6 +4754,27 @@ fn finalizer_copies_named_handler_cleanup_onto_elif_exits() {
 }
 
 #[test]
+fn a_nested_handler_arm_keeps_its_line_before_a_bare_raise() {
+    let source = r"def report():
+    try:
+        start()
+    except LookupError as error:
+        if active():
+            if ready():
+                if done():
+                    pass
+                else:
+                    record(error)
+            else:
+                pass
+        else:
+            clear(error)
+        raise
+";
+    assert_matches_cpython(source, "handler_arm_reraise.py", &LEVELS);
+}
+
+#[test]
 fn nested_handler_raise_keeps_empty_outer_exit() {
     for scope in ["def", "async def"] {
         for binding in ["", " as parse_error"] {
