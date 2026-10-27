@@ -11951,6 +11951,68 @@ impl LayoutAssembler {
                                 ExceptionOwnerDecision::override_with_region(None),
                             );
                         }
+                        // The two handler POPs and the copied None guard lose six records.
+                        // Eight earlier folds put the appended marker inside the protected
+                        // return value, before the first handler POP.
+                        if instruction.exception_policy() == super::ExceptionPolicy::NonePresent
+                            && owner_history_exact
+                            && pop_slot_epoch_known
+                            && owners
+                                .get(instruction_index)
+                                .is_none_or(|decision| !decision.is_definitive())
+                            && tail.early_removals >= 14
+                            && tail.insertions == 0
+                            && tail.late_removals == 0
+                            && tail.post_compaction_fusions == 0
+                            && let Some(value) = instruction_index.checked_sub(8)
+                            && value >= original_array_start
+                            && let [result, swap, pop, none, store, delete, load, guard] =
+                                &indexed_instructions[value..instruction_index]
+                            && result.opcode == crate::target::opcodes::BUILD_TUPLE
+                            && swap.opcode == crate::target::opcodes::SWAP
+                            && swap.value_argument() == Some(2)
+                            && pop.opcode == crate::target::opcodes::POP_EXCEPT
+                            && captured_pop_slots.get(&(value + 1)) == Some(&original_array_start)
+                            && captured_pop_slots.get(&(value + 2)) == Some(&original_array_start)
+                            && none.opcode == LOAD_CONST
+                            && store.opcode == crate::target::opcodes::STORE_FAST
+                            && delete.opcode == crate::target::opcodes::DELETE_FAST
+                            && store.operand() == delete.operand()
+                            && matches!(
+                                load.opcode,
+                                crate::target::opcodes::LOAD_FAST
+                                    | crate::target::opcodes::LOAD_FAST_BORROW
+                            )
+                            && load.local_policy.hidden_exception_owner_slots() == 1
+                            && matches!(guard.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+                            && guard.local_policy.hidden_exception_owner_slots() == 3
+                            && indexed_instructions[original_array_start..=value]
+                                .iter()
+                                .all(|record| {
+                                    record.local_policy.hidden_exception_owner_slots() == 0
+                                        || (record.opcode == LOAD_CONST
+                                            && record.local_policy.hidden_exception_owner_slots()
+                                                == u16::from(record.pre_fold_extra_instructions()))
+                                })
+                            && let Some(region) = self.uniform_exception_owner(
+                                original_array_start,
+                                value + 1,
+                                &label_positions,
+                            )
+                            && self.exception_regions[region].preserve_lasti
+                            && !self.exception_regions[region].is_scope_fallback
+                            && let handler = label_positions[&self.exception_regions[region].target]
+                            && matches!(indexed_instructions.get(handler..handler + 4),
+                                Some([null, bind, clear, raise])
+                                if null.opcode == LOAD_CONST && bind.opcode == store.opcode
+                                    && clear.opcode == delete.opcode && bind.operand() == store.operand()
+                                    && clear.operand() == delete.operand() && raise.opcode == crate::target::opcodes::RERAISE)
+                        {
+                            owners.insert(
+                                instruction_index,
+                                ExceptionOwnerDecision::override_with_region(Some(region)),
+                            );
+                        }
                         // This saved-value cleanup certifies two omitted handler POPs and
                         // the original marker cell at the end of the unwind.
                         if instruction.exception_policy() == super::ExceptionPolicy::NonePresent

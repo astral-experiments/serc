@@ -35,6 +35,27 @@ fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
 }
 
 #[test]
+fn folded_named_handler_return_owns_the_finalizer_guard_marker() {
+    let source = r"def collect(value, owner):
+    try:
+        work()
+    except LookupError as error:
+        value = first(value) or alternate(value)
+        value = normalize(convert(value))
+        return (encode(pack(value)), [(1, 2), (3, encode(pack(value)))], value)
+    finally:
+        if owner is not None:
+            close(owner)
+";
+    assert_matches_cpython_versions(
+        source,
+        "named_result_guard.py",
+        &LEVELS,
+        &[PythonVersion::Py314],
+    );
+}
+
+#[test]
 fn nested_finally_guard_inherits_the_preceding_calls_handler() {
     let source = r"def run(group):
     try:
