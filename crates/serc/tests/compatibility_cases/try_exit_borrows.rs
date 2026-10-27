@@ -2,6 +2,25 @@ use crate::common;
 use crate::common::indent as indent_finally_borrow_case;
 
 #[test]
+fn guarded_iterator_exhaustion_keeps_the_copied_try_exit_boundary() {
+    let source = r"def run(value, ready, items):
+    try:
+        try:
+            return prepare()
+        finally:
+            try:
+                if ready:
+                    for item in items:
+                        pass
+            except ValueError:
+                pass
+    finally:
+        consume(value)
+";
+    common::assert_matches_cpython_marshal(source, "guarded_iterator_exit.py");
+}
+
+#[test]
 fn conditional_nested_pass_recovery_reaches_following_loads() {
     for (scope, call) in [
         ("def", "operation(item)"),
