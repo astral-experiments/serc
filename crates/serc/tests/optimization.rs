@@ -15,6 +15,21 @@ use serc::{
 };
 
 #[test]
+fn raising_wildcard_does_not_locate_the_normal_try_exit() {
+    for continuation in ["return item", "selected = item.color"] {
+        let source = format!(
+            "async def scan(item):\n    try:\n        match item:\n            case captured if ready:\n                pass\n            case 2:\n                consume(item)\n            case _:\n                raise ValueError(item)\n    except ValueError as error:\n        report(error)\n    {continuation}\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "raising_wildcard_exit.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn protected_value_match_preserves_case_and_failure_exits() {
     for action in ["return item", "consume(item)"] {
         let source = format!(
@@ -27,6 +42,39 @@ fn protected_value_match_preserves_case_and_failure_exits() {
             &[PythonVersion::Py314, PythonVersion::Py315],
         );
     }
+}
+
+#[test]
+fn protected_value_match_with_multiple_handlers_locates_its_failure() {
+    let source = r"async def choose(item, flag):
+    try:
+        match item:
+            case Tags.A:
+                note()
+            case Tags.B:
+                pass
+    except Error:
+        pass
+    except More:
+        pass
+    consume(item)
+";
+    let versions = [PythonVersion::Py314, PythonVersion::Py315];
+    assert_matches_cpython_versions(source, "match_handlers.py", &LEVELS, &versions);
+
+    // A live assertion reaches the success jump through its own conditional edge.
+    let guarded = source
+        .replace(
+            "case Tags.B:\n                pass",
+            "case Tags.B:\n                assert flag",
+        )
+        .replace("consume(item)", "return item");
+    assert_matches_cpython_versions(
+        &guarded,
+        "match_assert.py",
+        &[OptimizationLevel::Zero],
+        &versions,
+    );
 }
 
 #[test]

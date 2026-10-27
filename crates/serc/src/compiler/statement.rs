@@ -730,6 +730,9 @@ pub(super) struct StatementContext {
     copied_nested_handler_join_successor: bool,
     // Whether the next statement evaluates a call expression in this suite.
     followed_by_call_expression: bool,
+    // A name assignment with an attribute or call RHS needs more than four records
+    // through the implicit return, even when it is the last statement in the suite.
+    followed_by_attribute_or_call_assignment: bool,
     // Whether the next statement assigns or deletes one name in this suite.
     followed_by_name_assignment_or_deletion: bool,
     // Whether an elided conditional join reaches a call, linear store, or name delete.
@@ -3459,6 +3462,10 @@ impl<'source> Compiler<'source> {
                     followed_by_break,
                     followed_by_call_expression: matches!(body.get(index + 1),
                         Some(Stmt::Expr(expression)) if matches!(expression.value.as_ref(), Expr::Call(_))),
+                    followed_by_attribute_or_call_assignment: matches!(body.get(index + 1),
+                        Some(Stmt::Assign(assignment))
+                            if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                                && matches!(assignment.value.as_ref(), Expr::Attribute(_) | Expr::Call(_))),
                     followed_by_name_assignment_or_deletion: matches!(body.get(index + 1),
                         Some(Stmt::Assign(assignment)) if matches!(assignment.targets.as_slice(), [Expr::Name(_)]))
                         || matches!(body.get(index + 1),
@@ -27173,23 +27180,37 @@ impl<'source> Compiler<'source> {
                                 self.control.stack.depth.cast_unsigned(),
                             ))
                 }));
-        // The normal exit is an unlocated POP_BLOCK and jump. Copying it into
-        // the located case successes leaves the value-pattern failure as its only donor.
-        let coroutine_value_match_pop = self.context.python_version >= crate::PythonVersion::Py314
-            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+        // Copy the normal POP_BLOCK and jump into the successful cases. A final
+        // value-pattern failure can then donate its line. A raising wildcard has
+        // no fallthrough and its raise line cannot locate the normal exit.
+        let named_coroutine_handler =
+            self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+                && matches!(statement.handlers.as_slice(), [handler]
+                    if handler.as_except_handler().is_some_and(|handler| handler.name.is_some()));
+        // A copied return can retain its surrounding exception owner on the marker.
+        let live_continuation = self.control.statements.context.has_following
+            && !self.control.statements.context.followed_by_return_or_raise;
+        let ordinary_match_pop = self.context.python_version >= crate::PythonVersion::Py314
             && !statement.is_star
             && statement.orelse.is_empty()
             && statement.finalbody.is_empty()
             && self.control.stack.depth == 0
-            && matches!(statement.handlers.as_slice(), [handler]
-                if handler.as_except_handler().is_some_and(|handler| handler.name.is_some()))
             && matches!(statement.body.last(), Some(Stmt::Match(matched))
-                if matched.cases.last().is_some_and(|case| case.guard.is_none()
-                    && matches!(case.pattern, Pattern::MatchValue(_))))
-            && self
-                .assembler
-                .has_located_match_success_before_try_end(try_end);
-        let copied_match_pop_block = compound_match_pop_block || coroutine_value_match_pop;
+                if matched.cases.split_last().is_some_and(|(case, earlier)| case.guard.is_none()
+                    && (((named_coroutine_handler || live_continuation)
+                        && matches!(case.pattern, Pattern::MatchValue(_))
+                        && self.assembler.has_located_match_success_before_try_end(try_end))
+                        || (named_coroutine_handler && is_wildcard_pattern(&case.pattern)
+                            && matches!(case.body.last(), Some(Stmt::Raise(_)))
+                            && (self.control.statements.context.followed_by_call_expression
+                                || self.control.statements.context.followed_by_attribute_or_call_assignment)
+                            && earlier.iter().all(|case| matches!(case.body.as_slice(), [Stmt::Pass(_)])
+                                || suite_has_linear_borrow_fallthrough(&case.body))
+                            && self.assembler.at_original_match_join()
+                            && self.assembler.instruction_opcode_at(
+                                self.assembler.instruction_count().saturating_sub(1),
+                            ) == Some(RAISE_VARARGS)))));
+        let copied_match_pop_block = compound_match_pop_block || ordinary_match_pop;
         // A discarded false arm still jumps to this original POP_BLOCK before
         // 3.13 compacts NOPs. Materialize it so jump threading sees that first
         // record, instead of threading straight through the normal-exit jump.
@@ -27250,7 +27271,11 @@ impl<'source> Compiler<'source> {
             // When the value-match exit copies a return, the POP_BLOCK and the
             // replaced jump acquire the same pattern line. CPython keeps the
             // jump's NOP, which belongs to the surrounding coroutine handler.
-            let policy = if coroutine_value_match_pop {
+            let policy = if ordinary_match_pop
+                && named_coroutine_handler
+                && matches!(statement.body.last(), Some(Stmt::Match(matched))
+                    if matched.cases.last().is_some_and(|case| matches!(case.pattern, Pattern::MatchValue(_))))
+            {
                 ExceptionPolicy::default()
             } else {
                 ExceptionPolicy::EXCLUDE_ALWAYS
