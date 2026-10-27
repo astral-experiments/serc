@@ -2372,3 +2372,9 @@ fn borrows_locals_when_a_yield_resumes_into_guarded_cleanup() {
         common::assert_matches_cpython_marshal(&source, "resumed_yield_cleanup.py");
     }
 }
+
+#[test]
+fn copies_both_iterator_exits_of_a_guarded_handler_break() {
+    let source = "def values(manager, items, enabled, strict):\n    with manager:\n        for item in items:\n            try:\n                yield item\n            except Error as error:\n                if strict:\n                    break\n            finally:\n                if enabled:\n                    close(item)\n";
+    common::assert_matches_cpython_marshal(source, "managed_iterator_handler_break.py");
+}

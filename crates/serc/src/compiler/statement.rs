@@ -6974,7 +6974,12 @@ impl<'source> Compiler<'source> {
                     == IteratorCleanup::Sync
                     && !context.prevent_break_exit_inlining
                     && context.break_policy == LoopBreakPolicy::Jump
-                    && self.control.withs.active_with_exits.is_empty()
+                    // A manager enclosing the iterator stays active across its break.
+                    && (self.control.withs.active_with_exits.is_empty()
+                        || (context.with_depth == 1
+                            && self.control.withs.active_with_exits.len() == 1
+                            && self.control.in_synchronous_with()
+                            && self.control.loops.contexts.len() == 1))
                     && self.control.finally.active_finally_try_bodies == 1
                     && self.control.finally.active_finally_end_blocks == 0
                     && self.control.finally.active_normal_finally_bodies == 0
