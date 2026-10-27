@@ -2986,15 +2986,8 @@ impl Compiler<'_> {
         if let [InterpolatedStringComponent::Literal(literal)] = components.as_mut_slice() {
             literal.range = self.fstring_result_range(fstring);
         }
-        let large = value_count > 30;
         let outer_location = self.source_location(fstring.range);
-        if large {
-            self.assembler.set_location(outer_location);
-            self.load_string_constant("")?;
-            let join = self.name_index("join")?;
-            self.emit(LOAD_ATTR, (join << 1) | 1, 1)?;
-            self.emit(BUILD_LIST, 0, 1)?;
-        }
+        let large = self.begin_joined_string(value_count, outer_location)?;
         for component in components {
             match component {
                 InterpolatedStringComponent::Literal(literal) => literal.load(self)?,
@@ -3280,6 +3273,7 @@ impl Compiler<'_> {
 
         let expression_location = self.source_location(expression.range);
         let part_count = parts.len();
+        let large = self.begin_joined_string(part_count, expression_location)?;
         for part in parts {
             match part {
                 PercentFormatPart::Literal(value) => {
@@ -3319,23 +3313,28 @@ impl Compiler<'_> {
                             argument |= FormatValue::HAVE_SPEC.argument();
                         }
                         self.emit(FORMAT_VALUE, argument, -i32::from(has_spec))?;
-                        continue;
-                    }
-                    self.emit_conversion(conversion)?;
-                    if let Some(format_spec) = format_spec {
-                        self.assembler.set_location(SourceLocation::NONE);
-                        self.load_string_constant(&format_spec)?;
-                        self.assembler.set_location(location);
-                        self.emit(FORMAT_WITH_SPEC, 0, -1)?;
                     } else {
-                        self.emit(FORMAT_SIMPLE, 0, 0)?;
+                        self.emit_conversion(conversion)?;
+                        if let Some(format_spec) = format_spec {
+                            self.assembler.set_location(SourceLocation::NONE);
+                            self.load_string_constant(&format_spec)?;
+                            self.assembler.set_location(location);
+                            self.emit(FORMAT_WITH_SPEC, 0, -1)?;
+                        } else {
+                            self.emit(FORMAT_SIMPLE, 0, 0)?;
+                        }
                     }
                 }
+            }
+            if large {
+                self.assembler.set_location(expression_location);
+                self.emit(LIST_APPEND, 1, -1)?;
             }
         }
 
         self.assembler.set_location(expression_location);
         match part_count {
+            _ if large => self.emit(CALL, 1, -2)?,
             0 => self.load_string_constant("")?,
             1 => {}
             count => self.emit(
@@ -3345,6 +3344,23 @@ impl Compiler<'_> {
             )?,
         }
         Ok(SpecializedLowering::Applied)
+    }
+
+    /// Starts a list for `str.join` when the formatted parts would exceed CPython's stack guideline.
+    fn begin_joined_string(
+        &mut self,
+        part_count: usize,
+        location: SourceLocation,
+    ) -> Result<bool, CompileError> {
+        let large = part_count > CPYTHON_STACK_USE_GUIDELINE;
+        if large {
+            self.assembler.set_location(location);
+            self.load_string_constant("")?;
+            let join = self.name_index("join")?;
+            self.emit(LOAD_ATTR, (join << 1) | 1, 1)?;
+            self.emit(BUILD_LIST, 0, 1)?;
+        }
+        Ok(large)
     }
 
     pub(super) fn load_string_constant(&mut self, value: &str) -> Result<(), CompileError> {
