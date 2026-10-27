@@ -256,7 +256,7 @@ impl<'source> Compiler<'source> {
                 control: ControlFlowState::default(),
                 assembler,
                 native_label_plan: None,
-                legacy_short_label_prefix: Default::default(),
+                legacy_short_label_prefix: super::legacy_native_seed_bound::SourcePrefix::default(),
             },
         )
     }
