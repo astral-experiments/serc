@@ -4347,8 +4347,14 @@ impl<'source> Compiler<'source> {
         for (value, exit) in exits.into_iter().rev() {
             self.assembler.mark(exit);
             self.set_depth(base_depth);
-            self.assembler
-                .set_location(self.source_location(while_condition_exit_range(value)));
+            // A nested condition can have several false edges. Keep their return
+            // unlocated until each incoming jump supplies its own source span.
+            let location = if condition_jump_target_count(value, false) > 1 {
+                SourceLocation::NONE
+            } else {
+                self.source_location(while_condition_exit_range(value))
+            };
+            self.assembler.set_location(location);
             self.emit_implicit_return()?;
         }
         self.set_depth(base_depth);

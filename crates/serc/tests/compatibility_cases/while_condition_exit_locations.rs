@@ -84,3 +84,12 @@ fn matches_cpython_while_before_separately_compiled_loop_tail() {
         }
     }
 }
+
+#[test]
+fn preserves_nested_terminal_while_false_exits() {
+    let source = r"async def wait_for_work(started, available, ready, enabled):
+    while (started or available and ready) and enabled:
+        await wait()
+";
+    common::assert_matches_cpython_marshal(source, "nested_while_false_exits.py");
+}
