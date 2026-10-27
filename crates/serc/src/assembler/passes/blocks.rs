@@ -2260,6 +2260,62 @@ impl ReversedStoreExits {
     }
 }
 
+/// Confirms that the preceding arm already copied this exact return after its line donor.
+fn copied_return_after_donor(
+    predecessor: &[Item],
+    target: &[Item],
+    location: SourceLocation,
+    copied_entries: &FxHashSet<Label>,
+) -> bool {
+    let [labels @ .., Item::Instruction(load), Item::Instruction(ret)] = target else {
+        return false;
+    };
+    let [
+        prefix @ ..,
+        Item::Instruction(copied_load),
+        Item::Instruction(copied_ret),
+    ] = predecessor
+    else {
+        return false;
+    };
+    if !labels.iter().all(|item| matches!(item, Item::Label(_)))
+        || !matches!(
+            load.opcode,
+            LOAD_FAST
+                | LOAD_GLOBAL
+                | LOAD_CONST
+                | LOAD_COMMON_CONSTANT
+                | crate::target::opcodes::LOAD_SMALL_INT
+        )
+        || ret.opcode != RETURN_VALUE
+        || load.pre_fold_extra_instructions() != 0
+        || copied_load.pre_fold_extra_instructions() == 0
+        || copied_ret != ret
+    {
+        return false;
+    }
+    let Some(index) = prefix
+        .iter()
+        .rposition(|item| matches!(item, Item::Instruction(_)))
+    else {
+        return false;
+    };
+    let Some(donor) = prefix[index].as_instruction() else {
+        return false;
+    };
+    let mut expected = *load;
+    expected.add_pre_fold_extra_instructions(copied_load.pre_fold_extra_instructions());
+    *copied_load == expected
+        && donor.location == location
+        && (donor.opcode == STORE_FAST
+            || (donor.opcode == POP_TOP
+                && matches!(prefix[..index].last(), Some(Item::Instruction(call))
+            if call.opcode == CALL && call.location == location)))
+        && prefix[index + 1..]
+            .iter()
+            .any(|item| matches!(item, Item::Label(entry) if copied_entries.contains(entry)))
+}
+
 /// Predicts the surviving donor of a reversed store pair at the end of an array.
 fn fused_store_tail_location(source: &[Item]) -> Option<SourceLocation> {
     let [.., Item::Instruction(first), Item::Instruction(second)] = source else {
@@ -6766,9 +6822,26 @@ impl OptimizationPipeline {
                     jump.jump_policy.is_original_match_success()
                         && jump.jump_policy.is_original_empty_join()
                 });
-            // A shared match return picks up its guard's line at the same point.
+            // A copied return after an assignment or discarded call leaves the
+            // final guard as the only edge to the original conditional join.
+            let copied_conditional_return = inline_unprotected_return
+                && target_chain_end == target_position
+                && source_location.line >= 0
+                && matches!(graph[source].items(), [Item::Label(_), labels @ .., Item::Instruction(jump)]
+                    if !labels.is_empty() && labels.iter().all(|item| matches!(item, Item::Label(_)))
+                        && jump.opcode == JUMP_FORWARD
+                        && jump.jump_policy.retained_nop() == super::super::ir::RetainedJumpNop::DirectTarget
+                        && jump.pre_fold_extra_instructions() == 0)
+                && source_position.checked_sub(1).is_some_and(|i| {
+                    copied_return_after_donor(
+                        graph[order[i]].items(),
+                        graph[target].items(),
+                        source_location,
+                        &copied_exit_or_eval_entry_labels,
+                    )
+                });
             let guard_location = if !planned_copy
-                && (guarded_match_return || retain_guard_nop)
+                && (guarded_match_return || retain_guard_nop || copied_conditional_return)
                 && remaining_predecessors[source.index()] == 1
                 && graph[source]
                     .items()
