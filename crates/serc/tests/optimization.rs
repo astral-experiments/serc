@@ -11577,7 +11577,9 @@ fn a_handlers_copied_finalizer_stays_inside_the_try_around_its_loop() {
     except LookupError:
         pass
 ";
-    assert_matches_cpython(source, "loop_handler_finalizer.py", &LEVELS);
+    for source in [source.to_owned(), source.replace(" as error", "")] {
+        assert_matches_cpython(&source, "loop_handler_finalizer.py", &LEVELS);
+    }
 }
 
 #[test]
