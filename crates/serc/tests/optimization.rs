@@ -2097,7 +2097,7 @@ fn erased_coroutine_join_preserves_predating_async_managers() {
 
 #[test]
 fn nested_finalizers_keep_shared_attribute_deletion() {
-    let source = r#"def sample(manager, value):
+    let source = r"def sample(manager, value):
     try:
         work()
     finally:
@@ -2110,7 +2110,7 @@ fn nested_finalizers_keep_shared_attribute_deletion() {
                 with manager:
                     finish()
                 del state.value
-"#;
+";
     assert_matches_cpython(source, "nested_attribute_cleanup.py", &LEVELS);
 }
 
