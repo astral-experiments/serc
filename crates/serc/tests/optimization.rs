@@ -1440,6 +1440,33 @@ fn async_iterator_recovery_keeps_cleanup_cold() {
 }
 
 #[test]
+fn guards_after_managed_stores_reuse_the_late_setup_slot() {
+    for (count, binding, guard) in [
+        (3, true, "flag is None"),
+        (4, true, "flag is None"),
+        (5, true, "flag is None"),
+        (5, false, "flag"),
+        (6, false, "flag == 2"),
+    ] {
+        let managers = vec!["acquire()"; count].join(", ");
+        let (target, assignment) = if binding {
+            (" as value", "")
+        } else {
+            ("", "        value = work()\n")
+        };
+        let source = format!(
+            "def sample(flag):\n    with {managers}{target}:\n{assignment}        try:\n            if {guard}:\n                use(value)\n        finally:\n            finish()\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "managed_store_guard.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn guarded_manager_cleanup_retains_raise_recovery() {
     for work in ["resource.run()", "result = resource.run()"] {
         for exit in ["raise", "return"] {

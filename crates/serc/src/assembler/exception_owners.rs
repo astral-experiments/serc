@@ -9498,34 +9498,58 @@ impl LayoutAssembler {
                                 | NormalizedExceptionOwner::DynamicCondition
                                 | NormalizedExceptionOwner::DynamicConditionStrict
                         )
-                        && uniform_with_suffix
-                            .is_some_and(|start| tail.late_removals > instruction_index - start)
+                        && tail.late_removals != 0
+                        && (uniform_with_suffix.is_some() || protected_suffix.is_some())
                     {
-                        let removed_before = late_setup_positions
-                            .partition_point(|position| *position < instruction_index);
-                        let reuses_null_setup =
-                            late_setup_positions.get(removed_before) == Some(&instruction_index);
-                        let source_region = if reuses_null_setup {
-                            None
-                        } else {
-                            let source = instruction_index - removed_before;
-                            self.uniform_exception_owner(source, source + 1, &label_positions)
-                        };
+                        let manager_entry = uniform_with_suffix
+                            .is_some_and(|start| tail.late_removals > instruction_index - start);
+                        let managed_store = protected_suffix.and_then(|(start, _, _)| {
+                            let source = start.checked_sub(2)?;
+                            (owner_history_exact
+                                && source >= original_array_start
+                                && retained_setup_nops.contains(&(source + 1))
+                                && indexed_instructions[source].opcode
+                                    == crate::target::opcodes::STORE_FAST
+                                && indexed_instructions[source].exception_policy()
+                                    == super::ExceptionPolicy::NoneUnchanged)
+                                .then_some(source)
+                        });
+                        let source = late_setup_positions
+                            .binary_search(&instruction_index)
+                            .err()
+                            .map(|removed_before| instruction_index - removed_before);
+                        let source_region = source.and_then(|index| {
+                            (manager_entry || Some(index) == managed_store)
+                                .then(|| {
+                                    self.uniform_exception_owner(index, index + 1, &label_positions)
+                                })
+                                .flatten()
+                        });
+                        // A retained try SETUP ends the manager-entry suffix. Its guard can
+                        // still reuse the STORE_FAST immediately before that SETUP. An exact
+                        // removed SETUP at the append address supplies its own NULL cell.
+                        let reuses_managed_store = source.is_some()
+                            && source == managed_store
+                            && source_region.is_some_and(|region| {
+                                self.exception_regions[region].preserve_lasti
+                                    && !self.exception_regions[region].is_scope_fallback
+                            });
                         // A structural override is weaker than a certified old-array
                         // region or NULL SETUP, but must not replace an earlier
                         // definitive decision. Only an exact SETUP position proves NULL;
                         // failure to recover a source owner does not.
-                        if instruction.exception_policy().owner()
-                            != NormalizedExceptionOwner::OverridePresent
-                            || (source_region.is_some_and(|region| {
-                                !self.exception_regions[region].is_scope_fallback
-                            }) && owners
-                                .get(instruction_index)
-                                .is_none_or(|owner| !owner.is_definitive()))
-                            || (reuses_null_setup
-                                && owners
+                        if (manager_entry || reuses_managed_store)
+                            && (instruction.exception_policy().owner()
+                                != NormalizedExceptionOwner::OverridePresent
+                                || (source_region.is_some_and(|region| {
+                                    !self.exception_regions[region].is_scope_fallback
+                                }) && owners
                                     .get(instruction_index)
                                     .is_none_or(|owner| !owner.is_definitive()))
+                                || (source.is_none()
+                                    && owners
+                                        .get(instruction_index)
+                                        .is_none_or(|owner| !owner.is_definitive())))
                         {
                             owners.insert(
                                 instruction_index,
