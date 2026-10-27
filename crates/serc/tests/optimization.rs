@@ -19066,3 +19066,20 @@ fn nested_conditional_arms_donate_implicit_return_locations() {
 ";
     assert_matches_cpython(source, "nested_implicit_returns.py", &LEVELS);
 }
+
+#[test]
+fn folded_unary_index_preserves_the_conditional_value_marker() {
+    let source = r"def verify(flag, count, short):
+    async def check():
+        with context:
+            await prime()
+            rows = []
+            if short:
+                pass
+            elif not flag or count:
+                assert 'absent' not in rows[-1]
+                assert rows[-1]['value'] == (2 if flag else 3)
+    return check
+";
+    assert_matches_cpython(source, "folded_index_value_guard.py", &LEVELS);
+}

@@ -10308,6 +10308,58 @@ impl LayoutAssembler {
                             ExceptionOwnerDecision::override_with_region(None),
                         );
                     }
+                    // A single folded literal shifts a terminating truth jump one slot
+                    // left. Its former cell still belongs to the same protected array.
+                    if instruction.opcode == NOT_TAKEN
+                        && owner_history_exact
+                        && pop_slot_epoch_known
+                        && tail.early_removals == 1
+                        && tail.insertions == 0
+                        && tail.late_removals == 0
+                        && tail.post_compaction_fusions == 0
+                        && let [first, literal, op, constant, other, value, truth, guard] =
+                            &indexed_instructions[original_array_start..instruction_index]
+                        && matches!(
+                            first.opcode,
+                            crate::target::opcodes::LOAD_FAST
+                                | crate::target::opcodes::LOAD_FAST_BORROW
+                                | crate::target::opcodes::LOAD_FAST_CHECK
+                        )
+                        && literal.opcode == LOAD_CONST
+                        && literal.local_policy.hidden_exception_owner_slots() == 1
+                        && literal.pre_fold_extra_instructions() == 1
+                        && op.opcode == crate::target::opcodes::BINARY_OP
+                        && matches!(
+                            constant.opcode,
+                            LOAD_CONST | crate::target::opcodes::LOAD_SMALL_INT
+                        )
+                        && other.opcode == op.opcode
+                        && matches!(
+                            value.opcode,
+                            crate::target::opcodes::LOAD_DEREF
+                                | crate::target::opcodes::LOAD_FAST
+                                | crate::target::opcodes::LOAD_FAST_BORROW
+                                | crate::target::opcodes::LOAD_FAST_CHECK
+                        )
+                        && truth.opcode == crate::target::opcodes::TO_BOOL
+                        && matches!(
+                            guard.opcode,
+                            crate::target::opcodes::POP_JUMP_IF_FALSE
+                                | crate::target::opcodes::POP_JUMP_IF_TRUE
+                        )
+                        && guard.forward_target().is_some()
+                        && truth.location == guard.location
+                        && let Some(region) = self.uniform_exception_owner(
+                            original_array_start,
+                            instruction_index,
+                            &label_positions,
+                        )
+                    {
+                        owners.insert(
+                            instruction_index,
+                            ExceptionOwnerDecision::override_with_region(Some(region)),
+                        );
+                    }
                     if instruction.opcode == NOT_TAKEN {
                         if instruction.exception_policy().exclusion()
                             == super::ExceptionExclusion::None
