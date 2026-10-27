@@ -23660,13 +23660,15 @@ impl<'source> Compiler<'source> {
                     )
                 },
             )?;
-            // A reachable final fallthrough keeps CPython's original common backedge live.
-            // A trailing cleanup join alone can instead be reached only by jumps.
-            original_backedge_has_fallthrough &= nested_tail == LoopBackedge::Required
-                && !suite_terminates(body)
-                && self
-                    .assembler
-                    .emitted_region_has_final_fallthrough(arm_start);
+            // A nested conditional can already have emitted each arm's backedge.
+            // Its certified final fallthrough still populates the original join.
+            original_backedge_has_fallthrough &= nested_tail
+                == LoopBackedge::EmittedWithOriginalFallthrough
+                || (nested_tail == LoopBackedge::Required
+                    && !suite_terminates(body)
+                    && self
+                        .assembler
+                        .emitted_region_has_final_fallthrough(arm_start));
             if nested_tail == LoopBackedge::Required && !suite_terminates(body) {
                 let shared_match_failure = self.context.python_version
                     >= crate::PythonVersion::Py314
