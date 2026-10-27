@@ -628,6 +628,7 @@ impl Assembler {
             borrow_finally_jump_sources: rustc_hash::FxHashMap::default(),
             borrow_block_aliases: self.borrow_block_aliases,
             conditional_threading_targets: self.conditional_threading_targets,
+            none_filter_locations: self.none_filter_locations,
             comprehension_assignment_exits: self.comprehension_assignment_exits,
             match_join_store_origins: self.match_join_store_origins,
             original_nop_targets: self.original_nop_targets,

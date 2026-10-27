@@ -12249,6 +12249,15 @@ impl Assembler {
         }
     }
 
+    /// Records the `IS_OP` span used before the filter specializes to a `None` jump.
+    pub(crate) fn record_none_filter_comparison_location(
+        &mut self,
+        target: Label,
+        location: SourceLocation,
+    ) {
+        self.none_filter_locations.insert(target, location);
+    }
+
     /// Keeps a shared join unlocated without changing a NOP produced by exit copying.
     pub(crate) fn defer_shared_jump_no_location(&mut self, emitted: EmittedJump) {
         self.emitted_jump_mut(emitted, "deferring a shared jump's source location");

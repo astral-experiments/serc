@@ -5990,11 +5990,18 @@ impl Compiler<'_> {
         Ok(())
     }
 
-    fn emit_multiline_none_filter_nops(
+    fn prepare_none_filter_jump(
         &mut self,
         comparison: &ruff_python_ast::ExprCompare,
         element_location: SourceLocation,
+        accepted: Label,
     ) -> Result<(), CompileError> {
+        if self.context.has_percent_format_expression {
+            self.assembler.record_none_filter_comparison_location(
+                accepted,
+                self.source_location(comparison.range),
+            );
+        }
         let left_location = self.source_location(comparison.first_operand().range());
         let none_location = self.source_location(comparison.comparators()[0].range());
         if left_location.line == none_location.line {
@@ -6133,9 +6140,10 @@ impl Compiler<'_> {
         {
             self.compile_expression(comparison.first_operand())?;
             self.add_constant(Constant::None)?;
-            self.emit_multiline_none_filter_nops(
+            self.prepare_none_filter_jump(
                 comparison,
                 self.source_location(element.range()),
+                accepted,
             )?;
             let exclusion_start = self.assembler.label();
             self.assembler.mark(exclusion_start);
@@ -6357,7 +6365,7 @@ impl Compiler<'_> {
         {
             self.compile_expression(comparison.first_operand())?;
             self.add_constant(Constant::None)?;
-            self.emit_multiline_none_filter_nops(comparison, element_location)?;
+            self.prepare_none_filter_jump(comparison, element_location, accepted)?;
             let exclusion_start = self.assembler.label();
             self.assembler.mark(exclusion_start);
             self.assembler.set_location(element_location);
@@ -6811,7 +6819,7 @@ impl Compiler<'_> {
         {
             self.compile_expression(comparison.first_operand())?;
             self.add_constant(Constant::None)?;
-            self.emit_multiline_none_filter_nops(comparison, element_location)?;
+            self.prepare_none_filter_jump(comparison, element_location, accepted)?;
             let exclusion_start = self.assembler.label();
             self.assembler.mark(exclusion_start);
             self.assembler.set_location(element_location);

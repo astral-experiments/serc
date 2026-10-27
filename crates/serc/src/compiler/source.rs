@@ -229,6 +229,7 @@ pub(super) struct CompilationContext<'source> {
     // Restricted generic-class identifiers also require real child lowering for key origins.
     pub(super) requires_interning_trace: bool,
     pub(super) requires_empty_bytes_cache_trace: bool,
+    pub(super) has_percent_format_expression: bool,
     empty_bytes_origin: Cell<EmptyBytesOrigin>,
     interning_events: RefCell<Vec<CompilationInterningEvent>>,
 }
@@ -436,6 +437,7 @@ impl<'source> CompilationContext<'source> {
             .collect::<Vec<_>>();
         dotted_import_names.sort_unstable();
         dotted_import_names.dedup();
+        let has_percent_format_expression = source_analysis.has_percent_format_expression;
         let (constant_string_origins, requires_empty_bytes_cache_trace) = source_analysis.finish(
             &mut generated_mangled_strings,
             &mut requires_interning_trace,
@@ -483,6 +485,7 @@ impl<'source> CompilationContext<'source> {
             generated_mangled_strings,
             requires_interning_trace,
             requires_empty_bytes_cache_trace,
+            has_percent_format_expression,
             empty_bytes_origin: Cell::default(),
             interning_events: RefCell::new(Vec::new()),
         };
@@ -985,6 +988,7 @@ pub(super) struct SourceAnalysis<'ast> {
     restricted_private_identifier: bool,
     static_attribute_names: FxHashSet<String>,
     has_percent_replacement: bool,
+    has_percent_format_expression: bool,
     requires_empty_bytes_cache_trace: bool,
 }
 
@@ -1215,6 +1219,8 @@ impl<'ast> SourceAnalysis<'ast> {
             }
             Expr::BinOp(binary) if binary.op == Operator::Mod => {
                 if let Expr::StringLiteral(format) = binary.left.as_ref() {
+                    self.has_percent_format_expression |=
+                        matches!(binary.right.as_ref(), Expr::Tuple(_));
                     self.has_percent_replacement |= format.value.to_str().contains("%%");
                 }
             }

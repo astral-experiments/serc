@@ -1724,6 +1724,7 @@ pub(crate) struct Assembler {
     pub(super) borrow_block_aliases: FxHashSet<Label>,
     /// Original ordinary jump blocks that can thread conditional predecessors after exit copying.
     pub(super) conditional_threading_targets: FxHashMap<Label, SourceLocation>,
+    pub(super) none_filter_locations: FxHashMap<Label, SourceLocation>,
     /// Exact pre-swap comprehension assignment arrays and their shared match exits.
     pub(super) comprehension_assignment_exits: FxHashMap<Label, (Vec<Label>, Vec<Instruction>)>,
     /// Original match fallthrough arrays ending in an ordinary two-store exchange.
@@ -1842,6 +1843,7 @@ pub(super) struct OptimizationPipeline {
     pub(super) borrow_block_aliases: FxHashSet<Label>,
     /// Original ordinary jump blocks that can thread conditional predecessors after exit copying.
     pub(super) conditional_threading_targets: FxHashMap<Label, SourceLocation>,
+    pub(super) none_filter_locations: FxHashMap<Label, SourceLocation>,
     /// Exact pre-swap comprehension assignment arrays and their shared match exits.
     pub(super) comprehension_assignment_exits: FxHashMap<Label, (Vec<Label>, Vec<Instruction>)>,
     /// Original match fallthrough arrays ending in an ordinary two-store exchange.
@@ -1981,6 +1983,7 @@ impl Default for Assembler {
             borrow_finally_entries: FxHashMap::default(),
             borrow_block_aliases: FxHashSet::default(),
             conditional_threading_targets: FxHashMap::default(),
+            none_filter_locations: FxHashMap::default(),
             comprehension_assignment_exits: FxHashMap::default(),
             match_join_store_origins: FxHashMap::default(),
             original_nop_targets: FxHashSet::default(),

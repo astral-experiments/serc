@@ -2767,8 +2767,7 @@ impl OptimizationPipeline {
                 entry.1 = location;
             }
         }
-        let mut conditional_targets =
-            FxHashMap::<BasicBlockId, (BasicBlockId, SourceLocation, SourceLocation)>::default();
+        let mut conditional_targets = FxHashMap::default();
         for source in order.iter().copied() {
             let mut previous_location = SourceLocation::NONE;
             for item in self.graph[source].items() {
@@ -2792,8 +2791,10 @@ impl OptimizationPipeline {
                 predecessor.0 += 1;
                 predecessor.1 = instruction.location;
                 if is_conditional_jump(instruction.opcode) {
-                    conditional_targets
-                        .insert(target, (source, instruction.location, predecessor_location));
+                    conditional_targets.insert(
+                        target,
+                        (source, label, instruction.location, predecessor_location),
+                    );
                 }
             }
         }
@@ -2871,7 +2872,7 @@ impl OptimizationPipeline {
         }
 
         for target in order {
-            let Some(&(source, jump_location, predecessor_location)) =
+            let Some(&(source, label, jump_location, predecessor_location)) =
                 conditional_targets.get(&target)
             else {
                 continue;
@@ -2893,7 +2894,12 @@ impl OptimizationPipeline {
                 {
                     location = *source_predecessor_location;
                 }
-                first.location = location;
+                // Specializing an identity test removes IS_OP before the output jump is emitted.
+                first.location = self
+                    .none_filter_locations
+                    .get(&label)
+                    .copied()
+                    .unwrap_or(location);
             }
             first.no_location_policy.percent_target_location = 0;
         }
