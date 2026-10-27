@@ -53,6 +53,21 @@ fn nested_guards_keep_their_case_exit_locations() {
 }
 
 #[test]
+fn value_match_failure_keeps_the_copied_return_handler() {
+    for value in ["item", "None", "(item, other)", "item.kind", "finish(item)"] {
+        let source = format!(
+            "async def select(item, other):\n    try:\n        match item:\n            case Color.red:\n                consume(item)\n            case Color.blue:\n                item = other\n    except ValueError as error:\n        recover(error)\n    return {value}\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "value_match_return.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn nested_conversion_handlers_keep_shared_cleanup() {
     let source = r"def sample(items):
     for item in items:
