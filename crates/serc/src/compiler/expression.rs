@@ -8116,7 +8116,30 @@ impl Compiler<'_> {
             self.assembler.set_location(location);
             shared
         } else {
-            self.assembler.set_location(SourceLocation::NONE);
+            // The removed outer NOT can donate its span to an unlocated jump.
+            // A folded Boolean prefix leaves the selected operand as its donor,
+            // unless that operand still ends in a shared short-circuit join.
+            let location = match expression.body.as_ref() {
+                Expr::UnaryOp(outer)
+                    if self.context.python_version >= PythonVersion::Py314
+                        && outer.op == UnaryOp::Not
+                        && matches!(outer.operand.as_ref(), Expr::UnaryOp(inner) if inner.op == UnaryOp::Not) =>
+                {
+                    self.source_location(outer.range)
+                }
+                Expr::BoolOp(group)
+                    if self.context.python_version >= PythonVersion::Py314
+                        && group.values.split_last().is_some_and(|(last, leading)| {
+                            !matches!(last, Expr::BoolOp(_))
+                                && !matches!(last, Expr::If(nested) if conditional_expression_has_shared_fallthrough(nested))
+                                && leading.iter().all(|value| jump_constant_truthiness(value).is_some())
+                        }) =>
+                {
+                    self.assembler.last_instruction_location().unwrap_or(SourceLocation::NONE)
+                }
+                _ => SourceLocation::NONE,
+            };
+            self.assembler.set_location(location);
             false
         };
         let optimized_tuple_join = matches!(expression.body.as_ref(), Expr::Call(call)

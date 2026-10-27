@@ -35,6 +35,17 @@ fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
 }
 
 #[test]
+fn folded_boolean_arms_locate_their_conditional_jumps() {
+    let source = r"def configure(target, enabled, value, fallback):
+    target.checked = not not value if enabled else fallback
+    target.raw = None or value if enabled else fallback
+    target.shared = True and (value or fallback) if enabled else fallback
+    target.fallback = fallback
+";
+    assert_matches_cpython(source, "conditional_boolean_location.py", &LEVELS);
+}
+
+#[test]
 fn nested_finally_guard_inherits_the_preceding_calls_handler() {
     let source = r"def run(group):
     try:
