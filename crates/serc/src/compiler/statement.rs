@@ -32951,7 +32951,11 @@ impl<'source> Compiler<'source> {
             // wholly unlocated array before propagating locations, including joins after
             // nested finalizers and manager suppression. Existing cleanup routes stay intact.
             let handler_cleanup_from_original_join = !handler_ends_with_inlineable_cleanup
-                && cold_with_cleanup_location.is_none()
+                // A complete conditional can reach this array only through a
+                // manager's suppression edge. Copy its cleanup before locating it.
+                && (cold_with_cleanup_location.is_none()
+                    || (self.context.python_version >= crate::PythonVersion::Py314
+                        && matches!(handler.body.last(), Some(Stmt::If(_)))))
                 // A terminating nested try can leave unreachable jumps into this join.
                 // The surviving sole condition edge locates POP_EXCEPT after folding.
                 && !handler_cleanup_fallthrough.is_some_and(|test| {
