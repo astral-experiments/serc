@@ -36006,6 +36006,39 @@ impl<'source> Compiler<'source> {
                     && matches!(branch.body.as_slice(), [Stmt::Pass(pass)]
                     if self.source_location(pass.range).line
                         != self.source_location(branch.range).line));
+        // END_ASYNC_FOR moves cold, but an alternative synchronous iterator retains
+        // END_FOR and POP_ITER on the hot path. Its located normal exit falls through
+        // to cleanup while a nonterminal handler keeps that finalizer shared.
+        let async_generator_iterator_exit = self.context.python_version
+            == crate::PythonVersion::Py314
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                == CO_ASYNC_GENERATOR
+            && !statement.is_star
+            && statement.orelse.is_empty()
+            && self.control.loops.contexts.is_empty()
+            && !self.control.in_exception_handler()
+            && self.control.finally.is_inactive_for_return_unwind()
+            && self.suite_has_nonempty_borrow_entry(&statement.finalbody)
+            && statement.handlers.iter().any(|handler| {
+                handler.as_except_handler().is_some_and(|handler| {
+                    handler.type_.is_some() && suite_has_linear_borrow_fallthrough(&handler.body)
+                })
+            })
+            && matches!(statement.body.split_last(), Some((Stmt::If(branch), leading))
+                if suite_has_normal_fallthrough(leading)
+                    && condition_has_linear_runtime_leaves(&branch.test)
+                    && !expression_suspends_current_scope(&branch.test)
+                    && (matches!(branch.body.as_slice(), [Stmt::For(first)]
+                        if first.is_async && first.orelse.is_empty() && !suite_contains_abrupt_control_flow(&first.body))
+                        || matches!(branch.body.as_slice(), [Stmt::Pass(_)]))
+                    && matches!(branch.elif_else_clauses.as_slice(), [otherwise]
+                        if otherwise.test.is_none()
+                            && matches!(otherwise.body.as_slice(), [Stmt::For(last)]
+                                if !last.is_async && last.orelse.is_empty()
+                                    && matches!(last.target.as_ref(), Expr::Name(_))
+                                    && !expression_contains_inline_branch(&last.iter)
+                                    && !expression_suspends_current_scope(&last.iter)
+                                    && !suite_contains_abrupt_control_flow(&last.body))));
         // A live linear arm before the final else keeps a reachable jump directly
         // into normal cleanup after handlers move cold. Folded assertions can leave
         // that jump behind an empty block, so a merely nonterminal arm is insufficient.
@@ -38138,6 +38171,7 @@ impl<'source> Compiler<'source> {
             || managed_runtime_while_return_reaches_finally
             || runtime_retry_break_reaches_finally
             || conditional_body_reaches_finally
+            || async_generator_iterator_exit
             || coroutine_conditional_store_reaches_finally
             || coroutine_await_recovery_reaches_finally
             || coroutine_guarded_nested_cleanup_entry
