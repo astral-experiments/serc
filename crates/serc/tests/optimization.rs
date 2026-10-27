@@ -5605,6 +5605,22 @@ fn erased_nested_else_preserves_coroutine_loop_exits() {
 }
 
 #[test]
+fn a_comprehension_store_donates_the_erased_finally_exit_position() {
+    let source = r"def filter_values(values):
+    try:
+        selected = [value for value in values if include(value)]
+    finally:
+        assert selected
+";
+    assert_matches_cpython_versions(
+        source,
+        "comprehension_cleanup_position.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn erased_final_else_suffix_preserves_coroutine_loop_exits() {
     let source = r"async def sample(items, selected, prepare, work, verify):
     for item in items:
