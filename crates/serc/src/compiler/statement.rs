@@ -45694,12 +45694,18 @@ fn suite_retained_try_exit_has_normal_fallthrough(body: &[Stmt]) -> bool {
         return suite_retained_try_exit_has_normal_fallthrough(selected);
     }
     if_normal_exit_count(statement) > 0
-        && if_suites(statement).any(|body| {
+        && (if_suites(statement).any(|body| {
             matches!(
                 body.last(),
                 Some(Stmt::Break(_) | Stmt::Continue(_) | Stmt::Return(_) | Stmt::Raise(_))
             )
-        })
+        }) || (statement.elif_else_clauses.is_empty()
+            && condition_has_only_runtime_tests(&statement.test)
+            && original_condition_has_unique_jump_target(&statement.test, false)
+            // Both arms of the nested conditional exit. Only the outer
+            // guard's false edge reaches the located normal-exit NOP.
+            && matches!(statement.body.last(), Some(Stmt::If(inner))
+                if if_normal_exit_count(inner) == 0)))
 }
 
 // A nested try can reach the branch join only through its cold recovery handlers.
@@ -48480,6 +48486,44 @@ fn suite_contains_orphan_cold_cleanup(body: &[Stmt], return_copies_terminal_with
                 }
                 return;
             }
+            // An inner while ending in an unconditional break arm leaves the
+            // jump over its later alternative unreachable. A terminal nested
+            // while likewise threads its false edge straight to the outer test.
+            // Cold relocation leaves the emptied jump in the warm try path.
+            if let Stmt::While(retry) = statement
+                && retry.orelse.is_empty()
+                && condition_has_linear_runtime_leaves(&retry.test)
+                && !expression_suspends_current_scope(&retry.test)
+                && retry.body.last().is_some_and(|tail| match tail {
+                    Stmt::If(branch) => {
+                        condition_has_linear_runtime_leaves(&branch.test)
+                            && branch
+                                .elif_else_clauses
+                                .last()
+                                .is_some_and(|clause| clause.test.is_none())
+                            && branch.elif_else_clauses.iter().all(|clause| {
+                                clause
+                                    .test
+                                    .as_ref()
+                                    .is_none_or(condition_has_linear_runtime_leaves)
+                            })
+                            && if_suites(branch)
+                                .take(branch.elif_else_clauses.len())
+                                .any(|arm| matches!(arm.last(), Some(Stmt::Break(_))))
+                    }
+                    Stmt::While(inner) => {
+                        inner.orelse.is_empty()
+                            && condition_has_linear_runtime_leaves(&inner.test)
+                            && !expression_suspends_current_scope(&inner.test)
+                            && (matches!(inner.body.as_slice(), [Stmt::Pass(_)])
+                                || suite_has_nonsuspending_linear_fallthrough(&inner.body))
+                    }
+                    _ => false,
+                })
+            {
+                self.found = true;
+                return;
+            }
             if let Stmt::While(statement) = statement
                 && early_condition_truthiness(&statement.test) == Some(false)
             {
@@ -50313,7 +50357,21 @@ fn finally_guarded_loop_recovery_leaves_empty_borrow_exit(body: &[Stmt]) -> bool
 fn finally_loop_leaves_empty_borrow_exit(statement: &Stmt) -> bool {
     match statement {
         Stmt::For(statement) => {
-            matches!(statement.body.last(), Some(Stmt::With(_) | Stmt::Try(_)))
+            // A handler which ends in continue has already unwound its exception.
+            // Its unreachable normal cleanup remains ahead of the successor when
+            // CPython moves the exceptional copy of the finalizer out of line.
+            (!statement.is_async
+                && statement.orelse.is_empty()
+                && statement.body.iter().any(|part| {
+                    matches!(part, Stmt::Try(recovery)
+                    if !recovery.is_star && recovery.finalbody.is_empty()
+                        && recovery.handlers.iter().any(|handler| {
+                            handler.as_except_handler().is_some_and(|handler| {
+                                matches!(handler.body.last(), Some(Stmt::Continue(_)))
+                            })
+                        }))
+                }))
+                || matches!(statement.body.last(), Some(Stmt::With(_) | Stmt::Try(_)))
                 || matches!(statement.body.last(), Some(Stmt::If(tail))
                     if tail.elif_else_clauses.last().is_none_or(|clause| clause.test.is_some()))
                 || statement
@@ -53405,6 +53463,38 @@ fn managed_guarded_raise_has_finally_route(statement: &ruff_python_ast::StmtTry)
             Stmt::Pass(_) => true,
             _ => false,
         })
+    }
+
+    // A completed protected operation and a conditional re-raise keep separate
+    // normal exits into cleanup. The manager stays active across both edges.
+    if !statement.is_star
+        && statement.orelse.is_empty()
+        && matches!(
+            statement.body.as_slice(),
+            [Stmt::Pass(_) | Stmt::Expr(_) | Stmt::Assign(_)]
+        )
+        && completed_work(&statement.body)
+        && statement
+            .handlers
+            .split_last()
+            .is_some_and(|(last, preceding)| {
+                preceding.iter().all(|handler| {
+                    handler.as_except_handler().is_some_and(|handler| {
+                        matches!(handler.type_.as_deref(), Some(Expr::Name(_)))
+                            && completed_work(&handler.body)
+                    })
+                }) && last.as_except_handler().is_some_and(|handler| {
+                    matches!(handler.type_.as_deref(), Some(Expr::Name(_)))
+                        && suite_has_linear_reraise_guards(&handler.body)
+                })
+            })
+        && matches!(
+            statement.finalbody.first(),
+            Some(Stmt::Expr(_) | Stmt::Assign(_))
+        )
+        && completed_work(&statement.finalbody)
+    {
+        return true;
     }
 
     !statement.is_star
