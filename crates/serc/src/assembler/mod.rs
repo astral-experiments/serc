@@ -9686,7 +9686,7 @@ impl Assembler {
     }
 
     /// Records the common backedge emitted after a loop body, before optimization.
-    /// Binds the distinct line donors of a loop-tail conditional's original backedge.
+    /// Binds the conditional and body locations copied onto a loop-tail backedge.
     pub(crate) fn record_threaded_borrow_backedge(&mut self, start: usize, restart: Label) {
         let items = &self.linear_items()[start..];
         let mut records = items
@@ -9710,7 +9710,6 @@ impl Assembler {
             || false_exit.jump_target() != Some(restart)
             || false_exit.location.line < 0
             || body_exit.location.line < 0
-            || body_exit.location.line == false_exit.location.line
             || !records.next().is_some_and(|(_, op)| op.opcode == NOT_TAKEN)
         {
             return;
