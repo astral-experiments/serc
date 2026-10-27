@@ -2183,7 +2183,8 @@ impl ThreadedNormalTryJoins {
     }
 }
 
-/// Original reversed-store fallthroughs into shared cleanup or loop exits.
+/// Original reversed-store fallthroughs into shared cleanup, match, or loop exits.
+#[derive(Default)]
 pub(in crate::assembler) struct ReversedStoreExits {
     original_labels: FxHashSet<Label>,
     entries: FxHashMap<Label, ReversedStoreExit>,
@@ -2196,6 +2197,20 @@ struct ReversedStoreExit {
 }
 
 impl ReversedStoreExits {
+    /// Restores the pre-swap donor on the original conditional exit of a match case.
+    fn match_case_location(&self, source: &[Item], target: &[Item]) -> Option<SourceLocation> {
+        if self.entries.is_empty()
+            || !target
+                .iter()
+                .filter_map(Item::as_instruction)
+                .map(|op| op.opcode)
+                .eq([JUMP_FORWARD])
+        {
+            return None;
+        }
+        self.location(source, target, &FxHashSet::default())
+    }
+
     /// Replays only the captured SWAP-to-NOP conversion and complete store exchange.
     fn location(
         &self,
@@ -2477,6 +2492,7 @@ fn propagate_exit_block_locations(
     setups: &[(Label, Option<SourceLocation>)],
     python_version: crate::PythonVersion,
     provenance: &ExceptionOwnerProvenance,
+    reversed_store_exits: &ReversedStoreExits,
 ) {
     #[cfg(test)]
     let mut eager = graph.clone();
@@ -2494,6 +2510,7 @@ fn propagate_exit_block_locations(
         setups,
         python_version,
         provenance,
+        reversed_store_exits,
     );
 
     #[cfg(test)]
@@ -2511,6 +2528,7 @@ fn propagate_exit_block_locations(
             setups,
             python_version,
             provenance,
+            reversed_store_exits,
         );
         assert_eq!(graph.copy_items(), eager.copy_items());
     }
@@ -2530,6 +2548,7 @@ fn propagate_exit_block_locations_inner<const SKIP_LOCATED: bool>(
     setups: &[(Label, Option<SourceLocation>)],
     python_version: crate::PythonVersion,
     provenance: &ExceptionOwnerProvenance,
+    reversed_store_exits: &ReversedStoreExits,
 ) {
     for target in order.iter().copied() {
         if analysis.exception_handler_blocks[target.index()] {
@@ -2637,6 +2656,11 @@ fn propagate_exit_block_locations_inner<const SKIP_LOCATED: bool>(
             analysis.jump_predecessors[target.index()]
         };
         let Some(location) = predecessor.and_then(|source| {
+            if let Some(location) = reversed_store_exits
+                .match_case_location(graph[source].items(), graph[target].items())
+            {
+                return Some(location);
+            }
             if let Some(location) = comprehension_assignment_exit_location(
                 graph[source].items(),
                 graph[target].items(),
@@ -4976,7 +5000,13 @@ impl OptimizationPipeline {
                 .iter()
                 .take_while(|item| matches!(item, Item::Label(_)))
                 .count();
+            let match_case = self.python_version >= crate::PythonVersion::Py314
+                && matches!(&target[entry_len..], [Item::Instruction(jump)]
+                    if jump.opcode == JUMP_FORWARD && jump.location == SourceLocation::NONE
+                        && jump.forward_target().is_some_and(|end|
+                            self.exception_owner_provenance.original_match_join_boundaries.contains(&end)));
             let named = match &target[entry_len..] {
+                _ if match_case => false,
                 [Item::Instruction(pop), Item::Instruction(jump)]
                     if pop.opcode == POP_EXCEPT
                         && pop.location == SourceLocation::NONE
@@ -5024,6 +5054,18 @@ impl OptimizationPipeline {
                 }
                 _ => continue,
             };
+            let capture_target = || {
+                let mut captured = target.to_vec();
+                if match_case
+                    && let Some(Item::Instruction(jump)) = captured.last_mut()
+                    && jump.jump_policy.defers_redundant_removal()
+                {
+                    // Jump threading resolves this original case-exit policy before
+                    // either location pass observes the exchanged stores.
+                    jump.jump_policy.resolve_deferred_removal();
+                }
+                captured
+            };
             let pair = if named {
                 source
                     .last_chunk::<5>()
@@ -5041,7 +5083,7 @@ impl OptimizationPipeline {
                     else {
                         return None;
                     };
-                    (call.opcode == CALL
+                    ((match_case || call.opcode == CALL)
                         && swap.opcode == SWAP
                         && swap.value_argument() == Some(2)
                         && [first, last].into_iter().all(|store| {
@@ -5066,7 +5108,7 @@ impl OptimizationPipeline {
                     label,
                     ReversedStoreExit {
                         swapped_source,
-                        target: target.to_vec(),
+                        target: capture_target(),
                         donor: last.location,
                     },
                 );
@@ -5107,7 +5149,7 @@ impl OptimizationPipeline {
                 label,
                 ReversedStoreExit {
                     swapped_source,
-                    target: target.to_vec(),
+                    target: capture_target(),
                     donor: last.location,
                 },
             );
@@ -5267,6 +5309,7 @@ impl OptimizationPipeline {
                 &self.exception_owner_provenance.setups,
                 self.python_version,
                 &self.exception_owner_provenance,
+                reversed_store_exits,
             );
             let heads = shared_pop_block_heads
                 .iter()
@@ -9258,6 +9301,11 @@ impl OptimizationPipeline {
                 {
                     return Some(location);
                 }
+                if let Some(location) = reversed_store_exits
+                    .match_case_location(graph[source].items(), graph[target].items())
+                {
+                    return Some(location);
+                }
                 if let Some(location) = comprehension_assignment_exit_location(
                     graph[source].items(),
                     graph[target].items(),
@@ -10482,6 +10530,7 @@ mod copied_pop_block_location_tests {
                         &[],
                         version,
                         &provenance,
+                        &ReversedStoreExits::default(),
                     );
 
                     let target_block = graph.label_block(target).unwrap();
