@@ -3178,7 +3178,7 @@ impl OptimizationPipeline {
             let mut backward_form_interruptible =
                 backward_form && (instruction.opcode == JUMP_BACKWARD || interruptible);
             let mut threaded_jump_count = 0_u8;
-            let mut crosses_normal_try_exit = false;
+            let mut threaded_normal_try_exit = false;
             for _ in 0..jump_target_count {
                 // The first replaced jump makes a previously copied four-slot
                 // return too large to copy again from an earlier nested arm.
@@ -3264,7 +3264,7 @@ impl OptimizationPipeline {
                 }
                 operand = next_operand;
                 threaded_jump_count = threaded_jump_count.saturating_add(1);
-                crosses_normal_try_exit |= next_normal_try_exit;
+                threaded_normal_try_exit = next_normal_try_exit;
                 crosses_empty_block |= next_empty_block;
                 crosses_fallthrough_barrier |= next_fallthrough_barrier;
                 interruptible |= next_interruptible;
@@ -3325,8 +3325,9 @@ impl OptimizationPipeline {
                 );
             }
             if authored_break_copy_nop
-                && threaded_jump_count == 1
-                && (crosses_normal_try_exit
+                && (threaded_jump_count == 1
+                    || (threaded_jump_count == 2 && threaded_normal_try_exit))
+                && (threaded_normal_try_exit
                     || folded_loop_return_heads.contains(&original_target)
                     || (unlocated_return_join_heads.contains(&original_target)
                         && region_ranges
@@ -3341,9 +3342,9 @@ impl OptimizationPipeline {
                 && matches!(operand, Operand::Forward(_))
                 && !instruction.jump_policy.is_interruptible()
             {
-                // A break's direct copy request survives the original POP_BLOCK/JUMP
-                // or unlocated return join. The copier still decides whether the target fits,
-                // and gives the copied NOP this break's own location and exit owner.
+                // An empty arm can add one jump before the normal try exit. Both
+                // original blocks can be copied onto the break before line resolution.
+                // The return copier still decides whether the final target fits.
                 instruction.jump_policy.retain_nop_for_direct_target();
             }
             if transparent_normal_try_tails.contains(&source_index)
