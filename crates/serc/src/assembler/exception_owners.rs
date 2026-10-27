@@ -12037,9 +12037,26 @@ impl LayoutAssembler {
                             && origin.return_nop.exception_policy()
                                 == super::ExceptionPolicy::NoneUnchanged
                             && !origin.return_nop.fusion_policy.is_converted_pop_block()
-                            && let Some((pop_end, pop_tail, width @ (1 | 2))) = ended_pop_slot
-                            && pop_end == end
-                            && pop_tail.early_removals == end_removed
+                            && let Some(width @ (1 | 2)) = ended_pop_slot
+                                .filter(|(pop_end, pop_tail, _)| {
+                                    *pop_end == end && pop_tail.early_removals == end_removed
+                                })
+                                .map(|(_, _, width)| width)
+                                .or_else(|| {
+                                    // A surrounding region may continue through the copied
+                                    // finalizer. Its handler still records the original POP.
+                                    let provenance = &self.exception_owner_provenance;
+                                    provenance
+                                        .removed_pop_block_boundaries
+                                        .contains(&origin.end)
+                                        .then(|| {
+                                            provenance
+                                                .removed_pop_block_widths
+                                                .get(&origin.end)
+                                                .copied()
+                                                .unwrap_or(1)
+                                        })
+                                })
                             && tail.insertions == 0
                             && tail.late_removals == 0
                             && tail.post_compaction_fusions == 0
