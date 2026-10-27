@@ -2224,6 +2224,35 @@ fn erased_loop_exit_stays_inside_managed_finally() {
 }
 
 #[test]
+fn continue_from_nested_handlers_keeps_the_finalizer_setup_unowned() {
+    for (binding, action) in [
+        ("", "continue"),
+        (" as inner", "if flag:\n                        continue"),
+    ] {
+        let source = format!(
+            r"def sample(items, flag):
+    for item in items:
+        try:
+            try:
+                work()
+            except ValueError as outer:
+                try:
+                    step()
+                except LookupError{binding}:
+                    {action}
+        finally:
+            try:
+                if flag >= 0:
+                    finish()
+            finally:
+                restore()
+"
+        );
+        assert_matches_cpython(&source, "continued_handler_setup.py", &LEVELS);
+    }
+}
+
+#[test]
 fn named_handler_return_keeps_the_nested_finalizer_setup_unowned() {
     let source = r"def sample(items, flag, value):
     with lock():

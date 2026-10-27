@@ -12242,7 +12242,7 @@ impl Assembler {
         managers: usize,
         named_handler: bool,
     ) {
-        use crate::target::opcodes::{CALL, DELETE_FAST, LOAD_FAST, STORE_FAST, TO_BOOL};
+        use crate::target::opcodes::{CALL, DELETE_FAST, STORE_FAST};
         let items = self.linear_items();
         let cleanup: Vec<_> = items[start..pop]
             .iter()
@@ -12278,12 +12278,89 @@ impl Assembler {
         {
             return;
         }
-        let mut suffix = items[pop..]
+        let Some((index, final_pop)) = items[pop..]
+            .iter()
+            .enumerate()
+            .find_map(|(i, item)| Some((i, item.as_instruction()?)))
+        else {
+            return;
+        };
+        if final_pop.opcode == NOP
+            && final_pop.fusion_policy.is_converted_pop_block()
+            && final_pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
+        {
+            self.record_copied_setup_guard(pop + index + 1, missing_pops, ordinary + 1, true);
+        }
+    }
+
+    /// Captures both handler exits and the retained setup of a continued finalizer.
+    pub(crate) fn record_copied_continue_setup(&mut self, start: usize, names: [bool; 2]) {
+        use crate::target::opcodes::{DELETE_FAST, STORE_FAST};
+        let items = self.linear_items();
+        let mut records = items[start..]
+            .iter()
+            .enumerate()
+            .filter_map(|(i, item)| Some((start + i, item.as_instruction()?)));
+        let Some((_, authored)) = records.next() else {
+            return;
+        };
+        if authored.opcode != NOP
+            || authored.fusion_policy.is_converted_pop_block()
+            || authored.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
+        {
+            return;
+        }
+        for named in names {
+            let Some((_, pop)) = records.next() else {
+                return;
+            };
+            if pop.opcode != POP_EXCEPT || pop.location != authored.location {
+                return;
+            }
+            if named {
+                let (Some((_, value)), Some((_, store)), Some((_, clear))) =
+                    (records.next(), records.next(), records.next())
+                else {
+                    return;
+                };
+                if value.opcode != LOAD_CONST
+                    || store.opcode != STORE_FAST
+                    || clear.opcode != DELETE_FAST
+                    || store.operand() != clear.operand()
+                    || [value, store, clear]
+                        .iter()
+                        .any(|r| r.location != authored.location)
+                {
+                    return;
+                }
+            }
+        }
+        if let Some((setup, _)) = records.next() {
+            // The two handlers and the finalizer each omit a POP. A bound
+            // exception name also unwinds its own protected cleanup block.
+            self.record_copied_setup_guard(
+                setup,
+                3 + names.into_iter().filter(|named| *named).count(),
+                1,
+                false,
+            );
+        }
+    }
+
+    /// Records the first guard of a copied nested try with its original POP boundaries.
+    fn record_copied_setup_guard(
+        &mut self,
+        start: usize,
+        missing_pops: usize,
+        adjacent_pops: usize,
+        transferred: bool,
+    ) {
+        use crate::target::opcodes::{LOAD_FAST, LOAD_SMALL_INT, TO_BOOL};
+        let mut suffix = self.linear_items()[start..]
             .iter()
             .filter_map(Item::as_instruction)
             .copied();
-        let (Some(final_pop), Some(setup), Some(load), Some(test)) =
-            (suffix.next(), suffix.next(), suffix.next(), suffix.next())
+        let (Some(setup), Some(load), Some(test)) = (suffix.next(), suffix.next(), suffix.next())
         else {
             return;
         };
@@ -12298,6 +12375,18 @@ impl Assembler {
             }
             records.push(condition);
             condition
+        } else if !transferred && test.opcode == LOAD_SMALL_INT {
+            let (Some(compare), Some(jump)) = (suffix.next(), suffix.next()) else {
+                return;
+            };
+            if compare.opcode != COMPARE_OP
+                || compare.value_argument().is_none_or(|arg| arg & 16 == 0)
+                || !matches!(jump.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE)
+            {
+                return;
+            }
+            records.extend([compare, jump]);
+            jump
         } else if matches!(test.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE) {
             test
         } else {
@@ -12306,10 +12395,7 @@ impl Assembler {
         let Some(marker) = suffix.next() else {
             return;
         };
-        if final_pop.opcode != NOP
-            || !final_pop.fusion_policy.is_converted_pop_block()
-            || final_pop.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
-            || setup.opcode != NOP
+        if setup.opcode != NOP
             || setup.fusion_policy.is_converted_pop_block()
             || setup.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
             || setup.location.line < 0
@@ -12322,7 +12408,9 @@ impl Assembler {
                 r.pre_fold_extra_instructions() != 0
                     || r.jump_policy.borrow_empty_block()
                     || r.local_policy.hidden_exception_owner_slots()
-                        != if i == 2 && test.opcode != TO_BOOL {
+                        != if i == 2
+                            && matches!(test.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+                        {
                             3
                         } else {
                             0
@@ -12332,13 +12420,16 @@ impl Assembler {
         {
             return;
         }
-        self.exception_owner_provenance.copied_return_setups.push(
-            exception_owners::CopiedReturnSetup {
+        if transferred {
+            records[0].local_policy.add_hidden_exception_owner_slots(1);
+        }
+        self.exception_owner_provenance
+            .copied_finalizer_setups
+            .push(exception_owners::CopiedFinalizerSetup {
                 records,
                 missing_pops,
-                adjacent_pops: ordinary + 1,
-            },
-        );
+                adjacent_pops,
+            });
     }
 
     /// Captures a constant coroutine return through one iterator or sync manager.
