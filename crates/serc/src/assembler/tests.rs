@@ -3007,6 +3007,43 @@ fn fallthrough_termination_accounts_for_jumps_to_any_trailing_label() {
 }
 
 #[test]
+fn records_identical_named_handler_exits_once() {
+    let mut assembler = Assembler::with_python_version(crate::PythonVersion::Py314);
+    let entry = assembler.label();
+    let target = assembler.label();
+    let cleanup_end = assembler.label();
+    assembler.record_exception_owner_block_boundary(entry);
+    assembler.mark(entry);
+    assembler.set_location(SourceLocation::new(2, 2, 4, 9));
+    assembler.emit_with_depth(NOP, 0, 1, ExceptionPolicy::EXCLUDE_ALWAYS);
+    let unwind = assembler.item_count();
+    for (opcode, arg, depth) in [
+        (POP_EXCEPT, 0, 0),
+        (LOAD_CONST, 0, 1),
+        (STORE_FAST, 1, 0),
+        (DELETE_FAST, 1, 0),
+    ] {
+        assembler.emit_with_depth(opcode, arg, depth, ExceptionPolicy::default());
+    }
+    assembler.mark(cleanup_end);
+    assembler.set_location(SourceLocation::new(4, 4, 7, 11));
+    assembler.emit_with_depth(LOAD_FAST, 2, 1, ExceptionPolicy::default());
+    assembler.emit_with_depth(TO_BOOL, 0, 1, ExceptionPolicy::default());
+    assembler.emit_forward_with_depth(POP_JUMP_IF_FALSE, target, 0, ExceptionPolicy::default());
+    assembler.emit_with_depth(NOT_TAKEN, 0, 0, ExceptionPolicy::NoneDynamicCondition);
+
+    assembler.record_copied_named_break_truth_prefix(unwind);
+    assembler.record_copied_named_break_truth_prefix(unwind);
+    assert_eq!(
+        assembler
+            .exception_owner_provenance
+            .copied_named_break_truth_prefixes
+            .len(),
+        1
+    );
+}
+
+#[test]
 fn copied_finalizer_guard_accepts_only_a_converted_pre_manager_pop() {
     for converted in [false, true] {
         let mut assembler = Assembler::with_python_version(crate::PythonVersion::Py314);

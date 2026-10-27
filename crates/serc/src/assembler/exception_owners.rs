@@ -1375,7 +1375,7 @@ pub(super) struct SavedNamedHandlerNonePrefix {
 }
 
 /// A captured named-handler break, retaining its original condition across exact retargets.
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 pub(super) struct CopiedNamedBreakTruthPrefix {
     pub(super) entry: Label,
     pub(super) items: Vec<Item>,
@@ -13626,14 +13626,26 @@ impl LayoutAssembler {
             .enumerate()
             .filter(|(_, region)| !region.is_scope_fallback && finally_ends.contains(&region.end))
             .collect::<Vec<_>>();
+        // The other arm can reopen all three ranges at the authored break NOP.
+        // Its leading labels still precede that NOP even when compaction moves
+        // them onto POP_EXCEPT. A coincident uncaptured label proves no coverage.
+        let covers_authored_exit = |start: Label| {
+            positions.get(&start).is_some_and(|&position| {
+                position < array
+                    || (position == array
+                        && origin
+                            .items
+                            .iter()
+                            .take_while(|item| matches!(item, Item::Label(_)))
+                            .any(|item| *item == Item::Label(start)))
+            })
+        };
         if handlers.len() != 2
             || handlers[0].target == handlers[1].target
             || handlers.iter().any(|region| {
                 !region.preserve_lasti
                     || Some(region.depth) != authored.depth_after()
-                    || positions
-                        .get(&region.start)
-                        .is_none_or(|position| *position >= array)
+                    || !covers_authored_exit(region.start)
             })
             || finalizers.len() != 1
         {
@@ -13642,9 +13654,7 @@ impl LayoutAssembler {
         let (finalizer_index, finalizer) = finalizers[0];
         if finalizer.preserve_lasti
             || Some(finalizer.depth) != pop.depth_after()
-            || positions
-                .get(&finalizer.start)
-                .is_none_or(|position| *position >= array)
+            || !covers_authored_exit(finalizer.start)
             || self.uniform_exception_owner(array, array + 4, positions) != Some(finalizer_index)
         {
             return false;

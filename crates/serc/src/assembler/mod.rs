@@ -11080,7 +11080,7 @@ impl Assembler {
     }
 
     /// Captures a named break's clear-name array and the first copied truth marker.
-    fn record_copied_named_break_truth_prefix(&mut self, unwind_start: usize) {
+    pub(crate) fn record_copied_named_break_truth_prefix(&mut self, unwind_start: usize) {
         let items = self.linear_items();
         let Some(break_item) = items[..unwind_start]
             .iter()
@@ -11122,8 +11122,10 @@ impl Assembler {
         expected_nop.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
         let mut expected_load =
             Instruction::new(LOAD_FAST, load.operand(), load.location, Some(loaded));
-        expected_load.local_policy =
-            LocalPolicy::for_load(load.local_policy.force_owned_load(), false);
+        expected_load.local_policy = LocalPolicy::for_load(
+            load.local_policy.force_owned_load(),
+            load.local_policy.strict_owned_load(),
+        );
         let mut expected_marker =
             Instruction::new(NOT_TAKEN, Operand::Value(0), load.location, Some(depth));
         expected_marker.set_exception_policy(ExceptionPolicy::NoneDynamicCondition);
@@ -11203,14 +11205,19 @@ impl Assembler {
         {
             return;
         }
-        let items = items[start..=*marker_at].to_vec();
-        self.exception_owner_provenance
-            .copied_named_break_truth_prefixes
-            .push(exception_owners::CopiedNamedBreakTruthPrefix {
-                entry,
-                items,
-                original_condition: *condition,
-            });
+        let prefix = exception_owners::CopiedNamedBreakTruthPrefix {
+            entry,
+            items: items[start..=*marker_at].to_vec(),
+            original_condition: *condition,
+        };
+        let prefixes = &mut self
+            .exception_owner_provenance
+            .copied_named_break_truth_prefixes;
+        // The handler unwind and its enclosing iterator can observe the same exit.
+        // Keep distinct original arrays visible to the ownership ambiguity check.
+        if !prefixes.contains(&prefix) {
+            prefixes.push(prefix);
+        }
     }
 
     /// Records the ordinary break's two ended regions before its copied truth array.
