@@ -563,12 +563,14 @@ impl Assembler {
                         if instruction.jump_target().is_some())
                 })
         );
-        exception_owner_provenance.bind_normal_try_borrow_exits(
-            &graph,
-            &self.preserved_block_boundaries,
-            &self.exception_regions,
-            &self.folded_loop_exit_anchors,
-        );
+        if self.python_version == crate::PythonVersion::Py314 {
+            exception_owner_provenance.bind_normal_try_borrow_exits(
+                &graph,
+                &self.preserved_block_boundaries,
+                &self.exception_regions,
+                &self.folded_loop_exit_anchors,
+            );
+        }
         if graph.features().has_jump() {
             for item in graph.iter_items() {
                 if let Item::Instruction(instruction) = item

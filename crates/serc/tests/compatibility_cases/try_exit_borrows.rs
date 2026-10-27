@@ -2009,6 +2009,21 @@ fn matches_cpython_partial_terminal_match_handler_borrow_entries() {
 }
 
 #[test]
+fn copied_comprehension_restore_stops_borrow_fallthrough() {
+    for cleanup in [
+        "result = [work(x) for x in items]",
+        "[work(x) for x in items]",
+        "result = [work(x, y) for x, y in items]",
+        "result = list([work(x) for x in items])",
+    ] {
+        let source = format!(
+            "def run(value, items):\n    try:\n        prepare()\n    except ValueError:\n        recover()\n    finally:\n        {cleanup}\n    consume(value)\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "comprehension_restore.py");
+    }
+}
+
+#[test]
 fn preserves_copied_pass_recovery_borrow_fallthrough_and_independent_jumps() {
     let source = r"def f(flag, value):
     try:

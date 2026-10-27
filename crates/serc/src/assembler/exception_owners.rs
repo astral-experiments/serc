@@ -26,6 +26,35 @@ thread_local! {
     static VERIFY_COMPLETE_OWNER_REPLAY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Whether a one-local restore, result consumer and reraise fit CPython's four-slot exit.
+fn copyable_comprehension_reraise(items: &[Item], original: &[Instruction]) -> bool {
+    use crate::target::opcodes::{POP_TOP, RERAISE, STORE_FAST, SWAP};
+    let [head, restore] = original else {
+        return false;
+    };
+    let mut instructions = items.iter().filter_map(Item::as_instruction);
+    if restore.opcode != STORE_FAST
+        || !restore.local_policy.may_store_null()
+        || instructions.next() != Some(head)
+        || instructions.next() != Some(restore)
+    {
+        return false;
+    }
+    let consumes_result = match head.opcode {
+        // Serc lowers SWAP / STORE_FAST_MAYBE_NULL / POP_TOP as POP_TOP / STORE_FAST.
+        POP_TOP => true,
+        SWAP if head.value_argument() == Some(2) => instructions.next().is_some_and(|store| {
+            store.opcode == STORE_FAST && !store.local_policy.may_store_null()
+        }),
+        _ => false,
+    };
+    consumes_result
+        && instructions
+            .next()
+            .is_some_and(|op| op.opcode == RERAISE && op.value_argument() == Some(0))
+        && instructions.next().is_none()
+}
+
 /// Original labels for a Python 3.12 async-manager protocol await.
 #[derive(Debug)]
 pub(super) struct LegacyProtocolAwaitSetup {
@@ -385,7 +414,7 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) borrow_normal_try_exits: Vec<(Label, Instruction)>,
     pub(super) initial_borrow_normal_try_exits: Vec<NormalTryBorrowExit>,
     // Handler labels locate the emptied original exits through cold-block relocation.
-    pub(super) copied_unlocated_try_exit_handlers: Vec<Label>,
+    pub(super) copied_borrow_exit_handlers: Vec<Label>,
     pub(super) retired_normal_try_exits: Vec<RetiredNormalTryExit>,
     // Sole authored break, retired ordinary-try bridge, and intact normal-finally array.
     pub(super) normal_try_break_pop_owners: Vec<NormalTryBreakPopOwner>,
@@ -500,16 +529,40 @@ impl ExceptionOwnerProvenance {
             && self.ordinary_try_setups.get(setup) == Some(target)
     }
 
-    /// Finds original two-slot exits copied into all their unconditional predecessors.
-    fn bind_copied_unlocated_try_exits(&mut self, graph: &super::block_graph::BlockGraph) {
+    /// Finds original exits copied into all their unconditional predecessors.
+    fn bind_copied_borrow_exits(
+        &mut self,
+        graph: &super::block_graph::BlockGraph,
+        regions: &[super::ExceptionRegion],
+    ) {
+        use crate::target::opcodes::{COPY, JUMP_FORWARD, PUSH_EXC_INFO, RERAISE};
+
+        enum Exit<'a> {
+            NormalTry(Label),
+            Comprehension(&'a [Instruction]),
+        }
         let mut entries = self
             .borrow_normal_try_exits
             .iter()
             .filter_map(|(entry, jump)| {
                 (jump.location == SourceLocation::NONE).then_some(())?;
-                Some((graph.label_block(*entry)?, (jump.forward_target()?, false)))
+                Some((
+                    graph.label_block(*entry)?,
+                    (Exit::NormalTry(jump.forward_target()?), false),
+                ))
             })
             .collect::<FxHashMap<_, _>>();
+        if !self.original_comprehension_normal_restores.is_empty() {
+            for (block, body) in graph.iter() {
+                let restore = body.items().iter().find_map(|item| match item {
+                    Item::Label(label) => self.original_comprehension_normal_restores.get(label),
+                    Item::Instruction(_) => None,
+                });
+                if let Some(restore) = restore.filter(|restore| restore.len() == 2) {
+                    entries.insert(block, (Exit::Comprehension(restore), false));
+                }
+            }
+        }
         if entries.is_empty() {
             return;
         }
@@ -527,35 +580,67 @@ impl ExceptionOwnerProvenance {
             }
         }
         let handlers: FxHashSet<_> = self.ordinary_try_setups.values().copied().collect();
+        let cleanup_handlers: FxHashSet<_> =
+            if self.original_comprehension_normal_restores.is_empty() {
+                FxHashSet::default()
+            } else {
+                regions.iter().map(|region| region.target).collect()
+            };
         for blocks in graph.order().windows(3) {
             let [previous, block, following] = *blocks else {
                 unreachable!()
             };
-            let Some(&(target, true)) = entries.get(&block) else {
+            let Some((exit, true)) = entries.get(&block) else {
                 continue;
             };
-            let Some((Item::Instruction(jump), labels)) = graph[block].items().split_last() else {
+            let Some(previous) = graph[previous].last_instruction() else {
                 continue;
             };
-            // The preceding error cleanup cannot fall through to the original exit.
-            if jump.opcode == crate::target::opcodes::JUMP_FORWARD
-                && jump.forward_target() == Some(target)
-                && jump.location == SourceLocation::NONE
-                && labels.iter().all(|item| matches!(item, Item::Label(_)))
-                && graph[previous].last_instruction().is_some_and(|op| {
-                    op.opcode == crate::target::opcodes::RERAISE && op.value_argument() == Some(1)
-                })
-                && graph[following]
-                    .items()
-                    .iter()
-                    .find_map(Item::as_instruction)
-                    .is_some_and(|op| op.opcode == crate::target::opcodes::PUSH_EXC_INFO)
-                && let Some(handler) = graph[following].items().iter().find_map(|item| match item {
-                    Item::Label(label) if handlers.contains(label) => Some(*label),
-                    _ => None,
-                })
-            {
-                self.copied_unlocated_try_exit_handlers.push(handler);
+            let Some(first) = graph[following]
+                .items()
+                .iter()
+                .find_map(Item::as_instruction)
+            else {
+                continue;
+            };
+            if previous.opcode != RERAISE {
+                continue;
+            }
+            let handler_labels = match exit {
+                // Only unconditional jumps can enter these blocks. The preceding error
+                // cleanup ends in RERAISE, and its successor is the next cold handler.
+                Exit::NormalTry(target) => {
+                    let Some((Item::Instruction(jump), labels)) = graph[block].items().split_last()
+                    else {
+                        continue;
+                    };
+                    if jump.opcode != JUMP_FORWARD
+                        || jump.forward_target() != Some(*target)
+                        || jump.location != SourceLocation::NONE
+                        || !labels.iter().all(|item| matches!(item, Item::Label(_)))
+                        || previous.value_argument() != Some(1)
+                        || first.opcode != PUSH_EXC_INFO
+                    {
+                        continue;
+                    }
+                    &handlers
+                }
+                Exit::Comprehension(restore) => {
+                    if previous.value_argument() != Some(0)
+                        || first.opcode != COPY
+                        || first.value_argument() != Some(3)
+                        || !copyable_comprehension_reraise(graph[block].items(), restore)
+                    {
+                        continue;
+                    }
+                    &cleanup_handlers
+                }
+            };
+            if let Some(handler) = graph[following].items().iter().find_map(|item| match item {
+                Item::Label(label) if handler_labels.contains(label) => Some(*label),
+                _ => None,
+            }) {
+                self.copied_borrow_exit_handlers.push(handler);
             }
         }
     }
@@ -568,7 +653,7 @@ impl ExceptionOwnerProvenance {
         regions: &[super::ExceptionRegion],
         folded_loop_exit_anchors: &FxHashSet<Label>,
     ) {
-        self.bind_copied_unlocated_try_exits(graph);
+        self.bind_copied_borrow_exits(graph, regions);
         for (entry, instruction) in std::mem::take(&mut self.borrow_normal_try_exits) {
             let Some(block) = graph.label_block(entry) else {
                 continue;
