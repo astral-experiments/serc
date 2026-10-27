@@ -4229,6 +4229,11 @@ impl<'source> Compiler<'source> {
                         clause.test.as_ref().is_none_or(condition_has_only_runtime_tests)
                     })
         );
+        // The matched handler leaves the loop, but a successful try enters its
+        // else suite. Each live conditional exit needs its own located backedge.
+        let try_else_exits = self.context.python_version >= crate::PythonVersion::Py314
+            && matches!(statement.body.last(), Some(Stmt::Try(tail))
+                if try_else_requires_loop_tail_inlining(tail));
         if self.context.python_version <= crate::PythonVersion::Py313
             && let Some(body_entry) = body_entry
         {
@@ -4244,7 +4249,7 @@ impl<'source> Compiler<'source> {
                 self.assembler.prevent_jump_threading_target(backedge);
                 self.assembler.record_last_original_loop_backedge();
             }
-        } else if normalize_final_condition || complete_tail_has_no_fallthrough {
+        } else if normalize_final_condition || complete_tail_has_no_fallthrough || try_else_exits {
             // CPython normalizes a backward conditional jump by reversing it around an explicit
             // backedge. A final `if` keeps that layout when its body does work before breaking.
             // A terminating final else leaves no fallthrough into the original common
