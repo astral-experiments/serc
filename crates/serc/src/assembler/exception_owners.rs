@@ -12935,8 +12935,14 @@ impl LayoutAssembler {
         }
         let transferred_inner_pop = usize::from(
             origin.inner_try_pop
-                && origin.cleanup[0].local_policy.hidden_exception_owner_slots() == 0
-                && instructions[start].local_policy.hidden_exception_owner_slots() == 1,
+                && origin.cleanup[0]
+                    .local_policy
+                    .hidden_exception_owner_slots()
+                    == 0
+                && instructions[start]
+                    .local_policy
+                    .hidden_exception_owner_slots()
+                    == 1,
         );
         if prefix_tail.insertions != 0
             || prefix_tail
@@ -13937,9 +13943,13 @@ mod tests {
                 change,
                 "transferred inner pop" | "unrecorded inner pop" | "two inner pops"
             ) {
-                live_cleanup[0].local_policy.add_hidden_exception_owner_slots(
-                    if change == "two inner pops" { 2 } else { 1 },
-                );
+                live_cleanup[0]
+                    .local_policy
+                    .add_hidden_exception_owner_slots(if change == "two inner pops" {
+                        2
+                    } else {
+                        1
+                    });
             }
             items.extend(live_cleanup.into_iter().map(Item::Instruction));
             items.extend([
@@ -14010,8 +14020,9 @@ mod tests {
                 10,
                 0,
                 ExceptionOwnerTail {
-                    early_removals: 5
-                        + usize::from(live_cleanup[0].local_policy.hidden_exception_owner_slots()),
+                    early_removals: 5 + usize::from(
+                        live_cleanup[0].local_policy.hidden_exception_owner_slots(),
+                    ),
                     ..ExceptionOwnerTail::default()
                 },
                 &instructions,
