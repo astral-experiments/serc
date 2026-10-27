@@ -624,26 +624,10 @@ impl ExceptionOwnerProvenance {
                 }
             }
         }
-        for &(entry, target, following) in &self.unnamed_handler_borrow_exits {
-            let Some(block) = graph.label_block(entry) else {
-                continue;
-            };
-            let mut ops = graph[block].items().iter().filter_map(Item::as_instruction);
-            if ops
-                .next()
-                .is_some_and(|op| op.opcode == crate::target::opcodes::POP_EXCEPT)
-                && ops.next().is_some_and(|op| {
-                    op.opcode == JUMP_FORWARD && op.forward_target() == Some(target)
-                })
-                && ops.next().is_none()
-            {
-                entries
-                    .entry(block)
-                    .or_insert((Exit::HandlerCleanup(following), true));
-            }
-        }
         let mut named_exit_splits = FxHashMap::default();
-        if !self.named_handler_cleanup_targets.is_empty() {
+        if !self.named_handler_cleanup_targets.is_empty()
+            || !self.unnamed_handler_borrow_exits.is_empty()
+        {
             let order = graph.order();
             let normal_targets: FxHashSet<_> = self
                 .borrow_normal_try_exits
@@ -664,6 +648,30 @@ impl ExceptionOwnerProvenance {
                 })
                 .map(|(_, block)| *block)
                 .collect();
+            for &(entry, target, following) in &self.unnamed_handler_borrow_exits {
+                let Some(block) = graph.label_block(entry) else {
+                    continue;
+                };
+                let mut ops = graph[block].items().iter().filter_map(Item::as_instruction);
+                if graph
+                    .label_block(target)
+                    .is_some_and(|block| copied_returns.contains(&block))
+                {
+                    continue;
+                }
+                if ops
+                    .next()
+                    .is_some_and(|op| op.opcode == crate::target::opcodes::POP_EXCEPT)
+                    && ops.next().is_some_and(|op| {
+                        op.opcode == JUMP_FORWARD && op.forward_target() == Some(target)
+                    })
+                    && ops.next().is_none()
+                {
+                    entries
+                        .entry(block)
+                        .or_insert((Exit::HandlerCleanup(following), true));
+                }
+            }
             for (position, pair) in order.windows(2).enumerate() {
                 let [normal, exceptional] = *pair else {
                     unreachable!()
