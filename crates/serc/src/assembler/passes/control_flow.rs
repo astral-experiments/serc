@@ -1694,6 +1694,7 @@ impl OptimizationPipeline {
             .collect::<FxHashSet<_>>();
         let mut jump_targets =
             vec![None; usize::try_from(self.next_label).expect("label count fits in usize")];
+        let mut full_return_joins = FxHashSet::default();
         let mut jump_target_count = 0;
         let mut next_instruction = None;
         for block in graph.order().iter().rev().copied() {
@@ -1925,6 +1926,26 @@ impl OptimizationPipeline {
                                         .contains(&label_offsets[label])
                                         || self.original_nop_targets.contains(label))))
                             .then_some(label_offsets[label]);
+                            if self.python_version >= crate::PythonVersion::Py314
+                                && instruction.opcode == JUMP_FORWARD
+                                && graph[block].last_instruction() == Some(&instruction)
+                                && let Some(exit) = instruction
+                                    .forward_target()
+                                    .and_then(|target| graph.label_block(target))
+                                && graph[exit].last_instruction().is_some_and(|last| {
+                                    last.opcode == RETURN_VALUE && last.location.line >= 0
+                                })
+                                && graph[exit]
+                                    .items()
+                                    .iter()
+                                    .filter_map(Item::as_instruction)
+                                    .take(5)
+                                    .map(Instruction::pre_fusion_width)
+                                    .sum::<usize>()
+                                    == 4
+                            {
+                                full_return_joins.insert(*label);
+                            }
                             let target = &mut jump_targets[label.index()];
                             jump_target_count += usize::from(
                                 target
@@ -3125,7 +3146,11 @@ impl OptimizationPipeline {
             let mut threaded_jump_count = 0_u8;
             let mut crosses_normal_try_exit = false;
             for _ in 0..jump_target_count {
-                if nested_match_copy_target == Some(target) {
+                // The first replaced jump makes a previously copied four-slot
+                // return too large to copy again from an earlier nested arm.
+                if nested_match_copy_target == Some(target)
+                    || (threaded_jump_count == 1 && full_return_joins.contains(&target))
+                {
                     break;
                 }
                 let Some((
