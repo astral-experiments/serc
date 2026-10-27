@@ -9528,7 +9528,8 @@ impl<'source> Compiler<'source> {
                                     == self.control.exceptions.active_try_marker_slots.len()
                     );
                 // A return may leave a handler, run an inner finally in an older
-                // handler, then restore that older handler inside an ordinary try.
+                // handler, then restore that older handler. Both handlers have the
+                // same enclosing ordinary tries, if any.
                 let interleaved_handlers_and_finalizers = !return_is_overridden
                     && self.control.withs.active_with_exits.is_empty()
                     && self.control.exceptions.active_exception_group_handlers == 0
@@ -9548,11 +9549,12 @@ impl<'source> Compiler<'source> {
                     ), ([older, newer], [outer, inner])
                         if outer.handler_depth == 0 && inner.handler_depth == 1
                             && outer.try_body_depth == 0 && outer.exception_region_depth == 0
-                            && older.exception_region_depth == 2 && inner.exception_region_depth == 3
-                            && newer.exception_region_depth == 4
-                            && older.try_body_depth == 1 && inner.try_body_depth == 1 && newer.try_body_depth == 1
-                            && self.control.exceptions.active_try_marker_slots.len() == 1
-                            && self.control.exceptions.active_exception_region_exclusions.len() == 5
+                            && older.exception_region_depth == 1 + older.try_body_depth
+                            && inner.exception_region_depth == older.exception_region_depth + 1
+                            && newer.exception_region_depth == inner.exception_region_depth + 1
+                            && older.try_body_depth == inner.try_body_depth && inner.try_body_depth == newer.try_body_depth
+                            && self.control.exceptions.active_try_marker_slots.len() == newer.try_body_depth
+                            && self.control.exceptions.active_exception_region_exclusions.len() == newer.exception_region_depth + 1
                             && older.loop_depth == inner.loop_depth && inner.loop_depth == newer.loop_depth
                             && !suite_contains_abrupt_control_flow(inner.body) && !suite_contains_yield(inner.body)
                             && !suite_contains_abrupt_control_flow(outer.body) && !suite_contains_yield(outer.body));
