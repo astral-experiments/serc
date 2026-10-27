@@ -26021,3 +26021,22 @@ def longer_tail(flag, value):
 ";
     assert_matches_cpython(source, "branch_pass.py", &LEVELS);
 }
+
+#[test]
+fn a_protected_branch_keeps_a_pass_after_an_empty_join() {
+    let source = r"def choose(first, second, enabled, value):
+    try:
+        if first:
+            other(value)
+        elif second:
+            if enabled:
+                consume(value)
+            pass
+    except Error as exc:
+        recover(exc)
+    finally:
+        finish(value)
+    return value
+";
+    assert_matches_cpython(source, "protected_branch_pass.py", &LEVELS);
+}
