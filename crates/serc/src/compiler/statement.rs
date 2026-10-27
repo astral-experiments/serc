@@ -22422,7 +22422,11 @@ impl<'source> Compiler<'source> {
                     && !statement.body.is_empty()
                     && statement.body.iter().all(|statement| self.context.is_elided_statement(statement))))
             && !self.control.in_exception_handler()
-            && (self.control.exceptions.active_exception_region_exclusions.is_empty()
+            && (self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
                 && self.control.finally.active_finally_try_bodies == 0
                 || protected_finally_loop_else
                 || protected_while_loop_else
