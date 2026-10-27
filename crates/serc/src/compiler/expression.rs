@@ -8969,7 +8969,24 @@ impl Compiler<'_> {
             self.emit(COPY, 2, 1)?;
             self.emit_boolean_comparison(*operator)?;
             self.emit_jump_forward(POP_JUMP_IF_FALSE, cleanup, -1)?;
-            self.emit(NOT_TAKEN, 0, 0)?;
+            // Earlier compaction can move this marker into an instruction-array slot
+            // from before the try. Resolve its owner after the array is assembled.
+            let policy = if self.context.python_version == PythonVersion::Py314
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .len()
+                    == 1
+                && self.control.generators.generator_region_start.is_none()
+                && self.control.withs.active_with_region_exclusions.is_empty()
+                && !self.control.in_exception_handler()
+            {
+                ExceptionPolicy::NoneDynamicConditionStrict
+            } else {
+                ExceptionPolicy::default()
+            };
+            self.emit_with_exception_policy(NOT_TAKEN, 0, 0, policy)?;
         }
         Ok(())
     }

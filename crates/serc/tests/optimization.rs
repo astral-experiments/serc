@@ -15,6 +15,17 @@ use serc::{
 };
 
 #[test]
+fn chained_comparison_markers_use_the_compacted_try_entry() {
+    for calls in [7, 8] {
+        let source = format!(
+            "def bounded(item):\n{}    try:\n        if 0 < item.size < 10:\n            return True\n    except ValueError:\n        raise\n    return False\n",
+            "    inspect(item)\n".repeat(calls)
+        );
+        assert_matches_cpython_versions(&source, "bounded.py", &LEVELS, &[PythonVersion::Py314]);
+    }
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
