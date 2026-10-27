@@ -11091,6 +11091,28 @@ fn managed_handler_returns_retain_outer_recovery_cleanup() {
 }
 
 #[test]
+fn an_inner_finalizer_keeps_the_surrounding_exception_handler() {
+    let source = r"def choose(items):
+    try:
+        value = items[0]
+    except IndexError:
+        try:
+            other = items[1]
+        except IndexError:
+            return -1
+        else:
+            return other
+        finally:
+            finish()
+    else:
+        return value
+    finally:
+        done()
+";
+    assert_matches_cpython(source, "nested_finalizer_handler_return.py", &LEVELS);
+}
+
+#[test]
 fn returning_through_interleaved_handlers_and_finalizers_keeps_their_owners() {
     for loop_header in ["while ready", "for item in items"] {
         let source = format!(
