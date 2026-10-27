@@ -48365,6 +48365,7 @@ fn suite_contains_orphan_cold_cleanup(body: &[Stmt], return_copies_terminal_with
     struct Detector {
         found: bool,
         return_copies_terminal_with: bool,
+        jump_tail: Option<TextRange>,
     }
 
     impl<'ast> Visitor<'ast> for Detector {
@@ -48486,10 +48487,16 @@ fn suite_contains_orphan_cold_cleanup(body: &[Stmt], return_copies_terminal_with
                 }
                 return;
             }
-            // If the final arm breaks, every route back to the test is a jump.
-            // Threading those jumps to the header empties the original loop
-            // backedge. It stays on the normal path when the handler moves cold.
+            // A terminal break can skip the empty, threaded loop backedge. A
+            // break that falls directly into later handler work keeps that
+            // array cold alongside its source, even after its jump disappears.
             if let Stmt::While(loop_) = statement
+                && (self.jump_tail == Some(loop_.range)
+                    || (early_condition_truthiness(&loop_.test).is_none()
+                        && matches!(
+                            loop_.orelse.first(),
+                            Some(Stmt::Assign(_) | Stmt::Expr(_) | Stmt::Raise(_))
+                        )))
                 && !expression_suspends_current_scope(&loop_.test)
                 && (early_condition_truthiness(&loop_.test) == Some(true)
                     || condition_has_linear_runtime_leaves(&loop_.test))
@@ -48559,7 +48566,19 @@ fn suite_contains_orphan_cold_cleanup(body: &[Stmt], return_copies_terminal_with
                 self.visit_body(&statement.orelse);
                 return;
             }
+            // A loop body ends at its own backedge. An ordinary nested branch
+            // can instead fall through to work in the enclosing handler.
+            let loop_tail = match statement {
+                Stmt::For(outer) if !outer.is_async => outer.body.last(),
+                Stmt::While(outer) => outer.body.last(),
+                _ => None,
+            };
+            let enclosing = self.jump_tail;
+            if let Some(tail) = loop_tail {
+                self.jump_tail = Some(tail.range());
+            }
             walk_stmt(self, statement);
+            self.jump_tail = enclosing;
         }
 
         fn visit_expr(&mut self, expression: &'ast Expr) {
@@ -48817,6 +48836,7 @@ fn suite_contains_orphan_cold_cleanup(body: &[Stmt], return_copies_terminal_with
         return true;
     }
     let mut detector = Detector {
+        jump_tail: body.last().map(Ranged::range),
         return_copies_terminal_with,
         ..Detector::default()
     };

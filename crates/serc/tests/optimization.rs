@@ -4007,6 +4007,18 @@ fn terminal_while_break_in_recovery_keeps_normal_borrow_boundary() {
             &LEVELS,
         );
     }
+    let fallthrough = r"def run(items, value, ready):
+    try:
+        value, = items
+    except LookupError:
+        if ready:
+            while ready:
+                if value:
+                    break
+        recover(value)
+    consume(value)
+";
+    assert_matches_cpython(fallthrough, "recovery_loop_fallthrough.py", &LEVELS);
 }
 
 #[test]
