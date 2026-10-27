@@ -21,3 +21,15 @@ fn folded_true_selector_keeps_large_continuation_borrow_boundary() {
         }
     }
 }
+
+#[test]
+fn folded_value_selector_owns_its_entry_after_a_return_guard() {
+    for selected in ["value", "value.first.second", "value.selected()"] {
+        for condition in ["1", "0", "gate"] {
+            let source = format!(
+                "def run(value, gate):\n    if gate:\n        return False\n    selected = {selected} if {condition} else value.other()\n    if selected is None:\n        return False\n    return use(selected)\n"
+            );
+            common::assert_matches_cpython_marshal(&source, "empty_value_selector.py");
+        }
+    }
+}
