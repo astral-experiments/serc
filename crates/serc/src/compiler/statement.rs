@@ -17035,11 +17035,7 @@ impl<'source> Compiler<'source> {
                     }
                     let folded_disjunction = matches!(test, Expr::BoolOp(boolean)
                     if boolean.op == BoolOp::Or
-                        && boolean.values.split_last().is_some_and(|(last, leading)| {
-                            jump_constant_truthiness(last) == Some(true)
-                                && !leading.is_empty()
-                                && leading.iter().all(condition_has_only_runtime_tests)
-                        }));
+                        && boolean.values.iter().any(|value| jump_constant_truthiness(value) == Some(true)));
                     let folded_or_true_exit = branch_index == 0
                         && matches!(self.unit.scope, Scope::Function { .. })
                         && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)

@@ -16090,9 +16090,14 @@ fn folded_comprehension_and_tail_preserves_borrow_boundary() {
 
 #[test]
 fn folded_disjunction_keeps_the_nested_else_fallthrough_position() {
-    for arm in ["pass", "return item"] {
+    for (condition, arm) in [
+        ("item.ready or True", "pass"),
+        ("item.ready or True", "return item"),
+        ("True or item.ready", "pass"),
+        ("item.ready or True or item.extra", "pass"),
+    ] {
         let source = format!(
-            "def visit(item):\n    if item.ready or True:\n        if item.mode:\n            {arm}\n        else:\n            item.update()\n    else:\n        pass\n    consume(item)\n"
+            "def visit(item):\n    if {condition}:\n        if item.mode:\n            {arm}\n        else:\n            item.update()\n    else:\n        pass\n    consume(item)\n"
         );
         assert_matches_cpython(&source, "folded_else.py", &LEVELS);
     }
