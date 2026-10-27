@@ -904,7 +904,8 @@ impl Compiler<'_> {
                                 .control
                                 .statements
                                 .context
-                                .followed_by_small_match_return
+                                .following_return_records
+                                .is_some_and(|records| records <= 4)
                             && case.guard.as_ref().is_some_and(|guard| {
                                 early_condition_truthiness(guard) == Some(true)
                             })))

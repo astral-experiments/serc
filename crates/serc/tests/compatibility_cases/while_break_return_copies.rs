@@ -245,3 +245,28 @@ fn constant_loop_bridges_preserve_small_return_line_events() {
         }
     }
 }
+
+#[test]
+fn borrows_the_copied_return_at_a_constant_loop_break() {
+    for (outer, protected) in [
+        ("", true),
+        ("    yield flag\n", true),
+        ("    for item in values:\n", false),
+    ] {
+        for returned in ["value.name", "value.name.other", "(value, flag)"] {
+            let body = format!(
+                "while True:\n    if flag:\n        work()\n    elif value:\n        break\nreturn {returned}\n",
+            );
+            let body = if protected {
+                format!(
+                    "    try:\n{}    except Error:\n        raise\n",
+                    common::indent(&common::indent(&body))
+                )
+            } else {
+                common::indent(&common::indent(&body))
+            };
+            let source = format!("def choose(value, flag, values):\n{outer}{body}");
+            common::assert_matches_cpython_marshal(&source, "copied_loop_return.py");
+        }
+    }
+}
