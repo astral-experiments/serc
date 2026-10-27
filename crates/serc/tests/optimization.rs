@@ -19066,3 +19066,23 @@ fn nested_conditional_arms_donate_implicit_return_locations() {
 ";
     assert_matches_cpython(source, "nested_implicit_returns.py", &LEVELS);
 }
+
+#[test]
+fn copied_finalizer_try_guard_reuses_an_unprotected_discard() {
+    let source = r"def sample(value, flag):
+    try:
+        work()
+        return value
+    except Error:
+        report()
+        return 1
+    finally:
+        close(value)
+        try:
+            if flag:
+                work()
+        except CleanupError:
+            recover()
+";
+    assert_matches_cpython(source, "copied_finalizer_try_guard.py", &LEVELS);
+}
