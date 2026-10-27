@@ -13372,6 +13372,18 @@ impl Assembler {
         else {
             return;
         };
+        if matches!(
+            condition.opcode,
+            LOAD_CONST | crate::target::opcodes::LOAD_SMALL_INT
+        ) && manager_count == 1
+            && ordinary_try_pops == 0
+            && retained_outer_handler.is_none()
+            && !named_handler
+        {
+            // The manager POP precedes all seven records of the saved-return unwind.
+            self.record_copied_guard_cleanup(pop_item, 1, false, Some(cleanup[5]));
+            return;
+        }
         if pop.opcode == NOP
             && pop.fusion_policy.is_converted_pop_block()
             && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
@@ -13399,13 +13411,6 @@ impl Assembler {
                     load,
                     condition,
                 });
-        } else if manager_count == 1
-            && ordinary_try_pops == 0
-            && retained_outer_handler.is_none()
-            && !named_handler
-        {
-            // The manager POP precedes all seven records of the saved-return unwind.
-            self.record_copied_guard_cleanup(pop_item, 1, false, Some(cleanup[5]));
         }
     }
 
