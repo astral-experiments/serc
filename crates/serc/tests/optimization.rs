@@ -22253,6 +22253,22 @@ fn a_folded_while_test_and_its_guard_share_the_copied_return() {
     return None
 ";
     assert_matches_cpython(source, "guarded_loop_return.py", &LEVELS);
+    let continued = source.replace("return None", "finish(item)");
+    for (index, version) in [(2, PythonVersion::Py314), (3, PythonVersion::Py315)] {
+        for level in LEVELS {
+            let [native, actual] =
+                compile_both(&continued, "guarded_loop_continuation.py", version, level);
+            assert_outputs_match(
+                probe(index).args([
+                    "-I",
+                    "-S",
+                    "-c",
+                    "import marshal, sys; sys.stdout.buffer.write(marshal.load(sys.stdin.buffer).co_consts[0].co_code)",
+                ]),
+                [&native, &actual],
+            );
+        }
+    }
 }
 
 #[test]
