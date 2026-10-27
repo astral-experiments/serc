@@ -6168,11 +6168,12 @@ impl<'source> Compiler<'source> {
                 // Normal cleanup and exception suppression both finish at the outer
                 // manager expression before reaching this shared implicit return.
                 self.source_location(manager.items[0].context_expr.range())
-            } else if matches!(last, Stmt::For(iterator) if !iterator.is_async)
+            } else if (matches!(last, Stmt::For(iterator) if !iterator.is_async)
+                || (self.context.python_version >= crate::PythonVersion::Py314
+                    && matches!(last, Stmt::Assign(_))))
                 && statement_uses_implicit_return_location(last)
             {
-                // With no else or break, FOR_ITER is the sole predecessor of the
-                // unlocated exhaustion cleanup and supplies the return's location.
+                // The iterator or the last assignment target supplies the return's location.
                 self.source_location(implicit_return_range(self, last))
             } else {
                 self.source_location(last.range())

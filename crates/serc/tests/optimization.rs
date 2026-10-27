@@ -15,6 +15,14 @@ use serc::{
 };
 
 #[test]
+fn chained_comparison_body_returns_at_the_last_assignment_target() {
+    for assignment in ["_, _ = pair()", "a = b = pair()"] {
+        let source = format!("def f(n):\n    if 0 <= n <= 10:\n        {assignment}\n");
+        assert_matches_cpython(&source, "chained_compare_assignment.py", &LEVELS);
+    }
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
