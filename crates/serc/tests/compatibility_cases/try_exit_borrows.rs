@@ -2362,3 +2362,9 @@ fn terminal_deletion_preserves_original_return_boundary() {
         common::assert_matches_cpython_marshal(&source, "terminal_deletion_return.py");
     }
 }
+
+#[test]
+fn borrows_finalizer_locals_on_the_false_edge_of_an_iterator_break() {
+    let source = "def find(items, stream):\n    found = None\n    for item in items:\n        try:\n            if item.accepts(stream):\n                found = item.name\n                break\n        except Error:\n            pass\n        finally:\n            if hasattr(stream, 'rewind'):\n                stream.rewind()\n    return found\n";
+    common::assert_matches_cpython_marshal(source, "iterator_break_false_edge.py");
+}

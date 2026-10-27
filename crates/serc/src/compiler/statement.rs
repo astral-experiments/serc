@@ -37486,7 +37486,8 @@ impl<'source> Compiler<'source> {
             && self.control.withs.active_with_exits.is_empty()
             && !self.control.in_exception_handler()
             && matches!(self.control.loops.contexts.as_slice(), [context]
-                if context.iterator_cleanup == IteratorCleanup::None && context.with_depth == 0)
+                if matches!(context.iterator_cleanup, IteratorCleanup::None | IteratorCleanup::Sync)
+                    && context.with_depth == 0)
             && matches!(statement.body.last(), Some(Stmt::If(guard))
                 if (condition_has_linear_runtime_leaves(&guard.test)
                     || matches!(guard.test.as_ref(), Expr::Compare(comparison) if comparison.ops.len() == 1))
