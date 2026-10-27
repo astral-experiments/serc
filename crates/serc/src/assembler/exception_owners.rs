@@ -9911,7 +9911,9 @@ impl LayoutAssembler {
                                                 )
                                             })
                                             && call.opcode == CALL
-                                            && call.value_argument() == Some(args.len() as u32)
+                                            && u32::try_from(args.len()).is_ok_and(|count| {
+                                                call.value_argument() == Some(count)
+                                            })
                                             && pop.opcode == POP_TOP
                                             && pop.location == call.location
                                             && !jump_targets.iter().any(|label| {
