@@ -173,3 +173,15 @@ def emit(items, key):
 ";
     common::assert_matches_cpython_marshal(source, "runtime_generator_loop_arms.py");
 }
+
+#[test]
+fn completed_comprehension_call_borrows_in_the_selected_loop_arm() {
+    let source = "def choose(items, key):
+    for item in items:
+        if all([accept(value) for value in item]) if key else False:
+            use(item, key)
+        else:
+            miss()
+";
+    common::assert_matches_cpython_marshal(source, "loop_comprehension_condition.py");
+}
