@@ -22704,6 +22704,9 @@ impl<'source> Compiler<'source> {
                     .active_with_exits
                     .iter()
                     .all(|owner| owner.loop_depth < self.control.loops.contexts.len());
+            let sync_for_else = self.control.loops.contexts.last().is_some_and(|context| {
+                context.has_orelse && context.iterator_cleanup == IteratorCleanup::Sync
+            });
             let copied_loop_else_branch_exit = non_final_branch
                 && self.control.loops.contexts.last().is_some_and(|context| {
                     context.has_orelse
@@ -22727,7 +22730,7 @@ impl<'source> Compiler<'source> {
                     .contexts
                     .last()
                     .is_some_and(|context| context.iterator_cleanup == IteratorCleanup::None)
-                    || (!self.has_active_control_flow_region()
+                    || ((!self.has_active_control_flow_region() || sync_for_else)
                         && condition_jump_target_count(&statement.test, false) > 1)
                     || (self.unit.flags & CO_COROUTINE != 0
                         && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
@@ -22827,9 +22830,6 @@ impl<'source> Compiler<'source> {
             // A synchronous for/else keeps the non-final arm's forward exit even
             // under a handler. The condition falls through to its body before
             // the fallback backedge, including when that body exits the loop.
-            let sync_for_else = self.control.loops.contexts.last().is_some_and(|context| {
-                context.has_orelse && context.iterator_cleanup == IteratorCleanup::Sync
-            });
             if copied_loop_branch_exit
                 || (non_final_branch
                     && !split_short_circuit

@@ -30,6 +30,22 @@ fn protected_for_else_keeps_the_inner_condition_fallthrough() {
 }
 
 #[test]
+fn protected_for_else_copies_each_short_circuit_backedge() {
+    let source = r"def scan(values, selected, ready):
+    with manager():
+        for value in values:
+            if selected(value):
+                if ready and value.active:
+                    use(value)
+            else:
+                pass
+        else:
+            raise LookupError
+";
+    assert_matches_cpython(source, "loop_short_circuit.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
