@@ -15261,9 +15261,27 @@ impl<'source> Compiler<'source> {
             if let Some(constant) = self.context.fold_constant(&statement.test) {
                 self.add_constant(constant)?;
             }
+            // A folded true guard can still reach the normal finalizer on its
+            // original false edge, even when the selected arm returns.
+            let folded_finally_exit = (self.context.python_version >= crate::PythonVersion::Py314
+                && truthiness
+                && statement.elif_else_clauses.is_empty()
+                && self.control.finally.active_finally_try_bodies > 0
+                && suite_terminates(&statement.body))
+            .then(|| {
+                let source = self.assembler.label();
+                let target = self.assembler.label();
+                self.assembler.mark(source);
+                self.assembler.record_folded_condition_predecessor(target);
+                (source, target)
+            });
             self.assembler
                 .set_location(self.source_location(statement.test.range()));
             self.emit(NOP, 0, 0)?;
+            if let Some((source, target)) = folded_finally_exit {
+                self.assembler
+                    .record_folded_predecessor_source(source, target);
+            }
             // An erased body with no else emits no discarded CFG block. Its
             // constant-false NOP can still reach the following local loads.
             let erased_false_body = self.context.python_version == crate::PythonVersion::Py314
@@ -15385,6 +15403,9 @@ impl<'source> Compiler<'source> {
                     self.assembler.record_exception_owner_block_boundary(end);
                     self.assembler.mark(end);
                 }
+            }
+            if let Some((_, target)) = folded_finally_exit {
+                self.assembler.mark(target);
             }
             return Ok(());
         }
