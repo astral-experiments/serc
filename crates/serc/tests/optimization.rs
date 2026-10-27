@@ -6215,7 +6215,7 @@ fn nested_conditional_stores_preserve_saved_iterator_owners() {
 
 #[test]
 fn protected_assertion_keeps_the_folded_success_jump() {
-    let source = r#"def sample(items, ready, enabled, flag):
+    let source = r"def sample(items, ready, enabled, flag):
     for item in items:
         try:
             if ready:
@@ -6224,7 +6224,7 @@ fn protected_assertion_keeps_the_folded_success_jump() {
                 mark()
         finally:
             finish()
-"#;
+";
     assert_matches_cpython(source, "protected_assertion_success.py", &LEVELS);
 }
 
