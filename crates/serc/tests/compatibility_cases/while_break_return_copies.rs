@@ -245,3 +245,18 @@ fn constant_loop_bridges_preserve_small_return_line_events() {
         }
     }
 }
+
+#[test]
+fn copies_a_protected_local_return_before_removing_a_while_break() {
+    let source = r"def consume(items, active):
+    try:
+        value = active
+        while active:
+            items = [item for item in items]
+            break
+        return value
+    except OSError:
+        pass
+";
+    common::assert_matches_cpython_marshal(source, "protected_while_return.py");
+}
