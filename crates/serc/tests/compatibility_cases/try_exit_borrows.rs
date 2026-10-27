@@ -2362,3 +2362,21 @@ fn terminal_deletion_preserves_original_return_boundary() {
         common::assert_matches_cpython_marshal(&source, "terminal_deletion_return.py");
     }
 }
+
+#[test]
+fn borrows_cleanup_locals_after_nested_reraise_guards() {
+    let protected = "try:\n    item.save()\nexcept Error as error:\n    if enabled:\n        if fatal(error):\n            raise\nfinally:\n    item.close()\n";
+    for body in [
+        protected.to_owned(),
+        format!(
+            "try:\n{}finally:\n    done(item)\n",
+            indent_finally_borrow_case(protected)
+        ),
+    ] {
+        let source = format!(
+            "def save(item, enabled):\n{}",
+            indent_finally_borrow_case(&body)
+        );
+        common::assert_matches_cpython_marshal(&source, "nested_reraise_cleanup.py");
+    }
+}
