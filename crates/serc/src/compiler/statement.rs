@@ -30719,11 +30719,18 @@ impl<'source> Compiler<'source> {
                                             && !expression_suspends_current_scope(part)
                                     }))))))
                 && self.control.exceptions.active_exception_handlers.is_empty()
-                && self
-                    .control
-                    .exceptions
-                    .active_exception_region_exclusions
-                    .is_empty()
+                && (self.control.exceptions.active_exception_region_exclusions.is_empty()
+                    // The outer try remains active on both sides of this normal jump.
+                    // Its recovery does not insert an empty block before the continuation.
+                    || (unowned_guarded_recovery
+                        && self.control.exceptions.active_exception_region_exclusions.len() == 1
+                        && self.control.exceptions.active_try_marker_slots.len() == 1
+                        && self.control.exceptions.direct_try_body_statements
+                            .binary_search_by_key(&statement.range.start(), Ranged::start)
+                            .is_ok_and(|index| self.control.exceptions.direct_try_body_statements[index] == statement.range)
+                        && suite_has_nonsuspending_linear_fallthrough(&statement.body)
+                        && statement.handlers.iter().all(|handler| handler.as_except_handler()
+                            .is_some_and(|handler| !suite_contains_abrupt_control_flow(&handler.body)))))
                 && self.control.finally.active_finally_try_bodies == 0
                 && self.control.finally.active_copied_finally_bodies == 0
                 && self.control.finally.active_finally_end_blocks == 0
