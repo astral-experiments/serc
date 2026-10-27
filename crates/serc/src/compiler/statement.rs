@@ -26456,7 +26456,7 @@ impl<'source> Compiler<'source> {
                 .unit
                 .class_conditional_annotation_indices
                 .get_mut(&assignment.range)
-                .and_then(|indices| indices.pop())
+                .and_then(smallvec::SmallVec::pop)
             {
                 self.assembler
                     .set_location(self.source_location(assignment.range));
