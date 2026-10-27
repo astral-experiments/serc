@@ -33092,9 +33092,11 @@ impl<'source> Compiler<'source> {
             // Independent live branches can reach the same original cleanup even
             // when a loop or nested guard precedes the last fallthrough.
             let shared_guarded_handler = self.context.python_version >= crate::PythonVersion::Py314
-                && handler.name.is_none()
                 && matches!(handler.body.last(), Some(Stmt::If(tail))
-                    if tail.elif_else_clauses.is_empty() && condition_has_only_runtime_tests(&tail.test))
+                if condition_has_only_runtime_tests(&tail.test)
+                    && tail.elif_else_clauses.iter().all(|clause| {
+                        clause.test.as_ref().is_none_or(condition_has_only_runtime_tests)
+                    }))
                 && self.assembler.at_original_shared_cleanup_join();
             let handler_ends_with_unlocated_if_cleanup = shared_guarded_handler || matches!(
                 handler.body.iter().rev().find(|statement| {
