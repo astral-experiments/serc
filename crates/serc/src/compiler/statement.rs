@@ -27035,9 +27035,9 @@ impl<'source> Compiler<'source> {
     fn preserve_normal_pass_exit(&mut self, body: &[Stmt], exit: EmittedJump) {
         if self.context.python_version >= crate::PythonVersion::Py314
             && let Some(Stmt::Pass(pass)) = body.last()
-            && self.assembler.last_instruction_location() == Some(self.source_location(pass.range))
         {
-            self.assembler.preserve_authored_pass_jump_nop(exit);
+            self.assembler
+                .preserve_distinct_noop_exit(exit, self.source_location(pass.range));
         }
     }
 

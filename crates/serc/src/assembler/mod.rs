@@ -9497,6 +9497,29 @@ impl Assembler {
             .retain_nop_after_retargeting();
     }
 
+    /// Retains an omitted statement's line if the jump inherited it from a distinct slot.
+    pub(crate) fn preserve_distinct_noop_exit(
+        &mut self,
+        exit: EmittedJump,
+        location: SourceLocation,
+    ) {
+        let items = self.linear_items();
+        let index = exit.instruction().item_index as usize;
+        if items[index]
+            .as_instruction()
+            .is_some_and(|jump| jump.location == location)
+            && items[..index]
+                .iter()
+                .rev()
+                .find_map(Item::as_instruction)
+                .is_none_or(|previous| {
+                    previous.opcode == NOP || previous.location.line != location.line
+                })
+        {
+            self.preserve_authored_pass_jump_nop(exit);
+        }
+    }
+
     pub(crate) fn preserve_direct_inlined_jump_nop(&mut self, emitted: EmittedJump) {
         let instruction = self.emitted_jump_mut(emitted, "retaining a directly inlined jump NOP");
         let Some(_) = instruction.forward_target() else {

@@ -18399,6 +18399,14 @@ def recovered(value):
         except LookupError:
             recover()
     return value
+
+
+def same_line(value):
+    try:
+        check(value)
+    finally:
+        close(); pass
+    return value
 ";
     assert_matches_cpython(source, "copied_pass_return.py", &LEVELS);
 }
