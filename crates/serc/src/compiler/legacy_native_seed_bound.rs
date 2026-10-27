@@ -31,14 +31,13 @@ pub(super) fn record(assembler: &mut crate::assembler::Assembler, body: &[Stmt])
         if counts.max_label() < 256 {
             assembler.certify_legacy_uniform_jump_seed();
             return TextSize::default();
-        } else {
-            if let Ok(max_label) = u8::try_from(counts.max_original_label()) {
-                assembler.set_legacy_exit_copy_budget(u8::MAX - max_label);
-            }
-            if counts.labels < 256 {
-                assembler.certify_legacy_source_jump_labels();
-                return TextSize::default();
-            }
+        }
+        if let Ok(max_label) = u8::try_from(counts.max_original_label()) {
+            assembler.set_legacy_exit_copy_budget(u8::MAX - max_label);
+        }
+        if counts.labels < 256 {
+            assembler.certify_legacy_source_jump_labels();
+            return TextSize::default();
         }
     }
     prefix
@@ -473,7 +472,7 @@ impl<'ast> Counter<'ast> {
         }
         match expression {
             Expr::UnaryOp(unary) if unary.op == UnaryOp::Not => {
-                self.condition(&unary.operand, !jump_on)?
+                self.condition(&unary.operand, !jump_on)?;
             }
             Expr::BoolOp(boolean) => {
                 let short = boolean.op == BoolOp::Or;

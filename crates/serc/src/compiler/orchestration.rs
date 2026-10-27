@@ -4,8 +4,7 @@ use std::rc::Rc;
 
 use ruff_python_ast::token::Tokens;
 use ruff_python_ast::{Expr, Stmt, Suite};
-use ruff_text_size::Ranged;
-use ruff_text_size::TextRange;
+use ruff_text_size::{Ranged, TextRange, TextSize};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{
@@ -258,7 +257,7 @@ impl<'source> Compiler<'source> {
                 control: ControlFlowState::default(),
                 assembler,
                 native_label_plan: None,
-                legacy_short_label_prefix: Default::default(),
+                legacy_short_label_prefix: TextSize::default(),
             },
         )
     }
