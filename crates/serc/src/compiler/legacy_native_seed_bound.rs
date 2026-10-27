@@ -158,6 +158,33 @@ impl<'ast> Counter<'ast> {
         Some(())
     }
 
+    /// Bound one class check whose attributes only capture or discard values.
+    fn capture_class_pattern(&mut self, pattern: &Pattern) -> Option<()> {
+        let (pattern, saved_subject) = match pattern {
+            Pattern::MatchAs(alias) => (alias.pattern.as_deref()?, 1),
+            pattern => (pattern, 0),
+        };
+        let Pattern::MatchClass(class) = pattern else {
+            return None;
+        };
+        let arguments = &class.arguments;
+        let captures = |pattern: &Pattern| matches!(pattern, Pattern::MatchAs(capture) if capture.pattern.is_none());
+        if !arguments.patterns.iter().all(captures)
+            || !arguments
+                .keywords
+                .iter()
+                .all(|keyword| captures(&keyword.pattern))
+        {
+            return None;
+        }
+        self.expression(&class.cls)?;
+        // The sole class check can discard its result and an enclosing AS subject.
+        // Captures add no failing edges. Success jumps over the labeled cleanup.
+        self.counts
+            .add_with_unlabeled_successors(2 + saved_subject, 2, 1, 0);
+        Some(())
+    }
+
     fn statement(&mut self, statement: &'ast Stmt) -> Option<()> {
         match statement {
             Stmt::Assign(assignment) => {
@@ -326,7 +353,7 @@ impl<'ast> Counter<'ast> {
                             // Also covers a sole wildcard, which can emit a case-end jump.
                             self.counts.add(1, 1, 0);
                         }
-                        _ => return None,
+                        pattern => self.capture_class_pattern(pattern)?,
                     }
                     if let Some(guard) = &case.guard {
                         self.condition(guard, false)?;

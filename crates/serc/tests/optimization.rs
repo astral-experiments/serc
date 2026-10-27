@@ -13621,6 +13621,24 @@ fn copied_loop_handler_cleanup_uses_each_conditional_predecessor() {
 }
 
 #[test]
+fn class_pattern_captures_keep_legacy_iterator_widths() {
+    for pattern in ["Pair(left=a, right=b)", "Pair(a, _) as pair"] {
+        for assignments in [119, 120, 121] {
+            let body = "        value = flag\n".repeat(assignments);
+            let source = format!(
+                "def scan(items, flag, obj):\n    match obj:\n        case {pattern}:\n            visit(obj)\n        case _:\n            pass\n    for item in items:\n{body}        visit(item)\n    return flag\n"
+            );
+            assert_matches_cpython_versions(
+                &source,
+                "class_pattern_iterator_width.py",
+                &LEVELS,
+                &[PythonVersion::Py312],
+            );
+        }
+    }
+}
+
+#[test]
 fn python312_await_cleanup_in_a_bounded_source_prefix() {
     for operator in ["and", "or"] {
         let prefix = format!("    if active {operator} state:\n        visit(state)\n").repeat(160);
