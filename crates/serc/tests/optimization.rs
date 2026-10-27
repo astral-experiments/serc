@@ -2958,6 +2958,38 @@ fn conditional_assignment_copies_protected_raise() {
 }
 
 #[test]
+fn handler_returns_keep_the_enclosing_try_until_iterator_or_finally_cleanup() {
+    let source = r"def scan(items):
+    try:
+        for item in items:
+            try:
+                try:
+                    visit(item)
+                except KeyError:
+                    return recover(item)
+            except ValueError:
+                record(item)
+    finally:
+        finish()
+
+def nested(value):
+    try:
+        try:
+            try:
+                visit(value)
+            except KeyError:
+                return value
+        except ValueError:
+            record(value)
+        finally:
+            release(value)
+    finally:
+        finish()
+";
+    assert_matches_cpython(source, "handler_return_through_finally.py", &LEVELS);
+}
+
+#[test]
 fn nested_recovery_shares_the_outer_call_return() {
     let source = "def sample(start, active, ready, allowed, last):\n    if start:\n        pass\n    elif active:\n        if ready:\n            if allowed:\n                try:\n                    work()\n                except ValueError:\n                    recover()\n                else:\n                    record()\n        else:\n            skip()\n    elif last:\n        pass\n    return finish()\n";
     assert_matches_cpython(source, "nested_recovery_call_return.py", &LEVELS);

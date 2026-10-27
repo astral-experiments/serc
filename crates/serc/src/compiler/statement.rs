@@ -9227,45 +9227,34 @@ impl<'source> Compiler<'source> {
                 let mut next_loop =
                     loops_before_finally_end.unwrap_or(self.control.loops.contexts.len());
                 let mut with_unwind_before_exception_start = with_unwind_starts.len();
-                // A named handler may sit inside an ordinary try which itself sits inside
-                // a pending finally. Keep each enclosing collector active until its own
-                // unwind boundary; the handler's saved depth also retires any try entered
-                // inside the handler before POP_EXCEPT clears its exception state.
-                let preserves_enclosing_try_return_owner =
-                    !return_is_overridden
-                        && handler_count == 1
+                // An ordinary try between the handler and its nearest pending finally still
+                // protects POP_EXCEPT. Iterators retire that try at their own saved depths.
+                let handler_cleanup_has_enclosing_try = !return_is_overridden
+                    && self.control.withs.active_with_exits.is_empty()
+                    && self.control.finally.active_finally_end_blocks == 0
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && matches!(
+                        (
+                            self.control.exceptions.active_exception_handlers.as_slice(),
+                            self.control.finally.active_return_finally_contexts.last(),
+                        ),
+                        ([handler], Some(finally))
+                            if finally.handler_depth == 0
+                                && handler.exception_region_depth > finally.exception_region_depth + 1
+                                && self.control.exceptions.active_exception_region_exclusions.len()
+                                    > handler.exception_region_depth
+                    );
+                let preserves_enclosing_try_pop_slots =
+                    handler_cleanup_has_enclosing_try
                         && self.control.finally.active_return_finally_contexts.len() == 1
                         && self.control.loops.contexts.iter().enumerate().all(
                             |(index, context)| {
-                                // Older iterators unwind after this finally, so they do not
-                                // retire the ordinary try before handler cleanup.
                                 context.iterator_cleanup == IteratorCleanup::None
                                     || index
                                         < self.control.finally.active_return_finally_contexts[0]
                                             .loop_depth
                             },
-                        )
-                        && self.control.withs.active_with_exits.is_empty()
-                        && self.control.finally.active_finally_end_blocks == 0
-                        && self.control.finally.active_normal_finally_bodies == 0
-                        && self
-                            .control
-                            .exceptions
-                            .active_exception_handlers
-                            .last()
-                            .is_some_and(|handler| {
-                                let finally =
-                                    &self.control.finally.active_return_finally_contexts[0];
-                                finally.handler_depth == 0
-                                    && handler.exception_region_depth
-                                        > finally.exception_region_depth + 1
-                                    && self
-                                        .control
-                                        .exceptions
-                                        .active_exception_region_exclusions
-                                        .len()
-                                        > handler.exception_region_depth
-                            });
+                        );
                 // A named handler inside a while can leave one ordinary try per
                 // pending finalizer under an older synchronous manager. Each try
                 // keeps its own collector after the handler has restored the exception
@@ -9643,7 +9632,7 @@ impl<'source> Compiler<'source> {
                 let tracks_finally_region_unwinds = !return_is_overridden
                     && (handler_count == 0
                         || tracks_handler_finally_iterator_unwinds
-                        || preserves_enclosing_try_return_owner
+                        || handler_cleanup_has_enclosing_try
                         || tracks_outer_try_handler_finally_unwinds
                         || tracks_two_named_handlers_before_finally
                         || tracks_try_between_finally_unwinds
@@ -10355,7 +10344,7 @@ impl<'source> Compiler<'source> {
                                 && self.control.exceptions.active_try_marker_slots.is_empty())
                                 || (preserve_tos && tracks_outer_try_handler_finally_unwinds)
                                 || preserves_handler_iterator_try_pop_slots
-                                || (preserves_enclosing_try_return_owner
+                                || (preserves_enclosing_try_pop_slots
                                     && try_body_depth <= self.control.exceptions.active_try_marker_slots.len()))
                             && next_loop == loop_depth
                             && self.control.finally.active_finally_end_blocks == 0
@@ -10387,7 +10376,7 @@ impl<'source> Compiler<'source> {
                             && self.control.finally.active_normal_finally_bodies == 0
                             && self.control.finally.active_copied_finally_bodies == 0;
                         if (preserve_named_handler_pop_slots
-                            && preserves_enclosing_try_return_owner)
+                            && preserves_enclosing_try_pop_slots)
                             || preserve_legacy_inner_try_pop_slots
                         {
                             // Ordinary tries entered inside this handler unwind before its
@@ -10537,7 +10526,7 @@ impl<'source> Compiler<'source> {
                         if let Some(region_starts) = &mut handler_region_unwind_starts {
                             let start = self.assembler.label();
                             self.assembler.mark(start);
-                            if preserves_enclosing_try_return_owner
+                            if preserves_enclosing_try_pop_slots
                                 || preserves_managed_handler_try_pops
                             {
                                 // This unwind label stays in the handler's original block.
@@ -10606,7 +10595,7 @@ impl<'source> Compiler<'source> {
                         let protected_pop_except = (protects_outer_handler
                             || live_manager_handler_try_owner
                             || (!return_is_overridden
-                                && !preserves_enclosing_try_return_owner
+                                && !handler_cleanup_has_enclosing_try
                                 && !enclosing_try_owns_pop_except
                                 && !tracked_outer_try_owns_pop_except
                                 && self
@@ -10665,7 +10654,7 @@ impl<'source> Compiler<'source> {
                         }
                         if preserve_named_handler_pop_slots
                             && (protected_pop_except.is_some()
-                                || preserves_enclosing_try_return_owner)
+                                || preserves_enclosing_try_pop_slots)
                         {
                             // The three name-clearing records share this exact outer owner;
                             // a later finally condition may reuse their stale array slots.
@@ -11401,6 +11390,7 @@ impl<'source> Compiler<'source> {
                         next_loop,
                         preserve_tos,
                         if tracks_handler_iterator_region_unwinds
+                            || handler_cleanup_has_enclosing_try
                             || (tracks_finally_region_unwinds
                                 && handler_count == 0
                                 && (self.control.withs.active_with_exits.is_empty()
@@ -12163,7 +12153,7 @@ impl<'source> Compiler<'source> {
                             self.assembler.mark_last_as_converted_pop_block();
                         }
                     }
-                    if preserves_enclosing_try_return_owner
+                    if preserves_enclosing_try_pop_slots
                         || preserves_handler_iterator_try_pop_slots
                         || preserves_managed_handler_try_pops
                     {
