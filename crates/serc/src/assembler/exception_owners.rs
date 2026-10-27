@@ -10308,6 +10308,90 @@ impl LayoutAssembler {
                             ExceptionOwnerDecision::override_with_region(None),
                         );
                     }
+                    // Replacing a None comparison removes its constant, IS_OP and truth
+                    // test. Across an unprotected finalizer call and its inner SETUP,
+                    // the marker can reuse the argument, call, or discard before the finalizer.
+                    if instruction.opcode == NOT_TAKEN
+                        && owner_history_exact
+                        && tail.insertions == 0
+                        && tail.late_removals == 0
+                        && tail.post_compaction_fusions == 0
+                        && let Some(start) = instruction_index.checked_sub(10)
+                        && start >= original_array_start
+                        && let [
+                            operand,
+                            donor,
+                            discard,
+                            receiver,
+                            method,
+                            call,
+                            pop,
+                            setup,
+                            value,
+                            guard,
+                        ] = &indexed_instructions[start..instruction_index]
+                        && matches!(
+                            operand.opcode,
+                            LOAD_CONST
+                                | crate::target::opcodes::LOAD_DEREF
+                                | crate::target::opcodes::LOAD_FAST
+                                | crate::target::opcodes::LOAD_FAST_BORROW
+                                | crate::target::opcodes::LOAD_FAST_CHECK
+                                | crate::target::opcodes::BUILD_MAP
+                        )
+                        && operand.local_policy.hidden_exception_owner_slots() == 0
+                        && operand.pre_fold_extra_instructions() == 0
+                        && donor.opcode == crate::target::opcodes::CALL
+                        && discard.opcode == POP_TOP
+                        && matches!(
+                            receiver.opcode,
+                            crate::target::opcodes::LOAD_DEREF
+                                | crate::target::opcodes::LOAD_FAST_BORROW
+                                | crate::target::opcodes::LOAD_FAST
+                        )
+                        && receiver.local_policy.hidden_exception_owner_slots() == 1
+                        && method.opcode == crate::target::opcodes::LOAD_ATTR
+                        && method.value_argument().is_some_and(|v| v & 1 != 0)
+                        && call.opcode == crate::target::opcodes::CALL
+                        && call.value_argument() == Some(0)
+                        && pop.opcode == POP_TOP
+                        && setup.opcode == NOP
+                        && matches!(
+                            value.opcode,
+                            crate::target::opcodes::LOAD_FAST
+                                | crate::target::opcodes::LOAD_FAST_BORROW
+                                | crate::target::opcodes::LOAD_FAST_CHECK
+                        )
+                        && matches!(guard.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+                        && guard.forward_target().is_some()
+                        && guard.local_policy.hidden_exception_owner_slots() == 3
+                        && let width = instruction_index - start
+                            + usize::from(guard.local_policy.hidden_exception_owner_slots())
+                            + usize::from(receiver.local_policy.hidden_exception_owner_slots())
+                        && (width - 2..=width).contains(&tail.early_removals)
+                        && let Some(region) =
+                            self.uniform_exception_owner(start, start + 3, &label_positions)
+                        && !self.exception_regions.iter().any(|region| {
+                            label_positions[&region.start] < start + 7
+                                && label_positions[&region.end] > start + 3
+                        })
+                        && !jump_targets.iter().any(|label| {
+                            label_positions
+                                .get(label)
+                                .is_some_and(|index| start < *index && *index <= instruction_index)
+                        })
+                        && let Some(inner) = self.uniform_exception_owner(
+                            start + 8,
+                            instruction_index,
+                            &label_positions,
+                        )
+                        && inner != region
+                    {
+                        owners.insert(
+                            instruction_index,
+                            ExceptionOwnerDecision::override_with_region(Some(region)),
+                        );
+                    }
                     if instruction.opcode == NOT_TAKEN {
                         if instruction.exception_policy().exclusion()
                             == super::ExceptionExclusion::None
