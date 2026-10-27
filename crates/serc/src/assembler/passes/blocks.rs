@@ -9218,9 +9218,17 @@ impl OptimizationPipeline {
                                 .filter(|instruction| instruction.location.line >= 0)
                                 .map(|instruction| instruction.location)
                         })
+                        .or_else(|| {
+                            // A nested handler can fall through from its own POP_EXCEPT.
+                            // The two pops share an original array after exit copying.
+                            let previous = order[positions[target.index()].checked_sub(1)?];
+                            let pop = graph[previous].last_instruction()?;
+                            (pop.opcode == POP_EXCEPT && pop.location.line >= 0)
+                                .then_some(pop.location)
+                        })
                     && let Some(first) = graph.instructions_mut(target).next()
                 {
-                    // Only the artificial prefix needs a line from its sole live jump.
+                    // Only the artificial prefix needs a line from its sole predecessor.
                     // Keep copied arrays on their existing internal-entry propagation path.
                     first.location = location;
                 }
