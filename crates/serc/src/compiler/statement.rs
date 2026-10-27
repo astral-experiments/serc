@@ -3236,9 +3236,7 @@ impl<'source> Compiler<'source> {
                             && !is_final
                             && matches!(statement, Stmt::For(statement) if statement.is_async)
                             && matches!(self.unit.scope, Scope::Function { .. })
-                            && self.unit.flags
-                                & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                                == CO_COROUTINE
+                            && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR) != 0
                             && self.control.loops.contexts.is_empty()
                             && self.control.withs.active_with_exits.len()
                                 == self.control.withs.active_with_region_exclusions.len()
@@ -39005,8 +39003,15 @@ impl<'source> Compiler<'source> {
                                 _ => false,
                             })
                         });
+                    // A runtime conditional starts with a located test on the normal
+                    // path, so the preceding exhaustion marker keeps its iterator span.
+                    let starts_with_guard = matches!(statement.finalbody.first(), Some(Stmt::If(branch))
+                        if condition_has_only_runtime_tests(&branch.test)
+                            && !expression_contains_inline_branch(&branch.test)
+                            && !expression_suspends_current_scope(&branch.test)
+                            && !expression_yields_in_current_scope(&branch.test));
                     let recorder =
-                        AsyncForEndPopRecorder::new(&compiler.control, live_linear_finalizer);
+                        AsyncForEndPopRecorder::new(&compiler.control, live_linear_finalizer || starts_with_guard);
                     let ((), recorder) = compiler.with_control_stack(
                         |control| &mut control.finally.async_for_end_pop_recorders,
                         recorder,
