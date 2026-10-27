@@ -6596,10 +6596,26 @@ impl OptimizationPipeline {
                     .iter()
                     .copied()
                     .any(|predecessor| {
-                        positions[predecessor.index()] > source_position
+                        let later = positions[predecessor.index()];
+                        later > source_position
                             && block_jump_target(graph[predecessor].items())
                                 .and_then(|label| graph.label_block(label))
                                 == Some(target)
+                            // A chain of conditional fallthroughs shares the same
+                            // warm or cold classification. Its unlocated returns
+                            // still receive copies in the original block order.
+                            && !(target_has_no_location
+                                && target_terminal_opcode == Some(RETURN_VALUE)
+                                && source_has_fallthrough
+                                && graph[predecessor].last_instruction().is_some_and(|jump| {
+                                    is_conditional_jump(jump.opcode)
+                                })
+                                && (source_position..later).all(|index| {
+                                    let next = order[index + 1];
+                                    block_has_fallthrough(graph[order[index]].items())
+                                        && predecessors[next.index()] == 1
+                                        && !exception_handler_blocks[next.index()]
+                                }))
                     })
             {
                 // CPython's second exit-duplication pass runs after cold blocks move. For a

@@ -33,3 +33,23 @@ fn matches_cpython_terminal_try_else_break_donors() {
         }
     }
 }
+
+#[test]
+fn preserves_conditional_copy_order_for_nested_try_returns() {
+    let source = r"def run(active, left, right):
+    try:
+        start()
+    except Error:
+        return
+    else:
+        try:
+            if active:
+                if left and right:
+                    work()
+            else:
+                finish()
+        except Other:
+            pass
+";
+    common::assert_matches_cpython_marshal(source, "nested_try_conditional_returns.py");
+}
