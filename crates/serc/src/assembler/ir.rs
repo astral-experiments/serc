@@ -1260,7 +1260,8 @@ pub(super) struct Instruction {
     metadata: InstructionMetadata,
     pub(super) early_boolean_admissions: EarlyBooleanAdmissions,
     pub(super) folded_constant_admissions: Option<FoldAdmissionId>,
-    pub(super) pattern_capture_swap: bool,
+    // Capture rotations carry the line span of the whole case pattern.
+    pub(super) single_line_capture_swap: Option<bool>,
 }
 
 impl Instruction {
@@ -1297,7 +1298,7 @@ impl Instruction {
             metadata: InstructionMetadata::default(),
             early_boolean_admissions: EarlyBooleanAdmissions::default(),
             folded_constant_admissions: None,
-            pattern_capture_swap: false,
+            single_line_capture_swap: None,
         }
     }
 
@@ -1319,7 +1320,7 @@ impl Instruction {
             metadata: InstructionMetadata::default(),
             early_boolean_admissions: EarlyBooleanAdmissions::default(),
             folded_constant_admissions: None,
-            pattern_capture_swap: false,
+            single_line_capture_swap: None,
         }
     }
 
@@ -1601,7 +1602,7 @@ impl Instruction {
                 .followed_by(second.early_boolean_admissions),
             // Constant admissions are consumed before superinstruction fusion.
             folded_constant_admissions: None,
-            pattern_capture_swap: false,
+            single_line_capture_swap: None,
         }
     }
 }

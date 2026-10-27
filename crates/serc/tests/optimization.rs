@@ -12431,6 +12431,21 @@ fn sequence_capture_before_trailing_wildcards_matches_cpython() {
 }
 
 #[test]
+fn protected_capture_rotations_preserve_pattern_lines() {
+    for pattern in [
+        r#"{"name": str() as key} as record"#,
+        r#"{"loc": (*_, key)}"#,
+        "[key, _, item, _, _, tail]",
+        "[key,\n                  _, item, _, _, tail]",
+    ] {
+        let source = format!(
+            "def read(obj):\n    try:\n        match obj:\n            case {pattern} if key:\n                consume(key)\n    except LookupError:\n        recover()\n"
+        );
+        assert_matches_cpython(&source, "protected_capture.py", &LEVELS);
+    }
+}
+
+#[test]
 fn single_line_patterns_exchange_discarded_captures() {
     let source = r#"
 def classify(item):

@@ -763,12 +763,12 @@ impl OptimizationPipeline {
                     && last_store.is_none()
                     && !capture_cleanup_swaps.contains(&positions[index])
                 {
-                    // An unprotected exchange on one physical line cannot change a line
-                    // event or the number of compacted slots belonging to a handler.
+                    // A multiline pattern can donate a different line to a slot
+                    // retained by a handler. Keep that protected rotation intact.
                     let line = swap.location.line;
-                    let single_line = swap.pattern_capture_swap
-                        && self.exception_regions.is_empty()
-                        && line >= 0
+                    let single_line = swap.single_line_capture_swap.is_some_and(|single_line| {
+                        single_line || self.exception_regions.is_empty()
+                    }) && line >= 0
                         && [
                             swap.location,
                             first_instruction.location,
