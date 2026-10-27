@@ -15730,6 +15730,19 @@ fn conditional_attribute_copies_fuse_aliased_local_entries() {
 }
 
 #[test]
+fn nested_iterators_keep_the_try_owner_on_copied_discards() {
+    let source = r"def probe(table):
+    for kind in ('first', 'second'):
+        for key, value in table.rows:
+            try:
+                value.process(kind) if value is not None else value
+            except ValueError:
+                pass
+";
+    assert_matches_cpython(source, "nested_iterator_try_discard.py", &LEVELS);
+}
+
+#[test]
 fn discarded_conditions_copy_the_pop_with_its_try_owner() {
     for discarded in [
         "read() if ready else fallback()",

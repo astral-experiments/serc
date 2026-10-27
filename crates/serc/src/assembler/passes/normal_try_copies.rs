@@ -1889,7 +1889,7 @@ impl OptimizationPipeline {
     /// Keeps an original unlocated discard/`POP_BLOCK`/jump array eligible for copying.
     fn prepare_unlocated_normal_try_discards(&mut self) {
         use super::super::ir::BorrowFallthrough;
-        use crate::target::opcodes::{LOAD_FAST, POP_TOP, RETURN_VALUE};
+        use crate::target::opcodes::{FOR_ITER, LOAD_FAST, POP_TOP, RETURN_VALUE};
 
         // A trailing authored Pass can be absent from the array without a head alias.
         if self.exception_owner_provenance.omitted_nop_tail.is_some() {
@@ -1963,12 +1963,11 @@ impl OptimizationPipeline {
                                 LOAD_FAST, load.operand(), load.location, Some(1))
                             && *ret == Instruction::new(
                                 RETURN_VALUE, Operand::Value(0), ret.location, Some(0)));
-                // The same three original records can leave one live iterator on
-                // the stack. The continuation stays separate: either the original
-                // common backedge or a located, non-exiting source block follows.
+                // The same three original records can leave iterators on the stack.
+                // Check a nested iterator's depth at its own FOR_ITER header.
                 let iterator_depth = 1 + u32::from(self.python_version == crate::PythonVersion::Py315);
                 let loop_continuation = self.python_version >= crate::PythonVersion::Py314
-                    && depth == iterator_depth
+                    && depth >= iterator_depth
                     && match continuation {
                         [Item::Label(label), Item::Instruction(backedge)]
                             if *label == target && backedge.opcode == JUMP_BACKWARD =>
@@ -1976,7 +1975,10 @@ impl OptimizationPipeline {
                             backedge.location == SourceLocation::NONE
                                 && backedge.depth_after() == Some(depth)
                                 && matches!(backedge.operand(), Operand::Backward(header)
-                                    if position(header).is_some_and(|head| head < cleanup_position))
+                                    if position(header).is_some_and(|head| head < cleanup_position
+                                        && (depth == iterator_depth
+                                            || self.graph[order[head]].last_instruction().is_some_and(|iter|
+                                                iter.opcode == FOR_ITER && iter.depth_after() == Some(depth + 1)))))
                                 && self.conditional_threading_targets.get(&target)
                                     == Some(&backedge.location)
                                 && backedge.pre_fold_extra_instructions() == 0
@@ -1985,7 +1987,8 @@ impl OptimizationPipeline {
                                 && !backedge.fusion_policy.is_converted_pop_block()
                         }
                         [Item::Label(label), Item::Instruction(first), ..]
-                            if *label == target
+                            if depth == iterator_depth
+                                && *label == target
                                 && first.location.line >= 0
                                 && first.opcode != NOP
                                 && !is_unconditional_jump(first.opcode)
