@@ -14169,7 +14169,8 @@ impl<'source> Compiler<'source> {
                     if (preserve_tos || self.context.python_version >= crate::PythonVersion::Py314)
                         && handler_count == 0
                         && return_finally_contexts.len() == 1
-                        && self.control.withs.active_with_exits.is_empty()
+                        // Managers entered inside the try have already exited before its finalizer.
+                        && finally_context.with_depth == 0
                         && self.control.finally.active_finally_end_blocks == 0
                         && self.control.finally.active_normal_finally_bodies == 0
                         && self.control.finally.active_copied_finally_bodies == 0
