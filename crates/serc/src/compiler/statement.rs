@@ -2964,7 +2964,10 @@ impl<'source> Compiler<'source> {
                             |handler| handler.name.is_some()
                                 && handler.with_depth == self.control.withs.active_with_exits.len(),
                         ))
-                    || ((!is_final || inherited_statement_has_following)
+                    // The loop tail compiles its last conditional separately from
+                    // this prefix. Its test still follows the Pass in the source.
+                    || ((!is_final || inherited_statement_has_following
+                        || self.control.loops.synthesized_loop_tail_predecessor == Some(statement.range))
                         && self.control.withs.active_with_exits.is_empty()))
                 && (self.control.withs.active_with_region_exclusions.is_empty()
                     || body.len() > 1
