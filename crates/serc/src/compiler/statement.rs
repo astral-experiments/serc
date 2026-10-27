@@ -15244,14 +15244,17 @@ impl<'source> Compiler<'source> {
         }
         // Legacy CFG passes still see a terminating arm's false continuation.
         // Folded false edges must also survive until jump threading and exit copying.
-        // 3.13's early location pass additionally sees each fallthrough arm and
-        // false edge sharing their original join.
+        // 3.13 assigns lines before folding. Keep both arms of a try body's
+        // final conditional so the normal cleanup sees its original predecessors.
         if let Some(truthiness) = early_condition_truthiness(&statement.test)
             && !(self.context.python_version <= crate::PythonVersion::Py313
                 && statement.elif_else_clauses.is_empty()
                 && (self.context.python_version == crate::PythonVersion::Py313
                     || !truthiness
                     || suite_terminates(&statement.body)))
+            && !(self.context.python_version == crate::PythonVersion::Py313
+                && self.control.exceptions.direct_try_body_statements.last()
+                    == Some(&statement.range))
             && statement.elif_else_clauses.len() <= 1
             && statement
                 .elif_else_clauses

@@ -3914,6 +3914,20 @@ fn nested_finalizers_keep_shared_attribute_deletion() {
 }
 
 #[test]
+fn folded_conditional_arms_preserve_the_normal_finally_join() {
+    let source = r"def run(obj):
+    try:
+        if False:
+            skip()
+        else:
+            obj.wait()
+    finally:
+        obj.finished = True
+";
+    assert_matches_cpython(source, "folded_conditional_finally_join.py", &LEVELS);
+}
+
+#[test]
 fn folded_loop_arm_keeps_the_finally_join_unlocated() {
     for condition in ["True", "ready"] {
         let source = format!(
