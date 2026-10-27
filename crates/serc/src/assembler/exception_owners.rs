@@ -10308,6 +10308,49 @@ impl LayoutAssembler {
                             ExceptionOwnerDecision::override_with_region(None),
                         );
                     }
+                    // Two earlier local fusions move a guarded call two cells left.
+                    // Its fallthrough marker replaces the former TO_BOOL record.
+                    if instruction.opcode == NOT_TAKEN
+                        && owner_history_exact
+                        && tail.insertions == 0
+                        && tail.late_removals == 0
+                        && tail.post_compaction_fusions == 2
+                        && let Some(start) = instruction_index.checked_sub(5)
+                        && start >= original_array_start
+                        && let [receiver, method, call, truth, guard] =
+                            &indexed_instructions[start..instruction_index]
+                        && matches!(
+                            receiver.opcode,
+                            crate::target::opcodes::LOAD_FAST
+                                | crate::target::opcodes::LOAD_FAST_BORROW
+                                | crate::target::opcodes::LOAD_FAST_CHECK
+                        )
+                        && receiver.local_policy.hidden_exception_owner_slots() == 1
+                        && tail.early_removals
+                            == tail.post_compaction_fusions
+                                + usize::from(receiver.local_policy.hidden_exception_owner_slots())
+                        && method.opcode == crate::target::opcodes::LOAD_ATTR
+                        && method.value_argument().is_some_and(|n| n & 1 != 0)
+                        && call.opcode == crate::target::opcodes::CALL
+                        && call.value_argument() == Some(0)
+                        && truth.opcode == crate::target::opcodes::TO_BOOL
+                        && matches!(
+                            guard.opcode,
+                            crate::target::opcodes::POP_JUMP_IF_FALSE
+                                | crate::target::opcodes::POP_JUMP_IF_TRUE
+                        )
+                        && guard.forward_target().is_some()
+                        && guard.location == truth.location
+                        && let Some(region) =
+                            self.uniform_exception_owner(start, instruction_index, &label_positions)
+                        && self.exception_regions[region].preserve_lasti
+                        && !self.exception_regions[region].is_scope_fallback
+                    {
+                        owners.insert(
+                            instruction_index,
+                            ExceptionOwnerDecision::override_with_region(Some(region)),
+                        );
+                    }
                     if instruction.opcode == NOT_TAKEN {
                         if instruction.exception_policy().exclusion()
                             == super::ExceptionExclusion::None
