@@ -9527,7 +9527,7 @@ impl<'source> Compiler<'source> {
                                 && inner.try_body_depth
                                     == self.control.exceptions.active_try_marker_slots.len()
                     );
-                // A named-handler return can copy an inner finally while an ordinary
+                // A handler return can copy an inner finally while an ordinary
                 // try between the two finalizers is still active. A synchronous iterator
                 // entered in that try remains live until after the inner copy; its POP
                 // still belongs to the ordinary try. Retire each collector at its own
@@ -9535,8 +9535,6 @@ impl<'source> Compiler<'source> {
                 let tracks_try_between_finally_unwinds = !return_is_overridden
                     && statement.value.is_none()
                     && !preserve_tos
-                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                        == CO_COROUTINE
                     && self.control.withs.active_with_exits.is_empty()
                     && self.control.exceptions.active_exception_group_handlers == 0
                     && self.control.finally.active_finally_end_blocks == 0
@@ -9560,8 +9558,7 @@ impl<'source> Compiler<'source> {
                             self.control.loops.contexts.as_slice(),
                         ),
                         ([handler], [outer, inner], [loop_context])
-                            if handler.name.is_some()
-                                && outer.handler_depth == 0
+                            if outer.handler_depth == 0
                                 && inner.handler_depth == 0
                                 && outer.with_depth == 0
                                 && inner.with_depth == 0
