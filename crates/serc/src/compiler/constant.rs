@@ -4078,13 +4078,10 @@ fn first_constant(
             if self.is_complete() {
                 return;
             }
-            if (self.compiler.context.python_version <= PythonVersion::Py313
-                || self.include_implicit_constants)
-                && matches!(statement, Stmt::Expr(expression)
-                    if self.compiler.return_value_is_constant(&expression.value))
+            if matches!(statement, Stmt::Expr(expression)
+                if self.compiler.return_value_is_constant(&expression.value))
             {
-                // A discarded constant expression does not reserve the first
-                // code-generation constant when searching a terminal loop body.
+                // A standalone AST constant emits only a NOP and never enters the constant pool.
                 return;
             }
             if matches!(statement, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {

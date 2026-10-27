@@ -22894,6 +22894,16 @@ assert (sets[0] is sets[1]) == (sys.argv[1] == 'shared')
 }
 
 #[test]
+fn unreachable_literal_statements_leave_the_first_constant_slot_free() {
+    for source in [
+        "def lookup(obj):\n    return obj.value\n    'field documentation'\n",
+        "def check():\n    raise Error\n    'unused'\n    report(17)\n",
+    ] {
+        assert_matches_cpython(source, "unreachable_literal_statement.py", &LEVELS);
+    }
+}
+
+#[test]
 fn empty_unreachable_tails_preserve_discarded_cache_admissions() {
     for tail in [
         "",
