@@ -3989,6 +3989,34 @@ fn folded_while_breaks_copy_unnamed_handler_cleanup() {
 }
 
 #[test]
+fn legacy_handler_return_counts_each_protected_scope() {
+    let source = r"def consume(active):
+    try:
+        while active:
+            try:
+                try:
+                    work()
+                except LookupError:
+                    if active:
+                        try:
+                            close()
+                        except OSError:
+                            pass
+                        return
+            except TypeError:
+                pass
+    except ValueError:
+        pass
+";
+    assert_matches_cpython_versions(
+        source,
+        "handler_scope_return.py",
+        &LEVELS,
+        &[PythonVersion::Py312],
+    );
+}
+
+#[test]
 fn named_handler_none_while_break_copies_cleanup() {
     for prefix in ["", "async "] {
         for condition in ["value", "value is None", "value is not None"] {

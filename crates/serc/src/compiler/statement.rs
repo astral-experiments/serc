@@ -14856,44 +14856,50 @@ impl<'source> Compiler<'source> {
                         self.assembler.allow_last_no_location_block_inlining();
                     }
                 }
-                if exception_unwind_start.is_some() || return_exclusion_start.is_some() {
+                if let Some(exclusion_start) = exception_unwind_start.or(return_exclusion_start) {
                     if !return_is_overridden
-                        && handler_count == 0
                         && with_unwind_starts.is_empty()
                         && !unwinds_return_finally
                         && finally_end_unwind_start.is_none()
                     {
-                        // Nested try exits share a single region-end label in the IR, but each
-                        // original POP_BLOCK still counts toward CPython's early copy limit.
-                        let original_pop = exception_unwind_start
-                            .or(return_exclusion_start)
-                            .expect("ordinary return unwind has a boundary");
-                        self.assembler.record_name_return_pop_boundary(
-                            original_pop,
-                            self.control
-                                .exceptions
-                                .active_exception_region_exclusions
-                                .len(),
-                        );
-                        // A shared value join can alias the first POP with the iterator
-                        // footer's entry. No physical block split counts that slot there.
-                        let pop_at_entry = self
-                            .assembler
-                            .iterator_return_pop_is_at_original_entry(original_pop);
-                        self.assembler.add_last_original_block_slots(
-                            self.control
-                                .exceptions
-                                .active_exception_region_exclusions
-                                .len()
-                                .saturating_sub(usize::from(!pop_at_entry)),
-                        );
+                        let pop_blocks = self
+                            .control
+                            .exceptions
+                            .active_exception_region_exclusions
+                            .len();
+                        // POP_EXCEPT and RETURN_CONST occupy two of the four slots a
+                        // 3.12 exit can copy. Each unwound region or iterator adds one.
+                        let long_handler_exit = self.context.python_version
+                            == crate::PythonVersion::Py312
+                            && !preserve_tos
+                            && matches!(self.control.exceptions.active_exception_handlers.as_slice(), [handler] if handler.name.is_none())
+                            && 2 + pop_blocks
+                                + self
+                                    .control
+                                    .loops
+                                    .contexts
+                                    .iter()
+                                    .filter(|loop_| loop_.iterator_cleanup != IteratorCleanup::None)
+                                    .count()
+                                > 4;
+                        if handler_count == 0 || long_handler_exit {
+                            self.assembler
+                                .record_name_return_pop_boundary(exclusion_start, pop_blocks);
+                        }
+                        if handler_count == 0 {
+                            // A shared value join can alias the first POP with the iterator
+                            // footer's entry. No physical block split counts that slot there.
+                            let pop_at_entry = self
+                                .assembler
+                                .iterator_return_pop_is_at_original_entry(exclusion_start);
+                            self.assembler.add_last_original_block_slots(
+                                pop_blocks.saturating_sub(usize::from(!pop_at_entry)),
+                            );
+                        }
                     }
                     let return_exclusion_end = self.assembler.label();
                     self.assembler
                         .mark_return_region_reentry(return_exclusion_end);
-                    let exclusion_start = exception_unwind_start
-                        .or(return_exclusion_start)
-                        .expect("return exclusion has a start");
                     let region_count = self
                         .control
                         .exceptions
