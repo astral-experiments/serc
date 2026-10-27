@@ -1056,7 +1056,7 @@ fn is_fused_builtin_guard_block(records: &[&Instruction], location: SourceLocati
         return false;
     };
     if load.opcode != LOAD_GLOBAL
-        || !load.value_argument().is_some_and(|arg| arg & 1 == 0)
+        || load.value_argument().is_none_or(|arg| arg & 1 != 0)
         || copy.opcode != COPY
         || copy.value_argument() != Some(1)
         || common.opcode != LOAD_COMMON_CONSTANT
@@ -8320,7 +8320,8 @@ impl LayoutAssembler {
                                 && pop_slot_epoch_known
                                 && tail.insertions == 0
                                 && tail.post_compaction_fusions > 0
-                                && tail.post_compaction_fusions <= instruction_index.saturating_sub(start)
+                                && tail.post_compaction_fusions
+                                    <= instruction_index.saturating_sub(start)
                                 && tail.post_compaction_fusions
                                     == setup_tail.post_compaction_fusions
                                 && start
