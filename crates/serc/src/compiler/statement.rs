@@ -7213,11 +7213,12 @@ impl<'source> Compiler<'source> {
                 let context = self.control.loops.contexts.last().copied().ok_or_else(|| {
                     CompileError::invalid_syntax("'continue' not properly in loop", statement.range)
                 })?;
-                // This direct named handler contributes two original POP_BLOCKs before
-                // its four name-cleanup records. No other unwind may add hidden records.
-                let continued_handler_origin = (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+                // Each named-handler continue unwinds two handler POPs before clearing
+                // the name. An inner ordinary try adds its POP before those records.
+                let inner_tries = self.control.exceptions.active_try_marker_slots.len();
+                let continued_handler_origin = (matches!((self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR), inner_tries), (CO_COROUTINE, 0) | (0, 1))
+                    && (inner_tries == 0 || (self.context.python_version == crate::PythonVersion::Py314 && context.iterator_cleanup == IteratorCleanup::Sync))
                     && self.control.withs.active_with_exits.is_empty()
-                    && self.control.exceptions.active_try_marker_slots.is_empty()
                     && self.control.exceptions.active_exception_group_handlers == 0
                     && self.control.finally.active_finally_try_bodies == 1
                     && self.control.finally.active_finally_end_blocks == 0
@@ -7229,17 +7230,18 @@ impl<'source> Compiler<'source> {
                     && self.control.finally.active_pass_finally_locations.is_empty()
                     && matches!(self.control.exceptions.active_exception_handlers.as_slice(), [handler]
                         if handler.name.is_some()
+                            && handler.try_body_depth == 0
                             && handler.with_depth == 0
                             && handler.loop_depth == self.control.loops.contexts.len()
                             && self.control.exceptions.active_exception_region_exclusions.len()
-                                == handler.exception_region_depth + 1
+                                == handler.exception_region_depth + 1 + inner_tries
                             && matches!(self.control.finally.active_loop_finally_contexts.as_slice(), [finally]
                                 if finally.handler_depth == 0
                                     && finally.with_depth == 0
                                     && finally.loop_depth == handler.loop_depth
                                     && finally.exception_region_depth + 1 == handler.exception_region_depth
                                     && finally.exception_region_depth == context.exception_region_depth)))
-                    .then(|| self.assembler.item_count());
+                    .then(|| (self.assembler.item_count(), inner_tries));
                 // A direct unnamed handler pops its handler block, then its finalizer.
                 // Keep both original NULL slots when the copy starts with a local None test.
                 let continued_unnamed_handler_origin = (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
@@ -7634,11 +7636,13 @@ impl<'source> Compiler<'source> {
                 if let Some(origin) = continued_handler_try_origin {
                     self.assembler.record_continued_handler_try_prefix(origin);
                 }
-                if let Some(origin) = continued_handler_origin {
+                if let Some((origin, inner_tries)) = continued_handler_origin {
                     self.assembler
-                        .record_copied_continue_none_handler_cleanup(origin);
-                    self.assembler
-                        .record_copied_continue_handler_cleanup(origin);
+                        .record_copied_continue_none_handler_cleanup(origin, inner_tries);
+                    if inner_tries == 0 {
+                        self.assembler
+                            .record_copied_continue_handler_cleanup(origin);
+                    }
                 }
                 if exclusion_start.is_some()
                     && (has_copied_finalizer || !with_unwind_starts.is_empty())

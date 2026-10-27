@@ -16082,8 +16082,12 @@ impl Assembler {
         self.record_copied_handler_cleanup(start, end, break_item, true);
     }
 
-    /// Captures a continued local None test with an emitted fallthrough suffix.
-    pub(crate) fn record_copied_continue_none_handler_cleanup(&mut self, continue_item: usize) {
+    /// Captures a continued local None test and counts ordinary try POPs before name cleanup.
+    pub(crate) fn record_copied_continue_none_handler_cleanup(
+        &mut self,
+        continue_item: usize,
+        inner_tries: usize,
+    ) {
         let items = self.linear_items();
         let records = items
             .iter()
@@ -16130,7 +16134,18 @@ impl Assembler {
         {
             return;
         }
+        let origin = self
+            .exception_owner_provenance
+            .copied_handler_cleanups
+            .len();
         self.record_copied_break_handler_cleanup(continue_item);
+        if let Some(cleanup) = self
+            .exception_owner_provenance
+            .copied_handler_cleanups
+            .get_mut(origin)
+        {
+            cleanup.missing_null_pops += inner_tries;
+        }
     }
 
     /// Captures a direct named-handler continue and its first copied call or attribute None test.
