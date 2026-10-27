@@ -1647,7 +1647,7 @@ impl ManagerSetupCertificate {
     }
 }
 
-/// One uniformly owned original dispatch with at most one accounted-for compaction.
+/// One uniformly owned original dispatch with verified compactions.
 struct HandlerDispatchCertificate {
     interval: Certificate,
     region: ExceptionRegion,
@@ -1788,25 +1788,26 @@ impl HandlerDispatchCertificate {
             .then_some(())
     }
 
-    /// Accounts only for a global-call NULL fold or an observed pair of local loads.
+    /// Counts compacted cells in an unchanged, uniformly protected dispatch.
     fn slots(&self, view: &View<'_>, start: usize, condition: usize) -> Option<usize> {
         use crate::target::opcodes::{
-            BUILD_TUPLE, CALL, CHECK_EXC_MATCH, LOAD_ATTR, LOAD_CONST, LOAD_FAST_CHECK, LOAD_GLOBAL,
+            BINARY_OP, BUILD_LIST, BUILD_TUPLE, CALL, CALL_FUNCTION_EX, CALL_INTRINSIC_1,
+            CHECK_EXC_MATCH, LIST_APPEND, LIST_EXTEND, LOAD_ATTR, LOAD_CONST, LOAD_FAST_CHECK,
+            LOAD_GLOBAL, LOAD_SMALL_INT, PUSH_NULL,
         };
+        use crate::target::operands::UnaryIntrinsic;
 
-        if !view.no_late_insertions_or_setups(start, condition)
-            || view.provenance.setups.iter().any(|(label, _)| {
+        if view.provenance.setups.iter().any(|(label, _)| {
+            view.label_index(*label)
+                .is_none_or(|position| start <= *position && *position <= condition)
+        }) || view
+            .provenance
+            .removed_pop_block_boundaries
+            .iter()
+            .any(|label| {
                 view.label_index(*label)
                     .is_none_or(|position| start <= *position && *position <= condition)
             })
-            || view
-                .provenance
-                .removed_pop_block_boundaries
-                .iter()
-                .any(|label| {
-                    view.label_index(*label)
-                        .is_none_or(|position| start <= *position && *position <= condition)
-                })
         {
             return None;
         }
@@ -1824,15 +1825,19 @@ impl HandlerDispatchCertificate {
                 }
                 Item::Instruction(instruction) => instruction,
             };
+            let folded = instruction.local_policy.hidden_exception_owner_slots();
             if instruction.exception_policy() != ExceptionPolicy::NoneUnchanged
-                || instruction.pre_fold_extra_instructions() != 0
-                || instruction.local_policy.hidden_exception_owner_slots() != 0
+                || folded == super::LocalPolicy::MAX_HIDDEN_EXCEPTION_OWNER_SLOTS
+                || usize::from(instruction.pre_fold_extra_instructions())
+                    != usize::from(folded).min(4)
+                || (folded != 0 && !matches!(instruction.opcode, LOAD_CONST | LOAD_SMALL_INT))
                 || instruction.only_allows_unconditional_inlining()
                 || instruction.no_location_policy.borrow_fallthrough()
                     == super::BorrowFallthrough::Barrier
             {
                 return None;
             }
+            removed += usize::from(folded);
             match instruction.opcode {
                 LOAD_GLOBAL => {
                     let argument = instruction.value_argument()?;
@@ -1845,22 +1850,26 @@ impl HandlerDispatchCertificate {
                     removed += 1;
                 }
                 LOAD_FAST | LOAD_FAST_BORROW | LOAD_FAST_CHECK | LOAD_CONST | BUILD_TUPLE
-                | CHECK_EXC_MATCH => {}
+                | LOAD_SMALL_INT | BUILD_LIST | LIST_APPEND | LIST_EXTEND | BINARY_OP
+                | PUSH_NULL | CHECK_EXC_MATCH => {}
+                CALL_INTRINSIC_1
+                    if instruction.value_argument()
+                        == Some(UnaryIntrinsic::LIST_TO_TUPLE.argument()) => {}
                 LOAD_ATTR if matches!(instruction.operand(), Operand::Value(argument) if argument & 1 == 0) =>
                     {}
                 // Code generation emits a zero-argument method lookup as one LOAD_ATTR
                 // record followed by CALL. Unlike a global call, it has no PUSH_NULL
-                // record to compact, so the existing one-slot certificate is unchanged.
+                // record to compact.
                 LOAD_ATTR
                     if matches!(instruction.operand(), Operand::Value(argument) if argument & 1 != 0)
                         && matches!(view.items.get(index + 1), Some(Item::Instruction(next))
                             if next.opcode == CALL && next.value_argument() == Some(0)) => {}
-                CALL => call = true,
+                CALL | CALL_FUNCTION_EX => call = true,
                 POP_JUMP_IF_FALSE if index == condition => {}
                 _ => return None,
             }
         }
-        if removed > 1 || (global_call && !call) {
+        if global_call && !call {
             return None;
         }
         Self::owns_interval(
@@ -1878,7 +1887,7 @@ impl HandlerDispatchCertificate {
     }
 
     fn rebind_one_fusion(&mut self, before: &View<'_>, after: &View<'_>) -> Option<()> {
-        if self.observed_fusion || self.removed != 0 {
+        if self.observed_fusion {
             return None;
         }
         self.valid(before, false)?;
@@ -1890,7 +1899,7 @@ impl HandlerDispatchCertificate {
         self.interval.items = items;
         self.interval.labels = labels_in(&self.interval.items);
         self.observed_fusion = true;
-        self.removed = 1;
+        self.removed += 1;
         self.valid(after, false)?;
         Some(())
     }
@@ -2750,7 +2759,7 @@ impl FusionOwnerCertificates {
         let dispatch_markers = self
             .handler_dispatch_certificates
             .iter()
-            .filter(|certificate| certificate.removed == 1)
+            .filter(|certificate| certificate.removed > 0)
             .filter_map(|certificate| certificate.valid(&view, true))
             .collect::<Vec<_>>();
         for (index, owner) in changes {
