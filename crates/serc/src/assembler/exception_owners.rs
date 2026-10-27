@@ -10308,6 +10308,56 @@ impl LayoutAssembler {
                             ExceptionOwnerDecision::override_with_region(None),
                         );
                     }
+                    // Specializing the comparison erases its TO_BOOL. When a preceding
+                    // try/else boundary also lost its NOP, the marker reuses COMPARE_OP.
+                    if instruction.opcode == NOT_TAKEN
+                        && owner_history_exact
+                        && tail.insertions == 0
+                        && tail.late_removals == 0
+                        && tail.post_compaction_fusions == 0
+                        && tail.early_removals == 2
+                        && let Some(start) = instruction_index.checked_sub(5)
+                        && start >= original_array_start
+                        && let [object, attr, operand, compare, jump] =
+                            &indexed_instructions[start..instruction_index]
+                        && matches!(
+                            object.opcode,
+                            crate::target::opcodes::LOAD_FAST
+                                | crate::target::opcodes::LOAD_FAST_BORROW
+                                | crate::target::opcodes::LOAD_FAST_CHECK
+                        )
+                        && object.local_policy.hidden_exception_owner_slots() == 1
+                        && attr.opcode == crate::target::opcodes::LOAD_ATTR
+                        && attr.value_argument().is_some_and(|arg| arg & 1 == 0)
+                        && matches!(
+                            operand.opcode,
+                            crate::target::opcodes::LOAD_FAST
+                                | crate::target::opcodes::LOAD_FAST_BORROW
+                                | crate::target::opcodes::LOAD_FAST_CHECK
+                        )
+                        && compare.opcode == COMPARE_OP
+                        && compare.value_argument().is_some_and(|arg| arg & 16 != 0)
+                        && matches!(
+                            jump.opcode,
+                            crate::target::opcodes::POP_JUMP_IF_FALSE
+                                | crate::target::opcodes::POP_JUMP_IF_TRUE
+                        )
+                        && jump.forward_target().is_some()
+                        && !jump_targets.iter().any(|label| {
+                            label_positions
+                                .get(label)
+                                .is_some_and(|index| start < *index && *index <= instruction_index)
+                        })
+                        && let Some(region) =
+                            self.uniform_exception_owner(start, instruction_index, &label_positions)
+                        && self.exception_regions[region].preserve_lasti
+                        && !self.exception_regions[region].is_scope_fallback
+                    {
+                        owners.insert(
+                            instruction_index,
+                            ExceptionOwnerDecision::override_with_region(Some(region)),
+                        );
+                    }
                     if instruction.opcode == NOT_TAKEN {
                         if instruction.exception_policy().exclusion()
                             == super::ExceptionExclusion::None
