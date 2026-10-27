@@ -25977,3 +25977,43 @@ fn short_circuit_value_after_manager_entries_uses_the_prior_handler() {
 ";
     assert_matches_cpython(source, "manager_value_guard.py", &LEVELS);
 }
+
+#[test]
+fn guard_exits_locate_manager_cleanup() {
+    let source = r"def check(manager, ready, value):
+    with manager:
+        if ready:
+            try:
+                return value
+            except ValueError:
+                return
+
+def nested(manager, first, second):
+    with manager:
+        if first:
+            raise ValueError
+        else:
+            if not second:
+                return
+
+def first_arm(manager, first, second):
+    with manager:
+        if first:
+            if second:
+                return
+        else:
+            try:
+                return first
+            except ValueError:
+                raise
+
+def shared(manager, first, second):
+    with manager:
+        if first and second:
+            try:
+                return first
+            except ValueError:
+                return
+";
+    assert_matches_cpython(source, "guard_manager_cleanup.py", &LEVELS);
+}

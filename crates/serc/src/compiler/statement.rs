@@ -42618,6 +42618,12 @@ impl<'source> Compiler<'source> {
             Some(WithBodyExitNoop::RetainedManagerPopBlock(location, entry))
         });
         let body_noop = body_noop.or_else(|| {
+            (remaining.is_empty() && self.context.python_version >= crate::PythonVersion::Py314)
+                .then(|| with_body_guard_exit_location(body))
+                .flatten()
+                .map(WithBodyExitNoop::RetainedConvertedPopBlock)
+        });
+        let body_noop = body_noop.or_else(|| {
             // Both legacy targets resolve the original POP_BLOCK's location
             // before NOP cleanup. A structured body can leave one continuing
             // predecessor whose span remains visible on the manager exit.
@@ -44664,6 +44670,42 @@ fn with_body_ends_in_terminal_try(body: &[Stmt]) -> bool {
                 .as_except_handler()
                 .is_some_and(|handler| suite_terminates_before_constant_folding(&handler.body))
         })
+}
+
+/// Finds the only false edge that reaches a manager's normal exit.
+/// Each taken branch leaves the manager before its original `POP_BLOCK`.
+fn with_body_guard_exit_location(mut body: &[Stmt]) -> Option<TextRange> {
+    while let Some(Stmt::If(branch)) = body.last() {
+        let mut tests = std::iter::once(branch.test.as_ref()).chain(
+            branch
+                .elif_else_clauses
+                .iter()
+                .filter_map(|clause| clause.test.as_ref()),
+        );
+        if !tests.clone().all(condition_has_only_runtime_tests) {
+            return None;
+        }
+        let mut continuing = if_suites(branch).filter(|arm| {
+            !suite_terminates_before_constant_folding(arm) && !with_body_ends_in_terminal_try(arm)
+        });
+        if branch
+            .elif_else_clauses
+            .last()
+            .is_some_and(|clause| clause.test.is_none())
+        {
+            body = continuing.next()?;
+            if continuing.next().is_some() {
+                return None;
+            }
+            continue;
+        }
+        let test = tests.next_back()?;
+        if continuing.next().is_some() || !original_condition_has_unique_jump_target(test, false) {
+            return None;
+        }
+        return unique_condition_jump_target(test, false).map(Ranged::range);
+    }
+    None
 }
 
 // When the try body exits on every path, only a fallthrough handler can donate a
