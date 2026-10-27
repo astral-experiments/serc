@@ -42478,6 +42478,22 @@ impl<'source> Compiler<'source> {
             // outside the protected body even when another manager still encloses it.
             self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
         }
+        // The 3.12 while-end label starts a new instruction array even when no break targets it.
+        // The manager POP_BLOCK can then inherit the final else instruction on its sole edge.
+        let body_noop = if self.context.python_version == crate::PythonVersion::Py312
+            && remaining.is_empty()
+            && matches!(body.last(), Some(Stmt::While(loop_statement))
+                if early_condition_truthiness(&loop_statement.test).is_none()
+                    && !loop_statement.orelse.is_empty()
+                    && !suite_terminates(&loop_statement.orelse))
+        {
+            Some(WithBodyExitNoop::RetainedManagerPopBlock(
+                SourceLocation::NONE,
+                protected_end,
+            ))
+        } else {
+            body_noop
+        };
         let body_noop = body_noop.or_else(|| {
             remaining
                 .is_empty()

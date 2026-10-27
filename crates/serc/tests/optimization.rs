@@ -12058,6 +12058,18 @@ fn copied_finally_compound_break_threads_both_conditions() {
 }
 
 #[test]
+fn the_while_else_edge_locates_its_manager_cleanup() {
+    let source = r"def wait(resource):
+    with resource:
+        while ready():
+            work()
+        else:
+            stop()
+";
+    assert_matches_cpython(source, "while_else_manager.py", &LEVELS);
+}
+
+#[test]
 fn shared_manager_cleanup_has_no_while_condition_line() {
     for first in [
         "for item in items:\n                work(item)",
