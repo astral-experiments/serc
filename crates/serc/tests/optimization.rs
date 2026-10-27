@@ -15,6 +15,23 @@ use serc::{
 };
 
 #[test]
+fn guarded_cleanup_keeps_the_outer_iterators_discard_unlocated() {
+    let source = r"def scan(items, manager, active):
+    with manager:
+        for item in items:
+            try:
+                return 1
+            finally:
+                if active:
+                    try:
+                        process(item)
+                    except ValueError:
+                        pass
+";
+    assert_matches_cpython(source, "guarded_iterator_discard.py", &LEVELS);
+}
+
+#[test]
 fn nested_conversion_handlers_keep_shared_cleanup() {
     let source = r"def sample(items):
     for item in items:
