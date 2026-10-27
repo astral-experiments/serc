@@ -9230,7 +9230,6 @@ impl<'source> Compiler<'source> {
                 // An ordinary try between the handler and its nearest pending finally still
                 // protects POP_EXCEPT. Iterators retire that try at their own saved depths.
                 let handler_cleanup_has_enclosing_try = !return_is_overridden
-                    && self.control.withs.active_with_exits.is_empty()
                     && self.control.finally.active_finally_end_blocks == 0
                     && self.control.finally.active_normal_finally_bodies == 0
                     && matches!(
@@ -9238,14 +9237,23 @@ impl<'source> Compiler<'source> {
                             self.control.exceptions.active_exception_handlers.as_slice(),
                             self.control.finally.active_return_finally_contexts.last(),
                         ),
-                        ([handler], Some(finally))
+                        ([outer, nested @ ..], Some(finally))
                             if finally.handler_depth == 0
-                                && handler.exception_region_depth > finally.exception_region_depth + 1
+                                && finally.with_depth == self.control.withs.active_with_exits.len()
+                                && nested.iter().enumerate().all(|(index, inner)| {
+                                    inner.exception_region_depth == outer.exception_region_depth + index + 1
+                                        && inner.try_body_depth == outer.try_body_depth
+                                        && inner.loop_depth == outer.loop_depth
+                                })
+                                && outer.exception_region_depth > finally.exception_region_depth + 1
                                 && self.control.exceptions.active_exception_region_exclusions.len()
-                                    > handler.exception_region_depth
+                                    > outer.exception_region_depth
                     );
+                // These original POP_BLOCK slots belong to a single handler with no manager.
                 let preserves_enclosing_try_pop_slots =
                     handler_cleanup_has_enclosing_try
+                        && handler_count == 1
+                        && self.control.withs.active_with_exits.is_empty()
                         && self.control.finally.active_return_finally_contexts.len() == 1
                         && self.control.loops.contexts.iter().enumerate().all(
                             |(index, context)| {
