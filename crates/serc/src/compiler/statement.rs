@@ -52649,7 +52649,9 @@ fn handler_cleanup_fallthrough_test(statement: &ruff_python_ast::StmtIf) -> Opti
 
 fn terminal_exception_handler_if_supported(statement: &ruff_python_ast::StmtIf) -> bool {
     if_suites(statement).all(|body| {
-        !suite_terminates(body)
+        // A direct bare return uses the shared handler action.
+        // Nested returns need the active handler while compiling the branch.
+        (!suite_terminates(body) && !suite_contains_return(body))
             || matches!(body, [Stmt::Return(statement)] if statement.value.is_none())
     })
 }

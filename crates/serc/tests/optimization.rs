@@ -26017,3 +26017,21 @@ async def process(flag):
 ";
     assert_matches_cpython(source, "recovery_exit.py", &LEVELS);
 }
+
+#[test]
+fn nested_returns_clear_the_enclosing_exception_name() {
+    let source = r"def recover(flag, ready, value):
+    try:
+        work()
+    except OSError as error:
+        if flag:
+            if ready:
+                with resource():
+                    return value
+            else:
+                return value
+        else:
+            record(error)
+";
+    assert_matches_cpython(source, "nested_handler_return.py", &LEVELS);
+}
