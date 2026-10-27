@@ -11959,7 +11959,7 @@ impl Assembler {
         instruction.no_location_policy.allow_block_inlining();
     }
 
-    /// Records the range-only labels within an original FINALLY_END/return block.
+    /// Records the range-only labels within an original `FINALLY_END` return block.
     pub(crate) fn record_deferred_finalizer_return(&mut self, start: Label, end: Label) {
         self.exception_owner_provenance
             .deferred_finalizer_return_boundaries
