@@ -11981,6 +11981,54 @@ fn break_keeps_its_line_before_a_small_attribute_return() {
 }
 
 #[test]
+fn copied_returns_keep_a_break_that_unwinds_a_try() {
+    let simple = r"def run(active, obj):
+    if active:
+        while True:
+            try:
+                obj.first = read()
+                break
+            except LookupError:
+                pass
+            obj.second = retry()
+            break
+    else:
+        wait()
+    return True
+";
+    let nested = r"def run(mode, value):
+    if mode:
+        try:
+            if enabled():
+                while True:
+                    try:
+                        if not ready():
+                            raise ValueError
+                        consume(value)
+                        break
+                    except ValueError:
+                        pass
+                    retry(value)
+                    break
+            else:
+                wait()
+        except LookupError:
+            pass
+    else:
+        stop()
+    return value
+";
+    assert_matches_cpython(simple, "break_unwinds_try.py", &LEVELS);
+    for exit in ["value", "value, mode", "finish(value)"] {
+        assert_matches_cpython(
+            &nested.replace("return value", &format!("return {exit}")),
+            "break_unwinds_nested_try.py",
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn folded_loop_breaks_keep_their_shared_return_location() {
     let conditional = r"def choose(flag, value):
     if flag:
