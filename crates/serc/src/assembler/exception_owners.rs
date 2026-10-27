@@ -10309,6 +10309,64 @@ impl LayoutAssembler {
                         );
                     }
                     if instruction.opcode == NOT_TAKEN {
+                        // Copying an inner finally before discarding the loop iterator
+                        // leaves the call's POP_TOP in the outer guard's marker slot.
+                        if instruction.exception_policy().exclusion()
+                            == super::ExceptionExclusion::None
+                            && owner_history_exact
+                            && tail.late_removals == 0
+                            && tail.insertions == 0
+                            && tail.post_compaction_fusions == 0
+                            && let Some(call_index) = instruction_index.checked_sub(5)
+                            && call_index >= original_array_start
+                            && let [call, discard, iterator, load, guard] =
+                                &indexed_instructions[call_index..instruction_index]
+                            && matches!(
+                                call.opcode,
+                                crate::target::opcodes::CALL | crate::target::opcodes::CALL_KW
+                            )
+                            && discard.opcode == POP_TOP
+                            && iterator.opcode == POP_TOP
+                            && call.location != SourceLocation::NONE
+                            && call.location == discard.location
+                            && discard.location == iterator.location
+                            && matches!(
+                                load.opcode,
+                                crate::target::opcodes::LOAD_FAST
+                                    | crate::target::opcodes::LOAD_FAST_BORROW
+                            )
+                            && load.local_policy.hidden_exception_owner_slots() == 1
+                            && matches!(guard.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+                            && guard.local_policy.hidden_exception_owner_slots() == 3
+                            && tail.early_removals
+                                == instruction_index - (call_index + 2)
+                                    + usize::from(load.local_policy.hidden_exception_owner_slots())
+                                    + usize::from(guard.local_policy.hidden_exception_owner_slots())
+                            && !jump_targets.iter().any(|label| {
+                                label_positions.get(label).is_some_and(|position| {
+                                    call_index < *position && *position <= instruction_index
+                                })
+                            })
+                            && let Some(region) = self.uniform_exception_owner(
+                                call_index,
+                                call_index + 2,
+                                &label_positions,
+                            )
+                            && let Some(iterator_region) = self.uniform_exception_owner(
+                                call_index + 2,
+                                call_index + 3,
+                                &label_positions,
+                            )
+                            && self.exception_regions[region].depth
+                                == self.exception_regions[iterator_region].depth + 1
+                            && !self.exception_regions[region].preserve_lasti
+                            && !self.exception_regions[iterator_region].preserve_lasti
+                        {
+                            owners.insert(
+                                instruction_index,
+                                ExceptionOwnerDecision::override_with_region(Some(region)),
+                            );
+                        }
                         if instruction.exception_policy().exclusion()
                             == super::ExceptionExclusion::None
                             && let Some((index, region)) = pending_normal_none_owner.take()
