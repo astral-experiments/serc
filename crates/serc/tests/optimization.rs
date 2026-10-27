@@ -15,6 +15,25 @@ use serc::{
 };
 
 #[test]
+fn post_try_fusion_survives_the_removed_fallthrough_jump() {
+    let source = r"import checks
+
+async def sample(values, flag, fallback):
+    a, b, c = values
+    try:
+        expected = b
+        if flag:
+            pass
+    except Error:
+        return fallback
+    if not checks.equal(c, expected):
+        return fallback
+    complete()
+";
+    assert_matches_cpython(source, "post_try_fusion.py", &LEVELS);
+}
+
+#[test]
 fn nested_conversion_handlers_keep_shared_cleanup() {
     let source = r"def sample(items):
     for item in items:
