@@ -14185,6 +14185,38 @@ impl Assembler {
             });
     }
 
+    /// Records ordinary try POPs between a discarded yield and the copied finalizer.
+    pub(crate) fn record_resumed_yield_return_pops(&mut self, try_pops: usize) {
+        let mut before = self
+            .linear_items()
+            .iter()
+            .rev()
+            .filter_map(Item::as_instruction);
+        let [Some(ret), Some(pop), Some(resume), Some(yielded)] =
+            std::array::from_fn(|_| before.next())
+        else {
+            return;
+        };
+        if ret.opcode != NOP
+            || pop.opcode != POP_TOP
+            || resume.opcode != RESUME
+            || yielded.opcode != crate::target::opcodes::YIELD_VALUE
+            || !matches!(resume.value_argument(), Some(1 | 5))
+        {
+            return;
+        }
+        let key = (ret.location, resume.location);
+        self.exception_owner_provenance
+            .resumed_yield_return_pops
+            .entry(key)
+            .and_modify(|count| {
+                if *count != Some(try_pops) {
+                    *count = None;
+                }
+            })
+            .or_insert(Some(try_pops));
+    }
+
     /// Records the final POP and the first local test of the copied finally suite.
     pub(crate) fn record_copied_return_guard(
         &mut self,

@@ -340,6 +340,8 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) copied_return_membership_prefixes: Vec<CopiedReturnMembershipPrefix>,
     pub(super) copied_return_call_prefixes: Vec<CopiedReturnCallPrefix>,
     pub(super) copied_return_attribute_truth_prefixes: Vec<CopiedReturnAttributeTruthPrefix>,
+    pub(super) resumed_yield_return_pops:
+        FxHashMap<(SourceLocation, SourceLocation), Option<usize>>,
     pub(super) copied_return_guards: Vec<CopiedReturnGuard>,
     pub(super) copied_handler_return_none_prefixes: Vec<(Label, [Instruction; 6], u16)>,
     pub(super) saved_named_handler_none_prefixes: Vec<SavedNamedHandlerNonePrefix>,
@@ -11185,6 +11187,23 @@ impl LayoutAssembler {
                     {
                         owners.insert(instruction_index, owner);
                     }
+                    if instruction.opcode == NOT_TAKEN
+                        && owner_history_exact
+                        && tail.insertions == 0
+                        && tail.late_removals == 0
+                        && tail.post_compaction_fusions == 0
+                        && self.resumed_yield_return_has_null_slot(
+                            instruction_index,
+                            original_array_start,
+                            tail,
+                            &indexed_instructions,
+                        )
+                    {
+                        owners.insert(
+                            instruction_index,
+                            ExceptionOwnerDecision::override_with_region(None),
+                        );
+                    }
                     // The captured marker aliases may delimit exception ranges without
                     // introducing another original array or invalidating its fresh cell.
                     if original_normal_finally_null_markers.contains(&instruction_index) {
@@ -14913,6 +14932,55 @@ impl LayoutAssembler {
         (!owner.is_scope_fallback && !owner.preserve_lasti && current_owner_matches).then_some(
             ExceptionOwnerDecision::override_with_region(owns_cleanup_record.then_some(region)),
         )
+    }
+
+    /// Projects the copied None guard's appended marker onto the original return array.
+    fn resumed_yield_return_has_null_slot(
+        &self,
+        marker: usize,
+        array: usize,
+        tail: ExceptionOwnerTail,
+        instructions: &[&Instruction],
+    ) -> bool {
+        use crate::target::opcodes::{LOAD_FAST, LOAD_FAST_BORROW, RESUME, YIELD_VALUE};
+        let Some(start) = marker.checked_sub(6).filter(|&start| start >= array) else {
+            return false;
+        };
+        let [yielded, resume, discard, pop, load, jump, append] = &instructions[start..=marker]
+        else {
+            return false;
+        };
+        if yielded.opcode != YIELD_VALUE
+            || resume.opcode != RESUME
+            || discard.opcode != POP_TOP
+            || !matches!(resume.value_argument(), Some(1 | 5))
+            || pop.opcode != NOP
+            || !pop.fusion_policy.is_converted_pop_block()
+            || pop.exception_policy() != super::ExceptionPolicy::EXCLUDE_ALWAYS
+            || pop.local_policy.hidden_exception_owner_slots() != 1
+            || !matches!(load.opcode, LOAD_FAST | LOAD_FAST_BORROW)
+            || load.local_policy.hidden_exception_owner_slots() != 0
+            || !matches!(jump.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+            || jump.local_policy.hidden_exception_owner_slots() != 3
+            || append.location != jump.location
+            || jump.forward_target().is_none()
+        {
+            return false;
+        }
+        let Some(Some(try_pops)) = self
+            .exception_owner_provenance
+            .resumed_yield_return_pops
+            .get(&(pop.location, resume.location))
+        else {
+            return false;
+        };
+        // The live POP is three records before the append. Restore the earlier
+        // folds, excluding the collapsed return NOP and the three None-test slots.
+        // Its original successors are the ordinary try POPs and the finalizer POP.
+        tail.early_removals
+            .checked_sub(4)
+            .and_then(|before| 3usize.checked_sub(before))
+            .is_some_and(|slot| (1..=try_pops + 1).contains(&slot))
     }
 
     /// Projects an appended guard through the original return cleanup and its final POP.
