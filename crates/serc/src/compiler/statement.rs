@@ -10304,12 +10304,15 @@ impl<'source> Compiler<'source> {
                             && next_finally > 0
                             && next_finally == return_finally_contexts.len()
                             && next_with == with_depth
-                            && self
-                                .control
-                                .loops
-                                .contexts
-                                .iter()
-                                .all(|context| context.iterator_cleanup == IteratorCleanup::None)
+                            && self.control.loops.contexts.iter().enumerate().all(
+                                |(index, context)| {
+                                    context.iterator_cleanup == IteratorCleanup::None
+                                        // An older iterator stays on the stack through POP_EXCEPT.
+                                        || (index < loop_depth
+                                            && context.iterator_cleanup == IteratorCleanup::Sync
+                                            && context.exception_region_depth <= region_depth)
+                                },
+                            )
                             && self.control.exceptions.active_exception_group_handlers == 0
                             && self.control.finally.active_finally_end_blocks == 0
                             && self.control.finally.active_normal_finally_bodies == 0

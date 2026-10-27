@@ -11091,6 +11091,24 @@ fn managed_handler_returns_retain_outer_recovery_cleanup() {
 }
 
 #[test]
+fn a_handler_return_inside_a_manager_restores_the_handler_before_its_iterator() {
+    let source = r"def run(items, manager):
+    try:
+        for item in items:
+            try:
+                work(item)
+            except KeyError as error:
+                with manager:
+                    return
+    except ValueError:
+        recover()
+    finally:
+        finish()
+";
+    assert_matches_cpython(source, "managed_handler_iterator.py", &LEVELS);
+}
+
+#[test]
 fn enclosing_tries_own_handler_returns_before_finalizers() {
     let body = r"try:
     try:
