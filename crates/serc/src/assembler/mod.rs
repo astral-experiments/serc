@@ -9016,6 +9016,29 @@ impl Assembler {
         }
     }
 
+    /// Retains a one-slot implicit jump after a handler path that cannot fall through.
+    pub(crate) fn record_unlocated_handler_jump(&mut self, emitted: EmittedJump) {
+        let index = usize::try_from(emitted.instruction().item_index)
+            .expect("emitted instruction index should fit in usize");
+        let items = self.linear_items();
+        let Some(&Item::Label(entry)) = items[..index].last() else {
+            return;
+        };
+        let Some(previous) = items[..index].iter().rev().find_map(Item::as_instruction) else {
+            return;
+        };
+        let Some(jump) = items[index].as_instruction() else {
+            return;
+        };
+        if ends_scope(previous.opcode)
+            && let Some(target) = jump.forward_target()
+        {
+            self.exception_owner_provenance
+                .cold_handler_borrow_jumps
+                .push((entry, target));
+        }
+    }
+
     /// Records the original two-slot normal exit of an ordinary try without an else suite.
     pub(crate) fn record_normal_try_exit(
         &mut self,

@@ -3478,18 +3478,18 @@ impl OptimizationPipeline {
         let mut copied_exit_successors = Vec::new();
         if !self
             .exception_owner_provenance
-            .copied_borrow_exit_handlers
+            .copied_borrow_exit_anchors
             .is_empty()
         {
-            let handlers: FxHashSet<_> = self
+            let anchors: FxHashSet<_> = self
                 .exception_owner_provenance
-                .copied_borrow_exit_handlers
+                .copied_borrow_exit_anchors
                 .iter()
-                .filter_map(|handler| graph.label_block(*handler))
+                .filter_map(|anchor| graph.label_block(*anchor))
                 .collect();
             let mut stranded = false;
             for &block in &order {
-                if temperatures[block.index()] == COLD_BLOCK && handlers.contains(&block) {
+                if temperatures[block.index()] == COLD_BLOCK && anchors.contains(&block) {
                     stranded = true;
                 } else if temperatures[block.index()] == WARM_BLOCK && std::mem::take(&mut stranded)
                 {
