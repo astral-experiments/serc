@@ -27799,12 +27799,13 @@ impl<'source> Compiler<'source> {
         // A live conditional arm in a nested recovery can jump past
         // both normal try exits into the enclosing continuation.
         let straight_stores = |body: &[Stmt]| {
-            !body.is_empty() && body.iter().all(|part| {
-                matches!(part, Stmt::Assign(assign)
+            !body.is_empty()
+                && body.iter().all(|part| {
+                    matches!(part, Stmt::Assign(assign)
                     if matches!(assign.targets.as_slice(), [Expr::Name(_)])
                         && !expression_contains_inline_branch(&assign.value)
                         && !expression_suspends_current_scope(&assign.value))
-            })
+                })
         };
         let falls_through = |handler: &ruff_python_ast::ExceptHandler| {
             handler.as_except_handler().is_some_and(|handler| {
@@ -27814,8 +27815,8 @@ impl<'source> Compiler<'source> {
             })
         };
         let populated_arm = |arm: &[Stmt]| {
-            straight_stores(arm) ||
-            matches!(arm, [Stmt::Expr(expression)]
+            straight_stores(arm)
+                || matches!(arm, [Stmt::Expr(expression)]
             if matches!(expression.value.as_ref(), Expr::Call(_))
                 || matches!(expression.value.as_ref(), Expr::Await(await_)
                     if matches!(await_.value.as_ref(), Expr::Call(_))))
