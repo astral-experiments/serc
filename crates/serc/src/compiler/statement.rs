@@ -29464,8 +29464,10 @@ impl<'source> Compiler<'source> {
             {
                 // The break threads past this normal try exit. The else store
                 // remains its sole line donor when the handler blocks move.
-                self.assembler.preserve_redundant_jump_nop_after_threading(normal_exit);
-                self.assembler.mark_retained_nop_borrow_fallthrough_if_unblocked(normal_exit);
+                self.assembler
+                    .preserve_redundant_jump_nop_after_threading(normal_exit);
+                self.assembler
+                    .mark_retained_nop_borrow_fallthrough_if_unblocked(normal_exit);
             }
             if chained_assertion_exit_location.is_some() || retained_runtime_while_exit {
                 // A unique runtime loop exit keeps its condition's line through return
