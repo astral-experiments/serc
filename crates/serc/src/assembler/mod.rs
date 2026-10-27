@@ -3189,6 +3189,41 @@ impl Assembler {
         .then_some(previous.location)
     }
 
+    /// Checks the fallthrough into an erased try-else after its earlier edges copy the exit.
+    pub(crate) fn try_exit_has_store_or_iterator_fallthrough(&self, try_end: Label) -> bool {
+        let items = self.linear_items();
+        let labels = trailing_labels(items).collect::<Vec<_>>();
+        let Some(Item::Instruction(previous)) =
+            items.get(items.len().saturating_sub(labels.len() + 1))
+        else {
+            return false;
+        };
+        if !labels.contains(&try_end)
+            || !matches!(previous.opcode, STORE_FAST | POP_ITER)
+            || previous.depth_after().is_none()
+            || previous.location.line < 0
+            || self.join_labels_have_authored_location(&labels)
+        {
+            return false;
+        }
+        let mut incoming = items.iter().filter_map(|item| match item {
+            Item::Instruction(jump)
+                if jump
+                    .forward_target()
+                    .is_some_and(|target| labels.contains(&target)) =>
+            {
+                Some(jump)
+            }
+            _ => None,
+        });
+        let is_copyable = |jump: &Instruction| {
+            jump.opcode == JUMP_FORWARD
+                && jump.depth_after() == previous.depth_after()
+                && jump.location.line >= 0
+        };
+        incoming.next().is_some_and(is_copyable) && incoming.all(is_copyable)
+    }
+
     /// Records an original POP whose jumping predecessors copy a small return.
     ///
     /// Native pre-line copying counts the POP itself and stops at four original
