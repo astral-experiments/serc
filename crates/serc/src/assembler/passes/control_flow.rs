@@ -5677,7 +5677,12 @@ impl OptimizationPipeline {
                                             && !self.original_nop_targets.contains(label)
                                             && ending.next().is_none()
                                             && original.is_some_and(|original| {
-                                                !original.is_scope_fallback
+                                                // A split in the scope-wide handler can resume
+                                                // with a different original-range priority.
+                                                let resumed_scope = original.is_scope_fallback
+                                                    && original.depth == 0
+                                                    && self.exception_regions.iter().any(|region| region.start == *label);
+                                                (!original.is_scope_fallback || resumed_scope)
                                                     && original.preserve_lasti
                                                     && Some(original.depth) == instruction.depth_after()
                                                     && self.exception_regions.iter().all(|region| {
@@ -5687,11 +5692,11 @@ impl OptimizationPipeline {
                                                                     && region.depth == original.depth
                                                                     && region.preserve_lasti == original.preserve_lasti
                                                                     && region.is_scope_fallback == original.is_scope_fallback
-                                                                    && match (region.priority, original.priority) {
+                                                                    && (resumed_scope || match (region.priority, original.priority) {
                                                                         (super::super::ExceptionRegionPriority::OriginalRange(a, b), super::super::ExceptionRegionPriority::OriginalRange(c, d)) => a == c && b == d,
                                                                         (super::super::ExceptionRegionPriority::Resolved { start: a, end: b }, super::super::ExceptionRegionPriority::Resolved { start: c, end: d }) => a == c && b == d,
                                                                         _ => false,
-                                                                    }))
+                                                                    })))
                                                     })
                                             });
                                     }

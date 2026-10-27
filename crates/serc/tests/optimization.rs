@@ -25977,3 +25977,25 @@ fn short_circuit_value_after_manager_entries_uses_the_prior_handler() {
 ";
     assert_matches_cpython(source, "manager_value_guard.py", &LEVELS);
 }
+
+#[test]
+fn copied_finalizer_break_keeps_its_line_across_a_scope_handler_split() {
+    let source = r"async def update(retry, budget, cost):
+    while True:
+        try:
+            if retry:
+                refresh()
+                continue
+            break
+        except ValueError as error:
+            if retry:
+                continue
+            raise error
+        finally:
+            if budget:
+                budget -= cost
+    finish(budget)
+    return budget
+";
+    assert_matches_cpython(source, "split_finalizer_exit.py", &LEVELS);
+}
