@@ -6922,6 +6922,34 @@ impl Assembler {
             }
             original.jump_policy.retain_nop_for_direct_target();
         } else {
+            if expected_location.is_none() {
+                // An aliased empty original array can precede the normal jump.
+                let boundaries = &self.exception_owner_provenance.block_boundaries;
+                if source_aliases
+                    .iter()
+                    .filter(|label| boundaries.contains(label))
+                    .count()
+                    != 1
+                {
+                    return;
+                }
+                // A discarded arm leaves a jump-only block. Require each incoming
+                // branch to end in a populated discard or assignment before its jump.
+                for (index, item) in items.iter().enumerate() {
+                    let Item::Instruction(incoming) = item else {
+                        continue;
+                    };
+                    if matches!(incoming.operand(), Operand::Forward(label) | Operand::Backward(label)
+                        if source_aliases.contains(&label))
+                        && !matches!(index.checked_sub(1).and_then(|previous| items.get(previous)),
+                            Some(Item::Instruction(prefix)) if prefix.location.line >= 0
+                                && matches!(prefix.opcode, POP_TOP | STORE_FAST
+                                    | crate::target::opcodes::STORE_ATTR | crate::target::opcodes::STORE_SUBSCR))
+                    {
+                        return;
+                    }
+                }
+            }
             original.jump_policy.mark_original_empty_join();
             original.jump_policy.retain_redundant_nop_after_threading();
             original
