@@ -13230,12 +13230,7 @@ fn a_terminal_try_keeps_its_original_break_until_the_return_is_copied() {
         let source = format!(
             "async def run(ready, manager, use):\n    while True:\n        try:\n            {body}\n        except ValueError as error:\n            pass\n        break\n"
         );
-        assert_matches_cpython_versions(
-            &source,
-            "shared_break.py",
-            &LEVELS,
-            &[PythonVersion::Py312, PythonVersion::Py313],
-        );
+        assert_matches_cpython(&source, "shared_break.py", &LEVELS);
     }
 }
 
