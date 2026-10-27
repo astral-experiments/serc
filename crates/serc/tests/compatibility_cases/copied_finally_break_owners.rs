@@ -26,3 +26,13 @@ fn matches_cpython_single_finally_pop_before_copied_break_condition() {
         }
     }
 }
+
+#[test]
+fn matches_handler_unwind_slots_after_a_generator_yields() {
+    for value in ["emit(item)", "emit(emit(item))", "emit(emit(emit(item)))"] {
+        let source = format!(
+            "def entries(rows, ready):\n    for item in rows:\n        try:\n            use(item)\n        except Error:\n            yield {value}\n            break\n        finally:\n            if ready:\n                yield item\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "resumed_handler_break.py");
+    }
+}

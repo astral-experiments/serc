@@ -13087,6 +13087,22 @@ impl LayoutAssembler {
                         if instruction.exception_policy()
                             == super::ExceptionPolicy::NoneDynamicCondition
                             && owner_history_exact
+                            && tail.insertions == 0
+                            && tail.late_removals == 0
+                            && tail.post_compaction_fusions == 0
+                            && let Some(owner) = self.resumed_handler_exit_owner(
+                                instruction_index,
+                                original_array_start,
+                                tail,
+                                &indexed_instructions,
+                                &label_positions,
+                            )
+                        {
+                            owners.insert(instruction_index, owner);
+                        }
+                        if instruction.exception_policy()
+                            == super::ExceptionPolicy::NoneDynamicCondition
+                            && owner_history_exact
                             && tail.early_removals == 1
                             && tail.insertions == 0
                             && tail.late_removals == 0
@@ -13482,6 +13498,61 @@ impl LayoutAssembler {
                 })
                 .count()
                 == 1
+    }
+
+    /// Projects a copied truth marker onto the original handler unwind after a yield.
+    fn resumed_handler_exit_owner(
+        &self,
+        marker: usize,
+        array: usize,
+        tail: ExceptionOwnerTail,
+        instructions: &[&Instruction],
+        positions: &OwnerLabelPositions,
+    ) -> Option<ExceptionOwnerDecision> {
+        use crate::target::opcodes::{
+            LOAD_FAST, LOAD_FAST_BORROW, POP_EXCEPT, RESUME, TO_BOOL, YIELD_VALUE,
+        };
+        let start = marker.checked_sub(7).filter(|&start| start >= array)?;
+        let [yielded, resume, discard, pop, load, truth, jump, append] =
+            &instructions[start..=marker]
+        else {
+            return None;
+        };
+        if yielded.opcode != YIELD_VALUE
+            || resume.opcode != RESUME
+            || !matches!(resume.value_argument(), Some(1 | 5))
+            || discard.opcode != POP_TOP
+            || pop.opcode != POP_EXCEPT
+            || pop.local_policy.hidden_exception_owner_slots() != 2
+            || !matches!(load.opcode, LOAD_FAST | LOAD_FAST_BORROW)
+            || load.local_policy.hidden_exception_owner_slots() != 1
+            || truth.opcode != TO_BOOL
+            || !matches!(
+                jump.opcode,
+                crate::target::opcodes::POP_JUMP_IF_FALSE
+                    | crate::target::opcodes::POP_JUMP_IF_TRUE
+            )
+            || jump.forward_target().is_none()
+            || [truth.location, jump.location, append.location] != [load.location; 3]
+        {
+            return None;
+        }
+        // The authored exit and first POP_BLOCK compact into POP_EXCEPT; the final
+        // POP_BLOCK compacts into the load. A shift of two earlier records makes
+        // the append reuse POP_EXCEPT. Its two neighbors are the unowned POPs.
+        let region = match tail.early_removals.checked_sub(3)? {
+            1 | 3 => None,
+            2 => {
+                let region = self.uniform_exception_owner(start + 3, start + 4, positions)?;
+                let owner = self.exception_regions[region];
+                if owner.is_scope_fallback || owner.preserve_lasti {
+                    return None;
+                }
+                Some(region)
+            }
+            _ => return None,
+        };
+        Some(ExceptionOwnerDecision::override_with_region(region))
     }
 
     /// Resolves only the captured named break's original NULL finalizer POP cell.
