@@ -16089,6 +16089,16 @@ fn folded_comprehension_and_tail_preserves_borrow_boundary() {
 }
 
 #[test]
+fn folded_disjunction_keeps_the_nested_else_fallthrough_position() {
+    for arm in ["pass", "return item"] {
+        let source = format!(
+            "def visit(item):\n    if item.ready or True:\n        if item.mode:\n            {arm}\n        else:\n            item.update()\n    else:\n        pass\n    consume(item)\n"
+        );
+        assert_matches_cpython(&source, "folded_else.py", &LEVELS);
+    }
+}
+
+#[test]
 fn linear_prefix_and_elided_suffix_preserve_nested_if_join() {
     let source = "def update(state):\n    if state.ready():\n        item = state.next()\n        if available(item):\n            apply(item)\n        else:\n            discard(item)\n        assert state.valid()\n    else:\n        assert state.valid()\n    result = state.finish()\n    assert result\n";
     for source in [
