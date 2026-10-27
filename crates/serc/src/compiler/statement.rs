@@ -39790,6 +39790,24 @@ impl<'source> Compiler<'source> {
                 let with_markers = if include_simple_normal_finally_not_taken_from_with {
                     NormalFinallyWithMarkers::Include
                 } else if compiler.context.python_version == crate::PythonVersion::Py314
+                    && compiler.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) != 0
+                    && statement.handlers.is_empty()
+                    && statement.orelse.is_empty()
+                    && matches!(statement.body.last(), Some(Stmt::While(loop_stmt))
+                        if loop_stmt.orelse.is_empty()
+                            && condition_has_linear_runtime_leaves(&loop_stmt.test)
+                            && !expression_contains_inline_branch(&loop_stmt.test)
+                            && !expression_suspends_current_scope(&loop_stmt.test)
+                            && !suite_contains_loop_break(&loop_stmt.body))
+                    && let Some(Stmt::If(guard)) = statement.finalbody.first()
+                    && is_specialized_none_condition(&guard.test)
+                    && matches!(guard.test.as_ref(), Expr::Compare(comparison)
+                        if matches!(comparison.operands.first(), Some(Expr::Name(_))))
+                {
+                    // The loop's false edge starts with the normal POP_BLOCK. The None
+                    // comparison leaves an owned slot after that POP for its marker.
+                    NormalFinallyWithMarkers::Condition(compiler.source_location(guard.test.range()))
+                } else if compiler.context.python_version == crate::PythonVersion::Py314
                     && statement.handlers.is_empty()
                     && let Some(index) = statement.finalbody.iter().position(|stmt| matches!(stmt, Stmt::If(_)))
                     && let (prefix, [Stmt::If(guard), ..]) = statement.finalbody.split_at(index)
