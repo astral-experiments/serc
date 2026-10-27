@@ -38131,10 +38131,37 @@ impl<'source> Compiler<'source> {
                             && context.finally_end_depth == 0
                             && context.exception_region_depth == 0))
                     && managed_guarded_raise_has_finally_route(statement)));
+        // When the true arm exits, the false edge can be the only source of
+        // the normal else exit. Its located jump or remaining work keeps the
+        // cleanup reachable after CPython moves the exception handlers.
+        let synchronous_else_exit_reaches_finally = self.context.python_version
+            == crate::PythonVersion::Py314
+            && !statement.is_star
+            && matches!(statement.orelse.last(), Some(Stmt::If(guard))
+                if condition_has_only_runtime_tests(&guard.test)
+                    && !expression_suspends_current_scope(&guard.test)
+                    && original_condition_has_unique_jump_target(&guard.test, false)
+                    && ((guard.elif_else_clauses.is_empty() && suite_has_linear_raise_exit(&guard.body))
+                        || (suite_terminates_before_constant_folding(&guard.body)
+                            && matches!(guard.elif_else_clauses.as_slice(), [arm]
+                                if arm.test.is_none() && suite_has_nonsuspending_linear_fallthrough(&arm.body)))))
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && !statement.handlers.is_empty()
+            && statement.handlers.iter().all(|handler| {
+                handler.as_except_handler().is_some_and(|arm| {
+                    arm.type_.is_some()
+                        && (matches!(arm.body.as_slice(), [Stmt::Pass(_)])
+                            || suite_has_nonsuspending_linear_fallthrough(&arm.body))
+                })
+            })
+            && suite_has_nonsuspending_linear_fallthrough(&statement.body)
+            && self.suite_has_nonempty_borrow_entry(&statement.finalbody);
         let normal_finally_is_borrow_reachable = (simple_fallthrough_handlers_reach_finally
             || compound_fallthrough_handlers_reach_finally
             || runtime_while_handlers_reach_finally)
             && (!has_empty_handler_or_else_exit || else_bypasses_empty_handler_exit)
+            || synchronous_else_exit_reaches_finally
             || managed_runtime_while_return_reaches_finally
             || runtime_retry_break_reaches_finally
             || conditional_body_reaches_finally

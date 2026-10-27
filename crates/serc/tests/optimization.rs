@@ -6462,6 +6462,19 @@ fn terminal_nested_recovery_else_stops_borrowed_continuation() {
 }
 
 #[test]
+fn terminal_else_guard_reaches_normal_finally() {
+    for arm in [
+        "raise Error()",
+        "return data\n        else:\n            value = data.read()",
+    ] {
+        let source = format!(
+            "def run(data, flag):\n    try:\n        value = work(data)\n    except Error:\n        pass\n    else:\n        prepare()\n        if flag:\n            {arm}\n    finally:\n        data.close()\n"
+        );
+        assert_matches_cpython(&source, "else_finally.py", &LEVELS);
+    }
+}
+
+#[test]
 fn asserted_try_else_retains_borrowed_continuation() {
     let indent = |source: &str| {
         let mut result = String::new();
