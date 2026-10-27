@@ -2782,6 +2782,84 @@ impl OptimizationPipeline {
             .then_some(donor.location)
     }
 
+    /// Finds the four-slot method return reached directly from the nested try's warm path.
+    fn guarded_nested_handler_return(
+        &self,
+        normal: BasicBlockId,
+        join: BasicBlockId,
+    ) -> Option<Label> {
+        use crate::target::opcodes::{CALL, LOAD_ATTR, LOAD_FAST, POP_TOP, RETURN_VALUE};
+        let graph = &self.graph;
+        let exits = &self.exception_owner_provenance.normal_try_exits;
+        if self.python_version < crate::PythonVersion::Py314 || exits.len() < 3 {
+            return None;
+        }
+        let instructions =
+            |id: BasicBlockId| graph[id].items().iter().filter_map(Item::as_instruction);
+        let mut block = instructions(join);
+        let branch = block.next()?;
+        let returned = branch.forward_target()?;
+        if block.next().is_some()
+            || branch.opcode != JUMP_FORWARD
+            || branch.location.line < 0
+            || branch.depth_after() != Some(0)
+            || !exits
+                .iter()
+                .any(|(start, end)| graph.label_block(*start) == Some(join) && *end == returned)
+        {
+            return None;
+        }
+        let incoming = |target| {
+            graph.iter().filter_map(move |(id, block)| {
+                let edge = block.last_instruction()?;
+                (graph.label_block(edge.forward_target()?) == Some(target)).then_some((id, edge))
+            })
+        };
+        let result = graph.label_block(returned)?;
+        // A separate outer-handler entry can copy the receiver with different ownership.
+        if incoming(result).any(|(id, _)| id != join) {
+            return None;
+        }
+        let mut ops = instructions(result);
+        let [load, method, call, ret] = [ops.next()?, ops.next()?, ops.next()?, ops.next()?];
+        if ops.next().is_some()
+            || [load.opcode, method.opcode, call.opcode, ret.opcode]
+                != [LOAD_FAST, LOAD_ATTR, CALL, RETURN_VALUE]
+            || method.value_argument()? & 1 == 0
+            || call.value_argument()? != 0
+            || [load, method, call, ret]
+                .iter()
+                .any(|op| op.pre_fusion_width() != 1 || op.location.line < 0)
+        {
+            return None;
+        }
+        let before = graph.order().windows(2).find(|pair| pair[1] == normal)?[0];
+        let mut work = instructions(before).rev();
+        if [work.next()?.opcode, work.next()?.opcode] != [POP_TOP, CALL] {
+            return None;
+        }
+        let mut inputs = incoming(join);
+        let (_, guard) = inputs.next()?;
+        let (warm, success) = inputs.next()?;
+        let (handler, edge) = inputs.next()?;
+        if inputs.next().is_some()
+            || !super::super::is_conditional_jump(guard.opcode)
+            || guard.location != branch.location
+            || warm != normal
+            || success.opcode != JUMP_FORWARD
+            || edge.opcode != JUMP_FORWARD
+            || !exits
+                .iter()
+                .any(|(_, end)| graph.label_block(*end) == Some(handler))
+        {
+            return None;
+        }
+        let mut cleanup = instructions(handler);
+        ([cleanup.next()?.opcode, cleanup.next()?.opcode] == [POP_EXCEPT, JUMP_FORWARD]
+            && cleanup.next().is_none())
+        .then_some(returned)
+    }
+
     /// Keeps original jumps until their shared try exit can copy its return.
     fn preserve_shared_try_return_joins(&mut self) {
         use crate::target::opcodes::RETURN_VALUE;
@@ -2800,6 +2878,7 @@ impl OptimizationPipeline {
         };
         let mut local_return_cleanups = FxHashSet::default();
         let mut joins = Vec::new();
+        let mut guarded_copies = Vec::new();
         for &(entry_label, join_label) in &self.exception_owner_provenance.normal_try_exits {
             let Some((entry, join)) = graph
                 .label_block(entry_label)
@@ -2818,6 +2897,9 @@ impl OptimizationPipeline {
                 local_return_cleanups.insert(entry);
             }
             let Some(tail) = unlocated_jump(join) else {
+                if let Some(tail) = self.guarded_nested_handler_return(entry, join) {
+                    guarded_copies.push((entry, join, tail));
+                }
                 continue;
             };
             let instructions = graph[tail].items().iter().filter_map(Item::as_instruction);
@@ -2884,6 +2966,31 @@ impl OptimizationPipeline {
                         .jump_policy
                         .defer_removal();
                 }
+            }
+        }
+        for (normal, join, tail) in guarded_copies {
+            // The normal edge copies the original POP_BLOCK and jump in the first round.
+            self.graph
+                .instructions_mut(normal)
+                .next_back()
+                .unwrap()
+                .set_operand(Operand::Forward(tail));
+            let jump = self.graph.instructions_mut(join).next_back().unwrap();
+            // The handler first copies POP_EXCEPT and its own jump. When it reaches the
+            // guard's join, the copied return has already taken the join past four slots.
+            jump.jump_policy.prevent_threading_target();
+            jump.jump_policy.prevent_small_exit_inlining();
+            jump.location = SourceLocation::NONE;
+            jump.no_location_policy.preserve_location();
+            if self.python_version == crate::PythonVersion::Py314 {
+                // Both surviving copies come from the warm return array visited by 3.14.
+                let returned = self.graph.label_block(tail).unwrap();
+                self.graph
+                    .instructions_mut(returned)
+                    .next()
+                    .unwrap()
+                    .local_policy
+                    .mark_force_borrowed_load();
             }
         }
         for (join, normal_copy) in joins {
