@@ -22,3 +22,14 @@ fn preserves_terminal_if_discarded_conditional_before_shared_footer() {
         }
     }
 }
+
+#[test]
+fn terminal_conditional_discards_preserve_the_fallthrough_value() {
+    for expression in [
+        "call(value) if flag else value",
+        "value if flag else call(value)",
+    ] {
+        let source = format!("def f(value, flag):\n    {expression}\n");
+        common::assert_matches_cpython_marshal(&source, "terminal_conditional_discard.py");
+    }
+}
