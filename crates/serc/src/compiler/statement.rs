@@ -38330,7 +38330,12 @@ impl<'source> Compiler<'source> {
             && matches!(statement.body.last(), Some(Stmt::While(loop_))
                 if loop_.orelse.is_empty()
                     && early_condition_truthiness(&loop_.test) != Some(false)
-                    && suite_contains_loop_break(&loop_.body))
+                    && suite_contains_loop_break(&loop_.body)
+                    // Multiple false exits can share an empty POP_BLOCK. A break
+                    // at the end of the body becomes a line NOP before that same
+                    // barrier; only an earlier independent break can bypass it.
+                    && (original_condition_has_unique_jump_target(&loop_.test, false)
+                        || suite_contains_borrow_reachable_conditional_loop_break(&loop_.body)))
             && statement.finalbody.first().is_some_and(|entry| {
                 self.suite_has_nonempty_borrow_entry(std::slice::from_ref(entry))
                     || matches!(entry, Stmt::If(guard)
