@@ -14116,9 +14116,28 @@ impl<'source> Compiler<'source> {
                                         starts.len() == self.control.exceptions.active_exception_region_exclusions.len()
                                             && starts[..finally_context.exception_region_depth].iter().all(Option::is_none)
                                             && starts[finally_context.exception_region_depth..].iter().all(Option::is_some)));
+                        // The inner finally runs before the interposed handler clears
+                        // its name. Keep that handler's existing cleanup range on the copy.
+                        let named_handler_between_finalizers = next_handler > 1
+                            && outer_context.handler_depth + 1 == next_handler
+                            && finally_context.handler_depth == next_handler
+                            && self
+                                .control
+                                .exceptions
+                                .active_exception_handlers
+                                .get(next_handler - 1)
+                                .is_some_and(|handler| {
+                                    handler.name.is_some()
+                                        && handler.exception_region_depth + 1
+                                            == finally_context.exception_region_depth
+                                        && handler.try_body_depth == finally_context.try_body_depth
+                                        && handler.with_depth == finally_context.with_depth
+                                        && handler.loop_depth == finally_context.loop_depth
+                                });
                         if !retained_manager_owns_copy
                             && !retained_try_owns_copy
                             && !retained_named_handler_owns_copy
+                            && !named_handler_between_finalizers
                             && !retained_handler_owns_linear_copy
                         {
                             self.add_exception_regions_with_exclusions(
