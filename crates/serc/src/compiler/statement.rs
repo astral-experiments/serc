@@ -36006,6 +36006,26 @@ impl<'source> Compiler<'source> {
                     && matches!(branch.body.as_slice(), [Stmt::Pass(pass)]
                     if self.source_location(pass.range).line
                         != self.source_location(branch.range).line));
+        let protected_arm_reaches_finally_pass = self.context.python_version
+            == crate::PythonVersion::Py314
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && !statement.is_star
+            && statement.orelse.is_empty()
+            && !statement.handlers.is_empty()
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && !self.control.in_exception_handler()
+            && self.control.finally.is_inactive_for_return_unwind()
+            && matches!(statement.finalbody.as_slice(), [Stmt::Pass(_)])
+            // The first arm retains a nonempty jump directly to the located pass after
+            // handlers move cold. The other arm may still fall into an empty try exit.
+            && matches!(statement.body.split_last(), Some((Stmt::If(branch), leading))
+                if suite_has_normal_fallthrough(leading)
+                    && condition_has_linear_runtime_leaves(&branch.test)
+                    && !expression_suspends_current_scope(&branch.test)
+                    && branch.elif_else_clauses.last().is_some_and(|clause| clause.test.is_none())
+                    && suite_has_nonsuspending_linear_fallthrough(&branch.body));
         // A live linear arm before the final else keeps a reachable jump directly
         // into normal cleanup after handlers move cold. Folded assertions can leave
         // that jump behind an empty block, so a merely nonterminal arm is insufficient.
@@ -38137,6 +38157,7 @@ impl<'source> Compiler<'source> {
             && (!has_empty_handler_or_else_exit || else_bypasses_empty_handler_exit)
             || managed_runtime_while_return_reaches_finally
             || runtime_retry_break_reaches_finally
+            || protected_arm_reaches_finally_pass
             || conditional_body_reaches_finally
             || coroutine_conditional_store_reaches_finally
             || coroutine_await_recovery_reaches_finally
