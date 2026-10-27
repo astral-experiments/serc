@@ -8418,6 +8418,16 @@ fn erased_loop_prefix_keeps_the_enclosing_condition_return() {
 }
 
 #[test]
+fn a_shared_match_case_exit_stays_unlocated_when_copying_a_return() {
+    for tail in ["return target", "return None", "return work(value, target)"] {
+        let source = format!(
+            "def choose(value, target, enabled):\n    match value:\n        case 1 | 2:\n            if enabled:\n                consume(value)\n            else:\n                if value:\n                    target.value = value\n    {tail}\n"
+        );
+        assert_matches_cpython(&source, "case.py", &LEVELS);
+    }
+}
+
+#[test]
 fn nested_match_case_guard_keeps_each_exit_position() {
     let source = r"async def run(outer, inner, first, second, visit):
     try:

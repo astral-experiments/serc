@@ -7312,10 +7312,51 @@ impl OptimizationPipeline {
                 None
             };
             let source_location = loop_return_join_location.unwrap_or(source_location);
+            // The original case-success jump is unlocated when both its final
+            // guard and its body still reach the array after earlier copies.
+            let shared_case_return = !planned_copy
+                && inline_unprotected_return
+                && target_chain_end == target_position
+                && (super::normal_try_copies::original_local_return(graph[target].items())
+                    || super::control_flow::is_original_constant_return(graph, target_label))
+                && remaining_predecessors[source.index()] > 1
+                && matches!(graph[source].items(), [Item::Label(_), labels @ .., Item::Instruction(jump)]
+                    if !labels.is_empty() && labels.iter().all(|item| matches!(item, Item::Label(_)))
+                        && jump.opcode == JUMP_FORWARD && jump.jump_policy.is_original_match_success()
+                        && jump.jump_policy.always_retains_nop() && jump.pre_fold_extra_instructions() == 0
+                        && jump.exception_policy() == ExceptionPolicy::default())
+                && source_position.checked_sub(1).is_some_and(|i| {
+                    let prev = order[i];
+                    !drop_blocks[prev.index()]
+                        && !inline_copies.contains_key(&prev)
+                        && !target_copies.contains_key(&prev)
+                        && block_has_fallthrough(graph[prev].items())
+                        && graph[prev].last_instruction().is_some_and(|last| {
+                            matches!(
+                                last.opcode,
+                                STORE_FAST
+                                    | crate::target::opcodes::STORE_ATTR
+                                    | crate::target::opcodes::STORE_SUBSCR
+                                    | POP_TOP
+                            ) && source_location.line >= 0
+                                && last.location == source_location
+                        })
+                })
+                && jump_sources[source.index()].iter().any(|from| {
+                    !drop_blocks[from.index()]
+                        && graph[*from].last_instruction().is_some_and(|guard| {
+                            is_conditional_jump(guard.opcode)
+                                && guard
+                                    .forward_target()
+                                    .and_then(|label| graph.label_block(label))
+                                    == Some(source)
+                        })
+                });
             let preserve_inlined_jump_nop = planned_copy
                 || loop_return_join_location.is_some()
                 || deferred_match_donor.is_some()
                 || (inline_small_exit
+                    && !shared_case_return
                     && (preserve_unlocated_join_nop
                         || (retain_guard_nop && guard_location.is_some())
                         || preserve_threaded_join_nop
