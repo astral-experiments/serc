@@ -6962,19 +6962,6 @@ impl OptimizationPipeline {
                     instruction.opcode = JUMP_BACKWARD;
                 }
             }
-            if inline_no_location_block
-                && let Some(instruction) =
-                    copied.iter_mut().rev().find_map(Item::as_instruction_mut)
-                && instruction
-                    .no_location_policy
-                    .first_copy_is_interruptible_backward()
-                && remaining_predecessors[target.index()] == predecessors[target.index()]
-                && instruction.opcode == JUMP_FORWARD
-            {
-                // CPython's copied normal exit checks the eval breaker if cold-block ordering
-                // turns it backward. The original synthetic cleanup edge remains no-interrupt.
-                instruction.opcode = JUMP_BACKWARD;
-            }
             // A short keyword-call raise is also a scope exit in CPython's
             // original array. Keep the same empty-join provenance and location
             // guards as returns, including an optional final keyword value load.

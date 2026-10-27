@@ -185,3 +185,13 @@ fn nested_manager_fallthrough_matches_cpython_handler_cleanup() {
         }
     }
 }
+
+#[test]
+fn preserves_jump_kind_on_suppressed_handler_exits() {
+    for transfer in ["raise", "if active: raise"] {
+        let source = format!(
+            "async def run(manager, active):\n    try:\n        read()\n    except Error:\n        with manager:\n            try:\n                {transfer}\n            finally:\n                finish()\n    if active:\n        report()\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "suppressed_handler_exit.py");
+    }
+}

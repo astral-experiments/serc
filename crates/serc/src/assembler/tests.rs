@@ -3283,7 +3283,6 @@ fn fusion_preserves_each_typed_instruction_policy() {
     first.local_policy = LocalPolicy::for_load(true, false);
     first.local_policy.mark_maybe_null_comprehension_restore();
     first.no_location_policy.allow_block_inlining();
-    first.no_location_policy.make_first_copy_interruptible();
     first.no_location_policy.mark_artificial_eval_break();
     first
         .no_location_policy
@@ -3330,11 +3329,6 @@ fn fusion_preserves_each_typed_instruction_policy() {
     expected_local_policy.add_hidden_exception_owner_slots(4);
     assert_eq!(fused.local_policy, expected_local_policy);
     assert!(fused.no_location_policy.allows_block_inlining());
-    assert!(
-        fused
-            .no_location_policy
-            .first_copy_is_interruptible_backward()
-    );
     assert!(fused.no_location_policy.is_artificial_eval_break());
     assert!(fused.no_location_policy.copy_inherits_shared_predecessor());
     assert!(fused.no_location_policy.preserves_location());
