@@ -35,6 +35,19 @@ fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
 }
 
 #[test]
+fn nested_guard_locates_the_exit_after_its_last_arm_is_removed() {
+    for tail in [
+        "if True:\n                return value",
+        "if active:\n                pass\n            else:\n                assert False",
+    ] {
+        let source = format!(
+            "def choose(outer, flag, active, value):\n    if outer:\n        if flag:\n            {tail}\n    else:\n        value = fallback()\n    use(value)\n"
+        );
+        assert_matches_cpython(&source, "nested_guard_exit.py", &LEVELS);
+    }
+}
+
+#[test]
 fn nested_finally_guard_inherits_the_preceding_calls_handler() {
     let source = r"def run(group):
     try:
