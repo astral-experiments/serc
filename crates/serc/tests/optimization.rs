@@ -25977,3 +25977,30 @@ fn short_circuit_value_after_manager_entries_uses_the_prior_handler() {
 ";
     assert_matches_cpython(source, "manager_value_guard.py", &LEVELS);
 }
+
+#[test]
+fn while_else_fallthrough_retains_its_line_after_try_exit_copying() {
+    let source = r"def search(ready, stop, value):
+    try:
+        while ready:
+            if stop:
+                break
+            visit(value)
+        else:
+            fallback(value)
+    except LookupError:
+        recover(value)
+    return value
+
+def stop_early(ready, value):
+    try:
+        while ready:
+            break
+        else:
+            return value
+    except LookupError:
+        recover(value)
+    return value
+";
+    assert_matches_cpython(source, "retained_while_else_exit.py", &LEVELS);
+}
