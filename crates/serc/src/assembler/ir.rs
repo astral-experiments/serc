@@ -1260,6 +1260,7 @@ pub(super) struct Instruction {
     metadata: InstructionMetadata,
     pub(super) early_boolean_admissions: EarlyBooleanAdmissions,
     pub(super) folded_constant_admissions: Option<FoldAdmissionId>,
+    pub(super) pattern_capture_swap: bool,
 }
 
 impl Instruction {
@@ -1296,6 +1297,7 @@ impl Instruction {
             metadata: InstructionMetadata::default(),
             early_boolean_admissions: EarlyBooleanAdmissions::default(),
             folded_constant_admissions: None,
+            pattern_capture_swap: false,
         }
     }
 
@@ -1317,6 +1319,7 @@ impl Instruction {
             metadata: InstructionMetadata::default(),
             early_boolean_admissions: EarlyBooleanAdmissions::default(),
             folded_constant_admissions: None,
+            pattern_capture_swap: false,
         }
     }
 
@@ -1598,6 +1601,7 @@ impl Instruction {
                 .followed_by(second.early_boolean_admissions),
             // Constant admissions are consumed before superinstruction fusion.
             folded_constant_admissions: None,
+            pattern_capture_swap: false,
         }
     }
 }

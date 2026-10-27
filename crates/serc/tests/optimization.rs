@@ -12431,6 +12431,20 @@ fn sequence_capture_before_trailing_wildcards_matches_cpython() {
 }
 
 #[test]
+fn single_line_patterns_exchange_discarded_captures() {
+    let source = r#"
+def classify(item):
+    0 < item < 10
+    match item:
+        case [first, _, middle, _, _, last]:
+            return first, middle, last
+        case {"meta": {"value": int() | str() as token}} if token:
+            return token
+"#;
+    assert_matches_cpython(source, "single_line_pattern_discards.py", &LEVELS);
+}
+
+#[test]
 fn sequence_capture_wildcard_cleanup_matrix() {
     let source = r#"
 def run(value):

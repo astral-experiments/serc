@@ -2032,19 +2032,17 @@ impl Compiler<'_> {
         let Some(name) = name else {
             return self.emit(POP_TOP, 0, -1);
         };
-        let mut rotations = context.on_top + context.stores.len() + 1;
-        while rotations > 1 {
-            self.emit(SWAP, to_u32(rotations, "pattern capture rotation")?, 0)?;
-            rotations -= 1;
-        }
+        self.rotate_match_stack(context.on_top + context.stores.len() + 1)?;
         context.stores.push(self.required_name_id(name));
         Ok(())
     }
 
-    fn rotate_match_stack(&mut self, mut count: usize) -> Result<(), CompileError> {
-        while count > 1 {
-            self.emit(SWAP, to_u32(count, "pattern capture rotation")?, 0)?;
-            count -= 1;
+    fn rotate_match_stack(&mut self, count: usize) -> Result<(), CompileError> {
+        if count > 1 {
+            let count = to_u32(count, "pattern capture rotation")?;
+            self.apply_compiler_stack_effect(SWAP, count, 0)?;
+            self.assembler
+                .emit_pattern_capture_rotation(count, self.control.stack.depth.cast_unsigned());
         }
         Ok(())
     }
