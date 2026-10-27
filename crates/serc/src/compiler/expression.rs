@@ -1213,7 +1213,14 @@ impl Compiler<'_> {
                         // match continuation before cold blocks move. Its surviving bridge
                         // represents that fallthrough, not an interruptible case-success jump.
                         // On 3.13, pattern-failure cleanup still requires the original jump.
-                        let final_async_exhaustion = match_has_following
+                        // A surrounding with or finally also supplies a continuation
+                        // after the last source statement. Exhaustion falls into that
+                        // cleanup before cold relocation materializes the jump.
+                        let pending_cleanup = self.context.python_version >= PythonVersion::Py314
+                            && !self.control.in_loop()
+                            && (self.control.active_with_count() != 0
+                                || !self.control.finally.is_inactive_for_return_unwind());
+                        let final_async_exhaustion = (match_has_following || pending_cleanup)
                             && (self.context.python_version != PythonVersion::Py313
                                 || context.fail_pop.is_empty())
                             && index + 1 == matched_cases
