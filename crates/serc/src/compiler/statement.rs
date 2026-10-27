@@ -29963,10 +29963,28 @@ impl<'source> Compiler<'source> {
                         .context
                         .followed_by_name_assignment_or_deletion
                     || self.control.statements.context.followed_by_direct_name_if);
+            // The empty body's normal exit keeps the original POP_BLOCK slot when
+            // it compacts to a NOP outside a surrounding try or manager.
+            let empty_suspending_scope_exit = self.context.python_version
+                == crate::PythonVersion::Py312
+                && self.control.generators.generator_region_start.is_some()
+                && self.control.loops.contexts.is_empty()
+                && self.control.withs.active_with_region_exclusions.is_empty()
+                && self.control.exceptions.active_exception_handlers.is_empty()
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty()
+                && !statement.is_star
+                && statement.orelse.is_empty()
+                && statement.finalbody.is_empty()
+                && body_noop_location.is_some();
             let exception_policy = if !loop_tail_inherits_outer_owner
                 && !direct_nested_pass_exit_in_outer_try
                 && !coroutine_nested_pass_exit
-                && (exclude_nested_normal_exit
+                && (empty_suspending_scope_exit
+                    || exclude_nested_normal_exit
                     || (body_has_elided_assertion
                         && body_noop_location.is_some()
                         && statement
