@@ -19284,6 +19284,31 @@ fn elided_assertion_after_simple_if_preserves_finally_borrow_boundary() {
 }
 
 #[test]
+fn discarded_bare_returns_preserve_none_admission_order() {
+    let source = r#"def simple(flag):
+    "doc"
+    if False:
+        return
+    call(flag=True)
+    return None
+
+def protected(flag):
+    "doc"
+    try:
+        if flag:
+            raise ValueError("before")
+            note("inside")
+            return
+    finally:
+        note("closing")
+    if flag:
+        return None
+    return "closing"
+"#;
+    assert_matches_cpython(source, "discarded_bare_return.py", &LEVELS);
+}
+
+#[test]
 fn discarded_imports_preserve_none_admission_order() {
     for (index, import) in [
         "import package",
