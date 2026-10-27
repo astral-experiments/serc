@@ -8620,6 +8620,16 @@ fn a_comprehension_store_donates_the_erased_finally_exit_position() {
 }
 
 #[test]
+fn wildcard_capture_keeps_its_original_exit_size() {
+    for action in ["raise LookupError", "return item"] {
+        let source = format!(
+            "def select(item):\n    match item:\n        case [1, _] | [2, 3]:\n            use(item)\n        case _ as other:\n            {action}\n"
+        );
+        assert_matches_cpython(&source, "wildcard_capture_exit.py", &LEVELS);
+    }
+}
+
+#[test]
 fn an_erased_wildcard_capture_body_falls_through_after_its_store() {
     let source = r"def check(value, enabled):
     match value:

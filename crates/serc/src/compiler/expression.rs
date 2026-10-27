@@ -2001,12 +2001,12 @@ impl Compiler<'_> {
             }
             Pattern::MatchAs(pattern) => {
                 if let Some(inner) = &pattern.pattern {
-                    if !is_wildcard_pattern(inner) {
-                        context.on_top += 1;
-                        self.emit(COPY, 1, 1)?;
-                        self.compile_stack_pattern(inner, context)?;
-                        context.on_top -= 1;
-                    }
+                    // The wildcard's POP_TOP and this COPY still count when copying the
+                    // capture's exit block. Adjacent-instruction optimization removes them.
+                    context.on_top += 1;
+                    self.emit(COPY, 1, 1)?;
+                    self.compile_stack_pattern(inner, context)?;
+                    context.on_top -= 1;
                 }
                 self.assembler
                     .set_location(self.source_location(pattern.range));
