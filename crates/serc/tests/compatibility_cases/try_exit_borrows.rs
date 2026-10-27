@@ -2009,6 +2009,17 @@ fn matches_cpython_partial_terminal_match_handler_borrow_entries() {
 }
 
 #[test]
+fn named_handler_cleanup_stops_borrow_fallthrough() {
+    for source in [
+        "def run(value, items):\n    for item in items:\n        try:\n            value = step(item)\n        except ValueError as error:\n            match error.info:\n                case key if key == item:\n                    continue\n                case _:\n                    raise\n        consume(value)\n        return value\n",
+        "def run(value, limit):\n    try:\n        step()\n    except ValueError:\n        while limit:\n            try:\n                take()\n            except OverflowError as error:\n                amount = error.size\n                continue\n            work()\n        recover()\n    consume(value)\n",
+        "def run(value, flag):\n    try:\n        step()\n    except ValueError as error:\n        if flag:\n            return\n        consume(error)\n    consume(value)\n",
+    ] {
+        common::assert_matches_cpython_marshal(source, "named_handler_cleanup.py");
+    }
+}
+
+#[test]
 fn unlocated_handler_jump_stops_borrow_fallthrough() {
     for body in [
         "if flag:\n    try:\n        step()\n    except OtherError:\n        pass\n    else:\n        return",
