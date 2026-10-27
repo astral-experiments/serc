@@ -1313,10 +1313,11 @@ impl Compiler<'_> {
                             .is_some();
                         // An erased final capture body leaves its unlocated success jump
                         // directly after the capture store. That store already supplies
-                        // the pattern line when the jump to the live successor is removed.
+                        // the pattern line to the successor or the loop backedge.
                         let erased_capture_fallthrough = self.context.python_version
                             >= PythonVersion::Py314
-                            && match_has_following
+                            && (match_has_following
+                                || self.control.falls_through_to_loop_backedge())
                             && !copied_subject
                             && !has_default
                             && case.guard.is_none()
