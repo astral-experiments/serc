@@ -55,6 +55,63 @@ fn copyable_comprehension_reraise(items: &[Item], original: &[Instruction]) -> b
         && instructions.next().is_none()
 }
 
+/// A small local return can be copied into the warm try exit before dead handlers empty.
+fn copyable_local_return<'a>(mut ops: impl Iterator<Item = &'a Instruction>) -> bool {
+    use crate::target::opcodes::{LOAD_FAST, RETURN_VALUE};
+
+    let Some(load) = ops.next().filter(|op| op.opcode == LOAD_FAST) else {
+        return false;
+    };
+    let mut slots = 1 + usize::from(load.pre_fold_extra_instructions());
+    for op in ops {
+        slots += 1 + usize::from(op.pre_fold_extra_instructions());
+        if slots > 4 {
+            return false;
+        }
+        if op.opcode != NOP {
+            return op.opcode == RETURN_VALUE;
+        }
+    }
+    false
+}
+
+/// Whether the normal and exceptional handler exits clear the same fast local.
+fn is_named_handler_exit<'a>(
+    mut normal: impl Iterator<Item = &'a Instruction>,
+    exceptional: &[Item],
+) -> bool {
+    use crate::target::opcodes::{
+        DELETE_FAST, JUMP_FORWARD, LOAD_CONST, POP_EXCEPT, RERAISE, STORE_FAST,
+    };
+
+    fn name_clear<'a>(
+        ops: &mut impl Iterator<Item = &'a Instruction>,
+    ) -> Option<(Operand, Operand)> {
+        let load = ops.next()?;
+        let store = ops.next()?;
+        let delete = ops.next()?;
+        (load.opcode == LOAD_CONST
+            && store.opcode == STORE_FAST
+            && delete.opcode == DELETE_FAST
+            && store.operand() == delete.operand())
+        .then_some((load.operand(), store.operand()))
+    }
+    if !normal.next().is_some_and(|op| op.opcode == POP_EXCEPT) {
+        return false;
+    }
+    let Some(clear) = name_clear(&mut normal) else {
+        return false;
+    };
+    let mut exceptional = exceptional.iter().filter_map(Item::as_instruction);
+    name_clear(&mut exceptional) == Some(clear)
+        && normal.next().is_some_and(|op| op.opcode == JUMP_FORWARD)
+        && normal.next().is_none()
+        && exceptional
+            .next()
+            .is_some_and(|op| op.opcode == RERAISE && op.value_argument() == Some(1))
+        && exceptional.next().is_none()
+}
+
 /// Original labels for a Python 3.12 async-manager protocol await.
 #[derive(Debug)]
 pub(super) struct LegacyProtocolAwaitSetup {
@@ -542,6 +599,7 @@ impl ExceptionOwnerProvenance {
             NormalTry(Label),
             Comprehension(&'a [Instruction]),
             HandlerJump(Label),
+            NamedHandler(Label),
         }
         let mut entries = self
             .borrow_normal_try_exits
@@ -565,6 +623,85 @@ impl ExceptionOwnerProvenance {
                 }
             }
         }
+        let mut named_exit_splits = FxHashMap::default();
+        if !self.named_handler_cleanup_targets.is_empty() {
+            let order = graph.order();
+            let normal_targets: FxHashSet<_> = self
+                .borrow_normal_try_exits
+                .iter()
+                .filter_map(|(_, jump)| graph.label_block(jump.forward_target()?))
+                .collect();
+            let copied_returns: FxHashSet<_> = order
+                .iter()
+                .enumerate()
+                .filter(|(_, block)| normal_targets.contains(block))
+                .filter(|(index, _)| {
+                    copyable_local_return(
+                        order[*index..]
+                            .iter()
+                            .flat_map(|block| graph[*block].items())
+                            .filter_map(Item::as_instruction),
+                    )
+                })
+                .map(|(_, block)| *block)
+                .collect();
+            for (position, pair) in order.windows(2).enumerate() {
+                let [normal, exceptional] = *pair else {
+                    unreachable!()
+                };
+                let Some(target) = graph[exceptional]
+                    .items()
+                    .iter()
+                    .find_map(|item| match item {
+                        Item::Label(label)
+                            if self.named_handler_cleanup_targets.contains(label) =>
+                        {
+                            Some(*label)
+                        }
+                        _ => None,
+                    })
+                else {
+                    continue;
+                };
+                // A copied return is already in the warm predecessor, ahead of
+                // the empty handler. Its local must remain reachable there.
+                if graph[normal]
+                    .last_instruction()
+                    .and_then(Instruction::forward_target)
+                    .and_then(|label| graph.label_block(label))
+                    .is_some_and(|block| copied_returns.contains(&block))
+                {
+                    continue;
+                }
+                let records = graph[normal]
+                    .items()
+                    .iter()
+                    .filter_map(Item::as_instruction);
+                if is_named_handler_exit(records.clone(), graph[exceptional].items()) {
+                    entries
+                        .entry(normal)
+                        .or_insert((Exit::NamedHandler(target), true));
+                // A range endpoint can split the final jump from its name clear.
+                // Reject that seam below if any branch or exception can enter it.
+                } else if let Some(&prefix) =
+                    position.checked_sub(1).and_then(|index| order.get(index))
+                    && records.clone().count() == 1
+                    && is_named_handler_exit(
+                        graph[prefix]
+                            .items()
+                            .iter()
+                            .filter_map(Item::as_instruction)
+                            .chain(records),
+                        graph[exceptional].items(),
+                    )
+                {
+                    entries
+                        .entry(prefix)
+                        .or_insert((Exit::NamedHandler(target), true));
+                    named_exit_splits.insert(normal, prefix);
+                }
+            }
+        }
         if !self.cold_handler_borrow_jumps.is_empty() {
             for &(entry, target) in &self.cold_handler_borrow_jumps {
                 if let Some(block) = graph.label_block(entry) {
@@ -575,23 +712,39 @@ impl ExceptionOwnerProvenance {
                         .or_insert((Exit::HandlerJump(target), true));
                 }
             }
-            for region in regions {
-                if let Some(block) = graph.label_block(region.target)
-                    && matches!(entries.get(&block), Some((Exit::HandlerJump(_), _)))
-                {
-                    entries.remove(&block);
-                }
-            }
         }
         if entries.is_empty() {
             return;
         }
+        if !self.cold_handler_borrow_jumps.is_empty()
+            || !self.named_handler_cleanup_targets.is_empty()
+        {
+            for region in regions {
+                let Some(block) = graph.label_block(region.target) else {
+                    continue;
+                };
+                if matches!(
+                    entries.get(&block),
+                    Some((Exit::HandlerJump(_) | Exit::NamedHandler(_), _))
+                ) {
+                    entries.remove(&block);
+                }
+                if let Some(prefix) = named_exit_splits.get(&block) {
+                    entries.remove(prefix);
+                }
+            }
+        }
         for instruction in graph.iter_items().filter_map(Item::as_instruction) {
-            if let Some(block) = instruction
+            let Some(block) = instruction
                 .jump_target()
                 .and_then(|label| graph.label_block(label))
-                && let Some((_, incoming)) = entries.get_mut(&block)
-            {
+            else {
+                continue;
+            };
+            if let Some(prefix) = named_exit_splits.get(&block) {
+                entries.remove(prefix);
+            }
+            if let Some((_, incoming)) = entries.get_mut(&block) {
                 if super::is_unconditional_jump(instruction.opcode) {
                     *incoming = true;
                 } else {
@@ -658,6 +811,14 @@ impl ExceptionOwnerProvenance {
                         continue;
                     }
                     handler(&cleanup_handlers)
+                }
+                Exit::NamedHandler(target) => {
+                    if !super::ends_scope(previous.opcode)
+                        && !super::is_unconditional_jump(previous.opcode)
+                    {
+                        continue;
+                    }
+                    Some(*target)
                 }
                 Exit::HandlerJump(target) => {
                     if !super::ends_scope(previous.opcode)
