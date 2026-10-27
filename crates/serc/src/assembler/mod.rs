@@ -16695,6 +16695,13 @@ impl Assembler {
         }
     }
 
+    /// Retains the exception target of a try/finally whose protected body begins with a guard.
+    pub(crate) fn record_guarded_finally_setup(&mut self, setup: Label, handler: Label) {
+        self.exception_owner_provenance
+            .guarded_finally_setups
+            .insert(setup, handler);
+    }
+
     /// Retains the authored handler identity of an ordinary try's original SETUP.
     pub(crate) fn record_ordinary_try_exception_setup(
         &mut self,

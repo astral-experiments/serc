@@ -36698,6 +36698,12 @@ impl<'source> Compiler<'source> {
         self.assembler.record_exception_setup(protected_start, true);
         self.assembler
             .record_legacy_native_setup_target(protected_start, finally_handler);
+        if self.context.python_version == crate::PythonVersion::Py314
+            && matches!(statement.body.first(), Some(Stmt::If(_)))
+        {
+            self.assembler
+                .record_guarded_finally_setup(protected_start, finally_handler);
+        }
         self.assembler.mark(protected_start);
         let pass_finally_location = match statement.finalbody.as_slice() {
             [Stmt::Pass(statement)] => Some(self.source_location(statement.range)),
