@@ -13268,7 +13268,7 @@ impl<'source> Compiler<'source> {
                         && !return_is_overridden
                         && !starts_jump_target
                         && handler_count == 0
-                        && return_finally_contexts.len() == 1
+                        && context_index + 1 == return_finally_contexts.len()
                         && let Some(try_pops) =
                             ordinary_pops.checked_sub(finally_context.try_body_depth)
                     {

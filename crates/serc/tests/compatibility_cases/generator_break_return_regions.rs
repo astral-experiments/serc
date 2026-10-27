@@ -39,3 +39,11 @@ fn matches_resumed_yield_return_marker_slots() {
         common::assert_matches_cpython_marshal(&source, "resumed_yield_return.py");
     }
 }
+
+#[test]
+fn matches_the_innermost_copied_finally_after_yield() {
+    common::assert_matches_cpython_marshal(
+        "def entries(value):\n    try:\n        try:\n            while True:\n                yield read(value)\n                return\n        except Error:\n            raise\n        finally:\n            if value is not None:\n                value.close()\n    finally:\n        done()\n",
+        "nested_yield_return.py",
+    );
+}
