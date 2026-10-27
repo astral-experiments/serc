@@ -107,3 +107,22 @@ def in_manager(manager, value, stop):
 ";
     common::assert_matches_cpython_marshal(source, "borrowed_try_exits.py");
 }
+
+#[test]
+fn guarded_handler_exits_reach_normal_cleanup() {
+    let source = "\
+def run(value, retry, failed):
+    try:
+        work(value)
+    except Error as error:
+        if retry:
+            log(error)
+        if failed:
+            raise
+        log(value)
+    finally:
+        notify(value)
+        value.close()
+";
+    common::assert_matches_cpython_marshal(source, "guarded_handler_exits.py");
+}
