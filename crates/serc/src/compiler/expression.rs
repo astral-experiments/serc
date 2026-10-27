@@ -1271,7 +1271,8 @@ impl Compiler<'_> {
                             && !has_default
                             && case.guard.is_none()
                             && matches!(&case.pattern, Pattern::MatchAs(pattern)
-                                if pattern.pattern.is_none() && pattern.name.is_some())
+                                if pattern.name.is_some()
+                                    && pattern.pattern.as_deref().is_none_or(is_wildcard_pattern))
                             && !case.body.is_empty()
                             && body_is_elided;
                         // An erased case leaves only its NEXT_LOCATION subject pop
