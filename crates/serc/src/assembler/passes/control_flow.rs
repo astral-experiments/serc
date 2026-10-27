@@ -6059,6 +6059,23 @@ impl OptimizationPipeline {
                                 })
                         });
 
+                    // A same-line break bypasses the normal try exit. The guard's
+                    // false edge starts a new instruction array there, so its line
+                    // is independent of the physically preceding break.
+                    let same_line_break_exit = previous == previous_at_block_entry
+                        && previous_line == Some(instruction.location.line)
+                        && previous.is_some_and(|p| {
+                            graph.item(p).as_instruction().is_some_and(|jump| {
+                                jump.fusion_policy.is_authored_break()
+                                    && jump.location != instruction.location
+                            })
+                        })
+                        && self.exception_owner_provenance.normal_try_exits.iter().any(
+                            |(entry, end)| {
+                                *end == target
+                                    && graph[block].items()[..offset].contains(&Item::Label(*entry))
+                            },
+                        );
                     if !preserves_original_fallthrough_nop
                         && !preserves_compound_fallthrough_nop
                         && !preserves_copied_finally_break_nop
@@ -6067,6 +6084,7 @@ impl OptimizationPipeline {
                         && (instruction.location.line < 0
                             || (!original_async_for_join
                                 && !original_manager_break_join
+                                && !same_line_break_exit
                                 && previous_line == Some(instruction.location.line))
                             || next_line == Some(instruction.location.line))
                     {
