@@ -2633,6 +2633,27 @@ fn paired_while_exhaustion_edges_keep_their_own_return_locations() {
 }
 
 #[test]
+fn break_keeps_its_line_when_a_loop_arm_copies_a_try_return() {
+    let source = r"def collect(flag, value):
+    try:
+        if flag:
+            while True:
+                value = advance(value)
+                if done(value):
+                    break
+        else:
+            while True:
+                value = reset(value)
+                if done(value):
+                    break
+    except LookupError:
+        raise
+    return value
+";
+    assert_matches_cpython(source, "copied_loop_break.py", &LEVELS);
+}
+
+#[test]
 fn protected_while_break_copies_following_local_return() {
     let source = r"async def collect(ready, limit, done, count):
     try:
