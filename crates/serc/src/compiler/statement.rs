@@ -18314,7 +18314,8 @@ impl<'source> Compiler<'source> {
                         .active_pass_finally_locations
                         .is_empty())
                 && self.assembler.location() == SourceLocation::NONE
-                && self.assembler.at_original_unconditional_join();
+                && self.assembler.at_original_unconditional_join()
+                && !self.assembler.at_reraising_handler_exit();
             self.emit_iterator_cleanup(
                 self.control.loops.contexts[index].iterator_cleanup,
                 preserve_tos,
