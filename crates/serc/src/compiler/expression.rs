@@ -97,6 +97,7 @@ struct MatchContext {
     fail_pop: Vec<Option<Label>>,
     // Case or OR-alternative source identity; fail-pop indices belong to this context.
     native_fail_owner: ruff_text_size::TextRange,
+    single_line_pattern: bool,
     direct_loop_failure: Option<Label>,
     on_top: usize,
     ownerless_markers_after_specialized_none: bool,
@@ -688,9 +689,9 @@ impl Compiler<'_> {
                 failure_reaches_end = true;
                 continue;
             }
+            let pattern_location = self.source_location(case.pattern.range());
             if copied_subject {
-                self.assembler
-                    .set_location(self.source_location(case.pattern.range()));
+                self.assembler.set_location(pattern_location);
                 self.emit(COPY, 1, 1)?;
             }
             let failure_depth = base_depth + i32::from(copied_subject);
@@ -698,6 +699,7 @@ impl Compiler<'_> {
                 stores: Vec::new(),
                 fail_pop: Vec::new(),
                 native_fail_owner: case.pattern.range(),
+                single_line_pattern: pattern_location.line == pattern_location.end_line,
                 direct_loop_failure: (!copied_subject
                     && !has_default
                     && case.guard.is_none()
@@ -2032,17 +2034,27 @@ impl Compiler<'_> {
         let Some(name) = name else {
             return self.emit(POP_TOP, 0, -1);
         };
-        self.rotate_match_stack(context.on_top + context.stores.len() + 1)?;
+        self.rotate_match_stack(
+            context.on_top + context.stores.len() + 1,
+            context.single_line_pattern,
+        )?;
         context.stores.push(self.required_name_id(name));
         Ok(())
     }
 
-    fn rotate_match_stack(&mut self, count: usize) -> Result<(), CompileError> {
+    fn rotate_match_stack(
+        &mut self,
+        count: usize,
+        single_line_pattern: bool,
+    ) -> Result<(), CompileError> {
         if count > 1 {
             let count = to_u32(count, "pattern capture rotation")?;
             self.apply_compiler_stack_effect(SWAP, count, 0)?;
-            self.assembler
-                .emit_pattern_capture_rotation(count, self.control.stack.depth.cast_unsigned());
+            self.assembler.emit_pattern_capture_rotation(
+                count,
+                self.control.stack.depth.cast_unsigned(),
+                single_line_pattern,
+            );
         }
         Ok(())
     }
@@ -2068,6 +2080,7 @@ impl Compiler<'_> {
                 stores: Vec::new(),
                 fail_pop: Vec::new(),
                 native_fail_owner: alternative.range(),
+                single_line_pattern: context.single_line_pattern,
                 direct_loop_failure: None,
                 on_top: 0,
                 ownerless_markers_after_specialized_none: context
@@ -2120,7 +2133,10 @@ impl Compiler<'_> {
                             rotated,
                         );
                         for _ in 0..rotations {
-                            self.rotate_match_stack(control_index + 1)?;
+                            self.rotate_match_stack(
+                                control_index + 1,
+                                context.single_line_pattern,
+                            )?;
                         }
                     }
                 }
@@ -2209,7 +2225,7 @@ impl Compiler<'_> {
             .set_location(self.source_location(pattern.range));
         let rotations = control.len() + 1 + context.on_top + context.stores.len();
         for name in control {
-            self.rotate_match_stack(rotations)?;
+            self.rotate_match_stack(rotations, context.single_line_pattern)?;
             if context.stores.contains(&name) {
                 return Err(CompileError::InvalidPattern {
                     message: format!(

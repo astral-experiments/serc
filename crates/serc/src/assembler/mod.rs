@@ -18366,11 +18366,16 @@ impl Assembler {
     }
 
     /// Rotates pattern captures at a fixed stack depth, keeping their origin through assembly.
-    pub(crate) fn emit_pattern_capture_rotation(&mut self, count: u32, depth_after: u32) {
+    pub(crate) fn emit_pattern_capture_rotation(
+        &mut self,
+        count: u32,
+        depth_after: u32,
+        single_line_pattern: bool,
+    ) {
         for argument in (2..=count).rev() {
             let mut swap =
                 Instruction::value_with_depth(SWAP, argument, self.location, depth_after);
-            swap.pattern_capture_swap = true;
+            swap.single_line_capture_swap = Some(single_line_pattern);
             self.push_linear_item(Item::Instruction(swap));
         }
     }
