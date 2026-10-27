@@ -30256,7 +30256,37 @@ impl<'source> Compiler<'source> {
                 }
                 _ => None,
             };
-            if let Some(location) = wildcard_before_try.or(guarded_recovery_exit) {
+            // Earlier case-success jumps thread past the try exit. The wildcard
+            // arm's final instruction then supplies the line of its removed jump.
+            let wildcard_fallthrough = if self.context.python_version >= crate::PythonVersion::Py314
+                && !statement.is_star
+                && statement.finalbody.is_empty()
+                && let Some(Stmt::Match(matched)) = normal_exit_suite.last()
+                && match_has_multiple_normal_case_exits(matched)
+                && let Some(case) = matched.cases.last()
+                && is_wildcard_pattern(&case.pattern)
+                && self.assembler.at_original_match_join()
+                && matches!(
+                    (
+                        case.body.last(),
+                        self.assembler.instruction_opcode_at(
+                            self.assembler.instruction_count().saturating_sub(1),
+                        )
+                    ),
+                    (Some(Stmt::Assign(_)), Some(STORE_FAST))
+                        | (Some(Stmt::Expr(_)), Some(POP_TOP))
+                        | (Some(Stmt::Pass(_)), Some(NOP))
+                ) {
+                self.assembler
+                    .last_instruction_location()
+                    .filter(|location| location.line >= 0)
+            } else {
+                None
+            };
+            if let Some(location) = wildcard_before_try
+                .or(guarded_recovery_exit)
+                .or(wildcard_fallthrough)
+            {
                 self.assembler.set_location(location);
             }
             let normal_exit = if (match_body_pop_block
@@ -31368,7 +31398,10 @@ impl<'source> Compiler<'source> {
                         .prevent_borrow_jump_threading_target(normal_exit);
                 }
             }
-            if retained_manager_match_failure || retained_match_fallthrough {
+            if retained_manager_match_failure
+                || retained_match_fallthrough
+                || wildcard_fallthrough.is_some()
+            {
                 self.assembler
                     .preserve_redundant_jump_nop_after_threading(normal_exit);
             }
