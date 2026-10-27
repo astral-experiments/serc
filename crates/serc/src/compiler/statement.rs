@@ -679,8 +679,8 @@ pub(super) struct StatementState {
     pub(super) match_tail_before_if_exit: Option<TextRange>,
     // This trailing while shares its empty exit with an enclosing conditional's false edge.
     while_before_conditional_join: Option<TextRange>,
-    // The final conditional arm's Pass falls through to a separate original join array.
-    retained_branch_pass: Option<TextRange>,
+    // The authored branch-tail NOP before the conditional's original join.
+    retained_branch_nop: Option<TextRange>,
     // Whether the current statement is nested directly in a terminal if branch suite.
     pub(super) in_terminal_if_branch_suite: bool,
     // A sibling terminal arm delays copying a nested while break onto the comparison edge.
@@ -2922,7 +2922,7 @@ impl<'source> Compiler<'source> {
                     || optimized_sync_with_pass_tail
                     || (self.context.python_version >= crate::PythonVersion::Py314
                         && split_finally_pass_prefix)
-                    || (self.control.statements.retained_branch_pass == Some(statement.range)
+                    || (self.control.statements.retained_branch_nop == Some(statement.range)
                         && self.assembler.current_block_last_instruction_location().is_some_and(
                             |previous| previous.line >= 0
                                 && previous.line != self.source_location(statement.range).line,
@@ -3069,7 +3069,8 @@ impl<'source> Compiler<'source> {
                 let retain_final_literal_nop = self.context.python_version
                     >= crate::PythonVersion::Py314
                     && is_final
-                    && final_expression_becomes_return
+                    && (final_expression_becomes_return
+                        || self.control.statements.retained_branch_nop == Some(statement.range()))
                     && literal_constant(&expression.value).is_some()
                     // Existing module markers retain their boundary for manager suppression.
                     && !located_module_manager_marker;
@@ -18458,14 +18459,26 @@ impl<'source> Compiler<'source> {
             }
             _ => None,
         };
-        let retained_branch_pass = (self.context.python_version >= crate::PythonVersion::Py314
-            && body.len() > 1
-            && body.last().map(Ranged::range) == fallthrough_body.last().map(Ranged::range))
-        .then(|| match body.last() {
-            Some(Stmt::Pass(pass)) => Some(pass.range),
-            _ => None,
-        })
-        .flatten();
+        let retained_branch_nop = if self.context.python_version >= crate::PythonVersion::Py314 {
+            match body.last() {
+                Some(Stmt::Pass(pass))
+                    if body.len() > 1
+                        && body.last().map(Ranged::range)
+                            == fallthrough_body.last().map(Ranged::range) =>
+                {
+                    Some(pass.range)
+                }
+                Some(Stmt::Expr(expr))
+                    if matches!(self.unit.scope, Scope::Class { .. })
+                        && is_literal_constant(&expr.value) =>
+                {
+                    Some(expr.range)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
         let branch_tail = body
             .iter()
             .rfind(|part| !self.context.is_elided_statement(part));
@@ -18567,8 +18580,8 @@ impl<'source> Compiler<'source> {
                     same_region_continuation,
                     |compiler| {
                         compiler.with_control_override(
-                            |control| &mut control.statements.retained_branch_pass,
-                            retained_branch_pass,
+                            |control| &mut control.statements.retained_branch_nop,
+                            retained_branch_nop,
                             |compiler| {
                                 compiler.with_control_override(
                                     |control| &mut control.statements.while_before_conditional_join,
