@@ -36257,6 +36257,35 @@ impl<'source> Compiler<'source> {
                             if self.source_location(call.range).line != self.source_location(cleanup.range).line
                                 && matches!(call.value.as_ref(), Expr::Call(_))
                                 && !expression_contains_inline_branch(&call.value))));
+        // A completed await resumes inside the synchronous manager. Its normal
+        // exit jumps past the guard's empty join to the nested finalizer setup.
+        let async_generator_manager_else_entry = self.context.python_version
+            == crate::PythonVersion::Py314
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                == CO_ASYNC_GENERATOR
+            && !statement.is_star
+            && !statement.handlers.is_empty()
+            && self.control.loops.contexts.is_empty()
+            && !self.control.in_exception_handler()
+            && self.control.finally.is_inactive_for_return_unwind()
+            && suite_has_normal_fallthrough(&statement.body)
+            && matches!(statement.finalbody.first(), Some(Stmt::Try(cleanup))
+                if !cleanup.is_star && !cleanup.finalbody.is_empty()
+                    && self.suite_has_nonempty_borrow_entry(&statement.finalbody))
+            && matches!(statement.orelse.split_last(), Some((Stmt::If(guard), prefix))
+                if suite_has_normal_fallthrough(prefix)
+                    && guard.elif_else_clauses.is_empty()
+                    && condition_has_linear_runtime_leaves(&guard.test)
+                    && !expression_suspends_current_scope(&guard.test)
+                    && matches!(guard.body.as_slice(), [Stmt::With(manager)]
+                        if !manager.is_async && manager.items.len() == 1
+                            && !expression_contains_inline_branch(&manager.items[0].context_expr)
+                            && !expression_suspends_current_scope(&manager.items[0].context_expr)
+                            && matches!(manager.body.as_slice(), [Stmt::Expr(part)]
+                                if matches!(part.value.as_ref(), Expr::Await(awaited)
+                                    if matches!(awaited.value.as_ref(), Expr::Call(_))
+                                        && !expression_contains_inline_branch(&awaited.value)
+                                        && !expression_suspends_current_scope(&awaited.value)))));
         // A synchronous manager's awaited store leaves a populated normal exit.
         // Its arm jumps directly into the eager cleanup prefix even when other
         // dispatch arms return or raise. Copied returns and exceptional cleanup
@@ -38144,6 +38173,7 @@ impl<'source> Compiler<'source> {
             || raising_alternative_reaches_finally
             || guarded_recovery_arm_reaches_finally
             || coroutine_manager_raise_else_reaches_finally
+            || async_generator_manager_else_entry
             || runtime_while_false_edge_reaches_finally
             || async_generator_while_cleanup
             || coroutine_nested_recovery_loop
