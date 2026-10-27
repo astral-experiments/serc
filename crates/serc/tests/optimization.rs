@@ -15,6 +15,25 @@ use serc::{
 };
 
 #[test]
+fn coroutine_break_retains_the_outer_finalizer_through_a_cleanup_guard() {
+    let source = r"async def walk(items, active, ready, worker):
+    try:
+        while active:
+            try:
+                if active:
+                    break
+            finally:
+                worker.cancel()
+                if not worker.done():
+                    worker.close()
+    finally:
+        if active:
+            release()
+";
+    assert_matches_cpython(source, "case.py", &LEVELS);
+}
+
+#[test]
 fn nested_conversion_handlers_keep_shared_cleanup() {
     let source = r"def sample(items):
     for item in items:

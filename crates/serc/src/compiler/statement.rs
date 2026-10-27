@@ -18449,12 +18449,15 @@ impl<'source> Compiler<'source> {
                 if manager.is_async
                     && manager.exception_region_depth == 0
                     && manager.loop_depth + 1 == self.control.loops.contexts.len());
-        // An ordinary break can leave an outer finalizer active while copying
+        // A function or coroutine can leave an outer finalizer active while copying
         // the inner cleanup. Its original POP_BLOCKs still precede that copy.
         let retained_outer_finally_break = retained_manager_break
             && self.context.python_version == crate::PythonVersion::Py314
             && matches!(self.unit.scope, Scope::Function { .. })
-            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && matches!(
+                self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR),
+                0 | CO_COROUTINE
+            )
             && context.iterator_cleanup == IteratorCleanup::None
             && context.exception_region_depth > 0
             && self.control.loops.contexts.len() == 1
