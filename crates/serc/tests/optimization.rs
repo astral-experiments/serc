@@ -15,6 +15,41 @@ use serc::{
 };
 
 #[test]
+fn async_bare_returns_keep_enclosing_try_pop_slots() {
+    let source = r"async def first(value, item):
+    try:
+        try:
+            while True:
+                await wait()
+                if check():
+                    return
+        except LookupError:
+            reject()
+    except Error:
+        reject()
+    finally:
+        value.release()
+        value.store(item, probe.current() or None)
+
+def factory(cell):
+    async def stream(local, item, flag):
+        try:
+            async with acquire():
+                async with acquire():
+                    if ready():
+                        return
+                    yield item
+        except Error:
+            reject()
+        finally:
+            touch(cell, local)
+            flag = flag or item
+    return stream
+";
+    assert_matches_cpython(source, "async_bare_return_pops.py", &LEVELS);
+}
+
+#[test]
 fn nested_conversion_handlers_keep_shared_cleanup() {
     let source = r"def sample(items):
     for item in items:
