@@ -7949,6 +7949,8 @@ impl OptimizationPipeline {
             // A large shared exit can also be copied after an unconditional source.
             // Its original target owners survive even though this is not inlining.
             if inline_exit_copy || !source_has_fallthrough {
+                let owner =
+                    |region: &ExceptionRegion| (region.target, region.depth, region.preserve_lasti);
                 if planned_copy
                     || (inline_no_location_block && target_chain_end > target_position)
                     || protected_return_revisit.is_some()
@@ -7961,21 +7963,22 @@ impl OptimizationPipeline {
                             Item::Instruction(_) => None,
                         })
                         .collect::<FxHashMap<_, _>>();
+                    let mut sibling_holes = Vec::new();
                     for (index, exclusions) in copied_region_exclusions.iter_mut().enumerate() {
                         let region = &self.exception_regions[index];
                         let membership = &region_memberships[index];
-                        if region.is_scope_fallback
-                            || !membership.contains(&source_position)
+                        if exclusions.is_empty()
+                            || region.is_scope_fallback
                             || !membership.contains(&target_position)
                             || !membership.contains(&target_chain_end)
                         {
                             continue;
                         }
-                        // A previously expanded cleanup can contain holes in this enclosing
-                        // owner. Copy both boundaries with the instructions they delimit.
-                        // Scheduled copies require physically copied endpoints; synthetic
-                        // region-end aliases do not identify an original owner hole.
-                        let exclusion_labels = if planned_copy {
+                        let contains_source = membership.contains(&source_position);
+                        // A previously expanded exit can contain holes in this enclosing
+                        // owner. Copies into a sibling region of the same owner retain
+                        // those holes too. Only original endpoints certify a sibling hole.
+                        let exclusion_labels = if planned_copy || !contains_source {
                             &copied_handler_labels
                         } else {
                             &copied_labels
@@ -7989,7 +7992,29 @@ impl OptimizationPipeline {
                                     .then_some((start, end))
                             })
                             .collect::<Vec<_>>();
-                        exclusions.extend(inherited);
+                        if contains_source {
+                            exclusions.extend(inherited);
+                        } else if !inherited.is_empty() {
+                            for (sibling_index, sibling) in
+                                self.exception_regions.iter().enumerate()
+                            {
+                                let membership = &region_memberships[sibling_index];
+                                if !sibling.is_scope_fallback
+                                    && owner(sibling) == owner(region)
+                                    && membership.contains(&source_position)
+                                    && !membership.contains(&target_position)
+                                {
+                                    sibling_holes.extend(
+                                        inherited
+                                            .iter()
+                                            .map(|&(start, end)| (sibling_index, start, end)),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    for (index, start, end) in sibling_holes {
+                        copied_region_exclusions[index].push((start, end));
                     }
                 }
                 let target_region_owners = self
@@ -7997,7 +8022,7 @@ impl OptimizationPipeline {
                     .iter()
                     .zip(&region_memberships)
                     .filter(|(_, membership)| membership.contains(&positions[target.index()]))
-                    .map(|(region, _)| (region.target, region.depth, region.preserve_lasti))
+                    .map(|(region, _)| owner(region))
                     .collect::<FxHashSet<_>>();
                 let entirely_excluded_regions = region_memberships
                     .iter()
@@ -8008,11 +8033,7 @@ impl OptimizationPipeline {
                             && !membership.contains(&positions[target.index()])
                             // Cleanup exclusions can split one logical exception owner.
                             // Keep the copied exit protected when the target is in its sibling.
-                            && !target_region_owners.contains(&(
-                                region.target,
-                                region.depth,
-                                region.preserve_lasti,
-                            )))
+                            && !target_region_owners.contains(&owner(region)))
                         .then_some(index)
                     })
                     .collect::<Vec<_>>();
@@ -8047,9 +8068,7 @@ impl OptimizationPipeline {
                                 .iter()
                                 .zip(&region_memberships)
                                 .filter(|(sibling, membership)| {
-                                    sibling.target == region.target
-                                        && sibling.depth == region.depth
-                                        && sibling.preserve_lasti == region.preserve_lasti
+                                    owner(sibling) == owner(region)
                                         && membership.contains(&positions[target.index()])
                                 })
                                 .max_by_key(|(_, membership)| membership.end)

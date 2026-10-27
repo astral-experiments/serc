@@ -13606,6 +13606,28 @@ def collect_direct(items, active, fallback):
 }
 
 #[test]
+fn copied_handler_cleanup_preserves_exclusions_across_sibling_ranges() {
+    let source = r"def lookup(read):
+    try:
+        result = read(0)
+    except LookupError:
+        try:
+            result = read(1)
+        except LookupError:
+            try:
+                result = read(2)
+            except LookupError:
+                try:
+                    result = read(3)
+                except LookupError:
+                    return None
+    use(result)
+    return result
+";
+    assert_matches_cpython(source, "nested_handler_fallthrough.py", &LEVELS);
+}
+
+#[test]
 fn copied_loop_handler_cleanup_uses_each_conditional_predecessor() {
     for header in ["for item in items:", "while active:"] {
         let source = format!(
