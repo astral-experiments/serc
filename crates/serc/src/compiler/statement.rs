@@ -16794,6 +16794,19 @@ impl<'source> Compiler<'source> {
                         {
                             Some(NestedIfExitLocation::Located(&guard.test))
                         }
+                        // Breaks cross the original exit of a constant-true loop. Its
+                        // enclosing guard supplies the exit's only remaining jump.
+                        Stmt::If(guard)
+                            if self.context.python_version >= crate::PythonVersion::Py314
+                                && guard.elif_else_clauses.is_empty()
+                                && original_condition_has_unique_jump_target(&guard.test, false)
+                                && matches!(guard.body.last(), Some(Stmt::While(tail))
+                                    if early_condition_truthiness(&tail.test) == Some(true)
+                                        && suite_contains_loop_break(&tail.body)
+                                        && suite_has_normal_fallthrough(&tail.body)) =>
+                        {
+                            Some(NestedIfExitLocation::Located(&guard.test))
+                        }
                         Stmt::If(statement) => nested_if_exit_location(
                             statement,
                             self.control.statements.context.has_following || finalizer_exit,

@@ -8704,6 +8704,23 @@ fn surviving_break_reaches_try_else_continuation() {
 }
 
 #[test]
+fn guard_locates_the_exit_after_a_break_in_a_constant_loop() {
+    let source = r"def visit(outer, ready, stop):
+    if outer:
+        if ready:
+            while True:
+                work()
+                if stop():
+                    break
+                advance()
+    else:
+        alternate()
+    finish()
+";
+    assert_matches_cpython(source, "guarded_loop_exit.py", &LEVELS);
+}
+
+#[test]
 fn while_break_keeps_fallthrough_else_exception_owner() {
     for coroutine in ["", "async "] {
         for condition in ["True", "ready"] {
