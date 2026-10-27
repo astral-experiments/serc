@@ -25977,3 +25977,43 @@ fn short_circuit_value_after_manager_entries_uses_the_prior_handler() {
 ";
     assert_matches_cpython(source, "manager_value_guard.py", &LEVELS);
 }
+
+#[test]
+fn handler_cleanup_follows_suppression_and_nested_recovery() {
+    let source = r"def suppressed(flag):
+    try:
+        work()
+    except OSError as error:
+        if flag:
+            return
+        else:
+            with resource():
+                raise ValueError()
+    except ValueError as second:
+        pass
+
+def load(path):
+    try:
+        work()
+    except IOError:
+        try:
+            work()
+        except IOError:
+            path = fallback or path
+            with resource(path) as stream:
+                return stream.read()
+
+async def process(flag):
+    try:
+        await work()
+    except OSError as error:
+        if flag:
+            try:
+                await retry(error)
+            except:
+                record()
+        else:
+            record()
+";
+    assert_matches_cpython(source, "recovery_exit.py", &LEVELS);
+}

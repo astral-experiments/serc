@@ -33771,8 +33771,11 @@ impl<'source> Compiler<'source> {
                         || handler_cleanup_from_original_join)
                         && (handler.name.is_some()
                             || (handler_cleanup_from_original_join
-                                && matches!(handler.body.as_slice(), [Stmt::With(manager)]
-                                    if !manager.is_async && suite_terminates(&manager.body)))
+                                && matches!(handler.body.split_last(), Some((Stmt::With(manager), prefix))
+                                    if !manager.is_async && suite_terminates(&manager.body)
+                                        && (prefix.is_empty()
+                                            || (self.context.python_version >= crate::PythonVersion::Py314
+                                                && prefix.iter().all(|stmt| matches!(stmt, Stmt::Assign(_)))))))
                             || (handler_ends_with_nonterminal_with
                                 && !self.control.exceptions.active_exception_handlers.is_empty()
                                 && matches!(handler.body.as_slice(), [Stmt::With(manager)]
@@ -34538,7 +34541,9 @@ impl<'source> Compiler<'source> {
             // into the artificial named-handler cleanup. Copy it while unlocated,
             // even when clearing the name makes the exit larger than a small return.
             let inline_join_cleanup = (matches!(body.last(), Some(Stmt::With(statement))
-                    if !statement.is_async && !suite_terminates(&statement.body))
+                    if !statement.is_async && (!suite_terminates(&statement.body)
+                        || (self.context.python_version >= crate::PythonVersion::Py314
+                            && matches!(statement.body.last(), Some(Stmt::Raise(_))))))
                 || matches!(body.last(), Some(Stmt::Try(nested))
                 if !nested.is_star
                     && nested.orelse.is_empty()
@@ -34547,7 +34552,9 @@ impl<'source> Compiler<'source> {
                     && matches!(nested.handlers.as_slice(), [handler]
                         if handler.as_except_handler().is_some_and(|handler| {
                             (handler.name.is_some()
-                                || matches!(handler.body.as_slice(), [Stmt::Pass(_)]))
+                                || matches!(handler.body.as_slice(), [Stmt::Pass(_)])
+                                || (self.context.python_version >= crate::PythonVersion::Py314
+                                    && handler.type_.is_none()))
                                 && !suite_terminates(&handler.body)
                         }))))
                 && self.assembler.at_original_unconditional_join();
