@@ -18403,6 +18403,18 @@ impl<'source> Compiler<'source> {
             // handler cleanup. Preserve its store donor before static SWAP reordering.
             self.assembler.record_comprehension_assignment_exit(end);
         }
+        if self.context.python_version == crate::PythonVersion::Py314
+            && !has_terminating_else
+            && statement
+                .elif_else_clauses
+                .last()
+                .is_some_and(|clause| clause.test.is_none())
+            && if_normal_exit_count(statement) == 1
+        {
+            // A terminating earlier arm loses its jump to the join. The final
+            // else still ends its own instruction array before the continuation.
+            self.assembler.record_borrow_analysis_block_boundary(end);
+        }
         self.assembler.record_exception_owner_block_boundary(end);
         self.assembler.mark(end);
         self.set_depth(base_depth);
