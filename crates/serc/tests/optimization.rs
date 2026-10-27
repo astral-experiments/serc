@@ -83,7 +83,11 @@ fn erased_async_manager_suffix_preserves_conditional_join() {
 
 #[test]
 fn chained_comparison_failures_copy_named_handler_cleanup() {
-    for guard in ["low <= code <= high", "ready and low <= code <= high", "ready"] {
+    for guard in [
+        "low <= code <= high",
+        "ready and low <= code <= high",
+        "ready",
+    ] {
         let source = format!(
             "def read(code, low, high, ready, result):
     try:
