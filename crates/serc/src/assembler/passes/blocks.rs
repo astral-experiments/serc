@@ -932,7 +932,7 @@ fn represented_setup_nops(
         )
 }
 
-/// Finds the region end already represented by a returned local's POP_BLOCK.
+/// Finds the region end already represented by a returned local's `POP_BLOCK`.
 fn local_return_finally_pop(
     graph: &BlockGraph,
     blocks: &[BasicBlockId],
