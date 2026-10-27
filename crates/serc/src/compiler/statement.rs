@@ -24531,15 +24531,23 @@ impl<'source> Compiler<'source> {
             self.loop_break_policy(statement.range),
         );
         self.with_loop_context(context, |compiler| {
-            if let [Stmt::Pass(pass)] = statement.body.as_slice() {
-                // The repeated test follows this original body array. Its different
-                // source line keeps the authored Pass through legacy NOP removal.
+            let trailing_passes = statement
+                .body
+                .iter()
+                .rev()
+                .take_while(|part| matches!(part, Stmt::Pass(_)))
+                .count();
+            let (leading, passes) = statement
+                .body
+                .split_at(statement.body.len() - trailing_passes);
+            compiler.compile_suite(leading)?;
+            // The repeated test has its own source line. Emit each authored
+            // Pass so the legacy NOP pass can retain distinct trailing lines.
+            for pass in passes {
                 compiler
                     .assembler
-                    .set_location(compiler.source_location(pass.range));
+                    .set_location(compiler.source_location(pass.range()));
                 compiler.emit(NOP, 0, 0)?;
-            } else {
-                compiler.compile_suite(&statement.body)?;
             }
             if compiler.context.python_version == crate::PythonVersion::Py313
                 && statement.orelse.is_empty()

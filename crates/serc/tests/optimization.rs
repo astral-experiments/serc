@@ -19119,6 +19119,32 @@ fn finally_guarded_loop_recovery_preserves_borrow_boundary() {
 }
 
 #[test]
+fn legacy_while_retest_keeps_trailing_pass_lines() {
+    let source = r"def drain(manager, stop):
+    try:
+        with manager:
+            while ready():
+                if stop:
+                    return True
+                pass
+    except ValueError:
+        return False
+    return True
+";
+    assert_matches_cpython(source, "while_retest_pass.py", &LEVELS);
+    let two_passes = source.replace(
+        "                pass",
+        "                pass\n                pass",
+    );
+    assert_matches_cpython_versions(
+        &two_passes,
+        "while_retest_passes.py",
+        &LEVELS,
+        &[PythonVersion::Py312, PythonVersion::Py313],
+    );
+}
+
+#[test]
 fn while_else_keeps_finally_borrowing_after_elided_assertions() {
     for condition in ["condition()", "condition() or count < 3"] {
         for following in ["", "    return obj\n"] {
