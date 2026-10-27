@@ -11563,6 +11563,28 @@ fn nested_handler_returns_keep_enclosing_try_owner_inside_while() {
 }
 
 #[test]
+fn a_try_inside_a_returning_handler_keeps_the_finalizer_protected() {
+    let source = r"async def run():
+    try:
+        try:
+            work()
+        except LookupError:
+            try:
+                return None
+            except KeyError:
+                recover()
+        finally:
+            try:
+                finish()
+            except ValueError:
+                recover()
+    except OSError:
+        recover()
+";
+    assert_matches_cpython(source, "handler_try_finalizer.py", &LEVELS);
+}
+
+#[test]
 fn enclosing_tries_own_copied_finalizers_after_handler_returns() {
     let source = r"def sample(first, second):
     try:

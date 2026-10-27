@@ -9426,6 +9426,7 @@ impl<'source> Compiler<'source> {
                 // An ordinary try surrounding a handler chain and finalizer still owns
                 // the copied finalizer after the handler and finally collectors unwind.
                 // Track those boundaries separately without changing handler POP slots.
+                let return_try_depth = self.control.exceptions.active_try_marker_slots.len();
                 let tracks_outer_try_handler_finally_unwinds = self
                     .control
                     .withs
@@ -9473,12 +9474,14 @@ impl<'source> Compiler<'source> {
                                 && finally.exception_region_depth > 0
                                 && finally.exception_region_depth == finally.try_body_depth
                                 && handler.try_body_depth == finally.try_body_depth
-                                && handler.try_body_depth
-                                    == self.control.exceptions.active_try_marker_slots.len()
+                                // Ordinary tries entered inside the handler unwind before
+                                // its cleanup and the copy of the enclosing finally.
+                                && handler.try_body_depth <= return_try_depth
                                 && handler.exception_region_depth
                                     == finally.exception_region_depth + 1
                                 && self.control.exceptions.active_exception_region_exclusions.len()
                                     == handler.exception_region_depth + nested.len() + 1
+                                        + (return_try_depth - handler.try_body_depth)
                                 && nested.iter().enumerate().all(|(index, inner)| {
                                     inner.exception_region_depth == handler.exception_region_depth + index + 1
                                         && inner.try_body_depth == handler.try_body_depth
