@@ -639,6 +639,7 @@ impl Compiler<'_> {
         let matched_cases = statement.cases.len() - usize::from(has_default);
         let erased_final_value_case =
             self.control.statements.match_tail_before_if_exit == Some(statement.range);
+        let ends_try_body = self.control.exceptions.active_try_body_tail == Some(statement.range());
         let guarded_try_tail = !has_default
             && matched_cases > 1
             && self.control.exceptions.active_try_body_tail == Some(statement.range)
@@ -977,9 +978,14 @@ impl Compiler<'_> {
                         end,
                         loop_tail,
                         index + 1 == matched_cases && !context.fail_pop.is_empty(),
-                        guarded_try_tail
+                        (guarded_try_tail
                             && case.guard.is_some()
-                            && matches!(case.pattern, Pattern::MatchValue(_)),
+                            && matches!(case.pattern, Pattern::MatchValue(_)))
+                            // Each false operand reaches this case's protected exit.
+                            // Copy it before the shared jump threads to the loop header.
+                            || (ends_try_body
+                                && self.control.in_loop()
+                                && condition_jump_target_count(&statement.test, false) > 1),
                     )?;
                     true
                 } else {
