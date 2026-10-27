@@ -2112,6 +2112,15 @@ impl Assembler {
 
     /// Whether the next instruction starts a block with an emitted incoming jump.
     pub(crate) fn at_jump_target(&self) -> bool {
+        self.at_jump_target_matching(|_| true)
+    }
+
+    /// Whether an unconditional jump can take a private copy of the following exit.
+    pub(crate) fn at_unconditional_jump_target(&self) -> bool {
+        self.at_jump_target_matching(is_unconditional_jump)
+    }
+
+    fn at_jump_target_matching(&self, matches_opcode: impl Fn(Opcode) -> bool) -> bool {
         let items = self.linear_items();
         let trailing = items
             .iter()
@@ -2121,7 +2130,8 @@ impl Assembler {
         !labels.is_empty()
             && previous.iter().rev().any(|item| {
                 matches!(item, Item::Instruction(instruction)
-                    if matches!(instruction.operand(), Operand::Forward(label) | Operand::Backward(label)
+                    if matches_opcode(instruction.opcode)
+                        && matches!(instruction.operand(), Operand::Forward(label) | Operand::Backward(label)
                         if labels.iter().any(|item| matches!(item, Item::Label(candidate) if *candidate == label))))
             })
     }

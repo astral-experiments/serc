@@ -707,6 +707,23 @@ fn iterators_keep_an_unlocated_join_after_a_named_finalizer_handler() {
 }
 
 #[test]
+fn nested_handler_arms_copy_their_implicit_name_cleanup() {
+    let source = r"def scan(first, second):
+    try:
+        visit()
+    except ValueError as error:
+        if first:
+            if second:
+                use(error)
+            else:
+                raise
+        else:
+            report(error)
+";
+    assert_matches_cpython(source, "conditional_name_cleanup.py", &LEVELS);
+}
+
+#[test]
 fn terminal_while_else_keeps_its_handler_break_position() {
     let source = r"def sample(active):
     if active:
