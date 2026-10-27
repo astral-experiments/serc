@@ -3339,8 +3339,12 @@ impl Assembler {
         .then_some(previous.location)
     }
 
-    /// Checks the fallthrough into an erased try-else after its earlier edges copy the exit.
-    pub(crate) fn try_exit_has_store_or_iterator_fallthrough(&self, try_end: Label) -> bool {
+    /// Checks that only the given fallthrough remains after jumping arms copy the try exit.
+    pub(crate) fn try_exit_has_copyable_fallthrough(
+        &self,
+        try_end: Label,
+        opcodes: &[Opcode],
+    ) -> bool {
         let items = self.linear_items();
         let labels = trailing_labels(items).collect::<Vec<_>>();
         let Some(Item::Instruction(previous)) =
@@ -3349,7 +3353,7 @@ impl Assembler {
             return false;
         };
         if !labels.contains(&try_end)
-            || !matches!(previous.opcode, STORE_FAST | POP_ITER)
+            || !opcodes.contains(&previous.opcode)
             || previous.depth_after().is_none()
             || previous.location.line < 0
             || self.join_labels_have_authored_location(&labels)
@@ -3580,7 +3584,7 @@ impl Assembler {
             })
     }
 
-    /// Captures the located first POP record of a certified original fallthrough join.
+    /// Captures the first POP record of a certified original fallthrough join.
     pub(crate) fn record_original_fallthrough_pop_block(&mut self) {
         let items = self.linear_items();
         let Some((index, pop)) =
@@ -3598,7 +3602,6 @@ impl Assembler {
         if pop.opcode != NOP
             || !pop.fusion_policy.is_converted_pop_block()
             || pop.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
-            || pop.location.line < 0
         {
             return;
         }

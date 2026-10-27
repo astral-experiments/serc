@@ -25,7 +25,7 @@ use crate::code_object::Constant;
 use crate::target::code_flags::{
     CO_ASYNC_GENERATOR, CO_COROUTINE, CO_FUTURE_ANNOTATIONS, CO_GENERATOR,
 };
-use crate::target::opcodes::{RERAISE, STORE_FAST};
+use crate::target::opcodes::{POP_ITER, RERAISE, STORE_FAST};
 use crate::target::operands::{
     BinaryIntrinsic, BinaryOperation, CommonConstant, ResumeLocation, SpecialMethod, UnaryIntrinsic,
 };
@@ -28760,6 +28760,24 @@ impl<'source> Compiler<'source> {
         // A copied return can retain its surrounding exception owner on the marker.
         let live_continuation = self.control.statements.context.has_following
             && !self.control.statements.context.followed_by_return_or_raise;
+        let local_return = self.context.python_version >= crate::PythonVersion::Py314
+            && self.control.statements.context.followed_by_name_return
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.exceptions.active_exception_handlers.is_empty()
+            && self.control.collected_exception_depth() == 0
+            && self.control.finally.active_finally_try_bodies == 0;
+        // The successful arms copy the small return before line propagation.
+        // The wildcard's physical fallthrough then owns the original POP's line.
+        let copied_wildcard_fallthrough = local_return
+            && matches!(statement.body.last(), Some(Stmt::Match(matched))
+                if matched.cases.last().is_some_and(|case|
+                    case.guard.is_none() && is_wildcard_pattern(&case.pattern)))
+            && self.assembler.at_original_match_join()
+            && self
+                .assembler
+                .try_exit_has_copyable_fallthrough(try_end, &[STORE_FAST, POP_TOP]);
         let ordinary_match_pop = self.context.python_version >= crate::PythonVersion::Py314
             && !statement.is_star
             && statement.orelse.is_empty()
@@ -28767,9 +28785,10 @@ impl<'source> Compiler<'source> {
             && self.control.stack.depth == 0
             && matches!(statement.body.last(), Some(Stmt::Match(matched))
                 if matched.cases.split_last().is_some_and(|(case, earlier)| case.guard.is_none()
-                    && (((named_coroutine_handler || live_continuation)
+                    && (((named_coroutine_handler || live_continuation || local_return)
                         && matches!(case.pattern, Pattern::MatchValue(_))
                         && self.assembler.has_located_match_success_before_try_end(try_end))
+                        || copied_wildcard_fallthrough
                         || (named_coroutine_handler && is_wildcard_pattern(&case.pattern)
                             && matches!(case.body.last(), Some(Stmt::Raise(_)))
                             && (self.control.statements.context.followed_by_call_expression
@@ -28817,7 +28836,7 @@ impl<'source> Compiler<'source> {
             && matches!(statement.body.last(), Some(Stmt::For(_) | Stmt::If(_)))
             && self
                 .assembler
-                .try_exit_has_store_or_iterator_fallthrough(try_end);
+                .try_exit_has_copyable_fallthrough(try_end, &[STORE_FAST, POP_ITER]);
         let sole_fallthrough_pop_location = (removed_try_pop_block
             && (suite_ends_in_sole_else_fallthrough(&statement.body)
                 || sequence_failure_location.is_some()))
@@ -28865,7 +28884,9 @@ impl<'source> Compiler<'source> {
             };
             self.emit_with_exception_policy(NOP, 0, 0, policy)?;
             self.assembler.mark_last_as_converted_pop_block();
-            if sole_fallthrough_pop_location.is_some() {
+            if sole_fallthrough_pop_location.is_some()
+                || (ordinary_match_pop && copied_wildcard_fallthrough)
+            {
                 self.assembler.record_original_fallthrough_pop_block();
             }
         }
