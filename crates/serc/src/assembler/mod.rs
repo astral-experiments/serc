@@ -2270,6 +2270,39 @@ impl Assembler {
         })
     }
 
+    /// Excludes the fresh slots used to reverse a condition around a backward jump.
+    pub(crate) fn exclude_handler_loop_backedges(&mut self, start: usize) {
+        let items = self.linear_items_mut();
+        for index in start..items.len().saturating_sub(2) {
+            let [
+                Item::Instruction(condition),
+                Item::Instruction(marker),
+                Item::Instruction(backedge),
+                tail @ ..,
+            ] = &mut items[index..]
+            else {
+                continue;
+            };
+            let Some(target) = condition.forward_target() else {
+                continue;
+            };
+            if is_conditional_jump(condition.opcode)
+                && marker.opcode == NOT_TAKEN
+                && backedge.opcode == JUMP_BACKWARD
+                && condition.location == marker.location
+                && condition.location == backedge.location
+                && tail
+                    .iter()
+                    .take_while(|item| matches!(item, Item::Label(_)))
+                    .any(|item| *item == Item::Label(target))
+            {
+                for instruction in [condition, marker, backedge] {
+                    instruction.exclude_from_exception_table(ExceptionExclusion::Always);
+                }
+            }
+        }
+    }
+
     /// Whether an authored break enters the empty original join at this position.
     ///
     /// An iterator's exhaustion arm may fall through here as well. It does not locate
