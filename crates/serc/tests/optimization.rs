@@ -5605,6 +5605,24 @@ fn erased_nested_else_preserves_coroutine_loop_exits() {
 }
 
 #[test]
+fn an_erased_wildcard_capture_body_falls_through_after_its_store() {
+    let source = r"def check(value, enabled):
+    match value:
+        case int() as result:
+            pass
+        case _ as result:
+            assert enabled, result
+    consume(result)
+";
+    assert_matches_cpython_versions(
+        source,
+        "wildcard_capture_fallthrough.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn erased_final_else_suffix_preserves_coroutine_loop_exits() {
     let source = r"async def sample(items, selected, prepare, work, verify):
     for item in items:
