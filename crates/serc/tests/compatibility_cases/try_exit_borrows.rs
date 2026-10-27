@@ -2362,3 +2362,9 @@ fn terminal_deletion_preserves_original_return_boundary() {
         common::assert_matches_cpython_marshal(&source, "terminal_deletion_return.py");
     }
 }
+
+#[test]
+fn borrows_finalizer_locals_after_a_managed_nested_guard() {
+    let source = "def finish(manager, item, ready, retry):\n    with manager:\n        try:\n            if ready:\n                if retry:\n                    process(item)\n            else:\n                skip(item)\n        except Error:\n            raise\n        finally:\n            if item is not None:\n                item.close()\n";
+    common::assert_matches_cpython_marshal(source, "managed_nested_guard.py");
+}
