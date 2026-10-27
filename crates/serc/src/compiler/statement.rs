@@ -28791,6 +28791,25 @@ impl<'source> Compiler<'source> {
                 if branch.elif_else_clauses.is_empty()
                     && early_condition_truthiness(&branch.test) == Some(false)
                     && !suite_terminates_before_constant_folding(&branch.body));
+        // Keep the pass's POP_BLOCK distinct from its normal jump. An inlined
+        // exit retains the unprotected POP_BLOCK, while a redundant jump can
+        // inherit the same line and keep the coroutine's handler instead.
+        let empty_suspending_pass = (self.context.python_version == crate::PythonVersion::Py312
+            && self.control.generators.generator_region_start.is_some()
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_region_exclusions.is_empty()
+            && self.control.exceptions.active_exception_handlers.is_empty()
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && !statement.is_star
+            && statement.orelse.is_empty()
+            && statement.finalbody.is_empty()
+            && matches!(statement.body.as_slice(), [Stmt::Pass(_)]))
+        .then_some(body_noop_location)
+        .flatten();
         let removed_try_pop_block = (self.assembler.python_version()
             == crate::PythonVersion::Py312
             || !statement.orelse.is_empty()
@@ -28798,7 +28817,8 @@ impl<'source> Compiler<'source> {
             || copied_match_pop_block
             || false_arm_pop_block)
             && !suite_terminates(&statement.body)
-            && (!self.assembler.last_instruction_is_nop()
+            && (empty_suspending_pass.is_some()
+                || !self.assembler.last_instruction_is_nop()
                 // A preceding arm's NOP does not replace the unlocated POP_BLOCK
                 // in this separate original join. 3.12 must keep that record
                 // through exit copying before each incoming path donates a span.
@@ -28837,18 +28857,20 @@ impl<'source> Compiler<'source> {
             // An original normal-exit array can have a sole physical fallthrough donor
             // even when every earlier arm terminates. Other incoming edges still
             // defer their POP_BLOCK location to CFG propagation and NOP removal.
-            let location = sole_fallthrough_pop_location.or_else(|| {
-                if self.context.python_version == crate::PythonVersion::Py312
-                    && let Some(Stmt::Pass(pass)) = statement.body.last()
-                {
-                    let location = self.source_location(pass.range);
-                    self.assembler
-                        .has_single_omitted_fallthrough_nop_before_label(try_end, location)
-                        .then_some(location)
-                } else {
-                    None
-                }
-            });
+            let location = sole_fallthrough_pop_location
+                .or(empty_suspending_pass)
+                .or_else(|| {
+                    if self.context.python_version == crate::PythonVersion::Py312
+                        && let Some(Stmt::Pass(pass)) = statement.body.last()
+                    {
+                        let location = self.source_location(pass.range);
+                        self.assembler
+                            .has_single_omitted_fallthrough_nop_before_label(try_end, location)
+                            .then_some(location)
+                    } else {
+                        None
+                    }
+                });
             self.assembler
                 .set_location(location.unwrap_or(SourceLocation::NONE));
             // When the value-match exit copies a return, the POP_BLOCK and the
@@ -29963,28 +29985,10 @@ impl<'source> Compiler<'source> {
                         .context
                         .followed_by_name_assignment_or_deletion
                     || self.control.statements.context.followed_by_direct_name_if);
-            // The empty body's normal exit keeps the original POP_BLOCK slot when
-            // it compacts to a NOP outside a surrounding try or manager.
-            let empty_suspending_scope_exit = self.context.python_version
-                == crate::PythonVersion::Py312
-                && self.control.generators.generator_region_start.is_some()
-                && self.control.loops.contexts.is_empty()
-                && self.control.withs.active_with_region_exclusions.is_empty()
-                && self.control.exceptions.active_exception_handlers.is_empty()
-                && self
-                    .control
-                    .exceptions
-                    .active_exception_region_exclusions
-                    .is_empty()
-                && !statement.is_star
-                && statement.orelse.is_empty()
-                && statement.finalbody.is_empty()
-                && body_noop_location.is_some();
             let exception_policy = if !loop_tail_inherits_outer_owner
                 && !direct_nested_pass_exit_in_outer_try
                 && !coroutine_nested_pass_exit
-                && (empty_suspending_scope_exit
-                    || exclude_nested_normal_exit
+                && (exclude_nested_normal_exit
                     || (body_has_elided_assertion
                         && body_noop_location.is_some()
                         && statement

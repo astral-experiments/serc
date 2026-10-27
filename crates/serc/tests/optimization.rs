@@ -21318,6 +21318,20 @@ fn empty_legacy_generator_try_exits_keep_their_unprotected_pop() {
             &LEVELS,
             &[PythonVersion::Py312],
         );
+        for (body, handler) in [
+            ("pass", "except LookupError:"),
+            ("assert value", "except LookupError as error:"),
+        ] {
+            let source = format!(
+                "{prefix}    try:\n        {body}\n    {handler}\n        raise RuntimeError(value)\n    notify(value)\n"
+            );
+            assert_matches_cpython_versions(
+                &source,
+                "empty_generator_try_fallthrough.py",
+                &LEVELS,
+                &[PythonVersion::Py312],
+            );
+        }
     }
 }
 
