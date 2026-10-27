@@ -6529,13 +6529,40 @@ pub(super) fn collect_target_names(target: &Expr, names: &mut Vec<String>) {
 }
 
 #[derive(Default)]
-pub(super) struct ComprehensionScopeFacts {
+pub(super) struct ComprehensionScopeFacts<'ast> {
+    inlined_children: Vec<&'ast Expr>,
     pub(super) names: BTreeSet<String>,
     pub(super) walrus_targets: BTreeSet<String>,
 }
 
-impl ComprehensionScopeFacts {
-    fn visit_nested_comprehension(&mut self, generators: &[ruff_python_ast::Comprehension]) {
+impl<'ast> ComprehensionScopeFacts<'ast> {
+    /// Merge global reads from inlined children in symbol-table insertion order.
+    pub(super) fn include_inlined_reads(&mut self) {
+        let mut children = std::mem::take(&mut self.inlined_children);
+        children.reverse();
+        let mut seen = FxHashSet::default();
+        while let Some(child) = children.pop() {
+            let (generators, key, value) = comprehension_parts(child).unwrap();
+            let child = comprehension_scope_facts(generators, key, value);
+            let mut targets = Vec::new();
+            for generator in generators {
+                collect_target_names(&generator.target, &mut targets);
+            }
+            // A child's symbol is admitted only when an earlier child hasn't
+            // supplied it. Its own iteration targets and walruses aren't reads.
+            for name in child.names {
+                if seen.insert(name.clone())
+                    && !child.walrus_targets.contains(&name)
+                    && !targets.contains(&name)
+                {
+                    self.names.insert(name);
+                }
+            }
+            children.extend(child.inlined_children.into_iter().rev());
+        }
+    }
+
+    fn visit_nested_comprehension(&mut self, generators: &'ast [ruff_python_ast::Comprehension]) {
         // The first iterable is evaluated in the containing scope; the remaining
         // expressions enter the nested comprehension's own inlined scope.
         if let Some(generator) = generators.first() {
@@ -6544,10 +6571,16 @@ impl ComprehensionScopeFacts {
     }
 }
 
-impl<'ast> Visitor<'ast> for ComprehensionScopeFacts {
+impl<'ast> Visitor<'ast> for ComprehensionScopeFacts<'ast> {
     fn visit_expr(&mut self, expression: &'ast Expr) {
         if crate::stack_growth_required() {
             return crate::grow_stack(|| self.visit_expr(expression));
+        }
+
+        if let Some((generators, _, _)) = comprehension_parts(expression) {
+            self.visit_nested_comprehension(generators);
+            self.inlined_children.push(expression);
+            return;
         }
 
         match expression {
@@ -6563,16 +6596,15 @@ impl<'ast> Visitor<'ast> for ComprehensionScopeFacts {
                 self.visit_nested_comprehension(&generator.generators);
                 return;
             }
-            Expr::ListComp(comprehension) => {
-                self.visit_nested_comprehension(&comprehension.generators);
-                return;
-            }
-            Expr::SetComp(comprehension) => {
-                self.visit_nested_comprehension(&comprehension.generators);
-                return;
-            }
-            Expr::DictComp(comprehension) => {
-                self.visit_nested_comprehension(&comprehension.generators);
+            Expr::Dict(dictionary) => {
+                for item in &dictionary.items {
+                    if let Some(key) = &item.key {
+                        self.visit_expr(key);
+                    }
+                }
+                for item in &dictionary.items {
+                    self.visit_expr(&item.value);
+                }
                 return;
             }
             Expr::Lambda(lambda) => {
@@ -6589,25 +6621,25 @@ impl<'ast> Visitor<'ast> for ComprehensionScopeFacts {
     }
 }
 
-pub(super) fn comprehension_scope_facts(
-    generators: &[ruff_python_ast::Comprehension],
-    key: Option<&Expr>,
-    value: &Expr,
-) -> ComprehensionScopeFacts {
+pub(super) fn comprehension_scope_facts<'ast>(
+    generators: &'ast [ruff_python_ast::Comprehension],
+    key: Option<&'ast Expr>,
+    value: &'ast Expr,
+) -> ComprehensionScopeFacts<'ast> {
     let mut facts = ComprehensionScopeFacts::default();
-    for generator in generators {
+    for (index, generator) in generators.iter().enumerate() {
         facts.visit_expr(&generator.target);
+        if index > 0 {
+            facts.visit_expr(&generator.iter);
+        }
         for condition in &generator.ifs {
             facts.visit_expr(condition);
         }
     }
-    for generator in generators.iter().skip(1) {
-        facts.visit_expr(&generator.iter);
-    }
+    facts.visit_expr(value);
     if let Some(key) = key {
         facts.visit_expr(key);
     }
-    facts.visit_expr(value);
     facts
 }
 

@@ -1,6 +1,23 @@
 use crate::common;
 
 #[test]
+fn nested_inlined_reads_supply_the_module_import_flags_for_method_calls() {
+    for sibling in [
+        "[pkg.member for item in values]",
+        "{pkg.member for item in values}",
+        "{pkg.member: item for item in values}",
+        "(pkg.member for pkg in values)",
+        "(pkg.member for item in values)",
+        "(lambda: pkg.member)",
+    ] {
+        let source = format!(
+            "import pkg\nresult = [((pkg.method() for x in values), {sibling}) for y in values]\npkg.method()\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "nested_import_flags.py");
+    }
+}
+
+#[test]
 fn preserves_comprehension_body_references_before_later_iteration_targets() {
     for expression in [
         "[lookup(value) for value in values]",

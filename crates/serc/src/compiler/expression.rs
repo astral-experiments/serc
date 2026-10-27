@@ -4874,7 +4874,7 @@ impl Compiler<'_> {
         let mut removed_module_globals = Vec::new();
         let mut added_module_globals = Vec::new();
         if matches!(self.unit.scope, Scope::Module) {
-            let facts = comprehension_scope_facts(generators, key, value);
+            let mut facts = comprehension_scope_facts(generators, key, value);
             // A nested `global` declaration also marks the module symbol explicit.
             // The comprehension's own reads are implicit globals instead, except
             // for its assignment-expression targets. Save the effective outer flags
@@ -4897,6 +4897,9 @@ impl Compiler<'_> {
                 .map(|name| self.symbol_analysis_name_id(name))
                 .filter(|name| !self.symbols.module_globals.contains(*name))
                 .collect();
+            if !self.symbols.imported_scope_names.is_empty() {
+                facts.include_inlined_reads();
+            }
             for name in facts.names {
                 let name_id = self.symbol_analysis_name_id(&name);
                 if !self.symbols.imported_scope_names.contains(name_id)
