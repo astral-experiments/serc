@@ -5991,9 +5991,47 @@ impl OptimizationPipeline {
                         if instruction.no_location_policy.is_artificial_eval_break())
                 })
             });
-            let target_allows_no_location_block_inlining = graph[target_exit]
-                .last_instruction()
-                .is_some_and(|instruction| instruction.no_location_policy.allows_block_inlining());
+            // The saved return value stays on top while each iterator is discarded.
+            // 3.15 iterators occupy two stack cells and need a second POP_TOP.
+            let copied_iterators =
+                if target_has_no_location && target_terminal_opcode == Some(RETURN_VALUE) {
+                    let pop = (POP_TOP, Operand::Value(0));
+                    let discard: &[_] = match self.python_version {
+                        crate::PythonVersion::Py314 => &[(SWAP, Operand::Value(2)), pop],
+                        crate::PythonVersion::Py315 => &[(SWAP, Operand::Value(3)), pop, pop],
+                        _ => &[],
+                    };
+                    let mut operations = target_blocks
+                        .iter()
+                        .flat_map(|block| graph[*block].items())
+                        .filter_map(Item::as_instruction)
+                        .map(|record| (record.opcode, record.operand()));
+                    let mut iterators = 0;
+                    while !discard.is_empty()
+                        && operations
+                            .clone()
+                            .take(discard.len())
+                            .eq(discard.iter().copied())
+                    {
+                        operations.by_ref().take(discard.len()).for_each(drop);
+                        iterators += 1;
+                    }
+                    if operations.eq([(RETURN_VALUE, Operand::Value(0))]) {
+                        iterators
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                };
+            let copy_iterator_return = copied_iterators >= 2
+                || (copied_iterators == 1 && self.python_version == crate::PythonVersion::Py314);
+            let target_allows_no_location_block_inlining = copy_iterator_return
+                || graph[target_exit]
+                    .last_instruction()
+                    .is_some_and(|instruction| {
+                        instruction.no_location_policy.allows_block_inlining()
+                    });
             let target_has_unlocated_jump_eval_check = target_has_no_location
                 && graph[target_exit]
                     .last_instruction()
@@ -6162,29 +6200,13 @@ impl OptimizationPipeline {
                 && target_is_small_exit
                 && remaining_predecessors[target.index()] > 1
                 && !exception_handler_blocks[target.index()];
-            // A two-cell iterator return split at an outer POP_BLOCK is cleanup,
-            // not a large footer whose copy order follows cold-block relocation.
-            let split_iterator_return = self.python_version == crate::PythonVersion::Py315
-                && target_chain_end > target_position
-                && target_has_no_location
-                && target_blocks
-                    .iter()
-                    .flat_map(|block| graph[*block].items())
-                    .filter_map(|item| match item {
-                        Item::Instruction(instruction) => {
-                            Some((instruction.opcode, instruction.operand()))
-                        }
-                        Item::Label(_) => None,
-                    })
-                    .eq([
-                        (SWAP, Operand::Value(3)),
-                        (POP_TOP, Operand::Value(0)),
-                        (POP_TOP, Operand::Value(0)),
-                        (RETURN_VALUE, Operand::Value(0)),
-                    ]);
+            // Iterator disposal belongs to its original return even when an outer
+            // POP_BLOCK splits that array or cold layout separates its predecessors.
+            let shared_iterator_return = copy_iterator_return
+                || (copied_iterators == 1 && target_chain_end > target_position);
             if exit_without_unique_predecessor[target.index()]
                 && !self.exception_regions.is_empty()
-                && !split_iterator_return
+                && !shared_iterator_return
                 && target_pre_fusion_size > 4
                 && !target_blocks.iter().any(|block| {
                     graph[*block].items().iter().any(|item| {
@@ -7341,7 +7363,7 @@ impl OptimizationPipeline {
             original_return_locations.extend(copied_return_locations);
             let inline_exit_copy = inline_small_exit
                 || inline_no_location_block
-                || (split_iterator_return && !source_has_fallthrough);
+                || (shared_iterator_return && !source_has_fallthrough);
             // A large shared exit can also be copied after an unconditional source.
             // Its original target owners survive even though this is not inlining.
             if inline_exit_copy || !source_has_fallthrough {
@@ -8101,7 +8123,7 @@ impl OptimizationPipeline {
                 // Exception-region labels can split one original cleanup array. Insert its
                 // copies after the whole array so the original still reaches its own jump.
                 if target != target_exit
-                    && (target_has_unlocated_jump_eval_check || split_iterator_return)
+                    && (target_has_unlocated_jump_eval_check || shared_iterator_return)
                 {
                     copied_split_eval_starts.insert(target_exit, target_position);
                 }
