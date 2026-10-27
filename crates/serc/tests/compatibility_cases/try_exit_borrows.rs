@@ -2378,3 +2378,17 @@ fn copies_both_iterator_exits_of_a_guarded_handler_break() {
     let source = "def values(manager, items, enabled, strict):\n    with manager:\n        for item in items:\n            try:\n                yield item\n            except Error as error:\n                if strict:\n                    break\n            finally:\n                if enabled:\n                    close(item)\n";
     common::assert_matches_cpython_marshal(source, "managed_iterator_handler_break.py");
 }
+
+#[test]
+fn retains_original_call_slots_for_a_copied_handler_break() {
+    for call in [
+        "logger.record(item)",
+        "record(item)",
+        "record(item, enabled)",
+    ] {
+        let source = format!(
+            "def values(manager, items, enabled, strict, logger):\n    with manager:\n        for item in items:\n            try:\n                yield item\n            except Error as error:\n                if strict:\n                    {call}\n                    break\n            finally:\n                if enabled:\n                    close(item)\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "guarded_break_after_call.py");
+    }
+}

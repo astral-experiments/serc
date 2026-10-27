@@ -11166,7 +11166,19 @@ impl Assembler {
         {
             return;
         }
-        let mut start = break_item;
+        // The named clear can share the conditional arm's array with a preceding call.
+        // Capture at most the five records of a simple method call. Replay checks the
+        // call operands and the exact source entry before interpreting its spare slots.
+        let call_length = items[..break_item]
+            .iter()
+            .rev()
+            .take(6)
+            .take_while(|item| matches!(item, Item::Instruction(_)))
+            .count();
+        if !matches!(call_length, 0 | 4 | 5) {
+            return;
+        }
+        let mut start = break_item - call_length;
         while start > 0 && matches!(items[start - 1], Item::Label(_)) {
             start -= 1;
         }

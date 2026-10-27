@@ -13087,25 +13087,23 @@ impl LayoutAssembler {
                         if instruction.exception_policy()
                             == super::ExceptionPolicy::NoneDynamicCondition
                             && owner_history_exact
-                            && tail.early_removals == 1
+                            && matches!(tail.early_removals, 1 | 2)
                             && tail.insertions == 0
                             && tail.late_removals == 0
                             && tail.post_compaction_fusions == 0
                             && owners
                                 .get(instruction_index)
                                 .is_none_or(|decision| !decision.is_definitive())
-                            && self.copied_named_break_truth_is_null(
+                            && let Some(decision) = self.copied_named_break_truth_owner(
                                 instruction_index,
                                 original_array_start,
+                                tail.early_removals,
                                 &indexed_instructions,
                                 &label_positions,
                                 &jump_targets,
                             )
                         {
-                            owners.insert(
-                                instruction_index,
-                                ExceptionOwnerDecision::override_with_region(None),
-                            );
+                            owners.insert(instruction_index, decision);
                         }
                         if owner_history_exact
                             && instruction.exception_policy()
@@ -13484,17 +13482,22 @@ impl LayoutAssembler {
                 == 1
     }
 
-    /// Resolves only the captured named break's original NULL finalizer POP cell.
-    fn copied_named_break_truth_is_null(
+    /// Projects a copied break marker into its original finalizer POP or name clear.
+    fn copied_named_break_truth_owner(
         &self,
         marker: usize,
         array: usize,
+        early_removals: usize,
         instructions: &[&Instruction],
         positions: &OwnerLabelPositions,
         targets: &FxHashSet<Label>,
-    ) -> bool {
-        if marker.checked_sub(array) != Some(7) {
-            return false;
+    ) -> Option<ExceptionOwnerDecision> {
+        use crate::target::opcodes::{CALL, LOAD_ATTR, LOAD_FAST};
+
+        let clear = marker.checked_sub(7)?;
+        let call_length = clear.checked_sub(array)?;
+        if !matches!(call_length, 0 | 4 | 5) {
+            return None;
         }
         let provenance = &self.exception_owner_provenance;
         let mut origins = provenance
@@ -13505,11 +13508,9 @@ impl LayoutAssembler {
                     && provenance.source_boundaries.contains(&origin.entry)
                     && provenance.block_boundaries.contains(&origin.entry)
             });
-        let Some(origin) = origins.next() else {
-            return false;
-        };
+        let origin = origins.next()?;
         if origins.next().is_some() {
-            return false;
+            return None;
         }
         let records = origin
             .items
@@ -13519,6 +13520,43 @@ impl LayoutAssembler {
                 Item::Label(_) => None,
             })
             .collect::<Vec<_>>();
+        let (prefix, cleanup) = records.split_at_checked(call_length)?;
+        let folded_null = match prefix {
+            [] => false,
+            [receiver, method, arg, call, discard]
+                if (receiver.opcode == LOAD_FAST
+                    || (receiver.opcode == LOAD_GLOBAL
+                        && receiver
+                            .value_argument()
+                            .is_some_and(|value| value & 1 == 0)))
+                    && method.opcode == LOAD_ATTR
+                    && method.value_argument().is_some_and(|value| value & 1 != 0)
+                    && arg.opcode == LOAD_FAST
+                    && call.opcode == CALL
+                    && call.value_argument() == Some(1)
+                    && discard.opcode == POP_TOP =>
+            {
+                false
+            }
+            [function, arg, call, discard]
+                if function.opcode == LOAD_GLOBAL
+                    && function
+                        .value_argument()
+                        .is_some_and(|value| value & 1 != 0)
+                    && matches!(arg.opcode, LOAD_FAST | LOAD_CONST)
+                    && call.opcode == CALL
+                    && call.value_argument() == Some(1)
+                    && discard.opcode == POP_TOP =>
+            {
+                true
+            }
+            _ => return None,
+        };
+        if early_removals != 1 + usize::from(folded_null)
+            || instructions.get(array..clear)?.iter().copied().ne(prefix)
+        {
+            return None;
+        }
         let [
             authored,
             pop,
@@ -13529,13 +13567,11 @@ impl LayoutAssembler {
             truth,
             condition,
             expected_marker,
-        ] = records.as_slice()
+        ] = cleanup
         else {
-            return false;
+            return None;
         };
-        let Some(actual) = instructions.get(array..=marker) else {
-            return false;
-        };
+        let actual = instructions.get(clear..=marker)?;
         let mut expected_pop = *pop;
         expected_pop
             .local_policy
@@ -13561,7 +13597,7 @@ impl LayoutAssembler {
                 .count()
                 != 1
         {
-            return false;
+            return None;
         }
         let mut ordinal = 0usize;
         let mut handler_ends = Vec::new();
@@ -13570,7 +13606,7 @@ impl LayoutAssembler {
             match item {
                 Item::Instruction(_) => ordinal += 1,
                 Item::Label(label) => {
-                    let expected = array + ordinal.saturating_sub(1);
+                    let expected = array + ordinal - usize::from(ordinal > call_length);
                     if positions.get(label) != Some(&expected)
                         || provenance.omitted_nop_counts.contains_key(label)
                         || provenance.omitted_nop_locations.contains_key(label)
@@ -13581,7 +13617,7 @@ impl LayoutAssembler {
                         // same array entry. An interior preserved boundary still rejects.
                         || (ordinal > 0 && self.preserved_block_boundaries.contains(label))
                     {
-                        return false;
+                        return None;
                     }
                     if ordinal > 0
                         && (targets.contains(label)
@@ -13592,12 +13628,12 @@ impl LayoutAssembler {
                                 .iter()
                                 .any(|region| region.start == *label || region.target == *label))
                     {
-                        return false;
+                        return None;
                     }
-                    if ordinal == 1 {
+                    if ordinal == call_length + 1 {
                         handler_ends.push(*label);
                     }
-                    if ordinal == 5 {
+                    if ordinal == call_length + 5 {
                         finally_ends.push(*label);
                     }
                 }
@@ -13613,7 +13649,7 @@ impl LayoutAssembler {
                     .is_some_and(|position| array < *position && *position <= marker)
             })
         {
-            return false;
+            return None;
         }
         let handlers = self
             .exception_regions
@@ -13637,7 +13673,7 @@ impl LayoutAssembler {
             })
             || finalizers.len() != 1
         {
-            return false;
+            return None;
         }
         let (finalizer_index, finalizer) = finalizers[0];
         if finalizer.preserve_lasti
@@ -13645,14 +13681,16 @@ impl LayoutAssembler {
             || positions
                 .get(&finalizer.start)
                 .is_none_or(|position| *position >= array)
-            || self.uniform_exception_owner(array, array + 4, positions) != Some(finalizer_index)
+            || self.uniform_exception_owner(clear, clear + 4, positions) != Some(finalizer_index)
         {
-            return false;
+            return None;
         }
-        // Original cells: NOP, POP, POP, four name-clear records, finally POP,
-        // LOAD, TO_BOOL, branch. The compacted seven-record prefix appends its
-        // marker into original cell seven, the separately authenticated NULL POP.
-        true
+        // Without an earlier vacancy the marker reuses the unowned finalizer POP.
+        // Folding PUSH_NULL into LOAD_GLOBAL shifts that slot onto DELETE_FAST,
+        // which still belongs to the finalizer that protected the name clear.
+        Some(ExceptionOwnerDecision::override_with_region(
+            folded_null.then_some(finalizer_index),
+        ))
     }
 
     /// Resolves a copied break marker whose old cell precedes its whole cleanup.
