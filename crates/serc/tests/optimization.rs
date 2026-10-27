@@ -15184,6 +15184,31 @@ fn erased_coroutine_handler_assertions_preserve_manager_pop_block() {
 }
 
 #[test]
+fn conditional_arm_supplies_the_manager_exit_line() {
+    let lookup = r"def lookup(manager, ready, value):
+    with manager:
+        if ready:
+            return value
+        else:
+            try:
+                return fetch(value)
+            except LookupError:
+                pass
+";
+    let shared_exit = r"def observe(manager, ready, value):
+    with manager:
+        if True:
+            if ready:
+                visit(value)
+        else:
+            raise LookupError(value)
+";
+    for source in [lookup, shared_exit] {
+        assert_matches_cpython(source, "manager_conditional_exit.py", &LEVELS);
+    }
+}
+
+#[test]
 fn continuing_handler_supplies_the_manager_exit_line() {
     for handler in ["except LookupError:", "except LookupError as error:"] {
         let source = format!(
