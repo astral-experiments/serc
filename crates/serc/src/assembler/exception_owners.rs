@@ -8365,6 +8365,36 @@ impl LayoutAssembler {
                                             });
                                     first_unprotected_setup || unprotected_array_prefix
                                 });
+                            // A copied finalizer can discard an unprotected call result just
+                            // before a nested SETUP. The two cells immediately before its
+                            // protected suffix are that POP_TOP and the retained setup NOP.
+                            if instruction.opcode == NOT_TAKEN
+                                && owner_history_exact
+                                && pop_slot_epoch_known
+                                && tail.insertions == 0
+                                && tail.post_compaction_fusions == 0
+                                && tail.early_removals == setup_tail.early_removals
+                                && protected_original_instructions.checked_add(2)
+                                    == Some(stale_slots)
+                                && let Some(call) = start.checked_sub(3)
+                                && call >= original_array_start
+                                && retained_setup_nops.contains(&(start - 1))
+                                && self
+                                    .exception_owner_provenance
+                                    .ordinary_try_setups
+                                    .contains_key(&setup_label)
+                                && indexed_instructions[call].opcode == crate::target::opcodes::CALL
+                                && indexed_instructions[call + 1].opcode == POP_TOP
+                                && indexed_instructions[call + 1]
+                                    .local_policy
+                                    .hidden_exception_owner_slots()
+                                    == 0
+                                && self
+                                    .uniform_exception_owner(call + 1, call + 2, &label_positions)
+                                    .is_none()
+                            {
+                                proven_unprotected_slot = true;
+                            }
                             // Fusion leaves its newer stale tail after early compaction.
                             // If no later fusion changes this retained SETUP's coordinates,
                             // one slot before its protected suffix is the original NULL NOP.
