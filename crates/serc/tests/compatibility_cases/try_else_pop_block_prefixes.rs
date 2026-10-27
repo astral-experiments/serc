@@ -277,3 +277,15 @@ fn excludes_retained_conditional_pop_blocks_from_enclosing_tries() {
         assert_matches_cpython_marshal(&source, "conditional_pop_block_enclosing_owner.py");
     }
 }
+
+#[test]
+fn matches_terminal_while_try_else_backedges() {
+    for header in ["while True:", "while ready():"] {
+        for prefix in ["", "async "] {
+            let source = format!(
+                "{prefix}def entries():\n    {header}\n        try:\n            item = read()\n        except Empty:\n            break\n        else:\n            if item is not None:\n                yield item\n"
+            );
+            assert_matches_cpython_marshal(&source, "terminal_while_try_else_backedges.py");
+        }
+    }
+}
