@@ -950,15 +950,19 @@ impl ControlFlowState<'_> {
             .is_some_and(|context| context.iterator_cleanup != IteratorCleanup::None)
     }
 
-    /// Whether the loop backedge is reached without crossing a nested cleanup.
-    fn in_loop_tail_without_nested_cleanup(&self) -> bool {
-        self.loops.contexts.last().is_some_and(|context| {
-            !context.has_orelse
-                && context.with_depth == self.withs.active_with_exits.len()
+    /// Returns the innermost loop if a jump to its header crosses no cleanup.
+    fn loop_at_current_cleanup_depth(&self) -> Option<&LoopContext> {
+        self.loops.contexts.last().filter(|context| {
+            context.with_depth == self.withs.active_with_exits.len()
                 && context.finally_end_depth == self.finally.active_finally_end_blocks
                 && context.exception_region_depth
                     == self.exceptions.active_exception_region_exclusions.len()
         })
+    }
+
+    fn in_loop_tail_without_nested_cleanup(&self) -> bool {
+        self.loop_at_current_cleanup_depth()
+            .is_some_and(|context| !context.has_orelse)
     }
 
     pub(super) fn current_try_marker_is_shifted_to_ownerless_slot(
@@ -22642,114 +22646,14 @@ impl<'source> Compiler<'source> {
                     .exceptions
                     .active_exception_region_exclusions
                     .is_empty();
-            // A non-final arm's no-location exit is copied before jump threading for
-            // both iterator and while loops. The nested condition targets that forward
-            // exit even when a surrounding exception or suspension region protects both
-            // the loop and its backedge.
-            // Folded tests have no runtime edge to copy within a protected region.
-            // Exhaustion enters a loop-else suite separately from the continuing
-            // backedge. Keep its unprotected compound false edges on one forward exit.
-            // Erased coroutine arms retain that exit under the loop's saved owners.
-            // With no intervening cleanup, a live coroutine return keeps the
-            // non-final arm's false edges on their original forward exit.
-            let copied_coroutine_for_else_return = self.context.python_version
-                >= crate::PythonVersion::Py314
-                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                    == CO_COROUTINE
-                && self.control.withs.active_with_exits.is_empty()
-                && self.control.withs.active_with_region_exclusions.is_empty()
-                && self
-                    .control
-                    .exceptions
-                    .active_exception_region_exclusions
-                    .is_empty()
-                && !self.control.in_exception_handler()
-                && self.control.finally.is_inactive_for_return_unwind()
-                && statement.elif_else_clauses.is_empty()
-                && condition_has_linear_runtime_leaves(&statement.test)
-                && !expression_suspends_current_scope(&statement.test)
-                && !expression_yields_in_current_scope(&statement.test)
-                && matches!(statement.body.as_slice(), [Stmt::Return(returned)]
-                if returned.value.as_deref().is_none_or(|value| {
-                    !expression_contains_inline_branch(value)
-                        && !expression_suspends_current_scope(value)
-                        && !expression_yields_in_current_scope(value)
-                }));
-            // A break leaves the iterator, not the managers that predate it. Its
-            // non-final condition keeps the same forward exit before threading.
-            let copied_coroutine_for_else_break = self.context.python_version
-                >= crate::PythonVersion::Py314
-                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                    == CO_COROUTINE
-                && matches!(self.unit.scope, Scope::Function { .. })
-                && matches!(statement.body.as_slice(), [Stmt::Break(_)])
-                && statement.elif_else_clauses.is_empty()
-                && condition_has_linear_runtime_leaves(&statement.test)
-                && original_condition_has_unique_jump_target(&statement.test, true)
-                && !expression_suspends_current_scope(&statement.test)
-                && !expression_yields_in_current_scope(&statement.test)
-                && !self.control.in_exception_handler()
-                && self.control.exceptions.active_exception_group_handlers == 0
-                && self.control.finally.is_inactive_for_return_unwind()
-                && self
-                    .control
-                    .exceptions
-                    .active_exception_region_exclusions
-                    .is_empty()
-                && self.control.withs.active_with_exits.len()
-                    == self.control.withs.active_with_region_exclusions.len()
-                && self
-                    .control
-                    .withs
-                    .active_with_exits
-                    .iter()
-                    .all(|owner| owner.loop_depth < self.control.loops.contexts.len());
-            let copied_loop_else_branch_exit = non_final_branch
-                && self.control.loops.contexts.last().is_some_and(|context| {
-                    context.has_orelse
-                        && (context.iterator_cleanup != IteratorCleanup::Async
-                            || copied_coroutine_for_else_break)
-                        && context.continue_label == restart
-                        && context.with_depth == self.control.withs.active_with_exits.len()
-                        && context.finally_end_depth
-                            == self.control.finally.active_finally_end_blocks
-                        && context.exception_region_depth
-                            == self
-                                .control
-                                .exceptions
-                                .active_exception_region_exclusions
-                                .len()
-                })
-                && condition_has_only_runtime_tests(&statement.test)
-                && (self
-                    .control
-                    .loops
-                    .contexts
-                    .last()
-                    .is_some_and(|context| context.iterator_cleanup == IteratorCleanup::None)
-                    || (!self.has_active_control_flow_region()
-                        && condition_jump_target_count(&statement.test, false) > 1)
-                    || (self.unit.flags & CO_COROUTINE != 0
-                        && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
-                        && !self.control.in_exception_handler()
-                        && self.control.finally.is_inactive_for_return_unwind()
-                        && self.control.finally.active_finally_try_bodies == 0
-                        && statement.elif_else_clauses.is_empty()
-                        && condition_has_linear_runtime_leaves(&statement.test)
-                        && !expression_suspends_current_scope(&statement.test)
-                        && !expression_yields_in_current_scope(&statement.test)
-                        && original_condition_has_unique_jump_target(&statement.test, true)
-                        && original_condition_has_unique_jump_target(&statement.test, false)
-                        && !statement.body.is_empty()
-                        && statement
-                            .body
-                            .iter()
-                            .all(|part| self.context.is_elided_statement(part)))
-                    || copied_coroutine_for_else_return
-                    || copied_coroutine_for_else_break);
+            // The non-final arm reaches its original forward exit before jump
+            // threading. Only the backedge's owners matter here; loop exhaustion
+            // enters an else suite on a separate edge.
             let copied_loop_branch_exit = non_final_branch
-                && (self.control.in_loop_tail_without_nested_cleanup()
-                    || copied_loop_else_branch_exit)
+                && self
+                    .control
+                    .loop_at_current_cleanup_depth()
+                    .is_some_and(|context| context.continue_label == restart)
                 && (!self.has_active_control_flow_region()
                     || condition_has_only_runtime_tests(&statement.test));
             // Managers and protected tries entered before the iterator keep
@@ -23146,7 +23050,10 @@ impl<'source> Compiler<'source> {
                     return Ok(LoopBackedge::Emitted);
                 }
                 let copied_loop_branch_exit = non_final_branch
-                    && self.control.in_loop_tail_without_nested_cleanup()
+                    && self
+                        .control
+                        .loop_at_current_cleanup_depth()
+                        .is_some_and(|context| context.continue_label == restart)
                     && (!expression_contains_chained_comparison(test)
                         // A direct runtime chain has two false paths into this original
                         // exit: its comparison edge and the intermediate-value cleanup.
