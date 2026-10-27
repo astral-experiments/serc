@@ -2800,6 +2800,8 @@ impl OptimizationPipeline {
         };
         let mut local_return_cleanups = FxHashSet::default();
         let mut joins = Vec::new();
+        let mut finalizer_returns = Vec::new();
+        let mut label_offsets = None;
         for &(entry_label, join_label) in &self.exception_owner_provenance.normal_try_exits {
             let Some((entry, join)) = graph
                 .label_block(entry_label)
@@ -2827,23 +2829,15 @@ impl OptimizationPipeline {
                 || !instructions
                     .clone()
                     .all(|op| op.location != SourceLocation::NONE)
-                || instructions
-                    .map(Instruction::pre_fusion_width)
-                    .sum::<usize>()
-                    != 4
             {
                 continue;
             }
-            if unlocated_jump(entry) != Some(join) {
-                if let Some(donor) = self.nested_recovery_tuple_donor(entry, join, tail) {
-                    let tail_label = graph[tail].first_label().expect("original return target");
-                    joins.push((join, Some((entry, tail_label, donor))));
-                }
+            let width = instructions
+                .map(Instruction::pre_fusion_width)
+                .sum::<usize>();
+            if !matches!(width, 3 | 4) {
                 continue;
             }
-            // The two earlier jumps first copy the normal POP_BLOCK/JUMP array. By
-            // the time the join copies the return, its old jump is a fifth (NOP)
-            // slot. Later copies through the join therefore exceed CPython's limit.
             let mut incoming = graph
                 .iter()
                 .take_while(|(block, _)| *block != entry)
@@ -2856,9 +2850,83 @@ impl OptimizationPipeline {
                                 == Some(entry)
                     })
                 });
+            if width == 3 {
+                // Two normal try exits copy one another before the outer exit copies
+                // the three-slot return. Its old jump donates an unprotected NOP
+                // on the line of the finalizer that reached it.
+                if self.python_version >= crate::PythonVersion::Py314
+                    && unlocated_jump(entry) == Some(join)
+                    && self
+                        .exception_owner_provenance
+                        .normal_try_exits
+                        .iter()
+                        .any(|(from, to)| {
+                            graph.label_block(*from) == Some(join)
+                                && graph.label_block(*to) == Some(tail)
+                        })
+                    && let (Some((source, block)), None) = (incoming.next(), incoming.next())
+                    && block
+                        .items()
+                        .iter()
+                        .filter_map(Item::as_instruction)
+                        .next()
+                        .is_some_and(|op| {
+                            op.opcode == NOP && op.fusion_policy.is_converted_pop_block()
+                        })
+                    && block.last_instruction().is_some_and(|op| {
+                        op.location.line >= 0 && !op.jump_policy.is_interruptible()
+                    })
+                    && let Some(label) = graph[tail].first_label()
+                    && {
+                        let offsets = label_offsets.get_or_insert_with(|| {
+                            let mut offset = 0;
+                            let mut offsets = FxHashMap::default();
+                            for item in graph.iter_items() {
+                                match item {
+                                    Item::Label(label) => {
+                                        offsets.insert(*label, offset);
+                                    }
+                                    Item::Instruction(_) => offset += 1,
+                                }
+                            }
+                            offsets
+                        });
+                        let offset = offsets[&label];
+                        self.exception_regions.iter().all(|region| {
+                            offsets
+                                .get(&region.start)
+                                .zip(offsets.get(&region.end))
+                                .is_some_and(|(&start, &end)| !(start..end).contains(&offset))
+                        })
+                    }
+                {
+                    finalizer_returns.push(source);
+                }
+                continue;
+            }
+            if unlocated_jump(entry) != Some(join) {
+                if let Some(donor) = self.nested_recovery_tuple_donor(entry, join, tail) {
+                    let tail_label = graph[tail].first_label().expect("original return target");
+                    joins.push((join, Some((entry, tail_label, donor))));
+                }
+                continue;
+            }
+            // The two earlier jumps first copy the normal POP_BLOCK/JUMP array. By
+            // the time the join copies the return, its old jump is a fifth (NOP)
+            // slot. Later copies through the join therefore exceed CPython's limit.
             if incoming.nth(1).is_some() {
                 joins.push((join, None));
             }
+        }
+        for source in finalizer_returns {
+            let jump = self
+                .graph
+                .instructions_mut(source)
+                .next_back()
+                .expect("normal finalizer exit");
+            jump.set_exception_policy(super::super::ExceptionPolicy::EXCLUDE_ALWAYS);
+            jump.jump_policy.retain_nop();
+            jump.jump_policy.retain_redundant_nop_after_threading();
         }
         // The original POP_BLOCK, skip jump and two-slot local return fit in one
         // four-slot copy. Keep an adjacent authored break until it can copy them;
