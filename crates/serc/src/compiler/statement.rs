@@ -4200,16 +4200,27 @@ impl<'source> Compiler<'source> {
         {
             self.add_constant(constant)?;
         }
-        // A normal try exit and its handlers can both enter this break. 3.12
-        // and 3.13 copy the implicit return onto the break in their first pass,
-        // before deciding which of those earlier edges can copy it in turn.
-        let shared_try_break = self.context.python_version <= crate::PythonVersion::Py313
-            && matches!(statement.body.as_slice(), [.., Stmt::Try(protected), Stmt::Break(_)]
-                if !protected.is_star && !protected.handlers.is_empty() && protected.finalbody.is_empty());
-        let break_policy = if shared_try_break {
-            LoopBreakPolicy::Jump
-        } else {
-            LoopBreakPolicy::Return
+        // The normal try exit and its handlers share the break. 3.12 and 3.13
+        // first copy the implicit return onto the break. From 3.14, preserve
+        // the break until each normal arm of a complete conditional can copy it.
+        let break_policy = match statement.body.as_slice() {
+            [.., Stmt::Try(protected), Stmt::Break(_)]
+                if !protected.is_star
+                    && !protected.handlers.is_empty()
+                    && protected.finalbody.is_empty() =>
+            {
+                if self.context.python_version <= crate::PythonVersion::Py313 {
+                    LoopBreakPolicy::Jump
+                } else if matches!(protected.body.last(), Some(Stmt::If(branch))
+                    if branch.elif_else_clauses.last().is_some_and(|clause| clause.test.is_none())
+                        && if_normal_exit_count(branch) > 1)
+                {
+                    LoopBreakPolicy::PreserveJumpExit
+                } else {
+                    LoopBreakPolicy::Return
+                }
+            }
+            _ => LoopBreakPolicy::Return,
         };
         let context =
             self.loop_context(start, condition_false, IteratorCleanup::None, break_policy);
