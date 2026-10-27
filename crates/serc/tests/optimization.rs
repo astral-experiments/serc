@@ -15,6 +15,66 @@ use serc::{
 };
 
 #[test]
+fn coroutine_nested_guard_donates_its_line_after_assertion_removal() {
+    let source = r"async def sample(first, second, leaf):
+    if first:
+        if second:
+            raise ValueError
+        assert check()
+    else:
+        handle()
+    return leaf
+";
+    assert_matches_cpython_versions(
+        source,
+        "erased_guard.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+    let source = r"async def sample(first, second):
+    if first:
+        assert check()
+        if second:
+            assert check()
+        assert check()
+    else:
+        assert check()
+    finish()
+";
+    assert_matches_cpython_versions(
+        source,
+        "erased_inner_guard.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
+fn loop_exhaustion_after_an_erased_alternative_keeps_its_own_line() {
+    for body in [
+        "for item in items:\n                use(item)",
+        "while pending():\n                step()",
+    ] {
+        let source = format!(
+            "async def visit(active, enabled, items):
+    if active:
+        if enabled:
+            {body}
+    else:
+        assert enabled
+    finish()
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "guarded_loop.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn nested_conversion_handlers_keep_shared_cleanup() {
     let source = r"def sample(items):
     for item in items:

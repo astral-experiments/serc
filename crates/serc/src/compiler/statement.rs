@@ -5547,6 +5547,29 @@ impl<'source> Compiler<'source> {
         }
     }
 
+    /// A nested guard can inherit a line from direct fallthrough. A loop's
+    /// exhaustion joins the guard separately, so only its else suite can donate.
+    fn suite_has_direct_guard_line_donor(&self, mut body: &[Stmt]) -> bool {
+        loop {
+            match body
+                .iter()
+                .rfind(|part| !self.context.is_elided_statement(part))
+            {
+                Some(Stmt::For(statement)) => body = &statement.orelse,
+                Some(Stmt::While(statement)) => body = &statement.orelse,
+                Some(Stmt::If(_) | Stmt::Pass(_) | Stmt::Global(_) | Stmt::Nonlocal(_)) | None => {
+                    return false;
+                }
+                Some(Stmt::Expr(statement)) => return fold_constant(&statement.value).is_none(),
+                Some(Stmt::AnnAssign(statement)) => {
+                    return statement.value.is_some()
+                        || !matches!(statement.target.as_ref(), Expr::Name(_));
+                }
+                Some(_) => return true,
+            }
+        }
+    }
+
     /// Keeps each live branch's copied footer unlocated after an erased suffix.
     fn elided_fallthrough_if_tail<'a>(&self, body: &'a [Stmt]) -> Option<&'a Stmt> {
         if self.context.python_version < crate::PythonVersion::Py314
@@ -16700,7 +16723,44 @@ impl<'source> Compiler<'source> {
                             && condition_has_only_runtime_tests(test))
                             || (nested_else_has_donor
                                 && (erased_else || effective_nested_else_body.len() < body.len())));
-                    if erased_join_has_donor
+                    // An erased alternative leaves the nested condition's false edge
+                    // as the line donor. With a live else, a terminating inner arm
+                    // can supply that edge across a trailing erased assertion.
+                    let coroutine_guard_donor = self.context.python_version
+                        >= crate::PythonVersion::Py314
+                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                            == CO_COROUTINE
+                        && !self.control.in_loop()
+                        && !self.control.in_exception_handler()
+                        && self
+                            .control
+                            .exceptions
+                            .active_exception_region_exclusions
+                            .is_empty()
+                        && self.control.finally.is_inactive_for_return_unwind()
+                        && effective_nested_else_body.last().is_some_and(|last| {
+                            let Stmt::If(tail) = last else {
+                                return false;
+                            };
+                            if !original_condition_has_unique_jump_target(&tail.test, false) {
+                                return false;
+                            }
+                            let direct_donor = match tail.elif_else_clauses.as_slice() {
+                                [] => self.suite_has_direct_guard_line_donor(&tail.body),
+                                [clause] => {
+                                    clause.test.is_none()
+                                        && is_elided_suite(&tail.body)
+                                        && is_elided_suite(&clause.body)
+                                }
+                                _ => false,
+                            };
+                            (erased_else && direct_donor)
+                                || (effective_nested_else_body.len() < body.len()
+                                    && tail.elif_else_clauses.is_empty()
+                                    && suite_terminates_before_constant_folding(&tail.body))
+                        });
+                    if coroutine_guard_donor
+                        || erased_join_has_donor
                         || optimized_empty_both
                         || optimized_nested_else
                         || raising_else_join.is_some()
