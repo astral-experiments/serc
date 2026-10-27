@@ -49886,9 +49886,13 @@ fn suite_contains_nested_handler_cold_join(body: &[Stmt]) -> bool {
                 self.found = true;
                 return;
             }
+            // The nested recovery's exits thread past the loop's single-jump
+            // backedge. The empty original block stays in the warm order when
+            // the handler moves. A loop else follows iterator exhaustion and
+            // does not add a predecessor to that backedge.
             if matches!(statement, Stmt::For(iterator)
             if !iterator.is_async
-                && iterator.orelse.is_empty()
+                && (iterator.orelse.is_empty() || suite_has_nonsuspending_linear_fallthrough(&iterator.orelse))
                 && matches!(iterator.target.as_ref(), Expr::Name(_))
                 && !expression_contains_inline_branch(&iterator.iter)
                 && !expression_suspends_current_scope(&iterator.iter)
@@ -49897,7 +49901,11 @@ fn suite_contains_nested_handler_cold_join(body: &[Stmt]) -> bool {
                         && !recovery.is_star
                         && recovery.orelse.is_empty()
                         && recovery.finalbody.is_empty()
-                        && suite_has_nonsuspending_linear_fallthrough(&recovery.body)
+                        && (suite_has_nonsuspending_linear_fallthrough(&recovery.body)
+                            || recovery.body.split_last().is_some_and(|(last, prefix)| {
+                                matches!(last, Stmt::Break(_))
+                                    && (prefix.is_empty() || suite_has_nonsuspending_linear_fallthrough(prefix))
+                            }))
                         && !recovery.handlers.is_empty()
                         && recovery.handlers.iter().all(|handler| {
                             handler.as_except_handler().is_some_and(|handler| {
