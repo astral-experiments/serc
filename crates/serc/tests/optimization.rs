@@ -5898,6 +5898,12 @@ fn recovery_break_cleanup_keeps_its_empty_exit() {
 }
 
 #[test]
+fn compact_try_break_keeps_the_guards_fallthrough_line() {
+    let source = "def scan(text, pos):\n    while active:\n        try:\n            if text[pos]: break\n        except IndexError: pass\n        pos += 1\n    return pos\n";
+    assert_matches_cpython(source, "compact_try_break.py", &LEVELS);
+}
+
+#[test]
 fn runtime_nonterminal_break_preserves_cleanup_entry() {
     for condition in [
         "ready and other",
