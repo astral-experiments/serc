@@ -1944,45 +1944,54 @@ impl Compiler<'_> {
         &self,
         attribute: &ruff_python_ast::ExprAttribute,
     ) -> SourceLocation {
-        let location = self.source_location(attribute.range);
+        self.location_with_attribute_start(self.source_location(attribute.range), attribute)
+    }
+
+    /// CPython moves the start of a multiline attribute operation to the method name.
+    /// A parenthesized call can start before a callee that fits on a single line.
+    fn location_with_attribute_start(
+        &self,
+        location: SourceLocation,
+        attribute: &ruff_python_ast::ExprAttribute,
+    ) -> SourceLocation {
         if location.line == location.end_line {
-            location
+            return location;
+        }
+        let name = self.source_location(attribute.attr.range());
+        if location.line == name.end_line {
+            return location;
+        }
+        // CPython subtracts the normalized identifier's character count from a byte column.
+        let length = i32::try_from(attribute.attr.as_str().chars().count()).unwrap_or(i32::MAX);
+        let (column, end_column) = if length <= name.end_column {
+            (name.end_column - length, location.end_column)
         } else {
-            self.source_location(attribute.attr.range())
+            (-1, -1)
+        };
+        SourceLocation {
+            line: name.end_line,
+            column,
+            end_column,
+            ..location
         }
     }
 
     pub(super) fn call_opcode_location(&self, call: &ruff_python_ast::ExprCall) -> SourceLocation {
-        let Expr::Attribute(attribute) = call.func.as_ref() else {
-            return self.source_location(call.range());
-        };
-        let attribute_location = self.source_location(attribute.range);
-        if attribute_location.line == attribute_location.end_line {
-            return self.source_location(call.range());
+        let location = self.source_location(call.range());
+        if location.line == location.end_line || !call.func.is_attribute_expr() {
+            return location;
         }
-        self.call_opcode_location_with_method(
-            call,
-            self.call_shape(call).direct_method,
-            self.source_location(call.range()),
-        )
+        self.call_opcode_location_with_method(self.call_shape(call).direct_method, location)
     }
 
     pub(super) fn call_opcode_location_with_method(
         &self,
-        call: &ruff_python_ast::ExprCall,
         direct_method: Option<&ruff_python_ast::ExprAttribute>,
         fallback: SourceLocation,
     ) -> SourceLocation {
-        if let Some(attribute) = direct_method {
-            let attribute_location = self.source_location(attribute.range);
-            if attribute_location.line != attribute_location.end_line {
-                return self.source_location(ruff_text_size::TextRange::new(
-                    attribute.attr.range().start(),
-                    call.range().end(),
-                ));
-            }
-        }
-        fallback
+        direct_method.map_or(fallback, |attribute| {
+            self.location_with_attribute_start(fallback, attribute)
+        })
     }
 
     pub(super) fn call_shape<'a>(&self, call: &'a ruff_python_ast::ExprCall) -> CallShape<'a> {

@@ -3538,7 +3538,7 @@ impl Compiler<'_> {
             self.emit(PUSH_NULL, 0, 1)?;
         }
         let call_location =
-            self.call_opcode_location_with_method(call, shape.direct_method, call_location);
+            self.call_opcode_location_with_method(shape.direct_method, call_location);
         self.assembler.set_location(call_location);
 
         if !shape.has_starred
@@ -3664,7 +3664,7 @@ impl Compiler<'_> {
             }
         }
         let call_location =
-            self.call_opcode_location_with_method(call, shape.direct_method, call_location);
+            self.call_opcode_location_with_method(shape.direct_method, call_location);
         if !shape.has_starred
             && !shape.has_keyword_unpack
             && (direct_method || shape.positional_count + shape.keyword_count * 2 <= 30)
