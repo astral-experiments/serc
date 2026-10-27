@@ -5853,7 +5853,13 @@ impl OptimizationPipeline {
                                 return false;
                             }
                             let entry_labels = &graph[block].items()[..offset];
-                            self.exception_owner_provenance.normal_try_exits.iter()
+                            // The jump was the sole instruction in the original join.
+                            // At normal finalizer entry its same-line POP_BLOCK owns the event.
+                            (self.python_version >= crate::PythonVersion::Py314
+                                && crosses_exception_boundary
+                                && instruction.jump_policy.is_original_empty_join()
+                                && entry_labels.iter().all(|item| matches!(item, Item::Label(_))))
+                                || self.exception_owner_provenance.normal_try_exits.iter()
                                 .chain(&self.exception_owner_provenance.compound_try_owner_exits)
                                 .chain(&self.exception_owner_provenance.guarded_try_else_exits)
                                 .any(|(entry, end)| {

@@ -380,6 +380,39 @@ fn protected_value_match_with_multiple_handlers_locates_its_failure() {
 }
 
 #[test]
+fn normal_finalizer_entry_keeps_a_single_guard_line() {
+    let nested = r"def sample(items, ready, failed):
+    try:
+        try:
+            pass
+        finally:
+            for item in items:
+                if item is ready:
+                    pass
+            if failed:
+                raise Error
+    finally:
+        if ready:
+            pass
+";
+    let returning = r"def run(source, ready):
+    while active():
+        try:
+            value = (yield next_item(source))
+        except Error as error:
+            raise
+        else:
+            if ready(value):
+                return
+        finally:
+            source.close()
+";
+    for source in [nested, returning] {
+        assert_matches_cpython(source, "normal_finalizer_guard.py", &LEVELS);
+    }
+}
+
+#[test]
 fn nested_finalizer_guard_shares_the_manager_exit_line() {
     let source = r"def apply():
     with manager:

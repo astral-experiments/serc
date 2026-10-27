@@ -41242,9 +41242,7 @@ impl<'source> Compiler<'source> {
                     if guard.elif_else_clauses.is_empty()
                         && original_condition_has_unique_jump_target(&guard.test, false)
                         && suite_has_linear_raise_exit(&guard.body))
-                && matches!(self.control.finally.active_return_finally_contexts.as_slice(), [owner]
-                    if matches!(owner.body, [Stmt::Expr(cleanup)]
-                        if simple_cleanup_call(&cleanup.value)))
+                && self.control.finally.active_return_finally_contexts.len() == 1
             {
                 // The enclosing finalizer's POP_BLOCK owns the donated line. Removing this
                 // separate jump leaves its original array empty for borrowing.
