@@ -1959,6 +1959,26 @@ fn compound_handler_loop_exits_keep_separate_cleanup_copies() {
 }
 
 #[test]
+fn chained_loop_condition_copies_short_terminal_arms() {
+    let source = r"def search(low, value, high, items):
+    while ready(value):
+        if low <= value < high:
+            return value
+        elif value < low:
+            advance()
+        else:
+            retreat()
+    for item in items:
+        if low < item < high:
+            raise LookupError
+        else:
+            visit(item)
+    return None
+";
+    assert_matches_cpython(source, "chained_loop_terminal_arms.py", &LEVELS);
+}
+
+#[test]
 fn nested_recovery_reaches_a_separate_tuple_return() {
     let source = "def sample(flag, left, right):
     if flag:

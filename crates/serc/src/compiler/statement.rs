@@ -23497,7 +23497,12 @@ impl<'source> Compiler<'source> {
                                             },
                                             true,
                                             |compiler| {
-                                                let retained_exit = (try_body_normal_exit
+                                                // A short return or raise is copied onto the comparison's
+                                                // success edge before its failure POP_TOP moves.
+                                                let can_copy_exit = try_body_normal_exit
+                                                    || compiler.context.python_version
+                                                        >= crate::PythonVersion::Py314;
+                                                let retained_exit = (can_copy_exit
                                                     && matches!(
                                                         body,
                                                         [Stmt::Return(_) | Stmt::Raise(_)]
