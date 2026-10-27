@@ -3031,6 +3031,134 @@ impl OptimizationPipeline {
         }
     }
 
+    /// Keeps a four-slot tuple return unlocated when an earlier copy still enters its join.
+    fn clear_shared_tuple_return_locations(&mut self) {
+        let graph = &self.graph;
+        let exits = &self.exception_owner_provenance.normal_try_exits;
+        if self.python_version < crate::PythonVersion::Py314 || exits.is_empty() {
+            return;
+        }
+        let instructions =
+            |id: BasicBlockId| graph[id].items().iter().filter_map(Item::as_instruction);
+        let single_jump = |id| {
+            let mut ops = instructions(id);
+            let jump = ops.next()?;
+            (jump.opcode == JUMP_FORWARD && ops.next().is_none()).then_some(jump)
+        };
+        let target = |edge: &Instruction| graph.label_block(edge.forward_target()?);
+        let tuple_exit = |id| {
+            let jump = single_jump(id)?;
+            (jump.location.line >= 0
+                && original_local_tuple_return(graph[target(jump)?].items()).is_some())
+            .then_some(jump)
+        };
+        let forwarded = |to| {
+            graph
+                .iter()
+                .take_while(|(id, _)| *id != to)
+                .any(|(_, block)| {
+                    block
+                        .last_instruction()
+                        .is_some_and(|edge| edge.opcode == JUMP_FORWARD && target(edge) == Some(to))
+                })
+        };
+        let mut shared = Vec::new();
+        let mut cold_joins = FxHashSet::default();
+        let mut early_copies = Vec::new();
+        for &(normal_label, join_label) in exits {
+            let Some((normal, join)) = graph
+                .label_block(normal_label)
+                .zip(graph.label_block(join_label))
+            else {
+                continue;
+            };
+            let Some(bridge) = single_jump(join) else {
+                continue;
+            };
+            if bridge.location == SourceLocation::NONE {
+                // The try and handler copy this unlocated bridge before the tuple is copied.
+                // Their jumps still enter the next join alongside its physical fallthrough.
+                if let Some(next) = target(bridge)
+                    && let Some(exit) = tuple_exit(next)
+                    && graph.order().windows(2).any(|pair| {
+                        pair[1] == next
+                            && super::super::block_has_fallthrough(graph[pair[0]].items())
+                            && graph[pair[0]]
+                                .last_instruction()
+                                .is_some_and(|op| op.location == exit.location)
+                    })
+                {
+                    shared.push(next);
+                }
+                continue;
+            }
+            if tuple_exit(join).is_none()
+                || single_jump(normal).is_none_or(|edge| {
+                    edge.location.line < 0 || edge.forward_target() != Some(join_label)
+                })
+            {
+                continue;
+            }
+            let copied_normal = forwarded(normal);
+            let mut copied_cleanup = false;
+            let mut warm = Vec::new();
+            let mut guard = false;
+            for (id, block) in graph.iter() {
+                let Some(edge) = block.last_instruction() else {
+                    continue;
+                };
+                if target(edge) != Some(join) {
+                    continue;
+                }
+                if super::super::is_conditional_jump(edge.opcode)
+                    && edge.location == bridge.location
+                {
+                    guard = true;
+                } else if edge.opcode == JUMP_FORWARD {
+                    if instructions(id).all(|op| op.location == SourceLocation::NONE) {
+                        copied_cleanup |= forwarded(id);
+                    } else {
+                        warm.push(id);
+                    }
+                }
+            }
+            // The original POP_BLOCK/JUMP or an unlocated handler cleanup was copied
+            // before this four-slot return. Its old jump remains beside the guard.
+            if guard && (copied_normal || copied_cleanup) {
+                shared.push(join);
+                if !copied_normal
+                    && !exits
+                        .iter()
+                        .any(|(start, _)| graph.label_block(*start) == Some(join))
+                {
+                    // Located predecessors copy the original guard jump first. The cold
+                    // cleanup reaches it in the next round, after the tuple made it too large.
+                    let returned = bridge.operand();
+                    early_copies.extend(warm.into_iter().map(|source| (source, returned)));
+                    cold_joins.insert(join);
+                }
+            }
+        }
+        for (source, returned) in early_copies {
+            self.graph
+                .instructions_mut(source)
+                .next_back()
+                .expect("original warm exit")
+                .set_operand(returned);
+        }
+        for join in shared {
+            let jump = self
+                .graph
+                .instructions_mut(join)
+                .next()
+                .expect("original return join");
+            jump.location = SourceLocation::NONE;
+            if cold_joins.contains(&join) {
+                jump.jump_policy.prevent_threading_target();
+            }
+        }
+    }
+
     /// Restores original cleanup arrays for a closed ordinary-try/short-return graph.
     ///
     /// These records precede location propagation and NOP compaction in CPython. Keeping
@@ -3042,6 +3170,7 @@ impl OptimizationPipeline {
         if !self.graph.features().has_forward_jump() {
             return;
         }
+        self.clear_shared_tuple_return_locations();
         self.preserve_nested_recovery_returns();
         if self.exception_owner_provenance.normal_try_exits.is_empty()
             && self

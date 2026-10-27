@@ -1959,6 +1959,54 @@ fn compound_handler_loop_exits_keep_separate_cleanup_copies() {
 }
 
 #[test]
+fn tuple_return_joins_stay_unlocated_after_copying_try_exits() {
+    let source = r"def guarded(flag, left, right):
+    try:
+        if flag:
+            try:
+                if ready(left):
+                    update(left)
+                else:
+                    update(right)
+            except OSError:
+                recover()
+    except ValueError:
+        log()
+    return left, right
+
+
+def fallthrough(flag, ready, left, right):
+    if flag:
+        if ready:
+            try:
+                update(left)
+            except ValueError as error:
+                log(error)
+        else:
+            left = update(right)
+    else:
+        observe(right)
+    return left, right
+
+
+def recovered(flag, left, right, enabled):
+    if enabled:
+        if flag:
+            try:
+                touch(left)
+            except KeyError as error:
+                try:
+                    touch(left)
+                except ArithmeticError:
+                    touch(right)
+    else:
+        consume(right)
+    return left, right
+";
+    assert_matches_cpython(source, "shared_tuple_return_joins.py", &LEVELS);
+}
+
+#[test]
 fn nested_recovery_reaches_a_separate_tuple_return() {
     let source = "def sample(flag, left, right):
     if flag:
