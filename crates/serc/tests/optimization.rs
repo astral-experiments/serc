@@ -3720,6 +3720,30 @@ fn guarded_recovery_preserves_named_cleanup_entry() {
 }
 
 #[test]
+fn copied_bare_raise_keeps_the_remaining_try_guard_line() {
+    let source = r"async def run(flag):
+    try:
+        work()
+    except Error:
+        try:
+            if flag:
+                try:
+                    pass
+                finally:
+                    finish()
+        except Other as other:
+            recover()
+        raise
+";
+    assert_matches_cpython_versions(
+        source,
+        "guarded_try_reraise.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn guarded_reraise_retains_normal_cleanup_entry() {
     for prefix in [
         "",
