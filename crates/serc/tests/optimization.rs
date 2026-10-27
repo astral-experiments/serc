@@ -1244,6 +1244,29 @@ fn erased_named_handler_suffix_preserves_cleanup_copies() {
 }
 
 #[test]
+fn terminal_async_break_retains_original_borrow_boundary() {
+    let source = r"async def run(stream, ready, stop, resource):
+    try:
+        async for item in stream:
+            if ready:
+                pass
+            elif stop:
+                break
+    finally:
+        await resource.close()
+
+async def collect(stream, ready, stop, value):
+    async for item in stream:
+        if ready:
+            continue
+        elif stop:
+            break
+    return value, ready
+";
+    assert_matches_cpython(source, "terminal_async_break.py", &LEVELS);
+}
+
+#[test]
 fn async_iterator_exhaustion_keeps_copied_branch_exit() {
     for first in ["pass", "visit(item)", "if item: break"] {
         let source = format!(

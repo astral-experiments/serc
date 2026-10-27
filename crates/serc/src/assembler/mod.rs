@@ -7217,6 +7217,31 @@ impl Assembler {
         }
     }
 
+    /// Keeps the empty backedge after an async loop's terminal break in the borrow walk.
+    pub(crate) fn mark_terminal_async_break_borrow_boundary(&mut self, header: Label, exit: Label) {
+        let mut tail = self
+            .linear_items_mut()
+            .iter_mut()
+            .rev()
+            .filter_map(Item::as_instruction_mut)
+            .peekable();
+        let backedge =
+            tail.next_if(|edge| edge.opcode == JUMP_BACKWARD && edge.jump_target() == Some(header));
+        if let Some(jump) = tail.next()
+            && jump.fusion_policy.is_authored_break()
+            && jump.forward_target() == Some(exit)
+            && backedge.is_none_or(|edge| edge.location.line < 0 || edge.location == jump.location)
+            && tail.next().is_some_and(|discard| {
+                discard.opcode == POP_TOP && discard.location == jump.location
+            })
+        {
+            // The borrow barrier follows the removed jump onto the iterator discard.
+            // A live jump still reaches its target or a copied terminal exit.
+            jump.no_location_policy
+                .set_borrow_fallthrough(BorrowFallthrough::Barrier);
+        }
+    }
+
     /// Stops disconnected break fallthrough while retaining independent entries to the loop exit.
     pub(crate) fn prevent_borrow_loop_exit_reachability(&mut self, label: Label) {
         self.prevent_borrow_reachability(label);
