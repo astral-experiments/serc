@@ -15,6 +15,28 @@ use serc::{
 };
 
 #[test]
+fn nested_try_joins_the_named_handler_cleanup_before_its_return() {
+    let source = r"def lookup(obj, key):
+    if not obj:
+        try:
+            obj = outer()
+        except LookupError as error:
+            reset()
+            if key:
+                args = build()
+                if args:
+                    try:
+                        obj = inner()
+                    except ValueError:
+                        raise error
+                else:
+                    raise error
+    return obj
+";
+    assert_matches_cpython(source, "nested_try_handler_cleanup.py", &LEVELS);
+}
+
+#[test]
 fn handler_branches_keep_their_jump_when_a_tuple_return_enlarges_the_cleanup() {
     for handler in ["except ValueError:", "except ValueError as exc:"] {
         let source = format!(

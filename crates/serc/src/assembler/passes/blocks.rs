@@ -2094,9 +2094,15 @@ fn comprehension_assignment_exit_location(
 
 /// Original normal-try exits threaded through one authenticated shared branch join.
 pub(in crate::assembler) struct ThreadedNormalTryJoins {
-    entries: FxHashMap<Label, (Vec<Item>, Vec<Item>)>,
+    entries: FxHashMap<Label, ThreadedNormalTryJoin>,
     recoveries: FxHashMap<Label, NamedRecoveryCopy>,
     located_joins: FxHashMap<Label, (Label, Vec<Item>, Instruction)>,
+}
+
+struct ThreadedNormalTryJoin {
+    source: Vec<Item>,
+    target: Vec<Item>,
+    ordered_join: bool,
 }
 
 struct NamedRecoveryCopy {
@@ -2112,24 +2118,25 @@ struct NamedRecoveryCopy {
 impl ThreadedNormalTryJoins {
     /// Accepts only the captured source after one threading step and its unchanged target.
     fn matches(&self, graph: &BlockGraph, entry: Label, source: &[Item], target: &[Item]) -> bool {
-        self.entries
-            .get(&entry)
-            .is_some_and(|(expected_source, expected_target)| {
-                source == expected_source.as_slice() && target == expected_target.as_slice()
-            })
-            && (self
-                .located_joins
-                .get(&entry)
-                .is_some_and(|(join, items, condition)| {
-                    graph
-                        .label_block(*join)
-                        .is_some_and(|join| graph[join].items() == items)
-                        && graph
-                            .iter_items()
-                            .filter(|item| **item == Item::Instruction(*condition))
-                            .count()
-                            == 1
-                })
+        let Some(expected) = self.entries.get(&entry) else {
+            return false;
+        };
+        source == expected.source.as_slice()
+            && target == expected.target.as_slice()
+            && (expected.ordered_join
+                || self
+                    .located_joins
+                    .get(&entry)
+                    .is_some_and(|(join, items, condition)| {
+                        graph
+                            .label_block(*join)
+                            .is_some_and(|join| graph[join].items() == items)
+                            && graph
+                                .iter_items()
+                                .filter(|item| **item == Item::Instruction(*condition))
+                                .count()
+                                == 1
+                    })
                 || self.recoveries.values().any(|recovery| {
                     if recovery.normal_entry != entry {
                         return false;
@@ -4661,20 +4668,24 @@ impl OptimizationPipeline {
             ) {
                 continue;
             }
-            if join_jump.location != SourceLocation::NONE {
-                // A specialized None guard locates the otherwise empty join early.
-                // The normal try edge still visits that join before the shared name
-                // cleanup, whose return must be appended before this edge can copy it.
+            let capture = |ordered_join| {
                 let mut expected_source = graph[source].items().to_vec();
                 let Some(Item::Instruction(expected_jump)) = expected_source.last_mut() else {
                     unreachable!("captured normal try jump");
                 };
                 expected_jump.retarget(Operand::Forward(target));
                 expected_jump.add_pre_fold_extra_instructions(1);
-                entries.insert(
-                    entry,
-                    (expected_source, graph[target_block].items().to_vec()),
-                );
+                ThreadedNormalTryJoin {
+                    source: expected_source,
+                    target: graph[target_block].items().to_vec(),
+                    ordered_join,
+                }
+            };
+            if join_jump.location != SourceLocation::NONE {
+                // A specialized None guard locates the otherwise empty join early.
+                // The normal try edge still visits that join before the shared name
+                // cleanup, whose return must be appended before this edge can copy it.
+                entries.insert(entry, capture(false));
                 located_joins.insert(
                     entry,
                     (
@@ -4742,28 +4753,45 @@ impl OptimizationPipeline {
                         located_sources,
                     )
                 });
+            let returned = block_jump_target(graph[target_block].items())
+                .and_then(|label| graph.label_block(label))
+                .expect("captured named cleanup return");
+            let cleanup_precedes_return = positions[&join_block] < positions[&target_block]
+                && positions[&target_block] < positions[&returned];
+            // The first scan visits the branch join. By the next scan the named
+            // cleanup has already absorbed its located return and is too large to copy.
+            let ordered_join = cleanup_precedes_return
+                && self
+                    .exception_owner_provenance
+                    .source_boundaries
+                    .contains(&join)
+                && self
+                    .exception_owner_provenance
+                    .block_boundaries
+                    .contains(&join)
+                && positions[&source] < positions[&join_block]
+                && graph[target_block]
+                    .items()
+                    .iter()
+                    .filter_map(Item::as_instruction)
+                    .all(|instruction| instruction.location == SourceLocation::NONE);
             if !reachable[source.index()]
-                || !predecessors.get(&join).is_some_and(|incoming| {
-                    incoming.iter().any(|&other| {
-                        other != source
-                            && graph[other].last_instruction().is_some_and(|incoming| {
-                                incoming.depth_after() == jump.depth_after()
-                            })
-                    })
-                })
+                || (!ordered_join
+                    && !predecessors.get(&join).is_some_and(|incoming| {
+                        incoming.iter().any(|&other| {
+                            other != source
+                                && graph[other].last_instruction().is_some_and(|incoming| {
+                                    incoming.depth_after() == jump.depth_after()
+                                })
+                        })
+                    }))
             {
                 continue;
             }
             // The recovery half must be one original named cleanup split immediately
             // before its unlocated jump. Do not promote an independently entered tail.
             let mut captured_recovery = false;
-            let returned = block_jump_target(graph[target_block].items())
-                .and_then(|label| graph.label_block(label))
-                .expect("captured named cleanup return");
-            if join_jump.jump_policy.borrow_empty_block()
-                && positions[&join_block] < positions[&target_block]
-                && positions[&target_block] < positions[&returned]
-            {
+            if join_jump.jump_policy.borrow_empty_block() && cleanup_precedes_return {
                 for &other in predecessors.get(&join).into_iter().flatten() {
                     let Some(previous) = positions[&other].checked_sub(1) else {
                         continue;
@@ -4908,17 +4936,8 @@ impl OptimizationPipeline {
                     captured_recovery = true;
                 }
             }
-            if captured_recovery {
-                let mut expected_source = graph[source].items().to_vec();
-                let Some(Item::Instruction(expected_jump)) = expected_source.last_mut() else {
-                    unreachable!("captured normal try jump");
-                };
-                expected_jump.retarget(Operand::Forward(target));
-                expected_jump.add_pre_fold_extra_instructions(1);
-                entries.insert(
-                    entry,
-                    (expected_source, graph[target_block].items().to_vec()),
-                );
+            if captured_recovery || ordered_join {
+                entries.insert(entry, capture(ordered_join && !captured_recovery));
             }
         }
         ThreadedNormalTryJoins {
