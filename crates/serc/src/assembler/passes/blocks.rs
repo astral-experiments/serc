@@ -6296,6 +6296,36 @@ impl OptimizationPipeline {
                                 && graph.label_block(*join) == Some(target)
                         },
                     );
+            // A return can copy across an unlocated branch join, or past the original
+            // target of a normal try exit. A terminating predecessor leaves the guard
+            // as the only incoming edge that can donate a source location.
+            let guarded_return_join = self.python_version >= crate::PythonVersion::Py314
+                && inline_small_exit
+                && target_terminal_opcode == Some(RETURN_VALUE)
+                && target_chain_end == target_position
+                && source_position
+                    .checked_sub(1)
+                    .is_some_and(|i| !block_has_fallthrough(graph[order[i]].items()))
+                && graph[source].last_instruction().is_some_and(|jump| {
+                    if source_location.line < 0 {
+                        jump.no_location_policy.preserves_location()
+                            && jump.pre_fold_extra_instructions() == 0
+                            && graph[source].items().iter().any(|item| {
+                                matches!(item, Item::Label(label)
+                                if self.exception_owner_provenance.source_boundaries.contains(label)
+                                    && !self.borrow_block_aliases.contains(label))
+                            })
+                    } else {
+                        jump.pre_fold_extra_instructions() == 1
+                            && self.exception_owner_provenance.normal_try_exits.iter().any(
+                                |(entry, join)| {
+                                    graph.label_block(*entry) == Some(source)
+                                        && graph.label_block(*join) != Some(target)
+                                },
+                            )
+                    }
+                });
+            let retain_guard_nop = guarded_try_reraise || guarded_return_join;
             let guarded_match_return = inline_unprotected_return
                 && graph[source].items().iter().any(|item| {
                     matches!(item, Item::Label(label)
@@ -6307,8 +6337,8 @@ impl OptimizationPipeline {
                         && jump.jump_policy.is_original_empty_join()
                 });
             // A shared match return picks up its guard's line at the same point.
-            let source_location = if !planned_copy
-                && (guarded_match_return || guarded_try_reraise)
+            let guard_location = if !planned_copy
+                && (guarded_match_return || retain_guard_nop)
                 && remaining_predecessors[source.index()] == 1
                 && graph[source]
                     .items()
@@ -6317,7 +6347,7 @@ impl OptimizationPipeline {
                     .count()
                     == 1
                 && graph[source].last_instruction().is_some_and(|jump| {
-                    (guarded_try_reraise || !jump.no_location_policy.preserves_location())
+                    (retain_guard_nop || !jump.no_location_policy.preserves_location())
                         && jump.exception_policy() == ExceptionPolicy::default()
                 }) {
                 let mut incoming = jump_sources[source.index()]
@@ -6335,13 +6365,14 @@ impl OptimizationPipeline {
                     (Some(guard), None)
                         if is_conditional_jump(guard.opcode) && guard.location.line >= 0 =>
                     {
-                        guard.location
+                        Some(guard.location)
                     }
-                    _ => source_location,
+                    _ => None,
                 }
             } else {
-                source_location
+                None
             };
+            let source_location = guard_location.unwrap_or(source_location);
             let keyword_return_seam = original_keyword_return_seams.get(&source).filter(
                 |(original_target, source_items, target_items)| {
                     inline_small_exit
@@ -6763,7 +6794,7 @@ impl OptimizationPipeline {
                 || deferred_match_donor.is_some()
                 || (inline_small_exit
                     && (preserve_unlocated_join_nop
-                        || (guarded_try_reraise && source_location.line >= 0)
+                        || (retain_guard_nop && guard_location.is_some())
                         || preserve_threaded_join_nop
                         || preserve_single_fallthrough_match_nop
                         || preserve_final_pattern_nop
