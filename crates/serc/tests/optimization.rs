@@ -9761,6 +9761,24 @@ fn boolean_returns_preserve_enclosing_named_handler_owners() {
 }
 
 #[test]
+fn nested_handlers_protect_saved_return_values_after_iterator_cleanup() {
+    let source = r"def choose(value, items):
+    try:
+        first()
+    except ValueError:
+        try:
+            second()
+        except LookupError:
+            try:
+                for item in items:
+                    return value
+            except TypeError:
+                pass
+";
+    assert_matches_cpython(source, "nested_handlers_iterator_return.py", &LEVELS);
+}
+
+#[test]
 fn nested_handler_value_returns_protect_the_resumed_handler_swap() {
     let source = r"def read(key):
     try:

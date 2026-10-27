@@ -9063,47 +9063,6 @@ impl<'source> Compiler<'source> {
                                             <= outer.exception_region_depth
                                 })
                     );
-                // A newer ordinary try retires before this contiguous unnamed handler
-                // chain. Its SWAPs therefore belong to each handler's own cleanup, even
-                // when older managers, loops, or finally blocks still need unwinding.
-                let inner_try_before_nested_handlers = !return_is_overridden
-                    && handler_count > 1
-                    && self.control.exceptions.active_exception_group_handlers == 0
-                    && self.control.exceptions.active_try_marker_slots.len() == 1
-                    && self.control.finally.active_finally_end_blocks == 0
-                    && self.control.finally.active_normal_finally_bodies == 0
-                    && self.control.finally.active_copied_finally_bodies == 0
-                    && self
-                        .control
-                        .finally
-                        .active_return_finally_contexts
-                        .iter()
-                        .all(|context| context.handler_depth == 0)
-                    && self
-                        .control
-                        .exceptions
-                        .active_exception_handlers
-                        .iter()
-                        .enumerate()
-                        .all(|(index, handler)| {
-                            handler.name.is_none()
-                                && handler.try_body_depth == 0
-                                && handler.with_depth == self.control.withs.active_with_exits.len()
-                                && handler.loop_depth == self.control.loops.contexts.len()
-                                && handler.exception_region_depth
-                                    == self.control.exceptions.active_exception_handlers[0]
-                                        .exception_region_depth
-                                        + index
-                                && handler.body_cleanup == handler.common_cleanup
-                        })
-                    && self
-                        .control
-                        .exceptions
-                        .active_exception_region_exclusions
-                        .len()
-                        == self.control.exceptions.active_exception_handlers[handler_count - 1]
-                            .exception_region_depth
-                            + 2;
                 // Two contiguous handlers retire their own collectors before the ordinary
                 // try surrounding them. Each name is cleared after its own handler exits,
                 // while the enclosing handler or try still owns the cleanup. A while
@@ -10435,76 +10394,23 @@ impl<'source> Compiler<'source> {
                             self.assembler.mark_last_as_converted_pop_block();
                         }
                         if preserve_tos {
-                            // After a directly nested handler has restored the exception state,
-                            // this handler's own cleanup protects the value-preserving SWAP.
-                            let handlers = &self.control.exceptions.active_exception_handlers;
-                            let resumed_handler =
-                                handlers.get(handler_index + 1).is_some_and(|inner| {
-                                    inner.exception_region_depth == region_depth + 1
-                                        && inner.try_body_depth == try_body_depth
-                                        && inner.with_depth == with_depth
-                                        && inner.loop_depth == loop_depth
-                                        && inner.finally_end_depth
-                                            == handlers[handler_index].finally_end_depth
-                                });
-                            let common_cleanup_start = (name.is_some()
-                                || resumed_handler
-                                || ((handler_count == 1
-                                    || unwinds_plain_nested_handlers
-                                    || (unwinds_named_outer_unnamed_handlers
-                                        && handler_count == 2
-                                        && handler_index == 1)
-                                    || (nested_handlers_inside_older_iterator
-                                        && handler_index + 1 == handler_count)
-                                    || inner_try_before_nested_handlers)
-                                    && self
-                                        .control
-                                        .exceptions
-                                        .active_exception_region_exclusions
-                                        .len()
-                                        > 1
-                                    && ((!with_unwind_starts.is_empty()
-                                        && self.control.exceptions.active_exception_handlers
-                                            [handler_index]
-                                            .finally_end_depth
-                                            == self.control.finally.active_finally_end_blocks
-                                        && self
-                                            .control
-                                            .finally
-                                            .active_loop_finally_contexts
-                                            .iter()
-                                            .all(|context| context.handler_depth == 0))
-                                        || self
-                                            .control
-                                            .exceptions
-                                            .direct_try_body_statements
-                                            .contains(&statement.range)
-                                        || self.control.exceptions.active_try_marker_slots.len()
-                                            > try_body_depth)))
-                                .then(|| {
-                                    let start = self.assembler.label();
-                                    self.assembler.mark(start);
-                                    start
-                                });
+                            // Handler unwinding restores the saved value before popping
+                            // its cleanup block. That block still protects the SWAP.
+                            let start = self.assembler.label();
+                            self.assembler.mark(start);
                             self.emit(SWAP, 2, 0)?;
                             if shared_manager_return_cleanup {
                                 self.assembler.preserve_last_no_location();
                             }
-                            if let Some(common_cleanup_start) = common_cleanup_start {
-                                // A named-handler return always assigns this swap to the common cleanup.
-                                // A try body entered inside this handler is popped before SWAP,
-                                // even when an if or loop contains the return. The handler's saved
-                                // try depth identifies that boundary without relying on AST nesting.
-                                let common_cleanup_end = self.assembler.label();
-                                self.assembler.mark(common_cleanup_end);
-                                self.assembler.add_exception_region(
-                                    common_cleanup_start,
-                                    common_cleanup_end,
-                                    common_cleanup,
-                                    common_cleanup_depth,
-                                    true,
-                                );
-                            }
+                            let end = self.assembler.label();
+                            self.assembler.mark(end);
+                            self.assembler.add_exception_region(
+                                start,
+                                end,
+                                common_cleanup,
+                                common_cleanup_depth,
+                                true,
+                            );
                             if let Some((target, start)) = protected_outer_pop_except_start
                                 && target == handler_index
                             {
