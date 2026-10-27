@@ -13239,7 +13239,7 @@ impl Assembler {
             });
     }
 
-    /// Captures a constant coroutine return through one iterator or sync manager.
+    /// Captures the iterator and synchronous-manager cleanup before a constant return.
     pub(crate) fn record_copied_cleanup_return_none_prefix(
         &mut self,
         return_item: usize,
@@ -13278,15 +13278,28 @@ impl Assembler {
                 DELETE_FAST,
             ],
         };
-        if cleanup
-            .iter()
-            .map(|record| record.opcode)
-            .ne(expected.iter().copied())
+        let Some((first, rest)) = cleanup.split_first() else {
+            return;
+        };
+        let manager_iterators = if manager && !handler {
+            rest.iter()
+                .take_while(|record| record.opcode == POP_TOP)
+                .count()
+        } else {
+            0
+        };
+        let (iterator_pops, rest) = rest.split_at(manager_iterators);
+        if first.opcode != expected[0]
+            || rest
+                .iter()
+                .map(|record| record.opcode)
+                .ne(expected[1..].iter().copied())
             || prefix.first() != Some(&Item::Instruction(cleanup[0]))
             || cleanup[0].fusion_policy.is_converted_pop_block()
             || cleanup[0].location.line < 0
             || cleanup[0].value_argument() != Some(0)
-            || cleanup[0].depth_after() != Some(u32::from(manager) + 1 + u32::from(handler))
+            || first.depth_after().map(|depth| depth as usize)
+                != Some(usize::from(manager) + 1 + usize::from(handler) + manager_iterators)
             || cleanup.iter().enumerate().any(|(index, record)| {
                 record.local_policy.hidden_exception_owner_slots() != 0
                     || record.pre_fold_extra_instructions() != 0
@@ -13304,6 +13317,15 @@ impl Assembler {
             return;
         }
         if manager {
+            if iterator_pops.iter().enumerate().any(|(index, pop)| {
+                pop.location != first.location
+                    || pop.value_argument() != Some(0)
+                    || pop.depth_after().map(|depth| depth as usize)
+                        != Some(manager_iterators - index + 1)
+            }) {
+                return;
+            }
+            let cleanup = &cleanup[manager_iterators..];
             if cleanup[1].operand() != cleanup[2].operand()
                 || cleanup[2].operand() != cleanup[3].operand()
                 || cleanup[4].value_argument() != Some(3)
@@ -13378,7 +13400,19 @@ impl Assembler {
         {
             return;
         }
-        let Some(entry) = self.last_source_block_boundary(&items[..return_item]) else {
+        let entry = if manager_iterators == 0 {
+            self.last_source_block_boundary(&items[..return_item])
+        } else {
+            // The successful loop test can jump directly to the returning arm.
+            items[..return_item]
+                .iter()
+                .rev()
+                .find_map(|item| match item {
+                    Item::Label(label) => Some(*label),
+                    Item::Instruction(_) => None,
+                })
+        };
+        let Some(entry) = entry else {
             return;
         };
         self.exception_owner_provenance
@@ -13389,6 +13423,7 @@ impl Assembler {
                 manager,
                 handler,
                 iterator_try_pop_slot,
+                manager_iterators,
                 pop: *pop,
                 load: *load,
                 condition: *condition,

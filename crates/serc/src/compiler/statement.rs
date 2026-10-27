@@ -12989,11 +12989,9 @@ impl<'source> Compiler<'source> {
                     } else {
                         None
                     };
-                    // These coroutine returns have already emitted their exact iterator
-                    // or synchronous-manager cleanup. Capture its original cells without
-                    // changing the omitted POPs or any emitted instruction.
-                    let copied_cleanup_none_pop = (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                            == CO_COROUTINE
+                    // The return has already emitted its iterator or synchronous-manager cleanup.
+                    // Capture the original cells before the copied finalizer's condition.
+                    let copied_cleanup_none_pop = (self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
                         && !preserve_tos
                         && !return_is_overridden
                         && context_index == 0
@@ -13062,13 +13060,20 @@ impl<'source> Compiler<'source> {
                             {
                                 Some((self.assembler.item_count(), false, false, Some(2)))
                             }
-                            ([manager], [], handlers)
-                                if next_loop == 0
+                            ([manager], loops, handlers)
+                                if next_loop == loops.len()
                                     && !manager.is_async
                                     && manager.loop_depth == 0
                                     && manager.normal_finally_depth == 0
                                     && manager.exception_region_depth == 2
                                     && with_unwind_starts.iter().map(|unwind| unwind.index).eq([0])
+                                    && (loops.is_empty()
+                                        || (self.context.python_version == crate::PythonVersion::Py314
+                                            && handlers.is_empty()
+                                            && loops.iter().all(|context|
+                                                context.with_depth == 1
+                                                    && context.finally_end_depth == 0
+                                                    && context.exception_region_depth == 2)))
                                     && ((handlers.is_empty()
                                         && self.control.exceptions.active_try_marker_slots.len() == 1)
                                         || (self.control.exceptions.active_try_marker_slots.is_empty()

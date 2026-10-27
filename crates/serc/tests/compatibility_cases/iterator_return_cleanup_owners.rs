@@ -204,3 +204,22 @@ fn handler_returns_keep_outer_try_owner_through_iterators() {
         }
     }
 }
+
+#[test]
+fn returning_from_a_managed_iterator_keeps_the_finally_guards_handler() {
+    let source = r"def consume(resource, items, active, state):
+    try:
+        with resource:
+            for value in items:
+                if active:
+                    emit(value)
+                    return
+    except OSError:
+        recover()
+    finally:
+        if state is not None:
+            state.flush()
+        release()
+";
+    common::assert_matches_cpython_marshal(source, "managed_iterator_finally.py");
+}
