@@ -4934,6 +4934,19 @@ fn erased_async_manager_loop_keeps_empty_exit() {
 }
 
 #[test]
+fn class_footer_inherits_the_final_literal_in_a_conditional_arm() {
+    let source = r#"from __future__ import annotations
+class Entry:
+    if enabled:
+        label: str = get_label()
+        "Display name"
+    else:
+        label: str = fallback()
+"#;
+    assert_matches_cpython(source, "class_branch_literal.py", &LEVELS);
+}
+
+#[test]
 fn compound_while_breaks_preserve_managed_cleanup_borrowing() {
     let source = r#"class Sample:
     def sample(self):
