@@ -18722,6 +18722,7 @@ mod tests {
         for change in [
             "unchanged",
             "refined owner",
+            "refined owner without range exclusion",
             "refined dead handler",
             "refined live handler",
             "refined interior handler",
@@ -18816,6 +18817,7 @@ mod tests {
             match change {
                 "unchanged" => {}
                 "refined owner"
+                | "refined owner without range exclusion"
                 | "refined dead handler"
                 | "refined live handler"
                 | "refined interior handler"
@@ -18831,7 +18833,11 @@ mod tests {
                     let Item::Instruction(donor) = &mut assembler.items[1] else {
                         unreachable!()
                     };
-                    donor.set_exception_policy(ExceptionPolicy::normalized_owner(false));
+                    donor.set_exception_policy(if change == "refined owner without range exclusion" {
+                        ExceptionPolicy::normalized_owner(false)
+                    } else {
+                        ExceptionPolicy::AlwaysAbsent
+                    });
                     if change == "refined missing edge" {
                         assembler
                             .exception_owner_provenance
