@@ -15,6 +15,16 @@ use serc::{
 };
 
 #[test]
+fn large_percent_formats_observe_the_joined_string_stack_limit() {
+    let arguments = ["value"; 15].join(", ");
+    for suffix in ["", "!"] {
+        let format = format!("{}{suffix}", "|%r".repeat(15));
+        let source = format!("def render(value):\n    return '{format}' % ({arguments})\n");
+        assert_matches_cpython(&source, "render.py", &LEVELS);
+    }
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
