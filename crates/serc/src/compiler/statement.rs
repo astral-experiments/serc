@@ -30249,9 +30249,10 @@ impl<'source> Compiler<'source> {
                     // The nested cleanup jumps past this exit. The original
                     // conditional edge stays here and supplies its line.
                     ((!statement.orelse.is_empty() && direct_exit_location.is_some())
-                        || self
-                            .assembler
-                            .original_guarded_exit_has_empty_cleanup(location))
+                        || self.assembler.original_guarded_exit_has_cleanup(
+                            location,
+                            self.control.finally.active_finally_try_bodies > 0,
+                        ))
                     .then_some(location)
                 }
                 _ => None,

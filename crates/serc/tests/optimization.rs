@@ -15755,6 +15755,23 @@ fn discarded_conditions_copy_the_pop_with_its_try_owner() {
 }
 
 #[test]
+fn conditional_nested_finalizers_keep_the_guard_false_exit() {
+    let source = r"def clean(flag, finish):
+    try:
+        if flag:
+            try:
+                pass
+            finally:
+                finish()
+    except ValueError:
+        pass
+    finally:
+        pass
+";
+    assert_matches_cpython(source, "nested_finalizer_guard_exit.py", &LEVELS);
+}
+
+#[test]
 fn final_elif_after_recovery_keeps_each_false_backedge() {
     let source = "def sample(items, selected, first, second):
     for item in items:
