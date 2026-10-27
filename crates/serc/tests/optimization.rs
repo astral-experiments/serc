@@ -7377,6 +7377,29 @@ fn nested_tries_own_copied_finalizer_handler_cleanup() {
 }
 
 #[test]
+fn completed_nested_finalizer_keeps_the_try_exit_before_manager_cleanup() {
+    let source = r"async def choose(value):
+    async with manager:
+        try:
+            try:
+                return value
+            finally:
+                try:
+                    pass
+                finally:
+                    finish()
+        except Error as err:
+            recover()
+";
+    assert_matches_cpython_versions(
+        source,
+        "finalizer_before_manager_unwind.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn try_else_manager_returns_preserve_conditional_finalizer_entry() {
     let source = r"async def sample(manager, work, pending):
     try:
