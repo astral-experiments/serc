@@ -79,6 +79,19 @@ fn matches_cpython_completed_handler_for_borrowing() {
 }
 
 #[test]
+fn nested_loop_arms_keep_the_original_backedge_populated() {
+    for inner in [
+        "use(item)",
+        "if check(item):\n                    use(item)\n                else:\n                    save(item)",
+    ] {
+        let source = format!(
+            "def visit(items, key, flag):\n    try:\n        start()\n    except Error:\n        for item in items:\n            if flag:\n                {inner}\n            else:\n                keep(item)\n    if key is not None:\n        use(key)\n",
+        );
+        common::assert_matches_cpython_marshal(&source, "nested_handler_loop_backedge.py");
+    }
+}
+
+#[test]
 fn matches_cpython_complete_conditional_normal_finally_borrows() {
     for scope in 0..4 {
         let is_async = scope == 1 || scope == 3;
