@@ -1701,6 +1701,16 @@ impl Compiler<'_> {
             // The body and false edge share CPython's case-exit block. Small return exits
             // replace its jump before conditional threading is considered.
             let terminating_body = suite_terminates(&statement.body);
+            // Successful inner cases copy the exit before its line is assigned.
+            // A terminal irrefutable case leaves the outer condition as the only donor.
+            let nested_match_exit = self.context.python_version >= PythonVersion::Py314
+                && self.assembler.at_original_match_join()
+                && matches!(statement.body.last(), Some(Stmt::Match(nested))
+                    if nested.cases.split_last().is_some_and(|(last, earlier)|
+                        last.guard.is_none() && last.pattern.irrefutable_pattern().is_some()
+                            && suite_terminates(&last.body)
+                            && earlier.iter().all(|case| suite_terminates(&case.body)
+                                || suite_has_linear_borrow_fallthrough(&case.body))));
             // An ordinary try's normal and handled exits also leave this join by
             // unconditional jumps. Early small-return copying removes those edges
             // before the false condition donates its line to the original jump slot.
@@ -1711,7 +1721,7 @@ impl Compiler<'_> {
                     nested_if_exit_location(statement, false),
                     Some(NestedIfExitLocation::Located(_))
                 );
-            let unique_false_edge = (terminating_body || cleanup_exit)
+            let unique_false_edge = (terminating_body || nested_match_exit || cleanup_exit)
                 .then(|| unique_condition_jump_target(&statement.test, false))
                 .flatten();
             // 3.12 copies the following small return before resolving lines.
