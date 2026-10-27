@@ -1959,6 +1959,32 @@ fn compound_handler_loop_exits_keep_separate_cleanup_copies() {
 }
 
 #[test]
+fn erased_else_keeps_the_nested_fallthrough_line() {
+    let source = r"def apply(active, items):
+    if first(active) or second(active):
+        if choose(items):
+            for item in items:
+                process(item)
+        else:
+            process(items)
+    else:
+        assert False
+    if ready(items):
+        finish(items)
+";
+    for tail in [
+        "process(items)",
+        "for item in items:\n                process(item)",
+    ] {
+        assert_matches_cpython(
+            &source.replace("process(items)", tail),
+            "erased_else_fallthrough.py",
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn nested_recovery_reaches_a_separate_tuple_return() {
     let source = "def sample(flag, left, right):
     if flag:
