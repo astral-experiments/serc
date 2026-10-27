@@ -13048,6 +13048,7 @@ impl Assembler {
         ordinary: usize,
         managers: usize,
         named_handler: bool,
+        work_entry: Option<Label>,
     ) {
         use crate::target::opcodes::{CALL, DELETE_FAST, STORE_FAST};
         let items = self.linear_items();
@@ -13096,7 +13097,30 @@ impl Assembler {
             && final_pop.fusion_policy.is_converted_pop_block()
             && final_pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
         {
-            self.record_copied_setup_guard(pop + index + 1, missing_pops, ordinary + 1, true);
+            let start = pop + index + 1;
+            if let Some(entry) = work_entry {
+                // Intervening work separates the original SETUP from the unwind
+                // POPs. Only the SETUP itself can be certified as unowned here.
+                let mut cursor = start;
+                let mut has_work = false;
+                while let Some(item) = items.get(cursor) {
+                    if let Item::Instruction(record) = item {
+                        if record.opcode == NOP {
+                            break;
+                        }
+                        if record.jump_target().is_some() || ends_scope(record.opcode) {
+                            return;
+                        }
+                        has_work = true;
+                    }
+                    cursor += 1;
+                }
+                if has_work && items[start..cursor].contains(&Item::Label(entry)) {
+                    self.record_copied_setup_guard(cursor, missing_pops, 0, false, Some(entry));
+                }
+            } else {
+                self.record_copied_setup_guard(start, missing_pops, ordinary + 1, true, None);
+            }
         }
     }
 
@@ -13150,6 +13174,7 @@ impl Assembler {
                 3 + names.into_iter().filter(|named| *named).count(),
                 1,
                 false,
+                None,
             );
         }
     }
@@ -13161,6 +13186,7 @@ impl Assembler {
         missing_pops: usize,
         adjacent_pops: usize,
         transferred: bool,
+        work_entry: Option<Label>,
     ) {
         use crate::target::opcodes::{LOAD_FAST, LOAD_SMALL_INT, TO_BOOL};
         let mut suffix = self.linear_items()[start..]
@@ -13234,6 +13260,7 @@ impl Assembler {
             .copied_finalizer_setups
             .push(exception_owners::CopiedFinalizerSetup {
                 records,
+                work_entry,
                 missing_pops,
                 adjacent_pops,
             });

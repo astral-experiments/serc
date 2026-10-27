@@ -13186,7 +13186,7 @@ impl<'source> Compiler<'source> {
                                 && handler.exception_region_depth == ordinary_pops + 1);
                     let nested_setup_return = self.context.python_version
                         == crate::PythonVersion::Py314
-                        && matches!(finally_context.body.first(), Some(Stmt::Try(inner))
+                        && matches!(finally_context.body.iter().find(|stmt| !matches!(stmt, Stmt::Expr(_) | Stmt::Assign(_))), Some(Stmt::Try(inner))
                             if !inner.is_star && inner.handlers.is_empty() && !inner.finalbody.is_empty()
                                 && matches!(inner.body.first(),Some(Stmt::If(_))))
                         && !return_is_overridden
@@ -13461,6 +13461,13 @@ impl<'source> Compiler<'source> {
                     let active_try_bodies = self.control.finally.active_finally_try_bodies;
                     self.control.finally.active_finally_try_bodies =
                         finally_context.enclosing_finally_try_depth;
+                    let setup_work = (nested_setup_return
+                        && !matches!(finally_context.body.first(), Some(Stmt::Try(_))))
+                    .then(|| {
+                        let entry = self.assembler.label();
+                        self.assembler.mark(entry);
+                        entry
+                    });
                     self.control.finally.active_copied_finally_bodies += 1;
                     let result = self.with_control_override(
                         |control| &mut control.exceptions.prevent_try_exit_inlining,
@@ -13524,6 +13531,7 @@ impl<'source> Compiler<'source> {
                             ordinary_pops,
                             with_unwind_starts.len(),
                             named_setup_return,
+                            setup_work,
                         );
                     }
                     if result.is_ok()

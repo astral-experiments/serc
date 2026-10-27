@@ -4398,6 +4398,31 @@ fn continue_from_nested_handlers_keeps_the_finalizer_setup_unowned() {
 }
 
 #[test]
+fn straight_line_finalizer_work_keeps_the_following_setup_outside_its_own_handler() {
+    let source = r"def close(items, value):
+    try:
+        for item in items:
+            if item:
+                return
+    except LookupError:
+        recover()
+    finally:
+        value.close()
+        try:
+            if value is not None:
+                release(value)
+        finally:
+            finish()
+";
+    assert_matches_cpython_versions(
+        source,
+        "finalizer_work_before_setup.py",
+        &LEVELS,
+        &VERSIONS.map(|(version, _, _)| version),
+    );
+}
+
+#[test]
 fn named_handler_return_keeps_the_nested_finalizer_setup_unowned() {
     let source = r"def sample(items, flag, value):
     with lock():
