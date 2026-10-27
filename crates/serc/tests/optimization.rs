@@ -15,6 +15,25 @@ use serc::{
 };
 
 #[test]
+fn protected_wildcard_call_keeps_its_exit_line_before_another_try() {
+    let source = r"def select(value):
+    try:
+        match value:
+            case 0:
+                handle_zero()
+            case _:
+                fallback(value)
+    except ValueError:
+        recover()
+    try:
+        finish()
+    finally:
+        close()
+";
+    assert_matches_cpython(source, "case.py", &LEVELS);
+}
+
+#[test]
 fn nested_conversion_handlers_keep_shared_cleanup() {
     let source = r"def sample(items):
     for item in items:
