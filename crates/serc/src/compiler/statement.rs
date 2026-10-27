@@ -4665,6 +4665,21 @@ impl<'source> Compiler<'source> {
         })
     }
 
+    /// Finds the condition that supplies a terminal branch's implicit return location.
+    fn terminal_branch_return_range(&self, body: &[Stmt]) -> Option<TextRange> {
+        if self.context.python_version >= crate::PythonVersion::Py314
+            && let Some(Stmt::For(iterator)) = body.last()
+            && let Some(range) = loop_false_fallthrough_range(body)
+            && !suite_contains_loop_break(&iterator.body)
+        {
+            // Exhaustion enters the else guard. With no break, only the guard's
+            // false edge reaches the outer branch's return.
+            return Some(range);
+        }
+        suite_assert_success_fallthrough_range(body)
+            .or_else(|| suite_unary_not_fallthrough_range(body))
+    }
+
     fn compile_terminal_if(
         &mut self,
         statement: &ruff_python_ast::StmtIf,
@@ -5577,9 +5592,7 @@ impl<'source> Compiler<'source> {
                     {
                         // Let each incoming edge supply the shared return's location.
                         self.assembler.set_location(SourceLocation::NONE);
-                    } else if let Some(range) = suite_assert_success_fallthrough_range(body) {
-                        self.assembler.set_location(self.source_location(range));
-                    } else if let Some(range) = suite_unary_not_fallthrough_range(body) {
+                    } else if let Some(range) = self.terminal_branch_return_range(body) {
                         self.assembler.set_location(self.source_location(range));
                     } else if let Some(statement) = body
                         .last()
@@ -5675,9 +5688,7 @@ impl<'source> Compiler<'source> {
                     {
                         // Let each incoming edge supply the shared return's location.
                         self.assembler.set_location(SourceLocation::NONE);
-                    } else if let Some(range) = suite_assert_success_fallthrough_range(body) {
-                        self.assembler.set_location(self.source_location(range));
-                    } else if let Some(range) = suite_unary_not_fallthrough_range(body) {
+                    } else if let Some(range) = self.terminal_branch_return_range(body) {
                         self.assembler.set_location(self.source_location(range));
                     } else if let Some(statement) = body
                         .last()

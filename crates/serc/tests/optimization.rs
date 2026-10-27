@@ -8856,6 +8856,32 @@ fn managed_while_else_preserves_nested_branch_exits() {
 }
 
 #[test]
+fn exhausted_for_else_guard_supplies_terminal_branch_return_location() {
+    let source = r"def find(values, enabled, required):
+    if enabled:
+        for value in values:
+            if value:
+                return value
+        else:
+            if required:
+                raise LookupError()
+    else:
+        return required
+
+def check(values, enabled, required):
+    if enabled:
+        return enabled
+    else:
+        for value in values:
+            pass
+        else:
+            if required:
+                raise LookupError()
+";
+    assert_matches_cpython(source, "for_else_branch_return.py", &LEVELS);
+}
+
+#[test]
 fn coroutine_for_else_return_keeps_shared_branch_exit() {
     let source = r"async def sample(items, step, flag, left, right, third, work):
     for item in items:
