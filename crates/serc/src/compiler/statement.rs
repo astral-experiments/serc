@@ -16975,7 +16975,23 @@ impl<'source> Compiler<'source> {
                             .len()
                             == 1
                         && self.control.finally.active_finally_try_bodies == 0;
-                    if protected_shared_join {
+                    // The guard and the loop's original false edge share this jump.
+                    // A copied return or raise keeps it unlocated. With ordinary work
+                    // after the branches, each break can thread through to that work.
+                    let folded_loop_join = self.context.python_version
+                        >= crate::PythonVersion::Py313
+                        && (self.control.statements.context.followed_by_return_or_raise
+                            || (!self.control.statements.context.has_following
+                                && self
+                                    .control
+                                    .statements
+                                    .context
+                                    .inherited_followed_by_small_return))
+                        && matches!(branch_tail, Some(Stmt::If(guard))
+                            if guard.elif_else_clauses.is_empty()
+                                && matches!(guard.body.last(), Some(Stmt::While(tail))
+                                    if tail.orelse.is_empty() && early_condition_truthiness(&tail.test) == Some(true)));
+                    if protected_shared_join || folded_loop_join {
                         self.assembler.set_location(SourceLocation::NONE);
                     }
                     let branch_exit = if exclude_direct_try_body_exit
@@ -17025,6 +17041,9 @@ impl<'source> Compiler<'source> {
                         }
                         branch_exit
                     };
+                    if folded_loop_join {
+                        self.assembler.prevent_jump_threading_target(branch_exit);
+                    }
                     if discarded_if_exit
                         && !direct_try_body_exit
                         && self.assembler.last_instruction_location() == Some(SourceLocation::NONE)

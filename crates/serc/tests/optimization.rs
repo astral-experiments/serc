@@ -22240,6 +22240,38 @@ fn deferred_handler_return_replays_the_inner_finalizer_owner() {
 }
 
 #[test]
+fn a_folded_while_test_and_its_guard_share_the_copied_return() {
+    let source = r"def scan(start, ready, item):
+    if start:
+        if ready:
+            while True:
+                if finished(item):
+                    break
+                item = next_item()
+    else:
+        pass
+    return None
+";
+    assert_matches_cpython(source, "guarded_loop_return.py", &LEVELS);
+    let continued = source.replace("return None", "finish(item)");
+    for (index, version) in [(2, PythonVersion::Py314), (3, PythonVersion::Py315)] {
+        for level in LEVELS {
+            let [native, actual] =
+                compile_both(&continued, "guarded_loop_continuation.py", version, level);
+            assert_outputs_match(
+                probe(index).args([
+                    "-I",
+                    "-S",
+                    "-c",
+                    "import marshal, sys; sys.stdout.buffer.write(marshal.load(sys.stdin.buffer).co_consts[0].co_code)",
+                ]),
+                [&native, &actual],
+            );
+        }
+    }
+}
+
+#[test]
 fn folded_loop_exit_precedes_nested_finally_line_propagation() {
     for protected in [
         "with manager:\n            while True:\n                work()",
