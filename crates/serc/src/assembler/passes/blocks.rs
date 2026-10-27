@@ -544,13 +544,30 @@ fn block_is_bare_raise(items: &[Item], original_nop_targets: &FxHashSet<Label>) 
     }) && instructions.next().is_none()
 }
 
-/// Certifies a two-slot exit exposed by copying a bare raise after a local store.
-fn copied_raise_completes_local_store(source: &[Item], copied: &[Item]) -> bool {
+/// Certifies a bare raise copied after a local store, optionally preceded by its literal load.
+fn copied_raise_completes_local_store(
+    source: &[Item],
+    copied: &[Item],
+    allow_literal: bool,
+) -> bool {
     let Some((Item::Instruction(store), source_labels)) = source.split_last() else {
         return false;
     };
     let Some((Item::Instruction(raise), copied_labels)) = copied.split_last() else {
         return false;
+    };
+    let source_labels = match source_labels.split_last() {
+        Some((Item::Instruction(load), labels))
+            if allow_literal
+                && matches!(load.opcode, LOAD_CONST | LOAD_SMALL_INT)
+                && load.value_argument().is_some()
+                && load.location.line >= 0
+                && *load
+                    == Instruction::new(load.opcode, load.operand(), load.location, Some(2)) =>
+        {
+            labels
+        }
+        _ => source_labels,
     };
     source_labels
         .iter()
@@ -7687,7 +7704,24 @@ impl OptimizationPipeline {
                         matches!(item, Item::Label(label) if self.original_nop_targets.contains(label))
                     })
                 })
-                && copied_raise_completes_local_store(graph[source].items(), &copied);
+                && copied_raise_completes_local_store(
+                    graph[source].items(),
+                    &copied,
+                    self.python_version >= crate::PythonVersion::Py314,
+                );
+            if inline_stored_reraise
+                && !inline_unprotected_raise
+                && graph[source]
+                    .items()
+                    .iter()
+                    .find_map(Item::as_instruction)
+                    .is_some_and(|first| matches!(first.opcode, LOAD_CONST | LOAD_SMALL_INT))
+                && let Some(raise) = copied.iter_mut().find_map(Item::as_instruction_mut)
+            {
+                // The literal load, store, replaced jump and bare raise fill all four
+                // original slots. A subsequent copy must count that replaced jump.
+                raise.add_pre_fold_extra_instructions(1);
+            }
             // CPython appends a small, unprotected exit to its predecessor before inserting
             // superinstructions. A tuple/call or attribute store followed by a direct name
             // return can expose two local loads. Keeping the copied entry label would split them
@@ -11535,6 +11569,7 @@ mod represented_setup_nop_tests {
         let location = SourceLocation::new(2, 2, 0, 5);
         for variation in [
             "plain",
+            "literal",
             "cell store",
             "global store",
             "value raise",
@@ -11551,6 +11586,12 @@ mod represented_setup_nop_tests {
             let mut source = vec![Item::Label(label)];
             match variation {
                 "plain" => {}
+                "literal" => source.push(Item::Instruction(Instruction::new(
+                    LOAD_CONST,
+                    Operand::Value(1),
+                    location,
+                    Some(2),
+                ))),
                 "cell store" => store.opcode = STORE_DEREF,
                 "global store" => store.opcode = STORE_GLOBAL,
                 "value raise" => raise.set_operand(Operand::Value(1)),
@@ -11576,8 +11617,8 @@ mod represented_setup_nop_tests {
             source.push(Item::Instruction(store));
             let copied = [Item::Label(Label::from_u32(1)), Item::Instruction(raise)];
             assert_eq!(
-                copied_raise_completes_local_store(&source, &copied),
-                variation == "plain",
+                copied_raise_completes_local_store(&source, &copied, true),
+                matches!(variation, "plain" | "literal"),
                 "{variation}"
             );
         }
