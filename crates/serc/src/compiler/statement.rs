@@ -15490,9 +15490,13 @@ impl<'source> Compiler<'source> {
         let first_branch_is_always_true = jump_constant_truthiness(&statement.test) == Some(true);
         let mut first_branch_max_depth = None;
         for (branch_index, (test, body)) in branches.into_iter().enumerate() {
-            let declaration_only_body = body
-                .iter()
-                .all(|statement| matches!(statement, Stmt::Global(_) | Stmt::Nonlocal(_)));
+            let declaration_only_body = body.iter().all(|statement| {
+                matches!(statement, Stmt::Global(_) | Stmt::Nonlocal(_))
+                    || (matches!(self.unit.scope, Scope::Function { .. })
+                        && matches!(statement, Stmt::AnnAssign(annotation)
+                            if annotation.value.is_none()
+                                && matches!(annotation.target.as_ref(), Expr::Name(_))))
+            });
             if let Some(test) = test {
                 // CPython uses one original array for the false edge and the end
                 // of a final branch without an else suite.

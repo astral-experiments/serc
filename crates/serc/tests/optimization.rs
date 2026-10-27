@@ -7883,6 +7883,20 @@ fn recovery_finalizer_preserves_local_return_borrow_boundary() {
 }
 
 #[test]
+fn annotation_only_local_branches_emit_no_line_marker() {
+    let source = r"def choose(enabled, value):
+    if enabled:
+        item: int
+    if value:
+        item = int(value)
+    else:
+        item = 0
+    return item
+";
+    assert_matches_cpython(source, "annotation_only_branch.py", &LEVELS);
+}
+
+#[test]
 fn chained_comparison_copies_a_store_and_bare_raise() {
     let source = r"def classify(value):
     try:
