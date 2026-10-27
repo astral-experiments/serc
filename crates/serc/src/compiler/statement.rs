@@ -5547,6 +5547,29 @@ impl<'source> Compiler<'source> {
         }
     }
 
+    /// A nested guard can inherit a line from direct fallthrough. A loop's
+    /// exhaustion joins the guard separately, so only its else suite can donate.
+    fn suite_has_direct_guard_line_donor(&self, mut body: &[Stmt]) -> bool {
+        loop {
+            match body
+                .iter()
+                .rfind(|part| !self.context.is_elided_statement(part))
+            {
+                Some(Stmt::For(statement)) => body = &statement.orelse,
+                Some(Stmt::While(statement)) => body = &statement.orelse,
+                Some(Stmt::If(_) | Stmt::Pass(_) | Stmt::Global(_) | Stmt::Nonlocal(_)) | None => {
+                    return false;
+                }
+                Some(Stmt::Expr(statement)) => return fold_constant(&statement.value).is_none(),
+                Some(Stmt::AnnAssign(statement)) => {
+                    return statement.value.is_some()
+                        || !matches!(statement.target.as_ref(), Expr::Name(_));
+                }
+                Some(_) => return true,
+            }
+        }
+    }
+
     /// Keeps each live branch's copied footer unlocated after an erased suffix.
     fn elided_fallthrough_if_tail<'a>(&self, body: &'a [Stmt]) -> Option<&'a Stmt> {
         if self.context.python_version < crate::PythonVersion::Py314
@@ -16723,11 +16746,7 @@ impl<'source> Compiler<'source> {
                                 return false;
                             }
                             let direct_donor = match tail.elif_else_clauses.as_slice() {
-                                [] => tail
-                                    .body
-                                    .iter()
-                                    .rfind(|part| !self.context.is_elided_statement(part))
-                                    .is_some_and(|part| !matches!(part, Stmt::If(_))),
+                                [] => self.suite_has_direct_guard_line_donor(&tail.body),
                                 [clause] => {
                                     clause.test.is_none()
                                         && is_elided_suite(&tail.body)
