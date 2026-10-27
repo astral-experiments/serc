@@ -37424,12 +37424,10 @@ impl<'source> Compiler<'source> {
             // return can instead copy its small exit onto the loop breaks.
             self.assembler.preserve_last_no_location();
         }
-        if self.context.python_version == crate::PythonVersion::Py313
+        if self.context.python_version >= crate::PythonVersion::Py313
             && statement.handlers.is_empty()
             && !overriding_return
-            && matches!(statement.body.last(), Some(Stmt::With(manager))
-                if suite_terminates(&manager.body)
-                    && !suite_terminates_before_constant_folding(&manager.body))
+            && suite_ends_in_manager_with_folded_normal_exit(&statement.body)
         {
             // The manager's normal exit and suppression exit both reach this POP_BLOCK
             // before constant folding removes the infinite loop's normal exit.
@@ -40612,6 +40610,21 @@ impl<'source> Compiler<'source> {
                     self.assembler.mark_last_borrow_fallthrough_barrier();
                 }
             }
+            if self.context.python_version >= crate::PythonVersion::Py314
+                && matches!(body_noop, WithBodyExitNoop::ConvertedPopBlock)
+                && remaining.is_empty()
+                && matches!(body.last(), Some(Stmt::Try(statement))
+                    if !statement.is_star
+                        && statement.orelse.is_empty()
+                        && statement.finalbody.is_empty()
+                        && suite_ends_in_manager_with_folded_normal_exit(&statement.body)
+                        && statement.handlers.iter().all(|handler| handler.as_except_handler()
+                            .is_some_and(|handler| suite_terminates_before_constant_folding(&handler.body))))
+            {
+                // Both original manager exits thread through the try's normal
+                // jump before constant folding removes the ordinary exit.
+                self.assembler.preserve_last_no_location();
+            }
             let noop_end = self.assembler.label();
             self.assembler.mark(noop_end);
             self.control
@@ -42751,6 +42764,13 @@ fn with_body_continue_exit_donor(body: &[Stmt]) -> Option<(TextRange, u8)> {
         }
         _ => None,
     }
+}
+
+/// The manager's ordinary exit still reaches its join when CPython resolves lines.
+fn suite_ends_in_manager_with_folded_normal_exit(body: &[Stmt]) -> bool {
+    matches!(body.last(), Some(Stmt::With(manager))
+        if suite_terminates(&manager.body)
+            && !suite_terminates_before_constant_folding(&manager.body))
 }
 
 /// Recognizes the two original predecessors of a manager's folded while join.

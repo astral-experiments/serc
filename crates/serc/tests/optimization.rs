@@ -2479,6 +2479,38 @@ fn erased_loop_before_managed_dispatch_keeps_empty_exit() {
 }
 
 #[test]
+fn folded_manager_loop_preserves_shared_cleanup_locations() {
+    for (outer, cleanup) in [
+        (
+            "with outer",
+            "except LookupError:\n            return value",
+        ),
+        (
+            "async with outer",
+            "finally:\n            if value:\n                release()",
+        ),
+    ] {
+        let source = format!(
+            r"async def sample(outer, inner, value):
+    {outer}:
+        try:
+            async with inner:
+                while True:
+                    pass
+        {cleanup}
+    use(value)
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "folded_manager_cleanup.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn erased_async_manager_loop_keeps_empty_exit() {
     for source in [
         "async def sample(server, health, receipt):\n    async with runtime() as context:\n        try:\n            async with connect(context) as control:\n                while True:\n                    if receipt['kind'] == 'done':\n                        break\n                    assert receipt['kind'] == 'progress'\n                await wait(lambda: not server.tasks)\n        finally:\n            if health is not None:\n                await gather(health, return_exceptions=True)\n",
