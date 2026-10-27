@@ -154,3 +154,9 @@ fn matches_cpython_borrow_runtime_conditional_loop_branch_entry() {
         common::assert_matches_cpython_marshal(&source, "runtime_if_expression_loop_entry.py");
     }
 }
+
+#[test]
+fn runtime_conditional_arms_borrow_in_a_nested_loop_body() {
+    let source = "def visit(items, flag, key):\n    for item in items:\n        if isinstance(item, Value):\n            if item.value is not None if flag else key in item.values:\n                use(item)\n        else:\n            handle(key)\n";
+    common::assert_matches_cpython_marshal(source, "runtime_loop_condition.py");
+}
