@@ -1001,6 +1001,13 @@ impl OptimizationPipeline {
                 // Inlineable unlocated joins use the same flag for a later modern
                 // copy phase; they contain no native NOP and remain threadable here.
                 if !is_unconditional_jump(bridge.opcode)
+                    // In 3.13 a target's omitted NOPs still precede its jump until
+                    // the cleanup pass following jump threading.
+                    || (self.python_version == PythonVersion::Py313
+                        && self.graph[target].items().iter().map_while(|item| match item {
+                            Item::Label(label) => Some(label),
+                            Item::Instruction(_) => None,
+                        }).any(|label| self.exception_owner_provenance.legacy_early_copy_slots.contains_key(label)))
                     || (!bridge.jump_policy.allows_threading_target()
                         && !bridge.no_location_policy.allows_block_inlining())
                     // 3.13 does not thread conditional jumps through JUMP_NO_INTERRUPT.
