@@ -12340,9 +12340,9 @@ impl LayoutAssembler {
                     let Some(target) = instructions[marker - 1].forward_target() else {
                         return false;
                     };
-                    if !positions
+                    if positions
                         .get(&target)
-                        .is_some_and(|position| *position > marker)
+                        .is_none_or(|position| *position <= marker)
                     {
                         return false;
                     }
