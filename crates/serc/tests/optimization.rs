@@ -25977,3 +25977,24 @@ fn short_circuit_value_after_manager_entries_uses_the_prior_handler() {
 ";
     assert_matches_cpython(source, "manager_value_guard.py", &LEVELS);
 }
+
+#[test]
+fn loop_else_preserves_a_shared_conditional_exit() {
+    let source = r"def scan(items, enabled, ready, retry):
+    if enabled:
+        for item in items:
+            consume(item)
+        else:
+            if ready:
+                finish()
+            else:
+                prepare()
+                if retry:
+                    for item in items:
+                        record(item)
+    else:
+        skip()
+    flush()
+";
+    assert_matches_cpython(source, "loop_else_exit.py", &LEVELS);
+}

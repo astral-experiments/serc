@@ -16799,15 +16799,17 @@ impl<'source> Compiler<'source> {
                             self.control.statements.context.has_following || finalizer_exit,
                         )
                         .or_else(|| self.elided_else_exit_location(statement)),
-                        // The loop's else can leave its own shared partial-if join.
-                        // Break edges bypass that original join during exit copying.
+                        // A partial condition in the loop's else can share its exit
+                        // with an elif or a nested fallthrough. Breaks bypass this join.
                         Stmt::For(loop_statement) if !loop_statement.is_async => {
                             loop_statement.orelse.last().and_then(|tail| match tail {
                                 Stmt::If(tail)
-                                    if tail.elif_else_clauses.is_empty()
-                                        && condition_has_only_runtime_tests(&tail.test) =>
+                                    if condition_has_only_runtime_tests(&tail.test)
+                                        && tail.elif_else_clauses.iter().all(|clause| {
+                                            clause.test.as_ref().is_none_or(condition_has_only_runtime_tests)
+                                        }) =>
                                 {
-                                    nested_if_exit_location(tail, false).filter(|location| {
+                                    nested_if_exit_location(tail, true).filter(|location| {
                                         matches!(location, NestedIfExitLocation::Unlocated)
                                     })
                                 }
