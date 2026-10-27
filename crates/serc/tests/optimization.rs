@@ -6809,7 +6809,7 @@ fn continue_copies_inner_cleanup_inside_an_enclosing_finalizer() {
 
 #[test]
 fn guard_after_finalizer_recovery_copies_continue_edge() {
-    let source = r#"def sample(items, ready, enabled, active, value):
+    let source = r"def sample(items, ready, enabled, active, value):
     for value in items:
         try:
             if ready:
@@ -6823,7 +6823,7 @@ fn guard_after_finalizer_recovery_copies_continue_edge() {
                     record(error)
             if value == 4:
                 act(value)
-"#;
+";
     assert_matches_cpython(source, "guard_after_recovery.py", &LEVELS);
 }
 
