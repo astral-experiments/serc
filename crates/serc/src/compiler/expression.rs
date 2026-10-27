@@ -8482,14 +8482,12 @@ impl Compiler<'_> {
         };
         self.assembler.set_location(location);
         if folded_prefix {
-            // CPython folds the leading constant load and its boolean jump, but retains the
-            // jump as a source-position NOP when the next operand starts on another line.
+            // Folding the constant and its value-preserving jump empties their original
+            // block. A line NOP on the following operand comes from its separate POP_TOP.
             let empty_folded_block = self.assembler.at_empty_borrow_block();
             self.emit(NOP, 0, 0)?;
             if empty_folded_block {
-                // Removing the sole folded value test empties its original array.
-                // A retained line NOP still permits borrowing through that array.
-                self.assembler.mark_last_nop_borrow_barrier_if_removed();
+                self.assembler.mark_last_borrow_fallthrough_barrier();
             }
         }
         let base_depth = self.control.stack.depth;

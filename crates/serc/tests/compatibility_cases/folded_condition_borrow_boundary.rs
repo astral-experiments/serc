@@ -56,3 +56,13 @@ fn matches_cpython_folded_elif_with_pending_chain_join() {
         common::assert_matches_cpython_marshal(&source, filename);
     }
 }
+
+#[test]
+fn folded_value_prefix_keeps_its_empty_block_before_a_line_nop() {
+    for prefix in ["None\n        or", "True\n        and"] {
+        let source = format!(
+            "def f(value, flag):\n    return (\n        first(value)\n        if flag\n        else {prefix} value.open()\n    )\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "folded_value_borrow.py");
+    }
+}
