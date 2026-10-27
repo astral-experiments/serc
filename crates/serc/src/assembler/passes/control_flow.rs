@@ -6209,9 +6209,9 @@ impl OptimizationPipeline {
                             instruction.jump_policy.mark_borrow_empty_block();
                         }
                         if ownerless_compound_exit {
-                            // Only this unchanged original jump survived as the normal-exit NOP.
-                            // Copied, retargeted, and still-live exits retain their own owners.
-                            instruction.set_exception_owner(NormalizedExceptionOwner::Absent);
+                            // The setup donated its location to this jump. Its NOP stays
+                            // outside every exception range, including a surrounding setup.
+                            instruction.set_exception_policy(ExceptionPolicy::AlwaysAbsent);
                         }
                         if let Some(donor) = module_annotation_donor {
                             self.exception_owner_provenance

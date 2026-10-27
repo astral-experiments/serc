@@ -4870,7 +4870,7 @@ impl LayoutAssembler {
                     });
                 if ownerless_compound_exit {
                     // Redundant-jump removal already restores this captured POP_BLOCK owner.
-                    retired_jump.set_exception_owner(NormalizedExceptionOwner::Absent);
+                    retired_jump.set_exception_policy(super::ExceptionPolicy::AlwaysAbsent);
                 }
                 compound_try_exit = *previous == retired_jump
                     && start.checked_sub(2).is_some_and(|index| {

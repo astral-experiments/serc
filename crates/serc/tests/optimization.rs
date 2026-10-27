@@ -22466,6 +22466,21 @@ fn erased_conditionals_preserve_repeated_join_predecessors_in_suspended_scopes()
 }
 
 #[test]
+fn erased_assertion_keeps_its_try_setup_outside_the_outer_handler() {
+    let source = r"def read(value, ready):
+    try:
+        try:
+            assert ready
+        except ValueError:
+            pass
+        result = convert(value=value)
+    except LookupError:
+        pass
+";
+    assert_matches_cpython(source, "erased_try_setup.py", &LEVELS);
+}
+
+#[test]
 fn empty_try_before_manager_cleanup_keeps_its_exit_unowned() {
     let source = "def f(manager):\n    try:\n        prepare()\n        with manager as resource:\n            resource.first()\n            resource.second()\n            try:\n                assert resource.check()\n            except Error:\n                pass\n        after()\n    finally:\n        finish()\n";
     for (index, source) in [
