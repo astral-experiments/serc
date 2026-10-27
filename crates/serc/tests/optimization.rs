@@ -5698,6 +5698,16 @@ fn linear_retry_else_stops_borrowed_continuation() {
 }
 
 #[test]
+fn loop_control_pops_the_inner_try_before_leaving_its_manager() {
+    for exit in ["break", "continue"] {
+        let source = format!(
+            "async def scan(items, manager):\n    try:\n        for item in items:\n            async with manager:\n                try:\n                    {exit}\n                except ValueError:\n                    recover()\n    finally:\n        finish()\n"
+        );
+        assert_matches_cpython(&source, "loop_manager_exit.py", &LEVELS);
+    }
+}
+
+#[test]
 fn surviving_break_reaches_cleanup_inside_nested_managers() {
     for (header, manager, work) in [
         ("def", "with", "resource.run()"),

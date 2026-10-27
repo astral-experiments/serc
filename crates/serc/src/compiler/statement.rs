@@ -7081,34 +7081,7 @@ impl<'source> Compiler<'source> {
                         self.assembler.mark_last_as_converted_pop_block();
                     }
                 }
-                if self.control.withs.active_with_exits.len() > context.with_depth
-                    && self
-                        .control
-                        .withs
-                        .active_with_exits
-                        .last()
-                        .is_some_and(|manager| {
-                            manager.exception_region_depth
-                                < self
-                                    .control
-                                    .exceptions
-                                    .active_exception_region_exclusions
-                                    .len()
-                        })
-                    && self.control.exceptions.active_exception_handlers.is_empty()
-                    && self.control.finally.active_loop_finally_contexts.is_empty()
-                    && self.control.finally.active_finally_try_bodies == 0
-                    && self.control.finally.active_finally_end_blocks == 0
-                    && self.control.finally.active_normal_finally_bodies == 0
-                    && self.control.finally.active_copied_finally_bodies == 0
-                {
-                    // As for continue, an ordinary try inside an exited manager
-                    // first unwinds POP_BLOCK at the authored break location.
-                    // NOP compaction retains this NULL-owned record in place of
-                    // the preceding authored marker before the manager exit.
-                    self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
-                    self.assembler.mark_last_as_converted_pop_block();
-                }
+                self.emit_loop_control_manager_try_pop(context)?;
                 let retained_finally_end_depth = self.loop_retained_finally_end_depth(context);
                 let defer_finally_end = retained_finally_end_depth > context.finally_end_depth;
                 let finally_end_unwind_starts =
@@ -7795,34 +7768,7 @@ impl<'source> Compiler<'source> {
                 if let Some((origin, target)) = continued_none_cleanup_origin {
                     self.assembler.record_early_return_nop_pair(origin, target);
                 }
-                if self.control.withs.active_with_exits.len() > context.with_depth
-                    && self
-                        .control
-                        .withs
-                        .active_with_exits
-                        .last()
-                        .is_some_and(|manager| {
-                            manager.exception_region_depth
-                                < self
-                                    .control
-                                    .exceptions
-                                    .active_exception_region_exclusions
-                                    .len()
-                        })
-                    && self.control.exceptions.active_exception_handlers.is_empty()
-                    && ((self.control.finally.active_loop_finally_contexts.is_empty()
-                        && self.control.finally.active_finally_try_bodies == 0)
-                        || self.loop_finalizers_follow_innermost_manager_exit())
-                    && self.control.finally.active_finally_end_blocks == 0
-                    && self.control.finally.active_normal_finally_bodies == 0
-                    && self.control.finally.active_copied_finally_bodies == 0
-                {
-                    // Unwinding an ordinary try inside an exited manager emits POP_BLOCK
-                    // at the continue location, before the manager changes that location.
-                    // NOP compaction keeps this unowned record, not the authored marker.
-                    self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
-                    self.assembler.mark_last_as_converted_pop_block();
-                }
+                self.emit_loop_control_manager_try_pop(context)?;
                 let retained_finally_end_depth = self.loop_retained_finally_end_depth(context);
                 let defer_finally_end = retained_finally_end_depth > context.finally_end_depth;
                 let finally_end_unwind_starts =
@@ -19917,6 +19863,40 @@ impl<'source> Compiler<'source> {
                             if self.source_location(comparison.first_operand().range()).line
                                 == self.source_location(none.range).line))
                 && matches!(guard.body.as_slice(), [Stmt::Try(cleanup)] if !cleanup.is_star))
+    }
+
+    /// Emits the ordinary try's POP_BLOCK before a loop exit calls its manager.
+    fn emit_loop_control_manager_try_pop(
+        &mut self,
+        context: LoopContext,
+    ) -> Result<(), CompileError> {
+        let managers = &self.control.withs.active_with_exits;
+        let finally = &self.control.finally;
+        if managers.len() > context.with_depth
+            && managers.last().is_some_and(|manager| {
+                manager.exception_region_depth
+                    < self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .len()
+            })
+            && self.control.exceptions.active_exception_handlers.is_empty()
+            && finally.active_finally_try_bodies == finally.active_loop_finally_contexts.len()
+            && finally
+                .active_loop_finally_contexts
+                .iter()
+                .all(|finalizer| finalizer.with_depth < managers.len())
+            && finally.active_finally_end_blocks == 0
+            && finally.active_normal_finally_bodies == 0
+            && finally.active_copied_finally_bodies == 0
+        {
+            // Finalizers entered before the manager are unwound after it, if at all.
+            // The inner try's POP_BLOCK replaces the same-line break or continue NOP.
+            self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
+            self.assembler.mark_last_as_converted_pop_block();
+        }
+        Ok(())
     }
 
     /// Counts the original `POP_BLOCK` records before a direct loop-control finalizer.
