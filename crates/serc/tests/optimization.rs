@@ -19428,6 +19428,32 @@ fn named_handler_loop_cleanup_after_elided_assertions_matches_cpython() {
 }
 
 #[test]
+fn exceptional_finally_returns_restore_the_outer_owner_after_the_stack_swaps() {
+    for (body, cleanup, outer) in [
+        (
+            "work(value)",
+            "if ready:\n                return value",
+            "except ValueError:\n        failed()",
+        ),
+        ("return value", "return value", "finally:\n        finish()"),
+    ] {
+        let source = format!(
+            r"def run(value, ready):
+    try:
+        try:
+            {body}
+        except KeyError as error:
+            recover()
+        finally:
+            {cleanup}
+    {outer}
+"
+        );
+        assert_matches_cpython(&source, "exceptional_finally_stack.py", &LEVELS);
+    }
+}
+
+#[test]
 fn exceptional_finally_return_unwinds_managers_in_order() {
     const FINALLY: &str = r"def f(outer, inner, work, cleanup):
     with outer:
