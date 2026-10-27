@@ -6675,6 +6675,23 @@ fn conditional_handler_return_preserves_normal_finally_borrows() {
 }
 
 #[test]
+fn nested_iterators_copy_the_return_after_guarded_recovery() {
+    let source = r"async def sample(items, value, ok):
+    for group in items:
+        for item in group:
+            try:
+                return value
+            finally:
+                if ok:
+                    try:
+                        finish()
+                    except ValueError as error:
+                        save(error)
+";
+    assert_matches_cpython(source, "nested_iterator_return.py", &LEVELS);
+}
+
+#[test]
 fn conditional_iterator_return_copies_preserve_locations_and_owners() {
     let source = r"async def sample(items, manager, state):
     try:
