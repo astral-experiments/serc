@@ -15,6 +15,19 @@ use serc::{
 };
 
 #[test]
+fn copied_finalizer_guard_can_use_a_returned_lists_handler() {
+    // Keep the local stores separate and fold two binary operations before the return.
+    let mut extra = String::new();
+    for index in 0..17 {
+        write!(extra, ", arg{index}").unwrap();
+    }
+    let source = format!(
+        "def choose(key{extra}):\n    try:\n        if skip():\n            return None\n        value = prepare(amount=19 * 31 * 700)\n        state = 1\n        return [value]\n    except ValueError:\n        raise\n    finally:\n        try:\n            selection = key.x if key else None\n            report(selection)\n        except KeyError:\n            recover()\n"
+    );
+    assert_matches_cpython_versions(&source, "case.py", &LEVELS, &[PythonVersion::Py314]);
+}
+
+#[test]
 fn nested_conversion_handlers_keep_shared_cleanup() {
     let source = r"def sample(items):
     for item in items:
