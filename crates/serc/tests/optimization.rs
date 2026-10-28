@@ -25977,3 +25977,37 @@ fn short_circuit_value_after_manager_entries_uses_the_prior_handler() {
 ";
     assert_matches_cpython(source, "manager_value_guard.py", &LEVELS);
 }
+
+#[test]
+fn normal_finalizers_borrow_locals_after_guarded_handler_exits() {
+    let source = r"def reset(settings, skip):
+    try:
+        result = work()
+    except ValueError:
+        if skip:
+            return 0
+        result = fallback()
+    finally:
+        restore(**settings)
+    return result
+
+def finish(resource, lock, items):
+    try:
+        work()
+    except ValueError:
+        with lock:
+            ready = resource in items
+        if not ready:
+            raise
+        record()
+    finally:
+        with resource.lock:
+            release()
+";
+    assert_matches_cpython_versions(
+        source,
+        "guarded_handler_locals.py",
+        &LEVELS,
+        &[PythonVersion::Py314],
+    );
+}

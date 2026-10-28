@@ -38131,10 +38131,40 @@ impl<'source> Compiler<'source> {
                             && context.finally_end_depth == 0
                             && context.exception_region_depth == 0))
                     && managed_guarded_raise_has_finally_route(statement)));
+        // The surviving false edge in a typed handler goes through POP_EXCEPT to
+        // the populated normal finalizer. Cold relocation preserves that route.
+        let guarded_handler_fallthrough = self.context.python_version
+            == crate::PythonVersion::Py314
+            && synchronous_recovery
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && !self.has_active_control_flow_region()
+            && self.control.loops.contexts.is_empty()
+            && !statement.is_star
+            && !statement.handlers.is_empty()
+            && statement.orelse.is_empty()
+            && suite_has_nonsuspending_linear_fallthrough(&statement.body)
+            && (self.suite_has_nonempty_borrow_entry(&statement.finalbody)
+                || matches!(statement.finalbody.first(), Some(Stmt::If(branch))
+                    if condition_has_linear_runtime_leaves(&branch.test)
+                        && !expression_suspends_current_scope(&branch.test)))
+            && statement
+                .handlers
+                .split_last()
+                .is_some_and(|(last, earlier)| {
+                    earlier.iter().all(|handler| {
+                        handler.as_except_handler().is_some_and(|handler| {
+                            handler.type_.is_some()
+                                && suite_has_nonsuspending_linear_fallthrough(&handler.body)
+                        })
+                    }) && last.as_except_handler().is_some_and(|handler| {
+                        handler.type_.is_some() && handler_has_guarded_normal_exit(&handler.body)
+                    })
+                });
         let normal_finally_is_borrow_reachable = (simple_fallthrough_handlers_reach_finally
             || compound_fallthrough_handlers_reach_finally
             || runtime_while_handlers_reach_finally)
             && (!has_empty_handler_or_else_exit || else_bypasses_empty_handler_exit)
+            || guarded_handler_fallthrough
             || managed_runtime_while_return_reaches_finally
             || runtime_retry_break_reaches_finally
             || conditional_body_reaches_finally
@@ -53343,6 +53373,33 @@ fn loop_recovery_has_nonempty_finally_route(
 }
 
 // Runtime re-raise guards keep their false successors connected to handler cleanup.
+/// Finds the normal exit past a conditional raise or a return of a constant.
+fn handler_has_guarded_normal_exit(body: &[Stmt]) -> bool {
+    let mut has_guard = false;
+    let falls_through = body.iter().all(|part| match part {
+        Stmt::If(guard) => {
+            has_guard = true;
+            guard.elif_else_clauses.is_empty()
+                && condition_has_linear_runtime_leaves(&guard.test)
+                && !expression_suspends_current_scope(&guard.test)
+                && (suite_has_linear_raise_exit(&guard.body)
+                    || matches!(guard.body.as_slice(), [Stmt::Return(exit)]
+                        if exit.value.as_deref().is_none_or(|value| fold_constant(value).is_some())))
+        }
+        Stmt::With(manager) => !manager.is_async
+            && manager.items.len() == 1
+            && !expression_contains_inline_branch(&manager.items[0].context_expr)
+            && suite_has_nonsuspending_linear_fallthrough(&manager.body),
+        Stmt::Assign(assignment) if matches!(assignment.targets.as_slice(), [Expr::Name(_)]) =>
+            !expression_suspends_current_scope(&assignment.value)
+                && (!expression_contains_inline_branch(&assignment.value)
+                    || matches!(assignment.value.as_ref(), Expr::BoolOp(_)
+                        if condition_has_linear_runtime_leaves(&assignment.value))),
+        _ => suite_has_nonsuspending_linear_fallthrough(std::slice::from_ref(part)),
+    });
+    falls_through && has_guard
+}
+
 // Linear work may separate guards; copied returns and folded tests need other proofs.
 fn suite_has_linear_reraise_guards(body: &[Stmt]) -> bool {
     suite_has_reraise_guards(body, condition_has_linear_runtime_leaves)
