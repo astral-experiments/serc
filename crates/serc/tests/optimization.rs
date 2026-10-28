@@ -15,6 +15,23 @@ use serc::{
 };
 
 #[test]
+fn a_nested_handler_preserves_the_normal_exits_trailing_pass() {
+    let source = r"def scan(items):
+    try:
+        work()
+        pass
+    except:
+        for item in items:
+            try:
+                consume(item)
+            except:
+                break
+    finish()
+";
+    assert_matches_cpython(source, "nested_handler_trailing_pass.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
