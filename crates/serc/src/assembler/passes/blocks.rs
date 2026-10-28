@@ -222,6 +222,8 @@ fn original_tuple_return_join(
 
 /// Recognizes the store, call, or deletion slots that keep a copied reraise shared.
 fn is_full_reraise_predecessor(items: &[Item]) -> bool {
+    use crate::target::opcodes::{STORE_DEREF, STORE_GLOBAL, STORE_NAME};
+
     let Some(first) = items
         .iter()
         .position(|item| matches!(item, Item::Instruction(_)))
@@ -231,17 +233,26 @@ fn is_full_reraise_predecessor(items: &[Item]) -> bool {
     matches!(
         &items[first..],
         [Item::Instruction(first), Item::Instruction(second), Item::Instruction(third), Item::Instruction(jump)]
-            if matches!((first.opcode, second.opcode, third.opcode),
-                (LOAD_CONST | LOAD_SMALL_INT, LOAD_FAST, STORE_ATTR)
-                | (LOAD_FAST, LOAD_CONST | LOAD_SMALL_INT, STORE_SUBSCR)
-                | (BUILD_LIST | BUILD_MAP | BUILD_SET | BUILD_TUPLE
-                        | DICT_UPDATE | LIST_EXTEND | SET_UPDATE, CALL, POP_TOP))
-                && jump.opcode == JUMP_FORWARD
+            if jump.opcode == JUMP_FORWARD
                 && [first, second, third, jump].iter().all(|instruction| {
-                    instruction.location.line >= 0
-                        && instruction.pre_fold_extra_instructions() == 0
+                    instruction.pre_fold_extra_instructions() == 0
                         && instruction.local_policy.hidden_exception_owner_slots() == 0
                 })
+                && [second, third, jump].iter().all(|instruction| instruction.location.line >= 0)
+                && ((first.location.line >= 0
+                    && matches!((first.opcode, second.opcode, third.opcode),
+                        (LOAD_CONST | LOAD_SMALL_INT, LOAD_FAST, STORE_ATTR)
+                            | (LOAD_FAST, LOAD_CONST | LOAD_SMALL_INT, STORE_SUBSCR)
+                            | (BUILD_LIST | BUILD_MAP | BUILD_SET | BUILD_TUPLE
+                                | DICT_UPDATE | LIST_EXTEND | SET_UPDATE, CALL, POP_TOP)))
+                    // The finalizer's POP_BLOCK also counts before the literal store.
+                    || (first.opcode == NOP
+                        && first.fusion_policy.is_converted_pop_block()
+                        && first.location == SourceLocation::NONE
+                        && matches!(second.opcode, LOAD_CONST | LOAD_SMALL_INT)
+                        && matches!(third.opcode, STORE_FAST | STORE_DEREF | STORE_GLOBAL | STORE_NAME)
+                        && second.location.line == third.location.line
+                        && second.location.line == jump.location.line))
     ) || matches!(
         &items[first..],
         [Item::Instruction(object), Item::Instruction(delete), Item::Instruction(jump)]

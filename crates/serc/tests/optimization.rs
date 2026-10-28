@@ -15,6 +15,24 @@ use serc::{
 };
 
 #[test]
+fn nested_finalizers_keep_the_shared_store_and_reraise() {
+    let source = r"def recover(flag):
+    global dirty
+    try:
+        work()
+    finally:
+        try:
+            if flag:
+                left()
+            else:
+                right()
+        finally:
+            dirty = False
+";
+    assert_matches_cpython(source, "shared_finally_store.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
