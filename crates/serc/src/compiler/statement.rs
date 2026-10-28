@@ -7330,6 +7330,11 @@ impl<'source> Compiler<'source> {
                         && self
                             .assembler
                             .at_original_shared_copied_finally_break_join();
+                    let copied_handler_break = self.context.python_version
+                        >= crate::PythonVersion::Py314
+                        && has_copied_finalizer
+                        && context.iterator_cleanup == IteratorCleanup::None
+                        && self.assembler.at_original_shared_handler_join();
                     let break_jump =
                         self.emit_jump_forward_instruction(JUMP_FORWARD, context.break_label)?;
                     // A manager unwind followed by a shared copied-finally join
@@ -7345,6 +7350,13 @@ impl<'source> Compiler<'source> {
                         self.assembler.prevent_jump_threading_target(break_jump);
                     }
                     self.assembler.mark_jump_as_authored_break(break_jump);
+                    if copied_handler_break {
+                        // The finalizer's normal and handled exits copy the original
+                        // interruptible break before either handler moves to a cold block.
+                        self.assembler
+                            .prepare_no_location_block_for_inlining(break_jump);
+                        self.assembler.mark_jump_as_interruptible(break_jump);
+                    }
                     self.assembler.record_copied_finally_break_head(
                         break_jump,
                         context.break_label,

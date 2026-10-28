@@ -1,6 +1,24 @@
 use crate::common;
 
 #[test]
+fn finalizer_handler_copies_the_interruptible_while_break() {
+    let source = r"def scan(active, flag):
+    while active:
+        try:
+            work()
+            if flag:
+                break
+        finally:
+            try:
+                cleanup()
+            except LookupError:
+                pass
+    finish()
+";
+    common::assert_matches_cpython_marshal(source, "handled_finalizer_break.py");
+}
+
+#[test]
 fn matches_cpython_copied_finally_continue_handler_jumps() {
     for (definition, footer) in [
         ("def", ""),
