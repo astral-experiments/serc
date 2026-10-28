@@ -38146,6 +38146,8 @@ impl<'source> Compiler<'source> {
                         matches!(part, Stmt::If(guard)
                             if guard.elif_else_clauses.is_empty()
                                 && condition_has_only_runtime_tests(&guard.test)
+                                // A chained comparison drops its saved operand on a separate edge.
+                                && !expression_contains_chained_comparison(&guard.test)
                                 && matches!(guard.body.as_slice(), [Stmt::Raise(raised)] if raised.exc.is_none()))
                     })
                 })
