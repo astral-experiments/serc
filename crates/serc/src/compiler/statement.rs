@@ -42270,7 +42270,7 @@ impl<'source> Compiler<'source> {
                 // Terminal arms lose their unreachable exits before line propagation. The
                 // final elif's sole false edge then locates the converted manager POP_BLOCK.
                 body_noop = Some(WithBodyExitNoop::Located(exit_test.range()));
-            } else if let Some(Stmt::Assert(statement)) = body.last() {
+            } else if let Some(statement) = with_exit_assertion(self.context.python_version, body) {
                 if condition_jump_target_count(&statement.test, true) == 1
                     && original_condition_has_unique_jump_target(&statement.test, true)
                 {
@@ -45393,6 +45393,25 @@ fn with_body_has_terminal_manager_suppression(body: &[Stmt]) -> bool {
                 && manager.items.len() == 1
                 && matches!(manager.body.last(), Some(Stmt::Return(_) | Stmt::Raise(_))))
             || with_body_has_terminal_manager_suppression(&statement.body))
+}
+
+/// Returns the assertion whose success edge alone reaches the manager's normal exit.
+fn with_exit_assertion(
+    version: crate::PythonVersion,
+    body: &[Stmt],
+) -> Option<&ruff_python_ast::StmtAssert> {
+    let (loop_body, otherwise) = match body.last()? {
+        Stmt::Assert(assertion) => return Some(assertion),
+        Stmt::For(statement) => (&statement.body, &statement.orelse),
+        Stmt::While(statement) => (&statement.body, &statement.orelse),
+        _ => return None,
+    };
+    let Stmt::Assert(assertion) = otherwise.last()? else {
+        return None;
+    };
+    // A break bypasses the else suite and gives the exit another predecessor.
+    (version >= crate::PythonVersion::Py314 && !suite_contains_loop_break(loop_body))
+        .then_some(assertion)
 }
 
 // CPython converts the POP_BLOCK after every synchronous with body into an unowned NOP.

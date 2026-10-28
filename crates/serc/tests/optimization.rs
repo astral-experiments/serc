@@ -25977,3 +25977,42 @@ fn short_circuit_value_after_manager_entries_uses_the_prior_handler() {
 ";
     assert_matches_cpython(source, "manager_value_guard.py", &LEVELS);
 }
+
+#[test]
+fn loop_else_assertions_locate_the_normal_manager_exit() {
+    let source = r"def scan(items, manager, flag):
+    with manager:
+        for item in items:
+            consume(item)
+        else:
+            assert flag
+
+def stop_early(items, manager, flag):
+    with manager:
+        for item in items:
+            if item:
+                break
+        else:
+            assert flag
+
+async def collect(items, first, second, ready):
+    with first, second:
+        async for item in items:
+            consume(item)
+        else:
+            assert ready
+
+def retry(manager, ready):
+    with manager:
+        while pending():
+            update()
+        else:
+            assert ready
+";
+    assert_matches_cpython_versions(
+        source,
+        "manager_loop_assertion.py",
+        &[OptimizationLevel::Zero],
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
