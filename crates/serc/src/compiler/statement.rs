@@ -3852,10 +3852,10 @@ impl<'source> Compiler<'source> {
                                     || self.control.statements.terminal_if_branch_has_forward_exit))
                             && !expression_suspends_current_scope(&assignment.value))
                         || body.last().map(Ranged::range) == Some(assignment.range))
-                    // A local attribute annotation emits no extra work. The receiver,
-                    // store and arm jump still make the copied return five original slots.
-                    || (has_later_arm
-                        && matches!(self.unit.scope, Scope::Function { .. })
+                    // An annotated attribute store has the same original boundary.
+                    // A jumping arm's copied exit has five slots; a falling-through
+                    // arm reaches the separate enclosing return block.
+                    || (matches!(self.unit.scope, Scope::Function { .. })
                         && matches!(statement, Stmt::AnnAssign(assignment)
                             if matches!(assignment.target.as_ref(), Expr::Attribute(attribute)
                                 if matches!(attribute.value.as_ref(), Expr::Name(_)))

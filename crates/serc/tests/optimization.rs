@@ -25943,7 +25943,11 @@ fn conditional_attribute_store_keeps_its_return_boundary_with_an_annotation() {
     else:
         obj.result = value
 ";
-    for source in [source.to_owned(), source.replace(": str", "")] {
+    for source in [
+        source.to_owned(),
+        source.replace(": str", ""),
+        source.replace("    else:\n        obj.result = value\n", ""),
+    ] {
         assert_matches_cpython(&source, "conditional_attribute_store.py", &LEVELS);
     }
 }
