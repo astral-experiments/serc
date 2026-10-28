@@ -15184,6 +15184,39 @@ fn erased_coroutine_handler_assertions_preserve_manager_pop_block() {
 }
 
 #[test]
+fn folded_normal_edges_keep_the_manager_exit_unlocated() {
+    let source = r"def guarded(manager, visit):
+    with manager:
+        try:
+            visit()
+        except LookupError:
+            pass
+        else:
+            assert False
+
+def consume(outer, inner, receive, finish):
+    with outer:
+        with inner:
+            try:
+                while True:
+                    receive()
+            finally:
+                finish()
+";
+    assert_matches_cpython(source, "manager_exit.py", &LEVELS);
+}
+
+#[test]
+fn continuing_handler_supplies_the_manager_exit_line() {
+    for handler in ["except LookupError:", "except LookupError as error:"] {
+        let source = format!(
+            "def lookup(manager, value):\n    with manager:\n        try:\n            return value\n        {handler}\n            from fallback import default\n"
+        );
+        assert_matches_cpython(&source, "manager_handler_exit.py", &LEVELS);
+    }
+}
+
+#[test]
 fn erased_handler_assertions_preserve_manager_pop_block() {
     const SOURCE: &str = "def f(manager, factory):\n    with manager():\n        obj = factory()\n        try:\n            obj.run()\n            raise ValueError(\"failed\")\n        except Error as exc:\n            text = str(exc)\n            assert \"bad\" in text\n        assert obj.ready\n    finish()\n";
     for (index, assignment) in [

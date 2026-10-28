@@ -42556,14 +42556,18 @@ impl<'source> Compiler<'source> {
         });
         // This original handler cleanup reaches the separate manager POP_BLOCK.
         // Its end identity excludes finally joins already represented upstream.
+        let cleanup_join = matches!(body_noop, None | Some(WithBodyExitNoop::ConvertedPopBlock))
+            .then(|| self.assembler.original_manager_cleanup_join(protected_end))
+            .flatten();
         let body_noop = match body_noop {
-            None | Some(WithBodyExitNoop::ConvertedPopBlock) => self
-                .assembler
-                .original_manager_cleanup_join(
-                    protected_end,
-                    remaining.is_empty() && with_body_has_cold_normal_donor(self, body),
-                )
-                .map(|entry| WithBodyExitNoop::RetainedManagerPopBlock(SourceLocation::NONE, entry))
+            None | Some(WithBodyExitNoop::ConvertedPopBlock) => cleanup_join
+                .filter(|(_, recorded)| {
+                    *recorded
+                        || (remaining.is_empty() && with_body_has_cold_normal_donor(self, body))
+                })
+                .map(|(entry, _)| {
+                    WithBodyExitNoop::RetainedManagerPopBlock(SourceLocation::NONE, entry)
+                })
                 .or_else(|| {
                     if !remaining.is_empty()
                         || !matches!(body_noop, Some(WithBodyExitNoop::ConvertedPopBlock))
@@ -42618,11 +42622,24 @@ impl<'source> Compiler<'source> {
             Some(WithBodyExitNoop::RetainedManagerPopBlock(location, entry))
         });
         let body_noop = body_noop.or_else(|| {
-            // Both legacy targets resolve the original POP_BLOCK's location
-            // before NOP cleanup. A structured body can leave one continuing
-            // predecessor whose span remains visible on the manager exit.
-            (self.context.python_version <= crate::PythonVersion::Py313)
-                .then_some(WithBodyExitNoop::ConvertedPopBlock)
+            // Ordinary handler and nested manager exits can donate a line to the
+            // original POP_BLOCK. Let location resolution decide whether it survives.
+            (self.context.python_version <= crate::PythonVersion::Py313
+                || (remaining.is_empty()
+                    && cleanup_join.is_some()
+                    && body.last().is_some_and(|part| match part {
+                        Stmt::Try(statement)
+                            if !statement.is_star && statement.finalbody.is_empty() =>
+                        {
+                            !manager_fallthrough_removed_by_folding(&statement.body)
+                                && !manager_fallthrough_removed_by_folding(&statement.orelse)
+                        }
+                        Stmt::With(manager) => {
+                            !manager_fallthrough_removed_by_folding(&manager.body)
+                        }
+                        _ => false,
+                    })))
+            .then_some(WithBodyExitNoop::ConvertedPopBlock)
         });
         let mut unlocated_body_pop = None;
         if let Some(body_noop) = body_noop {
@@ -45217,6 +45234,32 @@ fn with_chained_manager_exit_location(
         }
     }
     location
+}
+
+// A cold handler or suppression edge cannot donate a line to the manager POP
+// if a second normal edge was present until branch folding.
+fn manager_fallthrough_removed_by_folding(body: &[Stmt]) -> bool {
+    if crate::stack_growth_required() {
+        return crate::grow_stack(|| manager_fallthrough_removed_by_folding(body));
+    }
+    (suite_terminates(body) && !suite_terminates_before_constant_folding(body))
+        || body.iter().any(|part| match part {
+            Stmt::Assert(assertion) => early_condition_truthiness(&assertion.test) == Some(false),
+            Stmt::Try(statement)
+                if !statement.is_star
+                    && !suite_any_statement(&statement.finalbody, |part| {
+                        matches!(part, Stmt::Return(_) | Stmt::Break(_) | Stmt::Continue(_))
+                    }) =>
+            {
+                statement.handlers.iter().all(|handler| {
+                    handler.as_except_handler().is_some_and(|handler| {
+                        suite_terminates_before_constant_folding(&handler.body)
+                    })
+                }) && (manager_fallthrough_removed_by_folding(&statement.body)
+                    || manager_fallthrough_removed_by_folding(&statement.orelse))
+            }
+            _ => false,
+        })
 }
 
 // These source exits reach a distinct manager POP after the cold COPY/POP_EXCEPT/
