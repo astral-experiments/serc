@@ -15788,6 +15788,26 @@ def guarded(item, ready):
 }
 
 #[test]
+fn folded_assertion_threads_to_a_long_branch_continuation() {
+    let source = r"
+def long_footer(ready, item, items):
+    if ready:
+        assert 'present' or 'item' in items
+    else:
+        emit()
+    return item, {}, items
+
+def short_footer(ready, item, items):
+    if ready:
+        assert 'present' or 'item' in items
+    else:
+        emit()
+    return item
+";
+    assert_matches_cpython(source, "folded_assertion_branch.py", &LEVELS);
+}
+
+#[test]
 fn final_elif_after_recovery_keeps_each_false_backedge() {
     let source = "def sample(items, selected, first, second):
     for item in items:
