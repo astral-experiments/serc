@@ -28988,9 +28988,11 @@ impl<'source> Compiler<'source> {
                         } else {
                             // Without a finalizer, the normal else exit shares the
                             // try statement's continuation with its final conditional.
-                            let continuation = if compiler.context.python_version >= crate::PythonVersion::Py314
+                            let continuation = if compiler.context.python_version
+                                >= crate::PythonVersion::Py314
                                 && statement.finalbody.is_empty()
-                                && compiler.control.statements.context.same_region_continuation == Some(statement.range)
+                                && compiler.control.statements.context.same_region_continuation
+                                    == Some(statement.range)
                                 && let Some(Stmt::If(tail)) = statement.orelse.last()
                             {
                                 Some(tail.range)
