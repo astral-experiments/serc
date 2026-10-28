@@ -264,6 +264,36 @@ impl OptimizationPipeline {
         })
     }
 
+    /// Recovers a single-line constant return's width before bytecode folding.
+    fn original_folded_constant_return(&self, items: &[Item]) -> Option<OriginalTail> {
+        use crate::target::opcodes::{LOAD_CONST, LOAD_SMALL_INT, RETURN_VALUE};
+
+        let start = items
+            .iter()
+            .position(|item| matches!(item, Item::Instruction(_)))?;
+        let [Item::Instruction(load), Item::Instruction(ret)] = &items[start..] else {
+            return None;
+        };
+        let hidden = load.local_policy.hidden_exception_owner_slots();
+        (matches!(load.opcode, LOAD_CONST | LOAD_SMALL_INT)
+            && load.value_argument().is_some()
+            && load.depth_after() == Some(1)
+            && (1..=2).contains(&hidden)
+            && u16::from(load.pre_fold_extra_instructions()) == hidden
+            && load.location.line >= 0
+            && load.location.line == load.location.end_line
+            && load.location.line == ret.location.line
+            && ret.location.line == ret.location.end_line
+            && *ret == Instruction::new(RETURN_VALUE, Operand::Value(0), ret.location, Some(0))
+            && self
+                .exception_owner_provenance
+                .uniform_fold_owner_slots
+                .contains(&(load.location, load.opcode, hidden)))
+        .then_some(OriginalTail::ComputedReturn {
+            width: 2 + usize::from(hidden),
+        })
+    }
+
     /// Schedules exact local-tuple exits through their original unprotected arrays.
     pub(in crate::assembler) fn prepare_plain_tuple_copy_plan(&mut self) {
         use crate::target::opcodes::{
@@ -3731,7 +3761,7 @@ impl OptimizationPipeline {
             .enumerate()
             .map(|(i, block)| (*block, i))
             .collect::<FxHashMap<_, _>>();
-        let original_return_tail = |label| {
+        let original_return_tail = |label, direct_cleanup: bool| {
             if super::control_flow::is_original_constant_return(graph, label) {
                 return Some(OriginalTail::ConstantReturn { located: [true; 3] });
             }
@@ -3741,6 +3771,11 @@ impl OptimizationPipeline {
                 .map(|located| OriginalTail::LocalTupleReturn { located })
                 .or_else(|| original_local_subscript_return(items))
                 .or_else(|| original_computed_return(items))
+                .or_else(|| {
+                    direct_cleanup
+                        .then(|| self.original_folded_constant_return(items))
+                        .flatten()
+                })
                 .or_else(|| {
                     handler_continuations
                         .values()
@@ -3862,7 +3897,11 @@ impl OptimizationPipeline {
                 { continue; }
             }
             exits.insert(block, (entry, target_block, pass));
-            if let Some(tail) = original_return_tail(target)
+            // A separately entered Pass ends an earlier array before this cleanup.
+            // Its copy rounds cannot use the direct folded-return width.
+            let direct_cleanup =
+                pass.is_none() && !pass_prefixes.iter().any(|(_, restored)| *restored == entry);
+            if let Some(tail) = original_return_tail(target, direct_cleanup)
                 && self.exception_regions.iter().all(|region| {
                     region.is_scope_fallback
                         || match (
@@ -3895,7 +3934,7 @@ impl OptimizationPipeline {
                 let label = graph[*target]
                     .first_label()
                     .expect("certified assignment return");
-                let Some(tail) = original_return_tail(label) else {
+                let Some(tail) = original_return_tail(label, false) else {
                     return;
                 };
                 joins.insert(block, *target);
@@ -3935,7 +3974,7 @@ impl OptimizationPipeline {
                 continue;
             }
             joins.insert(block, target);
-            if let Some(tail) = original_return_tail(label)
+            if let Some(tail) = original_return_tail(label, false)
                 && self.exception_regions.iter().all(|region| {
                     region.is_scope_fallback
                         || match (
@@ -3966,8 +4005,8 @@ impl OptimizationPipeline {
                 let Some(target) = graph.label_block(label) else {
                     continue;
                 };
-                let Some(tail) =
-                    original_return_tail(label).filter(OriginalTail::is_four_slot_value_return)
+                let Some(tail) = original_return_tail(label, false)
+                    .filter(OriginalTail::is_four_slot_value_return)
                 else {
                     continue;
                 };
@@ -4172,7 +4211,7 @@ impl OptimizationPipeline {
                     continue;
                 };
                 let Some(tail @ OriginalTail::LocalTupleReturn { .. }) =
-                    original_return_tail(label)
+                    original_return_tail(label, false)
                 else {
                     continue;
                 };
