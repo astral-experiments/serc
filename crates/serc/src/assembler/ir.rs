@@ -9,6 +9,13 @@ use super::exception_owners::LazyExceptionOwnerProvenance;
 use crate::PythonVersion;
 use crate::target::Opcode;
 
+/// Original conditional whose destination is resolved after lowering.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum FoldedGuardExit {
+    ConditionalArm,
+    BooleanOperand,
+}
+
 pub(crate) struct AssembledCode {
     pub(crate) bytecode: Vec<u8>,
     pub(crate) line_table: Vec<u8>,
@@ -1675,7 +1682,7 @@ pub(crate) struct Assembler {
     /// Existing source marker, target, and marker location of an original folded edge.
     pub(super) folded_predecessor_sources: Vec<(Label, Label, SourceLocation)>,
     /// Exact folded arm jumps awaiting the complete original return destination.
-    pub(super) folded_arm_exit_origins: Vec<(Label, Instruction)>,
+    pub(super) folded_arm_exit_origins: Vec<(Label, Instruction, FoldedGuardExit)>,
     /// Empty original anchors before folded constant-while exits without else suites.
     pub(super) folded_loop_exit_anchors: FxHashSet<Label>,
     pub(super) operand_patches: Vec<OperandPatch>,

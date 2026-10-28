@@ -15771,6 +15771,18 @@ def runtime(ready, active, flag):
         return False
     emit()
     return True
+
+def guarded(item, ready):
+    try:
+        if ready:
+            return item
+        elif item:
+            assert 0 or 'yes' or check(item)
+        else:
+            other()
+        return None
+    except OSError:
+        close()
 ";
     assert_matches_cpython(source, "short_circuit_return.py", &LEVELS);
 }

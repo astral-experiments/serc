@@ -296,7 +296,7 @@ impl Assembler {
                 }
             });
         }
-        for (entry, original) in self.folded_arm_exit_origins {
+        for (entry, original, kind) in self.folded_arm_exit_origins {
             let Some(target) = original.forward_target() else {
                 continue;
             };
@@ -325,6 +325,11 @@ impl Assembler {
                     POP_JUMP_IF_TRUE, RAISE_VARARGS,
                 };
 
+                if kind == super::ir::FoldedGuardExit::BooleanOperand {
+                    // A Boolean operand can target a located return, but it does
+                    // not carry the conditional-expression proof for a shared join.
+                    return None;
+                }
                 let protected = !self.exception_regions.is_empty();
                 let (Item::Instruction(bridge), labels) = graph[target].items().split_last()?
                 else {
